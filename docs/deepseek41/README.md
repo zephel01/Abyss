@@ -66,6 +66,16 @@ replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the
 
 - The picks: **UD-IQ2_XXS** for quality (KL 0.188 → 0.141 against the old files), **UD-IQ1_M** for speed (0.270 →
   0.199, 40 tok/s on swe-bench with the DSpark drafter on 32 GB + 96 GB).
+- **A 32 GB GPU + 96 GB of RAM: UD-IQ1_M.** At this size it is the one that fits the hot experts in VRAM + RAM
+  (65% of the 15,360 experts placed against 55% for UD-IQ2_XXS), so it reads the SSD about half as often. RTX 5090 +
+  Radeon 8060S lane, the everyday settings + the DSpark drafter, 2026-11-01: 10 harder graded swe tasks 10/10 for both
+  (quality 81.1 vs 78.8), decode 52.5 vs 39.2 tok/s, 32K prompt 1,020 vs 833 tok/s, the 8K / 32K needle found by both,
+  a 7-turn tool session and Japanese text clean on both (these runs used UD-IQ1_M's experts with UD-IQ2_XXS's dense
+  tensors; the whole UD-IQ1_M file measures the same KL, 0.199). A layer mix of the two (layers 0-9 UD-IQ2_XXS) measured the
+  same KL and speed as UD-IQ1_M, so we publish no mix of our own. With 64 GB of RAM both are SSD-bound and about equal;
+  with the whole model in memory UD-IQ2_XXS (lower KL) is the better pick.
+- `--uncensor` on UD-IQ1_M (the edit file built on UD-IQ2_XXS, reused): refusals 92% -> 0%, over-refusals 2% -> 0%,
+  MMLU 90% -> 90%, math 19 -> 19 of 20, KL 0.018 against UD-IQ1_M ([UNCENSOR](../UNCENSOR.md)).
 - UD-IQ1_S and ISTA run but are not recommended: past KL 0.25 the loss shows in the text (our line for a pick).
 - swe-bench rows: the everyday settings + the DSpark drafter (`--dspark`, threshold 0.6), iGPU lane off, 8 tasks.
 - **Keep the iGPU lane on** when the box has one (the default; `STRATA_GLM_IGPU=0` turns it off): it computes RAM-tier
