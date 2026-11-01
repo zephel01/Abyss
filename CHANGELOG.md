@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.93 - 2026-11-02
+
+DeepSeek V4.1 reads images (a contributed change).
+
+- **DeepSeek V4.1 image input** (PR #28, thanks @rS-alonewolf). With ISTA-DASLab's V4.1 GSQ-RCO mmproj, image positions
+  pick their experts with the image router bias (`exp_probs_b_vl`) and add no Engram, as llama.cpp does; the server
+  expands V4.1's image placeholder. The `vision` entry is written by hand (setup does not install it for V4.1), and
+  `STRATA_GLM_VL_BIAS` names the bias file (or `exp_probs_b_vl.f32` beside the pack, which `tools/iq_pack.py` now
+  writes). Without the bias the model starts and image requests are refused. Text-only requests are unchanged.
+  How to set it up: [docs/SETTINGS.md](docs/SETTINGS.md#images-on-deepseek-v41).
+
+Checked: CUDA build; unsloth V4.1 UD-IQ2_XXS without images on an RTX 5090 (TAIL_SKIP, affinity, DSpark), alternated
+with v1.3.92 twice each: swe-bench 3 tasks 50.1 / 50.0 tok/s (v1.3.92) vs 52.2 / 51.0, answers normal; the serve and
+tools tests.
+
 ## v1.3.92 - 2026-11-02
 
 Qwen3.5-MoE models with a NextN drafter (Ornith-1.5-122B, Qwen3.5-122B, Qwen3.8-35B-A3B) no longer crash at the
