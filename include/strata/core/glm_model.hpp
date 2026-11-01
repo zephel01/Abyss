@@ -437,6 +437,7 @@ public:
     // ---- deepseek41 (src/core/dsv41_fast_path.cu): the token path, prompt chunks (their attention a token at a time),
     // snapshots and verify windows (dsv4_verify.cu, the batched kind); no layer splits
     void* dsv41_state_ = nullptr;                          // the window rings, the 4 KV slots and the scratch
+    bool vl_bias_ok_ = false;                              // exp_probs_b_vl is on the device (dsv41_alloc)
     void* v41_eng_ = nullptr;                              // the host's Engram state (dsv41_fast_path.cu V41Engram)
     bool dsv41_bind(std::string& err);
     bool dsv41_alloc(std::string& err);
@@ -620,6 +621,12 @@ public:
         img_pos_ = std::move(positions);
         img_rows_ = std::move(rows);
     }
+    /// Is position p an image row (V4.1: its router bias is exp_probs_b_vl and it gets no Engram)?  False at once when
+    /// the request has no image.
+    bool is_image_pos(int64_t p) const { return !img_pos_.empty() && image_row(p) != nullptr; }
+    bool has_image_rows() const { return !img_pos_.empty(); }
+    /// deepseek41: exp_probs_b_vl is loaded (STRATA_GLM_VL_BIAS, or <pack>/exp_probs_b_vl.f32); an image request needs it
+    bool has_vl_bias() const { return vl_bias_ok_; }
     const float* image_row(int64_t p) const {
         const auto it = std::lower_bound(img_pos_.begin(), img_pos_.end(), p);
         if (it == img_pos_.end() || *it != p) return nullptr;

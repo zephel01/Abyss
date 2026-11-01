@@ -2681,6 +2681,8 @@ static int glm_pack_generate(const Options& o) {
     // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
     // tokens take no positions of their own: the rows only replace the embeddings)
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
+    constexpr int64_t kV41ImageToken = 129264;   // deepseek41: <｜deepseek_image｜> (one token a row of the record)
+    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : kGlmImageToken;
     strata::program::LogposWriter logpos;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     std::string line;
@@ -2907,10 +2909,14 @@ static int glm_pack_generate(const Options& o) {
                 }
                 if (f) std::fclose(f);
                 for (size_t i = 0; ge.empty() && i < toks.size(); ++i)
-                    if (toks[i] == kGlmImageToken) cur_img_pos.push_back((int64_t) i);
+                    if (toks[i] == image_token) cur_img_pos.push_back((int64_t) i);
                 if (ge.empty() && (int64_t) cur_img_pos.size() * E != (int64_t) cur_img_rows.size())
                     ge = std::to_string(cur_img_pos.size()) + " image tokens, " +
                          std::to_string(cur_img_rows.size() / (size_t) E) + " image rows";
+                // deepseek41: image rows route with exp_probs_b_vl - without it they would run on the text bias
+                if (ge.empty() && model.geometry().v41 && !cur_img_pos.empty() && !model.has_vl_bias())
+                    ge = "this model has no exp_probs_b_vl (set STRATA_GLM_VL_BIAS or put exp_probs_b_vl.f32 in the "
+                         "pack): image input is refused";
                 if (!ge.empty()) {
                     cur_img_pos.clear();
                     cur_img_rows.clear();

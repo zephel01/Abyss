@@ -5371,7 +5371,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         const auto& La = F->L[(size_t) il + 1 + d];
         j[nj++] = {La.router, nullptr, F->x, F->alog + (size_t) d * g.n_expert, nullptr, 1.0f, La.router_type, g.n_embd,
                    g.n_expert};
-        ah_bias[d] = La.router_bias;
+        ah_bias[d] = F->cur_img && La.router_bias_vl ? La.router_bias_vl : La.router_bias;   // (an image row: exp_probs_b_vl)
         ++n_ah;
     }
     if (!gf::mv(j, nj, s)) { err = "glm fast: router / shared expert"; return false; }
@@ -5400,10 +5400,14 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
-    gf::moe_route(F->rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
+    // deepseek41: an image row selects its experts with exp_probs_b_vl (the prediction and lookahead of the next layers too)
+    const bool vl = F->cur_img && Ly.router_bias_vl != nullptr;
+    gf::moe_route(F->rlog, vl ? Ly.router_bias_vl : Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
                   g.n_embd, md, late ? nullptr : F->sh_g, late ? nullptr : F->sh_u, g.swiglu_shexp, late ? 0 : FFs,
                   F->sh_hq, s,
-                  pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
+                  pred ? F->plog : nullptr, pred ? (F->cur_img && F->L[(size_t) il + 1].router_bias_vl ? F->L[(size_t) il + 1].router_bias_vl
+                                                                    : F->L[(size_t) il + 1].router_bias)
+                       : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, fast_skip_from(il),
                   lane ? F->cpu_plan : 0ull, dlane ? -1 : promote_min, pf_rank, g.gating,
                   Ly.tid2eid != nullptr ? Ly.tid2eid + (size_t) F->cur_tok * g.n_exp_used : nullptr, fast_skip_w(il),
@@ -5806,7 +5810,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     cudaSetDevice(dev_);
     const auto te0 = std::chrono::steady_clock::now();
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->fast_->cur_tok = token;   // hash routing
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        m->fast_->cur_tok = token;   // hash routing
+        m->fast_->cur_img = is_image_pos(p);   // deepseek41: exp_probs_b_vl for an image row (false: no image rows set)
+    }
     // ---- the embedding row (host-dequantized from the shard mapping) -> the 4 streams
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {

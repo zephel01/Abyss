@@ -2,7 +2,7 @@
 
 This file lists only what DeepSeek-V4.1-Flash-1017 changes against DeepSeek V4 Flash as written in
 [../deepseek4/SPEC.md](../deepseek4/SPEC.md) ("SPEC") and ported per [../deepseek4/PORT.md](../deepseek4/PORT.md). It
-covers the text forward pass (no vision, no MTP / DSpark) and says, for each piece, where Abyss implements it.
+covers the text forward pass (no MTP / DSpark; images are in the last row of the table in section 8) and says, for each piece, where Abyss implements it.
 Notation as in SPEC: `rms(v) = v/sqrt(mean(v^2)+eps)`, `RMS(v,w) = rms(v)*w`, `X` = the residual `[n_embd, 4 streams]`,
 ggml shapes `{in, out}`.
 
@@ -107,7 +107,7 @@ exp_probs_b_vl.bias, ffn_{gate,up,down}_{exps,shexp}`.
 | the rest of 3-39 | - | reader: own window, the slot's compressed rows, the last index source's top-512 |
 
 Gone against V4: `output_hc_fn/base/scale`, `ffn_gate_tid2eid`, `attn_compressor_ape`, every `indexer_compressor_*`,
-`indexer.proj` outside the index sources. `exp_probs_b_vl` is the bias for image tokens; the packer drops it.
+`indexer.proj` outside the index sources. `exp_probs_b_vl` is the bias for image tokens. The packer does not pack it as a tensor: when the GGUF has it, `tools/iq_pack.py` writes it as `exp_probs_b_vl.f32` (layers x experts, F32) next to the pack, and the engine reads that file (or the file named by `STRATA_GLM_VL_BIAS`). Image positions route with it; the text positions keep `exp_probs_b`.
 
 The roles are not in the metadata of every GGUF: Abyss takes ds4's fixed lists (`kv_source = {2,8,14,20}`,
 `index_source = kv_source ∪ {24,28,32,36}`, `engram = {1,14}`, cache slot `owner = il<8 ? 0 : il<14 ? 1 : il<20 ? 2 : 3`)
@@ -355,7 +355,7 @@ collapses with the last FFN `pre` (`head_kernel`).
 | Candidate blocks past 16K | done (fixed in v1.3.32: 24,005 tokens through the decode path) |
 | Speculative decoding / verify window | not yet (the 1017 FP8 release has MTP layers; the GGUFs do not) |
 | Layer split | not yet |
-| Images | no |
+| Images | partly: the image encoder is llama.cpp's `strata-vision` (b11870 or later, projector `deepseek41v`), run on the CPU; image positions take the encoder's vectors, route with `exp_probs_b_vl` and skip the Engram. Tried on one GPU with one 4-file GGUF (three pictures); not tried: the GPU encoder lending expert memory, large or several pictures, GGUFs of the newer 6-file layout, HIP. Setup does not install it (the `vision` entry is written by hand) |
 
 ## 9. Where ds4 and llama.cpp disagree
 

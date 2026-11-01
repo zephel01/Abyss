@@ -492,6 +492,8 @@ struct Glm5Model::PrefillState {
     std::vector<cudaEvent_t> ev_land;    // a landing slot's copy to the device ran: the reader may refill it
     // pinned host staging
     float* emb_h = nullptr;          // T x n_embd
+    unsigned char* img_d = nullptr;  // deepseek41: the chunk's image-row flags on the device (route's per-row bias)
+    bool img_on = false;             // ... and this chunk has an image row (else route takes the plain bias)
     int* toks_d = nullptr;           // deepseek4: the chunk's token ids on the device (hash routing)
     float* hop_h = nullptr;          // 2 x T x hc x n_embd: the split's hand-over (first half), double-buffered
     int* h_counts = nullptr;
@@ -1033,6 +1035,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
         S->nland = n;
         S->ev_land.assign((size_t) n, nullptr);
     }
+    if (g.v41 && cudaMalloc(&S->img_d, (size_t) T) != cudaSuccess) {   // the image rows' flags (exp_probs_b_vl)
+        cudaGetLastError();
+        S->img_d = nullptr;
+        std::fprintf(stderr, "glm prefill: CUDA%d the image flag buffer did not allocate - token by token\n", dev_);
+        prefill_destroy();
+        return true;
+    }
     if (g.dsv4() && cudaMalloc(&S->toks_d, (size_t) T * sizeof(int)) != cudaSuccess) {   // the hash routing's tokens
         cudaGetLastError();
         S->toks_d = nullptr;
@@ -1565,6 +1574,7 @@ void Glm5Model::prefill_destroy() {
     if (S->gpin) cudaFreeHost(S->gpin);
     if (S->emb_h) cudaFreeHost(S->emb_h);
     if (S->toks_d) cudaFree(S->toks_d);
+    if (S->img_d) cudaFree(S->img_d);
     if (S->hop_h) cudaFreeHost(S->hop_h);
     if (S->h_counts) cudaFreeHost(S->h_counts);
     if (S->h_base) cudaFreeHost(S->h_base);
@@ -2959,7 +2969,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         S->mark("router", s);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s, g.gating,
-                  Ly.tid2eid, S->toks_d);
+                  Ly.tid2eid, S->toks_d, Ly.router_bias_vl, S->img_on ? S->img_d : nullptr);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
         S->mark("route", s);
@@ -4270,6 +4280,15 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
         if (S->toks_d != nullptr)   // (pageable source: the copy completes before the call returns)
             cudaMemcpyAsync(S->toks_d, tokens.data() + i, (size_t) T * sizeof(int), cudaMemcpyHostToDevice, fast_->cs);
+        // deepseek41: which rows of the chunk are images (the router's exp_probs_b_vl); none: route takes the plain bias
+        S->img_on = false;
+        if (g.v41 && S->img_d != nullptr && has_image_rows()) {
+            std::vector<unsigned char> fl((size_t) T, 0);
+            for (int t = 0; t < T; ++t)
+                if (is_image_pos(pos_start + i + t)) { fl[(size_t) t] = 1; S->img_on = true; }
+            if (S->img_on)   // (pageable source: the copy completes before the call returns)
+                cudaMemcpyAsync(S->img_d, fl.data(), (size_t) T, cudaMemcpyHostToDevice, fast_->cs);
+        }
         abl_res(S->x, T, E, fast_->cs);
         gb::embed_rows(S->x, S->R, T, E, fast_->cs);
         if (g.v41 || g.q4x) S->toks_h.assign(tokens.begin() + i, tokens.begin() + i + T);

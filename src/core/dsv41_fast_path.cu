@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -57,6 +58,9 @@ ds::Rope layer_rope(const Glm5Geometry& g, bool comp) {
 size_t al(size_t b) { return (b + 255u) & ~(size_t) 255u; }
 
 constexpr int kEngCols = 24, kEngDim = 256, kEngRowMax = 272, kEngDead = -1;
+// an image row's Engram "row number": no table row, the row decodes to zeros (llama.cpp's engram_keep = 0: the layer's
+// add is x += g * val with val = engram_kv(rows) = 0, so the stream is unchanged)
+constexpr uint64_t kEngRowZero = ~0ull;
 constexpr int kV41Blk = 256;   // the prompt path's Engram rows a block
 
 // the Engram reads' own threads (the fast path's workers are the MoE service's: the token's rows are read before
@@ -394,6 +398,33 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
     bytes += 2 * al(4 * 4) + al((ctx + 1) * 4) + al(B * 4) + al((size_t) g.cand_blocks * 4) + al(B);
     bytes += al((size_t) 2 * kEngCols * kEngDim * 4) + al((size_t) 5 * g.n_embd * 4) + al((size_t) 2 * kEngCols * kEngDim / 32 * 36) +
              al((size_t) kV41Blk * kEngCols * kEngDim * 4) + al((size_t) g.hc * g.n_embd * 4);
+    // exp_probs_b_vl (the image rows' router bias, n_layers x n_expert F32): STRATA_GLM_VL_BIAS=<file>, else
+    // <pack>/exp_probs_b_vl.f32 (tools/iq_pack.py writes it when the GGUF has it); none: an image request is refused
+    std::vector<float> vl_h;
+    {
+        std::string vp;
+        if (const char* e = getenv("STRATA_GLM_VL_BIAS"); e != nullptr && e[0]) vp = e;
+        else if (!pack_dir_.empty() && std::filesystem::exists(pack_dir_ + "/exp_probs_b_vl.f32")) vp = pack_dir_ + "/exp_probs_b_vl.f32";
+        if (!vp.empty()) {
+            const size_t want = (size_t) g.n_layers * (size_t) g.n_expert * 4;
+            std::ifstream f(vp, std::ios::binary | std::ios::ate);
+            if (!f) { err = "deepseek41: cannot open the image router bias " + vp; return false; }
+            const size_t sz = (size_t) f.tellg();
+            if (sz != want) {
+                err = "deepseek41: the image router bias " + vp + " is " + std::to_string(sz) + " bytes, expected " +
+                      std::to_string(want) + " (" + std::to_string(g.n_layers) + " layers x " + std::to_string(g.n_expert) +
+                      " experts x 4)";
+                return false;
+            }
+            vl_h.resize(want / 4);
+            f.seekg(0);
+            f.read((char*) vl_h.data(), (std::streamsize) want);
+            if (!f) { err = "deepseek41: short read of the image router bias " + vp; return false; }
+            for (float v : vl_h)
+                if (!std::isfinite(v)) { err = "deepseek41: the image router bias " + vp + " has a non-finite value"; return false; }
+            bytes += al(want);
+        }
+    }
     if (cudaMalloc(&dsv41_state_, bytes) != cudaSuccess) {
         cudaGetLastError();
         err = "deepseek41: the caches (" + std::to_string(bytes >> 20) + " MB for " + std::to_string(ctx) +
@@ -445,6 +476,15 @@ bool Glm5Model::dsv41_alloc(std::string& err) {
         for (int il = l0_; il < l1_; ++il)
             if (F->L[(size_t) il].eng >= 0 && F->L[(size_t) il].eng_kn == nullptr) F->L[(size_t) il].eng_kn = ones;
     }
+    if (!vl_h.empty()) {
+        float* vl_d = (float*) take(vl_h.size() * 4);
+        cudaMemcpy(vl_d, vl_h.data(), vl_h.size() * 4, cudaMemcpyHostToDevice);
+        for (int il = l0_; il < l1_; ++il) {   // (a hash-routed layer has no bias to swap)
+            auto& Ly = F->L[(size_t) il];
+            if (il < g.n_layers && Ly.router_bias != nullptr) Ly.router_bias_vl = vl_d + (size_t) il * g.n_expert;
+        }
+        vl_bias_ok_ = true;
+    }
     if (cudaMallocHost(&F->v41_pblk_h, (size_t) kV41Blk * kEngCols * kEngDim * 4) != cudaSuccess) {
         cudaGetLastError();
         err = "deepseek41: the prompt path's Engram staging buffer did not allocate";
@@ -482,11 +522,17 @@ void Glm5Model::dsv41_reset() {
 
 namespace {
 // the 48 row numbers (2 tables x 24 heads) of the token at position p; records its compressed id at p
-bool engram_rows(V41Engram& E, int32_t tok, int64_t p, uint64_t* rows, std::string& err) {
+// img: position p is an image row - its id is recorded DEAD (the n-grams of the text after it stop at the image, as
+// llama.cpp's cid() of an embedding token) and its rows are the zero row (no Engram contribution)
+bool engram_rows(V41Engram& E, int32_t tok, int64_t p, uint64_t* rows, std::string& err, bool img = false) {
     if (tok < 0 || (size_t) tok >= E.tmap.size()) { err = "deepseek41: Engram: token out of range"; return false; }
     if (p < 0 || (size_t) p >= E.hist.size()) { err = "deepseek41: Engram: position past the context"; return false; }
-    const int32_t cur = (int32_t) E.tmap[(size_t) tok];
+    const int32_t cur = img ? kEngDead : (int32_t) E.tmap[(size_t) tok];
     E.hist[(size_t) p] = cur;
+    if (img) {
+        for (int j = 0; j < 2 * kEngCols; ++j) rows[j] = kEngRowZero;
+        return true;
+    }
     uint32_t ids[4];
     bool blocked = false;
     for (int j = 0; j < 4; ++j) {
@@ -546,6 +592,10 @@ static bool engram_read(V41Engram& E, int k, uint64_t at, uint8_t* dst, size_t n
 // table k's 24 rows (row numbers rows[0..23]) -> dst, 24 x 256 floats
 // one row of table k -> dst (256 floats), through the raw row cache
 bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err) {
+    if (row == kEngRowZero) {   // an image row's: nothing to read
+        std::memset(dst, 0, kEngDim * sizeof(float));
+        return true;
+    }
     uint8_t raw[kEngRowMax];
     const int RB = E.row_bytes;
     bool hit = false;
@@ -620,6 +670,7 @@ void engram_async_loop(V41Engram* E) {
 
 // a row's raw bytes into the row cache unless there (the prefetch: no decode, no error - a failed read stays a miss)
 void engram_cache_row(V41Engram& E, int k, uint64_t row) {
+    if (row == kEngRowZero) return;
     uint8_t raw[kEngRowMax];
     const int RB = E.row_bytes;
     const uint64_t key = (((uint64_t) k << 63) | row) + 1;
@@ -684,7 +735,7 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
     if (!engram_sync(*E, err)) return false;
     engram_pf_stop(*E);
     uint64_t rows[2 * kEngCols];
-    if (!engram_rows(*E, tok, pos_ - 1, rows, err)) return false;   // (pos_ has moved past this token already)
+    if (!engram_rows(*E, tok, pos_ - 1, rows, err, is_image_pos(pos_ - 1))) return false;   // (pos_ has moved past this token already)
     F->v41_eng_async = async && F->v41_eng_flag != nullptr;
     if (F->v41_eng_async) {
         if (++F->v41_eng_seq == 0u) F->v41_eng_seq = 1u;
@@ -716,7 +767,8 @@ bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::s
     engram_pf_stop(*E);
     E->chunk.resize((size_t) T * 2 * kEngCols);
     for (int t = 0; t < T; ++t)
-        if (!engram_rows(*E, toks[t], p0 + t, E->chunk.data() + (size_t) t * 2 * kEngCols, err)) return false;
+        if (!engram_rows(*E, toks[t], p0 + t, E->chunk.data() + (size_t) t * 2 * kEngCols, err, is_image_pos(p0 + t)))
+            return false;
     static const int pf_threads = [] {
         const char* v = getenv("STRATA_DS41_ENGRAM_PREFETCH");
         return v == nullptr ? 8 : std::max(0, std::min(16, std::atoi(v)));   // (1 = on: 8 threads; 0 = off)
@@ -776,7 +828,8 @@ bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std:
     std::vector<uint64_t> rows((size_t) T * 2 * kEngCols);
     std::vector<int> ks(rows.size());
     for (int t = 0; t < T; ++t) {
-        if (!engram_rows(*E, toks[t], p0 + t, rows.data() + (size_t) t * 2 * kEngCols, err)) return false;
+        if (!engram_rows(*E, toks[t], p0 + t, rows.data() + (size_t) t * 2 * kEngCols, err, is_image_pos(p0 + t)))
+            return false;
         for (int j = 0; j < 2 * kEngCols; ++j) ks[(size_t) t * 2 * kEngCols + j] = j / kEngCols;
     }
     if (!engram_rows_par(*E, (int) rows.size(), rows.data(), 0, ks.data(), F->v41_pblk_h, err)) return false;

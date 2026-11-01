@@ -182,7 +182,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | `mcp_servers` | MCP servers the Chat page can use (Claude Desktop's format) | `{"name": {...}}` |
 | `installer` | what setup chose (the model and quant, for the Monitor's label); setup writes it, nothing reads it to decide | `{"quant": "UD-IQ2_XXS"}` |
 
-**Images (GLM-5.3-Flash only)**: `vision` holds the image encoder's settings (`exe`, `mmproj`, `model`, `gpu`,
+**Images (GLM-5.3-Flash by setup; DeepSeek V4.1 by hand, see below)**: `vision` holds the image encoder's settings (`exe`, `mmproj`, `model`, `gpu`,
 `resident`, `threads`, `max_tokens`, `no_flash_attn`). `./abyss.sh` writes it; it is normally left alone.
 
 Unknown keys are ignored. A bad value in `sampling`, though, stops the server from starting (so a typo cannot quietly
@@ -213,3 +213,7 @@ These change part of the config file; the other keys stay as they are.
 ### Per-position log probabilities
 
 Set `STRATA_GLM_LOGPOS` to a new output path to enable the engine command `LOGPOS <comma-separated-token-ids>`. It writes the target and top-k log probabilities for each next-token position as tab-separated rows and resets the model state. `STRATA_GLM_LOGPOS_TOPK` sets the number of top tokens (default 64). `STRATA_GLM_LOGPOS_PREFILL=1` uses the prompt path on a single-device DeepSeek V4.1 with prefill enabled; the default is the token path. The paths can differ numerically. Each tab-separated row contains position, target ID, target log probability, top ID, top log probability, hit (0 or 1), then top-k `ID:log_probability` fields. Multiple requests append to the same file and restart positions at zero; wait for `LPDONE` before sending `QUIT`.
+
+### Images on DeepSeek V4.1
+
+Setup does not install the image encoder for DeepSeek V4.1; add the `vision` entry to the config by hand (`exe` is a `strata-vision` built from llama.cpp b11870 or later, `mmproj` is the model's `deepseek41v` projector file, `model` is the first GGUF file of the model, which the encoder reads the vocabulary from). `STRATA_GLM_VL_BIAS` names the file with the router bias for image positions (`exp_probs_b_vl`, layers x experts, little-endian F32, no header). Without it Abyss reads `exp_probs_b_vl.f32` next to the pack, which `tools/iq_pack.py` writes when the GGUF has `exp_probs_b_vl.bias`. If neither exists the model still starts, and a request with an image is refused. At image positions the router uses this bias and the Engram adds nothing; text positions are unchanged. HIP builds have no images.

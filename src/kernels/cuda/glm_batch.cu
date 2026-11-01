@@ -1631,8 +1631,12 @@ __device__ void topk_argmax(float* sel, int E, int k, int* out, float* s_bv, int
 __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int E, int k, float w_scale, int norm_w, int* __restrict__ ids,
                                                     float* __restrict__ w, int gating, const int* __restrict__ hash,
-                                                    const int* __restrict__ toks) {
+                                                    const int* __restrict__ toks,
+                                                    const float* __restrict__ bias_vl,
+                                                    const unsigned char* __restrict__ img) {
     const int t = blockIdx.x, tid = threadIdx.x;
+    // deepseek41: an image row selects its experts with exp_probs_b_vl (img[t] = 1); without img this is the plain bias
+    if (img != nullptr && img[t] != 0 && bias_vl != nullptr) bias = bias_vl;
     __shared__ float s_p[512], s_sel[512];
     __shared__ int s_ids[strata::kernels::glmf::kMaxK];
     __shared__ float s_bv[32];
@@ -2122,9 +2126,11 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 }
 
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
-           float* w, cudaStream_t s, int gating, const int* hash, const int* toks) {
+           float* w, cudaStream_t s, int gating, const int* hash, const int* toks, const float* bias_vl,
+           const unsigned char* img) {
     if (T <= 0) return;
-    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w, gating, hash, toks);
+    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w, gating, hash, toks,
+                                   bias_vl, img);
     check("route");
 }
 

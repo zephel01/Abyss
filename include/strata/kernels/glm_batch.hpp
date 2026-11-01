@@ -125,7 +125,8 @@ void router_f32(const float* w, int NE, const float* x, int T, int n_embd, float
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
            float* w, cudaStream_t s, int gating = 0,
-           const int* hash = nullptr, const int* toks = nullptr);
+           const int* hash = nullptr, const int* toks = nullptr,
+           const float* bias_vl = nullptr, const unsigned char* img = nullptr);   // img[t] = 1: row t uses bias_vl
 /// Per expert: counts[e] and the stable rank (in (t, j) order) of every routed entry (rank[t*k + j]).
 void expert_count(const int* ids, int n, int n_expert, int* counts, int* rank, cudaStream_t s);
 /// dst[i] = src[i] by the SMs: dst may be pinned host memory, written over the bus without a copy engine (a small

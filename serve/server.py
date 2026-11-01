@@ -48,8 +48,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            effort_kwargs, effort_level, images_of, openai_to_messages)
+from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, Event, OutputParser,  # noqa: E402
+                            anthropic_to_messages, effort_kwargs, effort_level, images_of, openai_to_messages,
+                            v41_images_as_text)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.update import Updater  # noqa: E402
 
@@ -1623,6 +1624,11 @@ class Service:
             kwargs["enable_thinking"] = False
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
+        images = images_of(messages)
+        # DeepSeek V4.1: the GGUF template prints a message's content as it is - an image becomes a sentinel in the text
+        v41_images = bool(images) and self.template.dsv4 and V41_IMAGE not in self.template.source
+        if v41_images:
+            messages = v41_images_as_text(messages)
         prompt = self.template.render(messages, tools=tools, **kwargs)
         if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
             # GLM-5.3's template opens the thinking block whatever it is told (no enable_thinking, and an effort it
@@ -1636,9 +1642,19 @@ class Service:
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
         given["_prefill"] = prefill
-        ids = self.tok.encode(prompt, parse_special=True)
+        if v41_images:
+            # the prompt up to each sentinel, then None: this image's place (expanded to its rows below)
+            pieces = prompt.split(V41_IMAGE_SENTINEL)
+            if len(pieces) - 1 != len(images):
+                raise ValueError("the chat template dropped an image")
+            ids = []
+            for k, piece in enumerate(pieces):
+                ids += self.tok.encode(piece, parse_special=True) if piece else []
+                if k < len(images):
+                    ids.append(None)
+        else:
+            ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
-        images = images_of(messages)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -1647,8 +1663,10 @@ class Service:
             # <|vision_start|><|image_pad|><|vision_end|>
             glm = "<|begin_of_image|>" in self.template.source
             image_pad, image_start = ("<|image|>", "<|begin_of_image|>") if glm else (IMAGE_PAD, VISION_START)
+            if v41_images:   # DeepSeek V4.1: one <｜deepseek_image｜> a row, no start marker (the rows carry their own)
+                image_pad = V41_IMAGE
             pad = self.tok.encode(image_pad, parse_special=True)[0]
-            start = self.tok.encode(image_start, parse_special=True)[0]
+            start = None if v41_images else self.tok.encode(image_start, parse_special=True)[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -1661,7 +1679,10 @@ class Service:
             literal = self.tok.encode(image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start and k < len(encoded):
+                if t is None and k < len(encoded):   # (V4.1: an image's place)
+                    out += [pad] * encoded[k][1]
+                    k += 1
+                elif t is not None and t == pad and start is not None and j > 0 and ids[j - 1] == start and k < len(encoded):
                     out += [pad] * encoded[k][1]
                     k += 1
                 elif t == pad:

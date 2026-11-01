@@ -349,6 +349,7 @@ struct Glm5Model::FastState {
         const uint16_t* router = nullptr;
         int router_type = gf::kTypeBF16;                            // deepseek41: kTypeF32 (router then points at F32)
         const float* router_bias = nullptr;
+        const float* router_bias_vl = nullptr;                      // deepseek41: exp_probs_b_vl (an image position's bias)
         WSlot sh_gate, sh_up, sh_down;
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
@@ -416,6 +417,7 @@ struct Glm5Model::FastState {
     float* v41_eng_kv = nullptr;                                // engram_kv's output (5 x n_embd)
     void* v41_eng_q = nullptr;                                  // the Engram rows as Q8_1 (a quantized engram_kv)
     float *v41_pblk = nullptr, *v41_pblk_h = nullptr;           // the prompt path's block of rows (256 tokens' 24 x 256)
+    bool cur_img = false;                                       // the token in flight is an image row (deepseek41)
     int32_t cur_tok = 0;                                        // the token in flight (hash routing)
     // ---- qwen35moe activations (qwen35_fast_path.cu)
     float *q35_qkv = nullptr, *q35_z = nullptr, *q35_h = nullptr, *q35_ab = nullptr, *q35_gate = nullptr,

@@ -202,6 +202,40 @@ class ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class V41ImageMarkers(unittest.TestCase):
+    """DeepSeek V4.1: an image is one <｜deepseek_image｜> token in the prompt, expanded to the encoder's n rows; the same
+    text typed inside a message stays text.  (A GGUF template prints a message's content as it is.)"""
+
+    class V41Tok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<｜deepseek_image｜>"]
+
+    TEMPLATE = ("{#｜DSML｜#}{%- for m in messages -%}<｜User｜>{{ m['content'] }}{%- endfor -%}"
+                "{%- if add_generation_prompt -%}<｜Assistant｜>{%- endif -%}")
+
+    def test_one_marker_becomes_n_rows(self):
+        import tempfile
+        tok = self.V41Tok()
+        with tempfile.TemporaryDirectory() as d:
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text(self.TEMPLATE, encoding="utf-8")
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(tpl),
+                          vision=ImageMarkers.FakeVision(d))
+            self.assertTrue(svc.template.dsv4)
+            pad = tok.encode("<｜deepseek_image｜>", parse_special=True)[0]
+            for text in ("the docs say <｜deepseek_image｜> marks an image", "plain"):
+                with self.subTest(text=text):
+                    msgs = [{"role": "user", "content": [{"type": "image", "source": "x.png"},
+                                                         {"type": "text", "text": text}]}]
+                    ids, _, _ = svc.prepare(msgs, None, {})
+                    self.assertEqual(ids.count(pad), 3)          # the image's three rows, nothing else
+                    self.assertIn("<｜deepseek_image｜> marks" if "docs" in text else "plain", tok.decode(ids))
+                    self.assertNotIn(None, ids)
+                    # the rows come first (the image block precedes the text), after the user's marker
+                    first = ids.index(pad)
+                    self.assertEqual(ids[first:first + 3], [pad] * 3)
+            svc.embeddings.path.unlink(missing_ok=True)
+
+
 class GlmThinkingLevels(unittest.TestCase):
     """GLM-5.x's template knows reasoning_effort low / high and is "Max" otherwise (no effort given included), and it
     always opens <think>: the server's levels map onto low / high / max, and thinking off closes the think block."""

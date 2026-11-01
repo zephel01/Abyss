@@ -181,7 +181,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `mcp_servers` | チャット画面から使う MCP サーバー（Claude Desktop と同じ形式） | `{"name": {...}}` |
 | `installer` | セットアップが選んだもの（モデルと量子化。Monitor の表示名用）。セットアップが書き、判断には使わない | `{"quant": "UD-IQ2_XXS"}` |
 
-**画像（GLM-5.3-Flash のみ）**: `vision` に画像エンコーダーの設定が入ります（`exe`、`mmproj`、`model`、`gpu`、`resident`、
+**画像（セットアップが入れるのは GLM-5.3-Flash。DeepSeek V4.1 は手で設定、下記）**: `vision` に画像エンコーダーの設定が入ります（`exe`、`mmproj`、`model`、`gpu`、`resident`、
 `threads`、`max_tokens`、`no_flash_attn`）。`./abyss.sh` が書くので、通常は触りません。
 
 知らない項目は無視されます。ただし `sampling` の値が間違っていると、サーバーは起動しません（設定の書き間違いで答え方が
@@ -212,3 +212,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 ### 各位置の対数確率
 
 `STRATA_GLM_LOGPOS` に未使用の出力パスを指定すると、エンジンの `LOGPOS <カンマ区切りのトークンID>` が各位置の正解トークンと上位トークンの対数確率を記録します。モデルの状態はリセットされます。`STRATA_GLM_LOGPOS_TOPK` は記録する上位トークン数（既定 64）です。`STRATA_GLM_LOGPOS_PREFILL=1` はプレフィルが有効な単一デバイスの DeepSeek V4.1 でプロンプト経路を使用します。既定はトークン経路です。両経路の数値は異なる場合があります。
+
+### DeepSeek V4.1 の画像
+
+DeepSeek V4.1 の画像エンコーダーは、セットアップでは入りません。設定ファイルの `vision` を手で書きます（`exe` は llama.cpp b11870 以降で作った `strata-vision`、`mmproj` はモデルの `deepseek41v` の変換器ファイル、`model` はモデルの最初の GGUF ファイルで、エンコーダーが語彙を読みます）。`STRATA_GLM_VL_BIAS` は、画像の位置で専門家を選ぶときの偏り（`exp_probs_b_vl`。層数 × 専門家数、リトルエンディアンの F32、ヘッダーなし）のファイルを指します。指定がなければ、パックの横の `exp_probs_b_vl.f32` を読みます。これは GGUF に `exp_probs_b_vl.bias` があるとき `tools/iq_pack.py` が書き出します。どちらも無ければモデルは普通に起動し、画像つきの要求は断られます。画像の位置では、この偏りで専門家を選び、Engram は何も足しません。文字の位置は変わりません。HIP のビルドでは画像は使えません。

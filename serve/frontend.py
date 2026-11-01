@@ -178,6 +178,27 @@ def images_of(messages: list[dict]) -> list[str]:
             for item in m["content"] if item.get("type") == "image"]
 
 
+# DeepSeek V4.1: an image is one <｜deepseek_image｜> token in the prompt (the official template writes it for an image
+# block, its parts joined by a blank line).  The GGUF templates (ISTA's, unsloth's) print a message's content as it is, so
+# a list content has to become text first; the server swaps each image for V41_IMAGE_SENTINEL and, once the prompt is
+# rendered, puts the image marker token in its place (a "<｜deepseek_image｜>" typed inside a message stays text).
+V41_IMAGE = "<｜deepseek_image｜>"
+V41_IMAGE_SENTINEL = "\ue000image\ue000"
+
+
+def v41_images_as_text(messages: list[dict]) -> list[dict]:
+    """Every list content -> one string: the text parts and an image sentinel per image, joined with a blank line."""
+    out = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            parts = [V41_IMAGE_SENTINEL if p.get("type") == "image" else p.get("text", "")
+                     for p in c if isinstance(p, dict) and (p.get("type") == "image" or "text" in p)]
+            m = dict(m, content="\n\n".join(parts))
+        out.append(m)
+    return out
+
+
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user

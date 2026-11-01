@@ -307,6 +307,6 @@ but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead; r
 ## Not yet for V4.1
 
 MTP drafts from the model's own layers (the 1017 FP8 release has three MTP layers; no GGUF carries them - the DSpark
-drafter above, v1.3.53, is the opt-in alternative), conversation slots on disk, a layer split, images, and the
-one-command setup. The prompt's attention has been batched since v1.3.60 (it ran a token at a time, ~5 ms each,
+drafter above, v1.3.53, is the opt-in alternative), conversation slots on disk, a layer split, and the
+one-command setup. Images work in a limited way (see the Images row in SPEC.md section 8): the `vision` entry of the config is written by hand, and large or several pictures and the GPU encoder are untried. The prompt's attention has been batched since v1.3.60 (it ran a token at a time, ~5 ms each,
 before).

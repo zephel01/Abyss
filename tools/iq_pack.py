@@ -440,6 +440,36 @@ def index_from_base(a, src, base, out, g, T, mm) -> int:
     return 0
 
 
+def write_vl_bias(out, g, model: Model) -> int:
+    """deepseek41: the router bias of the image rows (blk.N.exp_probs_b_vl.bias, n_expert F32 a layer) as one raw
+    exp_probs_b_vl.f32 (n_layers x n_expert x 4 bytes, layer order; a layer without one - the hash-routed ones, which
+    never use a bias - holds zeros).  The engine reads it for an image request (STRATA_GLM_VL_BIAS names another file).
+    A GGUF without it (the converters that drop it) writes nothing, as before."""
+    import re
+    ids = sorted(int(mo.group(1)) for n in model.where for mo in [re.fullmatch(r"blk\.(\d+)\.exp_probs_b_vl\.bias", n)] if mo)
+    if not ids:
+        return 0
+    n_layers = int(g.metadata.get("deepseek41.block_count", ids[-1] + 1))
+    rows = []
+    ne = None
+    for il in range(n_layers):
+        name = "blk.%d.exp_probs_b_vl.bias" % il
+        if name not in model.where:
+            rows.append(None)
+            continue
+        v = np.asarray(model.bytes(name)).view(np.float32)
+        if ne is None:
+            ne = v.size
+        if v.size != ne:
+            print("deepseek41: %s has %d values, not %d" % (name, v.size, ne))
+            return 1
+        rows.append(v)
+    arr = np.stack([r if r is not None else np.zeros(ne, np.float32) for r in rows]).astype("<f4")
+    arr.tofile(out / "exp_probs_b_vl.f32")
+    print("deepseek41: exp_probs_b_vl.f32 (%d layers x %d experts; %d layers carry one)" % (n_layers, ne, len(ids)))
+    return 0
+
+
 def write_engram(out, g, model: Model) -> int:
     """deepseek41: what the engine needs to read the Engram rows from the GGUF (worklog 2026-10-18_deepseek41-spec.md
     section 3): engram.txt (the row format, each table's absolute offset and row count, the primes and multipliers)
@@ -659,7 +689,7 @@ def main() -> int:
     if rc:
         return rc
     if arch == "deepseek41":
-        rc = write_engram(out, g, model)
+        rc = write_engram(out, g, model) or write_vl_bias(out, g, model)
         if rc:
             return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
