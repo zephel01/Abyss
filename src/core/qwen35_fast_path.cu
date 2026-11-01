@@ -637,8 +637,10 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
     }();
     const bool ple_pf = ple_pf_env && g_.q4x && F->ple != nullptr && l0_ <= F->ple_il && F->ple_il < l1_ &&
                         (size_t) (pos_ + kmax + 1) <= F->ple_toks.size();
-    int32_t pf_tok[8] = {pos_ >= 2 ? F->ple_toks[(size_t) (pos_ - 2)] : -1, pos_ >= 1 ? F->ple_toks[(size_t) (pos_ - 1)] : -1,
-                         y, -1, -1, -1, -1, -1};
+    // (ple_toks is filled only on qwen4exp: read it only when the prefetch runs - qwen35moe's NextN drafter
+    // (Ornith, Qwen3.5/3.8-35B) read the empty vector here and crashed at its first draft, v1.3.87 - v1.3.91)
+    int32_t pf_tok[8] = {ple_pf && pos_ >= 2 ? F->ple_toks[(size_t) (pos_ - 2)] : -1,
+                         ple_pf && pos_ >= 1 ? F->ple_toks[(size_t) (pos_ - 1)] : -1, y, -1, -1, -1, -1, -1};
     const auto ple_prefetch = [&](int t) {   // column t's rows: its token pf_tok[t + 2] after pf_tok[t], pf_tok[t + 1]
         namespace kn = strata::kernels;
         static const kn::PleConsts consts = kn::ple_artifact_consts();

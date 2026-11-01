@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.92 - 2026-11-02
+
+Qwen3.5-MoE models with a NextN drafter (Ornith-1.5-122B, Qwen3.5-122B, Qwen3.8-35B-A3B) no longer crash at the
+first token.
+
+- **qwen35moe NextN drafter: a crash at the first draft** (since v1.3.87). The verify-window row prefetch added for
+  Qwen3.8-Flash-Next (qwen4exp) read its token history on every qwen35 model, but the history is kept only on
+  qwen4exp; on the others the empty list was read and the engine stopped with a segmentation fault right after the
+  first token. The history is now read only where the prefetch runs. Qwen3.8-Flash-Next is unchanged.
+- **Qwen3.8-35B-A3B Distill** (empero-ai Q4_K_M, 21.7 GB) runs: RTX 5090, swe-bench 3 tasks 399 tok/s with its NextN
+  drafter (85% of drafts accepted); VRAM capped at 16 GB 297 tok/s. Listed in the README's model table.
+
+Checked: CUDA build, Qwen3.8-35B-A3B Q4_K_M on an RTX 5090 (32 GB and 16 GB VRAM, a Japanese answer, swe-bench 3
+tasks), the serve and tools tests.
+
 ## v1.3.91 - 2026-11-01
 
 Qwen3.8-Flash-Next from unsloth's UD files reads the prompt in batches again; two contributed fixes.
