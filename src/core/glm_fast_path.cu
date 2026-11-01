@@ -1621,7 +1621,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         else if (!F->cpu_pool || !F->cpu_plan || F->igpu_experts)
             reason = "requires the CPU lane without an iGPU lane";
         if (reason) std::fprintf(stderr, "expert helper disabled: %s; using the existing lane\n", reason);
-        else F->expert_helper = std::make_unique<GlmExpertHelper>((int) device, (size_t) (gib * 1073741824.0));
+        else {
+            // STRATA_GLM_EXPERT_HELPER_SAME_GPU=1 (debug): the helper on this GPU - checks its answers on one GPU
+            const char* same = getenv("STRATA_GLM_EXPERT_HELPER_SAME_GPU");
+            const int hd = same && std::strcmp(same, "0") != 0 ? dev_ : (int) device;
+            F->expert_helper = std::make_unique<GlmExpertHelper>(hd, (size_t) (gib * 1073741824.0));
+        }
     }
     return true;
 }
@@ -1631,8 +1636,10 @@ void Glm5Model::expert_helper_decode_begin(bool speculative) {
     if (!F || !F->expert_helper || F->expert_helper->failed) return;
     auto& H = *F->expert_helper;
     H.active = false;
-    if (speculative || (getenv("STRATA_GLM_KDA_GRAPH") && std::atoi(getenv("STRATA_GLM_KDA_GRAPH")) != 0)) {
-        std::fprintf(stderr, "expert helper inactive: speculative decoding or layer graphs; using the CPU lane\n");
+    // speculative decoding (DSpark / NextN): the verify windows' columns go to the helper too (lane_flush, #24)
+    (void) speculative;
+    if (getenv("STRATA_GLM_KDA_GRAPH") && std::atoi(getenv("STRATA_GLM_KDA_GRAPH")) != 0) {
+        std::fprintf(stderr, "expert helper inactive: layer graphs; using the CPU lane\n");
         return;
     }
     std::string err;
@@ -3692,6 +3699,7 @@ void Glm5Model::fast_service() {
         int ne;
         const uint8_t* blob[gf::kMaxK];
         float w[gf::kMaxK];
+        int id[gf::kMaxK];   // (the expert of each entry: the expert helper's ownership)
         const float* x;
         const void* xq;   // (the iGPU lane's columns call: x's q8_1 from the request, when it has it)
     };
@@ -3719,7 +3727,83 @@ void Glm5Model::fast_service() {
             x[t] = wq[t].x;
             out[t] = (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->part;
         }
-        fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr);
+        // the expert helper (#24): a window's helper-owned experts on the helper GPU, the rest on the CPU at the same
+        // time; any helper failure recomputes the whole window on the CPU (a partial answer is never published)
+        auto* H = F->expert_helper.get();
+        bool done = false;
+        if (H && H->active && !H->failed && wq_n <= GlmExpertHelper::kCols) {
+            int hne[kVerifyMax], hid[gf::kMaxK * kVerifyMax], cne[kVerifyMax], cmap[kVerifyMax], nc = 0, hn_all = 0;
+            float hw[gf::kMaxK * kVerifyMax], cw[gf::kMaxK * kVerifyMax];
+            const uint8_t* cb[gf::kMaxK * kVerifyMax];
+            const float* cx[kVerifyMax];
+            const void* cxq[kVerifyMax];
+            float* cout[kVerifyMax];
+            for (int t = 0; t < wq_n; ++t) {
+                int h = 0, c = 0;
+                for (int i = 0; i < wq[t].ne; ++i) {
+                    if (h < GlmExpertHelper::kPer && H->owns(wq_layer * g.n_expert + wq[t].id[i])) {
+                        hid[gf::kMaxK * t + h] = wq[t].id[i];
+                        hw[gf::kMaxK * t + h++] = wq[t].w[i];
+                    } else {
+                        cb[gf::kMaxK * nc + c] = wq[t].blob[i];
+                        cw[gf::kMaxK * nc + c++] = wq[t].w[i];
+                    }
+                }
+                hne[t] = h;
+                hn_all += h;
+                if (c > 0) {
+                    cne[nc] = c;
+                    cx[nc] = wq[t].x;
+                    cxq[nc] = wq[t].xq;
+                    cout[nc] = out[t];
+                    cmap[nc++] = t;
+                } else {
+                    std::fill(out[t], out[t] + g.n_embd, 0.0f);
+                }
+            }
+            (void) cmap;
+            if (hn_all > 0) {
+                std::string helper_err;
+                const auto& L = F->L[(size_t) wq_layer];
+                bool ok = H->begin_cols(wq_layer, wq_n, hne, hid, hw, x, L.gu_type, L.d_type, L.down_off,
+                                        g.swiglu_exp, helper_err);
+                if (ok) {
+                    if (nc > 0) fast_cpu_experts_multi(wq_layer, nc, cne, cb, cw, cx, cout, xq_all ? cxq : nullptr);
+                    ok = H->finish_cols(wq_n, hne, out, helper_err);
+                }
+                if (ok) {
+                    done = true;
+                    // STRATA_GLM_EXPERT_HELPER_CHECK=1 (debug, slow): the whole window on the CPU too, compared
+                    static const bool hcheck = getenv("STRATA_GLM_EXPERT_HELPER_CHECK") != nullptr;
+                    if (hcheck) {
+                        static std::vector<float> ref;
+                        static uint64_t hc_cols = 0;
+                        static double hc_max = 0.0;
+                        ref.resize((size_t) wq_n * g.n_embd);
+                        float* ro[kVerifyMax];
+                        for (int t = 0; t < wq_n; ++t) ro[t] = ref.data() + (size_t) t * g.n_embd;
+                        fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, ro, xq_all ? xqv : nullptr);
+                        for (int t = 0; t < wq_n; ++t) {
+                            double d = 0.0, r = 0.0;
+                            for (int i = 0; i < g.n_embd; ++i) {
+                                d = std::max(d, (double) std::fabs(out[t][i] - ro[t][i]));
+                                r = std::max(r, (double) std::fabs(ro[t][i]));
+                            }
+                            hc_max = std::max(hc_max, d / std::max(r, 1e-6));
+                        }
+                        hc_cols += (uint64_t) wq_n;
+                        if (hc_cols % 2048 < (uint64_t) wq_n)
+                            std::fprintf(stderr, "expert helper check: %llu window columns, max |diff| / max |ref| %.3g\n",
+                                         (unsigned long long) hc_cols, hc_max);
+                    }
+                } else {
+                    ++H->fallbacks;
+                    H->disable();
+                    std::fprintf(stderr, "%s; CPU fallback for this and subsequent requests\n", helper_err.c_str());
+                }
+            }
+        }
+        if (!done) fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr);
         const auto t1 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
         for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->seq = wq[t].seq;
@@ -4196,6 +4280,7 @@ void Glm5Model::fast_service() {
             for (int i = 0; i < g.n_exp_used; ++i)
                 if ((rq->cpu_mask >> i) & 1u) {
                     c.blob[c.ne] = (const uint8_t*) rq->cpu_src[i];
+                    c.id[c.ne] = rq->ids[i];
                     c.w[c.ne++] = rq->w[i];
                 }
             c.x = rq->x;

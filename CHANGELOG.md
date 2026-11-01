@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.94 - 2026-11-02
+
+The second-GPU expert helper also works with the DSpark drafter, and the V4.1 guide names a pick for 32 GB + 96 GB.
+
+- **Expert helper with DSpark** (#24, item 1). `STRATA_GLM_EXPERT_HELPER` was turned off under speculative decoding,
+  so a second GPU added nothing to DSpark decode. Now a verify window's helper-owned experts go to the helper GPU in one
+  call for all the window's columns while the CPU lane computes the rest at the same time; a helper error recomputes
+  the whole window on the CPU. Layer graphs still turn it off. Debug: `STRATA_GLM_EXPERT_HELPER_SAME_GPU=1` puts the
+  helper on the primary GPU (a correctness check on one GPU), `STRATA_GLM_EXPERT_HELPER_CHECK=1` compares every
+  helper-served window with the CPU's answer. [docs/EXPERT_HELPER.md](docs/EXPERT_HELPER.md)
+- **docs/deepseek41: 32 GB GPU + 96 GB RAM -> UD-IQ1_M.** Real-use numbers against UD-IQ2_XXS (harder graded tasks
+  10/10 both, decode 52.5 vs 39.2 tok/s, 32K prompt 1,020 vs 833 tok/s) and `--uncensor` on UD-IQ1_M (refusals
+  92% -> 0%, MMLU 90% -> 90%, KL 0.018).
+
+Checked: CUDA build; unsloth V4.1 UD-IQ2_XXS + DSpark on one RTX 5090 with the helper on the same GPU and the check on:
+7,336 window columns through the helper, no fallback, largest difference from the CPU 3.8% of the largest value (the
+GPU vs CPU expert arithmetic; a mixed-up column would be ~100%), answers normal. The speed on two GPUs is for #24's
+reporter to measure; with the helper unset nothing changes.
+
 ## v1.3.93 - 2026-11-02
 
 DeepSeek V4.1 reads images (a contributed change).

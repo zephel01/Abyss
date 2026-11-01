@@ -674,6 +674,10 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     }();
     // every token's route first: the CPU lane has the whole window's RAM-tier experts queued before any wait
     if (wait_ev != nullptr) cudaStreamWaitEvent(s, wait_ev, 0);
+    // the expert helper's experts go to the CPU lane's request too (it hands them to the helper GPU, #24)
+    const uint8_t* helper_owned = F->expert_helper && F->expert_helper->active && !F->expert_helper->failed ?
+                                  F->expert_helper->owned_d : nullptr;
+    for (int t = tb; t < tb + T; ++t) V->md[(size_t) t].helper_owned = helper_owned;
     for (int t = tb; t < tb + T; ++t) {
         gf::moe_route(V->rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, k, g.w_scale, g.norm_w != 0, il,
                       V->x + (size_t) t * E, E, V->md[(size_t) t], late ? nullptr : V->sh_g + (size_t) t * FFs,

@@ -631,7 +631,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | --- | --- | --- |
 | `STRATA_GLM_WARM` | オン | `0`: 起動時に読み込まない（使われたエキスパートから載っていく。最初の応答が遅い） |
 | `STRATA_GLM_RAM_GB` | 空き RAM から | pinned の RAM 層の大きさを GB で固定。大きくすると SSD の待ちは減るが、そのエキスパートは CPU のレーンが計算する。DDR4 のデスクトップの V4.1 で 80 → 88 GB にすると SSD の待ち 11.1 → 8.7 ms、レーン 9.4 → 10.6 ms、生成 +3%（docs/BENCH） |
-| `STRATA_GLM_EXPERT_HELPER` / `_GIB` | オフ / 13 GiB | DeepSeek V4.1、CUDA のみ: 2 枚目の GPU の番号（例 `1`）と、そこに常駐させるデコード用エキスパートの置き場の大きさ。`0` でオフ。プロンプトは 1 枚目のまま。GPU が無い、置き場が入らない、ヘルパーでエラーが出たときは CPU で計算します。分割しない native pack と CPU レーンが必要で、投機デコードとレイヤーグラフはオフのとき。[設定と制限（英語）](EXPERT_HELPER.md) |
+| `STRATA_GLM_EXPERT_HELPER` / `_GIB` | オフ / 13 GiB | DeepSeek V4.1、CUDA のみ: 2 枚目の GPU の番号（例 `1`）と、そこに常駐させるデコード用エキスパートの置き場の大きさ。`0` でオフ。プロンプトは 1 枚目のまま。GPU が無い、置き場が入らない、ヘルパーでエラーが出たときは CPU で計算します。分割しない native pack と CPU レーンが必要で、レイヤーグラフはオフのとき。DSpark の検証窓でも使います（v1.3.94）。[設定と制限（英語）](EXPERT_HELPER.md) |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6（ユニファイドメモリでは 16） | RAM 層を決めるとき、システムのために空けておく RAM。AMD のセットアップは config に 16 を書く |
 | `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限 (全体に対する割合)。94 GB 機で 73% を超えて pin するとスラッシングした。0.05〜0.95 に収める（上限を外す値はログに一行出して丸める） |
 | `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |
