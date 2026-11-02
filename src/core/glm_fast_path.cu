@@ -1732,7 +1732,7 @@ void Glm5Model::expert_helper_decode_end() {
     if (ok && expert_helper_resync_budget() > 0) F->resync_due = true;   // (run after DONE: expert_helper_resync)
 }
 
-void Glm5Model::expert_helper_resync() {
+void Glm5Model::expert_helper_resync(const std::function<bool()>& pending) {
     auto* F = fast_;
     if (!F || !F->resync_due) return;
     F->resync_due = false;
@@ -1745,9 +1745,15 @@ void Glm5Model::expert_helper_resync() {
         const uint64_t n0 = F->resync_n;
         F->resync_left = budget;
         // a round fills the spares the previous one's demotions freed (step 2 needs their copies landed); two rounds in
-        // a row with nothing promoted: every layer is in step
+        // a row with nothing promoted: every layer is in step.  A round is ~kSpares promotions a layer (a few ms): the
+        // next request arriving stops it between rounds, so the resync only ever uses the idle time between requests
         int idle = 0;
-        for (int round = 0; round < 96 && F->resync_left > 0 && idle < 2; ++round) {
+        bool cut = false;
+        for (int round = 0; round < 4096 && F->resync_left > 0 && idle < 2; ++round) {
+            if (pending && pending()) {
+                cut = true;
+                break;
+            }
             const uint64_t before = F->resync_n;
             if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync landing", err) || !fast_boundary(err)) {
                 std::fprintf(stderr, "expert helper resync stopped: %s\n", err.c_str());
@@ -1757,8 +1763,9 @@ void Glm5Model::expert_helper_resync() {
         }
         F->resync_left = 0;
         if (!fast_boundary(err)) std::fprintf(stderr, "expert helper resync: %s\n", err.c_str());   // (refill the spares)
-        std::fprintf(stderr, "expert helper resync: %llu promotions in %.1f ms\n", (unsigned long long) (F->resync_n - n0),
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        std::fprintf(stderr, "expert helper resync: %llu promotions in %.1f ms%s\n", (unsigned long long) (F->resync_n - n0),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                     cut ? " (stopped: the next request)" : "");
     }
 }
 

@@ -2492,7 +2492,15 @@ static int glm_pack_generate(const Options& o) {
         std::fflush(stdout);
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
-        model.expert_helper_resync();   // (#24, STRATA_GLM_EXPERT_HELPER_RESYNC; after DONE, off the request's clock)
+        // (#24, STRATA_GLM_EXPERT_HELPER_RESYNC; after DONE, off the request's clock, stopped by the next request)
+        model.expert_helper_resync([&] {
+            if (!o.serve) return false;
+            // (not stop_req: a STOP the server sends as it stops reading - often right at DONE - stays set until the
+            // next GEN; it says nothing about a next request)
+            if (quit_req.load()) return true;
+            std::lock_guard<std::mutex> lk(in_mu);
+            return !in_lines.empty() || in_eof;
+        });
         if (model.fast() && produced > 0) {
             const double n = (double) produced;
             std::fprintf(stderr,

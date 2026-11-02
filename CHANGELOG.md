@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.99 - 2026-11-02
+
+- **Expert helper RESYNC stops when the next request arrives** (#24). In #24's two-card run, RESYNC=96/192 raised the
+  primary's VRAM hit (67.7 -> 76-80%) but barely moved the next Prefill (-0.4 to +1.4%) and its 33-106 ms wait made
+  back-to-back requests 0.7-2.1% slower. The resync now checks for a waiting request between rounds and stops there,
+  so it only uses idle time between requests and a large budget (e.g. 8192) costs back-to-back requests nothing. One
+  RTX 5090: with an 8 s pause it ran to the end (210 promotions, 0.7 s); requests sent right after DONE stopped it
+  (110 / 59 promotions); answers normal. Default still 0 (off).
+
 ## v1.3.98 - 2026-11-02
 
 - **`./abyss.sh --connect claude|opencode`**: the settings that point Claude Code or OpenCode at the server that runs
