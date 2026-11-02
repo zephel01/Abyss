@@ -50,8 +50,9 @@ NextN block (`blk.48`) is left out. The pack directory is ~160 MB.
 
 ## Running it
 
-Build the engine (the manual's [Build](../MANUAL.md#build); `setup-deepseek.sh` installs DeepSeek V4 only) and write
-a config next to the others:
+`./setup-deepseek.sh --model ornith --download-model` installs zephel01's IQ3_XXS-B (16 GB GPU + 64 GB RAM) with the
+engine, the pack and the config. For unsloth's files, build the engine (the manual's [Build](../MANUAL.md#build)) and
+write a config next to the others:
 
 ```json
 {

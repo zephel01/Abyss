@@ -60,6 +60,14 @@ DeepSeek V4.1 Flash 1017 は、GPU 32 GB + RAM 96 GB 向けの zephel01 の LDLQ
 `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`、ディスク読み出し 8 本）が入る。V4.1 の DSpark ドラフターはセットアップしない
 （手作業: [docs/deepseek41](deepseek41/README.md)）。ほかの V4.1 の GGUF も、そこに書いた手作業で準備する。
 
+Qwen3.5-MoE の 122B モデル 2 つは、GPU 16 GB + RAM 64 GB 向けの zephel01 の量子化版で入れられる（51〜52 GB。Ornith は
+2 つ目のシャードにある NextN 層で下書きする）:
+
+```sh
+./setup-deepseek.sh --model ornith --download-model     # Ornith-1.5-122B IQ3_XXS-B
+./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B IQ3_XXS-B2
+```
+
 `setup-deepseek.sh` は `.venv` を作ってから `tools/abyss_setup.py` を実行する。済んだ手順は飛ばすので、何度実行してもよい:
 
 1. PC の確認（NVIDIA GPU、RAM）

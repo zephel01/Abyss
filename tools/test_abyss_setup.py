@@ -203,5 +203,22 @@ class ToolkitSwitch(unittest.TestCase):
         self.assertIn("DeepSeek V4.1 Flash 1017", run.read_text(encoding="utf-8"))
         self.assertEqual(m["quants"], ("132G", "139G"))
 
+    def test_root_level_repo_files_by_prefix(self):
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "Ornith-1.5-122B-IQ3_XXS-B-00002-of-00002.gguf", "Ornith-1.5-122B-IQ3_XXS-B-00001-of-00002.gguf",
+            "imatrix-ornith122b.gguf", "README.md")]
+        m = A.MODELS["ornith"]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+            got = A.quant_files(m["quant"], m["repo"], m["folder"], m["prefix_file"])
+        self.assertEqual([g[0] for g in got], ["Ornith-1.5-122B-IQ3_XXS-B-00001-of-00002.gguf",
+                                               "Ornith-1.5-122B-IQ3_XXS-B-00002-of-00002.gguf"])
+        with mock.patch.object(A, "ROOT", self.root):
+            cfg, _ = A.write_config("ornith-iq3_xxs-b", self.root / "pack", 65536, 8082, False, None, None, m)
+        self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["sampling"]["top_k"], 20)
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,8 @@
     ./setup-deepseek.sh --quant UD-IQ3_XXS   another quant of unsloth/DeepSeek-V4-Flash-0731-GGUF
     ./setup-deepseek.sh --model v41          DeepSeek V4.1 Flash 1017: zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM
                                              (--quant 132G, the default: speed; --quant 139G: quality)
+    ./setup-deepseek.sh --model ornith       Ornith-1.5-122B, zephel01's IQ3_XXS-B for a 16 GB GPU + 64 GB RAM
+    ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
     ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
 
@@ -53,6 +55,16 @@ MODELS = {
             "model_name": "deepseek-v4.1-flash-1017", "prefix": "dsv41", "title": "DeepSeek V4.1 Flash 1017",
             "env": {"STRATA_GLM_DISK_READERS": "8", "STRATA_GLM_TAIL_SKIP": "4", "STRATA_GLM_TAIL_SKIP_DISK": "1",
                     "STRATA_GLM_ROUTE_AFFINITY_RAM": "0.08"}, "gb": 140},
+    # zephel01's 16 GB GPU + 64 GB RAM quants of the two Qwen3.5-MoE 122B models (the files at the repo's top level;
+    # the quant names the local folder).  Ornith's NextN drafter is in its second shard: the engine reads it there
+    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B",),
+               "folder": "", "prefix_file": "Ornith-1.5-122B-IQ3_XXS-B-", "model_name": "ornith-1.5-122b",
+               "prefix": "ornith", "title": "Ornith-1.5-122B", "env": {}, "gb": 52, "pack_args": [],
+               "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+    "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
+               "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
+               "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
+               "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
 }
 HF_FILE = "https://huggingface.co/{repo}/resolve/main/{path}"
 HF_TREE = "https://huggingface.co/api/models/{repo}/tree/main/{folder}"
@@ -80,13 +92,16 @@ MANAGED = ("abyss.sh", "common.sh")        # replaced when the template changes 
 ONCE = ("README.md",)                      # written only when missing: the user's own notes go there
 
 
-def quant_files(quant: str, repo: str = REPO) -> list[tuple[str, int, str]]:
-    """(path in the repo, size, sha256) of a quant's GGUF files, from Hugging Face's file list."""
+def quant_files(quant: str, repo: str = REPO, folder: str | None = None, prefix: str = "") -> list[tuple[str, int, str]]:
+    """(path in the repo, size, sha256) of a quant's GGUF files, from Hugging Face's file list (the quant's folder, or
+    `folder` with the files whose names start with `prefix`)."""
     try:
-        req = urllib.request.Request(HF_TREE.format(repo=repo, folder=quant), headers={"User-Agent": "abyss-setup"})
+        req = urllib.request.Request(HF_TREE.format(repo=repo, folder=quant if folder is None else folder),
+                                     headers={"User-Agent": "abyss-setup"})
         items = json.load(urllib.request.urlopen(req, timeout=60))
         files = sorted((i["path"], int(i["size"]), (i.get("lfs") or {}).get("oid", ""))
-                       for i in items if i.get("type") == "file" and i["path"].endswith(".gguf"))
+                       for i in items if i.get("type") == "file" and i["path"].endswith(".gguf")
+                       and i["path"].rsplit("/", 1)[-1].startswith(prefix) and "imatrix" not in i["path"])
         if files:
             return files
     except OSError as e:
@@ -255,7 +270,7 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             "model_name": model["model_name"],
             # (several: a layer split across them, the first the main card - serve/server.py adds --layer-split auto)
             **({"gpu": [g["index"] for g in gpus]} if gpus else {}),
-            "sampling": {"temperature": 1.0, "top_p": 0.95},
+            "sampling": model.get("sampling", {"temperature": 1.0, "top_p": 0.95}),
             "port": port,
             "log": str(ROOT / f"abyss-{name}.log"),
             **(extra or {}),
@@ -352,7 +367,8 @@ def make_tools(tools: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
-                    "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA)")
+                    "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
+                    "ornith: Ornith-1.5-122B, qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one); v41: 132G "
                     "(default, speed) or 139G (quality)")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
@@ -420,6 +436,9 @@ def main() -> int:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
     if a.model == "v4":
         S.ok(f"RAM {S.ram_gb():.0f} GB (with VRAM, ~100 GB holds every expert of the 97 GB quant; less reads from the SSD)")
+    elif a.model in ("ornith", "qwen35"):
+        S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 16 GB GPU + 64 GB RAM: with VRAM, ~60 GB holds every expert of the "
+             f"{model['gb']} GB file; less reads from the SSD)")
     else:
         S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 32 GB GPU + 96 GB RAM: the experts that do not fit there and the "
              "Engram table are read from the SSD - keep the model on a fast NVMe)")
@@ -433,7 +452,7 @@ def main() -> int:
         build_engine(a.arch, gpus, a.nvcc)
 
     S.step(4, f"the model: {repo} {quant}")
-    files = quant_files(quant, repo)
+    files = quant_files(quant, repo, model.get("folder"), model.get("prefix_file", ""))
     total = sum(f[1] for f in files)
     S.say(f"  {len(files)} files, {total / 1e9:.1f} GB -> {mdir}")
     missing = [f for f in files if not (mdir / Path(f[0]).name).exists()]
@@ -452,11 +471,12 @@ def main() -> int:
 
     S.step(5, "the pack")
     pack = mdir / ("pack-dsv4" if a.model == "v4" else "pack")
+    pack_args = model.get("pack_args", ["--compat-bf16"])
     if (pack / "native_experts.txt").exists() and (pack / "tokenizer" / "chat_template.jinja").exists():
         S.ok(f"pack: {pack} (already made)")
     else:
         first = mdir / Path(files[0][0]).name
-        S.run([sys.executable, ROOT / "tools" / "iq_pack.py", "--gguf", first, "--out", pack, "--compat-bf16"], quiet=True)
+        S.run([sys.executable, ROOT / "tools" / "iq_pack.py", "--gguf", first, "--out", pack, *pack_args], quiet=True)
         S.ok(f"pack: {pack}")
 
     S.step(6, "the run config")
@@ -488,7 +508,8 @@ def main() -> int:
     if a.model == "v4":
         dspark_step(a, data, cfg, fresh, had, gpus, backend)
     else:
-        S.ok("DSpark drafter: set up for DeepSeek V4 only (V4.1: by hand, docs/deepseek41/README.md)")
+        S.ok("DSpark drafter: set up for DeepSeek V4 only" + (" (V4.1: by hand, docs/deepseek41/README.md)" if a.model == "v41"
+             else " (Ornith drafts with its own NextN block from the shards)" if a.model == "ornith" else ""))
 
     S.step(8, "Abyss-tools")
     make_tools(tools)

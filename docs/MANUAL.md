@@ -60,6 +60,14 @@ It writes `abyss-dsv41-132g.json` with the card's everyday settings (`STRATA_GLM
 `STRATA_GLM_TAIL_SKIP_DISK=1`, `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`, 8 disk readers); the DSpark drafter is not set up
 for V4.1 (by hand: [docs/deepseek41](deepseek41/README.md)). Other V4.1 GGUFs are set up by hand as described there.
 
+The two Qwen3.5-MoE 122B models in zephel01's quants for a 16 GB GPU + 64 GB RAM (51-52 GB; Ornith drafts with the
+NextN block in its second shard):
+
+```sh
+./setup-deepseek.sh --model ornith --download-model     # Ornith-1.5-122B IQ3_XXS-B
+./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B IQ3_XXS-B2
+```
+
 `setup-deepseek.sh` makes the `.venv`, then runs `tools/abyss_setup.py`. Each step is skipped when it is already done,
 so it can be run again at any time:
 
