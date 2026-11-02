@@ -491,6 +491,11 @@ def main() -> int:
     extra = dict(hip_extra or {})
     if model["env"]:
         extra["env"] = {**model["env"], **extra.get("env", {})}
+    if a.model == "v41" and S.ram_gb() < 160:
+        # a RAM tier that leaves ~34 GB to the page cache and the rest of the PC: V4.1's Engram rows and SSD experts keep
+        # the page cache full, and without a cap systemd-oomd stops the server or the session that started it (the
+        # card's numbers: 60 GB on 94 GB)
+        extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 34))
     cfg, _ = write_config(name, pack, a.context, a.port, a.rewrite_config,
                           gpus if len(gpus) > 1 and backend == "cuda" else None, extra or None, model)
 

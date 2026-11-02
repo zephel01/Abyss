@@ -417,7 +417,10 @@ def check_shards(shards):
             g = GGUFFile(s)
         except (ValueError, struct.error) as e:
             fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
-        need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+        # a shard of metadata alone (llama-gguf-split's first: no tensors) is whole at its header's end - its writer
+        # leaves out the alignment padding no data follows (as abyss.py's incomplete(), #83)
+        need = (g.data_start + max(t.offset + (t.expected_bytes() or 0) for t in g.tensors) if g.tensors
+                else g.header_end)
         have = s.stat().st_size
         if have < need:
             fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",

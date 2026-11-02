@@ -53,6 +53,13 @@ class ShardCheck(unittest.TestCase):
             write_gguf(s)
         S.check_shards(shards)
 
+    def test_metadata_only_shard_without_padding_passes(self):
+        # (llama-gguf-split's first shard: header and metadata, no tensors, the file ends before the aligned data start;
+        # unsloth's and zephel01's DeepSeek V4.1 shard 1 of 6 is 5,780,868 bytes where the data would start at 5,780,896)
+        s = self.dir / "m-00001-of-00002.gguf"
+        s.write_bytes(struct.pack("<IIQQ", 0x46554747, 3, 0, 0) + bytes(4))
+        S.check_shards([s])
+
     def test_missing_shard_is_named(self):
         shards = [self.dir / "m-00001-of-00002.gguf", self.dir / "m-00002-of-00002.gguf"]
         write_gguf(shards[0])

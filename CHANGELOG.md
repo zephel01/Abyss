@@ -7,6 +7,30 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.100 - 2026-11-02
+
+Our own GGUFs in the one-command setup, and the setup's check of a metadata-only first shard.
+- **`./setup-deepseek.sh --model v41`**: DeepSeek V4.1 Flash 1017 with zephel01's LDLQ GGUF, made for a 32 GB GPU +
+  96 GB RAM ([the model card](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF), BETA):
+  132G by default (speed: the types of unsloth's UD-IQ1_M with LDLQ rounding, KL 0.194, coding tasks 67.5 tok/s on an
+  RTX 5090 + 8060S lane), `--quant 139G` for quality (layers 35-39 at IQ3_XXS, KL 0.182, 57.9 tok/s). The download is
+  275.8 / 283.0 GB (the experts 132.2 / 139.4 GB, the Engram table 135.2 GB, which is read from the SSD a few rows at a
+  time). The config gets the card's everyday settings (`STRATA_GLM_TAIL_SKIP=4`, `_DISK=1`,
+  `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`, 8 disk readers) and, below 160 GB of RAM, a RAM tier of the RAM less 34 GB
+  (`STRATA_GLM_RAM_GB`; 60 on a 94 GB PC, as measured): without it the page cache fills and systemd-oomd stops the
+  server. The DSpark drafter is not set up for V4.1 (Lucebox's V4.1 drafter repository is no longer on Hugging Face).
+  The files also run in upstream llama.cpp (`deepseek41`, checked on ac8e1694d).
+- **`./setup-deepseek.sh --model ornith` / `--model qwen35`**: zephel01's 16 GB GPU + 64 GB RAM quants of
+  Ornith-1.5-122B (IQ3_XXS-B, 51.7 GB; its NextN drafter is read from the second shard) and Qwen3.5-122B-A10B
+  (IQ3_XXS-B2, 51 GB), with the model cards' sampling (temperature 0.6, top_p 0.95, top_k 20). Checked on the RTX 5090
+  from the written config: Ornith decode 116 tok/s, 75% of the NextN drafts accepted.
+- **Setup: a first shard of metadata alone passes the size check.** llama-gguf-split's first shard holds no tensors
+  and ends before the aligned data start (unsloth's and zephel01's V4.1 shard 1 of 6: 5,780,868 bytes, the data would
+  start at 5,780,896); `setup.py`'s check took it for 28 bytes short and stopped. It is now whole at its header's end,
+  as `abyss.py` already counted it (#83).
+- **Docs**: MANUAL (EN + JA) one-command setup, docs/deepseek41 and docs/ornith; README introduces the own GGUFs and
+  asks for per-PC reports (`./abyss.sh --bench --deep`, the bench issue form).
+
 ## v1.3.99 - 2026-11-02
 
 - **Expert helper RESYNC stops when the next request arrives** (#24). In #24's two-card run, RESYNC=96/192 raised the
