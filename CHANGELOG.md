@@ -7,6 +7,19 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.101 - 2026-11-03
+
+NVFP4 experts, and a shorter wait for the next request after a helper resync.
+- **NVFP4 (NVIDIA's FP4 checkpoints)**: expert rows in NVFP4 with their per-expert second scale (`ffn_*_exps.scale`)
+  in the decode kernels, the CPU lane and the prompt path (Blackwell's FP4 tensor cores), and a Q8_0 PLE table.
+  Checked with [magnitudedev's Qwen3.8-Flash-Next NVFP4](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF)
+  on an RTX 5090 + 96 GB: KL 0.015 / 0.018 (token / prompt path) against llama.cpp, prompts 2,515 tok/s at 32K,
+  swe-bench 3 tasks 105.3 tok/s with the MTP drafter, Japanese and a 7-turn tool session fine (beta,
+  [docs/qwen38](docs/qwen38/README.md#nvfp4-nvidias-fp4-checkpoints-v13101-beta)).
+- **Expert helper resync stops within a few ms (#24)**: a resync round promoted ~120 experts (~42 ms over PCIe) before
+  it looked for the next request; rounds are now at most 16 promotions and resume where the last one stopped. The
+  budget (`STRATA_GLM_EXPERT_HELPER_RESYNC`) and the default (off) are unchanged.
+
 ## v1.3.100 - 2026-11-02
 
 Our own GGUFs in the one-command setup, and the setup's check of a metadata-only first shard.

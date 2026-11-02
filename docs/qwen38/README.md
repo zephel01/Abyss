@@ -133,6 +133,25 @@ New in the engine for these files: Q2_0, Q5_1 and Q8_0 expert rows, IQ4_XS / Q5_
 dense rows, Q5_1 on the prompt path, and BF16 hyper-connection, `ssm_alpha` / `ssm_beta` and PLE key / value
 rows (ISTA keeps those in BF16).
 
+### NVFP4 (NVIDIA's FP4 checkpoints, v1.3.101, beta)
+
+[magnitudedev's NVFP4 GGUF](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF) (rev `4591036`,
+127.8 GB in 3 shards): experts in NVFP4 (FP4 values, an FP8 scale every 16, and one more scale per expert), the
+rest in Q8_0, the PLE table too (54.4 GB, read from the SSD; resident 73.4 GB). The pack is made as above
+(`tools/iq_pack.py --fast --gguf ...-00001-of-00003.gguf`). Checked on an RTX 5090 + 96 GB RAM (+ the 8060S
+iGPU lane), MTP drafter on:
+
+| Check | Result |
+| --- | --- |
+| Engine vs llama.cpp (KL, 640 EN/JA tokens) | 0.015 token by token, 0.018 through the prompt path |
+| Prompt speed (needle found) | 8K: 1,054 tok/s, 32K: 2,515 tok/s |
+| swe-bench 3 tasks | 105.3 tok/s |
+| 10 hard llmbench tasks | 8 of 10 (2 hit the length cap), quality 76.1 |
+| Japanese (3 prompts), 7-turn tool session | natural Japanese; tests pass, the final report in Japanese |
+
+The prompt path multiplies NVFP4 with Blackwell's FP4 tensor cores (RTX 50, RTX PRO Blackwell, DGX Spark); other
+NVIDIA GPUs and AMD are not checked yet. Reports from other GPUs are welcome (a bench issue as above).
+
 ## Limits
 
 - One GPU: a split across cards has not been tried with this model, and the drafter loads only when one card runs

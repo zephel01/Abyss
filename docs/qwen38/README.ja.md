@@ -133,6 +133,25 @@ SSD の読み込みをどれだけ待っているかがわかります。
 Q2_0、プロンプト経路の Q5_1、BF16 の hyper-connection・`ssm_alpha` / `ssm_beta`・PLE の key / value（ISTA はこれらを
 BF16 で持っています）。
 
+### NVFP4（NVIDIA の FP4 チェックポイント、v1.3.101、ベータ）
+
+[magnitudedev の NVFP4 GGUF](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF)（rev `4591036`、
+3 分割で 127.8 GB）: エキスパートが NVFP4（FP4 の値、16 個ごとの FP8 の倍率、エキスパートごとにもう 1 つの倍率）、ほかは
+Q8_0 で、PLE 表も Q8_0 です（54.4 GB、SSD から読む。常駐分 73.4 GB）。pack は上と同じ手順で作ります
+（`tools/iq_pack.py --fast --gguf ...-00001-of-00003.gguf`）。RTX 5090 + RAM 96 GB（+ 8060S の iGPU レーン）、MTP
+ドラフターありで確認しました:
+
+| 確認 | 結果 |
+| --- | --- |
+| Abyss と llama.cpp の差（KL、英日 640 トークン） | 1 トークンずつ 0.015、プロンプト経路 0.018 |
+| プロンプト処理（needle は見つかる） | 8K: 1,054 tok/s、32K: 2,515 tok/s |
+| swe-bench 3 問 | 105.3 tok/s |
+| llmbench の難しめ 10 問 | 8/10（2 問は長さの上限で打ち切り）、品質 76.1 |
+| 日本語 3 本、7 往復のツール | 自然な日本語。テストは通り、最後の報告も日本語 |
+
+プロンプト経路は Blackwell の FP4 テンソルコア（RTX 50、RTX PRO Blackwell、DGX Spark）で NVFP4 を計算します。ほかの
+NVIDIA の GPU と AMD はまだ確認していません。ほかの GPU での報告も歓迎です（上と同じベンチの issue）。
+
 ## 制限
 
 - GPU は 1 枚: 複数枚への分割はこのモデルでは試していません。ドラフターは 1 枚でモデル全体を動かすときだけ読み込まれます。
