@@ -72,10 +72,25 @@ replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the
   (quality 81.1 vs 78.8), decode 52.5 vs 39.2 tok/s, 32K prompt 1,020 vs 833 tok/s, the 8K / 32K needle found by both,
   a 7-turn tool session and Japanese text clean on both (these runs used UD-IQ1_M's experts with UD-IQ2_XXS's dense
   tensors; the whole UD-IQ1_M file measures the same KL, 0.199). A layer mix of the two (layers 0-9 UD-IQ2_XXS) measured the
-  same KL and speed as UD-IQ1_M, so we publish no mix of our own. With 64 GB of RAM both are SSD-bound and about equal;
+  same KL and speed as UD-IQ1_M, so that mix is not published (our LDLQ re-quantization below is). With 64 GB of RAM both are SSD-bound and about equal;
   with the whole model in memory UD-IQ2_XXS (lower KL) is the better pick.
 - `--uncensor` on UD-IQ1_M (the edit file built on UD-IQ2_XXS, reused): refusals 92% -> 0%, over-refusals 2% -> 0%,
   MMLU 90% -> 90%, math 19 -> 19 of 20, KL 0.018 against UD-IQ1_M ([UNCENSOR](../UNCENSOR.md)).
+- **Our own LDLQ GGUFs (BETA, 2026-11-02):**
+  [zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF).
+  All experts re-quantized from the original FP4 with LDLQ ([trench-gguf](https://github.com/zephel01/trench-gguf));
+  everything else and the Engram shard are unsloth UD-IQ2_XXS's bytes. Same PC and settings as above (RTX 5090 +
+  Radeon 8060S lane, RAM tier 60 GB, DSpark drafter):
+
+  | | experts / files | KL (8 texts) | 10 hard tasks: solved / quality / tok/s | swe 3 tasks | `--uncensor`: refused / over-refused |
+  | --- | ---: | ---: | :---: | ---: | :---: |
+  | `132G` (speed; UD-IQ1_M's types, LDLQ rounding) | 132.2 / 275.8 GB | 0.194 | 10/10 / 77.6 / 58.0 | 67.5 tok/s | 92% -> 2% / 8% -> 4% |
+  | `139G` (quality; layers 35-39 IQ3_XXS) | 139.4 / 283.0 GB | **0.182** | 10/10 / **81.4** / 47.8 | 57.9 tok/s | 92% -> 0% / 12% -> 4% |
+  | unsloth UD-IQ1_M (reference) | 132.2 / 250 GB | 0.198 | 10/10 / 81.1 / 52.5 | 71.8 tok/s | 92% -> 0% |
+
+  Both also found the 8K / 32K needle, passed the 7-turn tool session and wrote clean Japanese. Pick `132G` for
+  UD-IQ1_M's speed with a slightly lower KL, `139G` for the best quality at this size (15-20% slower decode on
+  32 GB + 96 GB). Pack them with `tools/iq_pack.py --compat-bf16 --gguf <folder>/<name>-00001-of-00006.gguf --out <folder>/pack`.
 - UD-IQ1_S and ISTA run but are not recommended: past KL 0.25 the loss shows in the text (our line for a pick).
 - swe-bench rows: the everyday settings + the DSpark drafter (`--dspark`, threshold 0.6), iGPU lane off, 8 tasks.
 - **Keep the iGPU lane on** when the box has one (the default; `STRATA_GLM_IGPU=0` turns it off): it computes RAM-tier
