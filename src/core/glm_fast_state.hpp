@@ -771,4 +771,7 @@ struct Glm5Model::FastState {
 };
 
 
+/// STRATA_GLM_EXPERT_HELPER_PROMOTE (#24, glm_fast_path.cu): 0 = a helper-owned expert is never promoted into VRAM
+unsigned int expert_helper_promote();
+
 }  // namespace strata::core

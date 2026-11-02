@@ -1631,6 +1631,17 @@ bool Glm5Model::fast_setup(std::string& err) {
     return true;
 }
 
+// STRATA_GLM_EXPERT_HELPER_PROMOTE=N (#24): a helper-owned expert routed N times (the aged route count) may still be
+// promoted into VRAM, one a route into a free spare, so the VRAM tier keeps adapting during decode; 0 (default) = never
+unsigned int expert_helper_promote() {
+    static const unsigned int v = [] {
+        const char* e = getenv("STRATA_GLM_EXPERT_HELPER_PROMOTE");
+        const int n = e ? std::atoi(e) : 0;
+        return n > 0 ? (unsigned int) n : 0u;
+    }();
+    return v;
+}
+
 void Glm5Model::expert_helper_decode_begin(bool speculative) {
     auto* F = fast_;
     if (!F || !F->expert_helper || F->expert_helper->failed) return;
@@ -5529,8 +5540,10 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // the prefetch list of THIS route lives in the buffer of this layer's parity (the side stream may still
     // read the previous layer's list while this route writes)
     gf::MoeDev md = F->md;
-    if (F->expert_helper && F->expert_helper->active && !F->expert_helper->failed)
+    if (F->expert_helper && F->expert_helper->active && !F->expert_helper->failed) {
         md.helper_owned = F->expert_helper->owned_d;
+        md.helper_promote = expert_helper_promote();
+    }
     md.pf_src = F->pf_buf[il & 1];
     md.pf_dst = F->pf_buf[il & 1] + 8;
     md.pf_n = F->pf_n_buf[il & 1];

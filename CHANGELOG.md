@@ -7,6 +7,16 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.96 - 2026-11-02
+
+- **Expert helper: optional promotion of hot helper experts** (#24). With the helper on, its experts were never
+  promoted into primary VRAM, so Decode promotions fell from 2.2-2.5 to 0.3-0.5 per token and the following prompt
+  ran about 10% slower (16K prompt: ~2,950-3,030 tok/s off vs ~2,700-2,720 on, after a Decode). New opt-in
+  `STRATA_GLM_EXPERT_HELPER_PROMOTE=N` (default 0, unchanged behaviour): a helper-owned expert whose route count
+  reaches N is fetched into a free VRAM spare instead, at most one per route. Checked on one RTX 5090 (same-GPU
+  helper): answers normal, helper vs exact reference RMS 0.018 (CPU lane 0.020), no Prefill slowdown. The effect on
+  two GPUs is still to be measured in #24.
+
 ## v1.3.95 - 2026-11-02
 
 - **Expert helper check: RMS and an exact reference** (#24). `STRATA_GLM_EXPERT_HELPER_CHECK=1` printed only the

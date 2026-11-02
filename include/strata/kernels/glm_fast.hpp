@@ -221,6 +221,9 @@ struct MoeDev {
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
     int* route_error_d = nullptr;              // ... its device copy, which the route reads (a host-mapped read
                                                //     waits behind the copy engine's PCIe traffic: 16 -> 133 us)
+    // STRATA_GLM_EXPERT_HELPER_PROMOTE (#24): a helper-owned expert whose route count reached this is fetched into a
+    // free spare (promoted into VRAM) instead of going to the helper, at most one a route; 0 = never (helper only)
+    unsigned int helper_promote = 0;
 };
 /// The host's answers to routes - the CPU LANE's (CpuAnswer) and the disk misses' (MoeResponse, with its pinned
 /// staging): kCpuAnswers of each, the route `seq`'s at index seq % kCpuAnswers - a verify window has several routes

@@ -2884,8 +2884,26 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                 const unsigned int cj = __shfl_sync(0xffffffffu, c_i, j);
                 if (((cm >> j) & 1u) && (cj < c_i || (cj == c_i && j > i))) ++rank;
             }
-            host_i = cand && (rank < to_cpu ||
-                (a.d.helper_owned != nullptr && a.d.helper_owned[(size_t) a.layer * E + s_ids[i]] != 0));
+            const bool helper_i = cand && rank >= to_cpu && a.d.helper_owned != nullptr &&
+                                  a.d.helper_owned[(size_t) a.layer * E + s_ids[i]] != 0;
+            // a hot helper-owned expert may still be promoted (#24): without it the VRAM tier stops adapting during
+            // decode (the helper serves exactly the hot RAM-tier experts) and the next prompt is slower. One a route,
+            // only into a spare no other miss of this route will take
+            bool hp_i = false;
+            if (a.d.helper_owned != nullptr && a.d.helper_promote != 0u && a.promote_min >= 0) {
+                const bool hot = helper_i && s_cnt[i] >= a.d.helper_promote;
+                const unsigned int hm = (unsigned int) __ballot_sync(0xffffffffu, hot);
+                const bool other = on && !cut_i && tab_i == 0ull && !(cand && (rank < to_cpu || helper_i));
+                const int n_other = __popc((unsigned int) __ballot_sync(0xffffffffu, other));
+                if (hm != 0u) {
+                    const unsigned long long* spl = a.d.tab + 2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares;
+                    int navail = 0;
+#pragma unroll
+                    for (int j = 0; j < kSpares; ++j) navail += spl[j] != 0ull ? 1 : 0;
+                    hp_i = hot && navail - n_other >= 1 && (hm & ((1u << i) - 1u)) == 0u;
+                }
+            }
+            host_i = cand && (rank < to_cpu || (helper_i && !hp_i));
         }
         const float w = (float) ((double) p * inv * a.w_scale);
         const size_t key = on ? (size_t) a.layer * E + s_ids[i] : 0;
