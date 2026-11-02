@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.98 - 2026-11-02
+
+- **`./abyss.sh --connect claude|opencode`**: the settings that point Claude Code or OpenCode at the server that runs
+  now, read from the server (model name, context) and its config (address, key). `--write` writes a Claude Code
+  launcher (`run-claude-<config>.sh`, settings for that run only) or merges provider `abyss` into OpenCode's
+  `opencode.json` (asked first, backup kept); `--check` sends one prompt and one tool call the way the tool does;
+  `--url` / `--key-env` for a server on another PC. Claude Code gets its context (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`)
+  so it compacts in time. The API key is never written into a file. docs/MANUAL.md "Coding tools".
+
 ## v1.3.97 - 2026-11-02
 
 - **Expert helper: catch the VRAM tier up between requests** (#24). v1.3.96's `PROMOTE` brought the Prefill back

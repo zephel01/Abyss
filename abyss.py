@@ -18,6 +18,11 @@ Abyss Terminal (watch the server: speed, where a token's time goes, GPUs, SSDs, 
                                                loading starting down)
     ./abyss.sh --terminal --once / --json      one reading as text / JSON, then exit
 
+Coding tools (Claude Code, OpenCode) against the server that runs now:
+    ./abyss.sh --connect claude                print the settings (address, key, model name, context come from the server)
+    ./abyss.sh --connect opencode --write      write them (a launcher script / opencode.json), asked first, a backup kept
+    ./abyss.sh --connect claude --check        one prompt and one tool call the way the tool sends them
+
 Speed and tuning:
     ./abyss.sh --bench                         a standard speed test (Abyss stopped): decode, prefill, the bottleneck,
                                                a quality check; --deep finds the bottleneck, --full adds a 32k prompt
@@ -3241,9 +3246,9 @@ def main() -> int:
     ap.add_argument("--terminal", action="store_true",
                     help="Abyss Terminal: watch the server (speed, where a token's time goes, GPUs, memory, requests), "
                          "start / stop / switch models; closing it keeps the server running (docs/MANUAL.md)")
-    ap.add_argument("--url", help="with --terminal: a server on another PC, e.g. http://192.168.1.20:8082 (read-only)")
+    ap.add_argument("--url", help="with --terminal or --connect: a server on another PC, e.g. http://192.168.1.20:8082")
     ap.add_argument("--key-env", metavar="NAME",
-                    help="with --terminal --url: the environment variable that holds the server's API key")
+                    help="with --terminal / --connect --url: the environment variable that holds the server's API key")
     ap.add_argument("--interval", type=float, default=1.0, help="with --terminal: seconds between readings (0.5-10)")
     ap.add_argument("--layout", choices=("speed", "devices"),
                     help="with --terminal: the Overview - speed (big numbers) or devices (every GPU / SSD / CPU)")
@@ -3251,6 +3256,11 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="with --terminal: print one reading as JSON and exit")
     ap.add_argument("--demo", metavar="SCENARIO", help="with --terminal: recorded readings, no server (r9700, lowspec, "
                                                        "split, multi4, multi8, multi10, loading, starting, down)")
+    ap.add_argument("--connect", choices=("claude", "opencode"),
+                    help="print the settings that point Claude Code / OpenCode at the server that runs now; with "
+                         "--write: write them (asked first, a backup kept), with --check: try one prompt and one tool "
+                         "call the way the tool sends them (docs/MANUAL.md)")
+    ap.add_argument("--write", action="store_true", help="with --connect: write the settings")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
@@ -3267,6 +3277,13 @@ def main() -> int:
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "abyss.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     if a.terminal:
         return terminal(a)
+    if a.connect:
+        import abyss_connect
+        argv = [a.connect] + [f for f, on in (("--write", a.write), ("--check", a.check), ("--yes", a.yes)) if on]
+        for flag, val in (("--url", a.url), ("--key-env", a.key_env), ("--config", a.config)):
+            if val is not None:
+                argv += [flag, str(val)]
+        return abyss_connect.main(argv)
     version = maya_version()
     say(f"Abyss v{version} - big MoE models on your own GPU, RAM and SSD.")
     if a.report:

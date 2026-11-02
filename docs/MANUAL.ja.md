@@ -243,7 +243,7 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
   ```
 
   回答は `content`、思考は `reasoning_content` に入る。
-- **Anthropic 互換 API:** `http://127.0.0.1:8082/v1/messages`（Claude Code なら `ANTHROPIC_BASE_URL=http://127.0.0.1:8082`）。
+- **Anthropic 互換 API:** `http://127.0.0.1:8082/v1/messages`（Claude Code なら `ANTHROPIC_BASE_URL=http://127.0.0.1:8082`。全部の設定は `./abyss.sh --connect claude` で表示）。
 - **思考:** DeepSeek V4 は指定しなければ考えてから答える。`reasoning_effort`（またはチャットの設定）で変えられる:
 
   | レベル | DeepSeek に渡るもの |
@@ -366,6 +366,35 @@ Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.s
 `strata.sh`（start / stop / log）を使うなら、Abyss のフォルダに起動スクリプトと設定を `run-<名前>.sh`,
 `strata-<名前>.json` の名前で置いて、`STRATA_DIR=~/llm/apps/Abyss ./strata.sh start <名前>` で起動する。
 起動スクリプトの中身は上の起動コマンド（`exec .venv/bin/python serve/server.py --engine strata "--config" "<設定>" "--port" "8082" "$@"`）。
+
+### コーディングツール: Claude Code と OpenCode（`--connect`）
+
+`./abyss.sh --connect <ツール>` は、いま動いているサーバー（`GET /v1/models` のモデル名とコンテキスト）と、その起動設定
+（アドレス、API キー）を読んで、そのツール用の設定を表示する。`--write` を付けない限り何も書き込まない。
+
+```sh
+./abyss.sh --connect claude              # Claude Code を起動するときの環境変数
+./abyss.sh --connect claude --write      # 設定ファイルの横に run-claude-<設定名>.sh を書く（書く前に確認）
+./abyss.sh --connect claude --check      # Claude Code と同じ形でプロンプト 1 回 + ツール呼び出し 1 回を試す
+./abyss.sh --connect opencode            # opencode.json に入れる provider のブロック
+./abyss.sh --connect opencode --write    # ~/.config/opencode/opencode.json に provider "abyss" を追加（バックアップを残す）
+./abyss.sh --connect opencode --check    # 同じ確認を OpenAI 形式で
+ABYSS_KEY=... ./abyss.sh --connect claude --url http://192.168.1.20:8082 --key-env ABYSS_KEY   # 別の PC のサーバー
+```
+
+- **Claude Code:** ランチャーは `ANTHROPIC_BASE_URL`、全モデル枠（`ANTHROPIC_MODEL`、Opus / Sonnet / Haiku の既定、
+  `CLAUDE_CODE_SUBAGENT_MODEL`）をサーバーのモデルに、`CLAUDE_CODE_MAX_CONTEXT_TOKENS` をサーバーのコンテキストに
+  （知らないモデルだと Claude Code は 200K とみなし、要約が遅れる）、`CLAUDE_CODE_MAX_OUTPUT_TOKENS`（コンテキストの 1/4、
+  最大 32K）、`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`、`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` を、その起動の間だけ
+  設定する。`~/.claude/settings.json` は変えない。キーは `$ABYSS_API_KEY` から `ANTHROPIC_AUTH_TOKEN`（Bearer）で送る。
+  `ANTHROPIC_API_KEY` は Claude Code が使うかどうか聞いてくるので外す。`~/.claude/settings.json` の `env` に
+  `ANTHROPIC_*` があるとそちらが優先されるので、消しておく。Claude Code 自身のプロンプトが約 20K トークンあるため、
+  サーバーのコンテキストは 32K 以上（64K 以上なら余裕がある）で設定する。モデル名が `claude-` で始まると Claude の
+  モデルと見なされるので、設定の `model_name` を別の名前にする。
+- **OpenCode:** provider `abyss`（`@ai-sdk/openai-compatible`、ベース URL `.../v1`、`limit.context` = サーバーの
+  コンテキスト、キーは `{env:ABYSS_API_KEY}`）。既定のモデルがあればそのまま残すので、`/models` で `abyss/<モデル>` を
+  選ぶ。コメント入りの設定（JSONC）は書き換えないので、表示されたブロックを手で貼る。
+- キーはファイルに書かない。Claude Code 2.1.316 と RTX 5090 1 枚の Qwen3.8-35B-A3B-Distill で、ファイルを書くツール呼び出しまで確認した。
 
 ## 複数の GPU
 

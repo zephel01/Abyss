@@ -245,7 +245,7 @@ in the browser, `--gpu 0` picks the GPU.
   ```
 
   The answer is in `content`, the thinking in `reasoning_content`.
-- **Anthropic-compatible API:** `http://127.0.0.1:8082/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8082`).
+- **Anthropic-compatible API:** `http://127.0.0.1:8082/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8082`; `./abyss.sh --connect claude` prints all its settings).
 - **Thinking:** DeepSeek V4 thinks unless asked not to. `reasoning_effort` (or the chat's setting):
 
   | Level | What DeepSeek gets |
@@ -378,6 +378,36 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
 If you use the `strata.sh` helper (start / stop / log), put a run script and the config into the Abyss folder under
 its naming (`run-<name>.sh`, `strata-<name>.json`) and point it there: `STRATA_DIR=~/llm/apps/Abyss ./strata.sh start <name>`.
 The run script is the start command above (`exec .venv/bin/python serve/server.py --engine strata "--config" "<config>" "--port" "8082" "$@"`).
+
+### Coding tools: Claude Code and OpenCode (`--connect`)
+
+`./abyss.sh --connect <tool>` asks the server that runs now (`GET /v1/models`: its model name and context) and its
+run config (address, API key) and prints the settings for that tool. Nothing is written unless you add `--write`.
+
+```sh
+./abyss.sh --connect claude              # the variables to start Claude Code with
+./abyss.sh --connect claude --write      # writes run-claude-<config>.sh next to the configs (asked first)
+./abyss.sh --connect claude --check      # one prompt + one tool call the way Claude Code sends them
+./abyss.sh --connect opencode            # the provider block for opencode.json
+./abyss.sh --connect opencode --write    # merges provider "abyss" into ~/.config/opencode/opencode.json (backup kept)
+./abyss.sh --connect opencode --check    # the same check in OpenAI form
+ABYSS_KEY=... ./abyss.sh --connect claude --url http://192.168.1.20:8082 --key-env ABYSS_KEY   # another PC
+```
+
+- **Claude Code:** the launcher sets `ANTHROPIC_BASE_URL`, every model slot (`ANTHROPIC_MODEL`, the Opus / Sonnet /
+  Haiku defaults, `CLAUDE_CODE_SUBAGENT_MODEL`) to the server's model, `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the
+  server's context (Claude Code assumes 200K for a model it does not know and would compact too late),
+  `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (a quarter of the context, at most 32K), `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`
+  and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, for that run only - `~/.claude/settings.json` is not changed. The
+  key goes as `ANTHROPIC_AUTH_TOKEN` (Bearer) from `$ABYSS_API_KEY`; `ANTHROPIC_API_KEY` is unset, as Claude Code would
+  ask whether to use it. If your `~/.claude/settings.json` has `ANTHROPIC_*` in its `env`, those win - take them out.
+  Claude Code's own prompt is about 20K tokens: set the server up with a context of 32K or more (64K+ is comfortable).
+  A model name that starts with `claude-` is taken for one of Claude's models: give the config another `model_name`.
+- **OpenCode:** provider `abyss` (`@ai-sdk/openai-compatible`, base URL `.../v1`, `limit.context` = the server's
+  context, the key as `{env:ABYSS_API_KEY}`). Your default model is kept if you have one; pick `abyss/<model>` with
+  `/models`. A config with comments (JSONC) is not touched: copy the printed block by hand.
+- The key is never written into a file. Tested with Claude Code 2.1.316 against Qwen3.8-35B-A3B-Distill on one RTX 5090
+  (a file-writing tool call).
 
 ## Several GPUs
 
