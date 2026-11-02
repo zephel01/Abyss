@@ -26,6 +26,14 @@ GPU. The engine keeps the most-used experts in VRAM, the next ones in pinned RAM
 moves them as the conversation needs them. You get a browser chat and OpenAI- / Anthropic-compatible APIs, with
 thinking and tool calls — all on your own machine.
 
+**New: our own DeepSeek V4.1 GGUFs for a 32 GB GPU + 96 GB RAM ([BETA](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF))** — all experts re-quantized from
+the original FP4 with LDLQ ([trench-gguf](https://github.com/zephel01/trench-gguf)), no expert dropped. `132G` (speed):
+KL 0.194, 67.5 tok/s on coding tasks; `139G` (quality): KL 0.182, the best quality score at this size (unsloth UD-IQ1_M:
+0.198, 71.8 tok/s; RTX 5090 + 96 GB, DSpark). Both pass hard coding tasks, 8K / 32K needles, a tool session, Japanese, and
+`--uncensor` (refusals 92% → 0-2%, over-refusals down too). **Please report how they run on your PC** (R9700, V100,
+24 GB cards, 64 / 128 GB RAM...): `./abyss.sh --bench --deep` → [this issue form](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU), or quality problems in an
+issue / the HF Community tab. Reports go into the model card's GPU table and shape the next versions.
+
 **New: [DeepSeek V4.1 Flash (1017)](docs/deepseek41/README.md)** (v1.3.29-1.3.32) — on an RTX 5090 + 94 GB RAM + NVMe
 with nazeshinjite's Q2 GGUF: ~28 tok/s decode with the disk tail skip (17.7 with exact routing), 51.6 tok/s end to end
 on swe-bench coding tasks. Its 366 GB include ~200 GB of Engram tables, read row by row from the SSD, and ~43% of its
@@ -87,6 +95,7 @@ the APU's iGPU as a lane).
 | | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); NVIDIA: builds, not measured |
 | DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for quality) | 300 GB | measured on an AI PRO R9700: KL 0.141 (old file 0.188), swe-bench 8 tasks 33.9 tok/s on 32 GB + 96 GB, 29.5 on 32 GB + 64 GB ([which file](docs/deepseek41/README.md#ggufs-that-load)) |
 | | unsloth [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for speed) | 250 GB | measured the same way: KL 0.199 (old 0.270), **40.6 tok/s** on 32 GB + 96 GB, 30.5 on 32 GB + 64 GB |
+| | our [LDLQ 132G / 139G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF) for a 32 GB GPU + 96 GB RAM (BETA, 2026-11-02; reports welcome) | 275.8 / 283.0 GB | measured on an RTX 5090 + 96 GB: KL 0.194 / 0.182, swe 3 tasks 67.5 / 57.9 tok/s (UD-IQ1_M 71.8), 10 hard tasks 10/10 both; `--uncensor` OK ([details](docs/deepseek41/README.md#ggufs-that-load)) |
 | | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | measured, swe-bench 34 of 35 (a partial run, v1.3.31: the first 35 of 60 tasks; the full run is still owed) |
 | | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (re-uploaded 2026-10-28) | 233 GB | measured: runs, not recommended (KL 0.257; old file 0.36) |
 | | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |
@@ -107,6 +116,8 @@ the APU's iGPU as a lane).
 
 Which V4.1 file to pick and how each was measured: [docs/deepseek41/README.md](docs/deepseek41/README.md#ggufs-that-load).
 Quality and speed of every measured file, and reference numbers per GPU (ours and users' reports): [docs/MODELS.md](docs/MODELS.md).
+Running one of our own quants (the `zephel01/...` rows) on a GPU we have not measured? Your `--bench --deep` output
+([issue form](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)) goes into its model card with credit.
 To measure your own PC the same way - and see where its time goes - run `./abyss.sh --bench --deep` ([docs/BENCH.md](docs/BENCH.md)).
 
 ## 📊 Performance

@@ -25,6 +25,17 @@ Abyss は [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Fla
 動かす。よく使うエキスパートを VRAM に、次に使うものを pinned RAM に、残りを NVMe SSD に置き、会話に合わせて入れ替える。
 ブラウザのチャットと、OpenAI / Anthropic 互換の API（思考とツール呼び出しに対応）が、すべて手元のマシンだけで動く。
 
+**新しく公開: GPU 32 GB + RAM 96 GB 向けの自作 DeepSeek V4.1 GGUF（[BETA 版](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)）**
+- エキスパートはすべて、元の FP4 から LDLQ で作り直しました（[trench-gguf](https://github.com/zephel01/trench-gguf)）。1 つも削っていません。
+- `132G`（速さ重視）：KL 0.194、コーディング課題で 67.5 tok/s。
+- `139G`（品質重視）：KL 0.182。この大きさでは品質点が一番です。
+- 比較：unsloth UD-IQ1_M は KL 0.198、71.8 tok/s（RTX 5090 + RAM 96 GB、DSpark あり）。
+- 2 本とも、難しめのコーディング課題、8K / 32K の長文検索、ツールを使う作業、日本語、`--uncensor`（拒否率 92% → 0〜2%、断りすぎも減少）をすべて通過しました。
+- **お使いの PC で動かした結果を教えてください。** R9700、V100、24 GB のカード、RAM 64 / 128 GB など、何でも歓迎です。
+  - 速さは `./abyss.sh --bench --deep` の結果を[こちらの issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)へ。
+  - 品質の問題は issue か、HF の Community タブへ。
+  - いただいた報告は、モデルカードの GPU の表に載せ、次の版に反映します。
+
 **新しく対応: [DeepSeek V4.1 Flash（1017）](docs/deepseek41/README.md)**（v1.3.29〜1.3.32）— RTX 5090 + RAM 94 GB + NVMe と
 nazeshinjite の Q2 GGUF で、生成は SSD だけの下位エキスパートを省く設定で約 28 tok/s（省かなければ 17.7）、swe-bench の
 コーディング問題を通しで 51.6 tok/s。366 GB のうち約 200 GB は Engram の表で、SSD から行単位で読む。エキスパートも約 43% は
@@ -77,6 +88,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 | | DeepSeek の DSpark ドラフトモデル（bleysg の [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`、v1.3.43） | 6.9 GB | AI PRO R9700 で計測済み（swe-bench +28%）。NVIDIA はビルドのみ、未計測 |
 | DeepSeek V4.1 Flash 1017 | unsloth の [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（品質重視のおすすめ） | 300 GB | AI PRO R9700 で計測済み: KL 0.141（旧版 0.188）、swe-bench 8 問で GPU 32 GB + メモリ 96 GB 33.9 tok/s、32 GB + 64 GB 29.5 tok/s（[どれを選ぶか](docs/deepseek41/README.md#ggufs-that-load)） |
 | | unsloth の [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（速さ重視のおすすめ） | 250 GB | 同じ測り方で: KL 0.199（旧版 0.270）、32 GB + 96 GB で **40.6 tok/s**、32 GB + 64 GB で 30.5 tok/s |
+| | 自作の [LDLQ 132G / 139G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)（GPU 32 GB + RAM 96 GB 向け、BETA、2026-11-02。報告歓迎） | 275.8 / 283.0 GB | RTX 5090 + RAM 96 GB で計測: KL 0.194 / 0.182、swe 3 問 67.5 / 57.9 tok/s（UD-IQ1_M は 71.8）、難しめ 10 問は両方 10/10、`--uncensor` も問題なし（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
 | | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | 計測済み、swe-bench 35 問中 34（v1.3.31 の部分実行: 60 問のうち最初の 35 問。全問の再実行は未了） |
 | | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（2026-10-28 の再アップロード版） | 233 GB | 計測済み: 動くがおすすめしない（KL 0.257、旧版 0.36） |
 | | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
@@ -97,6 +109,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 
 V4.1 でどのファイルを選ぶかと、それぞれの測り方: [docs/deepseek41/README.md](docs/deepseek41/README.md#ggufs-that-load)。
 測ったファイルすべての品質と速さ、GPU ごとの参考値（こちらの実測と、利用者の報告）: [docs/MODELS.ja.md](docs/MODELS.ja.md)。
+自作の量子化（`zephel01/...` の行）を、こちらで測っていない GPU で動かしたら、`--bench --deep` の結果を[issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)で送ってください。名前を添えてモデルカードに載せます。
 自分の PC を同じ方法で測り、どこで時間がかかっているかを見るには `./abyss.sh --bench --deep` を実行してください（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
 
 ## 📊 性能
