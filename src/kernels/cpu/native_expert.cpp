@@ -277,7 +277,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
                           const void* const* act, int nt, float* const* ff, int r0, int r1,
-                          float swiglu_limit) {
+                          float swiglu_limit, float scale) {
+    // scale: NVFP4's second-level scale of the gate and up rows (inside the SiLU; 1 for every other type)
     const int n = (int) f.n_embd;
     const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
     if (r1 > r0) {
@@ -298,7 +299,7 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             fn(f.gu_type, up_base + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, uo.data(), 0, nr);
             for (int t = 0; t < nt; ++t) {
                 for (int r = 0; r < nr; ++r) {
-                    float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+                    float g = scale * go[(size_t) t][r], u = scale * uo[(size_t) t][r];
                     if (clamp) {
                         g = std::fmin(g, swiglu_limit);
                         u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
@@ -317,6 +318,8 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            g *= scale;
+            u *= scale;
             if (clamp) {   // GLM's clamped swiglu (glm_ffn's semantics), matching the device path
                 g = std::fmin(g, swiglu_limit);
                 u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);

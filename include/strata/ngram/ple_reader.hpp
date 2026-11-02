@@ -24,7 +24,7 @@
 
 namespace strata::ngram {
 
-inline constexpr uint32_t ROW_BYTES = 90;
+inline constexpr uint32_t ROW_BYTES = 90;   // IQ4_NL rows (the default); open's row_bytes: 170 for a Q8_0 table
 inline constexpr uint32_t PAGE = 4096;
 
 struct ReaderStats {
@@ -57,7 +57,7 @@ public:
     /// `io_thread` (default): a worker thread submits and reaps reads, so `issue` costs the caller no ReadFile
     /// calls. false: the caller's thread does it (A/B arm).
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
-              uint64_t cache_rows, std::string& err, bool io_thread = true);
+              uint64_t cache_rows, std::string& err, bool io_thread = true, uint32_t row_bytes = ROW_BYTES);
     void close();
     bool is_open() const;
 

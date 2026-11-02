@@ -24,8 +24,10 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 size_t q8_block_bytes();
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
+/// NVFP4 on Blackwell: the activations go to FP4 with a per-row scale, written to `scale` (rows floats; pass it as
+/// the Product's y_scale) - null for every other type.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
-              void* stream);
+              void* stream, float* scale = nullptr);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -43,6 +45,7 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    const float* y_scale = nullptr;   // (NVFP4 on Blackwell: the activation rows' scales from quantize, same offset as xq)
 };
 
 /// This build and the current device have the fused gate/up + SwiGLU product (Context::run_glu) for `ggml_type` with

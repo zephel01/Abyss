@@ -354,6 +354,7 @@ struct MoeBufs {
     uint16_t* sh16;
     int *ids, *rank, *counts, *base, *row_tok, *pos, *bounds;
     uint8_t *Xq, *Hq;
+    float *Xs, *Hs;   // (NVFP4 on Blackwell: the FP4 activation rows' scales of Xq / Hq)
 };
 MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     MoeBufs b{};
@@ -371,6 +372,8 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     const size_t W = (size_t) moe_window_rows(T, g);
     b.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) W, g.n_embd));
     b.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) W, g.n_ff_exp));
+    b.Xs = c.take<float>(W + 512);
+    b.Hs = c.take<float>(W + 512);
     // each set's gate/up rows live in its own OUTP rows until the down product, the swiglu over their gate halves
     b.OUTP = c.take<float>(W * g.n_embd);
     b.OUTPc = c.take<float>(W * g.n_embd);
@@ -687,6 +690,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    // NVFP4 experts: the MMQ sets apply their second-level scales (the down one folded into the route weights, the
+    // gate/up one on the product's rows before the SwiGLU); the light kernels, the CPU and the iGPU rows do not take
+    // them (their staged experts all go over PCIe), and the fused SwiGLU product is off for them
     bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false;
     bool v41_eng_tok = false;
     size_t gstride = 0;
@@ -985,16 +991,18 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->w16_elems = w16_elems;
     S->w32_elems = w32_elems;
     S->ws_bytes = ws_bytes;
-    S->gbuf_bytes = gbuf;
+    S->gbuf_bytes = gbuf > 0 ? gbuf + F->nv_guard : 0;   // (NVFP4: a zeroed guard after the staging groups)
     S->NP = pick.second;
     S->pbuf_bytes = (size_t) pick.second * gstride;
     {
         Carve c;
+        c.take<uint8_t>(F->nv_guard);   // (NVFP4: the zeroed guard the last kept slot's over-read lands in)
         c.take<uint8_t>(S->arena_bytes);
         c.take<uint16_t>((size_t) w16_elems);
         c.take<float>((size_t) w32_elems);
         c.take<uint8_t>(ws_bytes);
         c.take<uint8_t>(S->gbuf_bytes);
+        c.take<uint8_t>(F->nv_guard);   // (NVFP4: the prestage slots' guard - before them, so a trimmed buffer keeps it)
         c.take<uint8_t>(S->pbuf_bytes);
         S->borrow_bytes = c.off;
     }
@@ -1217,11 +1225,14 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
 // bytes that layout uses (a short prompt borrows - and evicts - only that much of the pool's tail)
 size_t Glm5Model::prefill_carve(int Tn) {
     PrefillState* S = pf_;
+    FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const size_t T = (size_t) Tn, E = (size_t) g.n_embd;
     S->sub = mixer_sub(T, g, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env);
     const auto [pers, uni] = prefill_bytes_for(T);
     Carve c{S->region};
+    if (F->nv_guard > 0)   // (NVFP4: the region starts with a zeroed guard - the slot before it over-reads into it)
+        cudaMemsetAsync(c.take<uint8_t>(F->nv_guard), 0, F->nv_guard, F->cs);
     S->arena = c.take<uint8_t>(pers + uni);
     S->w16 = c.take<uint16_t>((size_t) S->w16_elems);
     S->w32 = c.take<float>((size_t) S->w32_elems);
@@ -1237,7 +1248,11 @@ size_t Glm5Model::prefill_carve(int Tn) {
         slots = std::min(slots, all);
         S->pbuf_carved = slots * S->gstride;
     }
-    S->pbuf = S->pbuf_carved ? c.take<uint8_t>(S->pbuf_carved) : nullptr;   // (a short prompt: none)
+    S->pbuf = S->pbuf_carved ? c.take<uint8_t>(S->pbuf_carved + F->nv_guard) : nullptr;   // (a short prompt: none)
+    if (F->nv_guard > 0) {   // (NVFP4: the staging slots start zeroed, each region ends in its guard - see kNvGuard)
+        if (S->gbuf) cudaMemsetAsync(S->gbuf, 0, S->gbuf_bytes, F->cs);
+        if (S->pbuf) cudaMemsetAsync(S->pbuf, 0, S->pbuf_carved + F->nv_guard, F->cs);
+    }
     Carve a{S->arena};
     S->R = a.take<float>(T * 4 * E);
     S->x = a.take<float>(T * E);
@@ -1319,12 +1334,13 @@ bool Glm5Model::vision_reclaim(std::string& err) {
     FastState* F = fast_;
     if (F == nullptr || !vis_lent_) return true;
     cudaSetDevice(dev_);
-    if (cudaMalloc(&F->xpool, F->xpool_bytes) != cudaSuccess) {
+    if (cudaMalloc(&F->xpool, F->xpool_bytes + F->nv_guard) != cudaSuccess) {
         cudaGetLastError();
         F->xpool = nullptr;
         err = "the pool's tail is not free yet";
         return false;
     }
+    if (F->nv_guard > 0) cudaMemset(F->xpool, 0, F->xpool_bytes + F->nv_guard);   // (NVFP4: see kNvGuard)
     uint8_t* b = F->xpool;
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
@@ -2536,7 +2552,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const auto cpu_lane = [&](int il) {
         return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
-               !F->L[(size_t) il].exl3;   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
+               !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
+               F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
     const auto cpu_bufs = [&](int cpu_nrows) {
@@ -3213,6 +3230,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (n_light > 0)
             cudaMemcpyAsync(M.bounds + kLightOff, h_light, (size_t) 3 * n_light * sizeof(int), cudaMemcpyHostToDevice, s);
         gb::expert_scatter(M.ids, M.rank, M.base, T * K, K, M.row_tok, M.pos, s);
+        const bool nvl = Ly.nv_scale != nullptr;   // (NVFP4: the down scales into the route weights, once)
+        if (nvl) gb::nv_fold_down(M.rw, M.ids, T * K, Ly.nv_scale, s);
         if (cpu_nrows > 0) {
             if (!cpu_bufs(cpu_nrows)) {
                 err = "glm prefill: the CPU experts' host buffers did not allocate";
@@ -3261,7 +3280,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const char* v = getenv("STRATA_GLM_MMQ_GLU");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff);
+        const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl;
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
         // (the down matrices' over-read past their last row, see zero_tails; 0: n_ff fills MMQ's tiles)
@@ -3279,7 +3298,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 for (int i = i0; i < i1; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
                 if (nrows > 0) {
                     const int o = place(r0 + a, nrows);
-                    mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s);
+                    mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s, M.Xs);
                     // the part's bounds are the set's (from a): the activations and the destination are addressed a
                     // rows back so that bound a is the part's first row
                     float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff <= n_embd: the set's own OUTP rows hold its gate/up
@@ -3297,13 +3316,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gu.max_rows = max_rows;
                     gu.dst = GU - (size_t) a * (2 * nff);
                     gu.ld_dst = 2 * nff;
+                    gu.y_scale = M.Xs - a;
                     if (glu) {
                         S->mq->run_glu(gu, g.swiglu_exp, s);   // (h in each row's first n_ff floats, as below)
                     } else {
                         S->mq->run(gu, s);
+                        if (nvl)   // (NVFP4: the experts' gate/up scales, inside the SiLU)
+                            gb::nv_scale_rows(GU, M.ids, M.pos, T * K, r0 + a, r0 + a + nrows, 2 * nff, 2 * nff,
+                                              Ly.nv_scale, s);
                         gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (in place: no T x K x n_ff buffer)
                     }
-                    mmq::quantize(GU, nullptr, M.Hq, Ly.d_type, nff, 2 * nff, nrows, s);
+                    mmq::quantize(GU, nullptr, M.Hq, Ly.d_type, nff, 2 * nff, nrows, s, M.Hs);
                     if (dn_over > 0 && dn_end + (size_t) dn_over > stride) {
                         static bool said = false;
                         if (!said) std::fprintf(stderr, "glm prefill: a down matrix's MMQ over-read passes its slot (stride %zu)\n", stride);
@@ -3325,6 +3348,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.max_rows = max_rows;
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
+                    dn.y_scale = M.Hs - a;
                     S->mq->run(dn, s);
                 }
                 i0 = i1;

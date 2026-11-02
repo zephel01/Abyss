@@ -2163,6 +2163,32 @@ void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cud
     check("swiglu_rows");
 }
 
+__global__ void nv_fold_down_kernel(float* w, const int* ids, int n, const float* nv) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) w[i] *= nv[2 * ids[i] + 1];
+}
+__global__ void nv_scale_rows_kernel(float* gu, const int* ids, const int* pos, int lo, int hi, int ncols, int ld,
+                                     const float* nv) {
+    const int i = blockIdx.x, r = pos[i];
+    if (r < lo || r >= hi) return;
+    const float sc = nv[2 * ids[i]];
+    float* row = gu + (int64_t) (r - lo) * ld;
+    for (int c = threadIdx.x; c < ncols; c += blockDim.x) row[c] *= sc;
+}
+
+void nv_fold_down(float* w, const int* ids, int n, const float* nv, cudaStream_t s) {
+    if (n <= 0) return;
+    nv_fold_down_kernel<<<nblk(n), 256, 0, s>>>(w, ids, n, nv);
+    check("nv_fold_down");
+}
+
+void nv_scale_rows(float* gu, const int* ids, const int* pos, int n, int lo, int hi, int ncols, int ld, const float* nv,
+                   cudaStream_t s) {
+    if (n <= 0 || hi <= lo) return;
+    nv_scale_rows_kernel<<<(unsigned) n, 256, 0, s>>>(gu, ids, pos, lo, hi, ncols, ld, nv);
+    check("nv_scale_rows");
+}
+
 void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float limit, cudaStream_t s) {
     if (n <= 0) return;
     swiglu_f16_kernel<<<nblk(n), 256, 0, s>>>(gate, up, (__half*) h16, n, limit);

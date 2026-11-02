@@ -213,6 +213,9 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
 
 namespace gf = strata::kernels::glmf;
 
+// the zeroed guard after an NVFP4 model's expert allocations (the prompt MMQ's over-read: two 36-byte blocks; a page)
+inline constexpr size_t kNvGuard = 4096;
+
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
@@ -354,6 +357,10 @@ struct Glm5Model::FastState {
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
         size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        // NVFP4 experts: the second-level scales, [n_expert][2] = (gate = up, down) - device (MoeDev::nv_scale) and
+        // host (the CPU lane); empty for every other type
+        float* nv_scale = nullptr;
+        std::vector<float> nv_host;
         // ---- deepseek4 (dsv4_fast_path.cu): the attention mixer's weights and this layer's caches
         int ratio = 0;                                              // 0 window only, 4 CSA, 128 HCA
         WSlot kv, out_a, out_b, comp_kv, comp_gate, idx_comp_kv, idx_comp_gate, idx_q_b_q;
@@ -552,6 +559,7 @@ struct Glm5Model::FastState {
     // ~42 ms over PCIe, and the next request could only stop the resync between rounds)
     int resync_round_left = 0;
     int resync_layer = 0, resync_at = 0;   // the layer the next round starts at, and this one's (relative to l0_)
+    size_t nv_guard = 0;   // NVFP4 models: the zeroed bytes after each expert allocation (kNvGuard; 0 otherwise)
     bool resync_due = false;   // a helper decode ended: expert_helper_resync has work
     uint64_t resync_n = 0;
     // ---- paced promotions (STRATA_GLM_BG_PACE_KB, default 1024; 0: the boundary issues each whole copy).  The

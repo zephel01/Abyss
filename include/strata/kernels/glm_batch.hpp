@@ -137,6 +137,12 @@ void expert_scatter(const int* ids, const int* rank, const int* base, int n, int
                     cudaStream_t s);
 /// h[r][c] = silu(min(gu[r][c], limit)) * clamp(gu[r][n_ff + c], +-limit), rows of [gate | up].
 void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
+/// NVFP4 experts (nv: [n_expert][2] = gate/up scale, down scale): w[i] *= the down scale of route i's expert (ids[i])
+void nv_fold_down(float* w, const int* ids, int n, const float* nv, cudaStream_t s);
+/// NVFP4 experts: the sorted rows [lo, hi) of gu (row r at gu + (r - lo) * ld, its first ncols values) times their
+/// expert's gate/up scale - route i (expert ids[i]) is sorted row pos[i]
+void nv_scale_rows(float* gu, const int* ids, const int* pos, int n, int lo, int hi, int ncols, int ld, const float* nv,
+                   cudaStream_t s);
 // (ld_h: h's row stride, n_ff when 0; h = gu with ld_h = 2 n_ff writes each row's result over its gate half)
 /// The same from separate gate/up arrays, FP16 out.
 void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float limit, cudaStream_t s);

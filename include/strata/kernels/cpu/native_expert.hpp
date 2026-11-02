@@ -55,7 +55,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// qwen4exp's plain path) - the same semantics as the device grouped path, so the two agree.
 void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
                           const void* const* act, int nt, float* const* ff, int r0, int r1,
-                          float swiglu_limit = std::numeric_limits<float>::infinity());
+                          float swiglu_limit = std::numeric_limits<float>::infinity(), float scale = 1.0f);
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
                             int nt, float* const* out, int r0, int r1);
 /// Whether the split variants take the multi-token kernels for this weight type here (the CPU has

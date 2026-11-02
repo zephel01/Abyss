@@ -312,7 +312,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
         std::vector<gf::MoeColArgs> ca((size_t) TM);
         for (int t = 0; t < TM; ++t) {
             const gf::MoeDev& m = V->md[(size_t) t];
-            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part};
+            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part, m.plan_id};
         }
         ok = cudaMalloc((void**) &V->cols_d, ca.size() * sizeof(gf::MoeColArgs)) == cudaSuccess &&
              cudaMemcpy(V->cols_d, ca.data(), ca.size() * sizeof(gf::MoeColArgs), cudaMemcpyHostToDevice) == cudaSuccess;
@@ -733,7 +733,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         return false;
     }
     for (int t = tb; t < tb + T; ++t) {
-        const gf::MoeDev& md = V->md[(size_t) t];
+        gf::MoeDev md = V->md[(size_t) t];
+        md.nv_scale = Ly.nv_scale;   // (NVFP4 experts; null otherwise)
         float* sh_out = V->sh_out + (size_t) t * E;
         void* hq = (uint8_t*) V->hq + (size_t) t * V->hq_n;
         if (wait_fetch && !F->prof_on) {   // (one launch: gf::moe_wait_fetch, as fast_moe; streamed as its)
@@ -765,15 +766,17 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         void* hq = (uint8_t*) V->hq + (size_t) tb * V->hq_n;
         gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, g.swiglu_exp,
                              (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
-                             (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s);
+                             (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s, Ly.nv_scale);
         if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, T, E, s);
         if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (the shared expert's gate a column)
             q35::scale_sigmoid_rows(sh_out, T, E, V->q35_shg + tb, s);
         gf::moe_down_cols(Ly.d_type, V->cols_d + tb, T, k, E, g.n_ff_exp, Ly.down_off, hq, V->hq_n,
-                          Ly.sh_down.q != nullptr ? sh_out : nullptr, chk ? V->ffn_chk : V->ffn + (size_t) tb * E, E, s);
+                          Ly.sh_down.q != nullptr ? sh_out : nullptr, chk ? V->ffn_chk : V->ffn + (size_t) tb * E, E, s,
+                          Ly.nv_scale);
         if (chk) {   // the same inputs through a launch a column into V->ffn, then the rows compared
             for (int t = tb; t < tb + T; ++t) {
-                const gf::MoeDev& md = V->md[(size_t) t];
+                gf::MoeDev md = V->md[(size_t) t];
+        md.nv_scale = Ly.nv_scale;   // (NVFP4 experts; null otherwise)
                 float* sh_o = V->sh_out + (size_t) t * E;
                 void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
                 gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,

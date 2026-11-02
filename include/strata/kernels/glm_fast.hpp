@@ -224,6 +224,9 @@ struct MoeDev {
     // STRATA_GLM_EXPERT_HELPER_PROMOTE (#24): a helper-owned expert whose route count reached this is fetched into a
     // free spare (promoted into VRAM) instead of going to the helper, at most one a route; 0 = never (helper only)
     unsigned int helper_promote = 0;
+    // NVFP4 experts: this layer's second-level scales, [n_expert][2] = (gate = up, down), read by moe_gate_up /
+    // moe_down through plan_id (MoeColArgs::plan_id for a window's columns); null for every other type
+    const float* nv_scale = nullptr;
 };
 /// The host's answers to routes - the CPU LANE's (CpuAnswer) and the disk misses' (MoeResponse, with its pinned
 /// staging): kCpuAnswers of each, the route `seq`'s at index seq % kCpuAnswers - a verify window has several routes
@@ -337,6 +340,7 @@ struct MoeColArgs {
     const float* plan_w = nullptr;
     const int* cpu_flag = nullptr;
     const float* cpu_part = nullptr;
+    const int* plan_id = nullptr;   // (NVFP4: the experts' ids, for MoeDev::nv_scale)
 };
 /// moe_gate_up / moe_down for nc columns in one grid (cols: nc entries in device memory): column c's xq at
 /// xq + c * xq_cs bytes, hq + c * hq_cs bytes, sh_hq + c * sh_hq_cs bytes, sh_out / out + c * out_cs floats - the
@@ -344,9 +348,9 @@ struct MoeColArgs {
 /// half idle (83 us a launch against 76 for 8 experts).
 void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, float limit,
                       const void* xq, size_t xq_cs, void* hq, size_t hq_cs, const void* sh_down, int sh_type,
-                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s);
+                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s, const float* nv_scale = nullptr);
 void moe_down_cols(int d_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, size_t down_off,
-                   const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s);
+                   const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s, const float* nv_scale = nullptr);
 
 /// The prompt path's LIGHTLY routed experts (a few rows each - MMQ's 64-128-token tiles would be mostly empty):
 /// light[3 i .. 3 i + 2] = {slot, r0, nr} (device): expert i is the blob at base + slot * stride, its rows are

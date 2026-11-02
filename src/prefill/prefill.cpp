@@ -48,7 +48,7 @@ bool built() { return false; }
 bool supported(int) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
-void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
+void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*) {}
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}

@@ -97,6 +97,7 @@ bool supported(int t) {
         case GGML_TYPE_IQ1_S:  // GLM-5.3-Flash's IQ1_S experts
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
         case GGML_TYPE_MXFP4:  // deepseek4's FP4 expert rows
+        case GGML_TYPE_NVFP4:  // NVIDIA's FP4 checkpoints (the per-expert scale_2 is applied by the caller)
             return true;   // (the Maya quants' candidates, docs/maya/QUANT-PLAN.md; IQ1_M has no MMQ)
         default:
             return false;
@@ -113,15 +114,22 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 size_t q8_block_bytes() { return sizeof(block_q8_1_mmq); }
 
-void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
+              float* scale) {
     if (rows <= 0) return;
     // MXFP4 on Blackwell: the MMQ kernel multiplies natively in FP4 and reads its activations in llama.cpp's
     // block_fp4_mmq form (ggml_cuda_mul_mat_q's use_native_fp4) - smaller than the q8_1 form q8_bytes sizes for
-    if ((ggml_type) t == GGML_TYPE_MXFP4) {
+    // (NVFP4 the same, with its activations' per-row scale in `scale`)
+    if ((ggml_type) t == GGML_TYPE_MXFP4 || (ggml_type) t == GGML_TYPE_NVFP4) {
         int dev = 0;
         cudaGetDevice(&dev);
         if (blackwell_mma_available(ggml_cuda_info().devices[dev].cc)) {
-            quantize_mmq_fp4_cuda(x, ids, xq, nullptr, GGML_TYPE_MXFP4, false, cols, ld, rows * ld, rows * ld,
+            if ((ggml_type) t == GGML_TYPE_NVFP4 && scale == nullptr) {
+                std::fprintf(stderr, "prefill mmq: NVFP4 activations need a scale buffer\n");
+                std::exit(1);
+            }
+            quantize_mmq_fp4_cuda(x, ids, xq, (ggml_type) t == GGML_TYPE_NVFP4 ? scale : nullptr, (ggml_type) t, false,
+                                  cols, ld, rows * ld, rows * ld,
                                   pad512(cols), rows, 1, 1, (cudaStream_t) stream);
             ck(cudaGetLastError(), "quantize fp4");
             return;
@@ -159,6 +167,7 @@ void dispatch(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s)
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
         case GGML_TYPE_MXFP4: mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s); break;
+        case GGML_TYPE_NVFP4: mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s); break;
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) a.type_x);
             std::exit(1);
@@ -172,7 +181,7 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,

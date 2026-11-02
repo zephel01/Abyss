@@ -907,6 +907,37 @@ template<> __device__ __forceinline__ float dw<39>(const uint8_t* row, int kbx, 
 template<> struct F<39> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_mxfp4);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
         return dw<39>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
+// NVFP4 (NVIDIA's FP4 checkpoints, e.g. magnitudedev's Qwen3.8-Flash-Next NVFP4): 64 values a block in four
+// sub-blocks of 16, each with a UE4M3 scale (x0.5: the E2M1 table is doubled as MXFP4's), then the 4-bit codes - sub
+// s's 16 values are the low nibbles of qs[8s .. 8s+7] (values 0-7) and their high nibbles (8-15).  A call covers half
+// a block (32 values: two sub-blocks) against one q8_1 block.  The tensor's second-level scale (per expert) is not
+// here: moe_gate_up / moe_down apply it (MoeDev::nv_scale)
+__device__ __forceinline__ float ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    const float v = e == 0 ? (float) m * (1.0f / 512.0f) : __uint_as_float((uint32_t) (e + 120) << 23 | (uint32_t) m << 20);
+    return 0.5f * v;
+}
+template<> __device__ __forceinline__ float dw<40>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t*) {
+    const uint8_t* b = row + (size_t) kbx * 36;   // [4 UE4M3 scales | 32 bytes of codes]
+    float acc = 0.0f;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int sb = 2 * iqs + h;
+        const uint8_t* q = b + 4 + 8 * sb;
+        const int2 v0 = get_int_from_table_16(get_int_b1(q, 0), kvalues_mxfp4);
+        const int2 v1 = get_int_from_table_16(get_int_b1(q, 1), kvalues_mxfp4);
+        int sumi = __dp4a(v0.x, x.u[4 * h + 0], 0);
+        sumi = __dp4a(v1.x, x.u[4 * h + 1], sumi);
+        sumi = __dp4a(v0.y, x.u[4 * h + 2], sumi);
+        sumi = __dp4a(v1.y, x.u[4 * h + 3], sumi);
+        acc += ue4m3_to_fp32(b[sb]) * (float) sumi;
+    }
+    return x.d * acc;
+}
+template<> struct F<40> { static constexpr int qk = 64, ipb = 2, step = 1, bytes = 36;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {
+        return dw<40>((const uint8_t*) v, kbx, iqs, load_xv(y + iqs), nullptr); } };
 // IQ4_NL (qwen4exp's down experts, orcarouter's Qwen3.8): 32 values a block, an FP16 scale and the iq4nl table -
 // vecdotq's vec_dot_iq4_nl_q8_1 over the whole block (as MXFP4 above, without its x0.5)
 template<> __device__ __forceinline__ float dw<20>(const uint8_t* row, int kbx, int, const XV& x, const uint32_t*) {
@@ -3375,9 +3406,11 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     // a window's columns in one grid (moe_gate_up_cols): column blockIdx.z's plan and buffers
     const unsigned long long* plan_ptr = d.plan_ptr;
+    const int* plan_id = d.plan_id;
     if (ca != nullptr) {
         const int col = blockIdx.z;
         plan_ptr = ca[col].plan_ptr;
+        plan_id = ca[col].plan_id;
         xq = (const block_q8_1*) ((const uint8_t*) xq + (size_t) col * xq_cs);
         hq = (block_q8_1*) ((uint8_t*) hq + (size_t) col * hq_cs);
         if (sh_hq != nullptr) sh_hq = (const block_q8_1*) ((const uint8_t*) sh_hq + (size_t) col * shq_cs);
@@ -3436,8 +3469,12 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
     __syncthreads();
     if (warp == 0) {
-        const float g = fminf(sg[lane], limit);
-        const float u = fminf(fmaxf(su[lane], -limit), limit);
+        // NVFP4: the expert's second-level scale (gate and up share it in NVIDIA's checkpoints; [2 * id] = theirs)
+        float sc = 1.0f;
+        if constexpr (TG == 40)
+            if (d.nv_scale != nullptr && plan_id != nullptr && plan_id[ei] >= 0) sc = d.nv_scale[2 * plan_id[ei]];
+        const float g = fminf(sc * sg[lane], limit);
+        const float u = fminf(fmaxf(sc * su[lane], -limit), limit);
         q8_1_store_warp((g / (1.0f + expf(-g))) * u, hq + (size_t) ei * (n_ff / 32) + chunk, lane);
     }
 }
@@ -3474,12 +3511,14 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     // a window's columns in one grid (moe_down_cols): column blockIdx.z's plan, CPU-lane part and buffers
     const unsigned long long* plan_ptr = d.plan_ptr;
     const float* plan_w = d.plan_w;
+    const int* plan_id = d.plan_id;
     const int* cpu_flag = d.cpu_flag;
     const float* cpu_part = d.cpu_part;
     if (ca != nullptr) {
         const MoeColArgs& c = ca[blockIdx.z];
         plan_ptr = c.plan_ptr;
         plan_w = c.plan_w;
+        plan_id = c.plan_id;
         cpu_flag = c.cpu_flag;
         cpu_part = c.cpu_part;
         hq = (const block_q8_1*) ((const uint8_t*) hq + (size_t) blockIdx.z * hq_cs);
@@ -3488,7 +3527,12 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     }
     if (threadIdx.x < kMaxK) {
         s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
-        s_w[threadIdx.x] = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
+        float w = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
+        // NVFP4: the expert's down scale_2 ([2 * id + 1]) folds into its weight (the down sum is linear)
+        if constexpr (TD == 40)
+            if ((int) threadIdx.x < k && d.nv_scale != nullptr && plan_id != nullptr && plan_id[threadIdx.x] >= 0)
+                w *= d.nv_scale[2 * plan_id[threadIdx.x] + 1];
+        s_w[threadIdx.x] = w;
     }
     __syncthreads();
     const int lane = threadIdx.x & 31;
@@ -4005,7 +4049,7 @@ bool mv_supported(int type) { return mv_type_ok(type) != 0; }
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
     return type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
            type == 18 || type == 19 || type == 20 || type == 21 || type == 22 || type == 23 || type == 29 || type == 39 ||
-           type == 7 || type == 8 || type == 42;   // (Qwen3.8 GGUFs: unsloth's Q5_1 / Q8_0, ISTA's Q2_0 down experts)
+           type == 7 || type == 8 || type == 42 || type == 40;   // (40: NVFP4, its scale_2 in MoeDev::nv_scale)   // (Qwen3.8 GGUFs: unsloth's Q5_1 / Q8_0, ISTA's Q2_0 down experts)
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
@@ -4037,6 +4081,7 @@ size_t row_bytes(int type, int64_t n_in) {
         case 21: return (size_t) (n_in / 256) * sizeof(block_iq3_s);
         case 29: return (size_t) (n_in / 256) * sizeof(block_iq1_m);
         case 39: return (size_t) (n_in / 32) * sizeof(block_mxfp4);
+        case 40: return (size_t) (n_in / 64) * 36;
         case 20: return (size_t) (n_in / 32) * sizeof(block_iq4_nl);
         case 7: return (size_t) (n_in / 32) * sizeof(block_q5_1);
         case 42: return (size_t) (n_in / 64) * sizeof(block_q2_0);
@@ -4789,7 +4834,7 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
                                                                      n_ff_sh, sh_out, mc.ca, mc.xq_cs, mc.hq_cs,      \
                                                                      mc.shq_cs, mc.out_cs); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
-        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39) GLMF_GU(20) GLMF_GU(7) GLMF_GU(8) GLMF_GU(42)
+        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39) GLMF_GU(20) GLMF_GU(7) GLMF_GU(8) GLMF_GU(42) GLMF_GU(40)
 #undef GLMF_GU
         default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
     }
@@ -4804,7 +4849,8 @@ void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, floa
 
 void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, float limit,
                       const void* xq, size_t xq_cs, void* hq, size_t hq_cs, const void* sh_down, int sh_type,
-                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s) {
+                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s,
+                      const float* nv_scale) {
     MoeCols mc;
     mc.ca = cols;
     mc.nc = nc;
@@ -4812,7 +4858,9 @@ void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_
     mc.hq_cs = hq_cs;
     mc.shq_cs = sh_hq_cs;
     mc.out_cs = out_cs;
-    gate_up_impl(gu_type, MoeDev{}, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
+    MoeDev d{};
+    d.nv_scale = nv_scale;   // (NVFP4: the layer's scales, read through each column's plan_id)
+    gate_up_impl(gu_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
 }
 
 #if defined(STRATA_USE_HIP)
@@ -4934,7 +4982,7 @@ void down_impl(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t 
         case T: moe_down_kernel<T><<<grid, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out, mc.ca, mc.hq_cs, \
                                                          mc.out_cs); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
-        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39) GLMF_DN(20) GLMF_DN(7) GLMF_DN(8) GLMF_DN(42)
+        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39) GLMF_DN(20) GLMF_DN(7) GLMF_DN(8) GLMF_DN(42) GLMF_DN(40)
 #undef GLMF_DN
         default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
     }
@@ -4948,13 +4996,16 @@ void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t d
 }
 
 void moe_down_cols(int d_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, size_t down_off,
-                   const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s) {
+                   const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s,
+                   const float* nv_scale) {
     MoeCols mc;
     mc.ca = cols;
     mc.nc = nc;
     mc.hq_cs = hq_cs;
     mc.out_cs = out_cs;
-    down_impl(d_type, MoeDev{}, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc);
+    MoeDev d{};
+    d.nv_scale = nv_scale;
+    down_impl(d_type, d, k, n_embd, n_ff, down_off, hq, sh_out, out, s, mc);
 }
 
 namespace {

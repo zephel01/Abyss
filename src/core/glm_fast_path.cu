@@ -722,6 +722,35 @@ bool Glm5Model::fast_setup(std::string& err) {
                     gf::row_bytes(Ly.gu_type, g.n_embd) != nl.fmt.gu_row ||
                     gf::row_bytes(Ly.d_type, g.n_ff_exp) != nl.fmt.d_row)
                     missing += P + "expert types " + std::to_string(Ly.gu_type) + "/" + std::to_string(Ly.d_type) + " ";
+                // NVFP4 (type 40): the tensors' second-level scales (F32 [n_expert] each, ffn_*_exps.scale); gate and
+                // up must share theirs (NVIDIA's checkpoints do: one scale for the fused gate_up) - it sits inside
+                // the SiLU, so the kernels take one number for both
+                if (Ly.gu_type == 40 || Ly.d_type == 40) {
+                    F->nv_guard = kNvGuard;   // (set here, before the prompt path and the pool size their buffers)
+                    const float* sg = f32("ffn_gate_exps.scale");
+                    const float* su = f32("ffn_up_exps.scale");
+                    const float* sd = f32("ffn_down_exps.scale");
+                    if (sg != nullptr && su != nullptr && sd != nullptr) {
+                        const int NE = g.n_expert;
+                        std::vector<float> hg((size_t) NE), hu((size_t) NE), hd((size_t) NE);
+                        cudaMemcpy(hg.data(), sg, (size_t) NE * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(hu.data(), su, (size_t) NE * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(hd.data(), sd, (size_t) NE * 4, cudaMemcpyDeviceToHost);
+                        if (hg != hu) {
+                            missing += P + "NVFP4 gate/up scales differ (one SiLU-side scale per expert is supported) ";
+                        } else {
+                            Ly.nv_host.assign((size_t) 2 * NE, 1.0f);
+                            for (int e = 0; e < NE; ++e) {
+                                if (Ly.gu_type == 40) Ly.nv_host[(size_t) 2 * e] = hg[(size_t) e];
+                                if (Ly.d_type == 40) Ly.nv_host[(size_t) 2 * e + 1] = hd[(size_t) e];
+                            }
+                            if (cudaMalloc(&Ly.nv_scale, (size_t) 2 * NE * 4) != cudaSuccess ||
+                                cudaMemcpy(Ly.nv_scale, Ly.nv_host.data(), (size_t) 2 * NE * 4, cudaMemcpyHostToDevice) !=
+                                    cudaSuccess)
+                                missing += P + "NVFP4 scales (device) ";
+                        }
+                    }
+                }
             }
         } else {
             Ly.ffn_gate = q("ffn_gate.weight");
@@ -1203,7 +1232,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<uint8_t*> segs;
         std::vector<int> seg_of((size_t) NL, 0);
         const size_t main_bytes = tot - xtot;
-        if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes) == cudaSuccess) {
+        // NVFP4 experts: the prompt path's MMQ reads a down matrix's rows in 256-value steps, so n_ff = 640 reads two
+        // blocks past each expert's last row - into the next slot, or past the allocation.  llama.cpp zero-pads its
+        // tensors; here every slot starts zeroed and each allocation ends in a zeroed guard (FP4 scale bytes 0x7F /
+        // 0xFF are NaN in the tensor cores, and NaN x 0 is NaN)
+        const size_t guard = F->nv_guard;   // (set where the layers' expert types are read)
+        const bool nvm = guard > 0;
+        if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes + guard) == cudaSuccess) {
+            if (nvm) cudaMemset(one, 0, main_bytes + guard);
             segs.push_back(one);
         } else {
             cudaGetLastError();
@@ -1222,12 +1258,13 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 for (size_t sz : sizes) {
                     uint8_t* p = nullptr;
-                    if (cudaMalloc(&p, sz) != cudaSuccess) {
+                    if (cudaMalloc(&p, sz + guard) != cudaSuccess) {
                         cudaGetLastError();
                         for (uint8_t* q : segs) cudaFree(q);
                         segs.clear();
                         break;
                     }
+                    if (nvm) cudaMemset(p, 0, sz + guard);
                     segs.push_back(p);
                 }
             }
@@ -1235,11 +1272,12 @@ bool Glm5Model::fast_setup(std::string& err) {
                 std::fprintf(stderr, "glm fast: CUDA%d one allocation of %.2f GB did not allocate: the expert pool is in "
                                      "%zu\n", dev_, (double) main_bytes / 1073741824.0, segs.size());
         }
-        if (segs.empty() || (xtot > 0 && cudaMalloc(&F->xpool, xtot) != cudaSuccess)) {
+        if (segs.empty() || (xtot > 0 && cudaMalloc(&F->xpool, xtot + guard) != cudaSuccess)) {
             for (uint8_t* q : segs) cudaFree(q);
             err = "glm fast: the expert pool (" + std::to_string(tot >> 20) + " MB) did not allocate";
             return false;
         }
+        if (nvm && xtot > 0) cudaMemset(F->xpool, 0, xtot + guard);
         F->pool = segs[0];
         F->pool_more.assign(segs.begin() + 1, segs.end());
         F->pool_bytes = tot;
@@ -2098,7 +2136,7 @@ void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, co
 }  // namespace
 
 void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
-                                 const void* xq) {
+                                 const void* xq, const float* gs) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
@@ -2165,7 +2203,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     }
     // the iGPU lane: the same sum from the registered RAM tier (an EXL3 layer through abyss_igpu_experts_x3, when the
     // library has it - else the CPU threads below)
-    if (F->igpu_experts != nullptr && (!Ly.exl3 || F->igpu_x3 != nullptr)) {
+    if (F->igpu_experts != nullptr && (!Ly.exl3 || F->igpu_x3 != nullptr) && Ly.nv_host.empty()) {   // (NVFP4: CPU)
         const auto ti = std::chrono::steady_clock::now();
         int rc;
         if (Ly.exl3) {
@@ -2227,7 +2265,8 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
             float* o[1] = {F->cpu_ff.data() + (size_t) i * n_ff};
-            kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+            kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp,
+                                     gs != nullptr ? gs[i] : 1.0f);
             q += r1 - r0;
         }
     });
@@ -2298,7 +2337,8 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
 // column) product is the one-column call's bit for bit (the multi-token rows are ggml's dot per token, like the
 // one-token rows), and so is each sum.  An EXL3 layer or the iGPU lane: one call a column
 void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
-                                       const float* const* x, float* const* out, const void* const* xq) {
+                                       const float* const* x, float* const* out, const void* const* xq,
+                                       const float* gs) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
@@ -2310,7 +2350,8 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
         ref.resize((size_t) n_embd);
         static uint64_t cols = 0, bad = 0;
         for (int t = 0; t < n; ++t) {
-            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], ref.data(), xq ? xq[t] : nullptr);
+            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], ref.data(), xq ? xq[t] : nullptr,
+                             gs ? gs + gf::kMaxK * t : nullptr);
             ++cols;
             if (std::memcmp(ref.data(), out[t], (size_t) n_embd * sizeof(float)) != 0) ++bad;
         }
@@ -2320,7 +2361,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     };
     // the iGPU lane's columns call (abyss_igpu_experts_cols): the window's columns in one call; 1 (busy, a blob it
     // cannot see, ...): a call a column below; < 0: the lane is gone, the CPU takes over as fast_cpu_experts does
-    if (n >= 2 && !Ly.exl3 && F->igpu_experts != nullptr && F->igpu_cols != nullptr && n <= kVerifyMax) {
+    if (n >= 2 && !Ly.exl3 && F->igpu_experts != nullptr && F->igpu_cols != nullptr && n <= kVerifyMax && gs == nullptr) {
         const int rc = F->igpu_cols(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, n, ne,
                                     (const void* const*) blob, w, x, xq, out);
         if (rc == 0) {
@@ -2338,7 +2379,8 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     }
     if (n <= 1 || Ly.exl3 || F->igpu_experts != nullptr) {
         for (int t = 0; t < n; ++t)
-            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t], xq ? xq[t] : nullptr);
+            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t], xq ? xq[t] : nullptr,
+                             gs ? gs + gf::kMaxK * t : nullptr);
         return;
     }
     namespace kc = strata::kernels::cpu;
@@ -2347,6 +2389,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     // the union: expert u's blob, its columns, the (expert, column) pair each of them is; pair p's buffers at p
     int nu = 0, np = 0;
     const uint8_t* ub[kPairs];
+    float ugs[kPairs];
     int ucnt[kPairs], ucol[kPairs][kCols], upair[kPairs][kCols], pair_of[kCols][gf::kMaxK];
     for (int t = 0; t < n; ++t)
         for (int i = 0; i < ne[t]; ++i) {
@@ -2355,6 +2398,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             while (u < nu && ub[u] != b) ++u;
             if (u == nu) {
                 ub[nu] = b;
+                ugs[nu] = gs != nullptr ? gs[gf::kMaxK * t + i] : 1.0f;
                 ucnt[nu++] = 0;
             }
             ucol[u][ucnt[u]] = t;
@@ -2387,7 +2431,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
                 a[k] = act + (size_t) ucol[u][k] * kc::kNativeActBytes;
                 o[k] = F->cpu_ff_m.data() + (size_t) upair[u][k] * n_ff;
             }
-            kc::native_gu_rows_split(nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp);
+            kc::native_gu_rows_split(nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp, ugs[u]);
             q += r1 - r0;
         }
     });
@@ -2625,6 +2669,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             cal_all.push_back(R.base + (size_t) s * R.stride);
     if (cal_all.empty()) return true;   // nothing in RAM: the lane would never run
     const uint8_t* cal = cal_all[0];
+    int cal_id = 0;   // (its expert id: an NVFP4 layer's check applies that expert's scales)
+    for (int s = 0; s < R.n; ++s)
+        if (R.base + (size_t) s * R.stride == cal) cal_id = R.key[(size_t) s] % g.n_expert;
     const int n_cal = (int) std::min<size_t>(4, cal_all.size());
     const int n_sets = (int) cal_all.size() / n_cal;   // (fewer than 64 held: the sets repeat sooner)
     auto cal_set = [&](int i) { return cal_all.data() + (size_t) (i % n_sets) * n_cal; };
@@ -3033,15 +3080,21 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaMemcpyAsync(F->scratch, cal, blob, cudaMemcpyHostToDevice, F->cs);
         const unsigned long long sp = (unsigned long long) F->scratch;
         const float one = 1.0f;
+        // NVFP4: the expert's own scales (gate = up inside the SiLU, down on the sum), as a decode applies them
+        const bool nv = !Ly.nv_host.empty();
+        const float sgu = nv ? Ly.nv_host[(size_t) 2 * cal_id] : 1.0f, sdn = nv ? Ly.nv_host[(size_t) 2 * cal_id + 1] : 1.0f;
         cudaMemcpyAsync(F->md.plan_ptr, &sp, 8, cudaMemcpyHostToDevice, F->cs);
         cudaMemcpyAsync(F->md.plan_w, &one, 4, cudaMemcpyHostToDevice, F->cs);
+        cudaMemcpyAsync(F->md.plan_id, &cal_id, 4, cudaMemcpyHostToDevice, F->cs);
         cudaMemsetAsync(F->md.cpu_flag, 0, 4, F->cs);
-        gf::moe_gate_up(Ly.gu_type, F->md, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr, F->cs);
-        gf::moe_down(Ly.d_type, F->md, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
+        gf::MoeDev mdc = F->md;
+        mdc.nv_scale = Ly.nv_scale;
+        gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr, F->cs);
+        gf::moe_down(Ly.d_type, mdc, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
         cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
         cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
         cudaStreamSynchronize(F->cs);
-        fast_cpu_experts(il_cal, 1, &cal, &one, xc.data(), oc.data());
+        fast_cpu_experts(il_cal, 1, &cal, &sdn, xc.data(), oc.data(), nullptr, nv ? &sgu : nullptr);
         // the reference: rows dequantised by ggml, dots in double
         const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
         const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
@@ -3053,6 +3106,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             for (int i = 0; i < E; ++i) gs += (double) row[(size_t) i] * xc[(size_t) i];
             tg->to_float(cal + Ly.gu_bytes + (size_t) r * nf.gu_row, row.data(), E);
             for (int i = 0; i < E; ++i) us += (double) row[(size_t) i] * xc[(size_t) i];
+            gs *= sgu;
+            us *= sgu;
             const double lim = g.swiglu_exp;
             gs = std::min(gs, lim);
             us = std::min(std::max(us, -lim), lim);
@@ -3062,7 +3117,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             double s = 0.0;
             td->to_float(cal + Ly.down_off + (size_t) r * nf.d_row, row.data(), FFE);
             for (int j = 0; j < FFE; ++j) s += (double) row[(size_t) j] * hr[(size_t) j];
-            orf[(size_t) r] = s;
+            orf[(size_t) r] = s * sdn;
         }
         double nr = 0, eg = 0, ec = 0, egc = 0;
         for (int r = 0; r < E; ++r) {
@@ -3774,7 +3829,8 @@ void Glm5Model::fast_service() {
         const auto t0 = std::chrono::steady_clock::now();
         int ne[kVerifyMax];
         const uint8_t* blob[gf::kMaxK * kVerifyMax];
-        float w[gf::kMaxK * kVerifyMax];
+        float w[gf::kMaxK * kVerifyMax], gsv[gf::kMaxK * kVerifyMax];
+        const float* nv = F->L[(size_t) wq_layer].nv_host.empty() ? nullptr : F->L[(size_t) wq_layer].nv_host.data();
         const float* x[kVerifyMax];
         const void* xqv[kVerifyMax];
         float* out[kVerifyMax];
@@ -3788,6 +3844,11 @@ void Glm5Model::fast_service() {
             for (int i = 0; i < gf::kMaxK; ++i) {
                 blob[gf::kMaxK * t + i] = i < wq[t].ne ? wq[t].blob[i] : nullptr;
                 w[gf::kMaxK * t + i] = i < wq[t].ne ? wq[t].w[i] : 0.0f;
+                gsv[gf::kMaxK * t + i] = 1.0f;
+                if (nv != nullptr && i < wq[t].ne) {   // NVFP4: the gate/up scale for the SiLU, the down one into w
+                    gsv[gf::kMaxK * t + i] = nv[(size_t) 2 * wq[t].id[i]];
+                    w[gf::kMaxK * t + i] *= nv[(size_t) 2 * wq[t].id[i] + 1];
+                }
             }
             x[t] = wq[t].x;
             out[t] = (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->part;
@@ -3796,7 +3857,7 @@ void Glm5Model::fast_service() {
         // time; any helper failure recomputes the whole window on the CPU (a partial answer is never published)
         auto* H = F->expert_helper.get();
         bool done = false;
-        if (H && H->active && !H->failed && wq_n <= GlmExpertHelper::kCols) {
+        if (H && H->active && !H->failed && wq_n <= GlmExpertHelper::kCols && nv == nullptr) {   // (NVFP4: not yet)
             int hne[kVerifyMax], hid[gf::kMaxK * kVerifyMax], cne[kVerifyMax], cmap[kVerifyMax], nc = 0, hn_all = 0;
             float hw[gf::kMaxK * kVerifyMax], cw[gf::kMaxK * kVerifyMax];
             const uint8_t* cb[gf::kMaxK * kVerifyMax];
@@ -3933,7 +3994,8 @@ void Glm5Model::fast_service() {
                 }
             }
         }
-        if (!done) fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr);
+        if (!done) fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr,
+                                          nv != nullptr ? gsv : nullptr);
         const auto t1 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
         for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->seq = wq[t].seq;
@@ -4136,8 +4198,8 @@ void Glm5Model::fast_service() {
             // to wait for the reads, ~3 ms, and the device then for the lane after the last chunk); collected below
             const auto lane_start = [&] {
                 if (lane_started || rq->cpu_mask == 0u || F->cpu_ans_h == nullptr || F->igpu_start == nullptr ||
-                    F->igpu_experts == nullptr || F->L[(size_t) il].exl3)
-                    return;
+                    F->igpu_experts == nullptr || F->L[(size_t) il].exl3 || !F->L[(size_t) il].nv_host.empty())
+                    return;   // (NVFP4 layers: the CPU threads, which apply the expert scales)
                 const auto& Ly = F->L[(size_t) il];
                 const void* bl[gf::kMaxK];
                 float wl[gf::kMaxK];
@@ -4420,11 +4482,15 @@ void Glm5Model::fast_service() {
             const unsigned int cm = rq->cpu_mask;
             int ne = 0;
             const uint8_t* blob[gf::kMaxK];
-            float w[gf::kMaxK];
+            float w[gf::kMaxK], gsv1[gf::kMaxK];
+            // NVFP4: each expert's gate/up scale for the SiLU, its down scale folded into its weight
+            const auto& nvh = F->L[(size_t) rq->layer].nv_host;
+            const float* gs1 = nvh.empty() ? nullptr : gsv1;
             for (int i = 0; i < g.n_exp_used; ++i)
                 if ((cm >> i) & 1u) {
                     blob[ne] = (const uint8_t*) rq->cpu_src[i];
-                    w[ne++] = rq->w[i];
+                    gsv1[ne] = nvh.empty() ? 1.0f : nvh[(size_t) 2 * rq->ids[i]];
+                    w[ne++] = rq->w[i] * (nvh.empty() ? 1.0f : nvh[(size_t) 2 * rq->ids[i] + 1]);
                 }
             gf::CpuAnswer* ans = F->cpu_ans_h + (next % gf::kCpuAnswers);
             int rc = 1;
@@ -4443,8 +4509,9 @@ void Glm5Model::fast_service() {
             }
             if (rc != 0) {
                 auto* H = F->expert_helper.get();
-                if (!H || !H->active || H->failed) {
-                    fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr);
+                if (!H || !H->active || H->failed || gs1 != nullptr) {   // (NVFP4: not on the helper yet)
+                    fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr,
+                                     gs1);
                 } else {
                     int hn = 0, cn = 0, hi[8];
                     float hw[8], cw[8];
@@ -5653,6 +5720,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // the prefetch list of THIS route lives in the buffer of this layer's parity (the side stream may still
     // read the previous layer's list while this route writes)
     gf::MoeDev md = F->md;
+    md.nv_scale = Ly.nv_scale;   // (NVFP4 experts; null otherwise)
     if (F->expert_helper && F->expert_helper->active && !F->expert_helper->failed) {
         md.helper_owned = F->expert_helper->owned_d;
         md.helper_promote = expert_helper_promote();
