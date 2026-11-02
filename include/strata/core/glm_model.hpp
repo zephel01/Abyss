@@ -194,6 +194,8 @@ public:
     // Decode-only optional expert tier; unsupported or failed helpers leave the CPU lane in charge.
     void expert_helper_decode_begin(bool speculative);
     void expert_helper_decode_end();
+    // STRATA_GLM_EXPERT_HELPER_RESYNC (#24): the promotions a helper decode held back, run after DONE (not on the clock)
+    void expert_helper_resync();
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);
     /// Conversation reuse (the fast path): save the sequence state at the current position - the recurrent KDA

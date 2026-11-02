@@ -2492,6 +2492,7 @@ static int glm_pack_generate(const Options& o) {
         std::fflush(stdout);
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
+        model.expert_helper_resync();   // (#24, STRATA_GLM_EXPERT_HELPER_RESYNC; after DONE, off the request's clock)
         if (model.fast() && produced > 0) {
             const double n = (double) produced;
             std::fprintf(stderr,

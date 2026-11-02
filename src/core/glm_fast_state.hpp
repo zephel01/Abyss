@@ -545,6 +545,11 @@ struct Glm5Model::FastState {
     };
     std::vector<BgMove> bg;
     bool bg_hold = false;   // lend_tail: no new moves while the pool's tail is lent
+    // STRATA_GLM_EXPERT_HELPER_RESYNC (#24): promotions still owed after a helper decode (fast_boundary's step 3b), and
+    // how many were made in all
+    int resync_left = 0;
+    bool resync_due = false;   // a helper decode ended: expert_helper_resync has work
+    uint64_t resync_n = 0;
     // ---- paced promotions (STRATA_GLM_BG_PACE_KB, default 1024; 0: the boundary issues each whole copy).  The
     //      copies a boundary issued at once (the refill after a prompt: 24 x 7 MB, ~22 ms of a Gen4 x4 link) held
     //      up the next token's first zero-copy reads (the table edits, the embedding row) until all of them had
@@ -773,5 +778,6 @@ struct Glm5Model::FastState {
 
 /// STRATA_GLM_EXPERT_HELPER_PROMOTE (#24, glm_fast_path.cu): 0 = a helper-owned expert is never promoted into VRAM
 unsigned int expert_helper_promote();
+int expert_helper_resync_budget();
 
 }  // namespace strata::core

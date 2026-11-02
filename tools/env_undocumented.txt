@@ -239,4 +239,5 @@ STRATA_VERIFY_NODES  # src/core/verify.cpp
 STRATA_VERIFY_PROFILE  # src/core/verify.cpp
 STRATA_GLM_EXPERT_HELPER_CHECK  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
 STRATA_GLM_EXPERT_HELPER_PROMOTE  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
+STRATA_GLM_EXPERT_HELPER_RESYNC  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
 STRATA_GLM_EXPERT_HELPER_SAME_GPU  # src/core/glm_expert_helper.hpp (docs/EXPERT_HELPER.md)

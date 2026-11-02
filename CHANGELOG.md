@@ -7,6 +7,16 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.97 - 2026-11-02
+
+- **Expert helper: catch the VRAM tier up between requests** (#24). v1.3.96's `PROMOTE` brought the Prefill back
+  (+7%) but cost Decode (-6 to -10%) on two RTX PRO cards, because the promotions ran during Decode. New opt-in
+  `STRATA_GLM_EXPERT_HELPER_RESYNC=N` (default 0): after a helper decode, once `DONE` is out, up to N of the hottest
+  RAM-held experts are promoted into VRAM (spares refilled from the coldest residents). Decode is untouched; the next
+  prompt starts with a VRAM tier that followed the conversation. One RTX 5090 (same-GPU helper): answers normal,
+  helper vs exact reference RMS 0.022 (CPU lane 0.023), 50-192 promotions in 0.2-0.5 s; the two-GPU effect is to be
+  measured in #24.
+
 ## v1.3.96 - 2026-11-02
 
 - **Expert helper: optional promotion of hot helper experts** (#24). With the helper on, its experts were never

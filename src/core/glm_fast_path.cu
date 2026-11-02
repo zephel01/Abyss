@@ -1642,11 +1642,22 @@ unsigned int expert_helper_promote() {
     return v;
 }
 
+// STRATA_GLM_EXPERT_HELPER_RESYNC=N (#24): after a helper decode, up to N of the hottest RAM-held experts are promoted
+// into VRAM between requests (default 0 = off)
+int expert_helper_resync_budget() {
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_EXPERT_HELPER_RESYNC");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
+}
+
 void Glm5Model::expert_helper_decode_begin(bool speculative) {
     auto* F = fast_;
     if (!F || !F->expert_helper || F->expert_helper->failed) return;
     auto& H = *F->expert_helper;
     H.active = false;
+    F->resync_due = false;   // (a resync not run before this decode is dropped)
     // speculative decoding (DSpark / NextN): the verify windows' columns go to the helper too (lane_flush, #24)
     (void) speculative;
     if (getenv("STRATA_GLM_KDA_GRAPH") && std::atoi(getenv("STRATA_GLM_KDA_GRAPH")) != 0) {
@@ -1713,9 +1724,41 @@ void Glm5Model::expert_helper_decode_end() {
     const bool drained = fast_boundary(err);
     H.active = false;
     if (H.failed) H.disable();
+    const bool ok = drained && !H.failed;
     if (drained) {
         H.report("request_end");
         if (H.failed) F->expert_helper.reset();
+    }
+    if (ok && expert_helper_resync_budget() > 0) F->resync_due = true;   // (run after DONE: expert_helper_resync)
+}
+
+void Glm5Model::expert_helper_resync() {
+    auto* F = fast_;
+    if (!F || !F->resync_due) return;
+    F->resync_due = false;
+    // up to N promotions now, between requests (after DONE) (boundaries alternate between
+    // refilling the spares and filling them with the hottest RAM-held experts), instead of during decode
+    const int budget = expert_helper_resync_budget();
+    std::string err;
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t n0 = F->resync_n;
+        F->resync_left = budget;
+        // a round fills the spares the previous one's demotions freed (step 2 needs their copies landed); two rounds in
+        // a row with nothing promoted: every layer is in step
+        int idle = 0;
+        for (int round = 0; round < 96 && F->resync_left > 0 && idle < 2; ++round) {
+            const uint64_t before = F->resync_n;
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync landing", err) || !fast_boundary(err)) {
+                std::fprintf(stderr, "expert helper resync stopped: %s\n", err.c_str());
+                break;
+            }
+            idle = F->resync_n == before ? idle + 1 : 0;
+        }
+        F->resync_left = 0;
+        if (!fast_boundary(err)) std::fprintf(stderr, "expert helper resync: %s\n", err.c_str());   // (refill the spares)
+        std::fprintf(stderr, "expert helper resync: %llu promotions in %.1f ms\n", (unsigned long long) (F->resync_n - n0),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
 }
 
@@ -5008,6 +5051,59 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 ++F->diag_drop;
             }
         }
+    }
+    // (3b) the RESYNC after a helper decode (#24): the helper keeps its experts out of VRAM while it decodes, so the VRAM
+    //      tier stops following the text (0.3 promotions a token against 2.4) and the next prompt runs ~10% slower.
+    //      Here - between requests, no route in flight - each layer's hottest RAM-held experts go into its fresh spares
+    //      when they beat its coldest resident (aged counts, hot >= 2 x cold + 4); the next boundary's step 3 refills
+    //      the spares by demoting the coldest residents.  expert_helper_resync (after DONE) runs boundaries until it is done.
+    if (F->resync_left > 0 && !F->bg_hold) {
+        const int NE = g.n_expert;
+        int made = 0;
+        for (int il = l0_; il < lt_ && F->resync_left > 0; ++il) {
+            if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
+            auto& P = F->lp[(size_t) il];
+            if (P.n == 0) continue;
+            auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            for (int j = 0; j < gf::kSpares && F->resync_left > 0; ++j) {
+                const int s = P.spare[j];
+                if (s < 0 || P.st[(size_t) s] != FastState::kSpare) continue;
+                uint32_t cold = UINT32_MAX;
+                for (int s2 = 0; s2 < P.n; ++s2)
+                    if (P.st[(size_t) s2] == FastState::kResident && P.key[(size_t) s2] >= 0)
+                        cold = std::min(cold, F->cnt[(size_t) il * NE + P.key[(size_t) s2]]);
+                if (cold == UINT32_MAX) cold = 0;
+                int best = -1;
+                uint32_t hot = 0;
+                for (int e = 0; e < NE; ++e) {
+                    const size_t key = (size_t) il * NE + e;
+                    if (F->slot_of[key] >= 0) continue;
+                    const int rs = F->ram_of[key];
+                    if (rs < 0 || R.st[(size_t) rs] != FastState::kRHold) continue;
+                    if (F->cnt[key] > hot) {
+                        hot = F->cnt[key];
+                        best = e;
+                    }
+                }
+                if (best < 0 || hot < 2u * cold + 4u) break;   // this layer is in step
+                const int key = il * NE + best, rs = F->ram_of[(size_t) key];
+                if (!glmfast::cuda_ok(cudaMemcpyAsync(P.slot_ptr(s), R.base + (size_t) rs * R.stride, F->L[(size_t) il].blob,
+                                                      cudaMemcpyHostToDevice, F->copy), "glm resync copy", err))
+                    return false;
+                P.st[(size_t) s] = FastState::kResident;
+                P.key[(size_t) s] = best;
+                P.tick[(size_t) s] = F->clock;
+                P.spare[j] = -1;
+                F->slot_of[(size_t) key] = s;
+                upd(F->tab_key((size_t) key), (unsigned long long) P.slot_ptr(s));
+                R.st[(size_t) rs] = FastState::kRRelease;   // (exclusive tiers: freed at the next boundary's step 1)
+                --F->resync_left;
+                ++made;
+            }
+        }
+        // the copies land before the table edits (on the compute stream, at the next flush) can send a route there
+        if (made > 0 && !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync copies", err)) return false;
+        F->resync_n += (uint64_t) made;
     }
     // (4) a few free RAM slots per class for the next token's disk reads (and its reads ahead); RAM-resident
     // mode plans no disk reads, so no residents are evicted to keep landing room either
