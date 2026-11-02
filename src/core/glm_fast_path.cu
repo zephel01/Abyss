@@ -1749,11 +1749,14 @@ void Glm5Model::expert_helper_resync(const std::function<bool()>& pending) {
         // next request arriving stops it between rounds, so the resync only ever uses the idle time between requests
         int idle = 0;
         bool cut = false;
-        for (int round = 0; round < 4096 && F->resync_left > 0 && idle < 2; ++round) {
+        // (a round is at most kResyncRound promotions, a few ms, so the next request waits at most that long)
+        constexpr int kResyncRound = 16;
+        for (int round = 0; round < (1 << 16) && F->resync_left > 0 && idle < 2; ++round) {
             if (pending && pending()) {
                 cut = true;
                 break;
             }
+            F->resync_round_left = kResyncRound;
             const uint64_t before = F->resync_n;
             if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync landing", err) || !fast_boundary(err)) {
                 std::fprintf(stderr, "expert helper resync stopped: %s\n", err.c_str());
@@ -1762,6 +1765,7 @@ void Glm5Model::expert_helper_resync(const std::function<bool()>& pending) {
             idle = F->resync_n == before ? idle + 1 : 0;
         }
         F->resync_left = 0;
+        F->resync_round_left = 0;
         if (!fast_boundary(err)) std::fprintf(stderr, "expert helper resync: %s\n", err.c_str());   // (refill the spares)
         std::fprintf(stderr, "expert helper resync: %llu promotions in %.1f ms%s\n", (unsigned long long) (F->resync_n - n0),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
@@ -5067,12 +5071,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
     if (F->resync_left > 0 && !F->bg_hold) {
         const int NE = g.n_expert;
         int made = 0;
-        for (int il = l0_; il < lt_ && F->resync_left > 0; ++il) {
+        // (a short round starts where the last one stopped, so every layer gets its turn)
+        const int nl = lt_ - l0_;
+        for (int k = 0; k < nl && F->resync_left > 0 && F->resync_round_left > 0; ++k) {
+            const int il = l0_ + (F->resync_layer + k) % nl;
+            F->resync_at = il - l0_;   // (where this round is; the next one resumes here if it runs out)
             if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
             auto& P = F->lp[(size_t) il];
             if (P.n == 0) continue;
             auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-            for (int j = 0; j < gf::kSpares && F->resync_left > 0; ++j) {
+            for (int j = 0; j < gf::kSpares && F->resync_left > 0 && F->resync_round_left > 0; ++j) {
                 const int s = P.spare[j];
                 if (s < 0 || P.st[(size_t) s] != FastState::kSpare) continue;
                 uint32_t cold = UINT32_MAX;
@@ -5105,9 +5113,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 upd(F->tab_key((size_t) key), (unsigned long long) P.slot_ptr(s));
                 R.st[(size_t) rs] = FastState::kRRelease;   // (exclusive tiers: freed at the next boundary's step 1)
                 --F->resync_left;
+                --F->resync_round_left;
                 ++made;
             }
         }
+        F->resync_layer = F->resync_round_left > 0 ? 0 : F->resync_at;
         // the copies land before the table edits (on the compute stream, at the next flush) can send a route there
         if (made > 0 && !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync copies", err)) return false;
         F->resync_n += (uint64_t) made;

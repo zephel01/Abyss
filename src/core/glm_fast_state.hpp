@@ -548,6 +548,10 @@ struct Glm5Model::FastState {
     // STRATA_GLM_EXPERT_HELPER_RESYNC (#24): promotions still owed after a helper decode (fast_boundary's step 3b), and
     // how many were made in all
     int resync_left = 0;
+    // this resync round's promotions left: a round stops after a few (#24: a whole round - kSpares a layer, ~120 - took
+    // ~42 ms over PCIe, and the next request could only stop the resync between rounds)
+    int resync_round_left = 0;
+    int resync_layer = 0, resync_at = 0;   // the layer the next round starts at, and this one's (relative to l0_)
     bool resync_due = false;   // a helper decode ended: expert_helper_resync has work
     uint64_t resync_n = 0;
     // ---- paced promotions (STRATA_GLM_BG_PACE_KB, default 1024; 0: the boundary issues each whole copy).  The
