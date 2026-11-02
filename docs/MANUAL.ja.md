@@ -49,6 +49,17 @@ cd ~/llm/apps/Abyss
 ./setup-deepseek.sh --download-model
 ```
 
+DeepSeek V4.1 Flash 1017 は、GPU 32 GB + RAM 96 GB 向けの zephel01 の LDLQ GGUF で入れられる（BETA。既定は速さ重視の
+132G、品質重視は `--quant 139G`。[モデルカード](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)）:
+
+```sh
+./setup-deepseek.sh --model v41 --download-model
+```
+
+設定 `abyss-dsv41-132g.json` には、モデルカードの普段使いの設定（`STRATA_GLM_TAIL_SKIP=4`、`STRATA_GLM_TAIL_SKIP_DISK=1`、
+`STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`、ディスク読み出し 8 本）が入る。V4.1 の DSpark ドラフターはセットアップしない
+（手作業: [docs/deepseek41](deepseek41/README.md)）。ほかの V4.1 の GGUF も、そこに書いた手作業で準備する。
+
 `setup-deepseek.sh` は `.venv` を作ってから `tools/abyss_setup.py` を実行する。済んだ手順は飛ばすので、何度実行してもよい:
 
 1. PC の確認（NVIDIA GPU、RAM）
@@ -778,8 +789,8 @@ prompt）まで測った。アテンションのキャッシュは小さい（65
 - 画像は扱わない（ここでは DeepSeek V4 Flash はテキストのみ）。
 - 複数 GPU: 層の分割は動く（「複数の GPU」）が、遅い 2 枚目を足しても速い 1 枚 + iGPU レーンには
   届かない。そのとき `auto` は速いカード 1 枚で動かす。Windows は DeepSeek V4 では未確認。
-- `./abyss.sh`（Maya から引き継いだインストーラ）は GLM 用。DeepSeek V4 は `./setup-deepseek.sh`。DeepSeek V4.1 は手作業
-  （[docs/deepseek41/README.md](deepseek41/README.md)）。
+- `./abyss.sh`（Maya から引き継いだインストーラ）は GLM 用。DeepSeek V4 は `./setup-deepseek.sh`。DeepSeek V4.1 は
+  `./setup-deepseek.sh --model v41`（zephel01 の LDLQ GGUF）か手作業（[docs/deepseek41/README.md](deepseek41/README.md)）。
 - DeepSeek V4.1: モデル自身の MTP 層でのドラフトはない（MTP 層を持つ GGUF がない。v1.3.53 からの DSpark ドラフター（任意）が
   代わり）。層の分割、会話のディスク保存はまだない。prompt のアテンションは v1.3.60 からまとめて計算する。v1.3.31 までは、
   コンテキストの 16,385 トークン目で落ちた（8K を超えるとアテンションの行選びも崩れていた）。長い会話には v1.3.32 以降を使う。

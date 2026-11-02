@@ -49,6 +49,17 @@ cd ~/llm/apps/Abyss
 ./setup-deepseek.sh --download-model
 ```
 
+DeepSeek V4.1 Flash 1017 with zephel01's LDLQ GGUF, made for a 32 GB GPU + 96 GB RAM (BETA; `--quant 139G` for the
+quality build, 132G by default for speed; [the model card](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)):
+
+```sh
+./setup-deepseek.sh --model v41 --download-model
+```
+
+It writes `abyss-dsv41-132g.json` with the card's everyday settings (`STRATA_GLM_TAIL_SKIP=4`,
+`STRATA_GLM_TAIL_SKIP_DISK=1`, `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`, 8 disk readers); the DSpark drafter is not set up
+for V4.1 (by hand: [docs/deepseek41](deepseek41/README.md)). Other V4.1 GGUFs are set up by hand as described there.
+
 `setup-deepseek.sh` makes the `.venv`, then runs `tools/abyss_setup.py`. Each step is skipped when it is already done,
 so it can be run again at any time:
 
@@ -804,8 +815,8 @@ KL 0.009 over 3000 tokens, with the same next-token accuracy.
 - No images (DeepSeek V4 Flash is text-only here).
 - Several GPUs: the layer split runs (see "Several GPUs"), and a slower second card
   does not beat one fast card with the iGPU lane - `auto` then runs on the fast card alone. Windows is untested for DeepSeek V4.
-- `./abyss.sh` (Maya's installer) is for GLM; DeepSeek V4 is set up with `./setup-deepseek.sh`; DeepSeek V4.1 by hand
-  ([docs/deepseek41/README.md](deepseek41/README.md)).
+- `./abyss.sh` (Maya's installer) is for GLM; DeepSeek V4 is set up with `./setup-deepseek.sh`; DeepSeek V4.1 with
+  `./setup-deepseek.sh --model v41` (zephel01's LDLQ GGUF) or by hand ([docs/deepseek41/README.md](deepseek41/README.md)).
 - DeepSeek V4.1: no MTP drafter in any GGUF (the opt-in DSpark drafter, v1.3.53, drafts instead), no layer split, no
   conversation slots on disk. Up to v1.3.31 it crashed on the 16,385th token of a context (and chose its attention
   rows wrongly past 8K); use v1.3.32 or later for long chats; the prompt's attention is batched since v1.3.60.

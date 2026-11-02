@@ -191,5 +191,17 @@ class ToolkitSwitch(unittest.TestCase):
             self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["lib_dirs"], ["/opt/rocm/core-10.0/lib"])
 
 
+    def test_v41_config_has_its_name_and_settings(self):
+        m = A.MODELS["v41"]
+        extra = {"env": dict(m["env"], GPU_MAX_HW_QUEUES="2")}
+        with mock.patch.object(A, "ROOT", self.root):
+            cfg, run = A.write_config("dsv41-132g", self.root / "pack", 65536, 8082, False, None, extra, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "deepseek-v4.1-flash-1017")
+        self.assertEqual(got["env"]["STRATA_GLM_TAIL_SKIP"], "4")
+        self.assertEqual(got["env"]["GPU_MAX_HW_QUEUES"], "2")
+        self.assertIn("DeepSeek V4.1 Flash 1017", run.read_text(encoding="utf-8"))
+        self.assertEqual(m["quants"], ("132G", "139G"))
+
 if __name__ == "__main__":
     unittest.main()

@@ -178,7 +178,9 @@ local NVMe: the experts that do not fit and every Engram row come from it.
 
 ## Running it
 
-`./setup-deepseek.sh` installs DeepSeek V4 only. For V4.1, build the engine (the manual's
+`./setup-deepseek.sh --model v41 --download-model` installs zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM (132G;
+`--quant 139G` for the quality build) with the engine, the pack and a config holding the everyday settings. For any
+other V4.1 GGUF, build the engine (the manual's
 [Build](../MANUAL.md#build)), make the pack as above and write the config next to the others (`abyss-<name>.json`):
 
 ```json

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Abyss - set up DeepSeek V4 Flash (run through ./setup-deepseek.sh, which makes the .venv first).
+"""Abyss - set up DeepSeek V4 Flash / V4.1 Flash 1017 (run through ./setup-deepseek.sh, which makes the .venv first).
 
     ./setup-deepseek.sh                      everything below; each step is skipped when it is already done
     ./setup-deepseek.sh --quant UD-IQ3_XXS   another quant of unsloth/DeepSeek-V4-Flash-0731-GGUF
+    ./setup-deepseek.sh --model v41          DeepSeek V4.1 Flash 1017: zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM
+                                             (--quant 132G, the default: speed; --quant 139G: quality)
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
     ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
 
@@ -12,10 +14,11 @@ What it does:
   2. Python packages into .venv; llama.cpp's source at the pinned commit (third_party/llama.cpp)
   3. compiles the engine (build/strata) for the GPU - arch 120a on RTX 50, whose MXFP4 kernels need it
   4. the model: unsloth's DeepSeek-V4-Flash-0731-GGUF quant into <data>/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/<quant>
+     (--model v41: zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF, 132G or 139G)
      (asks first, or --download-model), every file checked against Hugging Face's SHA-256
   5. the pack next to the shards (tools/iq_pack.py --compat-bf16)
   6. the run config abyss-<name>.json and the start script run-abyss-<name>.sh in the Abyss folder
-  7. the DSpark drafter (asked when the config is new, or --dspark): bleysg's GGUF of DeepSeek's block drafter into
+  7. the DSpark drafter (V4 only; asked when the config is new, or --dspark): bleysg's GGUF of DeepSeek's block drafter into
      <data>/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF, its path in the config's env (STRATA_DS4_DSPARK)
   8. the Abyss-tools folder (abyss.sh start / stop / status / update / log / models) from ops/abyss-tools/
 
@@ -38,6 +41,19 @@ sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
 
 REPO = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
+# the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
+# is a fixed set, the config's model_name, the config name's prefix, the env the model's measurements were made with,
+# the experts' size in GB at the default quant (for the RAM line)
+MODELS = {
+    "v4": {"repo": REPO, "quant": "UD-Q2_K_XL", "quants": None, "model_name": "deepseek-v4-flash", "prefix": "dsv4",
+           "title": "DeepSeek V4 Flash 0731", "env": {}, "gb": 97},
+    # zephel01's own LDLQ GGUF (2026-11-02, BETA): 132G = UD-IQ1_M's types with better rounding (speed), 139G = layers
+    # 35-39 one step higher (quality).  The env is the model card's everyday settings (its speed and quality rows)
+    "v41": {"repo": "zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF", "quant": "132G", "quants": ("132G", "139G"),
+            "model_name": "deepseek-v4.1-flash-1017", "prefix": "dsv41", "title": "DeepSeek V4.1 Flash 1017",
+            "env": {"STRATA_GLM_DISK_READERS": "8", "STRATA_GLM_TAIL_SKIP": "4", "STRATA_GLM_TAIL_SKIP_DISK": "1",
+                    "STRATA_GLM_ROUTE_AFFINITY_RAM": "0.08"}, "gb": 140},
+}
 HF_FILE = "https://huggingface.co/{repo}/resolve/main/{path}"
 HF_TREE = "https://huggingface.co/api/models/{repo}/tree/main/{folder}"
 # the quant this setup was tested with; its files are known even without the Hugging Face API
@@ -64,21 +80,21 @@ MANAGED = ("abyss.sh", "common.sh")        # replaced when the template changes 
 ONCE = ("README.md",)                      # written only when missing: the user's own notes go there
 
 
-def quant_files(quant: str) -> list[tuple[str, int, str]]:
+def quant_files(quant: str, repo: str = REPO) -> list[tuple[str, int, str]]:
     """(path in the repo, size, sha256) of a quant's GGUF files, from Hugging Face's file list."""
     try:
-        req = urllib.request.Request(HF_TREE.format(repo=REPO, folder=quant), headers={"User-Agent": "abyss-setup"})
+        req = urllib.request.Request(HF_TREE.format(repo=repo, folder=quant), headers={"User-Agent": "abyss-setup"})
         items = json.load(urllib.request.urlopen(req, timeout=60))
         files = sorted((i["path"], int(i["size"]), (i.get("lfs") or {}).get("oid", ""))
                        for i in items if i.get("type") == "file" and i["path"].endswith(".gguf"))
         if files:
             return files
     except OSError as e:
-        if quant not in KNOWN:
-            S.fail(f"cannot read the file list of {REPO}/{quant} ({e})", "check the internet connection, or the quant's name")
-    if quant in KNOWN:
+        if repo != REPO or quant not in KNOWN:
+            S.fail(f"cannot read the file list of {repo}/{quant} ({e})", "check the internet connection, or the quant's name")
+    if repo == REPO and quant in KNOWN:
         return KNOWN[quant]
-    S.fail(f"{REPO} has no quant {quant!r}", "names are the folders on https://huggingface.co/" + REPO)
+    S.fail(f"{repo} has no quant {quant!r}", "names are the folders on https://huggingface.co/" + repo)
 
 
 def sha256_of(path: Path) -> str:
@@ -216,7 +232,8 @@ def hip_engine(a):
 
 
 def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus=None,
-                 extra: dict | None = None) -> tuple[Path, Path]:
+                 extra: dict | None = None, model: dict | None = None) -> tuple[Path, Path]:
+    model = model or MODELS["v4"]
     cfg = ROOT / f"abyss-{name}.json"
     run = ROOT / f"run-abyss-{name}.sh"
     if cfg.exists() and not rewrite:
@@ -235,7 +252,7 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto"],
             "cwd": str(ROOT),
             "tokenizer": str(pack / "tokenizer"),
-            "model_name": "deepseek-v4-flash",
+            "model_name": model["model_name"],
             # (several: a layer split across them, the first the main card - serve/server.py adds --layer-split auto)
             **({"gpu": [g["index"] for g in gpus]} if gpus else {}),
             "sampling": {"temperature": 1.0, "top_p": 0.95},
@@ -246,7 +263,7 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
         S.ok(f"{cfg.name} written (context {ctx}, port {port})")
     py = ROOT / ".venv" / "bin" / "python"
     run.write_text("#!/bin/sh\n"
-                   f"# DeepSeek V4 Flash ({name}) on Abyss: the dashboard and API (written by setup-deepseek.sh)\n"
+                   f"# {model['title']} ({name}) on Abyss: the dashboard and API (written by setup-deepseek.sh)\n"
                    f'cd "{ROOT}" || exit 1\n'
                    f'exec "{py}" "{ROOT / "serve" / "server.py"}" --engine strata "--config" "{cfg}" '
                    f'"--port" "{json.loads(cfg.read_text())["port"]}" "$@"\n', encoding="utf-8")
@@ -333,9 +350,13 @@ def make_tools(tools: Path) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash on Abyss")
-    ap.add_argument("--quant", default="UD-Q2_K_XL", help="a folder of " + REPO + " (default UD-Q2_K_XL, the tested one)")
-    ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>)")
+    ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
+    ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
+                    "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA)")
+    ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one); v41: 132G "
+                    "(default, speed) or 139G (quality)")
+    ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
+                                   "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")
     ap.add_argument("--tools-dir", default=str(ROOT.parent / "Abyss-tools"), help="the tools folder (default: Abyss-tools beside Abyss)")
     ap.add_argument("--context", type=int, default=65536, help="the context in tokens (default 65536)")
@@ -351,7 +372,7 @@ def main() -> int:
     ap.add_argument("--download-model", action="store_true", help="download the model without asking")
     ap.add_argument("--yes", action="store_true", help="the defaults for every question (the download still needs --download-model)")
     ap.add_argument("--rewrite-config", action="store_true", help="write abyss-<name>.json again")
-    ap.add_argument("--dspark", action="store_true", help="download DeepSeek's DSpark drafter (6.9 GB) and turn it on in "
+    ap.add_argument("--dspark", action="store_true", help="(V4) download DeepSeek's DSpark drafter (6.9 GB) and turn it on in "
                     "the config: drafts checked a step at a time, ~+28%% on swe-bench tasks on an AI PRO R9700 (~6.5 GB "
                     "of VRAM; one GPU, DeepSeek V4 Flash 0731). Asked when the config is new")
     ap.add_argument("--no-dspark", action="store_true", help="turn the DSpark drafter off in the config (the file stays)")
@@ -363,10 +384,16 @@ def main() -> int:
     if a.tools_only:
         make_tools(tools)
         return 0
-    quant = a.quant
-    name = a.name or "dsv4-" + quant.lower().removeprefix("ud-")
+    model = MODELS[a.model]
+    repo = model["repo"]
+    quant = a.quant or model["quant"]
+    if model["quants"] and quant not in model["quants"]:
+        ap.error(f"--model {a.model} has the quants {', '.join(model['quants'])}")
+    if a.dspark and a.model != "v4":
+        ap.error("--dspark: the DSpark drafter is set up for DeepSeek V4 only (V4.1: docs/deepseek41/README.md)")
+    name = a.name or model["prefix"] + "-" + quant.lower().removeprefix("ud-")
     data = Path(a.data_dir).expanduser().resolve()
-    mdir = data / "models" / REPO / quant
+    mdir = data / "models" / repo / quant
 
     S.step(1, "the PC")
     gpu = S.gpu_info(a.gpu) if a.backend != "hip" else None
@@ -391,7 +418,11 @@ def main() -> int:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
-    S.ok(f"RAM {S.ram_gb():.0f} GB (with VRAM, ~100 GB holds every expert of the 97 GB quant; less reads from the SSD)")
+    if a.model == "v4":
+        S.ok(f"RAM {S.ram_gb():.0f} GB (with VRAM, ~100 GB holds every expert of the 97 GB quant; less reads from the SSD)")
+    else:
+        S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 32 GB GPU + 96 GB RAM: the experts that do not fit there and the "
+             "Engram table are read from the SSD - keep the model on a fast NVMe)")
 
     S.step(2, "Python packages and llama.cpp's source")
     S.pip_install(S.PY_PACKAGES, ", ".join(S.PY_PACKAGES))
@@ -401,8 +432,8 @@ def main() -> int:
     if backend == "cuda":
         build_engine(a.arch, gpus, a.nvcc)
 
-    S.step(4, f"the model: {REPO} {quant}")
-    files = quant_files(quant)
+    S.step(4, f"the model: {repo} {quant}")
+    files = quant_files(quant, repo)
     total = sum(f[1] for f in files)
     S.say(f"  {len(files)} files, {total / 1e9:.1f} GB -> {mdir}")
     missing = [f for f in files if not (mdir / Path(f[0]).name).exists()]
@@ -413,14 +444,14 @@ def main() -> int:
             S.fail("the model is not downloaded", "run again with --download-model, or put the files into " + str(mdir))
     for path, size, sha in files:
         dst = mdir / Path(path).name
-        S.download(HF_FILE.format(repo=REPO, path=path), dst, dst.name)
+        S.download(HF_FILE.format(repo=repo, path=path), dst, dst.name)
         if sha and not verified(dst, sha):
             S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
     S.check_shards([mdir / Path(f[0]).name for f in files])
     S.ok("every file checked")
 
     S.step(5, "the pack")
-    pack = mdir / "pack-dsv4"
+    pack = mdir / ("pack-dsv4" if a.model == "v4" else "pack")
     if (pack / "native_experts.txt").exists() and (pack / "tokenizer" / "chat_template.jinja").exists():
         S.ok(f"pack: {pack} (already made)")
     else:
@@ -437,8 +468,11 @@ def main() -> int:
             had = (json.loads(cfg_path.read_text(encoding="utf-8")).get("env") or {}).get("STRATA_DS4_DSPARK")
         except (OSError, ValueError):
             pass
+    extra = dict(hip_extra or {})
+    if model["env"]:
+        extra["env"] = {**model["env"], **extra.get("env", {})}
     cfg, _ = write_config(name, pack, a.context, a.port, a.rewrite_config,
-                          gpus if len(gpus) > 1 and backend == "cuda" else None, hip_extra)
+                          gpus if len(gpus) > 1 and backend == "cuda" else None, extra or None, model)
 
     # the engine's per-GPU kernel choices measured on these GPUs (./abyss.sh --gpu-tune; under a minute a GPU, no
     # model): a faster one goes into the config's env.  Never stops the setup
@@ -451,7 +485,10 @@ def main() -> int:
         S.warn(f"the GPU check did not run ({e or 'see above'}): the engine's own choices stay")
 
     S.step(7, "the DSpark drafter")
-    dspark_step(a, data, cfg, fresh, had, gpus, backend)
+    if a.model == "v4":
+        dspark_step(a, data, cfg, fresh, had, gpus, backend)
+    else:
+        S.ok("DSpark drafter: set up for DeepSeek V4 only (V4.1: by hand, docs/deepseek41/README.md)")
 
     S.step(8, "Abyss-tools")
     make_tools(tools)
