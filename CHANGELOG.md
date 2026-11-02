@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.95 - 2026-11-02
+
+- **Expert helper check: RMS and an exact reference** (#24). `STRATA_GLM_EXPERT_HELPER_CHECK=1` printed only the
+  worst column's largest difference, which grows with the number of columns checked (0.034 at 2K columns, 0.056 at
+  20K in the #24 report). It now also prints the RMS difference against the CPU lane, and on every 256th column an
+  exact float reference (dequantized weights, float activations) with the helper's and the CPU lane's distance to it.
+  On one RTX 5090: helper vs CPU RMS 1e-4, and both 0.022 RMS from the exact result (worst column 0.026 both) - the
+  helper's difference is ordinary quantized arithmetic. Debug output only; no change to decoding.
+
 ## v1.3.94 - 2026-11-02
 
 The second-GPU expert helper also works with the DSpark drafter, and the V4.1 guide names a pick for 32 GB + 96 GB.

@@ -3783,18 +3783,83 @@ void Glm5Model::fast_service() {
                         float* ro[kVerifyMax];
                         for (int t = 0; t < wq_n; ++t) ro[t] = ref.data() + (size_t) t * g.n_embd;
                         fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, ro, xq_all ? xqv : nullptr);
+                        // also: the RMS relative difference over all checked columns, and on every 256th column an
+                        // exact float reference (dequantized weights, float activations) with the helper's and the CPU
+                        // lane's distance to it (RMS and worst column). Both quantize the activations (in different
+                        // ways), so the helper is fine when its distance sits at the CPU lane's level
+                        static double hc_d2 = 0.0, hc_r2 = 0.0, ex_h2 = 0.0, ex_c2 = 0.0, ex_r2 = 0.0;
+                        static double ex_hmax = 0.0, ex_cmax = 0.0;
+                        static uint64_t ex_cols = 0;
+                        static std::vector<float> exf, exh, exo;
                         for (int t = 0; t < wq_n; ++t) {
                             double d = 0.0, r = 0.0;
                             for (int i = 0; i < g.n_embd; ++i) {
-                                d = std::max(d, (double) std::fabs(out[t][i] - ro[t][i]));
+                                const double di = (double) out[t][i] - ro[t][i];
+                                d = std::max(d, std::fabs(di));
                                 r = std::max(r, (double) std::fabs(ro[t][i]));
+                                hc_d2 += di * di;
+                                hc_r2 += (double) ro[t][i] * ro[t][i];
                             }
                             hc_max = std::max(hc_max, d / std::max(r, 1e-6));
+                            if ((hc_cols + (uint64_t) t) % 256 != 0) continue;
+                            const auto& Lc = F->L[(size_t) wq_layer];
+                            const auto& nfc = F->cpu_fmt[(size_t) wq_layer];
+                            if (Lc.exl3 || nfc.n_ff <= 0) continue;
+                            const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Lc.gu_type);
+                            const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Lc.d_type);
+                            if (!tg || !tg->to_float || !td || !td->to_float) continue;
+                            const int E = g.n_embd, FF = g.n_ff_exp;
+                            const float lim = g.swiglu_exp;
+                            exf.resize((size_t) std::max(E, FF));
+                            exh.resize((size_t) FF);
+                            exo.assign((size_t) E, 0.0f);
+                            for (int i = 0; i < ne[t]; ++i) {
+                                const uint8_t* b = blob[gf::kMaxK * t + i];
+                                for (int rr = 0; rr < FF; ++rr) {
+                                    double sg = 0.0, su = 0.0;
+                                    tg->to_float(b + (size_t) rr * nfc.gu_row, exf.data(), E);
+                                    for (int k = 0; k < E; ++k) sg += (double) exf[(size_t) k] * x[t][k];
+                                    tg->to_float(b + Lc.gu_bytes + (size_t) rr * nfc.gu_row, exf.data(), E);
+                                    for (int k = 0; k < E; ++k) su += (double) exf[(size_t) k] * x[t][k];
+                                    float gg = (float) sg, uu = (float) su;
+                                    if (lim != std::numeric_limits<float>::infinity()) {
+                                        gg = std::fmin(gg, lim);
+                                        uu = std::fmin(std::fmax(uu, -lim), lim);
+                                    }
+                                    exh[(size_t) rr] = (gg / (1.f + std::exp(-gg))) * uu;
+                                }
+                                for (int rr = 0; rr < E; ++rr) {
+                                    double s = 0.0;
+                                    td->to_float(b + Lc.down_off + (size_t) rr * nfc.d_row, exf.data(), FF);
+                                    for (int k = 0; k < FF; ++k) s += (double) exf[(size_t) k] * exh[(size_t) k];
+                                    exo[(size_t) rr] += w[gf::kMaxK * t + i] * (float) s;
+                                }
+                            }
+                            double hm = 0.0, cm = 0.0, em = 0.0;
+                            for (int k = 0; k < E; ++k) {
+                                const double e = exo[(size_t) k], dh = out[t][k] - e, dc = ro[t][k] - e;
+                                ex_h2 += dh * dh;
+                                ex_c2 += dc * dc;
+                                ex_r2 += e * e;
+                                hm = std::max(hm, std::fabs(dh));
+                                cm = std::max(cm, std::fabs(dc));
+                                em = std::max(em, std::fabs(e));
+                            }
+                            ex_hmax = std::max(ex_hmax, hm / std::max(em, 1e-6));
+                            ex_cmax = std::max(ex_cmax, cm / std::max(em, 1e-6));
+                            ++ex_cols;
                         }
                         hc_cols += (uint64_t) wq_n;
-                        if (hc_cols % 2048 < (uint64_t) wq_n)
-                            std::fprintf(stderr, "expert helper check: %llu window columns, max |diff| / max |ref| %.3g\n",
-                                         (unsigned long long) hc_cols, hc_max);
+                        if (hc_cols % 2048 < (uint64_t) wq_n) {
+                            std::fprintf(stderr, "expert helper check: %llu window columns, max |diff| / max |ref| %.3g, "
+                                         "rms helper vs cpu %.3g\n", (unsigned long long) hc_cols, hc_max,
+                                         std::sqrt(hc_d2 / std::max(hc_r2, 1e-30)));
+                            if (ex_cols)
+                                std::fprintf(stderr, "expert helper check: exact float reference, %llu columns: helper rms "
+                                             "%.3g max %.3g | cpu lane rms %.3g max %.3g\n",
+                                             (unsigned long long) ex_cols, std::sqrt(ex_h2 / std::max(ex_r2, 1e-30)),
+                                             ex_hmax, std::sqrt(ex_c2 / std::max(ex_r2, 1e-30)), ex_cmax);
+                        }
                     }
                 } else {
                     ++H->fallbacks;
