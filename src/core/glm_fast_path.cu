@@ -1787,27 +1787,58 @@ void Glm5Model::expert_helper_resync(const std::function<bool()>& pending) {
         // next request arriving stops it between rounds, so the resync only ever uses the idle time between requests
         int idle = 0;
         bool cut = false;
-        // (a round is at most kResyncRound promotions, a few ms, so the next request waits at most that long)
-        constexpr int kResyncRound = 16;
+        // (fast_boundary's step 3b asks it before each promotion; the longest gap between two asks is how long a next
+        // request can wait at most - logged below)
+        auto last_ask = t0;
+        double max_gap = 0.0;
+        const std::function<bool()> ask = [&] {
+            const auto now = std::chrono::steady_clock::now();
+            max_gap = std::max(max_gap, std::chrono::duration<double, std::milli>(now - last_ask).count());
+            last_ask = now;
+            return pending && pending();
+        };
+        F->resync_pending = &ask;
+        F->resync_cut = false;
+        // (a round is at most kResyncRound promotions, and step 3b lands each copy and asks pending() before the next
+        // one.  The round size also caps the demotions the next boundary's step 3 queues ahead of them (one per spare
+        // used): with 16, a waiting request sat behind ~16 queued copies (#24: 6-8 ms on Gen5 x8; 18-28 ms here, Gen4
+        // x4); with 2 it waits for about two copies, and the resync is as fast in all (one copy at a time either way)
+        constexpr int kResyncRound = 2;
         for (int round = 0; round < (1 << 16) && F->resync_left > 0 && idle < 2; ++round) {
-            if (pending && pending()) {
+            if (ask()) {
                 cut = true;
                 break;
             }
             F->resync_round_left = kResyncRound;
             const uint64_t before = F->resync_n;
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync landing", err) || !fast_boundary(err)) {
+            // the copies still in flight (the decode's last moves) land first; a next request stops the wait
+            cudaError_t q = cudaSuccess;
+            while ((q = cudaStreamQuery(F->copy)) == cudaErrorNotReady && !ask())
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (q == cudaErrorNotReady) {
+                cut = true;
+                break;
+            }
+            if (!glmfast::cuda_ok(q, "glm resync landing", err) || !fast_boundary(err)) {
                 std::fprintf(stderr, "expert helper resync stopped: %s\n", err.c_str());
                 break;
             }
             idle = F->resync_n == before ? idle + 1 : 0;
+            if (F->resync_cut) {
+                cut = true;
+                break;
+            }
         }
         F->resync_left = 0;
         F->resync_round_left = 0;
-        if (!fast_boundary(err)) std::fprintf(stderr, "expert helper resync: %s\n", err.c_str());   // (refill the spares)
-        std::fprintf(stderr, "expert helper resync: %llu promotions in %.1f ms%s\n", (unsigned long long) (F->resync_n - n0),
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
-                     cut ? " (stopped: the next request)" : "");
+        F->resync_pending = nullptr;
+        // (refill the spares - unless the next request is waiting: its own first boundary refills them)
+        if (!cut && !fast_boundary(err)) std::fprintf(stderr, "expert helper resync: %s\n", err.c_str());
+        const auto t1 = std::chrono::steady_clock::now();
+        max_gap = std::max(max_gap, std::chrono::duration<double, std::milli>(t1 - last_ask).count());
+        std::fprintf(stderr, "expert helper resync: %llu promotions in %.1f ms%s (longest gap between next-request checks %.2f ms)\n",
+                     (unsigned long long) (F->resync_n - n0), std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     cut ? " (stopped: the next request)" : "", max_gap);
     }
 }
 
@@ -5168,6 +5199,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     }
                 }
                 if (best < 0 || hot < 2u * cold + 4u) break;   // this layer is in step
+                if (F->resync_pending && (*F->resync_pending)()) {   // the next request: stop after this one copy at most
+                    F->resync_cut = true;
+                    F->resync_round_left = 0;
+                    break;
+                }
                 const int key = il * NE + best, rs = F->ram_of[(size_t) key];
                 if (!glmfast::cuda_ok(cudaMemcpyAsync(P.slot_ptr(s), R.base + (size_t) rs * R.stride, F->L[(size_t) il].blob,
                                                       cudaMemcpyHostToDevice, F->copy), "glm resync copy", err))
@@ -5182,6 +5218,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 --F->resync_left;
                 --F->resync_round_left;
                 ++made;
+                // (a resync lands each copy before the next check: queued together, a round's copies kept a waiting
+                // request for the whole round, ~16 x 0.4 ms)
+                if (F->resync_pending && !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync copy", err))
+                    return false;
             }
         }
         F->resync_layer = F->resync_round_left > 0 ? 0 : F->resync_at;

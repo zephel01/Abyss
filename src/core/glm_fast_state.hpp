@@ -559,6 +559,10 @@ struct Glm5Model::FastState {
     // ~42 ms over PCIe, and the next request could only stop the resync between rounds)
     int resync_round_left = 0;
     int resync_layer = 0, resync_at = 0;   // the layer the next round starts at, and this one's (relative to l0_)
+    // expert_helper_resync's "a next request is waiting" check, asked before every promotion, each copy landed first
+    // (#24: a round of 16 queued copies still kept the next request ~7 ms; one copy is ~0.4 ms), and whether it said yes
+    const std::function<bool()>* resync_pending = nullptr;
+    bool resync_cut = false;
     size_t nv_guard = 0;   // NVFP4 models: the zeroed bytes after each expert allocation (kNvGuard; 0 otherwise)
     bool resync_due = false;   // a helper decode ended: expert_helper_resync has work
     uint64_t resync_n = 0;

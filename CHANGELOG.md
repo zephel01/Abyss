@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.102 - 2026-11-03
+
+- **Expert helper resync: the next request waits about two copies (#24)**: v1.3.101's rounds of 16 still kept a next
+  request 6-8 ms (Gen5 x8), because a round's copies - and the demotions the next boundary queued for the spares it
+  used - were queued together and waited for at the end. The resync now lands each copy before it checks again, runs
+  rounds of 2, and waits for the decode's last copies while checking; a stopped resync leaves the spare refill to the
+  next request's own boundary. On one RTX 5090 (Gen4 x4) the longest gap between checks went from 18-28 ms to
+  3.5-5 ms, with the same promotions per second. The log line adds `longest gap between next-request checks`.
+
 ## v1.3.101 - 2026-11-03
 
 NVFP4 experts, and a shorter wait for the next request after a helper resync.
