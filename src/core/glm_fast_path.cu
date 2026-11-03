@@ -55,6 +55,7 @@
 #include <vector>
 #include <bit>
 #ifndef _WIN32
+#include <dirent.h>
 #include <unistd.h>
 #else
 #ifndef NOMINMAX
@@ -2774,7 +2775,63 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // then the iGPU lane's: it keeps the decode's lane only when it is the faster (STRATA_GLM_IGPU=1: always)
     const abyss_igpu_experts_fn igpu = F->igpu_experts;
     F->igpu_experts = nullptr;
-    const double cpu_ms = time_lane("CPU");
+    // (issue #24: another job on the CPU through the start-up - a build - timed an expert at 0.923 ms where the quiet
+    //  box takes 0.155, and the decode's table gave the CPU 2 of 8 RAM-tier experts instead of 6 for the whole process.
+    //  When the timing looks disturbed - other work runnable on a quarter of the CPUs, or the slowest run over 3x the
+    //  median - it is taken again up to 3 times, 1 s apart, and the lowest median kept)
+    const auto others_running = [] {
+        FILE* fp = std::fopen("/proc/stat", "r");
+        int n = -1;
+        if (fp != nullptr) {
+            char line[256];
+            while (std::fgets(line, sizeof line, fp) != nullptr)
+                if (std::sscanf(line, "procs_running %d", &n) == 1) break;
+            std::fclose(fp);
+        }
+        // less this process's own running threads (the pool's workers spin 20 ms after a run, the tier warm-up's readers)
+        int own = 0;
+#ifndef _WIN32
+        if (DIR* d = opendir("/proc/self/task")) {
+            while (const dirent* e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                char path[64], buf[512];
+                std::snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
+                if (FILE* ft = std::fopen(path, "r")) {
+                    const size_t got = std::fread(buf, 1, sizeof buf - 1, ft);
+                    std::fclose(ft);
+                    buf[got] = 0;
+                    const char* rp = std::strrchr(buf, ')');   // "pid (comm) S ..."
+                    if (rp != nullptr && rp[1] == ' ' && rp[2] == 'R') ++own;
+                }
+            }
+            closedir(d);
+        }
+#endif
+        return std::max(0, n - std::max(1, own));
+    };
+    const int n_hw = std::max(1, (int) std::thread::hardware_concurrency());
+    double cpu_ms = time_lane("CPU");
+    {
+        const char* rv = getenv("STRATA_GLM_CPU_CAL_RETRY");
+        const int retries = rv != nullptr ? std::max(0, std::atoi(rv)) : 3;
+        int busy = others_running();
+        double spread = cal_max / std::max(1e-9, cpu_ms);
+        for (int r = 0; r < retries && (busy * 4 >= n_hw || spread > 3.0); ++r) {
+            const double first = cpu_ms;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const double again = time_lane("CPU");
+            cpu_ms = std::min(cpu_ms, again);
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane calibration disturbed (%d other tasks running on %d CPUs, "
+                                 "slowest run %.1fx the median): timed again, %.3f -> %.3f ms an expert\n", dev_, busy,
+                         n_hw, spread, first, cpu_ms);
+            busy = others_running();
+            spread = cal_max / std::max(1e-9, again);
+        }
+        if (busy * 4 >= n_hw)
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the CPU is still busy (%d other tasks running) - the decode's "
+                                 "CPU / PCIe split may be off for this process (STRATA_GLM_CPU_PLAN sets it by hand)\n",
+                         dev_, busy);
+    }
     double c_ms = cpu_ms;
     if (igpu != nullptr) {
         F->igpu_experts = igpu;

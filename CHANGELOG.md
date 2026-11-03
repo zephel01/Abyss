@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.103 - 2026-11-03
+
+- **CPU lane calibration taken again when the CPU is busy (#24)**: the start-up timing of an expert on the CPU decides
+  the decode's CPU / PCIe split for the whole process. With a build running beside the engine it read 0.923 ms where
+  the quiet box takes 0.155, and the split gave the CPU 2 of 8 RAM-tier experts instead of 6 (a first decode at 54
+  tok/s instead of 83). When the timing looks disturbed - other tasks running on a quarter of the CPUs (the engine's
+  own threads not counted), or the slowest of its 48 runs over 3x the median - it is now taken again up to 3 times,
+  1 s apart, and the lowest kept; a CPU still busy after that is named in the log. `STRATA_GLM_CPU_CAL_RETRY=<n>`
+  (default 3, `0` = one timing). The prompt path's own split recovers by itself once the CPU is free (checked on one
+  RTX 5090: 32 busy processes through start-up and the first prompt, 449 tok/s, then 520-526 as on a quiet start).
+- Docs: DeepSeek V4.1 Compact JA256 (207 GB, 256 of 384 experts) in README, MODELS, MANUAL and docs/deepseek41.
+
 ## v1.3.102 - 2026-11-03
 
 - **Expert helper resync: the next request waits about two copies (#24)**: v1.3.101's rounds of 16 still kept a next
