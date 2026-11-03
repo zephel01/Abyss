@@ -1625,8 +1625,11 @@ class Service:
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
         images = images_of(messages)
-        # DeepSeek V4.1: the GGUF template prints a message's content as it is - an image becomes a sentinel in the text
-        v41_images = bool(images) and self.template.dsv4 and V41_IMAGE not in self.template.source
+        # DeepSeek V4.1: every image becomes a sentinel in the text.  The GGUF templates print a message's content as it
+        # is; the official one writes its own <｜deepseek_image｜> for an image block, which the path below would not take
+        # for an image (no start marker before it), so it gets the sentinel too: the same prompt, the blocks joined by a
+        # blank line either way
+        v41_images = bool(images) and self.template.dsv4
         if v41_images:
             messages = v41_images_as_text(messages)
         prompt = self.template.render(messages, tools=tools, **kwargs)

@@ -236,6 +236,40 @@ class V41ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class V41OfficialTemplateImages(unittest.TestCase):
+    """DeepSeek V4.1 with the official template, which writes <｜deepseek_image｜> for an image block itself (and refuses
+    the marker typed in a message): the image still becomes the encoder's n rows, not a 400."""
+
+    TEMPLATE = ('{#｜DSML｜#}{%- set IMG = "<｜deepseek_image｜>" -%}'
+                "{%- for m in messages -%}{%- set c = m['content'] -%}"
+                "{%- if c is string and IMG in c -%}{{ raise_exception('image token in content') }}{%- endif -%}"
+                "{%- if c is not string -%}{%- set sp = namespace(parts=[]) -%}{%- for b in c -%}"
+                "{%- if b.type == 'text' -%}{%- set sp.parts = sp.parts + [b.text] -%}"
+                "{%- elif b.type in ['image', 'image_url'] -%}{%- set sp.parts = sp.parts + [IMG] -%}{%- endif -%}"
+                "{%- endfor -%}{%- set c = sp.parts | join('\\n\\n') -%}{%- endif -%}"
+                "<｜User｜>{{ c }}{%- endfor -%}{%- if add_generation_prompt -%}<｜Assistant｜>{%- endif -%}")
+
+    def test_an_image_block_becomes_n_rows(self):
+        import tempfile
+        tok = V41ImageMarkers.V41Tok()
+        with tempfile.TemporaryDirectory() as d:
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text(self.TEMPLATE, encoding="utf-8")
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(tpl),
+                          vision=ImageMarkers.FakeVision(d))
+            self.assertTrue(svc.template.dsv4)
+            self.assertIn("<｜deepseek_image｜>", svc.template.source)
+            pad = tok.encode("<｜deepseek_image｜>", parse_special=True)[0]
+            for n in (1, 2):
+                with self.subTest(images=n):
+                    blocks = [{"type": "image", "source": "x.png"}] * n + [{"type": "text", "text": "what is it"}]
+                    ids, _, _ = svc.prepare([{"role": "user", "content": blocks}], None, {})
+                    self.assertEqual(ids.count(pad), 3 * n)      # each image's three rows
+                    self.assertNotIn(None, ids)
+                    self.assertIn("what is it", tok.decode(ids))
+            svc.embeddings.path.unlink(missing_ok=True)
+
+
 class GlmThinkingLevels(unittest.TestCase):
     """GLM-5.x's template knows reasoning_effort low / high and is "Max" otherwise (no effort given included), and it
     always opens <think>: the server's levels map onto low / high / max, and thinking off closes the think block."""
