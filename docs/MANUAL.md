@@ -56,6 +56,10 @@ quality build, 132G by default for speed; [the model card](https://huggingface.c
 ./setup-deepseek.sh --model v41 --download-model
 ```
 
+The smaller, general-purpose [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF) (207 GB, 256 of 384 experts, Japanese intact, ~30% faster on
+32 GB + 96 GB) is not in the setup yet: download its `JA256/` folder and pack it by hand as in
+[docs/deepseek41/README.md](deepseek41/README.md#ggufs-that-load).
+
 It writes `abyss-dsv41-132g.json` with the card's everyday settings (`STRATA_GLM_TAIL_SKIP=4`,
 `STRATA_GLM_TAIL_SKIP_DISK=1`, `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`, 8 disk readers); the DSpark drafter is not set up
 for V4.1 (by hand: [docs/deepseek41](deepseek41/README.md)). Other V4.1 GGUFs are set up by hand as described there.

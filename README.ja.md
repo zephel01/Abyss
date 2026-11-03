@@ -25,6 +25,13 @@ Abyss は [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Fla
 動かす。よく使うエキスパートを VRAM に、次に使うものを pinned RAM に、残りを NVMe SSD に置き、会話に合わせて入れ替える。
 ブラウザのチャットと、OpenAI / Anthropic 互換の API（思考とツール呼び出しに対応）が、すべて手元のマシンだけで動く。
 
+**新しく公開: 日本語が崩れない、小さい DeepSeek V4.1 GGUF（[Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF)、207 GB、BETA、2026-11-03）**
+- 各層 384 個のエキスパートのうち 256 個を残した版です。日本語・中国語・英語・コード・数学・ツール呼び出しの文章で「どのエキスパートが選ばれるか」を数えて選びました。
+- 残るルート：日本語 95%、数学 94%、ツール 94%、英語 91%、コード 84%。コードだけで選ぶと日本語のルートは 45% しか残らず、実際に日本語の質問に中国語で答えました。
+- RTX 5090 + RAM 96 GB で、コーディング課題 87 tok/s（削っていない 132G は 67.5）、32K の入力処理 1,833 tok/s、KL 0.383、難しめ 10 問は 8/10。llama.cpp でも動きます。
+- 本格的なコーディングには、下の削っていない 132G / 139G がおすすめです。
+- trench-gguf の `prune_experts.py` と `requant_table.py` で作りました。
+
 **新しく公開: GPU 32 GB + RAM 96 GB 向けの自作 DeepSeek V4.1 GGUF（[BETA 版](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)）**
 - エキスパートはすべて、元の FP4 から LDLQ で作り直しました（[trench-gguf](https://github.com/zephel01/trench-gguf)）。1 つも削っていません。
 - `132G`（速さ重視）：KL 0.194、コーディング課題で 67.5 tok/s。
@@ -89,6 +96,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 | DeepSeek V4.1 Flash 1017 | unsloth の [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（品質重視のおすすめ） | 300 GB | AI PRO R9700 で計測済み: KL 0.141（旧版 0.188）、swe-bench 8 問で GPU 32 GB + メモリ 96 GB 33.9 tok/s、32 GB + 64 GB 29.5 tok/s（[どれを選ぶか](docs/deepseek41/README.md#ggufs-that-load)） |
 | | unsloth の [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（速さ重視のおすすめ） | 250 GB | 同じ測り方で: KL 0.199（旧版 0.270）、32 GB + 96 GB で **40.6 tok/s**、32 GB + 64 GB で 30.5 tok/s |
 | | 自作の [LDLQ 132G / 139G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)（GPU 32 GB + RAM 96 GB 向け、BETA、2026-11-02。報告歓迎） | 275.8 / 283.0 GB | RTX 5090 + RAM 96 GB で計測: KL 0.194 / 0.182、swe 3 問 67.5 / 57.9 tok/s（UD-IQ1_M は 71.8）、難しめ 10 問は両方 10/10、`--uncensor` も問題なし（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
+| | 自作の [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF)：エキスパート 384 個中 256 個、コード専用ではない汎用版（BETA、2026-11-03。報告歓迎） | 207.1 GB | RTX 5090 + RAM 96 GB で計測: KL 0.383、swe 3 問 **87.0 tok/s**、難しめ 10 問 8/10、32K の入力処理 1,833 tok/s、日本語・ツール・長文検索 OK、llama.cpp でも動作（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
 | | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | 計測済み、swe-bench 35 問中 34（v1.3.31 の部分実行: 60 問のうち最初の 35 問。全問の再実行は未了） |
 | | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（2026-10-28 の再アップロード版） | 233 GB | 計測済み: 動くがおすすめしない（KL 0.257、旧版 0.36） |
 | | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |

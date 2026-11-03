@@ -91,6 +91,24 @@ replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the
   Both also found the 8K / 32K needle, passed the 7-turn tool session and wrote clean Japanese. Pick `132G` for
   UD-IQ1_M's speed with a slightly lower KL, `139G` for the best quality at this size (15-20% slower decode on
   32 GB + 96 GB). Pack them with `tools/iq_pack.py --compat-bf16 --gguf <folder>/<name>-00001-of-00006.gguf --out <folder>/pack`.
+- **Compact JA256 (BETA, 2026-11-03):** [zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF), `JA256/`.
+  `132G` with 256 of its 384 experts per layer kept (sliced byte for byte, `expert_count` 256): the experts each layer
+  routes to most on Japanese, Chinese, English, code, math and tool-call text, every domain weighted the same, picked on
+  2/3 of the text and checked on the rest (kept routes: ja 94.8%, zh 93.6%, en 90.6%, code 83.6%, math 93.8%, tools
+  93.5%). The Engram table is re-quantized to IQ4_NL from the FP8 table in unsloth's UD-Q4_K_XL (110.6 GB instead of
+  Q5_K's 135.2). Same PC and settings as above:
+
+  | | experts / files | KL (8 texts) | 10 hard tasks: solved / quality / tok/s | swe 3 tasks | 32K prompt |
+  | --- | ---: | ---: | :---: | ---: | ---: |
+  | `JA256` | 88.4 / 207.1 GB | 0.383 | 8/10 / 80.5 / 75.7 | **87.0 tok/s** | **1,833 tok/s** |
+  | `132G` (above) | 132.2 / 275.8 GB | 0.194 | 10/10 / 77.6 / 58.0 | 67.5 tok/s | 865 tok/s |
+  | ISTA GSQ-RCO Coder (192 of 384, code-only selection) | 66.0 / 182.7 GB | 0.582 | 9/10 / 77.5 / 87.1 | 97.0 tok/s | 1,509 tok/s |
+
+  JA256 found the 8K / 32K needle, passed the 7-turn tool session (final report in Japanese) and wrote clean Japanese;
+  the Coder answered all three Japanese prompts in Chinese (a code-only selection keeps 45% of the Japanese routes).
+  Its experts nearly fit in VRAM + the RAM tier (0.1 SSD reads a token against ~1 for `132G`). The task it keeps
+  failing (t046, 3 of 3; the Coder fails it too) shows the cost on hard code: for coding agents keep `132G` / `139G`.
+  Pack it the same way (`--compat-bf16`). llama.cpp `ac8e1694d` runs it as is (`--n-cpu-moe 36` on 32 GB: 15-20 tok/s).
 - UD-IQ1_S and ISTA run but are not recommended: past KL 0.25 the loss shows in the text (our line for a pick).
 - swe-bench rows: the everyday settings + the DSpark drafter (`--dspark`, threshold 0.6), iGPU lane off, 8 tasks.
 - **Keep the iGPU lane on** when the box has one (the default; `STRATA_GLM_IGPU=0` turns it off): it computes RAM-tier

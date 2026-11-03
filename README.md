@@ -26,6 +26,13 @@ GPU. The engine keeps the most-used experts in VRAM, the next ones in pinned RAM
 moves them as the conversation needs them. You get a browser chat and OpenAI- / Anthropic-compatible APIs, with
 thinking and tool calls — all on your own machine.
 
+**New: a smaller DeepSeek V4.1 GGUF that is not code-only — [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF) (207 GB, BETA, 2026-11-03)** —
+256 of 384 experts per layer, chosen by measured routing on chat, math, tool-call, code and multilingual text (kept
+routes: math 94%, tools 94%, English 91%, code 84%, Japanese 95%; a code-only selection keeps 45% of the Japanese
+routes and answered Japanese in Chinese). 87 tok/s on coding tasks on an RTX 5090 + 96 GB (our unpruned 132G: 67.5),
+32K prompts 1,833 tok/s, KL 0.383, 10 hard tasks 8/10. Runs in llama.cpp too. For hard coding work keep the unpruned
+132G / 139G below. Built with trench-gguf's `prune_experts.py` / `requant_table.py`.
+
 **New: our own DeepSeek V4.1 GGUFs for a 32 GB GPU + 96 GB RAM ([BETA](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF))** — all experts re-quantized from
 the original FP4 with LDLQ ([trench-gguf](https://github.com/zephel01/trench-gguf)), no expert dropped. `132G` (speed):
 KL 0.194, 67.5 tok/s on coding tasks; `139G` (quality): KL 0.182, the best quality score at this size (unsloth UD-IQ1_M:
@@ -96,6 +103,7 @@ the APU's iGPU as a lane).
 | DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for quality) | 300 GB | measured on an AI PRO R9700: KL 0.141 (old file 0.188), swe-bench 8 tasks 33.9 tok/s on 32 GB + 96 GB, 29.5 on 32 GB + 64 GB ([which file](docs/deepseek41/README.md#ggufs-that-load)) |
 | | unsloth [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for speed) | 250 GB | measured the same way: KL 0.199 (old 0.270), **40.6 tok/s** on 32 GB + 96 GB, 30.5 on 32 GB + 64 GB |
 | | our [LDLQ 132G / 139G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF) for a 32 GB GPU + 96 GB RAM (BETA, 2026-11-02; reports welcome) | 275.8 / 283.0 GB | measured on an RTX 5090 + 96 GB: KL 0.194 / 0.182, swe 3 tasks 67.5 / 57.9 tok/s (UD-IQ1_M 71.8), 10 hard tasks 10/10 both; `--uncensor` OK ([details](docs/deepseek41/README.md#ggufs-that-load)) |
+| | our [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF): 256 of 384 experts, general-purpose (not code-only) (BETA, 2026-11-03; reports welcome) | 207.1 GB | measured on an RTX 5090 + 96 GB: KL 0.383, swe 3 tasks **87.0 tok/s**, 10 hard tasks 8/10, 32K prompt 1,833 tok/s, Japanese / tools / needles OK; llama.cpp OK ([details](docs/deepseek41/README.md#ggufs-that-load)) |
 | | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | measured, swe-bench 34 of 35 (a partial run, v1.3.31: the first 35 of 60 tasks; the full run is still owed) |
 | | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (re-uploaded 2026-10-28) | 233 GB | measured: runs, not recommended (KL 0.257; old file 0.36) |
 | | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |

@@ -56,6 +56,8 @@ DeepSeek V4.1 Flash 1017 は、GPU 32 GB + RAM 96 GB 向けの zephel01 の LDLQ
 ./setup-deepseek.sh --model v41 --download-model
 ```
 
+小さくて汎用の [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF)（207 GB、エキスパート 384 個中 256 個、日本語は崩れない、32 GB + 96 GB で約 3 割速い）は、まだセットアップに入っていない。`JA256/` フォルダをダウンロードし、[docs/deepseek41/README.md](deepseek41/README.md#ggufs-that-load) のとおり手作業で pack する。
+
 設定 `abyss-dsv41-132g.json` には、モデルカードの普段使いの設定（`STRATA_GLM_TAIL_SKIP=4`、`STRATA_GLM_TAIL_SKIP_DISK=1`、
 `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`、ディスク読み出し 8 本）が入る。V4.1 の DSpark ドラフターはセットアップしない
 （手作業: [docs/deepseek41](deepseek41/README.md)）。ほかの V4.1 の GGUF も、そこに書いた手作業で準備する。
