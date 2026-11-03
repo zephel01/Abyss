@@ -1499,6 +1499,15 @@ static int glm_pack_generate(const Options& o) {
     // in the same decode
     int64_t req_think_budget = 0;
     int32_t req_think_end = -1;
+    // GEN keys end_guard=1 ws_ids=<a,b,..> (the server, STRATA_GLM_END_GUARD): a turn that ends inside the reasoning
+    // closes it instead, and a turn that ends right after it with no answer (only whitespace tokens, ws_ids) takes
+    // the position's most likely other token, once each (Glm5Model::end_guard).  think_end=<id> alone (budget 0)
+    // marks an open reasoning block
+    bool req_end_guard = false;
+    std::vector<int64_t> req_ws_ids;
+    // GEN key end_ids=<a,b,..>: the turn's end tokens as the server stops on them (Qwen3.8's <|im_end|> on the glm
+    // path, whose own end list is GLM's); the guard watches these, else the engine's end list
+    std::vector<int64_t> req_end_ids;
     // GEN key spec=0: this request token by token - no drafter, no verify windows (--bench compares a greedy answer
     // with and without them: greedy speculation must give the same tokens)
     bool req_spec = true;
@@ -1763,7 +1772,10 @@ static int glm_pack_generate(const Options& o) {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
         stop_req.store(false);
         model.force_next(-1);
-        bool in_think = req_think_budget > 0 && req_think_end >= 0;
+        bool in_think = req_think_end >= 0;
+        bool ans_guard = false;   // the answer has had only whitespace since the reasoning closed (end guard armed)
+        const std::vector<int64_t>& guard_ids = req_end_ids.empty() ? eos : req_end_ids;
+        model.end_guard(req_end_guard && in_think ? &guard_ids : nullptr, req_think_end);
         std::vector<int32_t> prompt;
         prompt.reserve(ids.size());
         for (const int64_t t : ids) {
@@ -1895,7 +1907,10 @@ static int glm_pack_generate(const Options& o) {
         // Covers cancellation and every early error as well as the normal end of the request.
         struct HelperScope {
             strata::core::Glm5Model& model;
-            ~HelperScope() { model.expert_helper_decode_end(); }
+            ~HelperScope() {
+                model.expert_helper_decode_end();
+                model.end_guard(nullptr, -1);   // (the end guard is this request's only)
+            }
         } helper_scope{model};
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
@@ -1921,6 +1936,9 @@ static int glm_pack_generate(const Options& o) {
             return 0;
         };
         const auto on_token = [&](int tok) -> bool {
+            if (model.end_guard_fired() && o.serve)
+                std::printf("NOTE the turn ended %s: the model was kept going\n",
+                            ans_guard ? "with no answer after the reasoning" : "inside the reasoning");
             std::printf("T %d\n", tok);
             ++produced;
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
@@ -1938,6 +1956,10 @@ static int glm_pack_generate(const Options& o) {
                     gen_hist.clear();
                 }
             } else if (!in_think) {
+                if (ans_guard && std::find(req_ws_ids.begin(), req_ws_ids.end(), (int64_t) tok) == req_ws_ids.end()) {
+                    model.end_guard(nullptr, -1);   // the answer has begun: an end from here is the model's own
+                    ans_guard = false;
+                }
                 // where the answer stands: inside a tool call's argument value, the place a loop must be closed for
                 // an agent to go on (GLM's single-token tags)
                 // (deepseek4 has no single-token argument tags: its turn ends with <｜end▁of▁sentence｜>, 1)
@@ -1968,10 +1990,15 @@ static int glm_pack_generate(const Options& o) {
                     }
                 }
             }
-            if (in_think && (tok == req_think_end || produced >= req_think_budget || wrap_req.load())) {
+            if (in_think && (tok == req_think_end || (req_think_budget > 0 && produced >= req_think_budget) ||
+                             wrap_req.load())) {
                 if (tok != req_think_end) model.force_next(req_think_end);   // the budget: the next token closes it
                 in_think = false;
                 gen_hist.clear();
+                if (req_end_guard) {   // the answer's first tokens: an end there is guarded (once)
+                    model.end_guard(&guard_ids, -1);
+                    ans_guard = true;
+                }
             }
             // live expert-tier counters for the server's Monitor (serve/server.py parses STAT lines), every 8 tokens
             if (o.serve && model.fast() && produced % 8 == 0) {
@@ -2851,6 +2878,9 @@ static int glm_pack_generate(const Options& o) {
             bool any_key = false, greedy_req = false;
             req_think_budget = 0;
             req_think_end = -1;
+            req_end_guard = false;
+            req_ws_ids.clear();
+            req_end_ids.clear();
             req_spec = true;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
@@ -2875,6 +2905,9 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
+                else if (k == "end_guard") { req_end_guard = std::atoi(v.c_str()) != 0; }
+                else if (k == "ws_ids") { std::string e; parse_i64_list(v.c_str(), req_ws_ids, e); }
+                else if (k == "end_ids") { std::string e; parse_i64_list(v.c_str(), req_end_ids, e); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }

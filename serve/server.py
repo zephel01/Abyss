@@ -545,8 +545,18 @@ class StrataEngine:
         keys = ""
         t = sampling.get("temperature")
         tb, te = sampling.get("_think_budget"), sampling.get("_think_end")   # the run config's (StrataService.run)
-        think = f" think_budget={tb} think_end={te}" if isinstance(tb, int) and isinstance(te, int) and tb > 0 and \
-            te >= 0 else ""
+        think = f" think_end={te}" if isinstance(te, int) and te >= 0 else ""
+        if think and isinstance(tb, int) and tb > 0:
+            think += f" think_budget={tb}"
+        # the end-of-turn guard (STRATA_GLM_END_GUARD, default on): a turn ended inside the reasoning closes it, a turn
+        # ended right after it with nothing but whitespace takes the next most likely token - once each (a quantized
+        # model's empty answers); ws_ids: the whitespace-only tokens that do not count as an answer yet
+        ws = sampling.get("_ws_ids")
+        if think and ws:
+            think += " end_guard=1 ws_ids=" + ",".join(str(int(i)) for i in ws)
+            ends = sampling.get("_end_ids")
+            if ends:   # (the ids the server stops the turn on: the engine's own end list can be another model's)
+                think += " end_ids=" + ",".join(str(int(i)) for i in ends)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
         if isinstance(tune, dict):
@@ -1310,6 +1320,10 @@ class Service:
         self.think_budget = 0
         end = _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # whitespace-only single tokens (the template's "\n\n" after </think>): the end guard's "no answer yet"
+        self.ws_ids = sorted({i for w in ("\n", "\n\n", "\n\n\n", " ", "  ", " \n", "\n ", " \n\n")
+                              for i in tokenizer.encode(w, parse_special=False)[:1]
+                              if len(tokenizer.encode(w, parse_special=False)) == 1})
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -1336,7 +1350,8 @@ class Service:
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
-                if not req.get("reasoning_effort") and not req.get("reasoning") and \
+                # (a request's own reasoning_effort counts whatever its value - false / 0 / "" too: thinking off)
+                if req.get("reasoning_effort") is None and req.get("reasoning") is None and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
             elif not req.get("thinking") and not req.get("output_config"):
@@ -1813,7 +1828,8 @@ class Service:
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
-                in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                thinking_on = bool(thinking) and self.think_end_id is not None
+                in_think = thinking_on and self.think_budget > 0
                 # never let the reasoning use the whole output: a request whose max_tokens is reached while still
                 # thinking ends with no answer at all.  The budget is clamped to leave a quarter of max_tokens (at
                 # least 1024 tokens) for the answer; STRATA_GLM_THINK_RESERVE=<tokens> sets that floor
@@ -1821,8 +1837,14 @@ class Service:
                 if in_think and max_new:
                     reserve = max(int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024), int(max_new) // 4)
                     think_budget = max(1, min(think_budget, int(max_new) - reserve))
-                if in_think:
-                    sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
+                if thinking_on:
+                    # think_end marks the open reasoning block (the loop guard's thinking window, the end guard); the
+                    # budget only when the run config sets one
+                    sampling = {**(sampling or {}), "_think_budget": think_budget if in_think else 0,
+                                "_think_end": self.think_end_id}
+                    if os.environ.get("STRATA_GLM_END_GUARD", "1") != "0" and self.ws_ids:
+                        sampling["_ws_ids"] = self.ws_ids
+                        sampling["_end_ids"] = sorted(self.stop_ids)
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
                     self.engine.generate(ids, max_new, sampling, cancel)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)

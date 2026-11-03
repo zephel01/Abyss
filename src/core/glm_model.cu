@@ -1266,6 +1266,42 @@ bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& 
     return true;
 }
 
+// the end-of-turn guard (end_guard): `sampled` ends the turn where it should not - the reasoning's </think> instead,
+// or the position's most likely token that does not end it.  The sampler's last row (every sampled pick copies its
+// row there; a greedy verify column does not) is read back once: when the end token is not among its 64 most likely,
+// the row is another position's and the pick stands.
+int32_t Glm5Model::end_guard_pick(int32_t sampled) {
+    const std::vector<int64_t>& ids = *guard_ids_;
+    if (std::find(ids.begin(), ids.end(), (int64_t) sampled) == ids.end()) return sampled;
+    guard_ids_ = nullptr;
+    if (guard_tok_ >= 0) {
+        std::fprintf(stderr, "glm end guard: the turn ended inside the reasoning: closed it instead\n");
+        guard_fired_ = true;
+        return guard_tok_;
+    }
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    std::vector<float> row((size_t) g_.n_vocab);
+    cudaSetDevice(tail->dev_);
+    const bool ok = cudaMemcpy(row.data(), tail->sc_ + tail->sc_logits, row.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost) == cudaSuccess;
+    cudaSetDevice(dev_);
+    if (!ok) return sampled;
+    const float ls = row[(size_t) sampled];
+    int above = 0;
+    for (const float v : row) above += v > ls;
+    if (above >= 64) return sampled;
+    int32_t best = -1;
+    for (int64_t t = 0; t < g_.n_vocab; ++t) {
+        if (std::find(ids.begin(), ids.end(), t) != ids.end()) continue;
+        if (best < 0 || row[(size_t) t] > row[(size_t) best]) best = (int32_t) t;
+    }
+    if (best < 0) return sampled;
+    std::fprintf(stderr, "glm end guard: the turn ended with no answer after the reasoning: token %d instead\n", best);
+    guard_fired_ = true;
+    return best;
+}
+
 int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
     // the fast path already ran the greedy argmax on the device at the end of the forward
     if (fast_ != nullptr && sp.greedy && last_tok_ >= 0) return last_tok_;

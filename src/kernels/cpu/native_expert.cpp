@@ -141,7 +141,9 @@ RowsFn exact_rows(int type) {
 // The one-token rows (a decode step's CPU experts) for the formats whose ggml-cpu AVX2 dot rebuilds every value from
 // lookups: IQ3_XXS's four keven_signs loads per 32 values, IQ3_S's 9-bit indices built in vectors and read back from
 // memory.  iq256_rows1 is ggml's dot with two changes - IQ3_XXS's signs built in registers, IQ3_S's
-// indices in scalar registers - so it is bit-identical to ggml's dot (checked here once, 306 results).  On every AVX-2
+// indices in scalar registers, IQ1_S's grid indices and delta sums in vectors (Qwen3.8-Flash-Next 12G32G L448, a
+// gate/up expert from DRAM on the Ryzen AI Max+ 395: 1 thread 1142 -> 944 us, 8 threads 174 -> 142) - so it is
+// bit-identical to ggml's dot (checked here once, 306 results).  On every AVX-2
 // CPU, like ggml-cpu's own dot (it has no AVX-512 form for these).  STRATA_GLM_CPU_1T=0 keeps ggml's dot.
 RowsFn pick_rows1(int type) {
     static const bool on = [] {
@@ -169,6 +171,11 @@ RowsFn pick_rows1(int type) {
     if (!iq256_rows1_supported(type)) return nullptr;
     if (!cpu_avx2_ok() || std::getenv("STRATA_NO_IQ256") != nullptr) return nullptr;
     if (rows_match_ggml(iq256_rows1, type, {1}, 306)) return iq256_rows1;
+    if (type == GGML_TYPE_IQ1_S) {   // the delta term in the other form (MSVC's ggml: the multiply, then the add)
+        iq256_set_iq1s_fused(false);
+        if (rows_match_ggml(iq256_rows1, type, {1}, 306)) return iq256_rows1;
+        iq256_set_iq1s_fused(true);
+    }
     std::fprintf(stderr, "native experts: the one-token %s rows differ from ggml-cpu's dot in this build - "
                          "ggml's dot for them\n", ggml_type_name((ggml_type) type));
     return nullptr;

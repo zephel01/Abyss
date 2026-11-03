@@ -432,6 +432,18 @@ class SamplingKeys(unittest.TestCase):
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
 
+    def test_think_keys(self):
+        # the open reasoning block goes with or without a budget; the end guard only with whitespace ids
+        k = self.keys(temperature=0.7, _think_budget=0, _think_end=151668)
+        self.assertIn("think_end=151668", k)
+        self.assertFalse([x for x in k if x.startswith(("think_budget=", "end_guard=", "ws_ids="))])
+        k = self.keys(temperature=0, _think_budget=4096, _think_end=151668, _ws_ids=[198, 271], _end_ids=[151645])
+        self.assertIn("think_budget=4096", k)
+        self.assertIn("end_guard=1", k)
+        self.assertIn("ws_ids=198,271", k)
+        self.assertIn("end_ids=151645", k)
+        self.assertEqual(self.keys(temperature=0.7, _think_budget=4096, _ws_ids=[198]), ["temperature=0.7"])   # no </think>
+
     def test_uncensor_key(self):
         # the refusal-direction edit's per-request switch: a bool only, greedy and sampled lines alike
         self.assertIn("abl=0", self.keys(temperature=0, uncensor=False))
@@ -854,6 +866,8 @@ class SharedSettings(unittest.TestCase):
         r = self.svc.with_shared({"messages": []}, "openai")
         self.assertEqual(r["reasoning_effort"], "low")
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
+        for own in (False, 0, ""):   # a request's own "off" is kept
+            self.assertEqual(self.svc.with_shared({"reasoning_effort": own}, "openai")["reasoning_effort"], own)
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
 
     def test_off_again(self):

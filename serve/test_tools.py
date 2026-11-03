@@ -49,6 +49,23 @@ def content(events) -> str:
     return "".join(e.text for e in events if e.kind == "content")
 
 
+class SlippedCallOpening(unittest.TestCase):
+    """Qwen-style calls whose opening tag slipped (<=NAME>, <function:NAME>, <NAME> of a declared tool) are calls."""
+
+    def test_slips(self):
+        for opening in ("<=get_weather>", "<function:get_weather>", "<function get_weather>", "<get_weather>"):
+            for pieces in (None, 1, 7):
+                text = "<tool_call>\n" + opening + "\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+                with self.subTest(opening=opening, pieces=pieces):
+                    got = calls(run(text, pieces))
+                    self.assertEqual([(c.name, c.arguments.get("city")) for c in got], [("get_weather", "Paris")])
+
+    def test_undeclared_name_stays_text(self):
+        text = "<tool_call>\n<rm_rf>\n<parameter=path>\n/\n</parameter>\n</function>\n</tool_call>"
+        self.assertEqual(calls(run(text)), [])
+        self.assertIn("rm_rf", content(run(text)))
+
+
 class GlmCalls(unittest.TestCase):
     def test_whole(self):
         c = parse_tool_call(GLM[len("<tool_call>"):-len("</tool_call>")], TOOLS[0])

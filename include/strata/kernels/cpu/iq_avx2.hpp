@@ -20,6 +20,8 @@ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
                 float* const* out, int r0, int r1);
 /// See iq512_set_q5k_fused.
 void iq256_set_q5k_fused(bool fused) noexcept;
+/// IQ1_S's delta term in the one-token rows, as iq512v_set_iq1s_fused.
+void iq256_set_iq1s_fused(bool fused) noexcept;
 
 /// The one-token form (a decode step's experts) for IQ2_XXS, IQ3_XXS and IQ3_S: ggml-cpu's AVX2 dot with a cheaper decode (and AVX-VNNI when cpu_avxvnni_ok()),
 /// bit-identical to it; iq256_rows' arguments, each token in turn.

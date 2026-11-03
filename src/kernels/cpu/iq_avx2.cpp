@@ -29,6 +29,7 @@ namespace strata::kernels::cpu {
 namespace {
 
 std::atomic<bool> q5k_fused{true};   // see iq_avx512.cpp
+std::atomic<bool> iq1s_fused{true};  // IQ1_S's delta term, ggml's `accum1 += d * sumi1` (see iq_avx512_vbmi.cpp)
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
 inline uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -649,14 +650,75 @@ DEFINE_DOT1_IQ3_S(dot1_iq3_s_avx2, false, )
 DEFINE_DOT1_IQ3_S(dot1_iq3_s_vnni, true, TARGET_AVXVNNI)
 #undef DEFINE_DOT1_IQ3_S
 
+// IQ1_S, one token: ggml's AVX2 dot with a block's 32 grid indices built in two vectors instead of 32 scalar
+// shift-and-mask steps (a block's index j is qs[j] | the 3-bit field j % 4 of qh[j / 4], at bits 8-10: qh's word
+// spread over its 4 indices by a byte shuffle, each field lifted to bits 9-11 by a multiply by 512 / 64 / 8 / 1,
+// masked, down by one), and the delta's integer sum (the signed scales times the bsums' pair sums) in one vector.
+// The integer sums are exact and the float steps are ggml's, so the result is bit for bit its dot.
+#define DEFINE_DOT1_IQ1_S(NAME, VNNI_BOOL, ATTR) \
+ATTR inline float NAME(const uint8_t* row, int nb, const block_q8_K* y, bool fused) { \
+    const __m256i lo = _mm256_setr_epi8(0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, \
+                                        4, 5, 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7, 6, 7); \
+    const __m256i hi = _mm256_add_epi8(lo, _mm256_set1_epi8(8)); \
+    const __m256i lift = _mm256_setr_epi16(512, 64, 8, 1, 512, 64, 8, 1, 512, 64, 8, 1, 512, 64, 8, 1); \
+    const __m256i field = _mm256_set1_epi16(0x0E00); \
+    const block_iq1_s* x = (const block_iq1_s*) row; \
+    __m256 accum = _mm256_setzero_ps(); \
+    float accum1 = 0.0f; \
+    alignas(32) uint16_t ix[32]; \
+    alignas(16) int16_t ls[8]; \
+    for (int i = 0; i < nb; ++i) { \
+        const __m128i qh = _mm_loadu_si128((const __m128i*) x[i].qh); \
+        const __m256i qh2 = _mm256_broadcastsi128_si256(qh); \
+        const __m256i f0 = _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(qh2, lo), lift), field), 1); \
+        const __m256i f1 = _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(qh2, hi), lift), field), 1); \
+        _mm256_store_si256((__m256i*) ix, _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) x[i].qs)), f0)); \
+        _mm256_store_si256((__m256i*) (ix + 16), \
+                           _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) (x[i].qs + 16))), f1)); \
+        const __m128i l = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(qh, 11), _mm_set1_epi16(14)), _mm_set1_epi16(1)); \
+        _mm_store_si128((__m128i*) ls, l); \
+        const __m128i pairs = _mm_hadd_epi16(_mm_loadu_si128((const __m128i*) y[i].bsums), \
+                                             _mm_loadu_si128((const __m128i*) (y[i].bsums + 8))); \
+        __m128i s1 = _mm_madd_epi16(_mm_sign_epi16(l, _mm_or_si128(qh, _mm_set1_epi16(1))), pairs); \
+        s1 = _mm_add_epi32(s1, _mm_shuffle_epi32(s1, 0x4e)); \
+        s1 = _mm_add_epi32(s1, _mm_shuffle_epi32(s1, 0xb1)); \
+        const int sumi1 = _mm_cvtsi128_si32(s1); \
+        const int8_t* q8 = y[i].qs; \
+        __m256i sumi = _mm256_setzero_si256(); \
+        STRATA_UNROLL_4 \
+        for (int ib = 0; ib < QK_K / 32; ib += 2) { \
+            const uint16_t* k = ix + 4 * ib; \
+            const __m256i g1 = _mm256_set_epi64x((long long) iq1s_grid[k[3]], (long long) iq1s_grid[k[2]], \
+                                                 (long long) iq1s_grid[k[1]], (long long) iq1s_grid[k[0]]); \
+            const __m256i g2 = _mm256_set_epi64x((long long) iq1s_grid[k[7]], (long long) iq1s_grid[k[6]], \
+                                                 (long long) iq1s_grid[k[5]], (long long) iq1s_grid[k[4]]); \
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32; \
+            const __m256i dot1 = _mm256_maddubs_epi16(_mm256_sign_epi8(g1, g1), _mm256_sign_epi8(q8_1, g1)); \
+            const __m256i dot2 = _mm256_maddubs_epi16(_mm256_sign_epi8(g2, g2), _mm256_sign_epi8(q8_2, g2)); \
+            sumi = DotAcc<VNNI_BOOL>::madd(sumi, dot1, _mm256_set1_epi16(ls[ib])); \
+            sumi = DotAcc<VNNI_BOOL>::madd(sumi, dot2, _mm256_set1_epi16(ls[ib + 1])); \
+        } \
+        const float d = y[i].d * h2f(x[i].d); \
+        accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accum); \
+        accum1 = fused ? std::fma(d, (float) sumi1, accum1) : accum1 + d * (float) sumi1; \
+    } \
+    return hsum_ggml(accum) + IQ1S_DELTA * accum1; \
+}
+DEFINE_DOT1_IQ1_S(dot1_iq1_s_avx2, false, )
+DEFINE_DOT1_IQ1_S(dot1_iq1_s_vnni, true, TARGET_AVXVNNI)
+#undef DEFINE_DOT1_IQ1_S
+
 template <int TY>
 void rows1_avx2(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
+    const bool fused = iq1s_fused.load(std::memory_order_relaxed);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         for (int t = 0; t < nt; ++t) {
             const block_q8_K* y = (const block_q8_K*) act[t];
-            out[t][r] = TY == 16 ? dot1_iq2_xxs_avx2(row, nb, y) : TY == 18 ? dot1_iq3_xxs_avx2(row, nb, y) : dot1_iq3_s_avx2(row, nb, y);
+            out[t][r] = TY == 16 ? dot1_iq2_xxs_avx2(row, nb, y) : TY == 18 ? dot1_iq3_xxs_avx2(row, nb, y)
+                      : TY == 19 ? dot1_iq1_s_avx2(row, nb, y, fused) : dot1_iq3_s_avx2(row, nb, y);
         }
     }
 }
@@ -664,28 +726,34 @@ void rows1_avx2(const uint8_t* w, size_t row_bytes, int n, const void* const* ac
 template <int TY>
 TARGET_AVXVNNI void rows1_vnni(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
+    const bool fused = iq1s_fused.load(std::memory_order_relaxed);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         for (int t = 0; t < nt; ++t) {
             const block_q8_K* y = (const block_q8_K*) act[t];
-            out[t][r] = TY == 16 ? dot1_iq2_xxs_vnni(row, nb, y) : TY == 18 ? dot1_iq3_xxs_vnni(row, nb, y) : dot1_iq3_s_vnni(row, nb, y);
+            out[t][r] = TY == 16 ? dot1_iq2_xxs_vnni(row, nb, y) : TY == 18 ? dot1_iq3_xxs_vnni(row, nb, y)
+                      : TY == 19 ? dot1_iq1_s_vnni(row, nb, y, fused) : dot1_iq3_s_vnni(row, nb, y);
         }
     }
 }
 
 }  // namespace
 
-bool iq256_rows1_supported(int type) noexcept { return type == 16 || type == 18 || type == 21; }
+bool iq256_rows1_supported(int type) noexcept { return type == 16 || type == 18 || type == 19 || type == 21; }
+
+void iq256_set_iq1s_fused(bool fused) noexcept { iq1s_fused.store(fused); }
 
 void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avxvnni_ok()) {
         if (type == 16) rows1_vnni<16>(w, row_bytes, n, act, nt, out, r0, r1);
         else if (type == 18) rows1_vnni<18>(w, row_bytes, n, act, nt, out, r0, r1);
+        else if (type == 19) rows1_vnni<19>(w, row_bytes, n, act, nt, out, r0, r1);
         else if (type == 21) rows1_vnni<21>(w, row_bytes, n, act, nt, out, r0, r1);
     } else {
         if (type == 16) rows1_avx2<16>(w, row_bytes, n, act, nt, out, r0, r1);
         else if (type == 18) rows1_avx2<18>(w, row_bytes, n, act, nt, out, r0, r1);
+        else if (type == 19) rows1_avx2<19>(w, row_bytes, n, act, nt, out, r0, r1);
         else if (type == 21) rows1_avx2<21>(w, row_bytes, n, act, nt, out, r0, r1);
     }
 }

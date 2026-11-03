@@ -17,6 +17,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -442,6 +443,25 @@ def call_name(body: str) -> str:
     return body.split("<", 1)[0].strip()
 
 
+_CALL_OPEN_SLIP = re.compile(r"<(?:=|function\s*:\s*|function\s+)([A-Za-z_][A-Za-z0-9_.\-]*)\s*>")
+_CALL_OPEN_NAME = re.compile(r"<([A-Za-z_][A-Za-z0-9_.\-]*)>")
+
+
+def fix_call_open(body: str, names=()) -> str:
+    """A Qwen-style call body whose opening tag slipped, rewritten as <function=NAME>: `<=NAME>`, `<function:NAME>`
+    or `<function NAME>`, and `<NAME>` when NAME is one of the declared tools (`names`) - quantized Qwen models write
+    these now and then, and the call was returned as text.  Anything else is left as it is."""
+    b = body.lstrip()
+    if b.startswith(FUNC_START):
+        return body
+    m = _CALL_OPEN_SLIP.match(b)
+    if m is None:
+        m = _CALL_OPEN_NAME.match(b)
+        if m is None or m.group(1) not in names:
+            return body
+    return FUNC_START + m.group(1) + ">" + b[m.end():]
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """A call body -> ToolCall, in GLM's form (`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`, what GLM-5.x
     writes: issue #5) or Qwen's (`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>`).  Values are
@@ -864,8 +884,9 @@ class OutputParser:
                 if i < 0:
                     return out
                 body, self.buf = self._body_take()
+                fixed = fix_call_open(body, self.schemas)
                 try:
-                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                    call = parse_tool_call(fixed, self.schemas.get(call_name(fixed)))
                 except ValueError:                  # a malformed call is returned as text, never a failed request
                     call = None
                 if call is None and self.scall is None:

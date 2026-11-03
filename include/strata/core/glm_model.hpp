@@ -241,10 +241,19 @@ public:
     bool vision_reclaim(std::string& err);
     size_t vision_lend_bytes() const;
     int32_t forced(int32_t sampled) {
-        const int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
-        force_tok_ = -1;
-        return t;
+        if (force_tok_ >= 0) {
+            const int32_t t = force_tok_;
+            force_tok_ = -1;
+            return t;
+        }
+        return guard_ids_ != nullptr ? end_guard_pick(sampled) : sampled;
     }
+    /// The end-of-turn guard (serve): while set, a SAMPLED token that is one of `*ids` (the turn's end tokens) is
+    /// replaced, once - by `replace` (>= 0: the reasoning's </think>, for a turn ended inside the reasoning), or
+    /// (-1) by the most likely other token of that position, read from the sampler's logits row.  A quantized
+    /// model can close its reasoning and end the turn at once: an empty answer.  nullptr: off.
+    void end_guard(const std::vector<int64_t>* ids, int32_t replace) { guard_ids_ = ids; guard_tok_ = replace; }
+    bool end_guard_fired() { const bool f = guard_fired_; guard_fired_ = false; return f; }
 
 private:
     bool step(int32_t token, std::string& err);   // one token through all layers
@@ -423,6 +432,10 @@ public:
     bool host_logits_ = true;
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
     int32_t force_tok_ = -1;                               // force_next()
+    const std::vector<int64_t>* guard_ids_ = nullptr;      // end_guard()
+    int32_t guard_tok_ = -1;
+    bool guard_fired_ = false;
+    int32_t end_guard_pick(int32_t sampled);
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     std::map<std::string, const int*> wi32_;               // I32 tensors (deepseek4's hash-routing tables)
     // ---- deepseek4 (src/core/dsv4_fast_path.cu)

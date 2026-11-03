@@ -226,8 +226,12 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
     if (g.q4x && q4d_ == nullptr && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
-        getenv("STRATA_GLM_NO_MTP") == nullptr && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err))
-        return false;
+        getenv("STRATA_GLM_NO_MTP") == nullptr && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err)) {
+        // (refused before it allocated anything - a model its files do not fit: run without the drafter)
+        if (q4d_ != nullptr) return false;
+        std::fprintf(stderr, "qwen4exp: %s - running without the MTP drafter\n", err.c_str());
+        err.clear();
+    }
     return true;
 }
 

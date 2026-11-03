@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.106 - 2026-11-04
+
+- **End-of-turn guard against empty answers (Qwen3.8 and other thinking models on the GLM path)**: a heavily quantized
+  model can close its reasoning and end the turn at once, or end it inside the reasoning - the client gets an empty
+  answer. The server now asks the engine to keep it going once each: a turn ended inside the reasoning closes the
+  reasoning instead, and a turn ended right after it with nothing but whitespace takes the position's most likely
+  other token. Qwen3.8-Flash-Next 12G32G (448 experts, first LDLQ build), 2 x 11 real-use prompts: the guard fired
+  once, on a summary that had come back empty, and the answer was a right summary. `STRATA_GLM_END_GUARD=0` turns it
+  off. The engine watches the end tokens
+  the server stops on (Qwen3.8's `<|im_end|>` on this path; its own list is GLM's).
+- **Tool calls whose opening tag slipped are calls (Qwen style)**: `<=NAME>`, `<function:NAME>`, `<function NAME>`, and
+  `<NAME>` when NAME is a declared tool, are read as `<function=NAME>`; they came back as text before. An undeclared
+  `<NAME>` stays text.
+- **IQ1_S experts on the CPU lane ~18% faster for one token**: the grid indices and the delta sums of a block are built
+  in vectors instead of 32 scalar steps; bit for bit ggml-cpu's dot (checked at start, and in `native_rows_exact_test`).
+  Qwen3.8 12G32G, a gate/up expert from DRAM on a Ryzen AI Max+ 395: 1 thread 1142 -> 944 us, 8 threads 174 -> 142.
+- **Qwen3.8's MTP drafter with a pruned main model**: the drafter's files hold 512 experts and were refused for a model
+  that keeps fewer (448 / 384); they load now (the main model checks what the drafter proposes). A drafter that does
+  not fit at all is now skipped with a log line instead of stopping the engine.
+- **`reasoning_effort` of false / 0 / "" in a request is kept**: the dashboard's shared thinking level used to
+  overwrite it, so a request could not turn thinking off.
+
 ## v1.3.105 - 2026-11-04
 
 - **DeepSeek V4.1 image questions with ISTA-DASLab's new-format GGUF (PR #29, thanks @rS-alonewolf)**: its chat template

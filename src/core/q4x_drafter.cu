@@ -92,8 +92,11 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
         return false;
     }
     const int E = g.n_embd, HE = g.hc * E, LR = g.hc_lr, D = g.head_dim, NH = g.n_head, HD = NH * D,
-              KV = g.attn_head_kv * D, NE = g.n_expert, K = g.n_exp_used, FF = g.n_ff_exp;
-    if (NE != 512 || K != 10 || FF != 640 || E != 2560 || g.hc != 4) {
+              KV = g.attn_head_kv * D, K = g.n_exp_used, FF = g.n_ff_exp;
+    // the drafter's own 512 experts and router (experts.bin): the main model may keep fewer (a pruned build - the
+    // drafter only proposes tokens, the main model checks them)
+    constexpr int NE = 512;
+    if (g.n_expert > NE || K != 10 || FF != 640 || E != 2560 || g.hc != 4) {
         err = "q4x mtp: the runtime files are for 512 experts, top-10, n_ff 640, 4 x 2560 streams";
         return false;
     }
