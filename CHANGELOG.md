@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.104 - 2026-11-03
+
+- **Prompts no longer lose their CPU share to a timing cliff (#24)**: the prompt path gave the CPU none of its staged
+  experts whenever one copy over PCIe timed under two CPU experts at start-up. On a PCIe Gen5 x8 host that line sat
+  inside the CPU timing's own jitter: processes that read 0.155 ms an expert ran 16K prompts at ~2,700 tok/s, those
+  that read 0.159-0.169 ms at ~2,050 for their whole life (the same as `STRATA_GLM_PREFILL_CPU=0`). The gate is gone;
+  the plan already takes an expert only while the host's time stays under the copy stream's, and corrects itself as
+  it goes. Checked on one RTX 5090 with GLM-5.3-Flash UD-IQ2_XXS, iGPU lane off: with 1 CPU thread (the old gate off)
+  10K-token prompts went 321-346 -> 375-388 tok/s; with 16 threads (gate on) 516-524 -> 519-524, unchanged.
+- **A card that holds the whole model keeps it through a prompt**: the prompt path borrows a tail of the expert pool
+  (~3.5-4 GB) while it runs, and that tail used to be cut from the experts' own slots - so even a 72 GB card that holds
+  every expert dropped some to RAM for each prompt and ran them on the CPU lane after it. When VRAM holds every expert,
+  the spares and the tail, the tail now goes on top, and a lent slot's expert moves to a free slot instead of evicting
+  a colder one. Qwen3.8-35B-A3B on an RTX 5090: VRAM hits 99.1-99.4% -> 100%, CPU lane 2-3 experts a token -> 0,
+  10K-token prompts 5,148-5,675 -> 5,921-6,414 tok/s, decode after them +2-6%. `STRATA_GLM_TAIL_ON_TOP=0` keeps the
+  old layout.
+
 ## v1.3.103 - 2026-11-03
 
 - **CPU lane calibration taken again when the CPU is busy (#24)**: the start-up timing of an expert on the CPU decides

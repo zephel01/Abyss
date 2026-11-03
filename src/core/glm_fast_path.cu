@@ -1132,6 +1132,21 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "encoder\n", dev_, per, vb >> 20);
             }
         }
+        // a card that holds every expert, the spares AND the lendable tail (a 48-96 GB card on a model that fits)
+        // gets the tail on top: the main slots keep every expert while a prompt borrows the tail, so a prompt
+        // evicts nothing and the decode after it runs from VRAM alone, not the CPU lane.  (Without the room, the
+        // tail is cut from the experts' slots as before.)  STRATA_GLM_TAIL_ON_TOP=0 keeps the old layout (A/B)
+        int cap_main = g.n_expert + gf::kSpares;
+        if (k_extra > 0 && !F->unified_memory && per >= g.n_expert &&
+            (size_t) (g.n_expert + gf::kSpares + k_extra) * stride_sum <= avail) {
+            const char* tv = getenv("STRATA_GLM_TAIL_ON_TOP");
+            if (tv == nullptr || std::atoi(tv) != 0) {
+                per = g.n_expert + gf::kSpares + k_extra;
+                cap_main += k_extra;
+                std::fprintf(stderr, "glm fast: CUDA%d every expert fits beside the prompt's %d-slot tail: a prompt "
+                                     "evicts none\n", dev_, k_extra);
+            }
+        }
         // the slots PER LAYER: uniform, or - with the pack's expert_counts.txt (tools/glm_expert_prior.py) - by routing
         // share: every layer gets a floor, then each further slot goes to the layer whose next-most-routed expert serves
         // the largest share of its lookups (early layers spread their routing wide and gain the most).
@@ -1182,7 +1197,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe && share[(size_t) il].empty()) all = false;
             if (all) {
-                const int cap = g.n_expert + gf::kSpares;
+                const int cap = cap_main;
                 // the floor: a route's experts, the spares and the lendable tail, +16 when the budget has room for
                 // it (a 24 GB card running the whole model has ~30 slots a layer: the +16 floor alone overran it)
                 // (a pool below the floor - issue #23 - gives every layer what it has: per)
@@ -3452,7 +3467,10 @@ bool Glm5Model::fast_warm(std::string& err) {
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
         auto& P = F->lp[(size_t) il];
-        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n, g.n_expert, gf::kSpares);
+        // (at most every expert: a pool with the prompt's tail on top has more slots than experts + spares, and
+        // the tail stays free for the prompt to borrow)
+        const int nv = std::min({glmfast::warm_pool_slots(F->unified_memory, P.n, g.n_expert, gf::kSpares), g.n_expert,
+                                 (int) order[(size_t) il].size()});
         for (int j = 0; j < nv; ++j) {
             const int e = order[(size_t) il][(size_t) j];
             const int key = il * g.n_expert + e;

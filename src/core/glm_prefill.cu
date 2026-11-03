@@ -1469,6 +1469,12 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             std::sort(cold.begin(), cold.end(), [&](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first < b.first : P.tick[(size_t) a.second] < P.tick[(size_t) b.second];
             });
+            // free main slots first (a card that holds every expert has them): the lent expert moves there and
+            // nothing leaves VRAM
+            std::vector<int> freem;
+            if (!lend_drop)
+                for (int s = P.n_main - 1; s >= 0; --s)
+                    if (P.st[(size_t) s] == FastState::kFree) freem.push_back(s);
             size_t ci = 0;
             for (int s = P.n_main; s < P.n; ++s) {
                 // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
@@ -1476,7 +1482,22 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
-                    if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
+                    bool kept = false;   // (moved to a free main slot: nothing left VRAM)
+                    if (!freem.empty()) {
+                        kept = true;
+                        const int v = freem.back();
+                        freem.pop_back();
+                        if (!ok || !glmfast::cuda_ok(cudaMemcpyAsync(P.slot_ptr(v), P.slot_ptr(s),
+                                                                     F->L[(size_t) il].blob, cudaMemcpyDeviceToDevice,
+                                                                     F->cs), "glm lending move", err))
+                            return false;
+                        upd(F->tab_key((size_t) key), (unsigned long long) P.slot_ptr(v));
+                        F->slot_of[(size_t) key] = v;
+                        P.key[(size_t) v] = P.key[(size_t) s];
+                        P.tick[(size_t) v] = P.tick[(size_t) s];
+                        P.st[(size_t) v] = FastState::kResident;
+                        ++moved;
+                    } else if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
                         const int v = cold[ci++].second;   // the coldest: it goes, this expert takes its slot
                         const int vkey = il * NE + P.key[(size_t) v];
                         const bool parked = park(il, v, vkey);   // (read before the copy below overwrites the slot)
@@ -1498,8 +1519,10 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                         if (!park(il, s, key)) F->left[(size_t) key] = 3;
                         if (!ok) return false;
                     }
-                    ++dropped;
-                    ++F->diag_lend;
+                    if (!kept) {
+                        ++dropped;
+                        ++F->diag_lend;
+                    }
                 } else if (st == FastState::kSpare) {
                     for (int j = 0; j < gf::kSpares; ++j)
                         if (P.spare[j] == s) {
@@ -2550,7 +2573,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return v == nullptr || std::atoi(v) != 0;
     }();
     const auto cpu_lane = [&](int il) {
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
+        // (no gate on the CPU's speed against the link: the plan below takes an expert only while the host's time
+        // stays under the copy stream's, and kappa corrects it as it goes.  The old gate - one copy slower than two
+        // CPU experts - was a cliff: issue #24's Gen5 x8 host timed 0.155 ms an expert in some processes and 0.159-0.169
+        // in others, and those gave the CPU no prompt work at all, 2,050 vs 2,700 tok/s on 16K prompts)
+        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
                !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
                F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
