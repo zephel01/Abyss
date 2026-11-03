@@ -7,6 +7,14 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.105 - 2026-11-04
+
+- **DeepSeek V4.1 image questions with ISTA-DASLab's new-format GGUF (PR #29, thanks @rS-alonewolf)**: its chat template
+  writes `<｜deepseek_image｜>` for an image block itself, which the server took as "the template handles images" and
+  so sent no image rows - a question with an image came back as a 400. The server now places the image rows itself for
+  every V4.1 template; templates that do not write the marker behave as before. A test with one and two images on the
+  new-format template is added (it fails on v1.3.104); checked on an RTX 5090 with both templates.
+
 ## v1.3.104 - 2026-11-03
 
 - **Prompts no longer lose their CPU share to a timing cliff (#24)**: the prompt path gave the CPU none of its staged
