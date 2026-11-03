@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.107 - 2026-11-04
+
+- **Long prompts no longer fail or crash when the CPU share's pinned buffers do not allocate (#31, thanks @LarsDrakblod)**:
+  on a Windows host whose RAM tier pins most of its RAM (RTX 4090, 96 GB, `STRATA_GLM_RAM_GB=72`), the prompt's CPU
+  share asked for more pinned memory as prompts grew; from ~20K tokens the allocation failed and the request came back
+  as a 400, and from ~40K the engine died (0xC0000005). Two faults: a failed allocation kept the new buffer size with a
+  freed pointer, which the next layer wrote through (the crash); and a failure ended the prompt instead of moving the
+  CPU's experts to PCIe. Now a failed allocation leaves every buffer null, the buffers are taken before the CPU's
+  share is planned, and when they do not allocate - or would leave under 2 GB of RAM free - the process's prompts
+  stage every expert over PCIe from then on, with one log line (as `STRATA_GLM_PREFILL_CPU=0`, which the report found
+  avoided both). `STRATA_GLM_PREFILL_PIN_MB=<n>` caps a buffer's size. Checked on an RTX 5090 with DeepSeek V4 0731
+  UD-Q2_K_XL, the failure forced with `STRATA_GLM_PREFILL_PIN_MB=64`: 15K / 30K / 44K-token prompts all answered
+  (1,538 / 2,675 / 2,142 tok/s), and the default setup unchanged (1,284-2,731 / 3,120 / 2,999). The Windows limit itself
+  is not reproduced here.
+
 ## v1.3.106 - 2026-11-04
 
 - **End-of-turn guard against empty answers (Qwen3.8 and other thinking models on the GLM path)**: a heavily quantized

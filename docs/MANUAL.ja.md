@@ -727,6 +727,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_IGPU_EARLY` | オン | SSD からエキスパートを読むルートで、iGPU レーンを読みの後ではなく前に起動する（v1.3.36。DeepSeek V4.1 で −2%、出力は同じ）。`0`: 読みの後 |
 | `STRATA_GLM_IGPU_XQ` | オン | トークンの入力を、GPU が量子化した q8_1 のまま request で受け取り、iGPU で量子化し直さない（v1.3.36、ビット同一）。`0`: iGPU で量子化 |
 | `STRATA_GLM_PREFILL_IGPU` | オン | prompt の RAM 層エキスパートを iGPU で計算する。`0`: CPU のスレッド |
+| `STRATA_GLM_PREFILL_CPU` | オン | prompt で CPU も計算する（PCIe で送る間に、RAM 層のエキスパートの一部をホストで計算）。`0`: すべて PCIe で送る |
+| `STRATA_GLM_PREFILL_PIN_MB` | なし | CPU の分の pinned バッファ 1 つの上限（MB）。収まらない、確保できない、または空き RAM が 2 GB を切るときは、それ以降の prompt はすべてのエキスパートを PCIe で送る（#31）。`0` は `STRATA_GLM_PREFILL_CPU=0` と同じ |
 | `STRATA_GLM_IGPU_FUSED` | オン | prompt の iGPU エキスパートを fused な int8 tensor core カーネルで計算する（gfx1151、IQ2_XS / IQ3_XXS の 4096 / 2048 エキスパート。v1.3.18）。`0`: 1 行ずつのカーネル。`ABYSS_IGPU_FUSED_CHECK=<n>` で最初の n 回を 1 行カーネルと比べる（stderr） |
 | `STRATA_GLM_MV_Q6K_SPLIT` | GPU ごと | `1`: 4,096 block までの Q6_K GEMV を 1 行 4 warp、`0`: 1 warp。未設定: エンジンが GPU ごとに選ぶ（gfx12 は 1 warp。R9700 で DeepSeek V4.1 の 1 トークンあたり 8.8 -> 7.5 ms。ほかは 4 warp）。`./abyss.sh --gpu-tune` が測る（v1.3.51） |
 | `STRATA_GLM_MV_SPLIT` | auto | dense GEMV の 1 行を 4 warp で分担する: 未設定 = 256 block 未満と、Q6_K は 4,096 block まで（v1.3.18）。`0` 常に 1 warp、`2` / `4` 常にその分担。1 warp のときとビットは一致しない |

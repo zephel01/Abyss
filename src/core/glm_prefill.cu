@@ -546,6 +546,9 @@ struct Glm5Model::PrefillState {
     bool x_gathered = false;  // this layer's host rows' x is in out_h (row r = the host's row r), not x_h
     float* out_h = nullptr;
     size_t rows_h_n = 0;
+    // the CPU lane's pinned buffers did not allocate (issue #31: a host whose RAM tier is pinned to the limit):
+    // the prompts of this process give the CPU no experts - PCIe stages them all, as STRATA_GLM_PREFILL_CPU=0
+    bool pin_fail = false;
     std::vector<uint8_t> c_act, c_hq, c_pack;
     std::vector<float> c_ff;
     uint64_t cpu_experts = 0, cpu_rows = 0;
@@ -2577,14 +2580,29 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // stays under the copy stream's, and kappa corrects it as it goes.  The old gate - one copy slower than two
         // CPU experts - was a cliff: issue #24's Gen5 x8 host timed 0.155 ms an expert in some processes and 0.159-0.169
         // in others, and those gave the CPU no prompt work at all, 2,050 vs 2,700 tok/s on 16K prompts)
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 &&
+        return pf_cpu && !S->pin_fail && F->cpu_pool && F->cpu_c_ms > 0.0 &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
                !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
                F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
+    // A failed allocation frees what it had and leaves every pointer null and size 0 (it used to keep the new size
+    // with a freed pointer: the next layer or prompt wrote through it - issue #31's 0xC0000005 at 40K tokens), and
+    // turns the CPU lane off for the process (pin_fail).  Free RAM is checked first: pinned memory the OS cannot back
+    // pages the RAM tier out (#31: 17.8K tokens at 369 tok/s before the failures)
     const auto cpu_bufs = [&](int cpu_nrows) {
-        bool ok = true;
+        bool ok = !S->pin_fail;
+        // STRATA_GLM_PREFILL_PIN_MB=<n>: at most n MB in one of these buffers (a host that pins its RAM tier close to
+        // the OS's limit; 0 = the CPU lane takes no prompt work, as STRATA_GLM_PREFILL_CPU=0)
+        static const long long pin_mb = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_PIN_MB");
+            return v ? std::atoll(v) : -1LL;
+        }();
+        const auto room = [&](size_t bytes) {
+            if (pin_mb >= 0 && (long long) (bytes >> 20) >= pin_mb) return false;
+            const int64_t a = avail_ram_bytes();
+            return a <= 0 || (int64_t) bytes + ((int64_t) 2 << 30) < a;   // (2 GB left over; unknown: try)
+        };
         if (S->xs == nullptr)
             ok = cudaStreamCreateWithFlags(&S->xs, cudaStreamNonBlocking) == cudaSuccess &&
                  cudaEventCreateWithFlags(&S->ev_x, cudaEventDisableTiming) == cudaSuccess &&
@@ -2607,9 +2625,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (ok && S->x_h_n < (size_t) T * E) {
             unreg(S->x_h);
             if (S->x_h) cudaFreeHost(S->x_h);
-            S->x_h_n = (size_t) T * E;
-            ok = cudaHostAlloc((void**) &S->x_h, S->x_h_n * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
-            if (ok) reg(S->x_h, S->x_h_n * sizeof(float));
+            S->x_h = nullptr;
+            S->x_h_n = 0;
+            const size_t n = (size_t) T * E;
+            ok = room(n * sizeof(float)) &&
+                 cudaHostAlloc((void**) &S->x_h, n * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
+            if (ok) {
+                S->x_h_n = n;
+                reg(S->x_h, n * sizeof(float));
+            } else {
+                S->x_h = nullptr;
+            }
         }
         if (ok && S->rows_h_n < (size_t) cpu_nrows) {
             unreg(S->rt_h);
@@ -2618,21 +2644,44 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (S->rt_h) cudaFreeHost(S->rt_h);
             if (S->id_h) cudaFreeHost(S->id_h);
             if (S->out_h) cudaFreeHost(S->out_h);
+            S->rt_h = nullptr;
             S->id_h = nullptr;
+            S->out_h = nullptr;
+            S->rows_h_n = 0;
             // (what this layer needs and a quarter more, at most a chunk's routes: T x K rows of n_embd floats
             // would be 2 GB of pinned memory at 16K tokens)
-            S->rows_h_n = std::min((size_t) T * K, (size_t) cpu_nrows + (size_t) cpu_nrows / 4 + 64);
-            ok = cudaHostAlloc((void**) &S->rt_h, S->rows_h_n * sizeof(int), cudaHostAllocDefault) == cudaSuccess &&
-                 cudaHostAlloc((void**) &S->out_h, S->rows_h_n * E * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
-            if (ok && F->igpu_rows != nullptr &&
-                cudaHostAlloc((void**) &S->id_h, S->rows_h_n * sizeof(int), cudaHostAllocDefault) == cudaSuccess) {
-                for (size_t r = 0; r < S->rows_h_n; ++r) S->id_h[r] = (int) r;
-                reg(S->id_h, S->rows_h_n * sizeof(int));
-            }
+            const size_t n = std::min((size_t) T * K, (size_t) cpu_nrows + (size_t) cpu_nrows / 4 + 64);
+            ok = room(n * (E * sizeof(float) + 2 * sizeof(int))) &&
+                 cudaHostAlloc((void**) &S->rt_h, n * sizeof(int), cudaHostAllocDefault) == cudaSuccess &&
+                 cudaHostAlloc((void**) &S->out_h, n * E * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
             if (ok) {
-                reg(S->rt_h, S->rows_h_n * sizeof(int));
-                reg(S->out_h, S->rows_h_n * E * sizeof(float));
+                S->rows_h_n = n;
+                if (F->igpu_rows != nullptr &&
+                    cudaHostAlloc((void**) &S->id_h, n * sizeof(int), cudaHostAllocDefault) == cudaSuccess) {
+                    for (size_t r = 0; r < n; ++r) S->id_h[r] = (int) r;
+                    reg(S->id_h, n * sizeof(int));
+                } else {
+                    S->id_h = nullptr;
+                }
+                reg(S->rt_h, n * sizeof(int));
+                reg(S->out_h, n * E * sizeof(float));
+            } else {
+                if (S->rt_h) cudaFreeHost(S->rt_h);
+                if (S->out_h) cudaFreeHost(S->out_h);
+                S->rt_h = nullptr;
+                S->out_h = nullptr;
             }
+        }
+        if (!ok && !S->pin_fail) {
+            cudaGetLastError();   // (a failed cudaHostAlloc leaves its error behind)
+            S->pin_fail = true;
+            unreg(S->x_h);
+            if (S->x_h) cudaFreeHost(S->x_h);
+            S->x_h = nullptr;
+            S->x_h_n = 0;
+            std::fprintf(stderr, "glm prefill: the CPU lane's pinned host buffers did not allocate (%.0f MB of RAM free) "
+                                 "- prompts stage every expert over PCIe from here on (as STRATA_GLM_PREFILL_CPU=0)\n",
+                         (double) avail_ram_bytes() / 1048576.0);
         }
         return ok;
     };
@@ -2948,11 +2997,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // (not when the iGPU takes them: after the plan only their rows go down, gathered - a 32K chunk's whole x is
         // 537 MB, ~80 ms over PCIe Gen4 x4, against ~70 MB for a layer's ~4K host rows)
         bool x_down = false;
-        if (Ly.moe && cpu_lane(il) && !(igpu_lane(il) && S->id_h != nullptr)) {
-            if (!cpu_bufs(0)) {
-                err = "glm prefill: the CPU experts' host buffers did not allocate";
-                return false;
-            }
+        if (Ly.moe && cpu_lane(il) && !(igpu_lane(il) && S->id_h != nullptr) && cpu_bufs(0)) {
             cudaEventRecord(S->ev_x, s);
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
             cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
@@ -3174,7 +3219,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const bool ig = igpu_lane(il);
             const double row_ms = row_env != nullptr ? std::atof(row_env) : ig ? S->row_ms_ig : S->row_ms;
             const double fix_ms = ig ? S->fix_ms_ig : 2.0 * F->cpu_c_ms;
-            if (cpu_lane(il)) {
+            // (the host buffers for the most rows the CPU may take, before it takes any: when they do not allocate,
+            // every expert stays on PCIe - the prompt goes on instead of failing)
+            if (cpu_lane(il) && cpu_bufs(moe_window_rows((size_t) T, g))) {
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;
                 for (size_t i = 0; i < staged.size(); ++i) {
