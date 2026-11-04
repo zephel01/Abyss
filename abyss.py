@@ -795,7 +795,8 @@ def cuda_lib_dirs(nvcc: str) -> list:
     base = Path(nvcc).resolve().parent.parent
     if base == Path("/usr"):
         return []
-    return [str(p) for p in (base / "lib64", base / "targets" / "x86_64-linux" / "lib") if p.is_dir()]
+    return [str(p) for p in (base / "lib64", base / "targets" / "x86_64-linux" / "lib", base / "targets" / "sbsa-linux" / "lib")
+            if p.is_dir()]
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC

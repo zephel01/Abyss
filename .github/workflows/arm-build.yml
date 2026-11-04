@@ -1,0 +1,78 @@
+# The engine on aarch64 Linux (NVIDIA DGX Spark: Grace CPU, GB10 GPU = sm_121, CUDA 13) - no GPU on the runner, so
+# this is the build and the CPU-only tests: the CPU kernels' portable path (src/kernels/cpu/expert_portable.cpp, the
+# probes answering no, ggml-cpu's own dots) and the CUDA engine compiled for sm_121a with the arm64 (sbsa) toolkit.
+name: arm-build
+
+on:
+  push:
+    branches: [arm-prep, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # llama.cpp's ggml at the commit the build pins (CMakeLists.txt's FetchContent, third_party/ggml/VERSION.txt)
+  LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+  CUDA_VER: "13-3"         # the apt packages' suffix (cuda-*-13-3)
+  CUDA_HOME: /usr/local/cuda-13.3
+
+jobs:
+  cpu-tests:
+    # the CPU-side libraries and their tests, no CUDA: the kernels' non-x86 path, ggml-cpu on NEON
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: Build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=ON
+          -DSTRATA_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: CPU tests
+        # (expert_parity / pool_test / pool_stress report SKIPPED on a CPU without the x86 kernels)
+        run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+  cuda-build:
+    # the engine as the DGX Spark builds it: CUDA 13 for arm64 (sbsa), sm_121a (GB10; the MXFP4 MMQ kernels use the
+    # arch-specific FP4 MMA, as 120a does on RTX 50)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: CUDA toolkit (arm64 sbsa, NVIDIA's apt repository)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          # nvcc + cudart + CCCL (cub, thrust) and cuBLAS - all the engine links (CUDA::cudart, CUDA::cublas)
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ \
+            cuda-minimal-build-${CUDA_VER} libcublas-dev-${CUDA_VER}
+          "$CUDA_HOME/bin/nvcc" --version
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a
+          -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"
+          -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF
+          -DSTRATA_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build the engine
+        # (nvcc takes 2-4 GB a job on the big kernels; the runner's cores and RAM allow one a core)
+        run: cmake --build build --target strata -j"$(nproc)"
+      - name: The engine starts
+        # no GPU here: only that the binary loads and runs on aarch64 (its usage text, exit 0)
+        run: ./build/strata --help > /dev/null

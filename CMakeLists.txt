@@ -21,6 +21,21 @@ endif()
 # instead of this machine's (Strata's own AVX-512 kernels are per-file and chosen at run time either way), and
 # the MSVC runtime linked in, so no Visual C++ redistributable is needed.
 option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
+# x86-64 (and x86): the CPU expert kernels are AVX-512 / AVX2 code, and ggml's portable baseline is AVX2.  Any other
+# CPU (aarch64: NVIDIA DGX Spark's Grace) builds src/kernels/cpu/expert_portable.cpp in place of those kernels, and
+# ggml picks its own flags for it (include/strata/arch.hpp: STRATA_X86, the same answer from the compiler).
+set(_strata_proc "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_GENERATOR_PLATFORM)
+  set(_strata_proc "${CMAKE_GENERATOR_PLATFORM}")   # (Visual Studio: -A x64 / -A ARM64)
+endif()
+string(TOLOWER "${_strata_proc}" _strata_proc)
+if(_strata_proc MATCHES "^(x86_64|amd64|x64|i[3-6]86|x86|win32)$")
+  set(STRATA_X86 ON)
+else()
+  set(STRATA_X86 OFF)
+  message(STATUS "Strata: ${CMAKE_SYSTEM_PROCESSOR} is not x86 - the CPU expert kernels (AVX) are left out "
+                 "(src/kernels/cpu/expert_portable.cpp)")
+endif()
 if(STRATA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
@@ -804,13 +819,21 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
-            src/kernels/cpu/exl3_cpu.cpp)
+if(STRATA_X86)
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
+              src/kernels/cpu/exl3_cpu.cpp)
+else()
+  # not x86: the probes answer no and expert_portable.cpp stands in for expert.cpp and every AVX kernel file
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert_portable.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/exl3_ref.cpp src/kernels/cpu/exl3_cpu.cpp)
+endif()
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
+if(NOT STRATA_X86)
+  # (no AVX kernel sources to give flags to)
+elseif(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
@@ -841,11 +864,14 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_PORTABLE)
+  if(STRATA_PORTABLE AND STRATA_X86)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
       set(${_f} ON CACHE BOOL "" FORCE)
     endforeach()
+  elseif(STRATA_PORTABLE)
+    # not x86: ggml's own baseline for the architecture (aarch64: armv8 + its default extensions), no x86 flags
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
@@ -865,11 +891,15 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx512_vbmi.cpp src/kernels/cpu/iq_avx2.cpp
-                                           src/kernels/cpu/kq_avx512.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  if(STRATA_X86)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx512_vbmi.cpp
+                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp)
+  endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(MSVC)
+  if(NOT STRATA_X86)
+    # (expert_portable.cpp has the i-quant / K-quant kernels' entry points: no AVX sources)
+  elseif(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx512_vbmi.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -1048,9 +1078,11 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
   endif()
 
-  add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
-  target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
-  add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  if(STRATA_X86)   # (the VNNI kernel against itself: refuses a CPU without it, so not built where it never runs)
+    add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+    target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
+    add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)

@@ -60,6 +60,8 @@ namespace gf = strata::kernels::glmf;
 inline void cpu_relax() {
 #if defined(__x86_64__) && !defined(_WIN32)
     asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__) && !defined(_WIN32)
+    asm volatile("yield" ::: "memory");
 #endif
 }
 

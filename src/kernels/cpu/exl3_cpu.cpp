@@ -1279,7 +1279,12 @@ void exl3_cpu_rows_acc_n(const Exl3Part& m, const float* const* xh, int n, int k
     exl3_cpu_rows_acc_cols_n(m, xh, n, ks0, ks1, 0, m.n, acc);
 }
 
+#if defined(EXL3_X86)
 size_t exl3_cpu_gemm_scratch() { return (size_t) kGemmK * 128; }
+#else
+// (kGemmK is the x86 tiers' chunk; the same size here, though the portable band_gemm below uses no scratch)
+size_t exl3_cpu_gemm_scratch() { return (size_t) 256 * 128; }
+#endif
 
 void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0, int nb, float* const* acc,
                         float* wc) {

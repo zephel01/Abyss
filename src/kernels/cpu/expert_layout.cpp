@@ -1,13 +1,17 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 
+#include "strata/arch.hpp"
+
 #include <cstdio>
 #include <cstdlib>
+#if STRATA_X86
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
 #else
 #include <cpuid.h>
+#endif
 #endif
 #include <fstream>
 #include <sstream>
@@ -19,6 +23,7 @@ ExpertLayout g_layout;
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
+#if STRATA_X86
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
@@ -169,6 +174,23 @@ void act_quant_any(const float* x, int n, ActQ& a) {
     else if (!cpu_avx2_ok()) no_simd_kernel("the Q8_1 activation quantizer");
     else act_quant_q8_1_avx2(x, n, a);
 }
+#else
+// Not an x86 CPU (aarch64: the DGX Spark's Grace): none of the AVX kernels is built (CMakeLists.txt compiles
+// expert_portable.cpp in their place), so every probe answers no and the callers take ggml-cpu's own dots (native
+// experts), the scalar activation quantizer, or the GPU.
+bool cpu_avx512_ok() { return false; }
+bool cpu_avx512bw_ok() { return false; }
+bool cpu_avx2_ok() { return false; }
+bool cpu_avxvnni_ok() { return false; }
+
+void q2_rows_any(const uint8_t*, size_t, int, const ActQ* const*, int, float* const*, int, int) {
+    std::fprintf(stderr, "maya: the Q2_0 expert rows have x86 (AVX2 / AVX-512) kernels only and this CPU is not x86\n");
+    std::abort();
+}
+
+// expert_portable.cpp's act_quant_q8_1 is the scalar loop, bit for bit what the AVX-512 one computes
+void act_quant_any(const float* x, int n, ActQ& a) { act_quant_q8_1(x, n, a); }
+#endif
 
 #if !defined(STRATA_NATIVE_EXPERTS)
 // Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.

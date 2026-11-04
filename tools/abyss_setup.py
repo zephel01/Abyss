@@ -138,13 +138,14 @@ def verified(path: Path, sha: str) -> bool:
 
 
 def cuda_archs(arch: str | None, gpus) -> str:
-    """The CUDA architectures to compile for: --arch, else every chosen GPU's (RTX 50: 120a) - "86;120a" for an
-    RTX 3090 beside an RTX 5090."""
+    """The CUDA architectures to compile for: --arch, else every chosen GPU's (RTX 50: 120a, DGX Spark's GB10: 121a) -
+    "86;120a" for an RTX 3090 beside an RTX 5090."""
     if arch:
         return arch
     out = []
     for g in gpus:
-        cc = "120a" if g["arch"] == "120" else g["arch"]   # RTX 50: the MXFP4 MMQ kernels use Blackwell's FP4 MMA
+        # RTX 50 (12.0) and GB10 (12.1): the MXFP4 MMQ kernels use Blackwell's FP4 MMA, the arch-specific target's
+        cc = {"120": "120a", "121": "121a"}.get(g["arch"], g["arch"])
         if cc not in out:
             out.append(cc)
     return ";".join(sorted(out, key=lambda c: int(c.rstrip("a"))))

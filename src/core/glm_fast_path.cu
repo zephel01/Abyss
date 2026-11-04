@@ -2669,6 +2669,12 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         }
     }
     if (threads <= 0 || g.n_embd > gf::kMaxEmbd || g.n_exp_used > gf::kMaxK) return true;
+#if !(defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+    // (strata/arch.hpp's STRATA_X86, spelt out: that header brings immintrin.h, kept out of nvcc's way)
+    std::fprintf(stderr, "glm fast: CPU lane: not an x86 CPU - no AVX kernels, its experts run on ggml-cpu's own dots "
+                         "(EXL3: the scalar tier); the timing against the GPU's link decides the split "
+                         "(STRATA_GLM_CPU_LANE=0: off)\n");
+#endif
     namespace kc = strata::kernels::cpu;
     F->cpu_fmt.assign(F->L.size(), kc::NativeFmt{});
     int il_cal = -1;
