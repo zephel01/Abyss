@@ -7,6 +7,14 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.111 - 2026-11-05
+
+- **Qwen3.8 with the MTP drafter no longer breaks on long prompts.** From about 20K tokens in one prompt chunk, the
+  prompt path's drafter step wrote past its scratch region into the experts kept in VRAM for decoding, and the first
+  speculative window failed with `glm router: ... invalid expert ID or non-finite score` (seen with Swift 1.5 IQ2_XS
+  from 24K; other Qwen3.8 builds were exposed the same way). The step now works on groups of rows that fit; the output
+  is bit-identical and no extra VRAM is lent.
+
 ## v1.3.110 - 2026-11-05
 
 - **Two fixes for the Qwen3.8 two-GPU split (BETA), reported in #35** (thanks to tjm8874 for the real two-card runs):

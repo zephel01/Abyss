@@ -477,6 +477,7 @@ struct Glm5Model::PrefillState {
     int* iota = nullptr;
     uint8_t* v41_rows = nullptr;     // deepseek41: each row's top-k selection and candidate mask (prefill_v41_row)
     uint8_t* uni = nullptr;          // the per-layer region (KDA | DSA | dense | MoE)
+    size_t uni_bytes = 0;            // ... its size (a chunk's use of it must stay inside: the pool's experts follow)
     // weight scratch
     uint16_t* w16 = nullptr;
     int64_t w16_elems = 0;
@@ -1265,6 +1266,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->iota = a.take<int>(T * (size_t) g.n_exp_used + kIdsPad);
     S->v41_rows = prefill_v41_row() ? a.take<uint8_t>(T * prefill_v41_row()) : nullptr;
     S->uni = S->arena + a.off;
+    S->uni_bytes = uni;
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
     S->T_bound = Tn;
     S->need = c.off;
@@ -4076,9 +4078,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         int Tv = 0;
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
         if (Tv > 0) {
-            Carve c{S->uni};
-            float* xn = c.take<float>((size_t) Tv * g.hc * E);
-            q35::hc4_combine_norm(S->R, S->ffn, S->post, g.hc, F->q4_head[0], g.norm_eps, E, g.hc, Tv, xn, s);
+            // (the combine's normed rows are not read: a group of rows at a time in the per-layer region - the
+            // chunk's Tv rows at once overran it past ~20K tokens into the decode's resident experts after the lent
+            // bytes; Swift IQ2_XS + MTP from 24K: a router's non-finite score in the first window)
+            const size_t row_b = (size_t) g.hc * E * sizeof(float);
+            const int grp = (int) std::max<size_t>(1, std::min<size_t>((size_t) Tv, (S->uni_bytes - 256) / row_b));
+            float* xn = (float*) S->uni;
+            for (int r0 = 0; r0 < Tv; r0 += grp)
+                q35::hc4_combine_norm(S->R + (size_t) r0 * g.hc * E, S->ffn + (size_t) r0 * E, S->post + (size_t) r0 * g.hc,
+                                      g.hc, F->q4_head[0], g.norm_eps, E, g.hc, std::min(grp, Tv - r0), xn, s);
             std::vector<int32_t> nx(next_ids, next_ids + Tv);
             if (!q4x_mtp_rows(p0, Tv, S->R, (size_t) g.hc * E, nx.data(), err)) return false;
             S->mark("mtp_rows", s);
