@@ -1832,10 +1832,13 @@ class Service:
                 in_think = thinking_on and self.think_budget > 0
                 # never let the reasoning use the whole output: a request whose max_tokens is reached while still
                 # thinking ends with no answer at all.  The budget is clamped to leave a quarter of max_tokens (at
-                # least 1024 tokens) for the answer; STRATA_GLM_THINK_RESERVE=<tokens> sets that floor
+                # least 1024 tokens, STRATA_GLM_THINK_RESERVE=<tokens>) for the answer - but the floor never takes more
+                # than half of max_tokens: with max_tokens <= 1024 it used to leave the reasoning ONE token (issue
+                # #33: max_tokens 800 -> the model answered without thinking; a 1-bit build echoed the prompt back)
                 think_budget = self.think_budget
                 if in_think and max_new:
-                    reserve = max(int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024), int(max_new) // 4)
+                    floor = int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024)
+                    reserve = max(int(max_new) // 4, min(floor, int(max_new) // 2))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve))
                 if thinking_on:
                     # think_end marks the open reasoning block (the loop guard's thinking window, the end guard); the
