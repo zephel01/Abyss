@@ -611,15 +611,10 @@ void Glm5Model::prefill_cap(int T, const char* why) {
     PrefillState* S = pf_;
     if (S == nullptr || S->T <= T) return;
     const size_t E = (size_t) g_.n_embd;
-    const bool hop = S->hop_h != nullptr;
     cudaSetDevice(dev_);
     cudaFreeHost(S->emb_h);
     S->emb_h = nullptr;
-    if (hop) cudaFreeHost(S->hop_h);
-    S->hop_h = nullptr;
-    if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
-        (hop && cudaHostAlloc((void**) &S->hop_h, (size_t) 2 * T * 4 * E * sizeof(float), cudaHostAllocDefault) !=
-                    cudaSuccess)) {
+    if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "glm prefill: CUDA%d pinned staging did not allocate - token by token\n", dev_);
         prefill_destroy();
@@ -1012,9 +1007,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_counts, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_base, 4096 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**) &S->h_bounds, 8192 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
-        (l1_ < g.n_layers && cudaHostAlloc((void**) &S->hop_h, (size_t) 2 * T * 4 * E * sizeof(float),
-                                           cudaHostAllocDefault) != cudaSuccess)) {
+        cudaHostAlloc((void**) &S->h_bounds, 8192 * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "glm prefill: CUDA%d pinned staging did not allocate - token by token\n", dev_);
         prefill_destroy();
@@ -4425,12 +4418,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
                 const size_t hop = (size_t) T * 4 * E * sizeof(float);
-                cudaSetDevice(prev->dev_);
-                cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, prev->fast_->cs);
-                cudaEventRecord(SP->ev_hop, prev->fast_->cs);
+                if (!prev->hop_link_->send(HopLink::kPrompt, SP->R, hop, prev->fast_->cs, err) ||
+                    !prev->hop_link_->recv(HopLink::kPrompt, m->pf_->R, hop, m->fast_->cs, err))
+                    return false;
                 cudaSetDevice(m->dev_);
-                cudaStreamWaitEvent(m->fast_->cs, SP->ev_hop, 0);
-                cudaMemcpyAsync(m->pf_->R, SP->hop_h, hop, cudaMemcpyHostToDevice, m->fast_->cs);
                 m->pos_ = p0;
                 toks_to(m, c);
                 std::vector<int32_t> nx;
@@ -4479,7 +4470,6 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
         bool stop = false;
         std::string stage_err;
-        const size_t slot = (size_t) Tc * 4 * E;
         const auto fail = [&](std::string e) {
             std::lock_guard<std::mutex> lk(mu);
             if (stage_err.empty()) stage_err = std::move(e);
@@ -4494,9 +4484,12 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 cv.wait(lk, [&] { return consumed[(size_t) k] >= c - 1 || stop; });
                 if (stop) return false;
             }
-            cudaMemcpyAsync(m->pf_->hop_h + (size_t) (c & 1) * slot, m->pf_->R, (size_t) T * 4 * E * sizeof(float),
-                            cudaMemcpyDeviceToHost, m->fast_->cs);
             std::string e;
+            if (!m->hop_link_->send(HopLink::kPipe0 + (c & 1), m->pf_->R, (size_t) T * 4 * E * sizeof(float),
+                                    m->fast_->cs, e)) {
+                fail(e);
+                return false;
+            }
             if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop out", e)) {
                 fail(e);
                 return false;
@@ -4522,9 +4515,12 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     }
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + cs[(size_t) c];
-                    cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
-                                    (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
                     std::string e2;
+                    if (!up->hop_link_->recv(HopLink::kPipe0 + (c & 1), m->pf_->R, (size_t) T * 4 * E * sizeof(float),
+                                             m->fast_->cs, e2)) {
+                        fail(e2);
+                        return;
+                    }
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
                         fail(e2);
                         return;

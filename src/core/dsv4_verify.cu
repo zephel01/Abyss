@@ -218,10 +218,6 @@ bool Glm5Model::verify_alloc(std::string& err) {
     ok = ok && cudaHostGetDevicePointer((void**) &V->tok_in_d, V->tok_in_h, 0) == cudaSuccess;
     ok = ok && cudaHostAlloc((void**) &V->emb_h, (size_t) TM * E * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
     ok = ok && cudaEventCreateWithFlags(&V->done, cudaEventDisableTiming) == cudaSuccess;
-    if (split_next_)
-        ok = ok && cudaHostAlloc((void**) &V->hop_h, (size_t) TM * g.hc * E * sizeof(float), cudaHostAllocDefault) ==
-                       cudaSuccess &&
-             cudaEventCreateWithFlags(&V->ev_hop, cudaEventDisableTiming) == cudaSuccess;
     V->hpart_n = (size_t) (4 * E / 512) * 36 + 64;
     const int KS = std::max(8, g.n_exp_used);   // a column's route slots (8, or the top-k above it: qwen4exp 10)
     V->hq_n = (size_t) KS * g.n_ff_exp / 32 * kQ8;
@@ -1150,15 +1146,17 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
                 cudaStreamWaitEvent(s, V->ev_fin[t / grp], 0);
             }
         }
+        HopLink* L = hop_link_.get();
+        const size_t pb = HCE * sizeof(float);
+        if (!L->reserve(HopLink::kWindow, (size_t) T * pb, err)) return false;
         for (int t = 0; t < T; ++t)
-            cudaMemcpyAsync(V->hop_h + (size_t) t * HCE, Ro[(size_t) t], HCE * sizeof(float), cudaMemcpyDeviceToHost, s);
-        cudaEventRecord(V->ev_hop, s);
-        cudaSetDevice(B->dev_);
+            if (!L->put(HopLink::kWindow, (size_t) t * pb, Ro[(size_t) t], pb, s, err)) return false;
+        if (!L->ship(HopLink::kWindow, (size_t) T * pb, s, err)) return false;
         cudaStream_t sb = B->fast_->cs;
-        cudaStreamWaitEvent(sb, V->ev_hop, 0);
+        if (!L->arrive(HopLink::kWindow, sb, err)) return false;
         for (int t = 0; t < T; ++t)
-            cudaMemcpyAsync(VB->R + (size_t) t * 2 * HCE, V->hop_h + (size_t) t * HCE, HCE * sizeof(float),
-                            cudaMemcpyHostToDevice, sb);
+            if (!L->get(HopLink::kWindow, (size_t) t * pb, VB->R + (size_t) t * 2 * HCE, pb, sb, err)) return false;
+        cudaSetDevice(B->dev_);
         return true;
     }
     const auto fn = w16_.find("output_hc_fn.weight");
@@ -1759,13 +1757,11 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                               g.hc, T, V->q4_xn, s);
         Glm5Model* B = split_next_.get();
         auto* VB = (VerifyBuf*) B->vb_;
-        cudaMemcpyAsync(V->hop_h, V->R, (size_t) T * HE * sizeof(float), cudaMemcpyDeviceToHost, s);
-        cudaEventRecord(V->ev_hop, s);
+        if (!hop_link_->send(HopLink::kWindow, V->R, (size_t) T * HE * sizeof(float), s, err)) return false;
         if (prof) F->mark("q4w_hop");
-        cudaSetDevice(B->dev_);
         cudaStream_t sb = B->fast_->cs;
-        cudaStreamWaitEvent(sb, V->ev_hop, 0);
-        cudaMemcpyAsync(VB->R, V->hop_h, (size_t) T * HE * sizeof(float), cudaMemcpyHostToDevice, sb);
+        if (!hop_link_->recv(HopLink::kWindow, VB->R, (size_t) T * HE * sizeof(float), sb, err)) return false;
+        cudaSetDevice(B->dev_);
         return true;
     }
     // the output hyper-connection (the last FFN combined first) and the head

@@ -1041,6 +1041,7 @@ bool Glm5Geometry::from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out,
 // ================================ the model ================================
 
 Glm5Model::~Glm5Model() {
+    hop_link_.reset();   // (its buffers and events are on both parts' devices: before either goes)
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
     fast_destroy();
@@ -1385,8 +1386,13 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             }
         for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get()) p->prefill_cap(tmin, "the split's smallest");
     }
+    std::string how;
+    for (Glm5Model* p = this; p->split_next_ != nullptr; p = p->split_next_.get()) {
+        p->hop_link_ = HopLink::make(p->dev_, p->split_next_->dev_);
+        how += (how.empty() ? "" : ", ") + std::string(p->hop_link_->name());
+    }
     cudaSetDevice(dev_);
-    std::fprintf(stderr, "glm split: layers %s (one 64 KB host hop per boundary per token)\n", where.c_str());
+    std::fprintf(stderr, "glm split: layers %s (a hop per boundary per token: %s)\n", where.c_str(), how.c_str());
     return true;
 }
 

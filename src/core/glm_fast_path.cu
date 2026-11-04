@@ -897,7 +897,6 @@ bool Glm5Model::fast_setup(std::string& err) {
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**) &F->hop_h, (size_t) g.hc * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_in_h, 64 * sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: pinned staging did not allocate";
@@ -6323,13 +6322,11 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         FastState* FA = tail->fast_;
         FastState* FB = B->fast_;
         const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
-        cudaSetDevice(tail->dev_);
-        cudaMemcpyAsync(FA->hop_h, tail->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-        cudaEventRecord(FA->ev_hop, FA->cs);
+        if (!tail->hop_link_->send(HopLink::kToken, tail->state_, hop, FA->cs, err) ||
+            !tail->hop_link_->recv(HopLink::kToken, B->state_, hop, FB->cs, err))
+            return false;
         cudaSetDevice(B->dev_);
         B->pos_ = pos_;
-        cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-        cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
         if (!B->fast_layers(p, true, err)) return false;
         tail = B;
     }
@@ -6672,13 +6669,11 @@ bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
     const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
     FastState* FA = fast_;
     FastState* FB = B->fast_;
-    cudaSetDevice(dev_);
-    cudaMemcpyAsync(FA->hop_h, state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-    cudaEventRecord(FA->ev_hop, FA->cs);
+    if (!hop_link_->send(HopLink::kStep, state_, hop, FA->cs, err) ||
+        !hop_link_->recv(HopLink::kStep, B->state_, hop, FB->cs, err))
+        return false;
     cudaSetDevice(B->dev_);
     B->pos_ = p + 1;
-    cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-    cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
     return B->fast_layers(p, true, err);
 }
 
@@ -6765,10 +6760,9 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     ++spec_n_;
     const int sl = (int) (p & 1);
     // the head group's last part hands the residual to the tail group through hl's slots (events on hl's device)
-    cudaSetDevice(hl->dev_);
-    cudaMemcpyAsync(hl->spec_hop_h_[sl], hl->state_, (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyDeviceToHost,
-                    hl->fast_->cs);
-    cudaEventRecord(hl->spec_ev_hop_[sl], hl->fast_->cs);
+    if (!hl->hop_link_->send(HopLink::kSpec0 + sl, hl->state_, (size_t) g.hc * g.n_embd * sizeof(float), hl->fast_->cs,
+                             err))
+        return false;
     cudaSetDevice(dev_);
     if (sprof) {
         cudaEventRecord(spec_ev_[1], F->cs);
@@ -6816,10 +6810,10 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         m->pos_ = p + 1;
     }
     cudaSetDevice(dev_);
-    cudaStreamWaitEvent(F->cs, head->spec_ev_hop_[sl], 0);
+    if (!head->hop_link_->arrive(HopLink::kSpec0 + sl, F->cs, err)) return false;
     if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
-    cudaMemcpyAsync(state_, head->spec_hop_h_[sl], (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyHostToDevice,
-                    F->cs);
+    if (!head->hop_link_->get(HopLink::kSpec0 + sl, 0, state_, (size_t) g.hc * g.n_embd * sizeof(float), F->cs, err))
+        return false;
     if (!fast_layers(p, true, err)) return false;
     if (split_next_) {
         // a tail GROUP: down its parts; the last one computes the head and the argmax
@@ -6872,17 +6866,6 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     Glm5Model* B = hl->split_next_.get();     // the tail group's first part (spec_tail runs from it)
     Glm5Model* TL = spec_tail_last();         // its last: the token, the logits and the draft block live there
     const Glm5Geometry& g = g_;
-    if (hl->spec_hop_h_[0] == nullptr) {
-        cudaSetDevice(hl->dev_);
-        for (int i = 0; i < 2; ++i)
-            if (cudaHostAlloc((void**) &hl->spec_hop_h_[i], (size_t) g.hc * g.n_embd * sizeof(float),
-                              cudaHostAllocPortable) != cudaSuccess ||
-                cudaEventCreateWithFlags(&hl->spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
-                err = "glm spec: the hop slots did not allocate";
-                return false;
-            }
-        cudaSetDevice(dev_);
-    }
     // the head group's recurrent-state backups (each part on its own device and stream)
     const auto kda_all = [&](bool restore) -> bool {
         for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {

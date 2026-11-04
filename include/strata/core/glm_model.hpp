@@ -23,6 +23,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/core/hop_link.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -295,6 +296,8 @@ public:
                                                            // against this part's VRAM cap)
     size_t vram_cap() const;                               // STRATA_GLM_VRAM_GB_PARTS[part_] or STRATA_GLM_VRAM_GB, bytes
     std::unique_ptr<Glm5Model> split_next_;
+    // the hand-over to split_next_ (hop_link.hpp: STRATA_GLM_HOP picks how the rows move)
+    std::unique_ptr<HopLink> hop_link_;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
     bool step_layers(int64_t p, std::string& err);
