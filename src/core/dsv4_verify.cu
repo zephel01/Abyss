@@ -940,8 +940,13 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         cudaEventRecord(F->ev_gs, s);
         F->gap_emb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
-    // ---- the parts in order (one part: this one's layers and the head)
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+    // ---- the parts in order (one part: this one's layers and the head; qwen4exp's split: this part's, which hands the
+    //      columns to the next part's port)
+    if (next_port_ != nullptr) {
+        V->T = T;
+        if (!verify_part_q4x(toks, p0, err)) return false;
+    }
+    for (Glm5Model* m = next_port_ != nullptr ? nullptr : this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
         m->pos_ = pos_;
         ((VerifyBuf*) m->vb_)->T = T;
@@ -955,11 +960,16 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     auto* VT = (VerifyBuf*) tail->vb_;
     if (gp) cudaEventRecord(F->ev_ge[F->gap_par], s);
     const auto tw = std::chrono::steady_clock::now();
-    cudaError_t done;
-    while ((done = cudaEventQuery(VT->done)) == cudaErrorNotReady) {
-        if (F->token_spin) glmfast::cpu_relax(); else std::this_thread::yield();
+    if (next_port_ != nullptr) {   // (the last part's argmax per column, through the port)
+        if (!next_port_->window_wait(win_tok_, err)) return false;
+        cudaSetDevice(dev_);
+    } else {
+        cudaError_t done;
+        while ((done = cudaEventQuery(VT->done)) == cudaErrorNotReady) {
+            if (F->token_spin) glmfast::cpu_relax(); else std::this_thread::yield();
+        }
+        if (!glmfast::cuda_ok(done, "deepseek4 verify completion", err)) return false;
     }
-    if (!glmfast::cuda_ok(done, "deepseek4 verify completion", err)) return false;
     if (win_timing) {
         wt_lap(wt_wait);
         if (++wt_n % 32 == 0)
@@ -967,8 +977,8 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
                                  "%.2f ms launching them, %.2f ms waiting for the device\n", wt_n, wt_pre / wt_n,
                          wt_eng / wt_n, wt_launch / wt_n, wt_wait / wt_n);
     }
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
-        if (!m->fast_->route_ok(err)) return false;
+    for (Glm5Model* m = this; m != nullptr; m = next_port_ != nullptr ? nullptr : m->split_next_.get())
+        if (!m->fast_->route_ok(err)) return false;   // (the port's parts: in window_wait)
     if (gf::launch_errors() > 0) {
         err = "deepseek4 verify: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
         return false;
@@ -990,13 +1000,14 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
                          V->pipe_choice[T] ? "batched" : "pipelined");
         }
     }
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+    for (Glm5Model* m = this; m != nullptr; m = next_port_ != nullptr ? nullptr : m->split_next_.get())
         if (m->fast_->prof_on) {
             cudaSetDevice(m->dev_);
             m->fast_->collect();
         }
+    if (next_port_ != nullptr) next_port_->collect();
     cudaSetDevice(dev_);
-    last_tok_ = VT->tok_h[T - 1];
+    last_tok_ = next_port_ != nullptr ? win_tok_[(size_t) T - 1] : VT->tok_h[T - 1];
     if (gp) fast_gap_mark(tw);
     return true;
 }
@@ -1755,14 +1766,9 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
         // through the pinned hop buffer (as a token's hop; its first layer reads combined residuals)
         q35::hc4_combine_norm(V->R, V->ffn, V->q4_inj[1], g.hc, F->L[(size_t) (l1_ - 1)].hc4[0].norm, g.norm_eps, E,
                               g.hc, T, V->q4_xn, s);
-        Glm5Model* B = split_next_.get();
-        auto* VB = (VerifyBuf*) B->vb_;
         if (!hop_link_->send(HopLink::kWindow, V->R, (size_t) T * HE * sizeof(float), s, err)) return false;
         if (prof) F->mark("q4w_hop");
-        cudaStream_t sb = B->fast_->cs;
-        if (!hop_link_->recv(HopLink::kWindow, VB->R, (size_t) T * HE * sizeof(float), sb, err)) return false;
-        cudaSetDevice(B->dev_);
-        return true;
+        return next_port_->window(toks, p0, pos_, err);
     }
     // the output hyper-connection (the last FFN combined first) and the head
     if (!q4x_mix_cols(V->R, T, F->q4_head[0], F->q4_head_w[0], F->q4_head_w[1], nullptr, V->ffn, V->q4_inj[1], nullptr,
@@ -1861,11 +1867,17 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
 }
 
 int Glm5Model::verify_argmax(int i) const {
+    if (next_port_ != nullptr) return i >= 0 && (size_t) i < win_tok_.size() ? win_tok_[(size_t) i] : -1;
     const auto* V = (const VerifyBuf*) verify_tail()->vb_;
     return V != nullptr && i >= 0 && i < V->T ? V->tok_h[i] : -1;
 }
 
 bool Glm5Model::verify_logits(int i, std::vector<float>& out, std::string& err) {
+    if (next_port_ != nullptr) {
+        const bool ok = next_port_->window_logits(i, out, err);
+        cudaSetDevice(dev_);
+        return ok;
+    }
     const Glm5Model* tail = verify_tail();
     auto* V = (VerifyBuf*) tail->vb_;
     if (V == nullptr || i < 0 || i >= V->T) {
@@ -1885,6 +1897,12 @@ bool Glm5Model::verify_logits(int i, std::vector<float>& out, std::string& err) 
 }
 
 int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::string& err) {
+    if (next_port_ != nullptr) {
+        if (sp.greedy) return verify_argmax(i);
+        const int tok = next_port_->window_sample(i, sp, err);
+        cudaSetDevice(dev_);
+        return tok;
+    }
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     auto* V = (VerifyBuf*) tail->vb_;
@@ -1899,6 +1917,67 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
     const int tok = tail->fast_sample(sp, err);
     cudaSetDevice(dev_);
     return tok;
+}
+
+
+// ---------------------------------------------------------------- a later part's side of the window requests
+// (qwen4exp's splits: part_port.hpp.)  The columns' rows from `in`, this part's layers (verify_part_q4x hands them on
+// to the next part's port, the last part runs the head), then the last part's argmax per column.
+bool Glm5Model::part_window(HopLink* in, const std::vector<int32_t>& toks, int64_t p0, int64_t pos, std::string& err) {
+    auto* V = (VerifyBuf*) vb_;
+    if (V == nullptr && !verify_alloc(err)) return false;
+    V = (VerifyBuf*) vb_;
+    const int T = (int) toks.size();
+    if (!in->recv(HopLink::kWindow, V->R, (size_t) T * g_.hc * g_.n_embd * sizeof(float), fast_->cs, err)) return false;
+    cudaSetDevice(dev_);
+    pos_ = pos;
+    V->T = T;
+    return verify_part_q4x(toks, p0, err);
+}
+
+bool Glm5Model::part_window_wait(std::vector<int32_t>& argmax, std::string& err) {
+    FastState* F = fast_;
+    if (next_port_ != nullptr) return next_port_->window_wait(argmax, err) && F->route_ok(err);
+    auto* V = (VerifyBuf*) vb_;
+    cudaSetDevice(dev_);
+    cudaError_t done;
+    while ((done = cudaEventQuery(V->done)) == cudaErrorNotReady) {
+        if (F->token_spin) glmfast::cpu_relax(); else std::this_thread::yield();
+    }
+    if (!glmfast::cuda_ok(done, "qwen4exp window completion", err) || !F->route_ok(err)) return false;
+    argmax.assign(V->tok_h, V->tok_h + V->T);
+    return true;
+}
+
+int Glm5Model::part_window_sample(int i, strata::kernels::SamplerParams& sp, std::string& err) {
+    if (next_port_ != nullptr) return next_port_->window_sample(i, sp, err);
+    auto* V = (VerifyBuf*) vb_;
+    if (V == nullptr || i < 0 || i >= V->T) {
+        err = "qwen4exp window: no such column";
+        return -1;
+    }
+    if (sp.greedy) return V->tok_h[i];
+    cudaSetDevice(dev_);
+    cudaMemcpyAsync(sc_ + sc_logits, V->logits + (size_t) i * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float),
+                    cudaMemcpyDeviceToDevice, fast_->cs);
+    return fast_sample(sp, err);
+}
+
+bool Glm5Model::part_window_logits(int i, std::vector<float>& out, std::string& err) {
+    if (next_port_ != nullptr) return next_port_->window_logits(i, out, err);
+    auto* V = (VerifyBuf*) vb_;
+    if (V == nullptr || i < 0 || i >= V->T) {
+        err = "qwen4exp window: no such column";
+        return false;
+    }
+    cudaSetDevice(dev_);
+    out.resize((size_t) g_.n_vocab);
+    if (cudaMemcpy(out.data(), V->logits + (size_t) i * g_.n_vocab, out.size() * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "qwen4exp window: logits copy";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace strata::core

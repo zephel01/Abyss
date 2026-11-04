@@ -1041,6 +1041,7 @@ bool Glm5Geometry::from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out,
 // ================================ the model ================================
 
 Glm5Model::~Glm5Model() {
+    next_port_.reset();
     hop_link_.reset();   // (its buffers and events are on both parts' devices: before either goes)
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
@@ -1306,6 +1307,11 @@ int32_t Glm5Model::end_guard_pick(int32_t sampled) {
 int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
     // the fast path already ran the greedy argmax on the device at the end of the forward
     if (fast_ != nullptr && sp.greedy && last_tok_ >= 0) return last_tok_;
+    if (next_port_ != nullptr) {   // (qwen4exp's split: sampled on the last part)
+        const int tok = next_port_->sample(sp, err);
+        cudaSetDevice(dev_);
+        return tok;
+    }
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     if (tail->d_tok_ == nullptr) {
@@ -1389,6 +1395,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
     std::string how;
     for (Glm5Model* p = this; p->split_next_ != nullptr; p = p->split_next_.get()) {
         p->hop_link_ = HopLink::make(p->dev_, p->split_next_->dev_);
+        if (g_.q4x) p->next_port_ = PartPort::local(p->split_next_.get(), p->hop_link_.get());
         how += (how.empty() ? "" : ", ") + std::string(p->hop_link_->name());
     }
     cudaSetDevice(dev_);

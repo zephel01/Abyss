@@ -4414,8 +4414,17 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             const bool half_ok = prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data());
             pf_kv_cut_ = -1;
             if (!half_ok) return false;
+            if (next_port_ != nullptr) {   // (qwen4exp's split: the chunk's rows to the next part, which runs the rest)
+                std::vector<int32_t> nx;
+                next_of(c, nx);
+                if (!hop_link_->send(HopLink::kPrompt, pf_->R, (size_t) T * 4 * E * sizeof(float), fast_->cs, err) ||
+                    !next_port_->prompt(HopLink::kPrompt, p0, T, tokens.data() + cs[(size_t) c], nx.data(), true, err))
+                    return false;
+                cudaSetDevice(dev_);
+            }
             Glm5Model* prev = this;
-            for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
+            for (Glm5Model* m = next_port_ != nullptr ? nullptr : split_next_.get(); m != nullptr;
+                 m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
                 const size_t hop = (size_t) T * 4 * E * sizeof(float);
                 if (!prev->hop_link_->send(HopLink::kPrompt, SP->R, hop, prev->fast_->cs, err) ||
@@ -4530,11 +4539,19 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         consumed[(size_t) k - 1] = c + 1;
                     }
                     cv.notify_all();
-                    m->pos_ = p0;
-                    toks_to(m, c);
                     std::vector<int32_t> nx;
-                    if (m->mtp_il_ >= 0 || m->q4d_ != nullptr) next_of(c, nx);
-                    if (!m->prefill_half(p0, T, e2, nx.empty() ? nullptr : nx.data())) {
+                    bool ran;
+                    if (up->next_port_ != nullptr) {   // (qwen4exp's split: the rows are in - the part runs them)
+                        next_of(c, nx);
+                        ran = up->next_port_->prompt(-1, p0, T, tokens.data() + cs[(size_t) c], nx.data(), false, e2);
+                        cudaSetDevice(m->dev_);
+                    } else {
+                        m->pos_ = p0;
+                        toks_to(m, c);
+                        if (m->mtp_il_ >= 0 || m->q4d_ != nullptr) next_of(c, nx);
+                        ran = m->prefill_half(p0, T, e2, nx.empty() ? nullptr : nx.data());
+                    }
+                    if (!ran) {
                         fail(e2.empty() ? "glm prefill: part " + std::to_string(k) + " failed" : e2);
                         return;
                     }
@@ -4634,6 +4651,30 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                      100.0 * (double) rr / (double) std::max<uint64_t>(1, rr + rs), plan);
     }
     return true;
+}
+
+
+// a later part's side of PartPort::prompt (qwen4exp's splits): the chunk's rows from `in` (slot < 0: already in), its
+// tokens, the layers here with the drafter's next tokens; chain: the rows on to the next part, which runs the rest
+bool Glm5Model::part_prompt(HopLink* in, int slot, int64_t p0, int T, const int32_t* toks, const int32_t* next,
+                            bool chain, std::string& err) {
+    PrefillState* S = pf_;
+    if (S == nullptr) {
+        err = "glm split: a later part has no prompt path";
+        return false;
+    }
+    const size_t hop = (size_t) T * 4 * g_.n_embd * sizeof(float);
+    if (slot >= 0 && !in->recv(slot, S->R, hop, fast_->cs, err)) return false;
+    cudaSetDevice(dev_);
+    pos_ = p0;
+    if (S->toks_d != nullptr)   // (pageable source: the copy completes before the call returns)
+        cudaMemcpyAsync(S->toks_d, toks, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, fast_->cs);
+    if (g_.v41 || g_.q4x) S->toks_h.assign(toks, toks + T);
+    const bool drafter = mtp_il_ >= 0 || q4d_ != nullptr;
+    if (!prefill_half(p0, T, err, drafter ? next : nullptr)) return false;
+    if (!chain || next_port_ == nullptr) return true;
+    const int s2 = slot >= 0 ? slot : (int) HopLink::kPrompt;
+    return hop_link_->send(s2, S->R, hop, fast_->cs, err) && next_port_->prompt(s2, p0, T, toks, next, true, err);
 }
 
 }  // namespace strata::core

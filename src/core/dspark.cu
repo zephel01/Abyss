@@ -721,7 +721,11 @@ void Glm5Model::dspark_window(int64_t p0, int T) {
 }
 
 void Glm5Model::spec_rewind(int64_t pos) {
-    if (g_.qwen35()) {   // (the delta-net and conv states: not rings - replayed; each part of a split its own layers)
+    if (g_.qwen35() && next_port_ != nullptr) {   // (qwen4exp's split: the later parts through the port)
+        verify_rewind_q35(pos);
+        next_port_->rewind(pos);
+        cudaSetDevice(dev_);
+    } else if (g_.qwen35()) {   // (the delta-net and conv states: not rings - replayed; each part of a split its own layers)
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             if (m != this) cudaSetDevice(m->dev_);
             m->verify_rewind_q35(pos);
@@ -731,6 +735,13 @@ void Glm5Model::spec_rewind(int64_t pos) {
     }
     pos_ = pos;
     dspark_settle();
+}
+
+void Glm5Model::part_rewind(int64_t pos) {
+    cudaSetDevice(dev_);
+    verify_rewind_q35(pos);
+    pos_ = pos;
+    if (next_port_ != nullptr) next_port_->rewind(pos);
 }
 
 void Glm5Model::dspark_upload() {
@@ -763,10 +774,9 @@ void Glm5Model::dspark_upload() {
 }
 
 bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
-    if (Glm5Model* dm = mtp_part(); dsp_ == nullptr && dm->q35_mtp_on()) {   // (qwen35moe's NextN block / qwen4exp's
-        if (dm == this) return q35_mtp_draft(y, drafts, conf, err);           //  layer: a split's last part)
-        cudaSetDevice(dm->dev_);
-        const bool ok = dm->q35_mtp_draft(y, drafts, conf, err);
+    if (dsp_ == nullptr && q35_mtp_on()) return q35_mtp_draft(y, drafts, conf, err);   // (qwen35moe's NextN block)
+    if (dsp_ == nullptr && next_port_ != nullptr && next_port_->mtp_on()) {   // (qwen4exp's layer: the last part)
+        const bool ok = next_port_->mtp_draft(y, drafts, conf, err);
         cudaSetDevice(dev_);
         return ok;
     }

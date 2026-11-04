@@ -6262,15 +6262,26 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
             F->gap_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - F->t_ready).count();
     }
     // between tokens (every device idle): finished promotions go live in the device tables
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
-        cudaSetDevice(m->dev_);
-        if (!m->fast_boundary(err)) return false;
+    if (next_port_ != nullptr) {   // (qwen4exp's split: the later parts through their port)
+        cudaSetDevice(dev_);
+        if (!fast_boundary(err) || !next_port_->boundary(err)) return false;
+    } else {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!m->fast_boundary(err)) return false;
+        }
     }
     cudaSetDevice(dev_);
     const auto te0 = std::chrono::steady_clock::now();
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
-        m->fast_->cur_tok = token;   // hash routing
-        m->fast_->cur_img = is_image_pos(p);   // deepseek41: exp_probs_b_vl for an image row (false: no image rows set)
+    if (next_port_ != nullptr) {
+        fast_->cur_tok = token;
+        fast_->cur_img = is_image_pos(p);
+        next_port_->token_meta(token, is_image_pos(p));
+    } else {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            m->fast_->cur_tok = token;   // hash routing
+            m->fast_->cur_img = is_image_pos(p);   // deepseek41: exp_probs_b_vl for an image row (false: no image rows set)
+        }
     }
     // ---- the embedding row (host-dequantized from the shard mapping) -> the 4 streams
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
@@ -6304,16 +6315,38 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         cudaEventRecord(F->ev_gs, F->cs);
         F->gap_emb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
     }
-    if (Glm5Model* dm = mtp_part(); dm->q35_mtp_on()) {   // (qwen35moe's drafter: the last row; a split's last part)
-        if (dm != this) cudaSetDevice(dm->dev_);
-        const bool ok = dm->q35_mtp_pend_commit(token, err);
-        if (dm != this) cudaSetDevice(dev_);
-        if (!ok) return false;
+    if (q35_mtp_on()) {   // (qwen35moe's drafter: the last row; on a split's last part through the port)
+        if (!q35_mtp_pend_commit(token, err)) return false;
+    } else if (next_port_ != nullptr && next_port_->mtp_on() && !next_port_->mtp_commit(token, err)) {
+        return false;
     }
     if (!fast_layers(p, false, err)) return false;
     if (dsp_ != nullptr && !dspark_commit(p, 1, false, F->cs)) {
         err = "dspark: the context commit";
         return false;
+    }
+    if (next_port_ != nullptr) {
+        // qwen4exp's split: the residual to the next part, which runs the rest (the head on the last part); the
+        // token comes back from the last part
+        const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
+        if (!hop_link_->send(HopLink::kToken, state_, hop, F->cs, err) || !next_port_->token(p, pos_, err)) return false;
+        const int t = next_port_->token_wait(err);
+        cudaSetDevice(dev_);
+        if (t < 0 || !F->route_ok(err)) return false;
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            err = std::string("glm fast: ") + cudaGetErrorString(e);
+            return false;
+        }
+        if (gf::launch_errors() > 0) {
+            err = "glm fast: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+            return false;
+        }
+        last_tok_ = t;
+        if (F->prof_on) F->collect();
+        next_port_->collect();
+        cudaSetDevice(dev_);
+        return true;
     }
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
     // copy ordered on the devices by an event (the host never waits between the parts)
@@ -6578,7 +6611,7 @@ const char* Glm5Model::lane_kind() const {
 
 const char* Glm5Model::drafter_kind() const {
     if (dsp_ != nullptr) return "dspark";
-    if (mtp_part()->q35_mtp_on()) return g_.q4x ? "mtp" : "nextn";
+    if (chain_mtp_on()) return g_.q4x ? "mtp" : "nextn";
     return has_mtp() ? "mtp" : "none";
 }
 
@@ -7349,6 +7382,7 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
         F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++F->tokens;
     }
+    if (host_logits_ && next_port_ != nullptr) return next_port_->logits(logits_out, err);
     if (host_logits_) {
         Glm5Model* tail = this;
         while (tail->split_next_) tail = tail->split_next_.get();
@@ -7362,6 +7396,147 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
         cudaSetDevice(dev_);
     }
     return true;
+}
+
+
+// ---------------------------------------------------------------- a later part's side of the PartPort requests
+// (qwen4exp's splits: part_port.hpp.)  Each runs this part's share and hands the rest to its own next port.
+bool Glm5Model::part_boundary(std::string& err) {
+    cudaSetDevice(dev_);
+    if (!fast_boundary(err)) return false;
+    return next_port_ == nullptr || next_port_->boundary(err);
+}
+
+void Glm5Model::part_token_meta(int32_t token, bool image) {
+    fast_->cur_tok = token;
+    fast_->cur_img = image;
+    if (next_port_ != nullptr) next_port_->token_meta(token, image);
+}
+
+bool Glm5Model::part_token(HopLink* in, int64_t p, int64_t pos, std::string& err) {
+    FastState* F = fast_;
+    const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
+    if (!in->recv(HopLink::kToken, state_, hop, F->cs, err)) return false;
+    cudaSetDevice(dev_);
+    pos_ = pos;
+    if (!fast_layers(p, true, err)) return false;
+    if (next_port_ != nullptr)
+        return hop_link_->send(HopLink::kToken, state_, hop, F->cs, err) && next_port_->token(p, pos, err);
+    return part_token_head(p, err);
+}
+
+// the last part: the drafter's pending row, the head and its argmax (ev_done marks it)
+bool Glm5Model::part_token_head(int64_t p, std::string& err) {
+    FastState* FT = fast_;
+    const Glm5Geometry& g = g_;
+    cudaSetDevice(dev_);
+    if (g.qwen35()) {
+        if (g.q4x && q35_mtp_on()) q35_mtp_pend_set(p, state_);   // (qwen4exp: the final residual)
+    } else if (g.v41) {
+        if (!dsv41_head(err)) return false;
+    } else if (g.dsv4()) {
+        if (!dsv4_head(err)) return false;
+    } else {
+        gf::head_prep(state_, w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq, FT->cs);
+    }
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (!gf::mv(&o, 1, FT->cs)) {
+        err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
+        return false;
+    }
+    if (FT->zero_copy) {
+        gf::argmax(sc_ + sc_logits, g.n_vocab, FT->tok_hd, FT->cs);
+    } else {
+        gf::argmax(sc_ + sc_logits, g.n_vocab, FT->tok, FT->cs);
+        cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
+    }
+    cudaEventRecord(FT->ev_done, FT->cs);
+    return true;
+}
+
+int Glm5Model::part_token_wait(std::string& err) {
+    FastState* F = fast_;
+    if (next_port_ != nullptr) {
+        const int t = next_port_->token_wait(err);
+        return t >= 0 && F->route_ok(err) ? t : -1;
+    }
+    cudaSetDevice(dev_);
+    const auto tw = std::chrono::steady_clock::now();
+    bool warned = false;
+    cudaError_t done;
+    while ((done = cudaEventQuery(F->ev_done)) == cudaErrorNotReady) {
+        if (F->token_spin) cpu_relax(); else std::this_thread::yield();
+        if (!warned && std::chrono::steady_clock::now() - tw > std::chrono::seconds(10)) {
+            warned = true;
+            part_stall_report(pos_ - 1);
+        }
+    }
+    if (!glmfast::cuda_ok(done, "glm token completion", err) || !F->route_ok(err)) return -1;
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm fast: ") + cudaGetErrorString(e);
+        return -1;
+    }
+    last_tok_ = F->tok_h[0];
+    return last_tok_;
+}
+
+int Glm5Model::part_sample(strata::kernels::SamplerParams& sp, std::string& err) {
+    if (next_port_ != nullptr) return next_port_->sample(sp, err);
+    return fast_sample(sp, err);
+}
+
+bool Glm5Model::part_logits(std::vector<float>& out, std::string& err) {
+    if (next_port_ != nullptr) return next_port_->logits(out, err);
+    cudaSetDevice(dev_);
+    out.resize((size_t) g_.n_vocab);
+    if (cudaMemcpy(out.data(), sc_ + sc_logits, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+        err = "glm fast: logits copy";
+        return false;
+    }
+    return true;
+}
+
+bool Glm5Model::part_mtp_on() const { return q35_mtp_on() || (next_port_ != nullptr && next_port_->mtp_on()); }
+
+bool Glm5Model::part_mtp_commit(int32_t token, std::string& err) {
+    if (!q35_mtp_on()) return next_port_ == nullptr || next_port_->mtp_commit(token, err);
+    cudaSetDevice(dev_);
+    return q35_mtp_pend_commit(token, err);
+}
+
+bool Glm5Model::part_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
+    if (!q35_mtp_on()) {
+        if (next_port_ != nullptr) return next_port_->mtp_draft(y, drafts, conf, err);
+        err = "glm split: no drafter on the later parts";
+        return false;
+    }
+    cudaSetDevice(dev_);
+    return q35_mtp_draft(y, drafts, conf, err);
+}
+
+bool Glm5Model::part_route_ok(std::string& err) {
+    return fast_->route_ok(err) && (next_port_ == nullptr || next_port_->route_ok(err));
+}
+
+void Glm5Model::part_collect() {
+    if (fast_->prof_on) {
+        cudaSetDevice(dev_);
+        fast_->collect();
+    }
+    if (next_port_ != nullptr) next_port_->collect();
+}
+
+void Glm5Model::part_stall_report(int64_t p) {
+    const FastState* Fm = fast_;
+    unsigned int last = 0;
+    for (int i = 0; i < gf::kRingSize; ++i) last = std::max(last, (unsigned int) Fm->ring_h[i].seq);
+    std::fprintf(stderr, "glm fast: token %lld waiting > 10 s - CUDA%d last route seq %u, last answer %u\n",
+                 (long long) p, dev_, last, (unsigned int) Fm->resp_h->seq);
+    if (next_port_ != nullptr) next_port_->stall_report(p);
 }
 
 }  // namespace strata::core

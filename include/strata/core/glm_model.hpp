@@ -24,6 +24,7 @@
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/hop_link.hpp"
+#include "strata/core/part_port.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -298,6 +299,32 @@ public:
     std::unique_ptr<Glm5Model> split_next_;
     // the hand-over to split_next_ (hop_link.hpp: STRATA_GLM_HOP picks how the rows move)
     std::unique_ptr<HopLink> hop_link_;
+    // qwen4exp's splits: the next part as a PartPort (part_port.hpp) - this part never reaches into its state
+    std::unique_ptr<PartPort> next_port_;
+    std::vector<int32_t> win_tok_;   // (the last window's argmax per column, from the last part)
+
+public:
+    // ---- a later part's side of the PartPort requests (LocalPort calls them; a part server would too)
+    bool part_boundary(std::string& err);
+    void part_token_meta(int32_t token, bool image);
+    bool part_token(HopLink* in, int64_t p, int64_t pos, std::string& err);
+    int part_token_wait(std::string& err);
+    int part_sample(strata::kernels::SamplerParams& sp, std::string& err);
+    bool part_logits(std::vector<float>& out, std::string& err);
+    bool part_prompt(HopLink* in, int slot, int64_t p0, int T, const int32_t* toks, const int32_t* next, bool chain,
+                     std::string& err);
+    bool part_window(HopLink* in, const std::vector<int32_t>& toks, int64_t p0, int64_t pos, std::string& err);
+    bool part_window_wait(std::vector<int32_t>& argmax, std::string& err);
+    int part_window_sample(int i, strata::kernels::SamplerParams& sp, std::string& err);
+    bool part_window_logits(int i, std::vector<float>& out, std::string& err);
+    void part_rewind(int64_t pos);
+    bool part_mtp_on() const;
+    bool part_mtp_commit(int32_t token, std::string& err);
+    bool part_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    bool part_route_ok(std::string& err);
+    void part_collect();
+    void part_stall_report(int64_t p);
+    bool part_token_head(int64_t p, std::string& err);   // (the last part: the head and its argmax)
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
     bool step_layers(int64_t p, std::string& err);
@@ -549,16 +576,10 @@ public:
                          int* tok_out, std::string& err);
     bool q4x_mtp_rows(int64_t p0, int n, const float* Rin, size_t r_stride, const int32_t* next, std::string& err);
     const float* q4x_mtp_residual() const;
-    bool q4x_mtp_on() const { return mtp_part()->q4d_ != nullptr && mtp_part()->q35_mtp_on(); }
-    // the part carrying the drafter: qwen4exp's draft layer sits on a split's last part (it reads the final residual
-    // and the head); else this
-    Glm5Model* mtp_part() const {
-        Glm5Model* m = const_cast<Glm5Model*>(this);
-        if (g_.q4x)
-            for (Glm5Model* p = m; p != nullptr; p = p->split_next_.get())
-                if (p->q4d_ != nullptr) return p;
-        return m;
-    }
+    bool q4x_mtp_on() const { return g_.q4x && chain_mtp_on(); }
+    // the drafter here or on a later part (qwen4exp's draft layer sits on a split's last part: it reads the final
+    // residual and the head)
+    bool chain_mtp_on() const { return q35_mtp_on() || (next_port_ != nullptr && next_port_->mtp_on()); }
     // the conversation snapshot's qwen35moe state (pinned host memory, not VRAM): each delta-net layer's state and conv
     // rows, the drafter's pending hidden and its two positions - the KV caches are written a row a position, so the
     // position alone restores them
@@ -707,7 +728,7 @@ public:
     /// token, window (the kept columns) and prompt chunk by itself.  dspark_draft(y): the block at position() with y,
     /// the pending token -> 5 drafts and their confidences (host; waits for the device).  dspark_upload: the expert
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
-    bool dspark_ready() const { return dsp_ != nullptr || mtp_part()->q35_mtp_on(); }
+    bool dspark_ready() const { return dsp_ != nullptr || chain_mtp_on(); }
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     void dspark_upload();
     void dspark_report() const;
