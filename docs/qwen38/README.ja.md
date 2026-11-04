@@ -76,6 +76,8 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
 | `STRATA_Q4X_DENSE=1` | オフ | デバッグ用: QSA の選択を使わず、すべてのセルに注意します |
 | `STRATA_Q4X_PLE_SYNC=1` | オフ | デバッグ用: 検証窓の PLE の行を、層 0 と並行ではなく層 0 の前に読みます |
 | `STRATA_GLM_NO_MTP=1` | オフ | `STRATA_Q4X_MTP` があってもドラフターを切ります |
+| `STRATA_Q4X_DFLASH=<gguf>` | オフ | v1.3.125: MTP 層の代わりに DFlash 2 のブロックドラフター（nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF、Q8_0）を使います。コードと一覧は速く、文章は遅くなります（[MANUAL](../MANUAL.ja.md#qwen38-flash-next)）。GPU 1 枚のときだけ |
+| `STRATA_Q4X_DFLASH_N` / `STRATA_Q4X_DFLASH_PMIN` | 5 / 0.9 | 1 回の下書きの上限 / 下書きに必要な確信度 |
 | `STRATA_GLM_PRIOR` | サーバーが設定 | v1.3.86 から、pack に自分のプロファイルが無いとき、サーバーは Abyss に入っているこのモデル用のルーティングのプロファイル（`data/expert_counts/qwen38-flash-next.txt`）を指します。エキスパートはその順に温まり、層ごとの VRAM の割り当てもルーティングに合わせます |
 
 v1.3.112 の検証窓の CUDA グラフとまとめた待ちには、それぞれのスイッチがあります（`STRATA_GLM_GRAPH`、

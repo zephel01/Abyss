@@ -1040,8 +1040,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     // or STRATA_GLM_ZERO_COPY=0) gets a Q8_0 copy for the drafter only - the trunk keeps its exact host row
     // (qwen4exp's draft layer, STRATA_Q4X_MTP, the same)
     const char* q4m = getenv("STRATA_Q4X_MTP");
-    const bool q4_draft = g.q4x && l1_ == g.n_layers && q4m != nullptr && q4m[0] != '\0' &&
-                          getenv("STRATA_GLM_NO_MTP") == nullptr;
+    const char* q4f = getenv("STRATA_Q4X_DFLASH");   // (DFlash 2's block reads y's embedding the same way)
+    const bool q4_draft = g.q4x && l1_ == g.n_layers &&
+                          ((q4m != nullptr && q4m[0] != '\0' && getenv("STRATA_GLM_NO_MTP") == nullptr) ||
+                           (q4f != nullptr && q4f[0] != '\0'));
     const bool glm_draft = g.arch == 0 && mtp_il_ >= 0 && F->q35_pend_h != nullptr;   // (the one-GPU NextN drafter)
     if ((g.qwen35() || glm_draft) && (mtp_il_ >= 0 || q4_draft) && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
@@ -1104,6 +1106,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (!prefill_setup(err)) return false;
         // DSpark (STRATA_DS4_DSPARK): the drafter's weights and expert cache before the pool takes what is left
         if (!dspark_load(err)) return false;
+        if (!dflash_load(err)) return false;   // (Qwen3.8's DFlash 2, STRATA_Q4X_DFLASH)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -3818,6 +3821,8 @@ void Glm5Model::fast_destroy() {
     cudaSetDevice(dev_);
     dspark_report();
     dspark_destroy();
+    dflash_report();
+    dflash_destroy();
     prefill_destroy();
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
@@ -6634,6 +6639,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     if (!fast_layers(p, false, err)) return false;
+    if (dfl_ != nullptr && !dflash_commit(p, 1, false, F->cs)) {
+        err = "dflash: the context commit";
+        return false;
+    }
     if (dsp_ != nullptr && !dspark_commit(p, 1, false, F->cs)) {
         err = "dspark: the context commit";
         return false;
@@ -6942,6 +6951,7 @@ const char* Glm5Model::lane_kind() const {
 
 const char* Glm5Model::drafter_kind() const {
     if (dsp_ != nullptr) return "dspark";
+    if (dfl_ != nullptr) return "dflash";
     if (chain_mtp_on()) return g_.q4x ? "mtp" : "nextn";
     return has_mtp() ? "mtp" : "none";
 }

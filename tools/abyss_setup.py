@@ -14,6 +14,7 @@
     ./setup-deepseek.sh --model glm          GLM-5.3-Flash, zephel01's GGUFs: --quant 32G96G (the default) or 32G128G
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
     ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
+    ./setup-deepseek.sh --model qwen38 --dflash   also the DFlash 2 drafter (0.65 GB): faster code (--no-dflash: off)
 
 What it does:
 
@@ -128,6 +129,13 @@ DSPARK_REV = "57fae967d0c5dac1f32a444ea8884ec46459247b"
 DSPARK_FILE = ("DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf", 6940214304,
                "d2025be3a4351f20d9f3d4c58eda9d8577cfda878bee7377bbb71af2087d9181")
 DSPARK_URL = "https://huggingface.co/{repo}/resolve/{rev}/{file}"
+# Qwen3.8-Flash-Next's DFlash 2 block drafter (v1.3.125, opt-in): nazeshinjite's Q8_0 GGUF of incoai's drafter (5 dense
+# layers over the target's layers 6/16/26/36/46; Apache-2.0), pinned to the commit it was measured with.  The engine
+# loads it from the config's STRATA_Q4X_DFLASH (src/core/dflash2.cu, ~0.76 GB of VRAM) in place of the MTP layer
+DFLASH_REPO = "nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF"
+DFLASH_REV = "cbe1b23f1466458b9d839f6cbaef7d3b52d8cc9b"
+DFLASH_FILE = ("Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf", 652101056,
+               "5e7163abcbee4f348adced14c0f545fa4f2c5a1fdfd4d0a914b176e1c866ac9e")
 TOOL_TEMPLATES = ROOT / "ops" / "abyss-tools"
 MANAGED = ("abyss.sh", "common.sh")        # replaced when the template changes (the old one kept as .bak)
 ONCE = ("README.md",)                      # written only when missing: the user's own notes go there
@@ -383,6 +391,39 @@ def dspark_step(a, data: Path, cfg: Path, fresh: bool, had: str | None, gpus, ba
     save(f"DSpark drafter on in {cfg.name} (STRATA_DS4_DSPARK)")
 
 
+def dflash_step(a, data: Path, cfg: Path, gpus) -> None:
+    """Qwen3.8's DFlash 2 drafter, opt-in: --dflash downloads it (SHA-256 checked) and names it in the config's env;
+    --no-dflash takes it out.  Without either the config stays as it is."""
+    conf = json.loads(cfg.read_text(encoding="utf-8"))
+    env = conf.setdefault("env", {})
+    have = env.get("STRATA_Q4X_DFLASH") or None
+
+    def save(what: str) -> None:
+        cfg.write_text(json.dumps(conf, indent=1) + "\n", encoding="utf-8")
+        S.ok(what)
+
+    if a.no_dflash or (have and len(gpus) > 1):   # (the engine runs it on one device only)
+        if have:
+            del env["STRATA_Q4X_DFLASH"]
+            save(f"DFlash 2 drafter off in {cfg.name} (the file stays: {have})")
+        return
+    if not a.dflash:
+        if have:
+            S.ok(f"DFlash 2 drafter: on ({have})")
+        return
+    if len(gpus) > 1:
+        S.ok("DFlash 2 drafter: not with a layer split")
+        return
+    name, size, sha = DFLASH_FILE
+    dst = data / "models" / DFLASH_REPO / name
+    S.say(f"  {name}, {size / 1e9:.2f} GB -> {dst.parent}")
+    S.download(DSPARK_URL.format(repo=DFLASH_REPO, rev=DFLASH_REV, file=name), dst, name)
+    if not verified(dst, sha):
+        S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
+    env["STRATA_Q4X_DFLASH"] = str(dst)
+    save(f"DFlash 2 drafter on in {cfg.name} (STRATA_Q4X_DFLASH)")
+
+
 def make_tools(tools: Path) -> None:
     """The Abyss-tools folder from ops/abyss-tools: abyss.sh and common.sh follow the template (a changed one is kept
     as .bak), README.md is written once."""
@@ -435,10 +476,16 @@ def main() -> int:
                     "the config: drafts checked a step at a time, ~+28%% on swe-bench tasks on an AI PRO R9700 (~6.5 GB "
                     "of VRAM; one GPU, DeepSeek V4 Flash 0731). Asked when the config is new")
     ap.add_argument("--no-dspark", action="store_true", help="turn the DSpark drafter off in the config (the file stays)")
+    ap.add_argument("--dflash", action="store_true", help="(qwen38) download the DFlash 2 drafter (0.65 GB) and turn it on "
+                    "in the config instead of the MTP layer: faster code and lists, slower prose (docs/MANUAL.md, "
+                    "Qwen3.8-Flash-Next); one GPU")
+    ap.add_argument("--no-dflash", action="store_true", help="turn the DFlash 2 drafter off in the config (the file stays)")
     ap.add_argument("--tools-only", action="store_true", help="only create / update the Abyss-tools folder")
     a = ap.parse_args()
     if a.dspark and a.no_dspark:
         ap.error("--dspark and --no-dspark together")
+    if a.dflash and a.no_dflash:
+        ap.error("--dflash and --no-dflash together")
     tools = Path(a.tools_dir).expanduser().resolve()
     if a.tools_only:
         make_tools(tools)
@@ -453,6 +500,8 @@ def main() -> int:
     repo = model["repo"]
     if a.dspark and a.model != "v4":
         ap.error("--dspark: the DSpark drafter is set up for DeepSeek V4 only (V4.1: docs/deepseek41/README.md)")
+    if (a.dflash or a.no_dflash) and a.model != "qwen38":
+        ap.error("--dflash: the DFlash 2 drafter is Qwen3.8-Flash-Next's (--model qwen38)")
     name = a.name or model["prefix"] + "-" + quant.lower().removeprefix("ud-")
     data = Path(a.data_dir).expanduser().resolve()
     mdir = data / "models" / repo / quant
@@ -575,6 +624,8 @@ def main() -> int:
         S.ok("DSpark drafter: set up for DeepSeek V4 only" + (" (V4.1: by hand, docs/deepseek41/README.md)" if a.model == "v41"
              else " (Ornith drafts with its own NextN block from the shards)" if a.model == "ornith"
              else " (Qwen3.8 drafts with its own MTP block from the shards)" if a.model == "qwen38" else ""))
+    if a.model == "qwen38":
+        dflash_step(a, data, cfg, gpus)
 
     S.step(8, "Abyss-tools")
     make_tools(tools)

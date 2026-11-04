@@ -656,6 +656,26 @@ GGUFs that load, the pack command (`tools/iq_pack.py --fast`), the drafter, a co
   with its numbers in docs/qwen38.
 - **Two GPUs** (beta, v1.3.109): see [Several GPUs](#several-gpus). **DGX Spark** (beta, v1.3.113): see
   [NVIDIA DGX Spark](#nvidia-dgx-spark-gb10-arm-beta).
+- **The DFlash 2 drafter** (opt-in, v1.3.125): `STRATA_Q4X_DFLASH=<the GGUF>` loads nazeshinjite's Q8_0 GGUF of
+  incoai's [DFlash 2](https://huggingface.co/nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF) block drafter (0.65 GB file,
+  0.76 GB of VRAM) instead of the MTP layer: five small layers read the model's residual entering layers 6/16/26/36/46
+  and propose up to 5 tokens in one pass; the verify window checks them as it checks the MTP drafts.
+  `./setup-deepseek.sh --model qwen38 --dflash` downloads it and names it in the config (`--no-dflash`: off). It is
+  faster than the MTP layer on code and lists and slower on prose (Japanese most), so it is not the default:
+
+  | 16G64G, RTX 5090 (32 GB), greedy 512 tokens, tok/s | code | list | Japanese prose | swe-style fix |
+  | --- | --- | --- | --- | --- |
+  | no drafter (n-gram only) | 91.0 | 93.6 | 93.6 | 99.9 |
+  | MTP layer (`STRATA_Q4X_MTP`) | 140.2 | 137.2 | **105.7** | 128.2 |
+  | DFlash 2 (`STRATA_Q4X_DFLASH`) | **152.3** | **142.1** | 91.9 | 122.0 |
+
+  On 12G32G (L448v2; the card capped at 12 GB, a 20 GB RAM tier in a 28 GB cgroup, 8 CPU threads) the two drafters
+  are even: code 58.0 / list 72.6 / Japanese 46.8 / swe 37.9 tok/s with DFlash 2 against 58.5 / 72.6 / 47.9 / 36.7
+  with the MTP layer (no drafter: 48.1 / 63.7 / 47.0 / 41.1).
+  One GPU only (not with a layer split). `STRATA_Q4X_DFLASH_N` (5, 1-5): drafts a step at most;
+  `STRATA_Q4X_DFLASH_PMIN` (0.9): the selector's confidence a draft needs; the walk stops at the first draft below it
+  (0.75, the drafter's own default: list 137 against 142; 0.5 slower everywhere). The drafts match a numpy reference
+  of the drafter (teacher-forced code: 3.62 of 3.83 drafts kept a step against the reference's 3.59 of 3.79).
 
 ## Ornith-1.5-122B
 

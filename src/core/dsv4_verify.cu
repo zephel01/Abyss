@@ -1827,6 +1827,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             if (!q4x_mix_cols(V->R, T, Ly.hc4[0].norm, Ly.hc4[0].down, Ly.hc4[0].up, &Ly.hc4[0].inject, prev_out,
                               V->q4_inj[1], V->q4_inj[0], V->x, V->xq, err))
                 return false;
+            if (dfl_ != nullptr) dflash_capture(il, V->R, T, (size_t) HE, false, s);   // (DFlash 2's features a column)
             if (prof) F->mark("q4w_hc_attn");
             if (Ly.recr) {
                 float* qkv = V->q35_qkv + (size_t) li * TM * C;

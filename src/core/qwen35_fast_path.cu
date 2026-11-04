@@ -225,7 +225,12 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx);
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
-    if (g.q4x && q4d_ == nullptr && l1_ == g.n_layers && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
+    // (STRATA_Q4X_DFLASH: DFlash 2 replaces the MTP layer - the two drafters never run together)
+    const char* dfl_env = getenv("STRATA_Q4X_DFLASH");
+    const bool dfl_set = dfl_env != nullptr && dfl_env[0] != '\0';
+    if (g.q4x && dfl_set && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0')
+        std::fprintf(stderr, "qwen4exp: STRATA_Q4X_DFLASH is set - the MTP layer (STRATA_Q4X_MTP) is not loaded\n");
+    if (g.q4x && !dfl_set && q4d_ == nullptr && l1_ == g.n_layers && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
         getenv("STRATA_GLM_NO_MTP") == nullptr && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err)) {
         // (refused before it allocated anything - a model its files do not fit: run without the drafter)
         if (q4d_ != nullptr) return false;
@@ -1121,6 +1126,7 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
                      F->q4_inj[1], F->q4_inj[0], F->x, F->xq, err))
             return false;
         abl_cap(il, state_, g.hc, s);   // (--abl-build: the residual entering the layer, the last FFN combined)
+        if (dfl_ != nullptr) dflash_capture(il, state_, 1, 0, false, s);   // (DFlash 2's features)
         if (F->prof_on) F->mark("q4x_hc");
         if (dumps) {
             q35_dump(s, "hc_norm", il, F->q4_xn, (int64_t) g.hc * g.n_embd);

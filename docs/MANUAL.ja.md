@@ -615,6 +615,26 @@ v1.3.74 から、エンジンは Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`�
   それぞれの数字は docs/qwen38 にある。
 - **GPU 2 枚**（ベータ、v1.3.109）: [複数の GPU](#複数の-gpu)。**DGX Spark**（ベータ、v1.3.113）:
   [NVIDIA DGX Spark](#nvidia-dgx-sparkgb10armベータ)。
+- **DFlash 2 ドラフター**（オプトイン、v1.3.125）: `STRATA_Q4X_DFLASH=<GGUF>` で、incoai の
+  [DFlash 2](https://huggingface.co/nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF) ブロックドラフターを nazeshinjite が
+  Q8_0 GGUF にしたもの（ファイル 0.65 GB、VRAM 0.76 GB）を MTP 層の代わりに読む。小さな 5 層が、モデルの 6/16/26/36/46 層に
+  入る残差を読み、1 回で最大 5 トークンを下書きする。検証窓が MTP の下書きと同じように確かめる。
+  `./setup-deepseek.sh --model qwen38 --dflash` でダウンロードして設定に書く（`--no-dflash` で外す）。コードと一覧は MTP 層より
+  速く、文章（とくに日本語）は遅いので、既定にはしていない:
+
+  | 16G64G、RTX 5090（32 GB）、greedy 512 トークン、tok/s | コード | 一覧 | 日本語の文章 | swe 風の修正 |
+  | --- | --- | --- | --- | --- |
+  | ドラフターなし（n-gram だけ） | 91.0 | 93.6 | 93.6 | 99.9 |
+  | MTP 層（`STRATA_Q4X_MTP`） | 140.2 | 137.2 | **105.7** | 128.2 |
+  | DFlash 2（`STRATA_Q4X_DFLASH`） | **152.3** | **142.1** | 91.9 | 122.0 |
+
+  12G32G（L448v2。カードを 12 GB に制限、RAM の枠 20 GB を 28 GB の cgroup の中で、CPU 8 スレッド）では、2 つのドラフターは
+  ほぼ同じ: DFlash 2 がコード 58.0 / 一覧 72.6 / 日本語 46.8 / swe 37.9 tok/s、MTP 層が 58.5 / 72.6 / 47.9 / 36.7
+  （ドラフターなしは 48.1 / 63.7 / 47.0 / 41.1）。
+  GPU 1 枚のときだけ（層の分割では使わない）。`STRATA_Q4X_DFLASH_N`（5、1〜5）: 1 回の下書きの上限。
+  `STRATA_Q4X_DFLASH_PMIN`（0.9）: 下書きに必要な selector の確信度。下回った最初の下書きで止める（ドラフター本来の既定の
+  0.75 では一覧が 142 に対して 137。0.5 はどれも遅い）。下書きは numpy で書いた参照と合う（コードを教師強制で流して、1 回あたり
+  3.83 個の下書きのうち 3.62 個が当たり。参照は 3.79 個のうち 3.59 個）。
 
 ## Ornith-1.5-122B
 

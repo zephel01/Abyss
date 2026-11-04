@@ -75,6 +75,8 @@ lane. NVIDIA runs it too: an RTX 5090 from v1.3.83 and a DGX Spark from v1.3.113
 | `STRATA_Q4X_DENSE=1` | off | debug: dense attention everywhere instead of QSA's selection |
 | `STRATA_Q4X_PLE_SYNC=1` | off | debug: the verify window reads its PLE rows before layer 0 instead of during it |
 | `STRATA_GLM_NO_MTP=1` | off | the drafter off even with `STRATA_Q4X_MTP` set |
+| `STRATA_Q4X_DFLASH=<gguf>` | off | v1.3.125: the DFlash 2 block drafter (nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF, Q8_0) instead of the MTP layer - faster on code and lists, slower on prose ([MANUAL](../MANUAL.md#qwen38-flash-next)); one GPU |
+| `STRATA_Q4X_DFLASH_N` / `STRATA_Q4X_DFLASH_PMIN` | 5 / 0.9 | its drafts a step at most / the confidence a draft needs |
 | `STRATA_GLM_PRIOR` | set by the server | from v1.3.86 the server points it at the routing profile Abyss ships for this model (`data/expert_counts/qwen38-flash-next.txt`) when the pack has none of its own: the experts warm in its order and each layer gets a VRAM share by its routing |
 
 The verify window's CUDA graphs and batched waits of v1.3.112 have their own switches (`STRATA_GLM_GRAPH`,

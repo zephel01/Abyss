@@ -213,6 +213,8 @@ STRATA_Q35_ATTN_CHUNK_MIN  # src/kernels/cuda/qwen35_fast.cu
 STRATA_Q35_GDN_STEP  # src/core/qwen35_fast_path.cu
 STRATA_Q35_MTP_MIN  # src/core/qwen35_fast_path.cu
 STRATA_Q4X_DENSE  # src/core/qwen35_fast_path.cu
+STRATA_Q4X_DFLASH_DUMP  # src/core/dflash2.cu
+STRATA_Q4X_DFLASH_MASK  # src/core/dflash2.cu
 STRATA_Q4X_MTP_FULLHEAD  # src/core/q4x_drafter.cu
 STRATA_Q4X_PLE_SYNC  # src/core/dsv4_verify.cu
 STRATA_QSA_DUMP  # src/prefill/prefill.cpp

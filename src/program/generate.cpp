@@ -2243,7 +2243,8 @@ static int glm_pack_generate(const Options& o) {
             // than a token; prose 21.0 -> 20.0 ms a token against 0.6, 0.4 worse)
             const float d_thr = [&] {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_THR");
-                return v != nullptr ? (float) std::atof(v) : model.q4x_mtp_on() ? 0.75f : model.q35_mtp_on() ? 0.5f : 0.6f;
+                // (DFlash 2: its walk stopped at STRATA_Q4X_DFLASH_PMIN already - every draft it returns goes in)
+                return v != nullptr ? (float) std::atof(v) : model.dflash_on() ? 0.0f : model.q4x_mtp_on() ? 0.75f : model.q35_mtp_on() ? 0.5f : 0.6f;
             }();
             static const int d_max = [] {   // STRATA_DS4_DSPARK_K: drafts a window at most (1..5)
                 const char* v = std::getenv("STRATA_DS4_DSPARK_K");

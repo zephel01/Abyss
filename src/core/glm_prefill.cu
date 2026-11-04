@@ -2741,6 +2741,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             } else {
                 q4_mix(il, 0, il == l0_ ? nullptr : S->ffn, S->post, S->pre, false);
             }
+            if (dfl_ != nullptr) dflash_capture(il, S->R, T, (size_t) g.hc * E, true, s);   // DFlash 2's features
         } else if (g.qwen35()) {
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
@@ -4103,6 +4104,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // add the last FFN themselves - this update, run with the hyper-connections' unset post / comb, broke R and with it
     // every prompt position's draft cache, so the drafter's confidences stayed under its threshold after a prompt)
     // qwen4exp, an earlier part of a split: the last FFN's combine into R, which the next part's first layer reads
+    if (dfl_ != nullptr && kv_cut < 0) {   // DFlash 2: the chunk's last rows (up to its window) into its context
+        const int n = std::min(T, 2048);
+        if (!dflash_commit(p0 + T - n, n, true, s)) {
+            err = "dflash: the prompt's context commit";
+            return false;
+        }
+    }
     if (!tail_skip && g.q4x && l1_ < g.n_layers && kv_cut < 0) q4_mix(l1_ - 1, 0, S->ffn, S->post, nullptr, true);
     if (!tail_skip && !g.qwen35() && kv_cut < 0) {
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);

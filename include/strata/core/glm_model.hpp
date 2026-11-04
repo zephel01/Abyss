@@ -556,6 +556,21 @@ public:
     bool dspark_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
     void dspark_window(int64_t p0, int T);         // verify: its columns wait for spec_rewind's position
     void dspark_settle();                          // ... which commits the kept ones
+    // ---- DFlash 2, Qwen3.8-Flash-Next's block drafter (src/core/dflash2.cu, STRATA_Q4X_DFLASH=<its GGUF>): the same
+    // hooks as DSpark's (dspark_settle / dspark_window / dspark_reset / dspark_draft call these when it is loaded)
+    void* dfl_ = nullptr;
+    bool dflash_load(std::string& err);
+    void dflash_destroy();
+    void dflash_reset();
+    void dflash_report() const;
+    // the residual entering target layer il (hc streams of n_embd, rows rs floats apart) -> the features of n rows:
+    // the token path's / a window's columns 0..n-1 (prompt false), or a prompt chunk's last rows (prompt true, R the
+    // chunk's T = n rows: its last 2048 kept)
+    void dflash_capture(int il, const float* R, int n, size_t rs, bool prompt, cudaStream_t s);
+    bool dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
+    void dflash_settle();
+    void dflash_window(int64_t p0, int T);
+    bool dflash_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);
     bool verify_moe_router(int il, int tb, int n, cudaStream_t s, std::string& err);   // (its first launch)
@@ -758,7 +773,8 @@ public:
     /// token, window (the kept columns) and prompt chunk by itself.  dspark_draft(y): the block at position() with y,
     /// the pending token -> 5 drafts and their confidences (host; waits for the device).  dspark_upload: the expert
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
-    bool dspark_ready() const { return dsp_ != nullptr || chain_mtp_on(); }
+    bool dspark_ready() const { return dsp_ != nullptr || dfl_ != nullptr || chain_mtp_on(); }
+    bool dflash_on() const { return dfl_ != nullptr; }   // DFlash2 (dflash2.cu): its walk applied the threshold
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     void dspark_upload();
     void dspark_report() const;
