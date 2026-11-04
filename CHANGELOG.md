@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.108 - 2026-11-04
+
+- **Thinking no longer collapses to one token when a request's `max_tokens` is 1024 or less (#33, thanks @hondaru)**:
+  the server leaves the answer at least 1024 tokens of the output (`STRATA_GLM_THINK_RESERVE`), and with
+  `max_tokens` <= 1024 that left the reasoning a single token - the model answered without thinking. On the 1-bit
+  Qwen3.8 12G32G L448 build that made it echo the prompt back now and then (the reported dose-calculation prompt at
+  temperature 0.3, `max_tokens` 800: 1 of 8 answers, 6 of 8 with the drafters off). The reserve is now capped at half
+  of `max_tokens` (800 -> 400 tokens of thinking, 400 for the answer; 2048 and above unchanged). Same prompt after the
+  fix: 0 of 8 echoes, 8 of 8 with the right dose, on both L448 and a 2-bit build.
+- **Qwen3.8 GGUFs with Q8_0 down experts work on the prompt path again (unsloth UD-IQ4_XS)**: the prompt's expert
+  matrices are read in 512-value tiles, which run past a 640-wide down row; the expert slots had no room for that
+  over-read when the down matrix is Q8_0, so the tail was read from the next slot and layer 2 came out NaN (any prompt
+  of ~100 tokens and more: "invalid expert ID or non-finite score" and a 400). The slots now reserve the over-read
+  (only where the rounding left too little: other layouts keep their sizes). Checked on an RTX 5090: UD-IQ4_XS with
+  100- and 8,000-token prompts (8K at ~1,600 tok/s), the prompt path's first 26 tokens equal to the token path's on a
+  2,000-token prompt; UD-IQ3_XXS and the NVFP4 pack give the same tokens as v1.3.107.
+
 ## v1.3.107 - 2026-11-04
 
 - **Long prompts no longer fail or crash when the CPU share's pinned buffers do not allocate (#31, thanks @LarsDrakblod)**:
