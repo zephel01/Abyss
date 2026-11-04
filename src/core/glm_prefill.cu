@@ -4060,6 +4060,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // the last layer's write half: R = post x ffn + comb . R (qwen35moe's plain residual has none: the NextN rows below
     // add the last FFN themselves - this update, run with the hyper-connections' unset post / comb, broke R and with it
     // every prompt position's draft cache, so the drafter's confidences stayed under its threshold after a prompt)
+    // qwen4exp, an earlier part of a split: the last FFN's combine into R, which the next part's first layer reads
+    if (!tail_skip && g.q4x && l1_ < g.n_layers && kv_cut < 0) q4_mix(l1_ - 1, 0, S->ffn, S->post, nullptr, true);
     if (!tail_skip && !g.qwen35() && kv_cut < 0) {
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
@@ -4414,7 +4416,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             cudaSetDevice(dev_);
             if (!embed(c)) return false;
             std::vector<int32_t> nx0;
-            if (mtp_il_ >= 0) next_of(c, nx0);   // a single device carries the draft block itself
+            if (mtp_il_ >= 0 || q4d_ != nullptr) next_of(c, nx0);   // a single device carries the draft block itself
             pf_kv_cut_ = cs[(size_t) c + 1] <= cut ? yl : -1;
             const bool half_ok = prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data());
             pf_kv_cut_ = -1;
@@ -4432,7 +4434,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 m->pos_ = p0;
                 toks_to(m, c);
                 std::vector<int32_t> nx;
-                if (m->mtp_il_ >= 0) next_of(c, nx);
+                if (m->mtp_il_ >= 0 || m->q4d_ != nullptr) next_of(c, nx);
                 if (!m->prefill_half(p0, T, err, nx.empty() ? nullptr : nx.data())) return false;
                 prev = m;
             }
@@ -4535,7 +4537,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     m->pos_ = p0;
                     toks_to(m, c);
                     std::vector<int32_t> nx;
-                    if (m->mtp_il_ >= 0) next_of(c, nx);
+                    if (m->mtp_il_ >= 0 || m->q4d_ != nullptr) next_of(c, nx);
                     if (!m->prefill_half(p0, T, e2, nx.empty() ? nullptr : nx.data())) {
                         fail(e2.empty() ? "glm prefill: part " + std::to_string(k) + " failed" : e2);
                         return;

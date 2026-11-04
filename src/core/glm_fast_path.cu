@@ -936,7 +936,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     // or STRATA_GLM_ZERO_COPY=0) gets a Q8_0 copy for the drafter only - the trunk keeps its exact host row
     // (qwen4exp's draft layer, STRATA_Q4X_MTP, the same)
     const char* q4m = getenv("STRATA_Q4X_MTP");
-    const bool q4_draft = g.q4x && q4m != nullptr && q4m[0] != '\0' && getenv("STRATA_GLM_NO_MTP") == nullptr;
+    const bool q4_draft = g.q4x && l1_ == g.n_layers && q4m != nullptr && q4m[0] != '\0' &&
+                          getenv("STRATA_GLM_NO_MTP") == nullptr;
     if (g.qwen35() && (mtp_il_ >= 0 || q4_draft) && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
         const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
@@ -1040,9 +1041,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
-        if (getenv("STRATA_GLM_VRAM_GB")) {
-            const size_t cap = glmfast::env_gib("STRATA_GLM_VRAM_GB");
-            const size_t used = total_b - free_b;
+        if (const size_t cap = vram_cap(); cap > 0) {
+            const size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
             const size_t room = cap > used + reserve ? cap - used - reserve : 0;
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
@@ -6305,7 +6305,12 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         cudaEventRecord(F->ev_gs, F->cs);
         F->gap_emb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
     }
-    if (q35_mtp_on() && !q35_mtp_pend_commit(token, err)) return false;   // (qwen35moe's drafter: the last row)
+    if (Glm5Model* dm = mtp_part(); dm->q35_mtp_on()) {   // (qwen35moe's drafter: the last row; a split's last part)
+        if (dm != this) cudaSetDevice(dm->dev_);
+        const bool ok = dm->q35_mtp_pend_commit(token, err);
+        if (dm != this) cudaSetDevice(dev_);
+        if (!ok) return false;
+    }
     if (!fast_layers(p, false, err)) return false;
     if (dsp_ != nullptr && !dspark_commit(p, 1, false, F->cs)) {
         err = "dspark: the context commit";
@@ -6332,7 +6337,11 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     cudaSetDevice(tail->dev_);
     if (g.qwen35()) {
         // (fast_qwen35_layers left head_x / head_xq); the drafter's row of p waits for the next token
-        if (q35_mtp_on()) q35_mtp_pend_set(p, g.q4x ? tail->state_ : FT->head_x);   // (qwen4exp: the final residual)
+        if (g.q4x) {   // (qwen4exp: the final residual, on the part that carries the drafter)
+            if (tail->q35_mtp_on()) tail->q35_mtp_pend_set(p, tail->state_);
+        } else if (q35_mtp_on()) {
+            q35_mtp_pend_set(p, FT->head_x);
+        }
     } else if (g.v41) {
         if (!tail->dsv41_head(err)) return false;
     } else if (g.dsv4()) {
@@ -6535,12 +6544,29 @@ size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
     const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b));
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
     if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
-    if (getenv("STRATA_GLM_VRAM_GB")) {
+    if (getenv("STRATA_GLM_VRAM_GB")) {   // (the split search's estimate, before the parts exist: the one cap)
         const size_t cap = glmfast::env_gib("STRATA_GLM_VRAM_GB");
         const size_t used = total_b - free_b;
         avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
     }
     return avail;
+}
+
+// the VRAM this part behaves as having, bytes (0 = the card's own): STRATA_GLM_VRAM_GB_PARTS=a,b,... one per part of a
+// split in layer order (a test of two cards on one: with STRATA_GLM_SPLIT_SAME=1), else STRATA_GLM_VRAM_GB
+size_t Glm5Model::vram_cap() const {
+    if (const char* v = getenv("STRATA_GLM_VRAM_GB_PARTS")) {
+        std::vector<double> gb;
+        for (const char* q = v; *q != 0;) {
+            char* e = nullptr;
+            const double x = std::strtod(q, &e);
+            if (e == q) break;
+            gb.push_back(x);
+            q = *e == ',' ? e + 1 : e;
+        }
+        if ((size_t) part_ < gb.size() && gb[(size_t) part_] > 0.0) return (size_t) (gb[(size_t) part_] * 1073741824.0);
+    }
+    return getenv("STRATA_GLM_VRAM_GB") ? glmfast::env_gib("STRATA_GLM_VRAM_GB") : 0;
 }
 
 // ---- the run's facts for the server's INFO line (Abyss Terminal): read once at the start, nothing on the token path
@@ -6555,7 +6581,7 @@ const char* Glm5Model::lane_kind() const {
 
 const char* Glm5Model::drafter_kind() const {
     if (dsp_ != nullptr) return "dspark";
-    if (q35_mtp_on()) return g_.q4x ? "mtp" : "nextn";
+    if (mtp_part()->q35_mtp_on()) return g_.q4x ? "mtp" : "nextn";
     return has_mtp() ? "mtp" : "none";
 }
 

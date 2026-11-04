@@ -290,6 +290,10 @@ public:
     int n_parts_ = 1;                                      // the devices the layers are split across (the CPU lane's share)
     int part_ = 0;                                         // ... and which of them this one is (0 = the first layers)
     std::vector<int> split_devs_;                          // ... and the CUDA devices of all of them, part by part
+    size_t vram_base_ = 0;                                 // bytes earlier parts held on this part's device when it
+                                                           // started loading (STRATA_GLM_SPLIT_SAME: not counted
+                                                           // against this part's VRAM cap)
+    size_t vram_cap() const;                               // STRATA_GLM_VRAM_GB_PARTS[part_] or STRATA_GLM_VRAM_GB, bytes
     std::unique_ptr<Glm5Model> split_next_;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
@@ -542,7 +546,16 @@ public:
                          int* tok_out, std::string& err);
     bool q4x_mtp_rows(int64_t p0, int n, const float* Rin, size_t r_stride, const int32_t* next, std::string& err);
     const float* q4x_mtp_residual() const;
-    bool q4x_mtp_on() const { return q4d_ != nullptr && q35_mtp_on(); }
+    bool q4x_mtp_on() const { return mtp_part()->q4d_ != nullptr && mtp_part()->q35_mtp_on(); }
+    // the part carrying the drafter: qwen4exp's draft layer sits on a split's last part (it reads the final residual
+    // and the head); else this
+    Glm5Model* mtp_part() const {
+        Glm5Model* m = const_cast<Glm5Model*>(this);
+        if (g_.q4x)
+            for (Glm5Model* p = m; p != nullptr; p = p->split_next_.get())
+                if (p->q4d_ != nullptr) return p;
+        return m;
+    }
     // the conversation snapshot's qwen35moe state (pinned host memory, not VRAM): each delta-net layer's state and conv
     // rows, the drafter's pending hidden and its two positions - the KV caches are written a row a position, so the
     // position alone restores them
@@ -691,7 +704,7 @@ public:
     /// token, window (the kept columns) and prompt chunk by itself.  dspark_draft(y): the block at position() with y,
     /// the pending token -> 5 drafts and their confidences (host; waits for the device).  dspark_upload: the expert
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
-    bool dspark_ready() const { return dsp_ != nullptr || q35_mtp_on(); }
+    bool dspark_ready() const { return dsp_ != nullptr || mtp_part()->q35_mtp_on(); }
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     void dspark_upload();
     void dspark_report() const;

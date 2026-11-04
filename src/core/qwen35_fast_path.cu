@@ -225,7 +225,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx);
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
-    if (g.q4x && q4d_ == nullptr && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
+    if (g.q4x && q4d_ == nullptr && l1_ == g.n_layers && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
         getenv("STRATA_GLM_NO_MTP") == nullptr && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err)) {
         // (refused before it allocated anything - a model its files do not fit: run without the drafter)
         if (q4d_ != nullptr) return false;
@@ -1032,6 +1032,16 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
         if (!fast_moe(il, pf_pending, err)) return false;
         abl_out(il, 1, F->ffn, 1, g.n_embd, s);
         if (dumps) q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
+    }
+    if (l1_ < g.n_layers) {
+        // an earlier part of a layer split: the last FFN's combine into the streams, which cross over to the next
+        // part as they are (its first layer reads a combined residual); the output mixer is the tail's
+        q35::hc4_combine_norm(state_, F->ffn, F->q4_inj[1], g.hc, F->L[(size_t) (l1_ - 1)].hc4[0].norm, g.norm_eps,
+                              g.n_embd, g.hc, 1, F->q4_xn, s);
+        if (dumps) q35_dump(s, "l_last", l1_ - 1, state_, (int64_t) g.hc * g.n_embd);
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { err = std::string("qwen4exp: ") + cudaGetErrorString(e); return false; }
+        return true;
     }
     // the head: the last FFN's combine, then the output mixer -> head_x / head_xq
     if (!q4x_mix(F->q4_head[0], F->q4_head_w[0], F->q4_head_w[1], nullptr, F->ffn, F->q4_inj[1], nullptr, F->head_x,

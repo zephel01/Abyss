@@ -87,8 +87,8 @@ bool read_all(const std::string& path, std::vector<uint8_t>& out) {
 bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    if (!g.q4x || F == nullptr || l0_ != 0 || l1_ != g.n_layers) {
-        err = "q4x mtp: one device's whole qwen4exp model only";
+    if (!g.q4x || F == nullptr || l1_ != g.n_layers) {
+        err = "q4x mtp: the last part of a qwen4exp model only (it reads the final residual and the head)";
         return false;
     }
     const int E = g.n_embd, HE = g.hc * E, LR = g.hc_lr, D = g.head_dim, NH = g.n_head, HD = NH * D,
@@ -281,8 +281,8 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
             return false;
         }
     }
-    std::fprintf(stderr, "q4x mtp: CUDA%d the draft layer from %s (%.0f MB, head over %lld tokens)\n", dev_, dir.c_str(),
-                 (double) M->vram / 1048576.0, (long long) M->nv);
+    std::fprintf(stderr, "q4x mtp: CUDA%d the draft layer from %s (%.0f MB, head over %lld tokens, layers [%d, %d))\n",
+                 dev_, dir.c_str(), (double) M->vram / 1048576.0, (long long) M->nv, l0_, l1_);
     return true;
 }
 

@@ -1349,6 +1349,13 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->n_parts_ = n;
         m->part_ = i;
         m->split_devs_ = devs;
+        for (int j = 0; j < i; ++j)
+            if (devs[(size_t) j] == devs[(size_t) i]) {   // (a shared device: what the earlier parts hold is theirs)
+                size_t fb = 0, tb = 0;
+                cudaSetDevice(devs[(size_t) i]);
+                if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) m->vram_base_ = tb - fb;
+                break;
+            }
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
             if (prev != nullptr) prev->split_next_.reset();
             return false;
@@ -1544,8 +1551,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
-            } else if (nm == "output.weight" || nm == "output_norm.weight") {
-                head += b;
+            } else if (nm == "output.weight" || nm == "output_norm.weight" || nm.rfind("output_hc_", 0) == 0) {
+                head += b;   // (qwen4exp: the output hyper-connection, on the last part with the head)
             } else if (nm == "token_embd.weight") {
                 embd += b;
             } else {
@@ -1558,6 +1565,17 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const double lat = fast ? (double) g.kv_lora * (double) max_ctx / 2 : (double) g.kv_lora * (double) max_ctx;
     const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
+    // qwen35moe / qwen4exp (qwen35_fast_setup's layout): a delta-net layer's state and conv rows; an attention
+    // layer's BF16 K / V caches at the context, and qwen4exp's QSA block keys (one pooled key per 4 cells)
+    const double gdn_state = 4.0 * ((double) g.ssm_state * g.ssm_v_heads * g.ssm_state +
+                                    (double) g.ssm_conv_dim() * (g.d_conv - 1));
+    const double q35_attn_state =
+        2.0 * 2.0 * (double) max_ctx * g.attn_head_kv * g.head_dim +
+        (g.q4x ? 4.0 * 128.0 * ((double) max_ctx / 4.0 + 2.0 + 3.0) : 0.0);
+    const auto layer_state = [&](int l) {
+        if (g.qwen35()) return g.is_recr(l) ? gdn_state : q35_attn_state;
+        return g.is_recr(l) ? kda_state : dsa_state;
+    };
     // the experts: a layer's blob and its VRAM slot's stride (native_experts.txt)
     std::vector<double> blob((size_t) L + 1, 0.0), stride((size_t) L + 1, 0.0);
     {
@@ -1629,6 +1647,26 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         }
     }
     const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr;
+    // qwen4exp's MTP draft layer (STRATA_Q4X_MTP, q4x_mtp_load): on the last part, resident - its dense weights and
+    // 512 experts (the runtime files), the head's draft-vocabulary rows, its K / V cache at the context and its
+    // scratch.  (Its steps go through the windowed decode, not the pipelined one: the parts still add up.)
+    double q4_draft = 0;
+    if (g.q4x && fast && getenv("STRATA_GLM_NO_MTP") == nullptr)
+        if (const char* q4m = getenv("STRATA_Q4X_MTP"); q4m != nullptr && q4m[0] != '\0') {
+            const auto fsize = [](const std::string& f) {
+                std::ifstream in(f, std::ios::binary | std::ios::ate);
+                return in ? (double) in.tellg() : 0.0;
+            };
+            const std::string d(q4m);
+            const double dn = fsize(d + "/dense.bin"), ex = fsize(d + "/experts.bin"), dv = fsize(d + "/draft_vocab.bin");
+            if (dn > 0 && ex > 0) {
+                const strata::TensorInfo* ow = find("output.weight");
+                const double row = ow != nullptr ? (double) ggml_row_size((ggml_type) ow->type, g.n_embd) : 0.0;
+                q4_draft = dn + ex + (dv > 0 ? dv / 4.0 * (row + 4.0) : 0.0) +
+                           2.0 * 2.0 * (double) max_ctx * g.attn_head_kv * g.head_dim + 4.0 * g.n_vocab +
+                           (double) (64u << 20);
+            }
+        }
     // each layer's routes per expert: this machine's usage, else the pack's routing profile
     std::vector<std::vector<double>> cnt((size_t) L + 1);
     {
@@ -1701,6 +1739,19 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         cudaGetLastError();
         c.free = (double) fr;
         c.total = (double) tot;
+        {   // (the cap fast_setup keeps: Glm5Model::vram_cap - the part's own of STRATA_GLM_VRAM_GB_PARTS, else
+            //  STRATA_GLM_VRAM_GB; a cap below the card's size leaves cap - in use)
+            double cap_gb = 0;
+            if (const char* pp = getenv("STRATA_GLM_VRAM_GB_PARTS"); pp != nullptr && pp[0]) {
+                std::stringstream ps(pp);
+                std::string t;
+                for (int k = 0; std::getline(ps, t, ','); ++k)
+                    if (k == (int) cards.size()) cap_gb = std::atof(t.c_str());
+            }
+            if (cap_gb <= 0)
+                if (const char* vg = getenv("STRATA_GLM_VRAM_GB"); vg != nullptr && vg[0]) cap_gb = std::atof(vg);
+            if (cap_gb > 0) c.free = std::max(0.0, std::min(c.free, cap_gb * 1073741824.0 - (c.total - (double) fr)));
+        }
         c.bw = 2.0 * (double) khz * 1e3 * (double) bits / 8.0;
         cards.push_back(c);
     }
@@ -1747,7 +1798,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         double bsum = 0, ssum = 0, smax = 0;
         bool kda = false, dsa = false, dense_ffn = false, moe = false;
         for (int l = lb; l < le; ++l) {
-            used += dense[(size_t) l] + (g.is_recr(l) ? kda_state : dsa_state);
+            used += dense[(size_t) l] + layer_state(l);
             (g.is_recr(l) ? kda : dsa) = true;
             if (moe_layer(l)) {
                 bsum += blob[(size_t) l];
@@ -1759,7 +1810,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
         }
         if (last) {
-            used += head;
+            used += head + q4_draft;
             if (with_mtp) {
                 used += mtp_dense + dsa_state;
                 bsum += blob[(size_t) L];
@@ -1852,13 +1903,14 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (better(obj, tie, any_obj, any_tie)) { best_any = b; any_obj = obj; any_tie = tie; }
         if (ok && better(obj, tie, best_obj, best_tie)) { best = b; best_obj = obj; best_tie = tie; }
     };
+    const int k_lo = g.q4x ? 2 : 1;   // (qwen4exp: the first part keeps layers 0 and 1 - load_pack_env)
     if (n == 2) {
-        for (int k = 1; k < L; ++k) { b = {k}; consider(); }
+        for (int k = k_lo; k < L; ++k) { b = {k}; consider(); }
     } else if (n == 3) {
-        for (int k1 = 1; k1 + 1 < L; ++k1)
+        for (int k1 = k_lo; k1 + 1 < L; ++k1)
             for (int k2 = k1 + 1; k2 < L; ++k2) { b = {k1, k2}; consider(); }
     } else if (n == 4) {
-        for (int k1 = 1; k1 + 2 < L; ++k1)
+        for (int k1 = k_lo; k1 + 2 < L; ++k1)
             for (int k2 = k1 + 1; k2 + 1 < L; ++k2)
                 for (int k3 = k2 + 1; k3 < L; ++k3) { b = {k1, k2, k3}; consider(); }
     } else {
@@ -1982,6 +2034,11 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
     bool ok = devs.size() == bounds.size() + 1;
     for (size_t i = 0; ok && i < bounds.size(); ++i)
         ok = bounds[i] >= 1 && bounds[i] < g_.n_layers && (i == 0 || bounds[i] > bounds[i - 1]);
+    if (ok && g_.q4x && !bounds.empty() && bounds[0] < 2) {
+        // qwen4exp: the head part issues the PLE rows' reads and layer 1 applies them, so it keeps layers 0 and 1
+        err = "glm split: qwen4exp's first boundary must be 2 or more (layer 1 applies the per-layer embeddings)";
+        return false;
+    }
     // STRATA_GLM_SPLIT_SAME=1 (test): the parts may share a device - a split's code paths on a one-GPU host
     static const bool same_ok = getenv("STRATA_GLM_SPLIT_SAME") != nullptr;
     for (size_t i = 0; ok && i < devs.size(); ++i) {
@@ -2847,7 +2904,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const int il = std::atoi(n.c_str() + 4);
             return il >= l0_ && il < l1_;
         }
-        if (n == "token_embd.weight") return l0_ == 0;
+        if (n == "token_embd.weight") {
+            // (qwen4exp's MTP draft layer sits on the last part and reads its next token's embedding there too)
+            const char* q4m = getenv("STRATA_Q4X_MTP");
+            return l0_ == 0 || (g_.q4x && l1_ == g_.n_layers && q4m != nullptr && q4m[0] != '\0' &&
+                                getenv("STRATA_GLM_NO_MTP") == nullptr);
+        }
         if (n == "output.weight" || n == "output_norm.weight") return l1_ == g_.n_layers;
         return true;
     };

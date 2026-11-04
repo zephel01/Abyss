@@ -174,7 +174,9 @@ bool Glm5Model::verify_ready() const {
         const FastState* F = m->fast_;
         if (F == nullptr || !(m->g_.dsv4() || m->g_.qwen35()) || (m->mtp_il_ >= 0 && !m->g_.qwen35()) || F->max_pf > 0 ||
             F->n_ahead > 0) return false;
-        if ((m->g_.v41 || m->g_.qwen35()) && (F->defer || m->split_next_ != nullptr || m != this)) return false;   // (one part, no deferral)
+        if ((m->g_.v41 || m->g_.qwen35()) && F->defer) return false;   // (no deferral)
+        // (one part; qwen4exp's window crosses a split as its token does: verify_part_q4x's hop)
+        if ((m->g_.v41 || (m->g_.qwen35() && !m->g_.q4x)) && (m->split_next_ != nullptr || m != this)) return false;
         for (int il = m->l0_; il < m->l1_; ++il)
             if (!F->L[(size_t) il].moe) return false;
     }
@@ -1749,6 +1751,22 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
         if (prof) F->mark("q4w_hc_ffn");
         if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
         if (prof) F->mark("q4w_moe");
+    }
+    if (split_next_) {
+        // a part before the last: the last FFN combined into the columns' streams, which cross over to the next part
+        // through the pinned hop buffer (as a token's hop; its first layer reads combined residuals)
+        q35::hc4_combine_norm(V->R, V->ffn, V->q4_inj[1], g.hc, F->L[(size_t) (l1_ - 1)].hc4[0].norm, g.norm_eps, E,
+                              g.hc, T, V->q4_xn, s);
+        Glm5Model* B = split_next_.get();
+        auto* VB = (VerifyBuf*) B->vb_;
+        cudaMemcpyAsync(V->hop_h, V->R, (size_t) T * HE * sizeof(float), cudaMemcpyDeviceToHost, s);
+        cudaEventRecord(V->ev_hop, s);
+        if (prof) F->mark("q4w_hop");
+        cudaSetDevice(B->dev_);
+        cudaStream_t sb = B->fast_->cs;
+        cudaStreamWaitEvent(sb, V->ev_hop, 0);
+        cudaMemcpyAsync(VB->R, V->hop_h, (size_t) T * HE * sizeof(float), cudaMemcpyHostToDevice, sb);
+        return true;
     }
     // the output hyper-connection (the last FFN combined first) and the head
     if (!q4x_mix_cols(V->R, T, F->q4_head[0], F->q4_head_w[0], F->q4_head_w[1], nullptr, V->ffn, V->q4_inj[1], nullptr,
