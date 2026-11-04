@@ -1515,6 +1515,20 @@ static double host_read_bps() {
 //   - the startability gate (Strata #1094): every part keeps its pool's floor and can lend a 512-token prompt chunk.
 // Two to four GPUs try every placement (memoised per part and range, as Strata's four-way search); more keep the
 // proportional split (glm_auto_bounds).  STRATA_GLM_SPLIT_LOG=1 prints every placement's prediction.
+// The pack's own geometry (layer count, qwen4exp), read before loading: g_ still holds the default GLM shape
+// (45 layers) until load_pack, so a hand split of a 48-layer Qwen3.8 at 46 was refused (#35).
+static bool glm_pack_geometry(const std::string& pack_dir, Glm5Geometry& g) {
+    std::string err;
+    std::vector<std::string> names;
+    if (!pack_shard_names(pack_dir, names, err) || names.empty()) return false;
+    try {
+        strata::GgufFile gf(pack_dir + "/../" + names[0]);
+        return Glm5Geometry::from_gguf(gf, g, err);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs,
                                           int* one_dev = nullptr) {
     std::string err;
@@ -2008,6 +2022,8 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
     cudaGetLastError();
     std::vector<int> bounds, devs;
+    Glm5Geometry pg = g_;
+    if (!glm_pack_geometry(pack_dir, pg)) pg = g_;
     if (const char* dv = getenv("STRATA_GLM_DEVS"); dv != nullptr && !ints(dv, devs)) {
         err = std::string("STRATA_GLM_DEVS: not a device list: ") + dv;
         return false;
@@ -2036,18 +2052,22 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
         // the NextN draft block (2x V100, split 22 / 23 / 24 / 25 / 26 -> 36.3 / 36.7 / 40.0 / 37.3 / 39.4 tok/s)
         int one = -1;
         if (devs.size() <= 4) bounds = glm_search_bounds(pack_dir, max_ctx, devs, &one);
-        if (one >= 0) return load_pack(pack_dir, max_ctx, err, one);
+        if (one >= 0) {   // one card alone: it keeps the VRAM_GB_PARTS budget of its place in the list (#35)
+            for (size_t i = 0; i < devs.size(); ++i)
+                if (devs[i] == one) cap_index_ = (int) i;
+            return load_pack(pack_dir, max_ctx, err, one);
+        }
         if (bounds.empty() && devs.size() == 2)
-            bounds = {g_.n_layers / 2 +
+            bounds = {pg.n_layers / 2 +
                       (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr ? 2 : 0)};
-        if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, g_.n_layers, devs);
+        if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, pg.n_layers, devs);
     }
     if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr && !spec.empty() && spec != "auto")
         if (const char* d1 = getenv("STRATA_GLM_DEV1")) devs[1] = std::atoi(d1);
     bool ok = devs.size() == bounds.size() + 1;
     for (size_t i = 0; ok && i < bounds.size(); ++i)
-        ok = bounds[i] >= 1 && bounds[i] < g_.n_layers && (i == 0 || bounds[i] > bounds[i - 1]);
-    if (ok && g_.q4x && !bounds.empty() && bounds[0] < 2) {
+        ok = bounds[i] >= 1 && bounds[i] < pg.n_layers && (i == 0 || bounds[i] > bounds[i - 1]);
+    if (ok && pg.q4x && !bounds.empty() && bounds[0] < 2) {
         // qwen4exp: the head part issues the PLE rows' reads and layer 1 applies them, so it keeps layers 0 and 1
         err = "glm split: qwen4exp's first boundary must be 2 or more (layer 1 applies the per-layer embeddings)";
         return false;
@@ -2060,7 +2080,7 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
     }
     if (!ok) {
         err = "glm split: " + std::to_string(bounds.size()) + " boundaries (rising, 1.." +
-              std::to_string(g_.n_layers - 1) + ") need " + std::to_string(bounds.size() + 1) +
+              std::to_string(pg.n_layers - 1) + ") need " + std::to_string(bounds.size() + 1) +
               " distinct devices of the " + std::to_string(n_dev) + " visible";
         return false;
     }

@@ -6594,7 +6594,9 @@ size_t Glm5Model::vram_cap() const {
             gb.push_back(x);
             q = *e == ',' ? e + 1 : e;
         }
-        if ((size_t) part_ < gb.size() && gb[(size_t) part_] > 0.0) return (size_t) (gb[(size_t) part_] * 1073741824.0);
+        // (a split that auto turned into one card keeps that card's own entry, the one its prediction used - #35)
+        const size_t k = (size_t) (cap_index_ >= 0 ? cap_index_ : part_);
+        if (k < gb.size() && gb[k] > 0.0) return (size_t) (gb[k] * 1073741824.0);
     }
     return getenv("STRATA_GLM_VRAM_GB") ? glmfast::env_gib("STRATA_GLM_VRAM_GB") : 0;
 }

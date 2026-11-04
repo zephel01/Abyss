@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.110 - 2026-11-05
+
+- **Two fixes for the Qwen3.8 two-GPU split (BETA), reported in #35** (thanks to tjm8874 for the real two-card runs):
+  - A hand split is now checked against the model's own layer count. Before, it was checked against the default
+    45-layer shape before the GGUF was read, so `--layer-split 46` on the 48-layer Qwen3.8 was refused.
+  - When `--layer-split auto` decides that one card alone is faster, that card keeps its own entry of
+    `STRATA_GLM_VRAM_GB_PARTS`, the budget its prediction used. Before, it took the first entry (with `16,32` it
+    predicted with 32 GB and then loaded with 16).
+- Known: on a 16 GB + 16 GB GeForce pair, `auto` still picks the first card alone, while a split at layer 32 measured
+  22% faster on long requests (#35). The split's cost model will be refitted with those numbers; until then, set the
+  split by hand (`--layer-split 32`).
+
 ## v1.3.109 - 2026-11-05
 
 - **Qwen3.8-Flash-Next on two GPUs (BETA)**: `--gpus 0,1` now splits Qwen3.8 (qwen4exp) builds across the cards' layers -

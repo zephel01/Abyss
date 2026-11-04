@@ -291,6 +291,7 @@ public:
     int dev_ = 0;
     int n_parts_ = 1;                                      // the devices the layers are split across (the CPU lane's share)
     int part_ = 0;                                         // ... and which of them this one is (0 = the first layers)
+    int cap_index_ = -1;                                   // a split that fell back to one card: its place in the device list
     std::vector<int> split_devs_;                          // ... and the CUDA devices of all of them, part by part
     size_t vram_base_ = 0;                                 // bytes earlier parts held on this part's device when it
                                                            // started loading (STRATA_GLM_SPLIT_SAME: not counted
