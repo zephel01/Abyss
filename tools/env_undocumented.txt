@@ -171,7 +171,6 @@ STRATA_GLM_TOKEN_SPIN  # src/core/glm_fast_path.cu
 STRATA_GLM_TRACE  # src/core/glm_model.cu
 STRATA_GLM_UNIFORM_SLOTS  # src/core/glm_fast_path.cu
 STRATA_GLM_VISION_LEND_MB  # src/core/glm_fast_path.cu
-STRATA_GLM_VRAM_GB  # src/core/glm_fast_path.cu
 STRATA_GROUP_COPY  # src/prefill/prefill.cpp
 STRATA_GR_UNFUSED  # src/prefill/prefill.cpp
 STRATA_HIPBLASLT_TUNING  # src/core/glm_prefill.cu
@@ -209,7 +208,6 @@ STRATA_Q35_GDN_STEP  # src/core/qwen35_fast_path.cu
 STRATA_Q35_MTP_K  # src/core/qwen35_fast_path.cu
 STRATA_Q35_MTP_MIN  # src/core/qwen35_fast_path.cu
 STRATA_Q4X_DENSE  # src/core/qwen35_fast_path.cu
-STRATA_Q4X_MTP  # src/core/glm_fast_path.cu
 STRATA_Q4X_MTP_FULLHEAD  # src/core/q4x_drafter.cu
 STRATA_Q4X_PLE_GGUF  # src/core/glm_model.cu
 STRATA_Q4X_PLE_SYNC  # src/core/dsv4_verify.cu

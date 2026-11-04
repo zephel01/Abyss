@@ -462,13 +462,16 @@ experts in VRAM, so the second card's VRAM holds more of them.
   GPU does; on a split the chunk is sized first (8192 at most) and the prestage buffer takes what it leaves. RTX 5090 +
   RTX 3090 split 33 / 10: 32K-token prompts 2,177-2,186 -> 2,274-2,350 tok/s, 8K about even. `STRATA_GLM_PRESTAGE=0`
   turns it off.
-- **Qwen3.8-Flash-Next (qwen4exp):** the split runs its token path, prompts and verify windows; the MTP drafter
+- **Qwen3.8-Flash-Next (qwen4exp, BETA from v1.3.109):** the split runs its token path, prompts and verify windows; the MTP drafter
   (`STRATA_Q4X_MTP`) sits on the last part (it reads the final residual and the head; that part also keeps a pinned
   copy of token_embd, +497 MB of RAM). The first boundary is layer 2 or later (the first part applies the per-layer
   embeddings). `auto` counts its delta-net states, K / V caches and QSA keys at the context, and the drafter on the last
   part. Checked on one RTX 5090 seen as two devices (M16b build, split 24): KL the same as unsplit, real-use tasks the
-  same, drafts accepted 84.7% (83.2% unsplit). A real two-card speed has not been measured. Conversation reuse
-  (snapshots) is off under a split.
+  same, drafts accepted 84.7% (83.2% unsplit). A real two-card speed has not been measured: reports from two-card
+  machines are welcome (the bench issue form). Conversation reuse (snapshots) is off under a split.
+- **How the rows cross a boundary** (testing): `STRATA_GLM_HOP=host` (default: the pinned host buffer), `peer`
+  (device to device; cards without peer access use host) or `sock` (a byte stream, the shape a link to another process
+  or PC will take). On one RTX 5090 seen as two devices all three give the same KL and 44.6-46.1 tok/s.
 - **A memory cap per part** (testing): `STRATA_GLM_VRAM_GB_PARTS=14,14` gives each part its own
   `STRATA_GLM_VRAM_GB`, in part order; `auto` sizes the parts with the same caps.
 - AMD GPUs: see "AMD GPUs" below.

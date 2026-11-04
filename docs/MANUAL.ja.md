@@ -446,12 +446,16 @@ NVIDIA の GPU が 2 枚以上あれば、層を分けて載せられる（layer
 - **prestage**（v1.3.27）: 各 part が、次の層で使いそうな RAM 層のエキスパートを mixer の間に VRAM へ送る（1 枚の
   ときと同じ）。分割では chunk の大きさを先に決め（最大 8192）、残った分を prestage に使う。RTX 5090 + RTX 3090 の
   33 / 10 分割で、32K の prompt が 2,177〜2,186 → 2,274〜2,350 tok/s、8K はほぼ同じ。`STRATA_GLM_PRESTAGE=0` でオフ。
-- **Qwen3.8-Flash-Next（qwen4exp）:** 分割したまま、トークン、prompt、検証窓が動く。MTP ドラフター（`STRATA_Q4X_MTP`）は
+- **Qwen3.8-Flash-Next（qwen4exp、v1.3.109 からベータ）:** 分割したまま、トークン、prompt、検証窓が動く。MTP ドラフター（`STRATA_Q4X_MTP`）は
   最後の part に置く（最後の残差と head を使うため。その part も token_embd の pinned コピーを持ち、RAM を 497 MB 多く
   使う）。最初の境目は層 2 以降（層ごとの埋め込みは最初の part が足す）。`auto` は、文脈ぶんの delta-net の状態、K / V
   キャッシュ、QSA の鍵と、最後の part のドラフターを数える。RTX 5090 1 枚を 2 つに見立てて確認した（M16b 版、層 24 で
   分割）: KL は分けない場合と同じ、実用テストも同じ、候補の採用率 84.7%（分けない場合 83.2%）。本物の 2 枚での速さは
-  まだ測っていない。分割中は会話の使い回し（スナップショット）がオフになる。
+  まだ測っていない。2 枚で動かした方の報告を歓迎する（ベンチの issue フォーム）。分割中は会話の使い回し
+  （スナップショット）がオフになる。
+- **境目での受け渡し**（試験用）: `STRATA_GLM_HOP=host`（既定。pinned のホストバッファ）、`peer`（デバイスからデバイスへ。
+  peer アクセスのないカードは host になる）、`sock`（バイト列。別のプロセスや別の PC へのつなぎと同じ形）。RTX 5090 1 枚を
+  2 つに見立てると、3 つとも KL は同じで、44.6〜46.1 tok/s。
 - **part ごとの VRAM の上限**（試験用）: `STRATA_GLM_VRAM_GB_PARTS=14,14` で、part の順に、それぞれの
   `STRATA_GLM_VRAM_GB` を決める。`auto` も同じ上限で見積もる。
 - AMD の GPU は下の「AMD の GPU」を参照。

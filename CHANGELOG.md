@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.109 - 2026-11-05
+
+- **Qwen3.8-Flash-Next on two GPUs (BETA)**: `--gpus 0,1` now splits Qwen3.8 (qwen4exp) builds across the cards' layers -
+  the token path, prompts (serial and pipelined), the speculative verify window and the MTP drafter, which sits on the
+  last card (it reads the final residual and the head; that card also keeps a pinned copy of token_embd, +497 MB of
+  RAM). `--layer-split auto` counts Qwen3.8's delta-net states, K / V caches and QSA keys at the context and the drafter
+  on the last card; the first boundary is layer 2 or later. `STRATA_GLM_VRAM_GB_PARTS=a,b` caps each card's VRAM.
+  Checked on one RTX 5090 seen as two devices (16G64G build, split at layer 24): KL to the NVFP4 teacher the same as
+  unsplit (0.170 / 0.176), real-use tasks the same (Japanese 5/5, code 4/5, 8K needle), drafts accepted 84.7% (unsplit
+  83.2-86.1%); `auto` with two 15 GB caps picks layer 26. **A real two-card speed has not been measured** - reports
+  are welcome through the bench issue form. Conversation reuse (snapshots) is off under a split.
+- **The single-GPU Qwen3.8 drafter now sees its prompt rows' next tokens**: prompt chunks passed no next-token ids to the
+  MTP drafter, so its draft cache after a prompt was built from the wrong rows. Accepted drafts are within run-to-run
+  noise on the checked prompts (83.2% vs 86.1%).
+- **One swappable hand-over between split parts** (`STRATA_GLM_HOP=host|peer|sock`, default host as before), and the
+  Qwen3.8 split drives the next card through one interface (the groundwork for a part in another process or on another
+  PC). Other models' splits keep their paths; DeepSeek V4 0731 split vs unsplit on one card: same top-1 (89.18%), nll
+  0.5435 / 0.5398.
+
 ## v1.3.108 - 2026-11-04
 
 - **Thinking no longer collapses to one token when a request's `max_tokens` is 1024 or less (#33, thanks @hondaru)**:
