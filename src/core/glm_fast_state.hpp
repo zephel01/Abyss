@@ -194,10 +194,22 @@ private:
 // [off, off + len) of a shard into dst (O_DIRECT when the shard has a direct fd; see glm_fast_path.cu)
 void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst);
 
+// The bytes the prompt MMQ reads past a down matrix's last row: it reads K in whole tiles (256 values, FP4 512 -
+// counted as 512 for every type), so with n_ff not a multiple of 512 (qwen4exp's 640) the last row's last tile runs
+// past the matrix.  The prompt path zeroes those bytes in the slot's padding (glm_prefill.cu, zero_tails).
+inline size_t mmq_down_over(int d_type, int64_t n_ff) {
+    if (n_ff <= 0 || n_ff % 512 == 0 || d_type == strata::kernels::exl3::kTypeEXL3) return 0;
+    const int64_t qk = ggml_blck_size((ggml_type) d_type);
+    if (qk <= 0) return 0;
+    return (size_t) ((512 - n_ff % 512) / qk) * ggml_type_size((ggml_type) d_type);
+}
+
 // A layer's VRAM slot stride: the expert blob ([gate | up | down]) rounded up so that both matrices' block sizes and
 // 16 bytes divide it - llama.cpp's MMQ addresses expert e of a pool partition as base + e * stride in WHOLE blocks,
-// so the prompt path multiplies the resident experts where they lie.
-inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
+// so the prompt path multiplies the resident experts where they lie.  The padding also holds the down MMQ's
+// over-read (mmq_down_over, n_ff the experts' width): a blob the rounding leaves too little room after (Qwen3.8's
+// Q8_0 down behind IQ4_XS gate/up: 0 bytes) gets one more block-aligned step - other strides stay as they were.
+inline size_t expert_stride(size_t blob, int gu_type, int d_type, int64_t n_ff) {
     // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
     // multiply these with MMQ)
     if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
@@ -206,7 +218,8 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
     if (b2 > 0) a = std::lcm(a, b2);
-    return (blob + a - 1) / a * a;
+    const size_t s = (blob + a - 1) / a * a, over = mmq_down_over(d_type, n_ff);
+    return s - blob >= over ? s : (blob + over + a - 1) / a * a;
 }
 
 }  // namespace glmfast

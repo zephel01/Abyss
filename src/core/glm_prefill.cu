@@ -791,7 +791,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
                     why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                            std::to_string(Ly.d_type) + ") ";
             }
-            gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
+            gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp));
         } else {
             has_dense = true;
             deq_ok(Ly.ffn_gate, "ffn_gate", il);
@@ -862,7 +862,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe) continue;
         blob_sum += Ly.blob;
-        stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+        stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp);
     }
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
@@ -3360,8 +3360,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // (the down matrices' over-read past their last row, see zero_tails; 0: n_ff fills MMQ's tiles)
         const int64_t dn_qk = ggml_blck_size((ggml_type) Ly.d_type);
         const size_t dn_end = Ly.down_off + (size_t) E * (size_t) (nff / dn_qk) * ggml_type_size((ggml_type) Ly.d_type);
-        const int dn_over = nff % 512 == 0 ? 0
-                            : (int) ((512 - nff % 512) / dn_qk * (int64_t) ggml_type_size((ggml_type) Ly.d_type));
+        const int dn_over = (int) glmfast::mmq_down_over(Ly.d_type, nff);   // (expert_stride leaves room for it)
         const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
             for (int i0 = 0; i0 < n_exp;) {

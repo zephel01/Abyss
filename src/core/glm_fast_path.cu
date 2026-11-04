@@ -1027,7 +1027,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             size_t expert_bytes = 0;
             for (int il = l0_; il < lt_; ++il) {
                 const auto& Ly = F->L[(size_t) il];
-                if (Ly.moe) expert_bytes += (size_t) g.n_expert * glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+                if (Ly.moe) expert_bytes += (size_t) g.n_expert * glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp);
             }
             avail = glmfast::expert_pool_budget(true, free_b, (size_t) std::max(0LL, avail_kb) * 1024,
                                                 reserve, (size_t) (head_gb * 1073741824.0), expert_bytes);
@@ -1052,7 +1052,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // partition in place
         const auto slot_stride = [&](int il) {
             const auto& Ly = F->L[(size_t) il];
-            return glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+            return glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp);
         };
         // every layer gets the same number of slots: avail / sum(blob over layers)
         size_t blob_sum = 0;

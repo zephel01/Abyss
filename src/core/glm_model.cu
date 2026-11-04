@@ -1569,13 +1569,13 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             long long il = -1, gu = 0, dt = 0, off = 0, b = 0;
             if (!(ss >> il >> gu >> dt >> off >> b) || il < 0 || il >= L) continue;
             blob[(size_t) il] = (double) b;
-            stride[(size_t) il] = (double) glmfast::expert_stride((size_t) b, (int) gu, (int) dt);
+            stride[(size_t) il] = (double) glmfast::expert_stride((size_t) b, (int) gu, (int) dt, g.n_ff_exp);
         }
         for (const auto& kv : xtab.layers)
             if (kv.first >= 0 && kv.first < L) {
                 blob[(size_t) kv.first] = (double) kv.second.blob();
                 stride[(size_t) kv.first] = (double) glmfast::expert_stride(
-                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3);
+                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3, 0);
             }
     }
     // the NextN draft block: the last part of a two-part split carries it (load_pack), from the model's GGUF or
@@ -1603,7 +1603,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
             mtp_dense_vram(findm, L, g.qwen35(), b, e2)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
-            stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
+            stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type, g.n_ff_exp);
             mtp_dense = (double) b;
             mtp = true;
         } else if (g.nextn > 0 && (xtab.mats.count(P + "nextn.eh_proj.weight") || find(P + "nextn.eh_proj.weight")) &&
@@ -1623,7 +1623,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             blob[(size_t) L] = (double) xtab.layers.at(L).blob();
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) xtab.layers.at(L).blob(),
                                                                  strata::kernels::exl3::kTypeEXL3,
-                                                                 strata::kernels::exl3::kTypeEXL3);
+                                                                 strata::kernels::exl3::kTypeEXL3, 0);
             mtp_dense = d;
             mtp = true;
         }
