@@ -97,6 +97,11 @@ struct VerifyBuf {
     cudaEvent_t ev_hop = nullptr;
     std::vector<gf::MoeDev> md;               // a route plan per column (the shared tables, own plan arrays)
     gf::MoeColArgs* cols_d = nullptr;         // ... their plan / CPU-lane fields on the device (the column-batched experts)
+    gf::MoeDev* md_d = nullptr;               // ... the columns' plans as set up (device: moe_wait_fetch_cols)
+    std::vector<cudaGraphExec_t> q4g;         // qwen4exp: a layer's graph a window width ([layer][T], verify_part_q4x)
+    std::vector<unsigned char> q4g_n;         // ... the windows seen before its capture (255: it did not capture)
+    std::vector<uint64_t> q4g_sig;            // ... the route arguments it was captured with
+    unsigned long long q4g_rep = 0, q4g_eager = 0, q4g_recap = 0;   // layers replayed / launched, re-captures
     float* ffn_chk = nullptr;                 // STRATA_DS4_WIN_COLS_CHECK: the batched launch's FFN rows, then compared
     uint64_t chk_calls = 0, chk_cols = 0, chk_diff = 0;
     // per column, for the pipelined window's concurrent tokens: the mHC partials, the routed experts' h, the
@@ -314,6 +319,10 @@ bool Glm5Model::verify_alloc(std::string& err) {
         }
         ok = cudaMalloc((void**) &V->cols_d, ca.size() * sizeof(gf::MoeColArgs)) == cudaSuccess &&
              cudaMemcpy(V->cols_d, ca.data(), ca.size() * sizeof(gf::MoeColArgs), cudaMemcpyHostToDevice) == cudaSuccess;
+        // (the fields the wait and the fetch read - the plan, the fetch sources, wait_seq, the response ring, the
+        // tables - are fixed a column from here on)
+        ok = ok && cudaMalloc((void**) &V->md_d, (size_t) TM * sizeof(gf::MoeDev)) == cudaSuccess &&
+             cudaMemcpy(V->md_d, V->md.data(), (size_t) TM * sizeof(gf::MoeDev), cudaMemcpyHostToDevice) == cudaSuccess;
     }
     // the pipelined window's scratch slots (8 an extra column, an expert blob each): without them, the batched window
     size_t blob_max = 0;
@@ -639,8 +648,46 @@ bool Glm5Model::verify_attn_v41(int il, int64_t p0, int tb, int T, cudaStream_t 
     return true;
 }
 
+// verify_moe's first launch: the router's logits (and, STRATA_GLM_SH_LATE=0, the shared expert's gate / up) of the
+// columns tb .. tb + T - 1 - apart, so a layer's graph can carry it (verify_part_q4x)
+bool Glm5Model::verify_moe_router(int il, int tb, int T, cudaStream_t s, std::string& err) {
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared;
+    const size_t q8e = (size_t) (E / 32) * kQ8;
+    gf::MvJob j[3];
+    j[0] = {Ly.router, nullptr, V->x + (size_t) tb * E, V->rlog + (size_t) tb * g.n_expert, nullptr, 1.0f,
+            Ly.router_type, E, g.n_expert};   // (as fast_moe: deepseek4's BF16, deepseek41's F32)
+    j[1] = {Ly.sh_gate.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_g + (size_t) tb * FFs, nullptr, 1.0f,
+            Ly.sh_gate.type, E, FFs};
+    j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
+            Ly.sh_up.type, E, FFs};
+    if (!gf::mvn(j, verify_sh_late() && FFs > 0 ? 1 : 3, T, s)) { err = "deepseek4 verify: router / shared expert"; return false; }
+    return true;
+}
+
+void Glm5Model::verify_report() const {
+    const auto* V = (const VerifyBuf*) vb_;
+    if (V == nullptr || V->q4g_rep + V->q4g_eager == 0) return;
+    size_t n = 0;
+    for (auto e : V->q4g) n += e != nullptr;
+    std::fprintf(stderr, "qwen4exp verify graphs CUDA%d: %llu layer segments replayed, %llu launched (%.1f%% replayed), %zu "
+                         "graphs, %llu re-captured for new route arguments\n", dev_, V->q4g_rep, V->q4g_eager,
+                 100.0 * (double) V->q4g_rep / (double) (V->q4g_rep + V->q4g_eager), n, V->q4g_recap);
+}
+
+bool Glm5Model::verify_sh_late() {
+    static const bool sh_late = [] {
+        const char* v = getenv("STRATA_GLM_SH_LATE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return sh_late;
+}
+
 bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& toks, cudaStream_t s,
-                           cudaEvent_t wait_ev, cudaEvent_t done_ev, std::string& err) {
+                           cudaEvent_t wait_ev, cudaEvent_t done_ev, std::string& err, bool router_done, bool graphed) {
     FastState* F = fast_;
     auto* V = (VerifyBuf*) vb_;
     const Glm5Geometry& g = g_;
@@ -655,12 +702,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     // the shared expert's gate/up after the routes, as the token path does (fast_moe, STRATA_GLM_SH_LATE)
-    static const bool sh_late = [] {
-        const char* v = getenv("STRATA_GLM_SH_LATE");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
-    const bool late = sh_late && FFs > 0;
-    if (!gf::mvn(j, late ? 1 : 3, T, s)) { err = "deepseek4 verify: router / shared expert"; return false; }
+    const bool late = verify_sh_late() && FFs > 0;
+    if (!router_done && !verify_moe_router(il, tb, T, s, err)) return false;
     const bool lane = F->cpu_plan != 0ull && F->cpu_fmt[(size_t) il].n_ff > 0;
     static const int promote_min = [] {
         const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
@@ -730,18 +773,36 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         err = "deepseek4 verify: the check buffer";
         return false;
     }
-    for (int t = tb; t < tb + T; ++t) {
+    // STRATA_GLM_FETCH_COLS (default 1): with the column-batched experts, the columns' waits and fetches in one
+    // launch (moe_wait_fetch_cols: the same copies); 0: a moe_wait and a moe_fetch a column
+    // (default on for qwen4exp only: DeepSeek V4/V4.1's SSD-streamed fetches share the SMs differently - not measured)
+    static const int fetch_cols = [] {
+        const char* v = getenv("STRATA_GLM_FETCH_COLS");
+        return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
+    }();
+    const bool fcols = (fetch_cols < 0 ? g.q4x : fetch_cols != 0) && cols && V->md_d != nullptr && !F->prof_on;
+    if (fcols) {
+        if (F->stream_fetch)
+            gf::moe_wait_fetch_cols(V->md_d + tb, T, E, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks,
+                                    Ly.up_bytes);
+        else
+            gf::moe_wait_fetch_cols(V->md_d + tb, T, E, k, Ly.blob, s);
+        if (done_ev != nullptr) cudaEventRecord(done_ev, s);
+    }
+    for (int t = tb; t < tb + T && !fcols; ++t) {
         gf::MoeDev md = V->md[(size_t) t];
         md.nv_scale = Ly.nv_scale;   // (NVFP4 experts; null otherwise)
         float* sh_out = V->sh_out + (size_t) t * E;
         void* hq = (uint8_t*) V->hq + (size_t) t * V->hq_n;
         if (wait_fetch && !F->prof_on) {   // (one launch: gf::moe_wait_fetch, as fast_moe; streamed as its)
-            if (F->stream_fetch) gf::moe_wait_fetch(md, E, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+            if (F->stream_fetch) gf::moe_wait_fetch(md, E, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks,
+                                                    Ly.up_bytes);
             else gf::moe_wait_fetch(md, E, k, Ly.blob, s);
         } else {
             gf::moe_wait(md, E, s);
             if (F->prof_on) F->mark("vm_wait");
-            if (F->stream_fetch) gf::moe_fetch(md, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+            if (F->stream_fetch) gf::moe_fetch(md, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks,
+                                                    Ly.up_bytes);
             else gf::moe_fetch(md, k, Ly.blob, s);
             if (F->prof_on) F->mark("vm_fetch");
         }
@@ -750,7 +811,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         if (cols) continue;   // (the batched launches below; the check runs these after them)
         gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
                         hq, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
-                        FFs, sh_out, s);
+                        FFs, sh_out, s, Ly.up_type);
         if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, 1, E, s);
         if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (as fast_moe)
             q35::scale_sigmoid(sh_out, E, V->q35_shg + t, s);
@@ -764,7 +825,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         void* hq = (uint8_t*) V->hq + (size_t) tb * V->hq_n;
         gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, g.swiglu_exp,
                              (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
-                             (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s, Ly.nv_scale);
+                             (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s, Ly.nv_scale,
+                             Ly.up_type);
         if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, T, E, s);
         if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (the shared expert's gate a column)
             q35::scale_sigmoid_rows(sh_out, T, E, V->q35_shg + tb, s);
@@ -778,7 +840,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                 float* sh_o = V->sh_out + (size_t) t * E;
                 void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
                 gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
-                                hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s);
+                                hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s,
+                                Ly.up_type);
                 if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_o, 1, E, s);
                 if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)
                     q35::scale_sigmoid(sh_o, E, V->q35_shg + t, s);
@@ -817,12 +880,32 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     } else if (hc_cpu) {
         for (int t = tb; t < tb + T; ++t) V->hc_cpu[t] = true;
     } else if (lane) {
-        for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s);
+        // STRATA_GLM_CPU_WAIT_COLS=1/0: the columns' answers in one launch (the same adds) / a launch a column.
+        // Default: on for qwen4exp only (measured there)
+        static const int wait_cols = [] {
+            const char* v = getenv("STRATA_GLM_CPU_WAIT_COLS");
+            return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
+        }();
+        if ((wait_cols < 0 ? g.q4x : wait_cols != 0) && T > 1 && T <= 8 && V->md[(size_t) tb].cpu_seq != nullptr) {
+            gf::CpuWaitCols c;
+            c.n = T;
+            for (int t = 0; t < T; ++t) {
+                c.seq[t] = V->md[(size_t) (tb + t)].cpu_seq;
+                c.out[t] = V->ffn + (size_t) (tb + t) * E;
+            }
+            gf::moe_cpu_wait_cols(c, V->md[(size_t) tb].cpu_ans, E, s);
+        } else {
+            for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s);
+        }
         if (F->prof_on) F->mark("vm_cpu_wait");
     }
     abl_out(il, 1, V->ffn + (size_t) tb * E, T, (int) E, s);   // (complete: an edit keeps hc_cpu off)
+    if (graphed && (hc_cpu || (F->defer && Ly.moe && !Ly.mtp && il != l1_ - 1))) {
+        err = "a deferred or hc-fused CPU-lane answer";   // (host state the next layer reads: not in a graph)
+        return false;
+    }
     if (hc_cpu) V->bg_after[tb] = true;
-    else F->bg_drain(s, F->bg_pace);   // the paced promotions' next bytes, as fast_moe
+    else if (!graphed) F->bg_drain(s, F->bg_pace);   // the paced promotions' next bytes, as fast_moe (graphed: the caller)
     return true;
 }
 
@@ -1519,6 +1602,19 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
     V->q35_p0 = p0;
     for (int t = 0; t < T; ++t) V->q35_toks[t] = toks[(size_t) t];
     const bool prof = F->prof_on;   // STRATA_GLM_PROF: the window's phases as q4w_*
+    // STRATA_GLM_GRAPH=0/1: the per-layer graphs below off / on (default: on with CUDA, off with HIP - not measured)
+    static const bool q4g_moe = [] {
+        const char* v = getenv("STRATA_GLM_GRAPH_MOE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    static const bool q4g_on = [] {
+        const char* v = getenv("STRATA_GLM_GRAPH");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
     if (prof) F->mark("q4w_start");
     if (q35_mtp_on() && !q35_mtp_pend_commit(toks[0], err)) return false;   // (the drafter: the last position's row)
     if (prof) F->mark("q4w_mtp_commit");
@@ -1628,137 +1724,218 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             abl_res(V->R, T * g.hc, (int) E, s);   // (the PLE's rows are a residual write too)
             if (prof) F->mark("q4w_ple");
         }
-        if (!q4x_mix_cols(V->R, T, Ly.hc4[0].norm, Ly.hc4[0].down, Ly.hc4[0].up, &Ly.hc4[0].inject, prev_out,
-                          V->q4_inj[1], V->q4_inj[0], V->x, V->xq, err))
-            return false;
-        if (prof) F->mark("q4w_hc_attn");
-        if (Ly.recr) {
-            float* qkv = V->q35_qkv + (size_t) li * TM * C;
-            float* rws = V->q35_rows + (size_t) li * TM * C;
-            float* alpha = V->q35_alpha + (size_t) li * TM * HV;
-            float* beta = V->q35_beta + (size_t) li * TM * HV;
-            gf::MvJob j[4];
-            j[0] = {Ly.qkv.q, V->xq, V->x, qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
-            j[1] = {Ly.zg.q, V->xq, V->x, V->q35_z, nullptr, 1.0f, Ly.zg.type, E, Vd};
-            j[2] = {Ly.alpha_w.q, V->xq, V->x, alpha, nullptr, 1.0f, Ly.alpha_w.type, E, HV};
-            j[3] = {Ly.beta_w.q, V->xq, V->x, beta, nullptr, 1.0f, Ly.beta_w.type, E, HV};
-            if (!gf::mvn(j, 4, T, s)) { err = "qwen4exp verify: the delta-net projections"; return false; }
-            if (prof) F->mark("q4w_gdn_mv");
-            q35::conv_rows(qkv, T, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, rws, s);
-            q35::gdn_prep_gates(rws, T, C, HK, Sd, g.norm_eps, alpha, beta, Ly.dt_bias, Ly.ssm_a, HV, s);
-            if (prof) F->mark("q4w_gdn_conv");
-            // the recurrence, the output norm and y's q8_1 in one launch (q35::gdn_core after the prep above - the rows,
-            // gates and betas stay for the rewind's replay; the same bits, gdn_core_parity).  STRATA_Q4X_GDN_FUSE=0: the
-            // three launches.  Off by default with HIP, as the token path's
-            static const bool gdn_fuse = [] {
-                const char* v = getenv("STRATA_Q4X_GDN_FUSE");
-#if defined(STRATA_USE_HIP)
-                return v != nullptr && std::atoi(v) != 0;
-#else
-                return v == nullptr || std::atoi(v) != 0;
-#endif
-            }();
-            if (gdn_fuse && Sd == 128) {
-                q35::gdn_core(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, false, g.norm_eps, nullptr, nullptr,
-                              V->q35_z, Ly.ssm_norm, g.norm_eps, V->q35_y, V->q35_yq, s);
-                if (prof) F->mark("q4w_gdn_scan");
-            } else {
-                q35::gdn_scan(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
-                if (prof) F->mark("q4w_gdn_scan");
-                k::gdn_out_norm(V->q35_o, V->q35_z, Ly.ssm_norm, V->q35_y, (int64_t) T * HV, Sd, g.norm_eps, (void*) s);
-                gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
-            }
-            gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, E};
-            if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: ssm_out"; return false; }
-            if (prof) F->mark("q4w_gdn");
-            ++li;
-        } else {
-            gf::MvJob j[3];
-            j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, E, 2 * HD};
-            j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
-            j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
-            if (!gf::mvn(j, 3, T, s)) { err = "qwen4exp verify: the attention projections"; return false; }
-            q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
-                                g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
-            const float scale = 1.0f / std::sqrt((float) D);
-            // STRATA_Q4X_QSA_DECODE (on for CUDA, off on HIP): the QSA layer's keys and attention for the window's
-            // columns at once (below); the same bits
-#if defined(STRATA_USE_HIP)
-            static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v != nullptr && std::atoi(v) != 0; }();
-#else
-            static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v == nullptr || std::atoi(v) != 0; }();
-#endif
-            if (Ly.q4_pooled != nullptr) {
-                // the indexer's raw keys (kept a layer for the rewind) and queries (BF16 rows against the float
-                // columns), the block keys a column
-                float* rawk = Ly.q4_tail != nullptr ? V->q4_rawk + (size_t) la++ * TM * ID : V->q4_iraw;
-                gf::MvJob ij[2];
-                ij[0] = {Ly.q4_ik.q, nullptr, V->x, rawk, nullptr, 1.0f, Ly.q4_ik.type, E, ID};
-                ij[1] = {Ly.q4_iq.q, nullptr, V->x, V->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, IH * ID};
-                if (!gf::mvn(ij, 2, T, s)) { err = "qwen4exp verify: the indexer projections"; return false; }
-                const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
-                if (rows_attn)   // (the window's keys in two launches, the same buffers)
-                    k::indexer_key_append_rows(rawk, ID, p0, T, 0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin,
-                                               (void*) s);
-                else
-                    for (int t = 0; t < T; ++t)
-                        k::indexer_key_append(rawk + (size_t) t * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos, 0,
-                                              Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
-                bool any = false;
-                for (int t = 0; t < T && !any; ++t) any = k::qsa_selection_width(p0 + t + 1, sh) < p0 + t + 1;
-                if (any) {
-                    k::rms_norm_weighted(V->q4_iq, Ly.q4_iqn, (int64_t) T * IH, ID, g.norm_eps, (void*) s);
-                    k::rope_neox_apply(V->q4_iq, V->q4_iq, (int64_t) T * IH, ID, g.n_rot, F->q4_cos, F->q4_sin, ipos, (void*) s);
-                }
-            }
-            // the window's columns in one launch when they are all past 2,051 cells (one selection call for them all,
-            // then each column's cells read in place) or all below (every cell); a window across the bound: a column
-            // at a time
-            bool cols_done = false;
-            if (rows_attn && Ly.q4_pooled != nullptr && F->q4_pf_part != nullptr && T <= FastState::kQ4Grp) {
-                const bool sel_all = k::qsa_selection_width(p0 + 1, sh) < p0 + 1;
-                const bool dense_all = k::qsa_selection_width(p0 + T, sh) == p0 + T;
-                if (sel_all) {
-                    k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, V->q4_iq, V->q4_steps, T, F->q4_max_blocks, sh,
-                                        F->q4_pf_scores, (void*) s);
-                    k::qsa_block_topk(F->q4_pf_scores, V->q4_steps, T, F->q4_max_blocks, F->q4_cap, sh, F->q4_pf_ids,
-                                      (void*) s);
-                    cols_done = q35::attn_decode_rows(V->q35_q, Ly.kc, Ly.vc, F->q4_pf_ids, F->q4_cap, V->q4_steps, T,
-                                                      F->q4_cap, g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part,
-                                                      V->q35_ao, s);
-                } else if (dense_all) {
-                    cols_done = q35::attn_decode_rows(V->q35_q, Ly.kc, Ly.vc, nullptr, 0, V->q4_steps, T, (int) (p0 + T),
-                                                      g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part, V->q35_ao, s);
-                }
-            }
-            for (int t = 0; t < T && !cols_done; ++t) {
-                const int64_t p = p0 + t;
-                const int w = Ly.q4_pooled != nullptr ? (int) k::qsa_selection_width(p + 1, sh) : (int) (p + 1);
-                float* ao = V->q35_ao + (size_t) t * HD;
-                const float* q = V->q35_q + (size_t) t * HD;
-                if (w < p + 1) {
-                    const int32_t* st = V->q4_steps + (size_t) t * 4;
-                    k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, V->q4_iq + (size_t) t * IH * ID, st, 1, F->q4_max_blocks, sh,
-                                        F->q4_scores, (void*) s);
-                    k::qsa_block_topk(F->q4_scores, st, 1, F->q4_max_blocks, F->q4_cap, sh, F->q4_ids, (void*) s);
-                    q35::gather_rows(Ly.kc, Ly.vc, F->q4_ids, w, KV, F->q4_ks, F->q4_vs, s);
-                    q35::attn_decode(q, F->q4_ks, F->q4_vs, g.n_head, g.attn_head_kv, D, w, scale, F->q35_part, ao, s);
+        // the layer's same-every-window part - the hyper-connections, the delta-net block and the MoE's router -
+        // as a graph a (layer, window width) (STRATA_GLM_GRAPH, stage 1): captured at its second window, replayed
+        // after; the attention layers (their positions are arguments), the PLE layer and the MoE's dispatch run as
+        // launches.  The same kernels, the same arguments: the same bits
+        const auto seg = [&](bool with_router) -> bool {
+            if (!q4x_mix_cols(V->R, T, Ly.hc4[0].norm, Ly.hc4[0].down, Ly.hc4[0].up, &Ly.hc4[0].inject, prev_out,
+                              V->q4_inj[1], V->q4_inj[0], V->x, V->xq, err))
+                return false;
+            if (prof) F->mark("q4w_hc_attn");
+            if (Ly.recr) {
+                float* qkv = V->q35_qkv + (size_t) li * TM * C;
+                float* rws = V->q35_rows + (size_t) li * TM * C;
+                float* alpha = V->q35_alpha + (size_t) li * TM * HV;
+                float* beta = V->q35_beta + (size_t) li * TM * HV;
+                gf::MvJob j[4];
+                j[0] = {Ly.qkv.q, V->xq, V->x, qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
+                j[1] = {Ly.zg.q, V->xq, V->x, V->q35_z, nullptr, 1.0f, Ly.zg.type, E, Vd};
+                j[2] = {Ly.alpha_w.q, V->xq, V->x, alpha, nullptr, 1.0f, Ly.alpha_w.type, E, HV};
+                j[3] = {Ly.beta_w.q, V->xq, V->x, beta, nullptr, 1.0f, Ly.beta_w.type, E, HV};
+                if (!gf::mvn(j, 4, T, s)) { err = "qwen4exp verify: the delta-net projections"; return false; }
+                if (prof) F->mark("q4w_gdn_mv");
+                q35::conv_rows(qkv, T, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, rws, s);
+                q35::gdn_prep_gates(rws, T, C, HK, Sd, g.norm_eps, alpha, beta, Ly.dt_bias, Ly.ssm_a, HV, s);
+                if (prof) F->mark("q4w_gdn_conv");
+                // the recurrence, the output norm and y's q8_1 in one launch (q35::gdn_core after the prep above - the rows,
+                // gates and betas stay for the rewind's replay; the same bits, gdn_core_parity).  STRATA_Q4X_GDN_FUSE=0: the
+                // three launches.  Off by default with HIP, as the token path's
+                static const bool gdn_fuse = [] {
+                    const char* v = getenv("STRATA_Q4X_GDN_FUSE");
+    #if defined(STRATA_USE_HIP)
+                    return v != nullptr && std::atoi(v) != 0;
+    #else
+                    return v == nullptr || std::atoi(v) != 0;
+    #endif
+                }();
+                if (gdn_fuse && Sd == 128) {
+                    q35::gdn_core(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, false, g.norm_eps, nullptr, nullptr,
+                                  V->q35_z, Ly.ssm_norm, g.norm_eps, V->q35_y, V->q35_yq, s);
+                    if (prof) F->mark("q4w_gdn_scan");
                 } else {
-                    q35::attn_decode(q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, (int) (p + 1), scale, F->q35_part, ao, s);
+                    q35::gdn_scan(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
+                    if (prof) F->mark("q4w_gdn_scan");
+                    k::gdn_out_norm(V->q35_o, V->q35_z, Ly.ssm_norm, V->q35_y, (int64_t) T * HV, Sd, g.norm_eps, (void*) s);
+                    gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
+                }
+                gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, E};
+                if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: ssm_out"; return false; }
+                if (prof) F->mark("q4w_gdn");
+                ++li;
+            } else {
+                gf::MvJob j[3];
+                j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, E, 2 * HD};
+                j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
+                j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
+                if (!gf::mvn(j, 3, T, s)) { err = "qwen4exp verify: the attention projections"; return false; }
+                q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
+                                    g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
+                const float scale = 1.0f / std::sqrt((float) D);
+                // STRATA_Q4X_QSA_DECODE (on for CUDA, off on HIP): the QSA layer's keys and attention for the window's
+                // columns at once (below); the same bits
+    #if defined(STRATA_USE_HIP)
+                static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v != nullptr && std::atoi(v) != 0; }();
+    #else
+                static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v == nullptr || std::atoi(v) != 0; }();
+    #endif
+                if (Ly.q4_pooled != nullptr) {
+                    // the indexer's raw keys (kept a layer for the rewind) and queries (BF16 rows against the float
+                    // columns), the block keys a column
+                    float* rawk = Ly.q4_tail != nullptr ? V->q4_rawk + (size_t) la++ * TM * ID : V->q4_iraw;
+                    gf::MvJob ij[2];
+                    ij[0] = {Ly.q4_ik.q, nullptr, V->x, rawk, nullptr, 1.0f, Ly.q4_ik.type, E, ID};
+                    ij[1] = {Ly.q4_iq.q, nullptr, V->x, V->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, IH * ID};
+                    if (!gf::mvn(ij, 2, T, s)) { err = "qwen4exp verify: the indexer projections"; return false; }
+                    const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
+                    if (rows_attn)   // (the window's keys in two launches, the same buffers)
+                        k::indexer_key_append_rows(rawk, ID, p0, T, 0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin,
+                                                   (void*) s);
+                    else
+                        for (int t = 0; t < T; ++t)
+                            k::indexer_key_append(rawk + (size_t) t * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos, 0,
+                                                  Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
+                    bool any = false;
+                    for (int t = 0; t < T && !any; ++t) any = k::qsa_selection_width(p0 + t + 1, sh) < p0 + t + 1;
+                    if (any) {
+                        k::rms_norm_weighted(V->q4_iq, Ly.q4_iqn, (int64_t) T * IH, ID, g.norm_eps, (void*) s);
+                        k::rope_neox_apply(V->q4_iq, V->q4_iq, (int64_t) T * IH, ID, g.n_rot, F->q4_cos, F->q4_sin, ipos, (void*) s);
+                    }
+                }
+                // the window's columns in one launch when they are all past 2,051 cells (one selection call for them all,
+                // then each column's cells read in place) or all below (every cell); a window across the bound: a column
+                // at a time
+                bool cols_done = false;
+                if (rows_attn && Ly.q4_pooled != nullptr && F->q4_pf_part != nullptr && T <= FastState::kQ4Grp) {
+                    const bool sel_all = k::qsa_selection_width(p0 + 1, sh) < p0 + 1;
+                    const bool dense_all = k::qsa_selection_width(p0 + T, sh) == p0 + T;
+                    if (sel_all) {
+                        k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, V->q4_iq, V->q4_steps, T, F->q4_max_blocks, sh,
+                                            F->q4_pf_scores, (void*) s);
+                        k::qsa_block_topk(F->q4_pf_scores, V->q4_steps, T, F->q4_max_blocks, F->q4_cap, sh, F->q4_pf_ids,
+                                          (void*) s);
+                        cols_done = q35::attn_decode_rows(V->q35_q, Ly.kc, Ly.vc, F->q4_pf_ids, F->q4_cap, V->q4_steps, T,
+                                                          F->q4_cap, g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part,
+                                                          V->q35_ao, s);
+                    } else if (dense_all) {
+                        cols_done = q35::attn_decode_rows(V->q35_q, Ly.kc, Ly.vc, nullptr, 0, V->q4_steps, T, (int) (p0 + T),
+                                                          g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part, V->q35_ao, s);
+                    }
+                }
+                for (int t = 0; t < T && !cols_done; ++t) {
+                    const int64_t p = p0 + t;
+                    const int w = Ly.q4_pooled != nullptr ? (int) k::qsa_selection_width(p + 1, sh) : (int) (p + 1);
+                    float* ao = V->q35_ao + (size_t) t * HD;
+                    const float* q = V->q35_q + (size_t) t * HD;
+                    if (w < p + 1) {
+                        const int32_t* st = V->q4_steps + (size_t) t * 4;
+                        k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, V->q4_iq + (size_t) t * IH * ID, st, 1, F->q4_max_blocks, sh,
+                                            F->q4_scores, (void*) s);
+                        k::qsa_block_topk(F->q4_scores, st, 1, F->q4_max_blocks, F->q4_cap, sh, F->q4_ids, (void*) s);
+                        q35::gather_rows(Ly.kc, Ly.vc, F->q4_ids, w, KV, F->q4_ks, F->q4_vs, s);
+                        q35::attn_decode(q, F->q4_ks, F->q4_vs, g.n_head, g.attn_head_kv, D, w, scale, F->q35_part, ao, s);
+                    } else {
+                        q35::attn_decode(q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, (int) (p + 1), scale, F->q35_part, ao, s);
+                    }
+                }
+                q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s);
+                gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
+                gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
+                if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: attn_output"; return false; }
+                if (prof) F->mark("q4w_attn");
+            }
+            abl_out(il, 0, V->mixer, T, E, s);
+            if (!q4x_mix_cols(V->R, T, Ly.hc4[1].norm, Ly.hc4[1].down, Ly.hc4[1].up, &Ly.hc4[1].inject, V->mixer,
+                              V->q4_inj[0], V->q4_inj[1], V->x, V->xq, err))
+                return false;
+            if (prof) F->mark("q4w_hc_ffn");
+            return !with_router || verify_moe_router(il, 0, T, s, err);
+        };
+        // stage 2 (STRATA_GLM_GRAPH_MOE, default on with the graphs): the MoE's dispatch in the same graph - the routes,
+        // the waits and fetches, the experts and the CPU lane's wait all read their plans from device memory; what the
+        // host decides per window stays outside (the request count, the paced background copies) and what the routes
+        // take by value (the CPU lane's split, the helper, the tail skip) is the graph's key: another key re-captures
+        const uint64_t sig = [&] {
+            uint64_t h = F->cpu_plan * 0x9E3779B97F4A7C15ull;
+            const auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; };
+            mix((uint64_t) (uintptr_t) (F->expert_helper && F->expert_helper->active && !F->expert_helper->failed
+                                            ? F->expert_helper->owned_d : nullptr));
+            mix((uint64_t) F->tail_skip);
+            uint32_t w = 0;
+            std::memcpy(&w, &F->tail_skip_w, sizeof w);
+            mix(w);
+            mix(F->tail_skip_disk ? 1u : 0u);
+            return h;
+        }();
+        const auto seg_moe = [&]() -> bool {
+            return seg(true) && verify_moe(il, 0, T, toks, s, nullptr, nullptr, err, true, true);
+        };
+        bool router_done = false;
+        if (q4g_on && Ly.recr && il != l0_ && !(V->q4_ple_on && il == F->ple_il) && !prof) {
+            const size_t gk = (size_t) il * (kVerifyMax + 1) + (size_t) T;
+            if (V->q4g.empty()) {
+                V->q4g.assign((size_t) g.n_layers * (kVerifyMax + 1), nullptr);
+                V->q4g_n.assign(V->q4g.size(), 0);
+                V->q4g_sig.assign(V->q4g.size(), 0);
+            }
+            cudaGraphExec_t& ex = V->q4g[gk];
+            if (ex != nullptr && q4g_moe && V->q4g_sig[gk] != sig) {   // (a new key: captured again now)
+                cudaGraphExecDestroy(ex);
+                ex = nullptr;
+                ++V->q4g_recap;
+            }
+            const uint64_t exp0 = F->expected;
+            if (ex == nullptr && V->q4g_n[gk] < 255 && ++V->q4g_n[gk] >= 2) {
+                const int li0 = li, la0 = la;
+                cudaGraph_t gr = nullptr;
+                bool cok = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+                if (cok) {
+                    cok = q4g_moe ? seg_moe() : seg(true);
+                    const cudaError_t e = cudaStreamEndCapture(s, &gr);
+                    cok = cok && e == cudaSuccess && gr != nullptr;
+                }
+                if (cok && cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) ex = nullptr;
+                if (!cok) ex = nullptr;
+                if (gr != nullptr) cudaGraphDestroy(gr);
+                cudaGetLastError();
+                li = li0;
+                la = la0;
+                F->expected = exp0;   // (the capture ran no route: counted again below)
+                V->q4g_sig[gk] = sig;
+                if (ex == nullptr) {   // (this layer and width stay launches)
+                    V->q4g_n[gk] = 255;
+                    std::fprintf(stderr, "qwen4exp verify: layer %d's graph (%d columns) did not capture%s%s - launches\n",
+                                 il, T, err.empty() ? "" : ": ", err.c_str());
+                    err.clear();
                 }
             }
-            q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s);
-            gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
-            gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
-            if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: attn_output"; return false; }
-            if (prof) F->mark("q4w_attn");
+            if (ex != nullptr) {
+                if (!glmfast::cuda_ok(cudaGraphLaunch(ex, s), "qwen4exp verify graph", err)) return false;
+                ++li;   // (the segment's delta-net layer)
+                router_done = true;
+                ++V->q4g_rep;
+            }
         }
-        abl_out(il, 0, V->mixer, T, E, s);
-        if (!q4x_mix_cols(V->R, T, Ly.hc4[1].norm, Ly.hc4[1].down, Ly.hc4[1].up, &Ly.hc4[1].inject, V->mixer,
-                          V->q4_inj[0], V->q4_inj[1], V->x, V->xq, err))
+        if (!router_done) {
+            if (!seg(false)) return false;
+            ++V->q4g_eager;
+        }
+        if (router_done && q4g_moe) {   // (the graph ran the MoE too: its T routes, then the paced copies)
+            F->expected += (uint64_t) T;
+            F->bg_drain(s, F->bg_pace);
+        } else if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err, router_done)) {
             return false;
-        if (prof) F->mark("q4w_hc_ffn");
-        if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+        }
         if (prof) F->mark("q4w_moe");
     }
     if (split_next_) {

@@ -152,6 +152,23 @@ iGPU lane), MTP drafter on:
 The prompt path multiplies NVFP4 with Blackwell's FP4 tensor cores (RTX 50, RTX PRO Blackwell, DGX Spark); other
 NVIDIA GPUs and AMD are not checked yet. Reports from other GPUs are welcome (a bench issue as above).
 
+### unsloth UD-IQ1_S (UD 3.1, v1.3.112, beta)
+
+[unsloth's UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (66.4 GB) stores one layer's gate
+and up experts in different types (layer 18: IQ2_S gate, IQ2_XXS up; down Q2_0 everywhere). From v1.3.112 the pack
+records such a layer as `G,U` and each role is computed in its own type; older engines refuse the pack with a reason.
+Make the pack with v1.3.112's `tools/iq_pack.py --fast` (as above). The iGPU lane and a helper GPU leave that one layer
+to the CPU. Checked on an RTX 5090 (PCIe Gen4 x4) + 94 GB RAM, MTP drafter on, iGPU lane off:
+
+| Check | Result |
+| --- | --- |
+| KL to the NVFP4 teacher (seq 0-9, 2,048 context) | 0.2007, same top token 83.2% (llama.cpp on the same file: 0.2012 / 83.1%) - 16G64G: 0.083 / 89.3% |
+| Decode, 4K prompt, 512 tokens (median of 3) | 32 GB: 153.4 tok/s with the drafter, 103.7 without; 16 GB (`STRATA_GLM_VRAM_GB=16`): 78.0 with it, 109.6 with it and the 8060S iGPU lane |
+| Prompt | 4K ~1,900 tok/s, 10K (needle) 2,734 tok/s |
+| Real use (bench/mgpu/run.sh, 32 GB) | Japanese OK, code 4 / 5, 8K needle found |
+
+Lower quality than the 16G64G build at a smaller file; take it when the larger files do not fit.
+
 ## Limits
 
 - One GPU: a split across cards has not been tried with this model, and the drafter loads only when one card runs

@@ -38,9 +38,12 @@ td.log
 /run-maya-*.sh
 /run-maya-*.bat
 /maya-report.txt
-# ./abyss.sh --bench / --report: their results (pasted into issues, not committed)
+# ./abyss.sh --bench / --check / --report: their results (pasted into issues, not committed)
 /abyss-bench.txt
 /abyss-report.txt
+/abyss-check.txt
+/abyss-check.log
+/abyss-check-server.log
 /maya-bench.txt
 # Abyss-tools' run configs (abyss-<model>.json, run-abyss-<model>.sh) and engine logs
 /abyss-*.json

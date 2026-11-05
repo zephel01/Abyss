@@ -514,6 +514,18 @@ copies, the GPU), the likely bottleneck with what moves it, and a quality check 
 model (`bench/ref`). `--deep` adds the GPU timeline and a sweep of the PCIe / lane share; `--full` repeats the answers
 and adds a 32k prompt. It writes `abyss-bench.txt` to paste into an issue. [BENCH.md](BENCH.md) explains each line.
 
+### Checking that the model runs right (`./abyss.sh --check`)
+
+`./abyss.sh --check` (v1.3.112, Abyss stopped, 15-30 minutes; `--quick` about 5, `--long` adds the biggest prompts the
+context allows) runs the installed model the way it is used and checks that it stays up and answers right: the answer
+with and without the drafter, Japanese, small coding tasks whose code runs against tests, a tool call, prompts of 8K /
+24K / 32K tokens up to the context's top with a needle, and an 11-turn conversation. It writes `abyss-check.txt` (no
+host, user or folder names; nothing is sent) with this PC, the model and "What limits this PC" - the estimate of which
+part (GPU, CPU lane, PCIe, RAM, SSD, VRAM) holds a token back. Attach it to a [bug report](https://github.com/zephel01/Abyss/issues/new?template=bug.md)
+(`--report` includes it). The exit code is 1 only when a step fails. Before the setup, or with `--setup` / `--gpu` /
+`--gpus`, `--check` checks the PC only, as before. Windows: `START-ABYSS.bat --check`. Each step:
+[BENCH.md](BENCH.md#the-stability-check---check).
+
 ### Tuning for your GPU (`./abyss.sh --gpu-tune`)
 
 Some kernel choices depend on the GPU; the engine picks them per GPU architecture (it logs `glm fast: dense GEMV
@@ -782,6 +794,9 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_WAIT_FETCH` | on (HIP), off (NVIDIA) | the MoE layer's wait for disk reads and its copies of RAM-tier experts in one launch instead of two (v1.3.42; the same work); `0`: two launches |
 | `STRATA_HIP_EXPERTS_LEGACY` | off | `1`: the original decode expert kernels instead of the RDNA ones (gfx1100, gfx1201 since v1.3.40: gate/up and down ~20% faster on an AI PRO R9700; gfx1151 all but the IQ3_XXS down). Bit-identical either way |
 | `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16 (Qwen3.8: 2 / 8) | a RAM-tier expert replaces a resident one when its use count passes ratio x the resident's + margin (2 / 4: the old, churnier rule). Qwen3.8-Flash-Next swaps sooner and moves up to 16 experts a token boundary (`STRATA_GLM_PROMOTE`, else 8): its ~2 MB experts copy in ~0.3 ms (v1.3.86; RTX 5090, ISTA IQ3_S: VRAM hits 60-77% -> 68-89%, +12-15%) |
+| `STRATA_GLM_BG_SPLIT` | 1 for Qwen3.8, else 0 | background promotions also while the CPU lane takes only part of the RAM-tier experts (0: only when it takes all of them, as before). Qwen3.8 whose VRAM pool holds half of the experts or more swaps at ratio 1 / margin 2 (RTX 5090, Swift 1.5 IQ2_XS 32 GB: VRAM hits 95.0 -> 96.2%, 176 -> 182 tok/s); a tighter pool keeps 2 / 8 |
+| `STRATA_GLM_FETCH_COLS` / `STRATA_GLM_CPU_WAIT_COLS` | 1 for Qwen3.8, else 0 | the speculative verify window waits for the CPU lane and fetches its experts with one kernel for all columns instead of one per column (the same arithmetic) |
+| `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | 1 / 1 on CUDA, 0 on HIP | Qwen3.8's verify window replays each delta-net layer from a CUDA graph (0: launched kernel by kernel; `_MOE=0`: the MoE dispatch outside the graph). The same tokens; launches a token 453 -> 254 (no change in speed on an RTX 5090) |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | the tier moves' copies (the refill after a prompt, the swaps) go in pieces of up to this many KB a MoE layer, while the next layer's mixer runs, instead of all at the token boundary - there they held up the next token's host-mapped reads until they had landed (after an 8K prompt ~10 tokens at 35-39 ms). `0`: at the boundary, as before |
 | `STRATA_GLM_ZERO_COPY` | on | the token boundary without the copy engines (v1.3.21): the table edits, the embedding row (a pinned copy of `token_embd`, Q8_0 / Q5_K) and the token are read and written host-mapped by the kernels. `0`: the copies, as before |
 | `STRATA_GLM_GAP_PROF` | off | `1`: a `glm gap prof` line after each answer - where the time between two tokens goes (host laps, the GPU's idle gap by timing events) |

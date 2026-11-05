@@ -549,7 +549,10 @@ public:
     void dspark_window(int64_t p0, int T);         // verify: its columns wait for spec_rewind's position
     void dspark_settle();                          // ... which commits the kept ones
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
-                    cudaEvent_t done_ev, std::string& err);
+                    cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);
+    bool verify_moe_router(int il, int tb, int n, cudaStream_t s, std::string& err);   // (its first launch)
+    static bool verify_sh_late();
+    void verify_report() const;   // (the q4x window's graph use, at the end)
     // one part's share of a window (verify): its layers on the columns' residuals in its own buffers, then, a part
     // before the last, the columns' residuals into the next part's (the host hop), else the head, the logits and the
     // argmax; the last part records its buffers' done event

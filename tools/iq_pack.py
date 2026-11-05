@@ -8,7 +8,8 @@ its GGUF form:
 
   experts.bin          per layer, 512 blobs of [gate rows | up rows | down rows], the raw GGUF slices.  Blob
                        size is per layer (the files mix IQ1_M ... IQ3_S gate/up and Q2_0 / IQ4_NL down).
-  native_experts.txt   one line per layer: layer gu_type d_type offset blob_bytes
+  native_experts.txt   one line per layer: layer gu_type d_type offset blob_bytes (gu_type "G,U" when gate and up
+                       differ in type)
   index.txt            the table the engine loads.  Quantized dense tensors, token_embd and output are served
                        natively from the GGUF by the engine (--native): their rows carry shape only.
   dense.bin            standalone: the BF16/F16/F32 tensors exactly as the GGUF stores them (index kinds 4/5/2).
@@ -728,11 +729,12 @@ def main() -> int:
     for l in moe_layers:
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
         per = [t.expected_bytes() // n_expert for t in ts]
-        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
-            print("layer %d: gate and up differ in type" % l)
-            return 1
+        # gate and up may differ in type (unsloth's UD-IQ1_S Qwen3.8: IQ2_S gate + IQ2_XXS up in 13 layers): the row's
+        # gu_type field is then "G,U" and the blob [gate | up | down] has each role at its own size.  A layer whose
+        # roles agree writes the one type as before, so every other pack stays byte-identical
+        gt = str(ts[0].type_id) if ts[0].type_id == ts[1].type_id else "%d,%d" % (ts[0].type_id, ts[1].type_id)
         blob = per[0] + per[1] + per[2]
-        layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
+        layout.append((l, gt, ts[2].type_id, offset, blob, ts))
         offset += blob * n_expert
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
         straddle = any(len({w[3] for w in (model.where[t.name] for t in ts)}) != 1
@@ -752,7 +754,7 @@ def main() -> int:
             offs = [w[0].data_start + t.offset for w, t in zip(ws, ts)]
             if len(set(shards)) == 1:
                 # v3 row: one shard for the whole blob (omitted when it is shard 1)
-                line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
+                line = "%d %s %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
                 fo.write(line + ("" if shards[0] == src else " " + shards[0].name) + "\n")
             else:
                 # v4 row: the layer straddles shards (a shard boundary inside a layer); each
@@ -762,7 +764,7 @@ def main() -> int:
                 # checks each offset against that shard's directory at load, so gate and up may
                 # sit in different files too (a split by size can cut between them).
                 names = [s.name for s in shards]
-                fo.write("%d %d %d %d %d %d %d %d %s\n"
+                fo.write("%d %s %d %d %d %d %d %d %s\n"
                          % (l, gt, dt, off, blob, *offs, " ".join(names)))
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:
@@ -779,7 +781,9 @@ def main() -> int:
             assert chunk.shape == (n_expert, blob)
             fo.write(chunk.tobytes())
             if l % 8 == 0:
-                print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
+                print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name if ts[0].type_id == ts[1].type_id
+                                                                    else ts[0].type_name + "," + ts[1].type_name,
+                                                                    ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)
     print("experts.bin: %d layers, %.2f GiB" % (n_layers, offset / 2**30))
     return 0

@@ -567,6 +567,9 @@ class StrataEngine:
             ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (fewer than it started with)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"
+            sp = tune.get("spec")   # 0: this answer token by token, no drafter (./abyss.sh --check's drafter step)
+            if isinstance(sp, int) and not isinstance(sp, bool) and sp in (0, 1):
+                tune_keys += f" spec={sp}"
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)

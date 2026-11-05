@@ -112,6 +112,7 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 | Qwen3.8-35B-A3B Distill（Qwen3.5-MoE、Ornith を小さくした形式） | empero-ai の [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF)（v1.3.92） | 21.7 GB | RTX 5090 で計測: swe-bench 3 問で 399 tok/s（NextN 下書きあり、採用率 85%）、VRAM を 16 GB に制限して 297 tok/s |
 | Qwen3.8-Flash-Next（qwen4exp、[docs/qwen38](docs/qwen38/README.ja.md)） | orcarouter の [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) を速い経路で（v1.3.74）。v1.3.76 からベータ: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S、unsloth UD-IQ4_XS / UD-Q4_K_XL（どの PC にどれか: [docs/qwen38](docs/qwen38/README.ja.md#ほかの-ggufベータ)） | 85.2 GB | AI PRO R9700 で計測: プロンプト 30K で 1,037 tok/s、答えは MTP ドラフターありで文章 64〜65 tok/s / コード 86、llama.cpp 比 KL 0.026。NVIDIA は未ビルド |
 | | magnitudedev の [NVFP4](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF)（v1.3.101、ベータ、[docs/qwen38](docs/qwen38/README.ja.md#nvfp4nvidia-の-fp4-チェックポイントv13101ベータ)） | 127.8 GB | RTX 5090 + 96 GB で計測: llama.cpp 比 KL 0.018、プロンプト 32K で 2,515 tok/s、swe-bench 3 問 105.3 tok/s（MTP ドラフターあり） |
+| | unsloth の [UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（v1.3.112、ベータ。1 つの層で gate と up のエキスパートの型が違う、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-ud-iq1_sud-31v13112ベータ)） | 66.4 GB | RTX 5090 + 94 GB で計測: KL 0.201（同じファイルの llama.cpp も 0.201）、32 GB で MTP ドラフターあり 153 tok/s、コード 4 / 5 |
 | GLM-5.3-Flash（Maya のもの） | Maya-S-v2 IQ2_XXS、Maya-S24 | 96.5 / 94.7 GB | 計測済み |
 | | turboderp の EXL3 sc_2.10bpw（[EXL3](docs/exl3/README.md)） | | 計測済み、試験的 |
 | | kindlingai の [exlr8](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) K2 を `tools/exlr8_convert.py` で変換（v1.3.53） | 86 GB | AI PRO R9700 で計測済み: 約 23 tok/s、nll 1.61（Maya-S-v2 は 1.634、低いほど良い）。K3（125 GB）は nll 1.548、約 11 tok/s |
@@ -120,6 +121,7 @@ V4.1 でどのファイルを選ぶかと、それぞれの測り方: [docs/deep
 測ったファイルすべての品質と速さ、GPU ごとの参考値（こちらの実測と、利用者の報告）: [docs/MODELS.ja.md](docs/MODELS.ja.md)。
 自作の量子化（`zephel01/...` の行）を、こちらで測っていない GPU で動かしたら、`--bench --deep` の結果を[issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)で送ってください。名前を添えてモデルカードに載せます。
 自分の PC を同じ方法で測り、どこで時間がかかっているかを見るには `./abyss.sh --bench --deep` を実行してください（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
+入れたモデルがこの PC で正しく動くか（落ちないか、答えが合っているか、長いプロンプト、長い会話）を確かめるには `./abyss.sh --check` を実行してください（v1.3.112、[docs/BENCH.ja.md](docs/BENCH.ja.md)）。結果は[バグ報告](https://github.com/zephel01/Abyss/issues/new?template=bug.md)に添えられます。
 
 ## 📊 性能
 

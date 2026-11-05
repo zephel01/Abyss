@@ -1,4 +1,4 @@
-# 自分の PC で Abyss を測る（`--bench`）
+# 自分の PC で Abyss を測る（`--bench`、`--check`）
 
 [English](BENCH.md)
 
@@ -122,6 +122,61 @@ drafter check (greedy, the first answer): the same first 140 of 256 tokens with 
 
 最初の答えを、もう一度 1 トークンずつ（ドラフトも検証窓も使わずに）出させて比べます。ドラフトが決めるのは「窓で何トークンをまとめて確かめるか」だけで、次に来るトークンは変えません。なので、2 つの答えは本来一致します。ただ、窓はトークン経路と足し算の順序が違うため、僅差の候補がある箇所では、答えの後半で分かれることがあります。これは正常です。最初の 12 トークン以内で分かれたとき（**TOO EARLY**）は、ドラフターか検証窓の計算がおかしいので、報告してください。v1.3.83 では、CUDA の検証窓でエキスパートの重みが消える不具合を、このようにして見つけて直しました。
 
+## この PC で何が速さを止めているか
+
+`abyss-bench.txt` と `abyss-check.txt` の最後には、その回の実測値だけから作る節があります。ドラフターなしで書いた答え（ドラフターチェックの 2 本目）の 1 トークンを部分ごとに分け、それぞれを何を変えれば速くなるかを、見込める伸びが大きい順に並べます。
+
+```
+A token without the drafter: 9.1 ms (110.5 tokens/s). Where it goes (estimates; the parts overlap a little):
+- GPU compute: 6.0 ms (66%)
+- CPU lane: 2.8 ms (31%), 142 experts a token
+- PCIe fetches: 0.0 ms (0%), 0.0 experts a token
+- SSD waits: 0.0 ms (0%), 0.0 reads a token
+- host gaps (the GPU idle between tokens): 0.3 ms (3%)
+
+What would change it (largest estimated gain first; tokens/s without the drafter - with it a VRAM gain can be larger: its verify windows give the lane more work):
+1. VRAM: holds 64% of the experts a token uses - estimate: with 16 GB more (16 -> 32 GB class) ~82%; speed ~96 tokens/s (+21%) - the CPU lane takes 100% of the misses; measured on one model, the real gain was a little larger than this estimate
+2. VRAM: holds 64% of the experts a token uses - estimate: with 8 GB more (16 -> 24 GB class) ~74%; speed ~89 tokens/s (+11%) - the CPU lane takes 100% of the misses; measured on one model, the real gain was a little larger than this estimate
+3. PCIe: the GPU's link ran at Gen4 x4 (an expert copy measured 6.7 GB/s) - an x16 Gen5 slot (~63 GB/s) would change little here: the CPU lane already does the missed experts faster than such a copy
+4. RAM: the RAM tier holds every expert the GPU does not (no SSD reads while writing) - no change needed
+5. SSD: read 6.2 GB/s; waits under a tenth of a token - no change needed
+```
+
+| 部分 | 測るもの | 見積もり |
+|---|---|---|
+| GPU の計算 | 1 トークンの残り | 見積もらない。速い GPU のクラスほど縮む |
+| CPU / iGPU レーン | 1 トークンあたりの稼働時間（`glm stat`） | 下の VRAM と PCIe の行で動く |
+| PCIe の転送 | 1 トークンでコピーしたエキスパートの数 × エンジンが起動時に測った 1 回のコピー時間 | 同じコピーを、GPU の世代の x16 スロットで行った場合（公称の速さと、実際に動いたリンクの比）。外れたエキスパートは、レーンとコピーの速いほうに回る |
+| SSD の待ち | エンジンが SSD を待った時間 | RAM：モデルが GPU + RAM に収まれば消える（足りない量も出します）。SSD：読み出しの速さと、一般的な NVMe Gen4（約 6 GB/s）の比 |
+| トークン間のすき間 | トークンの間に GPU が空いた時間（`--check`、`--bench --deep`） | 見積もらない。CPU のシングルスレッド性能と電源設定で決まる |
+| VRAM | 1 トークンで使うエキスパートのうち、すでに VRAM にあった割合 | 実行中に書き出したエンジン自身の経路を、大きさごとのキャッシュに流し直す。外れ × 実測の 1 回の時間 |
+
+VRAM の見積もりは、経路を層ごとの LRU（最近使われていないものから追い出す）キャッシュに流し直して、今の 1 層あたりのスロット数と、8 GB / 16 GB 増やした場合を比べます。エンジンの置き方は理想的なキャッシュより追いつくのが遅く、Qwen3.8 を 12 / 16 / 24 GB でシミュレーションしたときは、外れの減り方が理想的なキャッシュの比の平方根くらいでした。そのため見積もりも平方根を取ります。まずヒット率を出し、速さは外れ 1 回の実測の時間から出します。実測と突き合わせました（v1.3.112、Qwen3.8 16G64G、ドラフターなし、16 GB → 32 GB）。ヒット率は見積もり 82%、実測 82%。速さは見積もり +21%、実測 +26%（71.4 → 90.0 tok/s）で、実際の伸びのほうが少し大きくなりました。ドラフターありでは、同じモデルで 89.2 → 131.3 tok/s（+47%）と、さらに大きく伸びます。1 トークンの 1 割に満たない部分は「no change needed」（変える必要なし）と出ます。どれも見積もりです。部分どうしは少し重なっていて、モデルや作業が変われば数字も変わります。この節に出るのは大きさとクラスだけで、製品名は出しません。
+
+## 安定性のチェック（`--check`）
+
+`--bench` は速さを測ります。`--check` は、インストールしたモデルを普段の使い方で動かして、落ちないか、答えが正しいかを確かめます。不具合の報告で最初に見るのはこの結果で、リリースの前にも同じチェックを回しています。
+
+```
+./abyss.sh --check                 # 15〜30 分ほど
+./abyss.sh --check --quick         # 5 分ほど
+./abyss.sh --check --long          # + コンテキストが許す一番大きなプロンプト
+./abyss.sh --check --config abyss-q38-16g64g.json   # 最後に使ったもの以外のモデル
+```
+
+先に Abyss を止めてください。Windows では `START-ABYSS.bat --check` です。セットアップの前（または `--setup`、`--gpu`、`--gpus` を付けたとき）は、これまでどおり PC だけを調べます。チェックは、モデルのサーバー（ダッシュボードと同じく、インストールした設定で `serve/server.py`）を、この PC の中だけで空いているポートに立てて、次のものを送ります。
+
+| ステップ | 内容 | 合格の条件 |
+|---|---|---|
+| drafter | 貪欲法の答え（思考なし）を、ドラフターありとなしで 1 本ずつ | 同じトークン列。12 トークン目以降で分かれるのは、足し算の順序による僅差で正常。それより前で分かれたら WARN（`--bench` が 2 つのトークンの点数を比べます） |
+| ja-explain, ja-arith | 日本語の質問（`--quick` は 1 問目だけ） | 日本語で、崩れていない（U+FFFD やループがない）。計算の答えが正しい |
+| code-* | Python の小さな課題（`--quick` は 1 問） | 答えのコードがテストに通る（この PC の一時フォルダで、ネットワークなし、最大 20 秒） |
+| tool-call | `get_weather` の呼び出し 1 回と、その結果を受けた答え（モデルのテンプレートがツールに対応しているとき） | 引数が JSON の呼び出しと、結果を使った答え |
+| long-* | 8K、24K、32K トークンと、コンテキストの上限近く（64K まで。`--long` は 64K、128K、コンテキスト全体）のプロンプトに、答えを 1 つ埋め込む。ドラフターあり | 落ちない。埋め込んだ答えが見つかる |
+| conversation | 1 つの話題で 11 回のやりとり。最初に伝えた 2 つの事実を思い出させ、最後は日本語でまとめさせる | 落ちない。話題からそれない。2 つとも思い出せる。ほとんどの回で会話を使い回す |
+
+各行には、生成とプロンプトの tok/s、使い回したトークン数、VRAM のヒット率も入ります。失敗したステップは、エンジンのログとサーバーの最後の行をファイルに残します。エンジンが落ちたら、その後のステップは実行しません（NOT RUN と出ます）。終了コードが 1 になるのは、FAIL（落ちた、答えが違う、埋め込んだ答えが見つからない、コードがテストに通らない）があるときだけです。WARN は注意で、終了コードは 0 です。ファイルには、この PC のこと（GPU、VRAM、ドライバー、動いている間の PCIe のリンク、CPU、RAM、OS、SSD の読み出しの速さ）、Abyss の版、モデル（フォルダ名と量子化）、そして「この PC で何が速さを止めているか」も入ります。`abyss-check.txt` は Abyss のフォルダにでき、`--report` にも含まれます。エンジンのログは `abyss-check.log` です。どこにも送りません。ファイルにはホスト名、ユーザー名、フォルダのパスは入りません。不具合は [bug report](https://github.com/zephel01/Abyss/issues/new?template=bug.md) を開いて、`abyss-report.txt` を添えてください。
+
 ## 対応環境
 
 | | Linux・AMD | Linux・NVIDIA | Windows・NVIDIA | Windows・AMD |
@@ -134,6 +189,7 @@ AMD のカードは、カード内部のスイッチを x16 と報告します�
 
 ## 報告に添えると助かるもの
 
+- `./abyss.sh --check`（上）：この PC で落ちる、答えがおかしい、を確かめます。`--report` に `abyss-check.txt` も入ります。
 - `./abyss.sh --gpu-tune`（1 分ほど、モデル不要）：GPU ごとのカーネルの選び方。`abyss-gpu-tune.txt` も貼ってください。
-- `./abyss.sh --report`：PC、セットアップ、エンジンのログの速度の行（`abyss-report.txt`。ベンチマークの結果も含みます）。
+- `./abyss.sh --report`：PC、セットアップ、エンジンのログの速度の行（`abyss-report.txt`。ベンチマークとチェックの結果も含みます）。
 - 変更の前後：`--bench` を 2 回回して、両方を貼ってください。何が変わったかが、カウンターに出ます。

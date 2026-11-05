@@ -198,6 +198,39 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(int(row[6]), f2.data_start + off2["blk.0.ffn_up_exps.weight"])
             self.assertEqual(int(row[7]), f3.data_start + off3["blk.0.ffn_down_exps.weight"])
 
+    def test_mixed_gate_up_types_get_a_g_u_field(self):
+        # unsloth's UD-IQ1_S Qwen3.8 keeps gate and up at different types in a layer (IQ2_S / IQ2_XXS): the row's
+        # gu_type field is "G,U", the blob each role at its own size; a uniform layer keeps the single number
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            first = root / "model-00001-of-00001.gguf"
+            exp = np.ones((512, 2, 32), np.float32)
+            write_gguf(first, [
+                ("blk.0.hc_attn_down.weight", np.ones((2, 32), np.float32), Q.Q8_0),
+                ("blk.0.ffn_gate_inp.weight", np.ones((512, 32), np.float32), Q.BF16),
+                ("blk.0.ffn_gate_exps.weight", exp, Q.Q8_0),
+                ("blk.0.ffn_up_exps.weight", exp, Q.F16),
+                ("blk.0.ffn_down_exps.weight", exp, Q.Q8_0),
+                ("blk.1.ffn_gate_inp.weight", np.ones((512, 32), np.float32), Q.BF16),
+                ("blk.1.ffn_gate_exps.weight", exp, Q.Q8_0),
+                ("blk.1.ffn_up_exps.weight", exp, Q.Q8_0),
+                ("blk.1.ffn_down_exps.weight", exp, Q.Q8_0),
+            ])
+            out = root / "pack"
+            (out / "tokenizer").mkdir(parents=True)
+            for name in ["vocab.json", "chat_template.jinja"]:
+                (out / "tokenizer" / name).touch()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(first), "--out", str(out), "--compat-bf16"]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(iq_pack.main(), 0)
+            rows = [l.split() for l in (out / "native_experts.txt").read_text().splitlines()
+                    if l and not l.startswith("#")]
+            self.assertEqual([r[1] for r in rows], ["%d,%d" % (Q.Q8_0, Q.F16), str(int(Q.Q8_0))])
+            q8_row, f16_row = 2 * 34, 2 * 32 * 2   # bytes of one expert's [2, 32] Q8_0 / F16 matrix
+            self.assertEqual(int(rows[0][4]), q8_row + f16_row + q8_row)
+            self.assertEqual(int(rows[1][4]), 3 * q8_row)
+            self.assertEqual(int(rows[1][3]), 512 * int(rows[0][4]))
+
 
 if __name__ == "__main__":
     unittest.main()

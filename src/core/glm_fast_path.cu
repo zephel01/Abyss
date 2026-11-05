@@ -699,8 +699,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else if (nl.x_cb >= 0) {
                 // EXL3: the blob is [gate | up | down], a part [trellis | suh | svh]
                 Ly.exl3 = true;
-                Ly.gu_type = Ly.d_type = strata::kernels::exl3::kTypeEXL3;
-                Ly.gu_bytes = nl.x_part(0);
+                Ly.gu_type = Ly.up_type = Ly.d_type = strata::kernels::exl3::kTypeEXL3;
+                Ly.gu_bytes = Ly.up_bytes = nl.x_part(0);
                 Ly.dn_bytes = nl.x_part(2);
                 Ly.down_off = 2 * Ly.gu_bytes;
                 Ly.blob = 2 * Ly.gu_bytes + Ly.dn_bytes;
@@ -714,15 +714,23 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             } else {
                 Ly.gu_type = nl.fmt.gu_type;
+                Ly.up_type = nl.fmt.up_type;
                 Ly.d_type = nl.fmt.d_type;
                 Ly.gu_bytes = (size_t) nl.fmt.gu_row * (size_t) g.n_ff_exp;
+                Ly.up_bytes = (size_t) nl.fmt.up_row * (size_t) g.n_ff_exp;
                 Ly.dn_bytes = (size_t) nl.fmt.d_row * (size_t) g.n_embd;
-                Ly.down_off = 2 * Ly.gu_bytes;
-                Ly.blob = 2 * Ly.gu_bytes + Ly.dn_bytes;
-                if (!gf::moe_supported(Ly.gu_type) || !gf::moe_supported(Ly.d_type) ||
+                Ly.down_off = Ly.gu_bytes + Ly.up_bytes;
+                Ly.blob = Ly.gu_bytes + Ly.up_bytes + Ly.dn_bytes;
+                if (!gf::moe_supported(Ly.gu_type) || !gf::moe_supported(Ly.up_type) || !gf::moe_supported(Ly.d_type) ||
+                    !gf::moe_gate_up_pair_supported(Ly.gu_type, Ly.up_type) ||
                     gf::row_bytes(Ly.gu_type, g.n_embd) != nl.fmt.gu_row ||
+                    gf::row_bytes(Ly.up_type, g.n_embd) != nl.fmt.up_row ||
                     gf::row_bytes(Ly.d_type, g.n_ff_exp) != nl.fmt.d_row)
-                    missing += P + "expert types " + std::to_string(Ly.gu_type) + "/" + std::to_string(Ly.d_type) + " ";
+                    missing += P + "expert types " + std::to_string(Ly.gu_type) + "/" + std::to_string(Ly.up_type) + "/" +
+                               std::to_string(Ly.d_type) + " ";
+                // gate and up of different types (a mixed layer): NVFP4 is not among them (one fused gate_up scale)
+                if (Ly.mixed() && (Ly.gu_type == 40 || Ly.up_type == 40))
+                    missing += P + "NVFP4 gate/up of different types ";
                 // NVFP4 (type 40): the tensors' second-level scales (F32 [n_expert] each, ffn_*_exps.scale); gate and
                 // up must share theirs (NVIDIA's checkpoints do: one scale for the fused gate_up) - it sits inside
                 // the SiLU, so the kernels take one number for both
@@ -1027,7 +1035,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             size_t expert_bytes = 0;
             for (int il = l0_; il < lt_; ++il) {
                 const auto& Ly = F->L[(size_t) il];
-                if (Ly.moe) expert_bytes += (size_t) g.n_expert * glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp);
+                if (Ly.moe) expert_bytes += (size_t) g.n_expert * glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type);
             }
             avail = glmfast::expert_pool_budget(true, free_b, (size_t) std::max(0LL, avail_kb) * 1024,
                                                 reserve, (size_t) (head_gb * 1073741824.0), expert_bytes);
@@ -1051,7 +1059,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // partition in place
         const auto slot_stride = [&](int il) {
             const auto& Ly = F->L[(size_t) il];
-            return glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp);
+            return glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type);
         };
         // every layer gets the same number of slots: avail / sum(blob over layers)
         size_t blob_sum = 0;
@@ -1736,7 +1744,8 @@ void Glm5Model::expert_helper_decode_begin(bool speculative) {
     for (int il = 0; il < g_.n_layers; ++il) {
         const auto& layer = F->L[(size_t) il];
         if (!layer.moe || layer.exl3 || F->cpu_fmt[(size_t) il].n_ff <= 0 ||
-            !gf::moe_supported(layer.gu_type) || !gf::moe_supported(layer.d_type)) continue;
+            !gf::moe_supported(layer.gu_type) || !gf::moe_supported(layer.d_type) ||
+            layer.mixed()) continue;   // (a mixed gate/up layer: the helper's kernels take one type - the CPU lane)
         blobs[(size_t) il] = layer.blob;
         const int cls = F->layer_rc[(size_t) il];
         if (cls < 0) continue;
@@ -2249,7 +2258,8 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     }
     // the iGPU lane: the same sum from the registered RAM tier (an EXL3 layer through abyss_igpu_experts_x3, when the
     // library has it - else the CPU threads below)
-    if (F->igpu_experts != nullptr && (!Ly.exl3 || F->igpu_x3 != nullptr) && Ly.nv_host.empty()) {   // (NVFP4: CPU)
+    // (NVFP4, a mixed gate/up layer: the CPU threads - the lane's kernels take one gate/up type)
+    if (F->igpu_experts != nullptr && (!Ly.exl3 || F->igpu_x3 != nullptr) && Ly.nv_host.empty() && !Ly.mixed()) {
         const auto ti = std::chrono::steady_clock::now();
         int rc;
         if (Ly.exl3) {
@@ -2341,6 +2351,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         static double e2 = 0, n2 = 0, worst = 0;
         static int calls = 0;
         const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
+        const ggml_type_traits* tu = ggml_get_type_traits((ggml_type) Ly.up_type);
         const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
         std::vector<float> row((size_t) std::max(n_embd, n_ff));
         std::vector<double> hr((size_t) n_ff), ref((size_t) n_embd, 0.0);
@@ -2350,7 +2361,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
                 double gs = 0.0, us = 0.0;
                 tg->to_float(blob[i] + (size_t) r * nf.gu_row, row.data(), n_embd);
                 for (int c = 0; c < n_embd; ++c) gs += (double) row[(size_t) c] * x[c];
-                tg->to_float(blob[i] + Ly.gu_bytes + (size_t) r * nf.gu_row, row.data(), n_embd);
+                tu->to_float(blob[i] + Ly.gu_bytes + (size_t) r * nf.up_row, row.data(), n_embd);
                 for (int c = 0; c < n_embd; ++c) us += (double) row[(size_t) c] * x[c];
                 gs = std::min(gs, lim);
                 us = std::min(std::max(us, -lim), lim);
@@ -2407,7 +2418,8 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     };
     // the iGPU lane's columns call (abyss_igpu_experts_cols): the window's columns in one call; 1 (busy, a blob it
     // cannot see, ...): a call a column below; < 0: the lane is gone, the CPU takes over as fast_cpu_experts does
-    if (n >= 2 && !Ly.exl3 && F->igpu_experts != nullptr && F->igpu_cols != nullptr && n <= kVerifyMax && gs == nullptr) {
+    if (n >= 2 && !Ly.exl3 && !Ly.mixed() && F->igpu_experts != nullptr && F->igpu_cols != nullptr && n <= kVerifyMax &&
+        gs == nullptr) {
         const int rc = F->igpu_cols(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, n, ne,
                                     (const void* const*) blob, w, x, xq, out);
         if (rc == 0) {
@@ -2423,7 +2435,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
         }
         F->igpu_cols_falls.fetch_add(1, std::memory_order_relaxed);
     }
-    if (n <= 1 || Ly.exl3 || F->igpu_experts != nullptr) {
+    if (n <= 1 || Ly.exl3 || (F->igpu_experts != nullptr && !Ly.mixed())) {
         for (int t = 0; t < n; ++t)
             fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t], xq ? xq[t] : nullptr,
                              gs ? gs + gf::kMaxK * t : nullptr);
@@ -2680,7 +2692,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             // layer
             if (Ly.xl.cb >= 1 && Ly.xl.cb <= 3) {
                 auto& f = F->cpu_fmt[(size_t) il];
-                f.gu_type = f.d_type = strata::kernels::exl3::kTypeEXL3;
+                f.gu_type = f.up_type = f.d_type = strata::kernels::exl3::kTypeEXL3;
                 f.n_embd = g.n_embd;
                 f.n_ff = g.n_ff_exp;
                 if (il_cal < 0) il_cal = il;
@@ -2689,7 +2701,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         }
         std::string e2;
         kc::NativeFmt f;
-        if (kc::native_fmt(Ly.gu_type, Ly.d_type, g.n_embd, g.n_ff_exp, f, e2) && f.h_bytes <= kc::kNativeHBytes)
+        if (kc::native_fmt(Ly.gu_type, Ly.up_type, Ly.d_type, g.n_embd, g.n_ff_exp, f, e2) && f.h_bytes <= kc::kNativeHBytes)
             F->cpu_fmt[(size_t) il] = f;
         if (il_cal < 0 && F->cpu_fmt[(size_t) il].n_ff > 0) il_cal = il;
     }
@@ -3191,7 +3203,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaMemsetAsync(F->md.cpu_flag, 0, 4, F->cs);
         gf::MoeDev mdc = F->md;
         mdc.nv_scale = Ly.nv_scale;
-        gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr, F->cs);
+        gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr, F->cs,
+                        Ly.up_type);
         gf::moe_down(Ly.d_type, mdc, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
         cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
         cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
@@ -3199,6 +3212,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         fast_cpu_experts(il_cal, 1, &cal, &sdn, xc.data(), oc.data(), nullptr, nv ? &sgu : nullptr);
         // the reference: rows dequantised by ggml, dots in double
         const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
+        const ggml_type_traits* tu = ggml_get_type_traits((ggml_type) Ly.up_type);
         const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
         std::vector<float> row((size_t) std::max(E, FFE));
         std::vector<double> hr((size_t) FFE), orf((size_t) E);
@@ -3206,7 +3220,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             double gs = 0.0, us = 0.0;
             tg->to_float(cal + (size_t) r * nf.gu_row, row.data(), E);
             for (int i = 0; i < E; ++i) gs += (double) row[(size_t) i] * xc[(size_t) i];
-            tg->to_float(cal + Ly.gu_bytes + (size_t) r * nf.gu_row, row.data(), E);
+            tu->to_float(cal + Ly.gu_bytes + (size_t) r * nf.up_row, row.data(), E);
             for (int i = 0; i < E; ++i) us += (double) row[(size_t) i] * xc[(size_t) i];
             gs *= sgu;
             us *= sgu;
@@ -3228,9 +3242,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             ec += (oc[(size_t) r] - orf[(size_t) r]) * (oc[(size_t) r] - orf[(size_t) r]);
             egc += (double) (og[(size_t) r] - oc[(size_t) r]) * (og[(size_t) r] - oc[(size_t) r]);
         }
-        std::fprintf(stderr, "glm fast: CPU lane check (layer %d, types %d/%d): relative L2 error vs the double "
+        std::fprintf(stderr, "glm fast: CPU lane check (layer %d, types %d/%d/%d): relative L2 error vs the double "
                              "reference: device %.5f, CPU lane %.5f; device vs CPU lane %.5f\n", il_cal, Ly.gu_type,
-                     Ly.d_type, std::sqrt(eg / nr), std::sqrt(ec / nr), std::sqrt(egc / nr));
+                     Ly.up_type, Ly.d_type, std::sqrt(eg / nr), std::sqrt(ec / nr), std::sqrt(egc / nr));
         cudaFree(dh);
         cudaFree(dw);
         cudaFree(dx);
@@ -3532,11 +3546,11 @@ bool Glm5Model::fast_warm(std::string& err) {
             }
             const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
             const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
-                                 : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
+                                 : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.up_bytes
                                              : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
-            const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+            const size_t len = role == 2 ? Ly.dn_bytes : role == 1 ? Ly.up_bytes : Ly.gu_bytes;
             uint8_t* base = J.vram ? F->stage[(size_t) (job / 3)] : J.dst;
-            uint8_t* d = base + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes);
+            uint8_t* d = base + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off);
             read_slice(sh, off, len, d);
         });
         for (int k = 0; k < nb; ++k) {
@@ -3698,6 +3712,7 @@ void Glm5Model::fast_destroy() {
         spec_hop_h_[i] = nullptr;
         spec_ev_hop_[i] = nullptr;
     }
+    verify_report();
     if (spec_steps_ > 0)
         std::fprintf(stderr, "glm spec: %llu speculative positions, %.1f%% accepted\n", (unsigned long long) spec_steps_,
                      100.0 * (double) spec_hits_ / (double) spec_steps_);
@@ -4037,8 +4052,9 @@ void Glm5Model::fast_service() {
                             const auto& nfc = F->cpu_fmt[(size_t) wq_layer];
                             if (Lc.exl3 || nfc.n_ff <= 0) continue;
                             const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Lc.gu_type);
+                            const ggml_type_traits* tu = ggml_get_type_traits((ggml_type) Lc.up_type);
                             const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Lc.d_type);
-                            if (!tg || !tg->to_float || !td || !td->to_float) continue;
+                            if (!tg || !tg->to_float || !tu || !tu->to_float || !td || !td->to_float) continue;
                             const int E = g.n_embd, FF = g.n_ff_exp;
                             const float lim = g.swiglu_exp;
                             exf.resize((size_t) std::max(E, FF));
@@ -4050,7 +4066,7 @@ void Glm5Model::fast_service() {
                                     double sg = 0.0, su = 0.0;
                                     tg->to_float(b + (size_t) rr * nfc.gu_row, exf.data(), E);
                                     for (int k = 0; k < E; ++k) sg += (double) exf[(size_t) k] * x[t][k];
-                                    tg->to_float(b + Lc.gu_bytes + (size_t) rr * nfc.gu_row, exf.data(), E);
+                                    tu->to_float(b + Lc.gu_bytes + (size_t) rr * nfc.up_row, exf.data(), E);
                                     for (int k = 0; k < E; ++k) su += (double) exf[(size_t) k] * x[t][k];
                                     float gg = (float) sg, uu = (float) su;
                                     if (lim != std::numeric_limits<float>::infinity()) {
@@ -4303,8 +4319,9 @@ void Glm5Model::fast_service() {
             // to wait for the reads, ~3 ms, and the device then for the lane after the last chunk); collected below
             const auto lane_start = [&] {
                 if (lane_started || rq->cpu_mask == 0u || F->cpu_ans_h == nullptr || F->igpu_start == nullptr ||
-                    F->igpu_experts == nullptr || F->L[(size_t) il].exl3 || !F->L[(size_t) il].nv_host.empty())
-                    return;   // (NVFP4 layers: the CPU threads, which apply the expert scales)
+                    F->igpu_experts == nullptr || F->L[(size_t) il].exl3 || !F->L[(size_t) il].nv_host.empty() ||
+                    F->L[(size_t) il].mixed())
+                    return;   // (NVFP4 and mixed gate/up layers: the CPU threads)
                 const auto& Ly = F->L[(size_t) il];
                 const void* bl[gf::kMaxK];
                 float wl[gf::kMaxK];
@@ -4763,13 +4780,13 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
     }
     const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
     const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) e * Ly.gu_bytes
-                         : role == 1 ? nl.up_off + (uint64_t) e * Ly.gu_bytes
+                         : role == 1 ? nl.up_off + (uint64_t) e * Ly.up_bytes
                                      : nl.down_off + (uint64_t) e * Ly.dn_bytes;
-    const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+    const size_t len = role == 2 ? Ly.dn_bytes : role == 1 ? Ly.up_bytes : Ly.gu_bytes;
     const size_t piece = ((len + (size_t) n_chunks - 1) / (size_t) n_chunks + 4095) & ~(size_t) 4095;
     const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
     if (c1 > c0)
-        read_slice(sh, off + c0, c1 - c0, blob + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes) + c0);
+        read_slice(sh, off + c0, c1 - c0, blob + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off) + c0);
 }
 
 // ---- LOOKAHEAD, for the route of layer il (service thread, F->mu held): score the predictions made for this layer
@@ -5430,7 +5447,18 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             auto& P = F->lp[(size_t) m.il];
             auto& R = F->rc[(size_t) m.rclass];
-            if (m.up) {
+            if (m.up && F->slot_of[(size_t) m.key] >= 0 && F->slot_of[(size_t) m.key] != m.vslot) {
+                // a route's fetch promoted it into a spare while this copy was on its way (the CPU lane's split
+                // plan sends some RAM-tier experts over PCIe): one VRAM copy is enough, this slot is free again
+                P.st[(size_t) m.vslot] = FastState::kFree;
+                P.key[(size_t) m.vslot] = -1;
+                if (R.st[(size_t) m.rslot] == FastState::kRPin) {
+                    R.st[(size_t) m.rslot] = FastState::kRFree;
+                    R.key[(size_t) m.rslot] = -1;
+                }
+                if (F->ram_of[(size_t) m.key] == m.rslot) F->ram_of[(size_t) m.key] = -1;
+                upd(F->rtab_key((size_t) m.key), 0ull);
+            } else if (m.up) {
                 P.st[(size_t) m.vslot] = FastState::kResident;
                 P.key[(size_t) m.vslot] = m.key % NE;
                 P.tick[(size_t) m.vslot] = F->clock;
@@ -5483,17 +5511,44 @@ bool Glm5Model::fast_boundary(std::string& err) {
         // noisy: at 2 / 4 DeepSeek V4 swapped ~2.7 experts a token, and each 8 MB copy held the PCIe link ~1.2 ms -
         // the route's and the CPU lane's host-mapped reads and writes waited behind it (16 -> ~100 us a route).
         // 4 / 16: ~0.5 a token, decode +3% (prose) / +9% (code) on an RTX 5090 at Gen4 x4.
-        static const uint32_t bg_ratio = [small_x] {
+        // qwen4exp by the pool's coverage (VRAM slots / experts of the MoE layers): from half of the experts on, the
+        // coldest resident is rarely used and a swap is cheap - 1 / 2 there (RTX 5090 + Gen4 x4, Swift 1.5 IQ2_XS at
+        // 32 GB, 74% coverage, 4K, MTP: VRAM hits 95.0 -> 96.2%, 176 -> 182 tok/s; no swaps at all: 93.4%, 168).  A
+        // tight pool keeps 2 / 8 (Qwen3.8 16G64G at 16 GB, 18%: 1 / 4 was slower, 97.9 -> 93.4 tok/s)
+        if (F->slot_cover < 0.0) {
+            size_t slots = 0, all = 0;
+            for (int il = l0_; il < lt_; ++il)
+                if (F->L[(size_t) il].moe) {
+                    slots += (size_t) F->lp[(size_t) il].n;
+                    all += (size_t) g.n_expert;
+                }
+            F->slot_cover = all > 0 ? (double) slots / (double) all : 0.0;
+        }
+        const bool wide = small_x && F->slot_cover >= 0.5;
+        static const int ratio_env = [] {
             const char* v = getenv("STRATA_GLM_PROMOTE_RATIO");
-            return v != nullptr ? (uint32_t) std::max(1, std::atoi(v)) : small_x ? 2u : 4u;
+            return v != nullptr ? std::max(1, std::atoi(v)) : -1;
         }();
-        static const uint32_t bg_margin = [small_x] {
+        static const int margin_env = [] {
             const char* v = getenv("STRATA_GLM_PROMOTE_MARGIN");
-            return v != nullptr ? (uint32_t) std::max(0, std::atoi(v)) : small_x ? 8u : 16u;
+            return v != nullptr ? std::max(0, std::atoi(v)) : -1;
         }();
+        const uint32_t bg_ratio = ratio_env >= 0 ? (uint32_t) ratio_env : wide ? 1u : small_x ? 2u : 4u;
+        const uint32_t bg_margin = margin_env >= 0 ? (uint32_t) margin_env : wide ? 2u : small_x ? 8u : 16u;
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
         for (int f = 1; f <= g.n_exp_used && lane_all; ++f) lane_all = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;
-        if (bg_n > 0 && lane_all && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
+        // ... or some of them (the split before the pool settles, or a calibration that read the CPU a little slow:
+        // 9 of 10): the moves ran only with lane_all before, and the first ~256 tokens of such a session promoted
+        // nothing - the slots a prompt's lending emptied stayed empty (Swift IQ2_XS 32 GB at 4K: 647 of 18,240
+        // slots, VRAM hits 92%).  A route's PCIe fetch lands in a spare, never in a slot a move holds (kLanding).
+        // STRATA_GLM_BG_SPLIT=1/0: on / lane_all only, as before.  Default: on for qwen4exp only (measured there; the
+        // other models' CPU lane, SSD reads and link compete differently - not measured yet)
+        static const bool bg_split = [small_x] {
+            const char* v = getenv("STRATA_GLM_BG_SPLIT");
+            return v != nullptr ? std::atoi(v) != 0 : small_x;
+        }();
+        const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all;
+        if (bg_n > 0 && bg_on && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
             struct Cand {
                 uint32_t hot, cold;
                 int il, e, rs, free_slot, cold_slot;
@@ -5910,13 +5965,15 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     }();
     if (wait_fetch && !F->prof_on) {
         if (F->stream_fetch)
-            gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+            gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks,
+                                                    Ly.up_bytes);
         else
             gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
     } else {
         gf::moe_wait(md, g.n_embd, s);
         if (F->prof_on) F->mark("moe_wait");
-        if (F->stream_fetch) gf::moe_fetch(md, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks);
+        if (F->stream_fetch) gf::moe_fetch(md, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks,
+                                                    Ly.up_bytes);
         else gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
         if (F->prof_on) F->mark("moe_fetch");
     }
@@ -5949,7 +6006,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     } else {
     // (the shared expert's down rides the gate/up launch: sh_out)
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
-                    Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
+                    Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s, Ly.up_type);
     if (Ly.sh_down.q != nullptr) abl_apply(il, 1, F->sh_out, 1, g.n_embd, s);
     if (F->prof_on) F->mark("moe_gate_up");
     if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // the shared expert behind its sigmoid gate

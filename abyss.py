@@ -6,7 +6,7 @@ DeepSeek V4 / V4.1, Qwen3.8 and Ornith are installed by ./setup-deepseek.sh (doc
 Setup and start:
     ./abyss.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./abyss.sh --setup         set up again (other GPUs, another context length, another model folder)
-    ./abyss.sh --check         only check this PC
+    ./abyss.sh --check         nothing installed yet: only check this PC (installed: the model check below)
     ./abyss.sh --config abyss-<name>.json      start another installed model (default: the last one used)
     ./abyss.sh --backend hip --gpu 0 --check   check an AMD card with system ROCm 10
 
@@ -28,6 +28,10 @@ Speed and tuning:
                                                a quality check; --deep finds the bottleneck, --full adds a 32k prompt
     ./abyss.sh --calibrate                     tune the CPU lane for this PC (~10-15 minutes)
     ./abyss.sh --gpu-tune                      measure the per-GPU kernel choices (about a minute a GPU)
+    ./abyss.sh --check                         a stability check of the installed model (Abyss stopped, ~15-30 min):
+                                               long prompts up to the context, a 10+ turn conversation, Japanese,
+                                               code run against tests, a tool call, the drafter on / off, speeds,
+                                               what limits this PC; --quick ~5 min, --long adds the biggest prompts
     ./abyss.sh --report                        write abyss-report.txt to attach to an issue (nothing is sent)
     ./abyss.sh --repack / --rebuild            build the model's pack / the engine again
 
@@ -2500,6 +2504,9 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
     bench_txt = ROOT / "abyss-bench.txt"
     if bench_txt.exists():
         add("Benchmark (abyss-bench.txt, from --bench)", bench_txt.read_text(encoding="utf-8", errors="replace"))
+    check_txt = ROOT / "abyss-check.txt"
+    if check_txt.exists():
+        add("Check (abyss-check.txt, from --check)", check_txt.read_text(encoding="utf-8", errors="replace"))
     out = ROOT / "abyss-report.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
@@ -2878,6 +2885,10 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
     env = SV.child_env(cfg)
     if deep:
         env["STRATA_GLM_GAP_PROF"] = "1"
+    import tempfile
+    import pc_limits as PL
+    route_dir = Path(tempfile.mkdtemp(prefix="abyss-bench-routes-"))
+    env["STRATA_GLM_ROUTE_LOG"] = str(route_dir / "route")   # (the VRAM estimate of "What limits this PC")
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
     shares, own = [], []
@@ -2982,6 +2993,7 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
                         shares.append((s, v))
                         say(f"    share {s:.2f}: {v:6.1f} tokens/s")
         links = watch.stop()
+        chains = dict(watch.best)
         p.stdin.write("QUIT\n")
         p.stdin.flush()
         try:
@@ -3043,6 +3055,14 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
             now = _mean(r["ms"] for r in dec_recs)
             now = 1000.0 / now if now > 0 else _mean(dec)
         lines += sweep_report(shares, own, own_disk, plan_share(log_lines), now, lane_name, how)
+    # what limits this PC: the answer without the drafter (spec=0) split, and what would change each part
+    facts = PL.engine_facts(log_lines, pack)
+    routes = PL.read_routes(sorted(route_dir.glob("route*")), facts.get("layers") or 0)
+    shutil.rmtree(route_dir, ignore_errors=True)
+    plain = recs[1 + n_dec] if len(recs) > 1 + n_dec else None
+    lines += ["", "What limits this PC (estimates from this run's measurements; --deep adds the host gaps):"]
+    lines += PL.what_limits(plain, facts, next(iter(chains.values()), None), disk, routes,
+                            found[0]["vram_gb"] if found else None, lane_name)
     lines += ["", f"quality: {q_txt}", f"drafter check (greedy, the first answer): {spec_txt}"]
     if spec_bad:
         lines.append("  a greedy answer must not change with the drafter: the drafter or the verify window computes "
@@ -3071,6 +3091,90 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         say("  " + x)
     ok(f"written: {out} - paste it into an issue (https://github.com/zephel01/Abyss/issues) with a speed report")
     return 0
+
+
+# ------------------------------------------------------------------------------------------------ the check
+def os_name() -> str:
+    """The OS and its version, no machine name (Linux: the distribution's name too; WSL said so)."""
+    import platform
+    name = f"{platform.system()} {platform.release()}"
+    try:
+        name = platform.freedesktop_os_release().get("PRETTY_NAME", "") + f" ({name})"
+    except (OSError, AttributeError):
+        pass
+    if WIN:
+        name = f"Windows {platform.version()}"
+    return name + (" (WSL)" if S.is_wsl() else "")
+
+
+def check_gpus(cfg: dict) -> list:
+    """The config's GPUs: [{name, vram_gb, ...}] in its order."""
+    found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
+    import serve.server as SV
+    want = SV.gpu_list(cfg)
+    if want:
+        by_index = {g["index"]: g for g in found}
+        found = [by_index[i] for i in want if i in by_index] or found
+    return found
+
+
+def gpu_driver(cfg: dict) -> str:
+    if cfg.get("backend") == "hip":
+        v = Path("/opt/rocm/.info/version")
+        return "ROCm " + (v.read_text().strip() if v.exists() else "?")
+    return (S.out(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]).strip().splitlines()
+            or ["?"])[0]
+
+
+def check_model_name(pack: Path | None, cfg: dict, cfg_path: Path) -> tuple:
+    """(the model's name, "folder <its folder's name>, quant <q>, <GB> of GGUF") - names only, no path."""
+    name, size = model_key(pack)
+    quant = (cfg.get("installer") or {}).get("quant")
+    if not quant and pack is not None:
+        first = sorted(pack.parent.glob("*.gguf"))
+        quant = quant_of(first[0]) if first else None
+    folder = pack.parent.name if pack is not None else "?"
+    return name or cfg_path.stem, (f"folder {folder}, quant {quant or '?'}" +
+                                   (f", {size / 1e9:.1f} GB of GGUF" if size else ""))
+
+
+def model_check(cfg_path: Path, version: str, mode: str) -> int:
+    """--check with a model installed: tools/abyss_check.py's stability check of it through its own server (the way
+    the dashboard starts it).  Writes abyss-check.txt (--report includes it)."""
+    import urllib.request
+    cfg = read_json(cfg_path)
+    select_build_backend(cfg.get("backend", "cuda"))
+    if cfg.get("backend") == "hip":
+        cfg["exe"] = str(EXE)
+    port = cfg.get("port") or 8080
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+        fail(f"Abyss is running (port {port}): the check needs the GPU memory it holds",
+             f"stop it ({ME} stop, or Ctrl+C in its window), then run --check again")
+    except OSError:
+        pass
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
+    tp = Path(cfg.get("tokenizer") or (pack / "tokenizer" if pack else ""))
+    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"), (tp / "vocab.json", "the tokenizer")):
+        if p is None or not p.exists():
+            fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
+    refresh_engine(cfg)
+    sys.path.insert(0, str(ROOT))
+    import serve.server as SV
+    import strata_tokenizer as ST
+    import abyss_check as CK
+    tok = ST.Tokenizer.from_dir(tp)
+    step(1, f"check: {cfg_path.name} ({mode}; Abyss must stay stopped while it runs)")
+    git = S.out(["git", "-C", str(ROOT), "log", "-1", "--format=%h %cd", "--date=short"]).strip()
+    hooks = {"say": say, "ok": ok, "warn": warn, "links": lambda c: bench_links(c, SV), "gpus": check_gpus,
+             "disk": lambda pk: disk_read_gbs(sorted(pk.parent.glob("*.gguf")) if pk and pk.parent.exists() else []),
+             "model": check_model_name, "driver": gpu_driver, "cpu": lambda: S.cpu_info()[0], "os": os_name,
+             "commit": lambda: git or "?", "mem_gb": mem_gb,
+             "speed_lines": lambda lines: speed_lines(lines),
+             "chars_per_token": lambda t: len(t) / max(1, len(tok.encode(t))),
+             "count_tokens": lambda t: len(tok.encode(t)), "encode": tok.encode}
+    return CK.run(ROOT, cfg_path, cfg, mode, version, hooks)
 
 
 # ------------------------------------------------------------------------------------------------ the setup
@@ -3189,7 +3293,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
-    ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--check", action="store_true",
+                    help="with a model installed: a stability check of it (Abyss stopped, ~15-30 minutes) - long "
+                         "prompts, a long conversation, Japanese, code, a tool call, the drafter - that writes "
+                         "abyss-check.txt; before the setup (or with --setup / --gpu / --gpus): only check this PC")
+    ap.add_argument("--quick", action="store_true", help="with --check: the short check (~5 minutes)")
+    ap.add_argument("--long", action="store_true", help="with --check: also the biggest prompts the context allows")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
     ap.add_argument("--yes", action="store_true",
                     help="take the recommended answers (the model download still needs --download-model)")
@@ -3290,6 +3399,14 @@ def main() -> int:
         return report(version, a.backend, a.config)
     if a.gpu_tune:
         return gpu_tune(a)
+    pc_only = a.setup or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model or a.gpu is not None \
+        or a.gpus
+    if a.check and not pc_only:
+        have = [a.config] if a.config is not None else all_configs()
+        if a.backend:
+            have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
+        if have:
+            return model_check(have[0], version, "quick" if a.quick else "long" if a.long else "default")
     if a.bench:
         have = [a.config] if a.config is not None else all_configs()   # (setup-deepseek.sh's abyss-*.json too)
         if a.backend:

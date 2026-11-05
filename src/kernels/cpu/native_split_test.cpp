@@ -3,6 +3,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
@@ -54,6 +55,73 @@ int main() {
     cpu::native_gu_rows_split(f, blob.data(), blob.data() + f.up_off, act, 1, result, 0, 32,
                               std::numeric_limits<float>::infinity());
     check(h == ordinary, "unclamped split equals contiguous gate/up");
+
+    // a mixed layer (unsloth's UD-IQ1_S Qwen3.8 layer 18: IQ2_S gate, IQ2_XXS up, Q2_0 down): each role at its own
+    // type and row size - the blob path, the split path and the multi-token rows all equal per-role ggml dots
+    {
+        const int E = 512, FF = 64;
+        cpu::NativeFmt m;
+        check(cpu::native_fmt(GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, E, FF, m, err), "mixed format");
+        check(m.mixed() && m.gu_row != m.up_row, "mixed rows");
+        check(m.down_off == m.up_off + m.up_row * FF && m.bytes == m.down_off + m.d_row * E, "mixed blob layout");
+        cpu::NativeFmt same;
+        check(cpu::native_fmt(GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, E, FF, same, err) && !same.mixed(),
+              "same types are not mixed");
+        check(!cpu::native_fmt(GGML_TYPE_IQ2_S, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0, E, FF, same, err),
+              "gate/up of different activation formats refused");
+        int gt = 0, ut = 0;
+        check(cpu::parse_gu_field("22,16", gt, ut) && gt == 22 && ut == 16, "parse G,U");
+        check(cpu::parse_gu_field("17", gt, ut) && gt == 17 && ut == 17, "parse T");
+        check(!cpu::parse_gu_field("17,", gt, ut) && !cpu::parse_gu_field("x", gt, ut), "parse junk");
+        // quantize random rows (the i-quants need ggml's init)
+        ggml_quantize_init(GGML_TYPE_IQ2_S);
+        ggml_quantize_init(GGML_TYPE_IQ2_XXS);
+        std::vector<unsigned char> mb(m.bytes);
+        uint32_t st = 12345u;
+        const auto rnd = [&st] {
+            st = st * 1664525u + 1013904223u;
+            return ((float) (st >> 8) / 16777216.0f - 0.5f) * 0.1f;
+        };
+        std::vector<float> wg((size_t) FF * E), wu((size_t) FF * E), wd((size_t) E * FF);
+        for (auto& v : wg) v = rnd();
+        for (auto& v : wu) v = rnd();
+        for (auto& v : wd) v = rnd();
+        const std::vector<float> imat((size_t) E, 1.0f);   // (IQ2_XXS needs an importance matrix: a flat one)
+        ggml_quantize_chunk(GGML_TYPE_IQ2_S, wg.data(), mb.data(), 0, FF, E, imat.data());
+        ggml_quantize_chunk(GGML_TYPE_IQ2_XXS, wu.data(), mb.data() + m.up_off, 0, FF, E, imat.data());
+        ggml_quantize_chunk(GGML_TYPE_Q2_0, wd.data(), mb.data() + m.down_off, 0, E, FF, nullptr);
+        const int NT = 3;
+        std::vector<std::vector<unsigned char>> a(NT, std::vector<unsigned char>(m.act_bytes));
+        std::vector<const void*> ap(NT);
+        for (int t = 0; t < NT; ++t) {
+            std::vector<float> xt(E);
+            for (auto& v : xt) v = rnd() * 20.0f;
+            cpu::native_quant_act(m, xt.data(), a[t].data());
+            ap[t] = a[t].data();
+        }
+        const auto* tg = ggml_get_type_traits_cpu(GGML_TYPE_IQ2_S);
+        const auto* tu = ggml_get_type_traits_cpu(GGML_TYPE_IQ2_XXS);
+        for (int nt : {1, NT}) {
+            std::vector<std::vector<float>> o1(nt, std::vector<float>(FF)), o2(nt, std::vector<float>(FF));
+            std::vector<float*> p1(nt), p2(nt);
+            for (int t = 0; t < nt; ++t) {
+                p1[t] = o1[t].data();
+                p2[t] = o2[t].data();
+            }
+            cpu::native_gu_rows_split(m, mb.data(), mb.data() + m.up_off, ap.data(), nt, p1.data(), 0, FF,
+                                      std::numeric_limits<float>::infinity());
+            cpu::native_gu_rows(m, mb.data(), ap.data(), nt, p2.data(), 0, FF);
+            for (int t = 0; t < nt; ++t)
+                for (int r = 0; r < FF; ++r) {
+                    float g = 0.f, u = 0.f;
+                    tg->vec_dot(E, &g, 0, mb.data() + (size_t) r * m.gu_row, 0, ap[t], 0, 1);
+                    tu->vec_dot(E, &u, 0, mb.data() + m.up_off + (size_t) r * m.up_row, 0, ap[t], 0, 1);
+                    const float ref = (g / (1.f + std::exp(-g))) * u;
+                    check(o1[t][r] == ref, "mixed split gate/up equals per-role ggml dots");
+                    check(std::abs(o2[t][r] - ref) <= 1e-6f * (1.0f + std::abs(ref)), "mixed blob gate/up");
+                }
+        }
+    }
     std::puts("native_split_test: ok");
     return 0;
 }

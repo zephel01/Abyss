@@ -1,4 +1,4 @@
-# Measuring Abyss on your PC (`--bench`)
+# Measuring Abyss on your PC (`--bench`, `--check`)
 
 [日本語](BENCH.ja.md)
 
@@ -155,6 +155,76 @@ token path, so a near-tie can still part them later in the answer; parting withi
 means the drafter or the window computes something wrong - please report it (v1.3.83 fixed one such bug: on CUDA the
 verify windows lost their experts' weights).
 
+## What limits this PC
+
+`abyss-bench.txt` and `abyss-check.txt` end with a section built from the run's own measurements: the answer written
+without the drafter (the drafter check's second answer) split into its parts, then what would change each part, the
+largest estimated gain first.
+
+```
+A token without the drafter: 9.1 ms (110.5 tokens/s). Where it goes (estimates; the parts overlap a little):
+- GPU compute: 6.0 ms (66%)
+- CPU lane: 2.8 ms (31%), 142 experts a token
+- PCIe fetches: 0.0 ms (0%), 0.0 experts a token
+- SSD waits: 0.0 ms (0%), 0.0 reads a token
+- host gaps (the GPU idle between tokens): 0.3 ms (3%)
+
+What would change it (largest estimated gain first; tokens/s without the drafter - with it a VRAM gain can be larger: its verify windows give the lane more work):
+1. VRAM: holds 64% of the experts a token uses - estimate: with 16 GB more (16 -> 32 GB class) ~82%; speed ~96 tokens/s (+21%) - the CPU lane takes 100% of the misses; measured on one model, the real gain was a little larger than this estimate
+2. VRAM: holds 64% of the experts a token uses - estimate: with 8 GB more (16 -> 24 GB class) ~74%; speed ~89 tokens/s (+11%) - the CPU lane takes 100% of the misses; measured on one model, the real gain was a little larger than this estimate
+3. PCIe: the GPU's link ran at Gen4 x4 (an expert copy measured 6.7 GB/s) - an x16 Gen5 slot (~63 GB/s) would change little here: the CPU lane already does the missed experts faster than such a copy
+4. RAM: the RAM tier holds every expert the GPU does not (no SSD reads while writing) - no change needed
+5. SSD: read 6.2 GB/s; waits under a tenth of a token - no change needed
+```
+
+| part | measured | the estimate |
+|---|---|---|
+| GPU compute | the rest of the token | not estimated: a faster GPU class scales it |
+| CPU / iGPU lane | its busy time a token (`glm stat`) | moves with the VRAM and PCIe lines below |
+| PCIe fetches | experts copied a token x the engine's own cost of one copy (its start line) | the same copy over an x16 slot of the GPU's generation (nominal rate vs the link it ran at); a miss goes the cheaper way, lane or copy |
+| SSD waits | the engine's wait time a token | RAM: the model in GPU + RAM removes them (the size missing is shown); SSD: its read rate vs a typical NVMe Gen4 drive (~6 GB/s) |
+| host gaps | the GPU idle between tokens (`--check`, `--bench --deep`) | not estimated: the CPU's single-thread speed and power mode set it |
+| VRAM | the share of a token's experts already in VRAM | the engine's own routes (written while it runs) replayed through a cache of each size; misses x their measured cost |
+
+The VRAM estimate: the routes replayed through a least-recently-used cache per layer, at the slots a layer has now
+and with 8 / 16 GB more. The engine's placement adapts more slowly than an ideal cache - on a simulation of
+Qwen3.8 at 12 / 16 / 24 GB its misses fell by about the square root of the ideal cache's ratio - so the estimate
+takes that root. It gives the hit rate first; the speed follows from the misses' measured cost. Checked against a measurement (v1.3.112, Qwen3.8 16G64G without the drafter, 16 -> 32 GB): the hit rate estimated 82%, measured 82%; the speed estimated +21%, measured +26% (71.4 -> 90.0 tok/s) - the real gain was a little larger. With the drafter the gain is larger still: 89.2 -> 131.3 tok/s (+47%) on the same model. A part under a tenth of a token says "no change needed". They are estimates: the parts overlap, and
+another model or another kind of work moves them. The section names sizes and classes only, never a product.
+
+## The stability check (`--check`)
+
+`--bench` measures speed; `--check` runs the installed model the way it is used and checks that it stays up and answers
+right. Its output is what we look at first in a bug report, and we run the same check before a release.
+
+```
+./abyss.sh --check                 # ~15-30 minutes
+./abyss.sh --check --quick         # ~5 minutes
+./abyss.sh --check --long          # + the biggest prompts the context allows
+./abyss.sh --check --config abyss-q38-16g64g.json   # another installed model than the last one used
+```
+
+Stop Abyss first. Windows: `START-ABYSS.bat --check`. Before the setup (or with `--setup`, `--gpu`, `--gpus`)
+`--check` checks the PC only, as before. The check starts the model's own server (`serve/server.py` with the
+installed config, as the dashboard does) on a free port of this machine only, and sends it:
+
+| step | what | passes when |
+|---|---|---|
+| drafter | one greedy answer (thinking off) with and without the drafter | the same tokens; parting at token 12 or later is a near-tie in the sums (fine); earlier warns - `--bench` scores the two tokens |
+| ja-explain, ja-arith | Japanese questions (`--quick`: the first) | Japanese, not broken (no U+FFFD, no loop); the arithmetic answer right |
+| code-* | small Python tasks (`--quick`: one) | the answer's code passes its tests (run here in a temp folder, no network, 20 s at most) |
+| tool-call | one `get_weather` call, then the answer after its result (when the model's template has tools) | a call with JSON arguments, then an answer with the result |
+| long-* | prompts of 8K, 24K, 32K tokens and the context's top (up to 64K; `--long`: 64K, 128K, the whole context) with a needle, the drafter on | no crash, the needle found |
+| conversation | 11 turns about one topic, a recall of two facts from the first turn, a Japanese summary | no crash, on topic, both facts recalled; the conversation reused on most turns |
+
+Each row also has its decode and prompt tok/s, the tokens reused and the VRAM hit. A failed step keeps the engine log's
+and the server's last lines in the file; a crash stops the steps after it (marked NOT RUN). The exit code is 1 only when a step FAILs (a crash, a wrong answer, a needle not found, code that fails its tests); a WARN is a note and exits 0. The file also has this PC
+(GPUs, VRAM, driver, the PCIe link while working, CPU, RAM, OS, the SSD's read rate), the Abyss version and the model
+(its folder's name and quant), and "What limits this PC". `abyss-check.txt` is in the Abyss folder, `--report` includes
+it; the engine log is `abyss-check.log`. Nothing is sent, and the file has no host name, user name or folder path.
+For a problem, open a [bug report](https://github.com/zephel01/Abyss/issues/new?template=bug.md) with
+`abyss-report.txt` attached.
+
 ## Platforms
 
 | | Linux, AMD | Linux, NVIDIA | Windows, NVIDIA | Windows, AMD |
@@ -168,7 +238,8 @@ chipset slot shows as what it is.
 
 ## What else helps a report
 
+- `./abyss.sh --check` (above): crashes and wrong answers on this PC; `--report` includes `abyss-check.txt`.
 - `./abyss.sh --gpu-tune` (a minute, no model): the per-GPU kernel choices; paste `abyss-gpu-tune.txt` too.
 - `./abyss.sh --report`: the PC, the setup and the engine log's speed lines (`abyss-report.txt`, includes the
-  benchmark).
+  benchmark and the check).
 - Before / after a change: run `--bench` twice and paste both - the counters show what the change moved.

@@ -431,6 +431,10 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("spec_min_p=0.7", k)
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
+        # ./abyss.sh --check's drafter step: one answer without the drafter
+        self.assertIn("spec=0", self.keys(temperature=0, strata_tune={"spec": 0}))
+        for sp in (True, 2, 0.0, "0"):
+            self.assertFalse([x for x in self.keys(strata_tune={"spec": sp}) if x.startswith("spec=")], sp)
 
     def test_think_keys(self):
         # the open reasoning block goes with or without a budget; the end guard only with whitespace ids

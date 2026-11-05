@@ -780,14 +780,14 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
             deq_ok(Ly.sh_up, "ffn_up_shexp", il);
             deq_ok(Ly.sh_down, "ffn_down_shexp", il);
-            if (!Ly.exl3 && !mmq_layer(Ly.gu_type, Ly.d_type)) {   // (EXL3: run_set_x3)
-                if (deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.d_type))
+            if (!Ly.exl3 && !(mmq_layer(Ly.gu_type, Ly.d_type) && mmq::supported(Ly.up_type))) {   // (EXL3: run_set_x3)
+                if (deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.up_type) && deq_expert_type(Ly.d_type))
                     has_deq = true;   // (run_blas_dq)
                 else
                     why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                            std::to_string(Ly.d_type) + ") ";
             }
-            gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp));
+            gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type));
         } else {
             has_dense = true;
             deq_ok(Ly.ffn_gate, "ffn_gate", il);
@@ -858,7 +858,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe) continue;
         blob_sum += Ly.blob;
-        stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp);
+        stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type);
     }
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
@@ -2486,7 +2486,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const auto igpu_lane = [&](int il) {
         const auto& Ly = F->L[(size_t) il];
         const auto ok = [](int t) { return t == 16 || t == 17 || t == 18 || t == 19; };
-        return pf_igpu && F->igpu_rows != nullptr && ok(Ly.gu_type) && ok(Ly.d_type) && 2 * g.n_ff_exp <= E &&
+        return pf_igpu && F->igpu_rows != nullptr && ok(Ly.gu_type) && ok(Ly.d_type) && !Ly.mixed() && 2 * g.n_ff_exp <= E &&
                E % 256 == 0;
     };
     const auto prestage = [&](int il) {
@@ -3110,7 +3110,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }();
         const auto lt_ok = [](int t) { return t == 16 || t == 18 || t == 19; };
         static const int light_layer = getenv("STRATA_GLM_PREFILL_LIGHT_LAYER") ? std::atoi(getenv("STRATA_GLM_PREFILL_LIGHT_LAYER")) : -1;
-        const int light_rows = lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && (light_layer < 0 || il == light_layer) ? light_env : 0;
+        const int light_rows = lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && (light_layer < 0 || il == light_layer)
+                                   ? light_env : 0;
         int n_light = 0, rows_mmq = 0;
         int b_pre = -1, rows_pre = 0, max_pre = 0;   // the prestaged set: its bounds, rows and largest expert
         const int pre_n = S->pre_layer == il ? (int) S->pre_e.size() : 0;
@@ -3349,7 +3350,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const char* v = getenv("STRATA_GLM_MMQ_GLU");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl;
+        const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl && !Ly.mixed();
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
         // (the down matrices' over-read past their last row, see zero_tails; 0: n_ff fills MMQ's tiles)
@@ -3387,6 +3388,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gu.y_scale = M.Xs - a;
                     if (glu) {
                         S->mq->run_glu(gu, g.swiglu_exp, s);   // (h in each row's first n_ff floats, as below)
+                    } else if (Ly.mixed()) {
+                        // gate and up of different types: one product a role, each into its half of the GU rows (gate
+                        // in the first n_ff floats, up in the next, as the one product writes them); up's activations
+                        // quantized for its own type
+                        gu.type = Ly.gu_type;
+                        gu.w_rows = nff;
+                        S->mq->run(gu, s);
+                        mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.up_type, E, E, nrows, s, M.Xs);
+                        mmq::Product up = gu;
+                        up.w = wbase + (size_t) i0 * stride + Ly.gu_bytes;
+                        up.type = Ly.up_type;
+                        up.dst = GU + nff - (size_t) a * (2 * nff);
+                        S->mq->run(up, s);
+                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
                     } else {
                         S->mq->run(gu, s);
                         if (nvl)   // (NVFP4: the experts' gate/up scales, inside the SiLU)
@@ -3561,7 +3576,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // experts MMQ does not read (deq_expert_type): one at a time, gate and up decoded to FP16 into w16 [2 n_ff][E]
         // (the blob's gate rows, then its up rows), the expert's rows gathered to FP16 and multiplied by cuBLAS, the
         // SwiGLU, then the down [E][n_ff] the same way - the outputs land in the expert's own OUTP rows as run_blas's
-        const bool deq = !Ly.exl3 && !mmq_layer(Ly.gu_type, Ly.d_type);
+        const bool deq = !Ly.exl3 && !(mmq_layer(Ly.gu_type, Ly.d_type) && mmq::supported(Ly.up_type));
         const auto run_blas_dq = [&](const uint8_t* blob, int a, int nrows, int r0) {
             const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
             const int gu_rows = (int) std::min<int64_t>(kDqRows, std::max<int64_t>(1, (S->w16_elems - wgu) / E));
@@ -3573,7 +3588,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // (part c0's outputs reach only the inputs of rows past it, already multiplied)
             float* GU = M.OUTP + (size_t) o * E;
             strata::kernels::dequant_f16(Ly.gu_type, blob, 0, nff, E, S->w16, s);
-            strata::kernels::dequant_f16(Ly.gu_type, blob + up_off, 0, nff, E, S->w16 + (size_t) nff * E, s);
+            strata::kernels::dequant_f16(Ly.up_type, blob + up_off, 0, nff, E, S->w16 + (size_t) nff * E, s);
             uint16_t* X16 = S->w16 + wgu;
             for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
                 const int n = std::min(gu_rows, nrows - c0);
@@ -3848,7 +3863,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 size_t pack_a = 0, pack_h = 0;
                 for (int j = 0; j < ncx; ++j) {
                     const int cnt = S->h_counts[cpu_set[(size_t) j].e];
-                    if (kq_use(nf.gu_type, nf.gu_act, cnt)) {
+                    if (kq_use(nf.gu_type, nf.gu_act, cnt) && kq_use(nf.up_type, nf.gu_act, cnt)) {   // (both roles)
                         off_a[(size_t) j] = pack_a;
                         pack_a += (kc::kq_act_bytes(cnt, E) + 63) & ~(size_t) 63;
                     }
@@ -3892,7 +3907,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         const void* pa = pk + off_a[(size_t) j];
                         kc::kq_rows_packed(nf.gu_type, blob + (size_t) r0 * nf.gu_row, nf.gu_row, E, pa, cnt, go.data(), 0,
                                            kGu);
-                        kc::kq_rows_packed(nf.gu_type, blob + Ly.gu_bytes + (size_t) r0 * nf.gu_row, nf.gu_row, E, pa,
+                        kc::kq_rows_packed(nf.up_type, blob + Ly.gu_bytes + (size_t) r0 * nf.up_row, nf.up_row, E, pa,
                                            cnt, uo.data(), 0, kGu);
                         const float lim = g.swiglu_exp;
                         for (int t = 0; t < cnt; ++t) {
@@ -3913,7 +3928,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         a[(size_t) t] = S->c_act.data() + (size_t) (b + t) * kA;
                         o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
                     }
-                    if (iq_use(nf.gu_type, nf.gu_act, cnt)) {
+                    if (iq_use(nf.gu_type, nf.gu_act, cnt) && iq_use(nf.up_type, nf.gu_act, cnt)) {
                         // gate and up rows [r0, r0 + kGu) for every token of the expert, then the clamped swiglu
                         thread_local std::vector<float> gu_t;
                         thread_local std::vector<float*> go, uo;
@@ -3926,7 +3941,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         }
                         kc::iq512_rows(nf.gu_type, blob + (size_t) r0 * nf.gu_row, nf.gu_row, E, a.data(), cnt, go.data(),
                                        0, kGu);
-                        kc::iq512_rows(nf.gu_type, blob + Ly.gu_bytes + (size_t) r0 * nf.gu_row, nf.gu_row, E, a.data(),
+                        kc::iq512_rows(nf.up_type, blob + Ly.gu_bytes + (size_t) r0 * nf.up_row, nf.up_row, E, a.data(),
                                        cnt, uo.data(), 0, kGu);
                         const float lim = g.swiglu_exp;
                         const bool clamp = lim != std::numeric_limits<float>::infinity();

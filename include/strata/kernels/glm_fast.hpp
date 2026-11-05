@@ -305,6 +305,14 @@ inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to
 /// `out` (the layer's FFN output, which moe_down wrote first - its work runs while the CPU computes).
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int mode = 1);
+/// moe_cpu_wait (mode 1) for up to 8 columns of a verify window in one launch: column t waits for the answer its
+/// seq[t] names and adds it into out[t] (seq[t] null: none)
+struct CpuWaitCols {
+    const unsigned int* seq[8] = {};
+    float* out[8] = {};
+    int n = 0;
+};
+void moe_cpu_wait_cols(const CpuWaitCols& c, const void* cpu_ans, int n_embd, cudaStream_t s);
 /// Expert deferral: the last route's CPU-lane part into the 4 hyper-connection streams R with the write weights post
 /// (4 floats, device): R[d][e] += post[d] * part[e].  Spins for the answer like moe_cpu_wait.
 void hc_defer_add(const MoeDev& d, const float* post, int n_embd, float* R, cudaStream_t s);
@@ -317,18 +325,26 @@ void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
 /// The disk-landed experts into their planned slots: whole blobs, or - for the response's streamed entries - chunk by
 /// chunk as the host's reads land (gu_bytes / dn_bytes / n_chunks: the layout of fast_read_part's chunks)
+/// (up_bytes: the up part's bytes when it differs from gate's - a mixed gate/up layer; 0: gu_bytes)
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes = 0, size_t dn_bytes = 0,
-               int n_chunks = 0);
+               int n_chunks = 0, size_t up_bytes = 0);
 /// moe_wait then moe_fetch in one launch (the same work; a route without misses skips the wait)
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes = 0,
-                    size_t dn_bytes = 0, int n_chunks = 0);
+                    size_t dn_bytes = 0, int n_chunks = 0, size_t up_bytes = 0);
+/// moe_wait_fetch for a verify window's n_cols columns in one launch; mds_dev: the columns' plans (device copies)
+void moe_wait_fetch_cols(const MoeDev* mds_dev, int n_cols, int n_embd, int k, size_t blob_bytes, cudaStream_t s,
+                         size_t gu_bytes = 0, size_t dn_bytes = 0, int n_chunks = 0, size_t up_bytes = 0);
 /// One host-mapped blob copied into VRAM the way moe_fetch copies a RAM-tier expert (SMs reading over PCIe, not the
 /// copy engine): the CPU lane's calibration times the decode's own PCIe path with it.
 void zero_copy(const void* src, void* dst, size_t bytes, cudaStream_t s);
 /// The routed gate/up rows of the planned (resident) experts, the clamped swiglu, the q8_1 of h; and (sh_down and
 /// sh_out given) the shared expert's down rows over its h in sh_hq into sh_out, by extra blocks of the same launch.
+/// up_type: up's type when it differs from gate's (a mixed layer; -1 or gu_type: the same).
 void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
-                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s);
+                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s,
+                 int up_type = -1);
+/// Whether moe_gate_up / moe_gate_up_cols take this gate/up type pair (up_type -1 or gu_type: moe_supported(gu_type)).
+bool moe_gate_up_pair_supported(int gu_type, int up_type);
 /// out[r] = (sum_i w_i * down_i(r) . h_i over the resident experts) [+ cpu_part[r]] + sh_out[r] (when given).
 /// down_off = the byte offset of the down rows inside an expert blob ([gate | up | down]).
 void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
@@ -348,7 +364,8 @@ struct MoeColArgs {
 /// half idle (83 us a launch against 76 for 8 experts).
 void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, float limit,
                       const void* xq, size_t xq_cs, void* hq, size_t hq_cs, const void* sh_down, int sh_type,
-                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s, const float* nv_scale = nullptr);
+                      const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s, const float* nv_scale = nullptr,
+                      int up_type = -1);
 void moe_down_cols(int d_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, size_t down_off,
                    const void* hq, size_t hq_cs, const float* sh_out, float* out, size_t out_cs, cudaStream_t s, const float* nv_scale = nullptr);
 

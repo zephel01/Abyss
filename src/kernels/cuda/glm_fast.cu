@@ -3161,21 +3161,22 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
 // the CPU LANE's answer for the last route (when it sent experts to the host): spin, then out += its weighted sum.
 // which: 0 the last route's (cpu_seq[0]), 1 the route before it (cpu_seq[1]: EXPERT DEFERRAL - the host's part of
 // layer l is added one layer late, into layer l + 1's FFN output, so the lane is never waited for)
-__global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which) {
+__device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const void* cpu_ans, int n_embd, float* out,
+                                             int which, int blk, int nblk) {
     __shared__ unsigned int s_need;
     const int tid = threadIdx.x;
-    if (tid == 0) s_need = d.cpu_seq[which];
+    if (tid == 0) s_need = cpu_seq[which];
     __syncthreads();
     if (s_need == 0) return;
-    const CpuAnswer* r = (const CpuAnswer*) d.cpu_ans + (s_need % kCpuAnswers);
+    const CpuAnswer* r = (const CpuAnswer*) cpu_ans + (s_need % kCpuAnswers);
     if (tid == 0) {
 #if defined(STRATA_USE_HIP)
         // block 0 alone polls the host-mapped answer and passes its seq on in device memory (cpu_seq[2]), where the
         // other blocks wait: every poll is a PCIe read the CPU's memory serves while the lane reads its experts
         // (hc3's 32 pollers made an R9700 host's CPU lane ~12% slower; not measured on NVIDIA, which keeps 8)
-        volatile unsigned int* seen = (volatile unsigned int*) d.cpu_seq + 2;
+        volatile unsigned int* seen = (volatile unsigned int*) cpu_seq + 2;
         const long long t0 = clock64();   // bounded like moe_wait (~60 s)
-        if (blockIdx.x == 0) {
+        if (blk == 0) {
             while (r->seq != s_need) {
                 if (clock64() - t0 > (1ll << 36)) break;
             }
@@ -3202,7 +3203,7 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which)
         const float4* src = (const float4*) r->part;
         float4* dst = (float4*) out;
         const int n4 = n_embd / 4;
-        for (int i = blockIdx.x * blockDim.x + tid; i < n4; i += gridDim.x * blockDim.x) {
+        for (int i = blk * blockDim.x + tid; i < n4; i += nblk * blockDim.x) {
 #if defined(__HIPCC__)
             const volatile float* vp = (const volatile float*) (src + i);
             const float4 v = make_float4(vp[0], vp[1], vp[2], vp[3]);
@@ -3214,9 +3215,21 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which)
             dst[i] = o;
         }
     } else {
-        for (int e = blockIdx.x * blockDim.x + tid; e < n_embd; e += gridDim.x * blockDim.x)
+        for (int e = blk * blockDim.x + tid; e < n_embd; e += nblk * blockDim.x)
             out[e] += ((volatile const CpuAnswer*) r)->part[e];
     }
+}
+
+__global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which) {
+    cpu_wait_add(d.cpu_seq, d.cpu_ans, n_embd, out, which, blockIdx.x, gridDim.x);
+}
+
+// a verify window's columns in one launch (blockIdx.y the column): each column's answer is waited for and added as
+// moe_cpu_wait does it (the same adds), a launch a layer instead of one a column
+__global__ void moe_cpu_wait_cols_kernel(CpuWaitCols c, const void* cpu_ans, int n_embd) {
+    const int t = blockIdx.y;
+    if (c.seq[t] == nullptr) return;
+    cpu_wait_add(c.seq[t], cpu_ans, n_embd, c.out[t], 0, blockIdx.x, gridDim.x);
 }
 
 // EXPERT DEFERRAL, the half-layer form: the CPU lane's part of layer l's MoE, waited for after layer l + 1's
@@ -3286,8 +3299,9 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
 // the chunks whose bit is b modulo the grid, each as soon as it is set - the PCIe pull (~6 GB/s) runs behind the
 // SSD (~3.4) instead of after it, so only the last chunk's copy stays exposed.  Entries outside stream_mask are
 // whole blobs, as above.  A bit that never comes (a dead host) gives up after ~60 s like moe_wait.
+// gu / uu / dn: the gate, up and down parts' bytes (uu == gu but in a mixed gate/up layer)
 __device__ void moe_fetch_stream_body(const MoeDev& d, int k, size_t n16, unsigned long long gu, unsigned long long dn,
-                                      int rch, unsigned int s_need) {
+                                      int rch, unsigned int s_need, unsigned long long uu) {
     const volatile MoeResponse* r = s_need != 0u ? (const volatile MoeResponse*) d.resp + (s_need % kCpuAnswers) : nullptr;
     const unsigned int sm = r != nullptr ? r->stream_mask : 0u;
     for (int i = 0; i < k; ++i) {
@@ -3304,11 +3318,11 @@ __device__ void moe_fetch_stream_body(const MoeDev& d, int k, size_t n16, unsign
         }
         for (int bit = blockIdx.x; bit < 3 * rch; bit += gridDim.x) {
             const int part = bit / rch, c = bit % rch;
-            const unsigned long long len = part == 2 ? dn : gu;
+            const unsigned long long len = part == 2 ? dn : part == 1 ? uu : gu;
             const unsigned long long piece = ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
             const unsigned long long c0 = min(len, (unsigned long long) c * piece), c1 = min(len, c0 + piece);
             if (c1 <= c0) continue;
-            const unsigned long long base = (part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0;
+            const unsigned long long base = (part == 0 ? 0ull : part == 1 ? gu : gu + uu) + c0;
             if (threadIdx.x == 0) {
                 const long long t0 = clock64();
                 while (((r->ready[i] >> bit) & 1u) == 0u) {
@@ -3328,11 +3342,11 @@ __device__ void moe_fetch_stream_body(const MoeDev& d, int k, size_t n16, unsign
 }
 
 __global__ void __launch_bounds__(256) moe_fetch_stream_kernel(MoeDev d, int k, size_t n16, unsigned long long gu,
-                                                               unsigned long long dn, int rch) {
+                                                               unsigned long long dn, int rch, unsigned long long uu) {
     __shared__ unsigned int s_need;
     if (threadIdx.x == 0) s_need = *d.wait_seq;
     __syncthreads();
-    moe_fetch_stream_body(d, k, n16, gu, dn, rch, s_need);
+    moe_fetch_stream_body(d, k, n16, gu, dn, rch, s_need, uu);
 }
 
 // moe_wait and moe_fetch in one launch: a route without disk misses - the rule once warm - goes straight to the
@@ -3340,7 +3354,8 @@ __global__ void __launch_bounds__(256) moe_fetch_stream_kernel(MoeDev d, int k, 
 // in device memory (wait_seq[1]), where the other blocks wait before they read the plan
 template <bool STREAM>
 __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_embd, int k, size_t n16,
-                                                             unsigned long long gu, unsigned long long dn, int rch) {
+                                                             unsigned long long gu, unsigned long long dn, int rch,
+                                                             unsigned long long uu) {
     __shared__ unsigned int s_need;
     if (threadIdx.x == 0) s_need = *d.wait_seq;
     __syncthreads();
@@ -3365,7 +3380,44 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
             __syncthreads();
         }
     }
-    if (STREAM) moe_fetch_stream_body(d, k, n16, gu, dn, rch, need);
+    if (STREAM) moe_fetch_stream_body(d, k, n16, gu, dn, rch, need, uu);
+    else moe_fetch_body(d, k, n16);
+}
+
+// moe_wait_fetch over a verify window's columns in one launch (blockIdx.y the column, its plan in mds[y], device):
+// each column's blocks do what moe_wait_fetch_kernel's do for it - the same copies, a launch a layer instead of a
+// moe_wait and a moe_fetch a column
+template <bool STREAM>
+__global__ void __launch_bounds__(256) moe_wait_fetch_cols_kernel(const MoeDev* __restrict__ mds, int n_embd, int k,
+                                                                  size_t n16, unsigned long long gu,
+                                                                  unsigned long long dn, int rch,
+                                                                  unsigned long long uu) {
+    const MoeDev& d = mds[blockIdx.y];
+    __shared__ unsigned int s_need;
+    if (threadIdx.x == 0) s_need = *d.wait_seq;
+    __syncthreads();
+    const unsigned int need = s_need;
+    if (need != 0u) {
+        volatile unsigned int* done = (volatile unsigned int*) d.wait_seq + 1;
+        if (blockIdx.x == 0) {
+            moe_wait_apply(d, n_embd, need);
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence();
+                *done = need;
+            }
+        } else {
+            if (threadIdx.x == 0) {
+                const long long t0 = clock64();   // bounded like moe_wait (~60 s)
+                while (*done != need) {
+                    if (clock64() - t0 > (1ll << 36)) break;
+                }
+                __threadfence();
+            }
+            __syncthreads();
+        }
+    }
+    if (STREAM) moe_fetch_stream_body(d, k, n16, gu, dn, rch, need, uu);
     else moe_fetch_body(d, k, n16);
 }
 
@@ -3381,13 +3433,15 @@ constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp mea
 
 // grid (n_ff / GU_ROWS, k [+ 1]): the extra row of blocks (blockIdx.y == k) computes the SHARED expert's down rows
 // into sh_out while the routed experts' blocks run - in moe_down it was a serial tail (~25 us of 72)
+// TU: up's type when it differs from gate's (a mixed layer: unsloth's UD-IQ1_S Qwen3.8 keeps IQ2_S gate + IQ2_XXS up in
+// some layers) - each role's rows at its own size and codebook, one dot pass a role; TU == TG is the one-pass kernel
 #if defined(STRATA_USE_HIP)
 template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool SPLIT = false,
-         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0>
+         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, int TU = TG>
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
 __global__ void __launch_bounds__(NW * 32)
 #else
-template<int TG>
+template<int TG, int TU = TG>
 __global__ void __launch_bounds__(GU_WARPS * 32)
 #endif
 moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
@@ -3432,14 +3486,17 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if (ptr == 0ull) return;
     __shared__ float sg[GU_ROWS], su[GU_ROWS];
     __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+    __shared__ uint32_t s_tab_u[TU != TG && TabWords<TU>::n > 0 ? TabWords<TU>::n : 1];   // (a mixed layer's up)
 #if defined(STRATA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TG>(s_sign);
     if constexpr (!GLOBAL)
 #endif
     load_tab<TG>(s_tab);
+    if constexpr (TU != TG) load_tab<TU>(s_tab_u);
     __syncthreads();
     const size_t rb = rbytes<TG>(n_embd);
+    const size_t rbu = rbytes<TU>(n_embd);
     const uint8_t* blob = (const uint8_t*) ptr;
     // each warp: 2 gate + 2 up rows in ONE pass (one activation load per call for all four)
     constexpr int RPW = GU_ROWS / NW;
@@ -3448,10 +3505,15 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     for (int j = 0; j < RPW; ++j) {
         const int r = chunk * GU_ROWS + warp * RPW + j;
         rows[j] = blob + (size_t) r * rb;
-        rows[RPW + j] = blob + (size_t) n_ff * rb + (size_t) r * rb;
+        rows[RPW + j] = blob + (size_t) n_ff * rb + (size_t) r * rbu;
     }
     float s[2 * RPW];
     const uint32_t* tab = s_tab;
+    if constexpr (TU != TG) {
+        // a mixed layer: the gate rows, then the up rows, each at its own type (each row's sum is the same dot)
+        rows_dot<TG, RPW>(rows, xq, n_embd, lane, tab, s);
+        rows_dot<TU, RPW>(rows + RPW, xq, n_embd, lane, s_tab_u, s + RPW);
+    } else {
 #if defined(STRATA_USE_HIP)
     if constexpr (GLOBAL) tab = TG == 16 ? (const uint32_t*) iq2xxs_grid :
                                 TG == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
@@ -3460,6 +3522,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     } else
 #endif
     rows_dot<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s);
+    }
     if (lane == 0) {
 #pragma unroll
         for (int j = 0; j < RPW; ++j) {
@@ -4634,6 +4697,13 @@ void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int m
     launch_check("moe_cpu_wait");
 }
 
+void moe_cpu_wait_cols(const CpuWaitCols& c, const void* cpu_ans, int n_embd, cudaStream_t s) {
+    if (c.n <= 0) return;
+    static const int cwb = [] { const char* v = getenv("STRATA_GLM_CPU_WAIT_BLOCKS"); return v ? std::max(1, std::atoi(v)) : 8; }();
+    moe_cpu_wait_cols_kernel<<<dim3((unsigned) cwb, (unsigned) c.n), 128, 0, s>>>(c, cpu_ans, n_embd);
+    launch_check("moe_cpu_wait_cols");
+}
+
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
     static int sms = 0;
     if (sms == 0) {
@@ -4669,7 +4739,9 @@ void zero_copy(const void* src, void* dst, size_t bytes, cudaStream_t s) {
     launch_check("zero_copy");
 }
 
-void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes, size_t dn_bytes, int n_chunks) {
+void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes, size_t dn_bytes, int n_chunks,
+               size_t up_bytes) {
+    if (up_bytes == 0) up_bytes = gu_bytes;
     static int sms = 0;
     if (sms == 0) {
         int dev = 0;
@@ -4678,14 +4750,15 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, size_t
         if (sms <= 0) sms = 80;
     }
     if (n_chunks > 0 && gu_bytes > 0 && dn_bytes > 0)
-        moe_fetch_stream_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16, gu_bytes, dn_bytes, n_chunks);
+        moe_fetch_stream_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16, gu_bytes, dn_bytes, n_chunks, up_bytes);
     else
         moe_fetch_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
     launch_check("moe_fetch");
 }
 
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s, size_t gu_bytes,
-                    size_t dn_bytes, int n_chunks) {
+                    size_t dn_bytes, int n_chunks, size_t up_bytes) {
+    if (up_bytes == 0) up_bytes = gu_bytes;
     static int sms = 0;
     if (sms == 0) {
         int dev = 0;
@@ -4695,10 +4768,31 @@ void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaS
     }
     if (n_chunks > 0 && gu_bytes > 0 && dn_bytes > 0)
         moe_wait_fetch_kernel<true><<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16, gu_bytes, dn_bytes,
-                                                        n_chunks);
+                                                        n_chunks, up_bytes);
     else
-        moe_wait_fetch_kernel<false><<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16, 0, 0, 0);
+        moe_wait_fetch_kernel<false><<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16, 0, 0, 0, 0);
     launch_check("moe_wait_fetch");
+}
+
+void moe_wait_fetch_cols(const MoeDev* mds_dev, int n_cols, int n_embd, int k, size_t blob_bytes, cudaStream_t s,
+                         size_t gu_bytes, size_t dn_bytes, int n_chunks, size_t up_bytes) {
+    if (up_bytes == 0) up_bytes = gu_bytes;
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 80;
+    }
+    if (n_cols <= 0) return;
+    // (the SMs shared among the columns: a column's copies are PCIe-bound, ~a dozen blocks keep the link busy)
+    const dim3 grid((unsigned) std::max(16, sms / n_cols), (unsigned) n_cols);
+    if (n_chunks > 0 && gu_bytes > 0 && dn_bytes > 0)
+        moe_wait_fetch_cols_kernel<true><<<grid, 256, 0, s>>>(mds_dev, n_embd, k, (blob_bytes + 15) / 16, gu_bytes,
+                                                              dn_bytes, n_chunks, up_bytes);
+    else
+        moe_wait_fetch_cols_kernel<false><<<grid, 256, 0, s>>>(mds_dev, n_embd, k, (blob_bytes + 15) / 16, 0, 0, 0, 0);
+    launch_check("moe_wait_fetch_cols");
 }
 
 #if defined(STRATA_USE_HIP)
@@ -4780,9 +4874,47 @@ void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off
 #endif
 
 namespace {
+// the gate/up type pairs of a mixed layer that have a kernel (moe_gate_up_kernel<G, U>): the 2-bit i-quants among
+// themselves (unsloth's UD-IQ1_S Qwen3.8: IQ2_S / IQ2_XXS both ways), the 3-bit and the 1-bit pairs
+#define GLMF_GU_PAIRS(X) X(16, 17) X(17, 16) X(16, 22) X(22, 16) X(17, 22) X(22, 17) X(18, 21) X(21, 18) X(19, 29) X(29, 19)
+
+bool gate_up_mixed(int gu_type, int up_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq,
+                   void* hq, const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out,
+                   cudaStream_t s, const MoeCols& mc) {
+    const bool sh = sh_down != nullptr && sh_out != nullptr;
+    const dim3 grid((unsigned) (n_ff / GU_ROWS), (unsigned) (k + (sh ? 1 : 0)), (unsigned) mc.nc);
+    const auto* X = (const block_q8_1*) xq;
+    auto* H = (block_q8_1*) hq;
+    const auto* SD = (const uint8_t*) sh_down;
+    const auto* SH = (const block_q8_1*) sh_hq;
+    const int kk = sh ? k : k + 1;
+#if defined(STRATA_USE_HIP)
+#define GLMF_GU2_K(G, U) moe_gate_up_kernel<G, GU_WARPS, false, false, false, false, false, 0, U>
+#else
+#define GLMF_GU2_K(G, U) moe_gate_up_kernel<G, U>
+#endif
+#define GLMF_GU2(G, U)                                                                                                  \
+    if (gu_type == G && up_type == U) {                                                                                 \
+        GLMF_GU2_K(G, U)<<<grid, GU_WARPS * 32, 0, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh,    \
+                                                        sh_out, mc.ca, mc.xq_cs, mc.hq_cs, mc.shq_cs, mc.out_cs);       \
+        launch_check("moe_gate_up mixed");                                                                              \
+        return true;                                                                                                    \
+    }
+    GLMF_GU_PAIRS(GLMF_GU2)
+#undef GLMF_GU2
+#undef GLMF_GU2_K
+    std::fprintf(stderr, "glm_fast moe_gate_up: gate type %d with up type %d unsupported\n", gu_type, up_type);
+    return false;
+}
+
 void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                   const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s,
-                  const MoeCols& mc) {
+                  const MoeCols& mc, int up_type = -1) {
+    if (up_type >= 0 && up_type != gu_type) {
+        gate_up_mixed(gu_type, up_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s,
+                      mc);
+        return;
+    }
 #if defined(STRATA_USE_HIP)
     // IQ2_XS (DeepSeek V4's gate/up) the same way, measured on gfx1151 (the Radeon 8060S lane) and gfx1201 (an AI PRO
     // R9700: 90.6 -> 75.6 us for 8 experts), the RX 7900 XT (gfx1100: 78.4 -> 60.1 us), bit-identical sums
@@ -4843,14 +4975,24 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
 }  // namespace
 
 void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
-                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
-    gate_up_impl(gu_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, MoeCols{});
+                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s,
+                 int up_type) {
+    gate_up_impl(gu_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, MoeCols{},
+                 up_type);
+}
+
+bool moe_gate_up_pair_supported(int gu_type, int up_type) {
+    if (up_type < 0 || up_type == gu_type) return moe_supported(gu_type);
+#define GLMF_GU2_OK(G, U) if (gu_type == G && up_type == U) return true;
+    GLMF_GU_PAIRS(GLMF_GU2_OK)
+#undef GLMF_GU2_OK
+    return false;
 }
 
 void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_embd, int n_ff, float limit,
                       const void* xq, size_t xq_cs, void* hq, size_t hq_cs, const void* sh_down, int sh_type,
                       const void* sh_hq, size_t sh_hq_cs, int n_ff_sh, float* sh_out, size_t out_cs, cudaStream_t s,
-                      const float* nv_scale) {
+                      const float* nv_scale, int up_type) {
     MoeCols mc;
     mc.ca = cols;
     mc.nc = nc;
@@ -4860,7 +5002,7 @@ void moe_gate_up_cols(int gu_type, const MoeColArgs* cols, int nc, int k, int n_
     mc.out_cs = out_cs;
     MoeDev d{};
     d.nv_scale = nv_scale;   // (NVFP4: the layer's scales, read through each column's plan_id)
-    gate_up_impl(gu_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc);
+    gate_up_impl(gu_type, d, k, n_embd, n_ff, limit, xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s, mc, up_type);
 }
 
 #if defined(STRATA_USE_HIP)

@@ -7,6 +7,33 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.112 - 2026-11-05
+
+- **Qwen3.8-Flash-Next answers faster with the MTP drafter**, the same tokens. The speculative verify window now
+  replays each delta-net layer from a CUDA graph, waits for the CPU lane and fetches the columns' experts in one
+  launch instead of one per column (launches a token 453 -> 254), and swaps experts into VRAM also while the CPU lane
+  takes part of the RAM-tier experts (with a quicker swap rule when the VRAM pool holds half of the experts or more).
+  RTX 5090 (PCIe Gen4 x4) + 94 GB RAM, 4K prompt, median of 3 x 512 tokens, v1.3.111 -> v1.3.112 the same day:
+  - Swift 1.5 IQ2_XS, 32 GB: 158.6 -> **180.6 tok/s (+14%)** with the drafter (VRAM hits 92.6 -> 95.6%), 115.7 -> 118.6
+    without; 16 GB: 79.3 -> 80.7.
+  - Qwen3.8 16G64G: 32 GB 129.3 -> 131.3 (+1.5%; 16K / 32K prompts: +1.6% / +2.8%); 16 GB 89.2 -> **96.4 (+8%)**.
+    Without the drafter: unchanged (90.0 / 70.7 -> 71.4).
+  - Switches: `STRATA_GLM_GRAPH`, `STRATA_GLM_GRAPH_MOE`, `STRATA_GLM_CPU_WAIT_COLS`, `STRATA_GLM_FETCH_COLS`,
+    `STRATA_GLM_BG_SPLIT` ([MANUAL](docs/MANUAL.md)). The graphs are CUDA only.
+- **unsloth's UD 3.1 UD-IQ1_S of Qwen3.8-Flash-Next (66.4 GB) loads** (beta). One layer stores its gate and up experts
+  in different types (IQ2_S / IQ2_XXS), which the pack and the kernels did not take. `tools/iq_pack.py` now writes such
+  a layer's types as `G,U` (other packs stay byte for byte the same), and the decode, verify window, prompt path, CPU
+  lane and streamed fetches compute each role in its own type; the iGPU lane and a helper GPU leave that layer to the
+  CPU. The GGUF's bytes are read as they are: KL to the NVFP4 teacher 0.2007 (llama.cpp on the same file 0.2012),
+  same top token 83.2% ([docs/qwen38](docs/qwen38/README.md#unsloth-ud-iq1_s-ud-31-v13112-beta)). Re-make its pack
+  after updating.
+- **`./abyss.sh --check`: a stability check of the installed model** (15-30 minutes; `--quick` ~5, `--long` adds the
+  biggest prompts). Through the model's own server: drafter on and off, Japanese, code run against tests, a tool call,
+  8K-64K prompts with a needle, an 11-turn conversation. `abyss-check.txt` (no host, user or folder names; nothing
+  sent) ends with "What limits this PC", an estimate of which part holds a token back - also in `--bench`.
+  Attach it to the new [bug report](https://github.com/zephel01/Abyss/issues/new?template=bug.md) form. Before the
+  setup, `--check` still checks the PC only ([BENCH](docs/BENCH.md#the-stability-check---check)).
+
 ## v1.3.111 - 2026-11-05
 
 - **Qwen3.8 with the MTP drafter no longer breaks on long prompts.** From about 20K tokens in one prompt chunk, the

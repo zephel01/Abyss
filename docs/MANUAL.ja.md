@@ -494,6 +494,10 @@ Radeon 8060S（gfx1151）。
 
 `./abyss.sh --bench`（Abyss を止めて実行、数分）は、入っているモデルをどの PC でも同じ方法で測ります。3 つの質問での生成速度、2k / 8k トークンのプロンプトを読む速度に加えて、1 トークンの時間がどこで使われているか（SSD 待ち、CPU / iGPU レーン、PCIe での転送、GPU）、一番ありそうなボトルネックと速くする方法、同じモデルの正常な実行と比べた品質チェック（`bench/ref`）を出します。`--deep` は GPU の稼働率と、PCIe / レーンの分担率の振り分けを足します。`--full` は回答を繰り返し、32k トークンのプロンプトも測ります。結果は `abyss-bench.txt` に書き出すので、issue に貼ってください。各行の意味は [BENCH.ja.md](BENCH.ja.md) にあります。
 
+### モデルが正しく動くか確かめる（`./abyss.sh --check`）
+
+`./abyss.sh --check`（v1.3.112。Abyss を止めて実行、15〜30 分。`--quick` は 5 分ほど、`--long` はコンテキストが許す一番大きなプロンプトまで）は、入っているモデルを実際の使い方で動かし、落ちないか、答えが正しいかを確かめます。ドラフターあり・なしの答え、日本語、テストで動かす小さなコーディング課題、ツール呼び出し、8K / 24K / 32K からコンテキストの上限近くまでの長いプロンプト（埋め込んだ答えを探す）、11 回のやりとりの会話です。結果は `abyss-check.txt` に書き出します（ホスト名・ユーザー名・フォルダのパスは消し、どこにも送りません）。この PC、モデル、「この PC で何が速さを止めているか」（GPU、CPU レーン、PCIe、RAM、SSD、VRAM のどれが 1 トークンを遅らせているかの見積もり）が入ります。[バグ報告](https://github.com/zephel01/Abyss/issues/new?template=bug.md)に添えてください（`--report` にも入ります）。終了コードが 1 になるのは、失敗したステップがあるときだけです。セットアップの前、または `--setup` / `--gpu` / `--gpus` を付けたときは、これまでどおり PC だけを調べます。Windows は `START-ABYSS.bat --check`。各ステップの中身は [BENCH.ja.md](BENCH.ja.md) にあります。
+
 ### GPU に合わせた調整（`./abyss.sh --gpu-tune`）
 
 カーネルの選び方には GPU によって速さが変わるものがある。エンジンは手元で実測した GPU（AI PRO R9700、RTX 5090）の
@@ -755,6 +759,9 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_WAIT_FETCH` | on（HIP）、off（NVIDIA） | MoE の層のディスク読み込みの待ちと、RAM 層の expert のコピーを 2 回ではなく 1 回の起動で行う（v1.3.42。処理は同じ）。`0` で 2 回の起動 |
 | `STRATA_HIP_EXPERTS_LEGACY` | off | `1`: decode の expert を RDNA 版ではなく元のカーネルで計算する（gfx1100、v1.3.40 から gfx1201 も: AI PRO R9700 で gate/up と down が約 2 割速い。gfx1151 は IQ3_XXS の down 以外）。どちらでもビット一致 |
 | `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16（Qwen3.8: 2 / 8） | RAM 層のエキスパートの使用回数が「VRAM 側の ratio 倍 + margin」を超えたら入れ替える（2 / 4 は以前の、入れ替えの多い規則）。Qwen3.8-Flash-Next は早めに入れ替え、1 回のトークン境界で最大 16 個動かす（`STRATA_GLM_PROMOTE`、他は 8）。エキスパートが約 2 MB で、1 個のコピーが約 0.3 ms のため（v1.3.86。RTX 5090、ISTA IQ3_S: VRAM ヒット 60〜77% → 68〜89%、+12〜15%） |
+| `STRATA_GLM_BG_SPLIT` | Qwen3.8 は 1、他は 0 | CPU の道が RAM 層のエキスパートの一部だけを受け持つときも、背景の入れ替えを動かす（0: 全部を受け持つときだけ。以前のまま）。Qwen3.8 で、VRAM の枠にエキスパートの半分以上が入るときは ratio 1 / margin 2 で入れ替える（RTX 5090、Swift 1.5 IQ2_XS 32 GB: VRAM ヒット 95.0 → 96.2%、176 → 182 tok/s）。枠が少ないときは 2 / 8 のまま |
+| `STRATA_GLM_FETCH_COLS` / `STRATA_GLM_CPU_WAIT_COLS` | Qwen3.8 は 1、他は 0 | 先読みを確かめる窓で、CPU の答えを待つ処理とエキスパートを取ってくる処理を、列ごとではなく 1 回のカーネルで全部の列にする（計算は同じ） |
+| `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | CUDA は 1 / 1、HIP は 0 | Qwen3.8 の確かめる窓で、delta-net の層を CUDA graph で流す（0: 1 つずつ起動。`_MOE=0`: MoE の振り分けは graph の外）。出力は同じ。1 トークンの起動回数 453 → 254（RTX 5090 では速さは変わらない） |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。`0`: 従来どおり境目で |
 | `STRATA_GLM_ZERO_COPY` | オン | copy engine を使わない token の境目（v1.3.21）: 表の更新・埋め込み行（`token_embd` の pinned コピー、Q8_0 / Q5_K）・トークンを、カーネルが host-mapped で直接読み書きする。`0`: 従来どおり memcpy |
 | `STRATA_GLM_GAP_PROF` | オフ | `1`: 答えごとに `glm gap prof` の行を出す。トークンとトークンの間の時間の内訳（host 側のラップと、timing event で測った GPU の空き） |

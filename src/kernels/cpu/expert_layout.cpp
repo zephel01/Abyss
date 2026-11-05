@@ -170,10 +170,31 @@ void act_quant_any(const float* x, int n, ActQ& a) {
     else act_quant_q8_1_avx2(x, n, a);
 }
 
+bool parse_gu_field(const std::string& field, int& gate_type, int& up_type) {
+    // "T" or "G,U" (decimal ggml types)
+    const size_t c = field.find(',');
+    const auto num = [](const std::string& t, int& v) {
+        if (t.empty() || t.size() > 4) return false;
+        v = 0;
+        for (char ch : t) {
+            if (ch < '0' || ch > '9') return false;
+            v = 10 * v + (ch - '0');
+        }
+        return true;
+    };
+    if (c == std::string::npos) {
+        if (!num(field, gate_type)) return false;
+        up_type = gate_type;
+        return true;
+    }
+    return num(field.substr(0, c), gate_type) && num(field.substr(c + 1), up_type);
+}
+
 #if !defined(STRATA_NATIVE_EXPERTS)
 // Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.
 bool native_experts_available() noexcept { return false; }
 bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
+bool native_fmt(int, int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
@@ -212,10 +233,17 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             continue;
         }
         std::istringstream ss(line);
-        long long l = -1, gt = -1, dt = -1;
+        long long l = -1, dt = -1;
+        int gt = -1, ut = -1;
+        std::string gu_field;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
-        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
+        if (!(ss >> l >> gu_field >> dt >> off >> blob) || l < 0 || l >= n_layers || !parse_gu_field(gu_field, gt, ut)) {
             err = "native_experts.txt: a malformed line: " + line;
+            return false;
+        }
+        if (gt != ut) {   // (gate and up of different types: the --glm-pack fast path's kernels take them)
+            err = "native_experts.txt: layer " + std::to_string(l) + "'s gate and up differ in type (" + gu_field +
+                  "): this pack runs on the GLM-pack fast path only";
             return false;
         }
         NativeFmt f;

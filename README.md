@@ -119,6 +119,7 @@ the APU's iGPU as a lane).
 | Qwen3.8-35B-A3B Distill (Qwen3.5-MoE, a small Ornith layout) | empero-ai [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF) (v1.3.92) | 21.7 GB | measured on an RTX 5090: swe-bench 3 tasks 399 tok/s with its NextN drafter (85% of drafts accepted); VRAM capped at 16 GB: 297 tok/s |
 | Qwen3.8-Flash-Next (qwen4exp, [docs/qwen38](docs/qwen38/README.md)) | orcarouter's [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) on the fast path (v1.3.74); beta from v1.3.76: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S, unsloth UD-IQ4_XS / UD-Q4_K_XL (which fits where: [docs/qwen38](docs/qwen38/README.md#other-ggufs-beta)) | 85.2 GB | measured on an AI PRO R9700: prompts 1,037 tok/s at 30K, answers 64-65 tok/s prose / 86 code with its MTP drafter, KL 0.026 against llama.cpp; NVIDIA: not built |
 | | magnitudedev's [NVFP4](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF) (v1.3.101, beta, [docs/qwen38](docs/qwen38/README.md#nvfp4-nvidias-fp4-checkpoints-v13101-beta)) | 127.8 GB | measured on an RTX 5090 + 96 GB: KL 0.018 against llama.cpp, prompts 2,515 tok/s at 32K, swe-bench 3 tasks 105.3 tok/s with its MTP drafter |
+| | unsloth [UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (v1.3.112, beta: its gate and up experts differ in type on one layer, [docs/qwen38](docs/qwen38/README.md#unsloth-ud-iq1_s-ud-31-v13112-beta)) | 66.4 GB | measured on an RTX 5090 + 94 GB: KL 0.201 (llama.cpp on the same file 0.201), 153 tok/s with its MTP drafter at 32 GB, code 4 / 5 |
 | GLM-5.3-Flash (Maya's) | Maya-S-v2 IQ2_XXS, Maya-S24 | 96.5 / 94.7 GB | measured |
 | | turboderp's EXL3 sc_2.10bpw ([EXL3](docs/exl3/README.md)) | | measured, experimental |
 | | kindlingai's [exlr8](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) K2, converted with `tools/exlr8_convert.py` (v1.3.53) | 86 GB | measured on an AI PRO R9700: ~23 tok/s, nll 1.61 (Maya-S-v2 1.634, lower is better); K3 (125 GB): nll 1.548 at ~11 tok/s |
@@ -128,6 +129,7 @@ Quality and speed of every measured file, and reference numbers per GPU (ours an
 Running one of our own quants (the `zephel01/...` rows) on a GPU we have not measured? Your `--bench --deep` output
 ([issue form](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)) goes into its model card with credit.
 To measure your own PC the same way - and see where its time goes - run `./abyss.sh --bench --deep` ([docs/BENCH.md](docs/BENCH.md)).
+To check that the installed model runs right on your PC (crashes, wrong answers, long prompts, a long conversation) - and attach the result to a [bug report](https://github.com/zephel01/Abyss/issues/new?template=bug.md) - run `./abyss.sh --check` (v1.3.112, [docs/BENCH.md](docs/BENCH.md#the-stability-check---check)).
 
 ## 📊 Performance
 

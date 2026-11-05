@@ -209,7 +209,7 @@ inline size_t mmq_down_over(int d_type, int64_t n_ff) {
 // so the prompt path multiplies the resident experts where they lie.  The padding also holds the down MMQ's
 // over-read (mmq_down_over, n_ff the experts' width): a blob the rounding leaves too little room after (Qwen3.8's
 // Q8_0 down behind IQ4_XS gate/up: 0 bytes) gets one more block-aligned step - other strides stay as they were.
-inline size_t expert_stride(size_t blob, int gu_type, int d_type, int64_t n_ff) {
+inline size_t expert_stride(size_t blob, int gu_type, int d_type, int64_t n_ff, int up_type = -1) {
     // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
     // multiply these with MMQ)
     if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
@@ -218,6 +218,10 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type, int64_t n_ff) 
     const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
     if (b2 > 0) a = std::lcm(a, b2);
+    if (up_type >= 0 && up_type != gu_type) {   // a mixed layer: up's blocks whole too
+        const size_t b3 = ggml_type_size((ggml_type) up_type);
+        if (b3 > 0) a = std::lcm(a, b3);
+    }
     const size_t s = (blob + a - 1) / a * a, over = mmq_down_over(d_type, n_ff);
     return s - blob >= over ? s : (blob + over + a - 1) / a * a;
 }
@@ -369,7 +373,11 @@ struct Glm5Model::FastState {
         WSlot sh_gate, sh_up, sh_down;
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
-        size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        // gu_type / gu_bytes: the gate role's; up_type / up_bytes: the up role's - the same but in a mixed layer
+        // (unsloth's UD-IQ1_S Qwen3.8: IQ2_S gate + IQ2_XXS up), whose blob is [gate | up | down] at their own sizes
+        int up_type = 0;
+        size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0, up_bytes = 0;
+        bool mixed() const { return up_type != gu_type; }
         // NVFP4 experts: the second-level scales, [n_expert][2] = (gate = up, down) - device (MoeDev::nv_scale) and
         // host (the CPU lane); empty for every other type
         float* nv_scale = nullptr;
@@ -795,6 +803,7 @@ struct Glm5Model::FastState {
         cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
         return e;
     }
+    double slot_cover = -1.0;   // the expert pool's VRAM slots / the MoE layers' experts (fast_boundary step 5's swap bar)
     bool route_ok(std::string& err) const {
         const int e = route_error_h ? *route_error_h : 0;
         if (e == 0) return true;

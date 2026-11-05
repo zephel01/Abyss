@@ -23,19 +23,31 @@ inline constexpr size_t kNativeHBytes = 4096;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
-    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    int gu_type = -1, d_type = -1;      ///< ggml types of gate (and of up when up_type is the same) and of down
+    int up_type = -1;                   ///< up's ggml type: gu_type except in a mixed layer (unsloth's UD-IQ1_S
+                                        ///< Qwen3.8: IQ2_S gate + IQ2_XXS up) - both share one activation format
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
     int64_t n_embd = 0, n_ff = 0;
-    size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
+    size_t gu_row = 0, d_row = 0;       ///< bytes per weight row (gu_row: gate's)
+    size_t up_row = 0;                  ///< bytes per up row (gu_row unless mixed)
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    /// gate and up of different types: every gate/up kernel takes each role at its own type
+    bool mixed() const { return up_type >= 0 && up_type != gu_type; }
 };
+
+/// native_experts.txt's gate/up field: "T" (gate and up both T) or "G,U" (a mixed layer, tools/iq_pack.py).
+/// false when the field is neither.
+bool parse_gu_field(const std::string& field, int& gate_type, int& up_type);
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// ... with up at its own type (up_type == gu_type: the same as above).  Gate and up must share the activation
+/// format (vec_dot_type), so one quantized activation serves both.
+bool native_fmt(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

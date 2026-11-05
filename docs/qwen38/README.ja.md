@@ -152,6 +152,23 @@ Q8_0 で、PLE 表も Q8_0 です（54.4 GB、SSD から読む。常駐分 73.4 
 プロンプト経路は Blackwell の FP4 テンソルコア（RTX 50、RTX PRO Blackwell、DGX Spark）で NVFP4 を計算します。ほかの
 NVIDIA の GPU と AMD はまだ確認していません。ほかの GPU での報告も歓迎です（上と同じベンチの issue）。
 
+### unsloth UD-IQ1_S（UD 3.1、v1.3.112、ベータ）
+
+[unsloth の UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（66.4 GB）は、1 つの層だけ gate と up
+のエキスパートの型が違います（層 18: gate が IQ2_S、up が IQ2_XXS。down はすべて Q2_0）。v1.3.112 から、pack はその層を
+`G,U` と書き、役割ごとにそれぞれの型で計算します。古いエンジンは理由を出して読み込みを止めます。pack は v1.3.112 の
+`tools/iq_pack.py --fast` で作ってください（上と同じ手順）。iGPU レーンと別 GPU のヘルパーは、その 1 層を CPU に回します。
+RTX 5090（PCIe Gen4 x4）+ RAM 94 GB、MTP ドラフターあり、iGPU レーンなしで確かめました:
+
+| 確認 | 結果 |
+| --- | --- |
+| NVFP4 教師との KL（seq 0〜9、コンテキスト 2,048） | 0.2007、1 位一致 83.2%（同じファイルの llama.cpp: 0.2012 / 83.1%）。16G64G は 0.083 / 89.3% |
+| 生成、4K プロンプト、512 トークン（3 回の中央値） | 32 GB: ドラフターあり 153.4 tok/s、なし 103.7。16 GB（`STRATA_GLM_VRAM_GB=16`）: ありで 78.0、8060S の iGPU レーンも使うと 109.6 |
+| プロンプト | 4K 約 1,900 tok/s、10K（needle）2,734 tok/s |
+| 実際の作業（bench/mgpu/run.sh、32 GB） | 日本語 OK、コード 4 / 5、8K needle 正解 |
+
+ファイルは小さいぶん、品質は 16G64G より下がります。大きいファイルが入らないときに選んでください。
+
 ## 制限
 
 - GPU は 1 枚: 複数枚への分割はこのモデルでは試していません。ドラフターは 1 枚でモデル全体を動かすときだけ読み込まれます。
