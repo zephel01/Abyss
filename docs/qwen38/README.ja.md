@@ -169,6 +169,23 @@ RTX 5090（PCIe Gen4 x4）+ RAM 94 GB、MTP ドラフターあり、iGPU レー�
 
 ファイルは小さいぶん、品質は 16G64G より下がります。大きいファイルが入らないときに選んでください。
 
+### unsloth UD-IQ2_XS（UD 3.1、v1.3.114、ベータ）
+
+[unsloth の UD 3.1 UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（75.8 GB）は、gate と up の
+エキスパートが IQ2_S / IQ2_XXS（同じ層の中では同じ型）、down が IQ4_NL / Q2_0 で、down の 1 層（層 4）だけが Q5_0 です。
+v1.3.114 より前のエンジンは、読み込みのときに `unresolved weights: blk.4.expert types 22/22/6` と出して止まります。pack は
+`tools/iq_pack.py --fast` で作ってください（上と同じ手順）。RTX 5090（PCIe Gen4 x4）+ RAM 94 GB（RAM ティア 50 GB）、
+iGPU レーンなしで確かめました:
+
+| 確認 | 結果 |
+| --- | --- |
+| NVFP4 教師との KL（seq 0〜9、コンテキスト 2,048） | 0.1359、1 位一致 86.4%（同じファイルの llama.cpp: 0.1356 / 86.6%）。UD-IQ1_S は 0.2007、16G64G は 0.083 |
+| 生成、4K プロンプト、512 トークン（3 回の中央値） | 32 GB: ドラフターあり 134.2 tok/s、なし 91.3。16 GB（`STRATA_GLM_VRAM_GB=16`）: ありで 71.7、なしで 57.9 |
+| プロンプト | 8K 約 1,660〜2,080 tok/s、24K 3,082 tok/s |
+| `./abyss.sh --check --quick`（32 GB） | 7 / 7 合格: ドラフターあり/なしで同じ答え、日本語、コード、ツール呼び出し、8K と 24K の needle、11 回の会話 |
+
+品質は UD-IQ1_S と 16G64G の間です。ファイルが大きいぶん VRAM に載る割合が下がり、UD-IQ1_S より遅くなります。
+
 ## 制限
 
 - GPU は 1 枚: 複数枚への分割はこのモデルでは試していません。ドラフターは 1 枚でモデル全体を動かすときだけ読み込まれます。

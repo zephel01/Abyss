@@ -151,10 +151,11 @@ def grade_japanese(answer: str, want: str | None) -> tuple:
     why = broken(answer)
     if why:
         return False, why
-    if kana(answer) < 10 or japanese_share(answer) < 0.5:
-        return False, f"not Japanese enough (kana {kana(answer)}, Japanese {japanese_share(answer):.0%})"
     if want and want not in answer:
         return False, f"the answer lacks {want!r}"
+    # a short right answer is fine (issue #37: "120×3=360、45×7=315、合計675、おつり325円" has 9 kana)
+    if kana(answer) < (3 if want else 10) or japanese_share(answer) < 0.5:
+        return False, f"not Japanese enough (kana {kana(answer)}, Japanese {japanese_share(answer):.0%})"
     return True, f"Japanese {japanese_share(answer):.0%}, kana {kana(answer)}"
 
 

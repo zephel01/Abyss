@@ -169,6 +169,23 @@ to the CPU. Checked on an RTX 5090 (PCIe Gen4 x4) + 94 GB RAM, MTP drafter on, i
 
 Lower quality than the 16G64G build at a smaller file; take it when the larger files do not fit.
 
+### unsloth UD-IQ2_XS (UD 3.1, v1.3.114, beta)
+
+[unsloth's UD 3.1 UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (75.8 GB) has IQ2_S / IQ2_XXS
+gate and up experts (the same type within a layer) and IQ4_NL / Q2_0 down experts, with one Q5_0 down (layer 4).
+Engines before v1.3.114 stop at load with `unresolved weights: blk.4.expert types 22/22/6`. Make the pack with
+`tools/iq_pack.py --fast` (as above). Checked on an RTX 5090 (PCIe Gen4 x4) + 94 GB RAM (50 GB RAM tier), iGPU lane
+off:
+
+| Check | Result |
+| --- | --- |
+| KL to the NVFP4 teacher (seq 0-9, 2,048 context) | 0.1359, same top token 86.4% (llama.cpp on the same file: 0.1356 / 86.6%) - UD-IQ1_S 0.2007, 16G64G 0.083 |
+| Decode, 4K prompt, 512 tokens (median of 3) | 32 GB: 134.2 tok/s with the drafter, 91.3 without; 16 GB (`STRATA_GLM_VRAM_GB=16`): 71.7 with it, 57.9 without |
+| Prompt | 8K ~1,660-2,080 tok/s, 24K 3,082 tok/s |
+| `./abyss.sh --check --quick` (32 GB) | 7 / 7 pass: same answer with and without the drafter, Japanese, code, tool call, 8K and 24K needles, 11-turn conversation |
+
+Between UD-IQ1_S and the 16G64G build in quality; slower than UD-IQ1_S because less of the larger file fits in VRAM.
+
 ## Limits
 
 - One GPU: a split across cards has not been tried with this model, and the drafter loads only when one card runs

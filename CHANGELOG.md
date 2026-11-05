@@ -7,6 +7,17 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.114 - 2026-11-06
+
+- **unsloth's UD 3.1 UD-IQ2_XS of Qwen3.8-Flash-Next (75.8 GB) runs** (beta). One of its layers has Q5_0 down
+  experts, which the GPU expert kernels did not take; the engine stopped at load (`unresolved weights: blk.4.expert
+  types 22/22/6`). The Q5_0 dot sums the 5-bit values as signed integers, as ggml-cpu does (the layer's error matches
+  its neighbours'). RTX 5090, 4K prompt, median of 3 x 512 tokens: 134.2 tok/s with the MTP drafter at 32 GB, 71.7 at
+  16 GB; KL 0.1359 / same top token 86.4% (llama.cpp on the same file 0.1356 / 86.6%); `./abyss.sh --check --quick`
+  7 / 7. Make the pack with `tools/iq_pack.py --fast` ([docs/qwen38](docs/qwen38/README.md)).
+- `./abyss.sh --check`: a short right answer to the Japanese arithmetic task passes (it failed as "not Japanese
+  enough" with 9 kana on a DGX Spark, issue #37); an answer without the number or in English still fails.
+
 ## v1.3.113 - 2026-11-05
 
 - **NVIDIA DGX Spark (GB10, ARM, unified memory) support** (beta,

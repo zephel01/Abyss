@@ -983,6 +983,37 @@ template<> __device__ __forceinline__ float dw<7>(const uint8_t* row, int kbx, i
 template<> struct F<7> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_q5_1);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
         return dw<7>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
+// Q5_0 (unsloth's UD 3.1 UD-IQ2_XS of Qwen3.8: one layer's 640-wide down experts): Q5_1 without the min - codes
+// 0..31 meaning -16..15.  The bytes are made signed (code - 16) before the dot, so the sum is ggml-cpu's exact integer
+// sum: vecdotq's form (sumi * d8 - 16 * s8) subtracts the q8_1 block's FP16 sum s8 from a sum of about the same size,
+// and that cancellation nearly doubled the layer's error against the double reference (STRATA_GLM_CPU_LANE_CHECK on
+// that layer: 0.024 in vecdotq's form, 0.014 in this one; its IQ4_NL neighbours 0.013-0.017).  The
+// block is 22 bytes, so its ints are read two bytes at a time (get_int_b2)
+template<> __device__ __forceinline__ float dw<6>(const uint8_t* row, int kbx, int, const XV& x, const uint32_t*) {
+    const block_q5_0* b = (const block_q5_0*) row + kbx;
+    const int qh = get_int_b2(b->qh, 0);
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int vl = get_int_b2(b->qs, i), vh = qh >> (4 * i);
+        int vi0 = vl & 0x0F0F0F0F;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = __dp4a((int) __vsub4(vi0, 0x10101010), x.u[i], sumi);
+        int vi1 = (vl >> 4) & 0x0F0F0F0F;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = __dp4a((int) __vsub4(vi1, 0x10101010), x.u[i + 4], sumi);
+    }
+    return __half2float(b->d) * x.d * (float) sumi;
+}
+template<> struct F<6> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_q5_0);
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
+        return dw<6>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
 // Q2_0 (ISTA-DASLab's GSQ-RCO Qwen3.8: down experts and shared experts): 64 values, one FP16 scale, 2-bit codes
 // 0..3 meaning -1..2 - vecdotq's vec_dot_q2_0_q8_1, a call per q8_1 block (iqs: the block's half).  The codes are
 // spread into bytes with shifts and masks (no byte permute: the same on CUDA and HIP)
@@ -4167,7 +4198,7 @@ bool mv_supported(int type) { return mv_type_ok(type) != 0; }
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
     return type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
            type == 18 || type == 19 || type == 20 || type == 21 || type == 22 || type == 23 || type == 29 || type == 39 ||
-           type == 7 || type == 8 || type == 42 || type == 40;   // (40: NVFP4, its scale_2 in MoeDev::nv_scale)   // (Qwen3.8 GGUFs: unsloth's Q5_1 / Q8_0, ISTA's Q2_0 down experts)
+           type == 7 || type == 6 || type == 8 || type == 42 || type == 40;   // (40: NVFP4, its scale_2 in MoeDev::nv_scale)   // (Qwen3.8 GGUFs: unsloth's Q5_1 / Q5_0 / Q8_0, ISTA's Q2_0 down experts)
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
@@ -4202,6 +4233,7 @@ size_t row_bytes(int type, int64_t n_in) {
         case 40: return (size_t) (n_in / 64) * 36;
         case 20: return (size_t) (n_in / 32) * sizeof(block_iq4_nl);
         case 7: return (size_t) (n_in / 32) * sizeof(block_q5_1);
+        case 6: return (size_t) (n_in / 32) * sizeof(block_q5_0);
         case 42: return (size_t) (n_in / 64) * sizeof(block_q2_0);
         default: return 0;
     }
@@ -5031,7 +5063,7 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
                                                                      n_ff_sh, sh_out, mc.ca, mc.xq_cs, mc.hq_cs,      \
                                                                      mc.shq_cs, mc.out_cs); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
-        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39) GLMF_GU(20) GLMF_GU(7) GLMF_GU(8) GLMF_GU(42) GLMF_GU(40)
+        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39) GLMF_GU(20) GLMF_GU(7) GLMF_GU(6) GLMF_GU(8) GLMF_GU(42) GLMF_GU(40)
 #undef GLMF_GU
         default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
     }
@@ -5189,7 +5221,7 @@ void down_impl(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t 
         case T: pdl_launch(moe_down_kernel<T>, grid, 256, 0, s, d, k, n_embd, n_ff, down_off, H, sh_out, out, mc.ca, mc.hq_cs, \
                                                          mc.out_cs); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
-        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39) GLMF_DN(20) GLMF_DN(7) GLMF_DN(8) GLMF_DN(42) GLMF_DN(40)
+        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39) GLMF_DN(20) GLMF_DN(7) GLMF_DN(6) GLMF_DN(8) GLMF_DN(42) GLMF_DN(40)
 #undef GLMF_DN
         default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
     }

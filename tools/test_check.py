@@ -42,6 +42,9 @@ class GraderTests(unittest.TestCase):
         self.assertFalse(C.grade_japanese("おつりは３２５円\ufffdです。ひらがなをもっとたくさんかきます。", "325")[0])
         self.assertTrue(C.grade_japanese("おつりは325円です。りんごは360円、みかんは315円になります。", "325")[0])
         self.assertFalse(C.grade_japanese("おつりは300円です。りんごは360円、みかんは315円になります。", "325")[0])
+        # issue #37: a short right answer on DGX Spark (9 kana) passes; an English one still does not
+        self.assertTrue(C.grade_japanese("120×3=360、45×7=315、合計675、おつり325円", "325")[0])
+        self.assertFalse(C.grade_japanese("The change is 325 yen.", "325")[0])
 
     def test_loops(self):
         self.assertTrue(C.looping("the same sentence again and again here. " * 12))

@@ -122,6 +122,49 @@ int main() {
                 }
         }
     }
+    // a Q5_0 down layer (unsloth's UD 3.1 UD-IQ2_XS Qwen3.8: one layer's 640-wide down experts): Q8_0 activations,
+    // 22-byte blocks; the blob path and the split path equal ggml's own dots, one token and three
+    {
+        const int64_t E = 2560, FF = 640;
+        cpu::NativeFmt q;
+        check(cpu::native_fmt(GGML_TYPE_IQ2_S, GGML_TYPE_Q5_0, E, FF, q, err), "Q5_0 down format");
+        check(q.d_act == GGML_TYPE_Q8_0 && q.d_row == (size_t) FF / 32 * 22, "Q5_0 down rows");
+        std::vector<unsigned char> qb(q.bytes);
+        uint32_t st = 777u;
+        const auto rnd = [&st] {
+            st = st * 1664525u + 1013904223u;
+            return ((float) (st >> 8) / 16777216.0f - 0.5f) * 0.1f;
+        };
+        std::vector<float> wd((size_t) E * FF);
+        for (auto& v : wd) v = rnd();
+        ggml_quantize_chunk(GGML_TYPE_Q5_0, wd.data(), qb.data() + q.down_off, 0, E, FF, nullptr);
+        const int NT = 3;
+        std::vector<std::vector<unsigned char>> hb(NT, std::vector<unsigned char>(q.h_bytes));
+        std::vector<const void*> hp(NT);
+        for (int t = 0; t < NT; ++t) {
+            std::vector<float> ht(FF);
+            for (auto& v : ht) v = rnd() * 20.0f;
+            cpu::native_quant_h(q, ht.data(), hb[t].data());
+            hp[t] = hb[t].data();
+        }
+        const auto* td = ggml_get_type_traits_cpu(GGML_TYPE_Q5_0);
+        for (int nt : {1, NT}) {
+            std::vector<std::vector<float>> o1(nt, std::vector<float>(E)), o2(nt, std::vector<float>(E));
+            std::vector<float*> p1(nt), p2(nt);
+            for (int t = 0; t < nt; ++t) {
+                p1[t] = o1[t].data();
+                p2[t] = o2[t].data();
+            }
+            cpu::native_down_rows(q, qb.data(), hp.data(), nt, p1.data(), 0, (int) E);
+            cpu::native_down_rows_split(q, qb.data() + q.down_off, hp.data(), nt, p2.data(), 0, (int) E);
+            for (int t = 0; t < nt; ++t)
+                for (int r = 0; r < E; ++r) {
+                    float ref = 0.f;
+                    td->vec_dot(FF, &ref, 0, qb.data() + q.down_off + (size_t) r * q.d_row, 0, hp[t], 0, 1);
+                    check(o1[t][r] == ref && o2[t][r] == ref, "Q5_0 down equals ggml's dots");
+                }
+        }
+    }
     std::puts("native_split_test: ok");
     return 0;
 }
