@@ -145,10 +145,11 @@ def split_token(rec: dict, facts: dict) -> dict:
 
 
 def what_limits(rec: dict | None, facts: dict, chain=None, disk_gbs: float | None = None, routes=None,
-                vram_gb: float | None = None, lane_name: str = "CPU lane") -> list:
+                vram_gb: float | None = None, lane_name: str = "CPU lane", unified: bool = False) -> list:
     """The "What limits this PC" lines from a decode record without the drafter (bench_rules.bench_records), the
     engine's facts (engine_facts), the GPU's PCIe chain (abyss.pcie_chain / nvidia_links), the SSD's read GB/s, the
-    engine's routes (read_routes) and the GPU's VRAM (GB).  Every estimate says it is one."""
+    engine's routes (read_routes) and the GPU's VRAM (GB).  Every estimate says it is one.  unified: an integrated
+    GPU (DGX Spark / GB10) - no PCIe link, its "VRAM" is the expert pool's share of the one memory."""
     if not rec or rec.get("ms", 0) <= 0:
         return ["(no decode statistics from the engine: nothing to split)"]
     t = rec["ms"]
@@ -160,7 +161,7 @@ def what_limits(rec: dict | None, facts: dict, chain=None, disk_gbs: float | Non
            f"- GPU compute: {p['gpu']:.1f} ms ({pct(p['gpu'])})" + ("" if p["gaps_measured"] else
                                                                       " (host gaps included: not profiled in this run)"),
            f"- {lane_name}: {p['lane']:.1f} ms ({pct(p['lane'])}), {rec.get('lane', 0):.0f} experts a token",
-           f"- PCIe fetches: {p['pcie']:.1f} ms ({pct(p['pcie'])}), {rec.get('ram_fetch', 0):.1f} experts a token",
+           f"- {'RAM-tier copies' if unified else 'PCIe fetches'}: {p['pcie']:.1f} ms ({pct(p['pcie'])}), {rec.get('ram_fetch', 0):.1f} experts a token",
            f"- SSD waits: {p['ssd']:.1f} ms ({pct(p['ssd'])}), {rec.get('disk_reads', 0):.1f} reads a token"]
     if p["gaps_measured"]:
         out.append(f"- host gaps (the GPU idle between tokens): {p['gaps']:.1f} ms ({pct(p['gaps'])})")
@@ -175,8 +176,10 @@ def what_limits(rec: dict | None, facts: dict, chain=None, disk_gbs: float | Non
         return 1000.0 / new_ms, 1000.0 / new_ms - tps
 
     # PCIe: the link it ran on vs an x16 slot of the GPU's own generation
-    ln = link_now(chain)
-    if ln and facts.get("pcie_ms") and facts.get("expert_bytes"):
+    ln = None if unified else link_now(chain)
+    if unified:
+        ideas.append((0.0, "PCIe: none - the GPU shares the system memory (unified memory): no link to change"))
+    elif ln and facts.get("pcie_ms") and facts.get("expert_bytes"):
         g, w, gm, wm = ln
         rate = facts["expert_bytes"] / (facts["pcie_ms"] / 1000.0) / 1e9
         full = PCIE_LANE_GBS.get(gm, 0) * max(wm, 16)
@@ -214,7 +217,8 @@ def what_limits(rec: dict | None, facts: dict, chain=None, disk_gbs: float | Non
             new_miss = misses * r
             new_ms = t - (misses - new_miss) * (miss_ms / misses if misses else 0.0)
             v, d = est(new_ms)
-            more = f" ({vram_gb:.0f} -> {vram_gb + gb:.0f} GB class)" if vram_gb else ""
+            more = (" for the expert pool (unified memory: STRATA_GLM_VRAM_GB, the share of the memory it gets)"
+                    if unified else f" ({vram_gb:.0f} -> {vram_gb + gb:.0f} GB class)" if vram_gb else "")
             head = (f"VRAM: holds {hit:.0f}% of the experts a token uses - estimate: with {gb} GB more{more} "
                     f"~{100 - (100 - hit) * r:.0f}%")
             if lane_share >= LANE_MOST:

@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/arch.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -3518,11 +3519,28 @@ int main(int argc, char** argv) {
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
+#if !STRATA_X86
+    // not x86 (aarch64): no AVX kernel is built - a native pack's experts take ggml-cpu's own dots, but the Q2_0 ones
+    // (the canonical pack, a native pack's Q2_0 layers) have no portable kernel, and this path's CPU pool computes
+    // every expert the GPU does not hold
+    {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        bool q2 = !native_pack;
+        for (const auto& f : lay.fmt) q2 = q2 || f.gu_type == 42 || f.d_type == 42;
+        if (q2) {
+            std::fprintf(stderr, "maya generate: %s has Q2_0 experts, whose CPU kernels are x86 only (AVX2 / AVX-512) - "
+                                 "this pack cannot run on this CPU\n", o.pack.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "maya generate: not an x86 CPU: the CPU experts run on ggml-cpu's own dots\n");
+    }
+#else
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "maya generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+#endif
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||

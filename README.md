@@ -330,6 +330,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | [Small VRAM](docs/SMALL-VRAM.md) · [VRAM の小さいカード](docs/SMALL-VRAM.ja.md) | 8-12 GB cards: the expert pool below a route, prompts in chunks, the CPU lane's share, GLM-5.3-Flash's IQ4_XS dense pack (`tools/requant_dense.py`) |
 | [Two SSDs](docs/SSD2.md) · [SSD を 2 枚](docs/SSD2.ja.md) | `STRATA_GLM_MIRROR`: a copy of the model on a second NVMe read alongside the first, measurements, space needed |
 | [AMD Radeon](docs/amd/README.md) · [日本語](docs/amd/README.ja.md) | AMD: the driver, ROCm (per-architecture packages), a discrete Radeon + the APU's iGPU, troubleshooting |
+| [DGX Spark](docs/DGX-SPARK.md) · [日本語](docs/DGX-SPARK.ja.md) | NVIDIA DGX Spark (GB10, ARM, unified memory, beta): the build, what was measured, what is untested |
 | [Changelog](CHANGELOG.md) | every release with its measurements |
 | [Port notes](docs/deepseek4/PORT.md) | what Abyss adds and how it was validated |
 | [Spec](docs/deepseek4/SPEC.md) | DeepSeek V4's forward pass as implemented |

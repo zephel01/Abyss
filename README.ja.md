@@ -320,6 +320,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | [SSD を 2 枚](docs/SSD2.ja.md) · [Two SSDs](docs/SSD2.md) | `STRATA_GLM_MIRROR`: 2 枚目の NVMe に置いたモデルの写しを 1 枚目と一緒に読む、実測、必要な容量 |
 | [無検閲化](docs/UNCENSOR.ja.md) · [Uncensoring](docs/UNCENSOR.md) | `--uncensor` の有効化、自分のモデル用のファイル作り、実測、以前からある方法 |
 | [AMD Radeon](docs/amd/README.ja.md) · [English](docs/amd/README.md) | AMD: ドライバ、ROCm（アーキテクチャ別のパッケージ）、単体の Radeon と APU の iGPU、トラブル対応 |
+| [DGX Spark](docs/DGX-SPARK.ja.md) · [English](docs/DGX-SPARK.md) | NVIDIA DGX Spark（GB10、ARM、共有メモリ、ベータ）: ビルド、測った数字、まだ試していないこと |
 | [更新履歴](CHANGELOG.md) | 各リリースの内容と測定結果 |
 | [移植の記録](docs/deepseek4/PORT.md) | Abyss が足したものと、その確認方法 |
 | [仕様](docs/deepseek4/SPEC.md) | 実装した DeepSeek V4 の計算 |

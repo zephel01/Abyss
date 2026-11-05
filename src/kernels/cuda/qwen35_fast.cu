@@ -16,6 +16,7 @@
 #pragma pop_macro("__shfl_sync")
 #endif
 #include "strata/kernels/qwen35_fast.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -92,6 +93,7 @@ __global__ void gdn_gates_kernel(const float* __restrict__ alpha, const float* _
     beta[h] = sigmoid_f(beta[h]);
 }
 __global__ void scale_sigmoid_kernel(float* __restrict__ x, int n, const float* __restrict__ g) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= sigmoid_f(g[0]);
 }
@@ -100,6 +102,7 @@ __global__ void scale_sigmoid_rows_kernel(float* __restrict__ x, int n, const fl
     if (i < n) x[(size_t) t * n + i] *= sigmoid_f(g[t]);
 }
 __global__ void attn_gate_kernel(float* __restrict__ o, const float* __restrict__ qf, int n_head) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int h = blockIdx.x, d = threadIdx.x;
     if (h < n_head) o[h * kD + d] *= sigmoid_f(qf[(size_t) h * 2 * kD + kD + d]);
 }
@@ -111,6 +114,7 @@ __global__ void __launch_bounds__(kD) attn_prep_kernel(const float* __restrict__
                                                        int n_head_kv, int n_rot, float rope_base, int p,
                                                        uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
                                                        float* __restrict__ q) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ float sv[kD];
     __shared__ float sred[8];
     const int b = blockIdx.x, d = threadIdx.x;
@@ -219,6 +223,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_ids_kernel(const float*
                                                                     const int32_t* __restrict__ steps, int n_head,
                                                                     int n_head_kv, float scale, float* __restrict__ part,
                                                                     int n_chunks) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ float sm[kWarps][HPW], sl[kWarps][HPW];
     __shared__ float sacc[kWarps][HPW][kD];
     const int h0 = blockIdx.x * HPW, c = blockIdx.y, r = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -318,6 +323,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_ids_kernel(const float*
 
 // grid (n_head, rows), 256 threads (a dim each): the chunks' partials merged (part and out row-major: [row][head])
 __global__ void __launch_bounds__(kD) attn_merge_kernel(const float* __restrict__ part, int n_chunks, float* __restrict__ out) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int h = blockIdx.y * gridDim.x + blockIdx.x, d = threadIdx.x;
     const float* P = part + (size_t) h * n_chunks * (kD + 2);
     float M = -INFINITY;
@@ -442,6 +448,7 @@ __global__ void __launch_bounds__(128) gdn_prep_gates_kernel(float* __restrict__
 // the decode conv (gdn_conv_kernel's state slide) with the SiLU in the same launch
 __global__ void conv_silu_step_kernel(float* __restrict__ cs, const float* __restrict__ x, const float* __restrict__ kW,
                                       float* __restrict__ out, int C, int dc) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float* st = cs + (size_t) c * (dc - 1);
@@ -503,6 +510,7 @@ __global__ void __launch_bounds__(S) gdn_core_kernel(float* __restrict__ state, 
                                                      const float* __restrict__ dt, const float* __restrict__ A,
                                                      const float* __restrict__ z, const float* __restrict__ ssm_norm,
                                                      float out_eps, float* __restrict__ y, Q81* __restrict__ yq) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ float ks[S], qs[S], os[S];
     __shared__ double sh[2][4];
     __shared__ float s_inv;
@@ -1087,6 +1095,7 @@ __global__ void __launch_bounds__(256) hc4_combine_norm_kernel(float* __restrict
                                                                const float* __restrict__ gamma, float eps, int n_embd,
                                                                int hc, int inj_stride, float* __restrict__ xn,
                                                                Q81* __restrict__ xq) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ float sh[8];
     const int c = blockIdx.x, t = blockIdx.y;
     float* r = R + ((size_t) t * hc + c) * n_embd;
@@ -1124,6 +1133,7 @@ __global__ void gather_rows_kernel(const uint16_t* __restrict__ kc, const uint16
 }
 // lo[i] = silu(lo[i] * a)
 __global__ void silu_scale_kernel(float* __restrict__ x, int n, float a, Q81* __restrict__ xq) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {   // (with xq: n % 32 == 0, whole warps)
         const float v = x[i] * a;
@@ -1135,6 +1145,7 @@ __global__ void silu_scale_kernel(float* __restrict__ x, int n, float a, Q81* __
 // mixed[t][e] = (1 / hc) sum_c xn[t][c][e] sigmoid(gate[t][c][e])
 __global__ void hc4_mix_kernel(const float* __restrict__ xn, const float* __restrict__ gate, int n_embd, int hc,
                                float* __restrict__ mixed, Q81* __restrict__ xq) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= n_embd) return;   // (with xq: n_embd % 32 == 0, whole warps)
     const size_t b = (size_t) t * hc * n_embd + e;
@@ -1164,6 +1175,7 @@ __global__ void __launch_bounds__(256) hc4_fused_a_kernel(const float* __restric
                                                           const void* __restrict__ inject, bool inj_f32,
                                                           float* __restrict__ lo, float* __restrict__ inj_out,
                                                           float* __restrict__ sc_out, int inj_stride) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ __align__(16) float xs[kHcMaxHE];
     {   // column blockIdx.y of a window (hc4_fused_cols; the token path's grid has one row)
         const int t = blockIdx.y;
@@ -1273,6 +1285,7 @@ __global__ void __launch_bounds__(512) hc4_fused_cols_b_kernel(float* __restrict
                                                                const float* __restrict__ sc, float* __restrict__ xn,
                                                                float* __restrict__ gate, float* __restrict__ mixed,
                                                                Q81* __restrict__ xq) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ __align__(16) float ls[8 * 512];
     __shared__ float gs[8 * 4 * 32];
     for (int i = threadIdx.x; i < T * lr; i += 512) {   // (silu_scale_kernel's expression)
@@ -1374,11 +1387,11 @@ void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_s
                     bool inject_f32) {
     if (T <= 0) return;
     const int rows = lr + (inject != nullptr ? hc : 0);
-    hc4_fused_a_kernel<<<dim3((unsigned) ((rows + 7) / 8), (unsigned) T), 256, 0, s>>>(
+    pdl_launch(hc4_fused_a_kernel, dim3((unsigned) ((rows + 7) / 8), (unsigned) T), 256, 0, s, 
         R, out, inj_prev, gamma, eps, n_embd, hc, (const uint16_t*) down, lr, inject, inject_f32, lo, inj_out, sc,
         inj_stride);
     check("hc4_fused_cols_a");
-    hc4_fused_cols_b_kernel<<<n_embd / 32, 512, 0, s>>>(R, out, inj_prev, inj_stride, gamma, n_embd, hc, T,
+    pdl_launch(hc4_fused_cols_b_kernel, n_embd / 32, 512, 0, s, R, out, inj_prev, inj_stride, gamma, n_embd, hc, T,
                                                         (const uint16_t*) up, lr, lo, 1.0f / (float) hc, sc, xn, gate,
                                                         x, (Q81*) xq);
     check("hc4_fused_cols_b");
@@ -1407,7 +1420,7 @@ void attn_prep(const float* q_full, const float* k, const float* v, const float*
         std::fprintf(stderr, "qwen35 attn_prep: head_dim %d (the kernels take %d)\n", head_dim, kD);
         return;
     }
-    attn_prep_kernel<<<n_head + n_head_kv, kD, 0, s>>>(q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot,
+    pdl_launch(attn_prep_kernel, n_head + n_head_kv, kD, 0, s, q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot,
                                                        rope_base, p, kc, vc, q);
     check("attn_prep");
 }
@@ -1436,7 +1449,7 @@ static bool attn_split(const float* q, const uint16_t* kc, const uint16_t* vc, i
 #undef Q35_SPLIT
         default: return false;
     }
-    attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, n_chunks, out);
+    pdl_launch(attn_merge_kernel, dim3((unsigned) n_head, (unsigned) T), kD, 0, s, part, n_chunks, out);
     return true;
 }
 size_t attn_part_floats(int n_head, int head_dim, int max_ctx) {
@@ -1456,7 +1469,7 @@ void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     const int n_chunks = (n_pos + kChunk - 1) / kChunk;
     attn_part_kernel<<<dim3((unsigned) n_head, (unsigned) n_chunks), kWarps * 32, 0, s>>>(q, kc, vc, n_head, n_head_kv,
                                                                                             n_pos, scale, part, n_chunks);
-    attn_merge_kernel<<<n_head, kD, 0, s>>>(part, n_chunks, out);
+    pdl_launch(attn_merge_kernel, n_head, kD, 0, s, part, n_chunks, out);
     check("attn_decode");
 }
 size_t attn_rows_part_floats(int rows, int n_head, int head_dim, int max_ids) {
@@ -1487,23 +1500,23 @@ bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, co
     if (hpw <= 0 || G % hpw != 0 || hpw == 5 || hpw > 6) hpw = rows_hpw(G, rows, n_chunks);
     const dim3 grid((unsigned) (n_head / hpw), (unsigned) n_chunks, (unsigned) rows);
     switch (hpw) {
-#define Q35_IDS(n) case n: attn_part_ids_kernel<n><<<grid, kWarps * 32, 0, s>>>(q, kc, vc, ids, ld_ids, steps, n_head, n_head_kv, scale, part, n_chunks); break;
+#define Q35_IDS(n) case n: pdl_launch(attn_part_ids_kernel<n>, grid, kWarps * 32, 0, s, q, kc, vc, ids, ld_ids, steps, n_head, n_head_kv, scale, part, n_chunks); break;
         Q35_IDS(1) Q35_IDS(2) Q35_IDS(3) Q35_IDS(4) Q35_IDS(6)
 #undef Q35_IDS
         default: return false;
     }
-    attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) rows), kD, 0, s>>>(part, n_chunks, out);
+    pdl_launch(attn_merge_kernel, dim3((unsigned) n_head, (unsigned) rows), kD, 0, s, part, n_chunks, out);
     check("attn_decode_rows");
     return true;
 }
 void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s) {
     if (head_dim != kD) return;
-    attn_gate_kernel<<<n_head, kD, 0, s>>>(o, q_full, n_head);
+    pdl_launch(attn_gate_kernel, n_head, kD, 0, s, o, q_full, n_head);
     check("attn_gate");
 }
 void scale_sigmoid(float* x, int n, const float* g, cudaStream_t s) {
     if (n <= 0) return;
-    scale_sigmoid_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n, g);
+    pdl_launch(scale_sigmoid_kernel, (n + 255) / 256, 256, 0, s, x, n, g);
     check("scale_sigmoid");
 }
 void scale_sigmoid_rows(float* x, int T, int n, const float* g, cudaStream_t s) {
@@ -1559,7 +1572,7 @@ void conv_state_rows(const float* x, int T, int C, int d_conv, float* conv_state
 }
 void conv_silu_step(float* conv_state, const float* x, const float* kW, int C, int d_conv, float* out, cudaStream_t s) {
     if (C <= 0 || d_conv < 2) return;
-    conv_silu_step_kernel<<<(C + 255) / 256, 256, 0, s>>>(conv_state, x, kW, out, C, d_conv);
+    pdl_launch(conv_silu_step_kernel, (C + 255) / 256, 256, 0, s, conv_state, x, kW, out, C, d_conv);
     check("conv_silu_step");
 }
 void gdn_gates_rows(float* alpha, float* beta, const float* dt_bias, const float* ssm_a, int T, int h_v, cudaStream_t s) {
@@ -1586,7 +1599,7 @@ void gdn_core(float* state, const float* h, int T, int C, const float* gate, con
         std::fprintf(stderr, "qwen35 gdn_core: S %d, heads %d / %d\n", S, h_k, h_v);
         return;
     }
-    gdn_core_kernel<128><<<h_v, 128, 0, s>>>(state, h, T, C, gate, beta, h_k, h_v, prep, eps, 1.0f / std::sqrt((float) S),
+    pdl_launch(gdn_core_kernel<128>, h_v, 128, 0, s, state, h, T, C, gate, beta, h_k, h_v, prep, eps, 1.0f / std::sqrt((float) S),
                                              dt_bias, ssm_a, z, ssm_norm, out_eps, y, (Q81*) yq);
     check("gdn_core");
 }
@@ -1665,7 +1678,7 @@ void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     if (G == 8) attn_window_kernel<1><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
     else if (G == 16) attn_window_kernel<2><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
     else attn_window_kernel<4><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-    attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, n_chunks, out);
+    pdl_launch(attn_merge_kernel, dim3((unsigned) n_head, (unsigned) T), kD, 0, s, part, n_chunks, out);
     check("attn_window");
 }
 void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s) {
@@ -1700,7 +1713,7 @@ void hc4_combine_norm(float* R, const float* out, const float* inject, int inj_s
         std::fprintf(stderr, "q35 hc4_combine_norm: the q8_1 output needs n_embd %% 256 == 0 (%d)\n", n_embd);
         return;
     }
-    hc4_combine_norm_kernel<<<dim3((unsigned) hc, (unsigned) T), 256, 0, s>>>(R, out, inject, gamma, eps, n_embd, hc,
+    pdl_launch(hc4_combine_norm_kernel, dim3((unsigned) hc, (unsigned) T), 256, 0, s, R, out, inject, gamma, eps, n_embd, hc,
                                                                             inj_stride, xn, (Q81*) xq);
     check("hc4_combine_norm");
 }
@@ -1716,7 +1729,7 @@ void silu_scale(float* x, int n, float a, cudaStream_t s, void* xq) {
         std::fprintf(stderr, "q35 silu_scale: the q8_1 output needs n %% 32 == 0 (%d)\n", n);
         return;
     }
-    silu_scale_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n, a, (Q81*) xq);
+    pdl_launch(silu_scale_kernel, (n + 255) / 256, 256, 0, s, x, n, a, (Q81*) xq);
     check("silu_scale");
 }
 void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, float* mixed, cudaStream_t s, void* xq) {
@@ -1725,7 +1738,7 @@ void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, floa
         std::fprintf(stderr, "q35 hc4_mix: the q8_1 output needs n_embd %% 32 == 0 (%d)\n", n_embd);
         return;
     }
-    hc4_mix_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) T), 256, 0, s>>>(xn, gate, n_embd, hc, mixed,
+    pdl_launch(hc4_mix_kernel, dim3((unsigned) ((n_embd + 255) / 256), (unsigned) T), 256, 0, s, xn, gate, n_embd, hc, mixed,
                                                                                        (Q81*) xq);
     check("hc4_mix");
 }

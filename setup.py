@@ -213,14 +213,25 @@ def cpu_info():
     else:
         try:
             txt = open("/proc/cpuinfo").read()
-            flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
+            fm = re.search(r"^(?:flags|Features)\s*:\s*(.*)$", txt, re.M)   # (ARM: "Features")
+            flags = set(fm.group(1).split()) if fm else set()
             avx2 = "avx2" in flags
             avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
             m = re.search(r"^model name\s*:\s*(.*)$", txt, re.M)
-            name = m.group(1) if m else name
+            name = m.group(1) if m else (_arm_cpu_name(out(["lscpu"])) or name)   # (ARM: no "model name" there)
         except OSError:
             pass
     return name, avx2, avx512
+
+
+def _arm_cpu_name(lscpu: str) -> str:
+    """An ARM CPU's name from lscpu's text ("" when it has none): its core types, e.g. a DGX Spark's
+    "ARM Cortex-X925 + Cortex-A725" (/proc/cpuinfo there has part numbers only)."""
+    vendor = re.search(r"^Vendor ID:\s*(.*)$", lscpu, re.M)
+    names = list(dict.fromkeys(m.strip() for m in re.findall(r"^\s*Model name:\s*(.*)$", lscpu, re.M) if m.strip()))
+    if not names:
+        return ""
+    return ((vendor.group(1).strip() + " ") if vendor else "") + " + ".join(names)
 
 
 def _cpuid_avx512_full() -> bool:
@@ -285,6 +296,18 @@ def _cpuid_avx2() -> bool:
         return False
 
 
+def _unified_name(name: str) -> bool:
+    return bool(re.search(r"\bGB10\b|\bGB20\d\b|Thor|Orin", name))
+
+
+def _mem_total_gib() -> float:
+    try:
+        m = re.search(r"^MemTotal:\s*(\d+)", open("/proc/meminfo").read(), re.M)
+        return int(m.group(1)) / 1048576.0 if m else 0.0
+    except OSError:
+        return 0.0
+
+
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
     s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
@@ -293,8 +316,15 @@ def gpus():
     for line in s.strip().splitlines():
         try:
             idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            g = {"index": int(idx), "name": name, "arch": cc.replace(".", ""), "driver": drv}
+            try:
+                g["vram_gb"] = float(mem) / 1024.0
+            except ValueError:
+                # a unified-memory GPU (DGX Spark / GB10: memory.total is [N/A]) shares the system RAM
+                if not _unified_name(name):
+                    continue
+                g["vram_gb"], g["integrated"] = _mem_total_gib(), True
+            found.append(g)
         except ValueError:
             continue
     return found

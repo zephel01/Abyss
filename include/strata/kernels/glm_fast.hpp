@@ -227,6 +227,10 @@ struct MoeDev {
     // NVFP4 experts: this layer's second-level scales, [n_expert][2] = (gate = up, down), read by moe_gate_up /
     // moe_down through plan_id (MoeColArgs::plan_id for a window's columns); null for every other type
     const float* nv_scale = nullptr;
+    // STRATA_GLM_UMA_DIRECT (an integrated GPU: the RAM tier is the same memory): 1 - a planned expert that is not in
+    // the VRAM pool but in the RAM tier is read IN PLACE, its RAM-tier address (host-mapped) in the plan: no fetch
+    // into a spare or scratch slot, no promotion or prefetch by the route, no CPU lane share, never tail-skipped
+    int ram_direct = 0;
 };
 /// The host's answers to routes - the CPU LANE's (CpuAnswer) and the disk misses' (MoeResponse, with its pinned
 /// staging): kCpuAnswers of each, the route `seq`'s at index seq % kCpuAnswers - a verify window has several routes

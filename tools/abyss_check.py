@@ -315,7 +315,8 @@ def render(head: dict, results: list, limits: list, failures: list, answers: lis
     n_ok = sum(r["status"] in ("PASS", "SKIP") for r in results)
     dec = [r["decode"] for r in results if r.get("decode")]
     pre = {r["name"]: r["prefill"] for r in results if r.get("prefill") and r["name"].startswith("long-")}
-    summary = (f"Abyss v{head['version']} | {head['model']} | {head['gpus']} | PCIe {head['pcie']} | RAM "
+    link = "memory unified" if head.get("unified") else f"PCIe {head['pcie']}"
+    summary = (f"Abyss v{head['version']} | {head['model']} | {head['gpus']} | {link} | RAM "
                f"{head['ram']} | check: {res} ({n_ok} of {len(results)} steps)"
                + (f" | decode {sorted(dec)[len(dec) // 2]:.1f} tok/s (median)" if dec else "")
                + "".join(f" | prompt {k[5:]} {v:.0f} tok/s" for k, v in list(pre.items())[:2]))
@@ -324,7 +325,8 @@ def render(head: dict, results: list, limits: list, failures: list, answers: lis
              f"backend {head['backend']}, drafter {head['drafter']}",
              f"- model: {head['model']} ({head['model_detail']})",
              f"- GPUs: {head['gpus']}; driver {head['driver']}",
-             f"- PCIe while working: {head['pcie']}",
+             ("- memory: unified (the GPU and the CPU share the RAM; no PCIe link)" if head.get("unified") else
+              f"- PCIe while working: {head['pcie']}"),
              f"- CPU {head['cpu']}; RAM {head['ram']}; OS {head['os']}; model SSD reads {head['ssd']}",
              f"- Abyss v{head['version']}, commit {head['commit']}; loaded in {head['load_s']}",
              "",
@@ -582,21 +584,23 @@ def run(root: Path, cfg_path: Path, cfg: dict, mode: str, version: str, hooks: d
     routes = PL.read_routes(sorted(route_dir.glob("route*")), facts.get("layers") or 0)
     shutil.rmtree(route_dir, ignore_errors=True)
     gpus = hooks["gpus"](cfg)
+    uma = bool(gpus) and all(g.get("integrated") for g in gpus)   # (DGX Spark / GB10: no PCIe link to its memory)
     disk = hooks["disk"](pack)
     vram = (cfg.get("env") or {}).get("STRATA_GLM_VRAM_GB") or os.environ.get("STRATA_GLM_VRAM_GB")
     try:                                                 # (a VRAM cap in the config: the size the model runs in)
         vram = float(vram) if vram else (sum(g["vram_gb"] for g in gpus) if gpus else None)
     except ValueError:
         vram = sum(g["vram_gb"] for g in gpus) if gpus else None
-    limits = PL.what_limits(plain_rec, facts, next(iter(chains.values()), None), disk, routes, vram,
-                            BR.lane_name(log_lines)) if plain_rec else \
+    limits = PL.what_limits(plain_rec, facts, None if uma else next(iter(chains.values()), None), disk, routes, vram,
+                            BR.lane_name(log_lines), unified=uma) if plain_rec else \
         ["(not split: the drafter step did not run to the end)"]
     total, _ = hooks["mem_gb"]()
     drafter = next((r.get("drafter") for r in results if r.get("drafter")), "?")
     head = {"version": version, "model": hooks["model"](pack, cfg, cfg_path)[0],
             "model_detail": hooks["model"](pack, cfg, cfg_path)[1], "gpus": ", ".join(
-                f"{g['name']} {g['vram_gb']:.0f} GB" for g in gpus) or "?",
-            "driver": hooks["driver"](cfg), "pcie": "; ".join(f"{k} {v}" for k, v in links.items()) or "?",
+                f"{g['name']} {g['vram_gb']:.0f} GB" + (" unified" if g.get("integrated") else "") for g in gpus) or "?",
+            "driver": hooks["driver"](cfg), "unified": uma,
+            "pcie": "none (unified memory)" if uma else "; ".join(f"{k} {v}" for k, v in links.items()) or "?",
             "ram": f"{total:.0f} GB", "cpu": hooks["cpu"](), "os": hooks["os"](),
             "ssd": f"{disk:.1f} GB/s" if disk else "? (not measured)", "date": time.strftime("%Y-%m-%d %H:%M"),
             "mode": mode, "setup": cfg_path.name, "context": ctx, "backend": cfg.get("backend", "cuda"),

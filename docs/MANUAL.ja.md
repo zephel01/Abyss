@@ -512,6 +512,15 @@ Radeon 8060S（gfx1151）。
 [issue](https://github.com/zephel01/Abyss/issues/new?template=gpu-tune.md) に貼ってほしい。その GPU の既定値は、
 こうした報告をもとに決める。
 
+## NVIDIA DGX Spark（GB10、ARM、ベータ）
+
+v1.3.113 から、エンジンは aarch64 + sm_121 でビルドでき、DGX Spark の GB10 で動く。GB10 は GPU と CPU が 1 つの
+メモリを分け合うので、エキスパートの置き場と RAM 層を 1 つの予算から決め（`STRATA_GLM_UMA_HEADROOM_GB` を空けておく）、
+programmatic dependent launch を有効にし（`STRATA_GLM_PDL`）、RAM 層のエキスパートは置き場の枠に写してから使い
+（`STRATA_GLM_UMA_DIRECT=1` でその場で読む）、CPU レーンは無効にする。借りた Spark で Qwen3.8 16G64G を測ったところ、
+MTP の下書きありで 47.05 tok/s（CLI、4K）、サーバー経由で 43〜54 tok/s、8K のプロンプトは約 1,040 tok/s。
+ビルドの手順、測った数字、まだ試していないこと（大きいモデル）は [docs/DGX-SPARK.ja.md](DGX-SPARK.ja.md) にある。
+
 ## DeepSeek V4.1 Flash
 
 v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準備は手作業（まとめてセットアップが入れるのは V4 だけ）。
@@ -703,7 +712,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |
 | `STRATA_GLM_RAM_THP` | オン（Linux） | RAM 層を透過的ヒュージページに置く（空きの 2 MB ブロックの範囲で。APU のレーンが再検証するページが 512 分の 1 になり、数秒の停止が消える）。`0` でドライバの pinned ページ |
 | `STRATA_GLM_RESERVE_MB` | 1536。12 GB 以下の CUDA カードは 700 | エキスパート用プールの横に空けておく VRAM。CUDA も v1.3.82 から 12 GB を超えるカードでは 1536 です。RTX 5090 で DeepSeek V4.1 を `--max-context 65536` で動かすと、700 では attention と DSpark ドラフタのバッファで VRAM が足りなくなっていました。HIP は v1.3.68 から多めに空けます。最初のプロンプトのときに hipBLASLt の GEMM がカーネルを読み込み（約 0.7 GB）、0.7 GB の空きでは R9700 で `--max-context 131072` のときに読み込めず、プロンプトの GEMM がすべて失敗して 8K のプロンプトに 1,300 秒かかっていました。プールが小さくなる分、生成は約 3% 遅くなります |
-| `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
+| `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド（NVIDIA の内蔵 GPU、DGX Spark では無効） | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | 起動時の CPU レーンの計測が乱れていそうなとき（CPU の 4 分の 1 以上でほかの仕事が動いている、または一番遅い回が中央値の 3 倍を超える）、1 秒おきに最大この回数まで測り直し、一番小さい値を使います。それでも CPU が混んでいればログに出します。`0`: 1 回だけ |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | VRAM に全エキスパート・予備・プロンプト処理が借りる分がすべて入るとき、借りる分をエキスパートの置き場とは別に確保し、プロンプトでエキスパートを追い出さないようにします。`0`：借りる分をエキスパートの置き場から削ります（v1.3.104 より前の動き） |
 | `STRATA_GLM_X3_SPLIT` | オフ | EXL3 の pack で、各ルートの RAM 層エキスパートのうちこの割合を CPU スレッドが、残りを iGPU が同時に計算する（`auto`: 起動時の計測から）。Ryzen AI Max+ 395 では電力と熱を共有するため遅くなる（[EXL3](exl3/README.md#settings)） |
@@ -761,7 +770,11 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16（Qwen3.8: 2 / 8） | RAM 層のエキスパートの使用回数が「VRAM 側の ratio 倍 + margin」を超えたら入れ替える（2 / 4 は以前の、入れ替えの多い規則）。Qwen3.8-Flash-Next は早めに入れ替え、1 回のトークン境界で最大 16 個動かす（`STRATA_GLM_PROMOTE`、他は 8）。エキスパートが約 2 MB で、1 個のコピーが約 0.3 ms のため（v1.3.86。RTX 5090、ISTA IQ3_S: VRAM ヒット 60〜77% → 68〜89%、+12〜15%） |
 | `STRATA_GLM_BG_SPLIT` | Qwen3.8 は 1、他は 0 | CPU の道が RAM 層のエキスパートの一部だけを受け持つときも、背景の入れ替えを動かす（0: 全部を受け持つときだけ。以前のまま）。Qwen3.8 で、VRAM の枠にエキスパートの半分以上が入るときは ratio 1 / margin 2 で入れ替える（RTX 5090、Swift 1.5 IQ2_XS 32 GB: VRAM ヒット 95.0 → 96.2%、176 → 182 tok/s）。枠が少ないときは 2 / 8 のまま |
 | `STRATA_GLM_FETCH_COLS` / `STRATA_GLM_CPU_WAIT_COLS` | Qwen3.8 は 1、他は 0 | 先読みを確かめる窓で、CPU の答えを待つ処理とエキスパートを取ってくる処理を、列ごとではなく 1 回のカーネルで全部の列にする（計算は同じ） |
-| `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | CUDA は 1 / 1、HIP は 0 | Qwen3.8 の確かめる窓で、delta-net の層を CUDA graph で流す（0: 1 つずつ起動。`_MOE=0`: MoE の振り分けは graph の外）。出力は同じ。1 トークンの起動回数 453 → 254（RTX 5090 では速さは変わらない） |
+| `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | CUDA は 1 / 1、HIP は 0 | Qwen3.8 の確かめる窓で、delta-net の層を CUDA graph で流す（0: 1 つずつ起動。`_MOE=0`: MoE の振り分けは graph の外）。出力は同じ。1 トークンの起動回数 453 → 254（RTX 5090: 速さは変わらない。DGX Spark で PDL と合わせて: 43.4 → 47.1 tok/s） |
+| `STRATA_GLM_PDL` / `STRATA_GLM_PDL_PREFETCH` | 内蔵 GPU（sm_90 以上）は有効、外付けのカードは無効 / 1 | programmatic dependent launch: 前のカーネルが終わりかけたところで次を始める（DGX Spark、Qwen3.8 16G64G: MTP なし 25.0 → 30.7 tok/s、MTP あり 43.4 → 46.5）。`_PREFETCH`: GEMV が重みの行を早めに L2 へ読む（0: 読まない。2: PDL なしでも読む） |
+| `STRATA_GLM_UMA` / `STRATA_GLM_UMA_HEADROOM_GB` | 1 / 8（CUDA） | 内蔵 GPU（DGX Spark）は共有メモリから層の大きさを決め、`_HEADROOM_GB` を空けておく（0: 外付けのカードと同じ決め方。比べる用） |
+| `STRATA_GLM_UMA_DIRECT` | 0 | 内蔵 GPU で、RAM 層のエキスパートを VRAM の枠に写さず、その場で読む。既定は無効: 入れ替えが止まり、ヒット率が低いままになる（DGX Spark、Qwen3.8 16G64G 32 GB: 写す方式 45.8、その場で読む方式 34.9 tok/s） |
+| `STRATA_GLM_DISK_BUFFERED` | 0 | （試験用）SSD からのエキスパートの読み込みを、O_DIRECT ではなくページキャッシュ経由にする |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。`0`: 従来どおり境目で |
 | `STRATA_GLM_ZERO_COPY` | オン | copy engine を使わない token の境目（v1.3.21）: 表の更新・埋め込み行（`token_embd` の pinned コピー、Q8_0 / Q5_K）・トークンを、カーネルが host-mapped で直接読み書きする。`0`: 従来どおり memcpy |
 | `STRATA_GLM_GAP_PROF` | オフ | `1`: 答えごとに `glm gap prof` の行を出す。トークンとトークンの間の時間の内訳（host 側のラップと、timing event で測った GPU の空き） |

@@ -44,6 +44,9 @@
 
 namespace strata::core {
 namespace glmfast {
+// unified memory: MemAvailable less the headroom (glm_memory.hpp's uma_budget), bytes, now - what an integrated
+// device's pool can grow to (glm_fast_path.cu; the prompt path's estimate of the pool to come reads it too)
+size_t uma_room_now();
 inline bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
     if (e == cudaSuccess) return true;
     err = std::string(what) + ": " + cudaGetErrorString(e);
@@ -60,6 +63,8 @@ namespace gf = strata::kernels::glmf;
 inline void cpu_relax() {
 #if defined(__x86_64__) && !defined(_WIN32)
     asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__) && !defined(_WIN32)
+    asm volatile("yield" ::: "memory");
 #endif
 }
 
@@ -234,7 +239,12 @@ namespace gf = strata::kernels::glmf;
 inline constexpr size_t kNvGuard = 4096;
 
 struct Glm5Model::FastState {
-    bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
+    bool unified_memory = false;   // an integrated device on Linux (HIP APUs, CUDA's GB10; STRATA_GLM_UMA=0: off);
+                                   // Windows keeps the discrete policy (an APU's memory there is a fixed carve-out)
+    bool integrated = false;       // cudaDevAttrIntegrated (any OS)
+    size_t uma_budget = 0;         // unified memory: MemAvailable less the headroom when the pool was priced ...
+    double uma_avail_gb = 0.0, uma_head_gb = 0.0;   // ... and its two parts (the start line)
+    std::atomic<uint64_t> direct_reads{0};   // STRATA_GLM_UMA_DIRECT: RAM-tier experts read in place
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     // ROUTE TAIL SKIP (STRATA_GLM_TAIL_SKIP=<r>): a trunk route's experts at rank >= r that are not in VRAM are left out

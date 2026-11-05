@@ -7,6 +7,32 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.113 - 2026-11-05
+
+- **NVIDIA DGX Spark (GB10, ARM, unified memory) support** (beta,
+  [docs/DGX-SPARK.md](docs/DGX-SPARK.md)). The engine builds for aarch64 + sm_121 (CMake picks the ARM CPU's own
+  ggml-cpu flags from `/proc/cpuinfo`; no x86 kernels are built - packs with Q2_0 experts need AVX and say so). Measured
+  on a rented DGX Spark with Qwen3.8 16G64G: **47.05 tok/s with the MTP drafter** (CLI, 4K, median of 3 x 512 tokens;
+  31.2 without), 43-54 tok/s through the server, 8K prompts ~1,040 tok/s, 24K-262K prompts with the drafter to the
+  end. DeepSeek V4.1 / V4 and GLM-5.3-Flash are not tested on a real Spark yet.
+  - **Programmatic dependent launch** on an integrated GPU: the decode's next kernel starts while the one before
+    finishes. GB10, Qwen3.8 16G64G: 43.4 -> 47.05 tok/s with the drafter (with the graphs), 25.0 -> 31.2 without; the
+    same tokens. Off on discrete cards (RTX 5090: no change). `STRATA_GLM_PDL`, `STRATA_GLM_PDL_PREFETCH`.
+  - **One memory budget** for the expert pool and the pinned RAM tier on an integrated GPU (`MemAvailable`, page cache
+    counted as free, less `STRATA_GLM_UMA_HEADROOM_GB`, 8 GB on CUDA); `STRATA_GLM_UMA=0` keeps the discrete-card
+    rules. RAM-tier experts are copied into the pool's slots as on a PC (32 GB budget: 45.8 tok/s, read in place
+    34.9 - `STRATA_GLM_UMA_DIRECT=1` for tests), and the CPU lane is off there.
+  - **Prompts under a VRAM cap on unified memory**: with `STRATA_GLM_VRAM_GB` the prompt path counted the page cache
+    and other processes as used, saw no pool and read the prompt token by token (GB10 at 16 GB: 3.8K tokens 129 s ->
+    6.5 s).
+  - **The tools on ARM**: `./abyss.sh --check`, `--bench` and `--gpu-tune` take nvidia-smi's `[N/A]` memory (GB10:
+    the system memory, shared), ARM's `/proc/cpuinfo` (no `flags`; the CPU named from lscpu) and say "memory
+    unified" instead of a PCIe link; CUDA 12.9+ is asked for sm_121.
+  - `STRATA_GLM_DISK_BUFFERED=1` (a test): the SSD's expert reads through the page cache instead of O_DIRECT.
+  - CI: a new `arm-build` workflow on GitHub's ARM runners - the Python tests (with GB10-like nvidia-smi and ARM
+    cpuinfo inputs), the CPU-only build and its tests, and the CUDA engine compiled for sm_121a.
+- RTX 5090: the same tokens and speed as v1.3.112 (PDL and the unified-memory paths are off on a discrete card).
+
 ## v1.3.112 - 2026-11-05
 
 - **Qwen3.8-Flash-Next answers faster with the MTP drafter**, the same tokens. The speculative verify window now

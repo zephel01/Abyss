@@ -68,6 +68,12 @@ int main(int argc, char** argv) {
     const std::string gguf = argc > 1 ? argv[1] : "glm5-big-fixture.gguf";
     const std::string expect = argc > 2 ? argv[2] : "data/glm5-big-dumps/result_output.f32";
     const char* dump_out = argc > 3 ? argv[3] : nullptr;   // optional: write the streamed logits
+    if (FILE* f = std::fopen(gguf.c_str(), "rb")) {
+        std::fclose(f);
+    } else {   // glm_model_big_gen was skipped (no numpy) - it says why; a FAILED generator fails on its own
+        std::printf("SKIPPED: the fixture %s was not generated (see glm_model_big_gen)\n", gguf.c_str());
+        return 77;
+    }
     constexpr size_t T = 512;
 
     strata::core::Glm5Model model;

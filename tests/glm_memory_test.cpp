@@ -39,5 +39,36 @@ int main() {
     assert(!full_unified_pool(true, 192, 288));
     assert(warm_pool_slots(false, 288, 288, 3) == 285);
     assert(!full_unified_pool(false, 288, 288));
+
+    // Unified memory (CUDA's GB10 too): ONE budget, MemAvailable less the headroom, shared by the pool and the tier.
+    using strata::core::glmfast::uma_budget;
+    using strata::core::glmfast::uma_ram_tier;
+    using strata::core::glmfast::uma_direct_on;
+    using strata::core::glmfast::uma_headroom_default_gb;
+    assert(uma_budget(118 * G, 8 * G) == 110 * G);
+    assert(uma_budget(8 * G, 8 * G) == 0 && uma_budget(3 * G, 8 * G) == 0 && uma_budget(0, 8 * G) == 0);
+    // GB10, 118 GB available, Qwen3.8's 53 GB of experts: the pool takes them all, the tier at most the rest
+    {
+        const size_t budget = uma_budget(118 * G, 8 * G), q38 = 53 * G;
+        const size_t pool = expert_pool_budget(true, 50 * G, 118 * G, G, 8 * G, q38);
+        assert(pool == q38);
+        assert(pool + uma_ram_tier(budget, pool) == budget);
+    }
+    // a model larger than the budget: the pool takes budget - reserve, the tier only the reserve's worth - never
+    // pool + tier above the budget, whatever MemAvailable reads after the pool allocated
+    for (size_t avail : {20 * G, 64 * G, 118 * G, 128 * G})
+        for (size_t experts : {10 * G, 80 * G, 200 * G}) {
+            const size_t budget = uma_budget(avail, 8 * G);
+            const size_t pool = expert_pool_budget(true, G, avail, G, 8 * G, experts);
+            assert(pool <= budget);
+            assert(pool + uma_ram_tier(budget, pool) <= budget);
+            assert(uma_ram_tier(budget, pool) == budget - pool);
+        }
+    assert(uma_ram_tier(10 * G, 12 * G) == 0);   // an explicit pool (STRATA_GLM_VRAM_GB) past the budget: no tier
+    // STRATA_GLM_UMA_DIRECT: on exactly for an integrated device unless set; "0" off; any other value forces it on
+    assert(uma_direct_on(true, nullptr) && !uma_direct_on(false, nullptr));
+    assert(uma_direct_on(true, "") && !uma_direct_on(false, ""));
+    assert(!uma_direct_on(true, "0") && uma_direct_on(false, "1") && uma_direct_on(true, "1"));
+    assert(uma_headroom_default_gb(true) == 16.0 && uma_headroom_default_gb(false) == 8.0);
     std::puts("GLM memory policy checks passed (CPU only)");
 }

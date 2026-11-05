@@ -21,6 +21,28 @@ endif()
 # instead of this machine's (Strata's own AVX-512 kernels are per-file and chosen at run time either way), and
 # the MSVC runtime linked in, so no Visual C++ redistributable is needed.
 option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
+# x86-64 (and x86): the CPU expert kernels are AVX-512 / AVX2 code, and ggml's portable baseline is AVX2.  Any other
+# CPU (aarch64: NVIDIA DGX Spark's Grace) builds src/kernels/cpu/expert_portable.cpp in place of those kernels, and
+# ggml picks its own flags for it (include/strata/arch.hpp: STRATA_X86, the same answer from the compiler).
+set(_strata_proc "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_GENERATOR_PLATFORM)
+  set(_strata_proc "${CMAKE_GENERATOR_PLATFORM}")   # (Visual Studio: -A x64 / -A ARM64)
+endif()
+string(TOLOWER "${_strata_proc}" _strata_proc)
+if(_strata_proc MATCHES "^(x86_64|amd64|x64|i[3-6]86|x86|win32)$")
+  set(STRATA_X86 ON)
+else()
+  set(STRATA_X86 OFF)
+  message(STATUS "Strata: ${CMAKE_SYSTEM_PROCESSOR} is not x86 - the CPU expert kernels (AVX) are left out "
+                 "(src/kernels/cpu/expert_portable.cpp)")
+  # GCC / Clang on aarch64 fuse a*b+c into one FMA by default (x86 cannot without -mfma), so the host's float steps
+  # differ from the GPU's and from an x86 build: the activation quantizer's ties came out one step off on a DGX Spark
+  # (quantize_act_parity, 1e-7 magnitudes). No contraction keeps every host computation the x86 one.
+  if(NOT MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>
+                        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
+  endif()
+endif()
 if(STRATA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
@@ -261,6 +283,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_layer_graph_test COMMAND glm_layer_graph_test)
     set_tests_properties(glm_layer_graph_test PROPERTIES TIMEOUT 60)
+    # STRATA_GLM_UMA_DIRECT: the decode's expert step reading RAM-tier experts in place vs device memory vs the copy
+    # path, bitwise (synthetic Qwen3.8-shaped experts, no model; --bench times the three)
+    add_executable(glm_uma_direct_test tests/glm_uma_direct_test.cu)
+    target_link_libraries(glm_uma_direct_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_uma_direct_test COMMAND glm_uma_direct_test)
+    set_tests_properties(glm_uma_direct_test PROPERTIES TIMEOUT 120)
     # the EXL3 kernels against the scalar CPU reference (random matrices, no model)
     add_executable(exl3_test tests/exl3_test.cu)
     target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
@@ -606,16 +634,25 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_model_big_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_model_big_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   find_program(STRATA_PYTHON3 python3)
-  if(STRATA_PYTHON3)
+  # the generator needs numpy: the repo's own venv (setup's .venv) has it where the system python may not (a fresh
+  # Ubuntu, the DGX Spark); without numpy both tests report SKIPPED (exit 77) with the reason, not a failure
+  set(_strata_fixture_python "${STRATA_PYTHON3}")
+  foreach(_venv_py IN ITEMS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python3" "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe")
+    if(EXISTS "${_venv_py}")
+      set(_strata_fixture_python "${_venv_py}")
+      break()
+    endif()
+  endforeach()
+  if(_strata_fixture_python)
     add_test(NAME glm_model_big_gen
-             COMMAND ${STRATA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_big_fixture.py
+             COMMAND ${_strata_fixture_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_big_fixture.py
                      --out ${CMAKE_CURRENT_BINARY_DIR}/glm5-big-fixture.gguf)
-    set_tests_properties(glm_model_big_gen PROPERTIES FIXTURES_SETUP glm5_big_gguf)
+    set_tests_properties(glm_model_big_gen PROPERTIES FIXTURES_SETUP glm5_big_gguf SKIP_RETURN_CODE 77)
     add_test(NAME glm_model_big_test
              COMMAND glm_model_big_test ${CMAKE_CURRENT_BINARY_DIR}/glm5-big-fixture.gguf)
     set_tests_properties(glm_model_big_test PROPERTIES
                          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                         FIXTURES_REQUIRED glm5_big_gguf)
+                         FIXTURES_REQUIRED glm5_big_gguf SKIP_RETURN_CODE 77)
   endif()
 
   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
@@ -689,6 +726,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME ple_parity COMMAND ple_parity --selftest
     --in "${STRATA_PLE_FIXTURE_DIR}/ple_in.bin" --out "${STRATA_PLE_FIXTURE_DIR}/ple_out.bin"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # (an ABSENT input - a checkout without the Qwen3.8 Q2_0 GGUF / pack / capture, e.g. a CI box or a DGX Spark - is
+  # reported SKIPPED, exit 77, naming the file; one that is present but wrong still fails)
+  set_tests_properties(ple_parity PROPERTIES SKIP_RETURN_CODE 77)
 
   # Plan v0.3 P7: INT8 KV storage vs a host reference and vs the FP16 path (GPU, synthetic, no model).
   add_executable(kv_q8_parity src/kernels/kv_q8_parity.cpp)
@@ -729,6 +769,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(platform_memory_test src/platform/memory_test.cpp)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
+  # (exit 77, SKIPPED: the locked-memory limit, ulimit -l, is below the test's 256 MiB - a container's default 8 MiB)
+  set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)
 
   # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
   add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
@@ -804,13 +846,21 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
-            src/kernels/cpu/exl3_cpu.cpp)
+if(STRATA_X86)
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
+              src/kernels/cpu/exl3_cpu.cpp)
+else()
+  # not x86: the probes answer no and expert_portable.cpp stands in for expert.cpp and every AVX kernel file
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert_portable.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/exl3_ref.cpp src/kernels/cpu/exl3_cpu.cpp)
+endif()
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
+if(NOT STRATA_X86)
+  # (no AVX kernel sources to give flags to)
+elseif(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
@@ -841,11 +891,36 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_PORTABLE)
+  if(STRATA_PORTABLE AND STRATA_X86)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
       set(${_f} ON CACHE BOOL "" FORCE)
     endforeach()
+  elseif(STRATA_PORTABLE)
+    # not x86: ggml's own baseline for the architecture (aarch64: armv8 + its default extensions), no x86 flags
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+  elseif(NOT STRATA_X86 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND EXISTS "/proc/cpuinfo")
+    # aarch64 Linux: ggml's GGML_NATIVE asks the compiler which -mcpu "native" is, and a GCC older than the core (GCC 13
+    # on the DGX Spark's Cortex-X925 / A725) answers nothing - ggml then builds plain armv8-a: no dotprod, i8mm or fp16,
+    # and its feature probes fail on "-mcpu=native+dotprod".  The CPU's own feature list instead: armv8.2-a plus what
+    # /proc/cpuinfo says it has.  GB10, one expert's ggml-cpu dots on one core: Qwen3.8 IQ3_XXS/IQ4_NL 320 -> 241 us,
+    # IQ2_XXS 1444 -> 1075, Q4_K 905 -> 522, bitwise the same results.  No +sve: ggml's SVE paths were no faster there
+    # (128-bit SVE), Q4_K slower.  -DGGML_CPU_ARM_ARCH=<march> sets it by hand (kept as given).
+    if(NOT GGML_CPU_ARM_ARCH)
+      file(STRINGS "/proc/cpuinfo" _strata_arm_feat REGEX "^Features" LIMIT_COUNT 1)
+      set(_strata_arm_arch "armv8.2-a")
+      foreach(_pair IN ITEMS "asimddp:dotprod" "asimdhp:fp16" "i8mm:i8mm")
+        string(REPLACE ":" ";" _pair "${_pair}")
+        list(GET _pair 0 _flag)
+        list(GET _pair 1 _ext)
+        if(_strata_arm_feat MATCHES "[ \t]${_flag}( |$)")
+          string(APPEND _strata_arm_arch "+${_ext}")
+        endif()
+      endforeach()
+      set(GGML_CPU_ARM_ARCH "${_strata_arm_arch}" CACHE STRING "" FORCE)
+    endif()
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    message(STATUS "Strata: ggml-cpu for this aarch64 CPU: -march=${GGML_CPU_ARM_ARCH}")
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
@@ -865,11 +940,15 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx512_vbmi.cpp src/kernels/cpu/iq_avx2.cpp
-                                           src/kernels/cpu/kq_avx512.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  if(STRATA_X86)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx512_vbmi.cpp
+                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp)
+  endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(MSVC)
+  if(NOT STRATA_X86)
+    # (expert_portable.cpp has the i-quant / K-quant kernels' entry points: no AVX sources)
+  elseif(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx512_vbmi.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -1048,9 +1127,11 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
   endif()
 
-  add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
-  target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
-  add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  if(STRATA_X86)   # (the VNNI kernel against itself: refuses a CPU without it, so not built where it never runs)
+    add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+    target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
+    add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)

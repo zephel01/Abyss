@@ -10,6 +10,11 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+try:
+    import numpy  # noqa: F401,E402  (glm_synth_gguf's one dependency)
+except ImportError:
+    print("SKIPPED: numpy is not installed for %s (the repo's .venv has it: CMake uses it when present)" % sys.executable)
+    sys.exit(77)
 import glm_synth_gguf  # noqa: E402
 
 

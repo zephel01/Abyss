@@ -77,6 +77,7 @@ import glob
 import json
 import math
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -473,6 +474,8 @@ def choose(question: str, intro: list, options: list, default: int, yes: bool, o
 def gpu_label(g) -> str:
     if g.get("vendor") == "amd":
         return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, {g['arch']})"
+    if g.get("integrated"):   # (DGX Spark / GB10: nvidia-smi has no memory.total - the system RAM, shared)
+        return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB unified memory, shared with the CPU)"
     return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB)"
 
 
@@ -739,7 +742,7 @@ def check_hip_pc(a, installed=False) -> dict:
 
 def nvcc_range(archs) -> tuple:
     """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
-    lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
+    lo = (12, 9) if 121 in archs else (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell 12.8, GB10 (sm_121) 12.9
     hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70)
     return lo, hi
 
@@ -799,7 +802,8 @@ def cuda_lib_dirs(nvcc: str) -> list:
     base = Path(nvcc).resolve().parent.parent
     if base == Path("/usr"):
         return []
-    return [str(p) for p in (base / "lib64", base / "targets" / "x86_64-linux" / "lib") if p.is_dir()]
+    return [str(p) for p in (base / "lib64", base / "targets" / "x86_64-linux" / "lib", base / "targets" / "sbsa-linux" / "lib")
+            if p.is_dir()]
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC
@@ -940,7 +944,10 @@ def check_pc(a) -> dict:
              f"managed\" can stay small (8 GB on a 128 GB PC): set a custom size of {need_pf} GB or more - System > "
              "About > Advanced system settings > Performance > Advanced > Virtual memory - and restart")
     cpu, avx2, avx512 = S.cpu_info()
-    if not avx2:
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        ok(f"CPU: {cpu} (ARM, {os.cpu_count()} threads: no AVX kernels - with an integrated GPU (DGX Spark) the "
+           "engine leaves the CPU lane off, the GPU reads the shared memory itself)")
+    elif not avx2:
         warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower; "
              "on 2x Xeon E5-2660 v2 it still added ~15% to 4-GPU decode). STRATA_GLM_CPU_LANE=0 turns it off")
     else:
@@ -3023,8 +3030,11 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
              f"skipped: {quality['skipped']}" if "skipped" in quality else
              f"{quality['verdict']} (KL {quality['kl']:.4f} vs a known-good run, same top token "
              f"{quality['same_top']:.1f}%)")
-    summary = (f"Abyss v{version} | {name or cfg_path.stem} | {gpus} | PCIe "
-               f"{', '.join(links.values()) or '?'} | RAM {total:.0f} GB | SSD "
+    uma = bool(found) and all(g.get("integrated") for g in found)   # (DGX Spark / GB10: no PCIe link to its memory)
+    if uma:
+        links = {k: "unified memory (no PCIe link)" for k in links} or {"GPU": "unified memory (no PCIe link)"}
+    summary = (f"Abyss v{version} | {name or cfg_path.stem} | {gpus} | "
+               f"{'memory unified' if uma else 'PCIe ' + (', '.join(links.values()) or '?')} | RAM {total:.0f} GB | SSD "
                f"{f'{disk:.1f} GB/s' if disk else '?'} | decode {_mean(dec):.1f} tok/s"
                + (f" | prompt 8k {pre['8192 tokens']:.0f} tok/s" if "8192 tokens" in pre else "")
                + f" | quality {q_txt.split(' (')[0]} | bottleneck: {verdict or '?'}")

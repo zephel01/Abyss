@@ -290,7 +290,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("128.0 tokens/s over 3 answers", text)
         self.assertIn("2048 tokens/s, 2048 tokens", text)
         self.assertIn("8192 tokens/s, 8192 tokens", text)
-        return popen.call_args, text
+        # the engine's launch (the PCIe watcher's nvidia-smi calls may come after it on a slow machine)
+        return next((c for c in reversed(popen.call_args_list) if "--serve" in c.args[0]), popen.call_args), text
 
     def test_bench_uses_hip_build_and_config_env(self):
         call, text = self.run_bench(self.installed_config(gpu=[1, 0]))

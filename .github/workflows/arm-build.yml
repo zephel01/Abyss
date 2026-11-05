@@ -1,0 +1,108 @@
+# aarch64 Linux (NVIDIA DGX Spark: Grace CPU, GB10 GPU = sm_121, CUDA 13) on GitHub's ARM runners - no GPU there, so:
+# the Python tests as tests.yml runs them (tools/test_arm.py feeds them a GB10's nvidia-smi and an ARM /proc/cpuinfo),
+# the CPU-side build and its tests (the kernels' portable path, ggml-cpu on NEON), and the CUDA engine compiled for
+# sm_121a with NVIDIA's arm64 (sbsa) toolkit.
+name: arm-build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # llama.cpp at the commit the installer pins (setup.py LLAMA_CPP_COMMIT; tests.yml uses the same)
+  LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+  CUDA_VER: "13-3"         # the apt packages' suffix (cuda-*-13-3)
+  CUDA_HOME: /usr/local/cuda-13.3
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+          sparse-checkout: gguf-py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: "Python packages (and CMake: tools/test_hip_archs.py runs cmake -P)"
+        run: |
+          command -v cmake > /dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake; }
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil
+      - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
+      - name: Server tests
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
+      - name: Installer and tools tests (with the DGX Spark inputs, tools/test_arm.py)
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+
+  cpu-tests:
+    # the CPU-side libraries and their tests, no CUDA: expert_portable.cpp in place of the AVX kernels, ggml-cpu on NEON
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: Build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=ON
+          -DSTRATA_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: CPU tests
+        # (expert_parity / pool_test / pool_stress check the x86 kernels: on ARM they report SKIPPED and pass)
+        run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+  cuda-build:
+    # the engine as the DGX Spark builds it: CUDA 13 for arm64 (sbsa), sm_121a (GB10; the MXFP4 MMQ kernels use the
+    # arch-specific FP4 MMA, as 120a does on RTX 50).  Compile only (no GPU): on main, tags and by hand, not on PRs
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: CUDA toolkit (arm64 sbsa, NVIDIA's apt repository)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          # nvcc + cudart + CCCL (cub, thrust), cuBLAS and NVTX - all the engine includes and links
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ \
+            cuda-minimal-build-${CUDA_VER} libcublas-dev-${CUDA_VER} cuda-nvtx-${CUDA_VER}
+          "$CUDA_HOME/bin/nvcc" --version
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a
+          -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"
+          -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF
+          -DSTRATA_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build the engine and the GPU tuner
+        # (nvcc takes 2-4 GB a job on the big kernels: the runner's 16 GB allow four)
+        run: cmake --build build --target strata abyss_gpu_tune -j4
+      - name: The engine starts
+        # no GPU here: only that the binary loads on aarch64 and prints its usage (exit 0)
+        run: LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/targets/sbsa-linux/lib" ./build/strata --help > /dev/null

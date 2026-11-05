@@ -2852,7 +2852,10 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     s.fd = fd;   // kept open: the prefetch fadvises its ranges (the mapping itself does not need it)
     // the fast path reads experts with O_DIRECT (no page cache: on a host whose RAM is mostly the pinned
     // expert tier, buffered reads pushed the system into swap); absent where the filesystem refuses it
-    s.fd_direct = open(path.c_str(), O_RDONLY | O_DIRECT);
+    // STRATA_GLM_DISK_BUFFERED=1 (a test): buffered preads instead - a page cache warmed with part of the shard then
+    // stands in for a faster SSD (the rate a token's expert reads see, against the disk's own)
+    static const bool buffered = [] { const char* v = getenv("STRATA_GLM_DISK_BUFFERED"); return v != nullptr && atoi(v) != 0; }();
+    s.fd_direct = buffered ? -1 : open(path.c_str(), O_RDONLY | O_DIRECT);
     // STRATA_GLM_MIRROR=<dir>[:<dir>...]: a copy of this shard (same name, same size, the same bytes where sampled) on
     // another SSD - the expert reads then go to both drives, each read worker to one of them (read_slice), so two
     // SSDs add up their speed without a RAID; anything not mirrored is read from here as before

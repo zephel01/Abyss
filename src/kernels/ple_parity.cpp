@@ -277,6 +277,14 @@ int main(int argc, char** argv) {
     PleCapture cap;
     bool preflight_done = false;
     if (selftest || check_fixtures) {
+        // an input that does not EXIST (a checkout without the Qwen3.8 Q2_0 artifacts): skipped, by name - ctest
+        // shows SKIPPED, never a pass; one that exists but is wrong fails below
+        for (const std::string& need : {gguf, pack + "/dense.bin", in_bin, out_bin})
+            if (file_size(need.c_str()) < 0) {
+                std::printf("SKIPPED: required input absent: %s (STRATA_PLE_GGUF / --gguf / --pack / --in / --out)\n",
+                            need.c_str());
+                return 77;
+            }
         if (!table.open(gguf, err) || table.rows() != o::kTableRows ||
             file_size(gguf.c_str()) != (long long) o::kTableDataStart + (long long) o::kTableRows * k::PLE_ROW_BYTES) {
             std::fprintf(stderr, "ple_parity: required PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(), err.c_str());

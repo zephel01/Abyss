@@ -448,7 +448,11 @@ class Local(unittest.TestCase):
         """))
         info = T.start_detached(a, root=self.root)
         try:
-            time.sleep(0.5)
+            for _ in range(100):   # (until the child is up: a slow or emulated machine takes over 0.5 s)
+                log = T.server_log_path(a)
+                if log.exists() and "fake abyss" in log.read_text():
+                    break
+                time.sleep(0.1)
             self.assertTrue(T.alive(info["pid"]))
             self.assertEqual(os.getsid(info["pid"]), info["pid"])     # (a session of its own: survives our exit)
             self.assertEqual(T.read_pid(a)["pid"], info["pid"])

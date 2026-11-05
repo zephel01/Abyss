@@ -540,6 +540,15 @@ A choice clearly faster than the engine's own (2% or more) goes into the install
 those two, please paste it into an [issue](https://github.com/zephel01/Abyss/issues/new?template=gpu-tune.md) - the
 engine's defaults for that GPU come from such reports.
 
+## NVIDIA DGX Spark (GB10, ARM, beta)
+
+From v1.3.113 the engine builds for aarch64 + sm_121 and runs on a DGX Spark's GB10, whose GPU and CPU share one
+memory: the expert pool and the RAM tier are sized from one budget (`STRATA_GLM_UMA_HEADROOM_GB` left free),
+programmatic dependent launch is on (`STRATA_GLM_PDL`), RAM-tier experts are copied into the pool's slots
+(`STRATA_GLM_UMA_DIRECT=1`: read in place) and the CPU lane is off. Measured on a rented Spark with Qwen3.8 16G64G:
+47.05 tok/s with the MTP drafter (CLI, 4K), 43-54 through the server, 8K prompts ~1,040 tok/s. Build steps, the
+measurements and what is untested (the big models): [docs/DGX-SPARK.md](DGX-SPARK.md).
+
 ## DeepSeek V4.1 Flash
 
 From v1.3.29 the same engine runs DeepSeek-V4.1-Flash-1017. It is set up by hand (the one-command setup installs V4
@@ -738,7 +747,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_STREAM_FETCH` | on | an expert read from the SSD is copied to VRAM chunk by chunk as the reads land, the PCIe copy running behind the SSD (v1.3.31; DeepSeek V4.1 -9% a token); `0`: the whole expert after the read |
 | `STRATA_GLM_RAM_THP` | on (Linux) | the RAM tier in transparent huge pages, as far as the free 2 MB blocks go (an APU lane re-validates 512x fewer pages: no multi-second lane stalls); `0`: the driver's pinned pages |
 | `STRATA_GLM_RESERVE_MB` | 1536; 700 on a CUDA card of 12 GB or less | VRAM left free beside the expert pool. CUDA keeps 1536 too from v1.3.82 on cards over 12 GB: an RTX 5090 running DeepSeek V4.1 at `--max-context 65536` ran out of VRAM in the attention's and the DSpark drafter's buffers with 700 kept. HIP keeps more since v1.3.68: the first prompt's hipBLASLt GEMMs load their kernels then (~0.7 GB), and with 0.7 GB kept an R9700 at `--max-context 131072` could not load them - every prompt GEMM failed and an 8K prompt took 1,300 s. Decode ~3% slower for the smaller pool |
-| `STRATA_GLM_CPU_LANE` | one thread per physical core | CPU threads computing RAM-tier experts; `0` = off |
+| `STRATA_GLM_CPU_LANE` | one thread per physical core (an integrated NVIDIA GPU, DGX Spark: off) | CPU threads computing RAM-tier experts; `0` = off |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | when the start-up timing of the CPU lane looks disturbed (other work running on a quarter of the CPUs, or its slowest run over 3x the median), it is taken again up to this many times, 1 s apart, and the lowest kept; a CPU still busy after that is reported in the log. `0`: one timing |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | when VRAM holds every expert, the spares and the prompt path's borrowed tail, the tail is allocated on top of the experts' slots, so a prompt evicts none. `0`: the tail is cut from the experts' slots (the layout before v1.3.104) |
 | `STRATA_GLM_X3_SPLIT` | off | an EXL3 pack: the CPU threads compute this fraction of each route's RAM-tier experts while the iGPU computes the rest (`auto`: by their timings); slower on a Ryzen AI Max+ 395 (shared power and heat), see [EXL3](exl3/README.md#settings) |
@@ -796,7 +805,11 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16 (Qwen3.8: 2 / 8) | a RAM-tier expert replaces a resident one when its use count passes ratio x the resident's + margin (2 / 4: the old, churnier rule). Qwen3.8-Flash-Next swaps sooner and moves up to 16 experts a token boundary (`STRATA_GLM_PROMOTE`, else 8): its ~2 MB experts copy in ~0.3 ms (v1.3.86; RTX 5090, ISTA IQ3_S: VRAM hits 60-77% -> 68-89%, +12-15%) |
 | `STRATA_GLM_BG_SPLIT` | 1 for Qwen3.8, else 0 | background promotions also while the CPU lane takes only part of the RAM-tier experts (0: only when it takes all of them, as before). Qwen3.8 whose VRAM pool holds half of the experts or more swaps at ratio 1 / margin 2 (RTX 5090, Swift 1.5 IQ2_XS 32 GB: VRAM hits 95.0 -> 96.2%, 176 -> 182 tok/s); a tighter pool keeps 2 / 8 |
 | `STRATA_GLM_FETCH_COLS` / `STRATA_GLM_CPU_WAIT_COLS` | 1 for Qwen3.8, else 0 | the speculative verify window waits for the CPU lane and fetches its experts with one kernel for all columns instead of one per column (the same arithmetic) |
-| `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | 1 / 1 on CUDA, 0 on HIP | Qwen3.8's verify window replays each delta-net layer from a CUDA graph (0: launched kernel by kernel; `_MOE=0`: the MoE dispatch outside the graph). The same tokens; launches a token 453 -> 254 (no change in speed on an RTX 5090) |
+| `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | 1 / 1 on CUDA, 0 on HIP | Qwen3.8's verify window replays each delta-net layer from a CUDA graph (0: launched kernel by kernel; `_MOE=0`: the MoE dispatch outside the graph). The same tokens; launches a token 453 -> 254 (RTX 5090: no change in speed; DGX Spark, with PDL: 43.4 -> 47.1 tok/s) |
+| `STRATA_GLM_PDL` / `STRATA_GLM_PDL_PREFETCH` | on for an integrated GPU (sm_90+), off for a discrete card / 1 | programmatic dependent launch: a kernel starts while the one before finishes (DGX Spark, Qwen3.8 16G64G: 25.0 -> 30.7 tok/s without MTP, 43.4 -> 46.5 with it). `_PREFETCH`: the GEMVs pull their weight rows into L2 early (0: not; 2: also without PDL) |
+| `STRATA_GLM_UMA` / `STRATA_GLM_UMA_HEADROOM_GB` | 1 / 8 (CUDA) | an integrated GPU (DGX Spark) sizes its tiers from the unified memory, leaving `_HEADROOM_GB` free (0: the discrete-card policy, A/B) |
+| `STRATA_GLM_UMA_DIRECT` | 0 | an integrated GPU reads RAM-tier experts in place instead of copying them into VRAM slots. Off by default: it stops promotions, so the hit rate stays low (DGX Spark, Qwen3.8 16G64G at 32 GB: copy 45.8, direct 34.9 tok/s) |
+| `STRATA_GLM_DISK_BUFFERED` | 0 | (test) expert reads from the SSD through the page cache instead of O_DIRECT |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | the tier moves' copies (the refill after a prompt, the swaps) go in pieces of up to this many KB a MoE layer, while the next layer's mixer runs, instead of all at the token boundary - there they held up the next token's host-mapped reads until they had landed (after an 8K prompt ~10 tokens at 35-39 ms). `0`: at the boundary, as before |
 | `STRATA_GLM_ZERO_COPY` | on | the token boundary without the copy engines (v1.3.21): the table edits, the embedding row (a pinned copy of `token_embd`, Q8_0 / Q5_K) and the token are read and written host-mapped by the kernels. `0`: the copies, as before |
 | `STRATA_GLM_GAP_PROF` | off | `1`: a `glm gap prof` line after each answer - where the time between two tokens goes (host laps, the GPU's idle gap by timing events) |

@@ -425,8 +425,26 @@ inline int default_reserve_mb(size_t total_b) {
 // RAM left free beside the pinned expert tier (STRATA_GLM_RAM_HEADROOM_GB): 6 GB with a discrete card, 16 on a
 // unified-memory APU, whose pool is that RAM - the one place both tier sizings read it from (the AMD setup writes 16
 // into its configs on purpose)
+// (unified memory: STRATA_GLM_UMA_HEADROOM_GB first; the default glm_memory.hpp's uma_headroom_default_gb - 16 on HIP,
+// as before, 8 on CUDA)
 inline double ram_headroom_gb(bool unified) {
-    return strata::core::env_num("STRATA_GLM_RAM_HEADROOM_GB", unified ? 16.0 : 6.0, 0.0, 4096.0);
+    if (unified && getenv("STRATA_GLM_UMA_HEADROOM_GB") != nullptr)
+        return strata::core::env_num("STRATA_GLM_UMA_HEADROOM_GB", 8.0, 0.0, 4096.0);
+#if defined(STRATA_USE_HIP)
+    const double uma_def = uma_headroom_default_gb(true);
+#else
+    const double uma_def = uma_headroom_default_gb(false);
+#endif
+    return strata::core::env_num("STRATA_GLM_RAM_HEADROOM_GB", unified ? uma_def : 6.0, 0.0, 4096.0);
+}
+#if defined(STRATA_USE_HIP)
+constexpr bool kHipBuild = true;
+#else
+constexpr bool kHipBuild = false;
+#endif
+size_t uma_room_now() {
+    const int64_t a = avail_ram_now();
+    return uma_budget(a > 0 ? (size_t) a : 0, (size_t) (ram_headroom_gb(true) * 1073741824.0));
 }
 // the VRAM kept free, from the build's default or STRATA_GLM_RESERVE_MB (never negative: it was cast to size_t)
 inline size_t vram_reserve_bytes(int default_mb) {
@@ -533,14 +551,19 @@ bool Glm5Model::fast_setup(std::string& err) {
     fast_ = F;
     // Not on Windows: there an APU's GPU memory is a fixed carve-out (AMD's Variable Graphics Memory, or the BIOS)
     // that Windows does not count as RAM, so it is sized like a discrete card - the pool from what HIP reports free,
-    // the RAM tier from the free RAM and commit (below)
-#if defined(STRATA_USE_HIP) && !defined(_WIN32)
-    int integrated = 0;
-    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) == cudaSuccess)
-        F->unified_memory = integrated != 0;
-    else
-        cudaGetLastError();
+    // the RAM tier from the free RAM and commit (below).  CUDA too from the DGX Spark on (GB10: integrated, 128 GB
+    // LPDDR5X shared by the CPU and the GPU; STRATA_GLM_UMA=0 keeps the discrete policy there, for A/B)
+    {
+        int integrated = 0;
+        if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) == cudaSuccess)
+            F->integrated = integrated != 0;
+        else
+            cudaGetLastError();
+#if !defined(_WIN32)
+        const char* uv = getenv("STRATA_GLM_UMA");
+        F->unified_memory = F->integrated && (uv == nullptr || std::atoi(uv) != 0);
 #endif
+    }
     const Glm5Geometry& g = g_;
     F->timing = getenv("STRATA_GLM_TIMING") != nullptr;
     F->prof_on = getenv("STRATA_GLM_PROF") != nullptr;
@@ -1020,7 +1043,6 @@ bool Glm5Model::fast_setup(std::string& err) {
         // headroom: the context's own growth is already allocated (state arena); see default_reserve_mb
         const size_t reserve = glmfast::vram_reserve_bytes(F->unified_memory ? 1024 : glmfast::default_reserve_mb(total_b));
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
-#if defined(STRATA_USE_HIP)
         if (F->unified_memory) {
             // Measure after dense/KV/scratch and pinned prompt staging are allocated.
             // Prompt device buffers borrow the pool, so their budget is not subtracted again.
@@ -1039,17 +1061,30 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             avail = glmfast::expert_pool_budget(true, free_b, (size_t) std::max(0LL, avail_kb) * 1024,
                                                 reserve, (size_t) (head_gb * 1073741824.0), expert_bytes);
-            std::fprintf(stderr, "glm fast: HIP%d unified memory: MemAvailable %.2f GB, headroom %.2f GB + "
-                                 "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", dev_,
+            // the one budget the pool and the RAM tier share (the tier takes what the pool leaves of it, below)
+            F->uma_budget = glmfast::uma_budget((size_t) std::max(0LL, avail_kb) * 1024, (size_t) (head_gb * 1073741824.0));
+            F->uma_avail_gb = (double) avail_kb / 1048576.0;
+            F->uma_head_gb = head_gb;
+#if defined(STRATA_USE_HIP)
+            const char* bk = "HIP";
+#else
+            const char* bk = "CUDA";
+#endif
+            std::fprintf(stderr, "glm fast: %s%d unified memory: MemAvailable %.2f GB, headroom %.2f GB + "
+                                 "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", bk, dev_,
                          (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
                          (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
         }
-#endif
         if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
         if (const size_t cap = vram_cap(); cap > 0) {
-            const size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
+            // (unified memory: what this process holds - the dense weights, state, activations, arenas, scratch -
+            // plus 1 GB for the context; the device's total - free counts the page cache and every other process)
+            const size_t used = F->unified_memory
+                                    ? (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_ + F->arena_bytes + 8 * sstride) +
+                                          ((size_t) 1 << 30)
+                                    : total_b - free_b - std::min(vram_base_, total_b - free_b);
             const size_t room = cap > used + reserve ? cap - used - reserve : 0;
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
@@ -1403,7 +1438,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             // Decode misses and pool-tail lending still need landing slots. Keep
             // only the existing per-class floor; do not duplicate the expert cache.
             budget = 0;
-            std::fprintf(stderr, "glm fast: HIP%d all experts fit in the GPU pool; RAM tier is staging only\n", dev_);
+            std::fprintf(stderr, "glm fast: %s%d all experts fit in the GPU pool; RAM tier is staging only\n",
+#if defined(STRATA_USE_HIP)
+                         "HIP",
+#else
+                         "CUDA",
+#endif
+                         dev_);
         }
         // the whole machine's budget is measured ONCE (the first half's pinning would shrink what the second
         // half sees): MemAvailable minus headroom for the OS, the server and the page cache the disk reads go
@@ -1459,6 +1500,12 @@ bool Glm5Model::fast_setup(std::string& err) {
                     }
 #endif
                     total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf - stage_b);
+                    // unified memory: the pool and the tier share ONE budget (glm_memory.hpp) - the tier gets what
+                    // the pool left of it, whatever MemAvailable says now (a lazily committed pool would not show)
+                    if (F->unified_memory && F->uma_budget > 0)
+                        total = std::min<int64_t>(
+                            total, std::max<int64_t>(0, (int64_t) glmfast::uma_ram_tier(
+                                                            F->uma_budget, F->pool_bytes + F->xpool_bytes) - stage_b));
                     // and at most 73% of the RAM (STRATA_GLM_RAM_FRAC; Linux, a discrete card): MemAvailable less
                     // 6 GB pinned 82 of 94 GB for DeepSeek V4.1 (its experts outgrow the RAM) and the disk staging
                     // then did not allocate; on that box 67-68 GB pinned ran for days and 73.9 GB thrashed (an 8K
@@ -1499,6 +1546,18 @@ bool Glm5Model::fast_setup(std::string& err) {
                 budget = keep;
             }
         }
+        // UMA DIRECT (STRATA_GLM_UMA_DIRECT; glm_memory.hpp): the device reads RAM-tier experts in place.  Off by
+        // default everywhere (STRATA_GLM_UMA_DIRECT=1 turns it on): on the GB10 with a PC-like budget the copy mode
+        // decodes faster (Qwen3.8 16G64G at 32 GB: 45.8 vs 34.9 tok/s) - the slots keep the hot experts cached, the
+        // in-place reads cost every token.  Why it looked good: GB10, a decode-like gather of 1.5 MB expert blobs: device memory 218-223
+        // GB/s, cudaHostAlloc'd pinned memory read in place 211-224, while copying it into a slot first moves the
+        // bytes twice (and cudaMemcpy H2D runs at 59 GB/s).  The tier then comes from cudaHostAlloc, not the
+        // mmap + cudaHostRegister path (registered pages read at 154-160 GB/s there)
+        F->md.ram_direct = glmfast::uma_direct_on(false, getenv("STRATA_GLM_UMA_DIRECT")) ? 1 : 0;
+        if (F->md.ram_direct)
+            std::fprintf(stderr, "glm fast: CUDA%d %s: RAM-tier experts are read in place, not copied into VRAM slots "
+                                 "(STRATA_GLM_UMA_DIRECT=0: copy them)\n", dev_,
+                         F->integrated ? "integrated GPU (unified memory)" : "STRATA_GLM_UMA_DIRECT=1 on a discrete GPU");
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
             auto& R = F->rc[c];
@@ -1521,7 +1580,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
 #endif
             while (n >= least) {
-                if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
+                if ((!F->md.ram_direct || numa_nodes().size() >= 2) &&
+                    (p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
                     break;
                 }
@@ -1565,6 +1625,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         for (auto& R : F->rc) ram_slots += R.n;
         std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
                      (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
+        if (F->unified_memory)
+            std::fprintf(stderr, "glm fast: CUDA%d unified memory: MemAvailable %.1f GB, headroom %.1f GB -> pool %.1f GB, "
+                                 "RAM tier %.1f GB (STRATA_GLM_UMA_HEADROOM_GB; STRATA_GLM_VRAM_GB / STRATA_GLM_RAM_GB "
+                                 "set them)\n", dev_, F->uma_avail_gb, F->uma_head_gb,
+                         (double) (F->pool_bytes + F->xpool_bytes) / 1073741824.0, (double) F->ram_bytes / 1073741824.0);
         if (F->ram_resident)
             std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: every non-VRAM expert gets a slot (+%d slack/layer); disk evictions are OFF\n",
                          dev_, F->ram_slack);
@@ -2599,6 +2664,13 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     int threads = 0;
     if (lv != nullptr) {
         threads = std::max(0, std::min(64, std::atoi(lv)));
+    } else if (F->integrated && !glmfast::kHipBuild) {   // (an AMD APU keeps its lane: not measured there)
+        // an integrated GPU reads the same DRAM at ~220 GB/s (in place, UMA DIRECT) or copies at ~59+: the CPU's
+        // ggml dots on 20 Arm cores do one Qwen3.8 expert in ~40 us, the GPU's read of it ~10 - the lane would only
+        // take the CPU from the service thread and the GPU's memory bandwidth (GB10, 2026-11-05)
+        std::fprintf(stderr, "glm fast: CUDA%d integrated GPU: the CPU lane is off (STRATA_GLM_CPU_LANE=<threads> "
+                             "turns it on)\n", dev_);
+        return true;
     } else {
         int cores = physical_cores();
         if (cores <= 0) cores = (int) std::thread::hardware_concurrency() / 2;
@@ -2681,6 +2753,12 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         }
     }
     if (threads <= 0 || g.n_embd > gf::kMaxEmbd || g.n_exp_used > gf::kMaxK) return true;
+#if !(defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+    // (strata/arch.hpp's STRATA_X86, spelt out: that header brings immintrin.h, kept out of nvcc's way)
+    std::fprintf(stderr, "glm fast: CPU lane: not an x86 CPU - no AVX kernels, its experts run on ggml-cpu's own dots "
+                         "(EXL3: the scalar tier); the timing against the GPU's link decides the split "
+                         "(STRATA_GLM_CPU_LANE=0: off)\n");
+#endif
     namespace kc = strata::kernels::cpu;
     F->cpu_fmt.assign(F->L.size(), kc::NativeFmt{});
     int il_cal = -1;
@@ -2820,7 +2898,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         if (DIR* d = opendir("/proc/self/task")) {
             while (const dirent* e = readdir(d)) {
                 if (e->d_name[0] == '.') continue;
-                char path[64], buf[512];
+                char path[300], buf[512];   // (d_name: up to 255)
                 std::snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
                 if (FILE* ft = std::fopen(path, "r")) {
                     const size_t got = std::fread(buf, 1, sizeof buf - 1, ft);
@@ -4230,7 +4308,7 @@ void Glm5Model::fast_service() {
                     std::fprintf(rf, " %u %u %u\n", fetch, miss, cpu);
                 }
             }
-            uint64_t nh = 0;
+            uint64_t nh = 0, nd = 0;
             for (int i = 0; i < K; ++i) {
                 const int key = il * g.n_expert + ids[i];
                 if (F->cnt[(size_t) key] < (1u << 24)) ++F->cnt[(size_t) key];
@@ -4241,7 +4319,14 @@ void Glm5Model::fast_service() {
                 if (resident) {
                     const int s = F->slot_of[(size_t) key];
                     if (s >= 0) P.tick[(size_t) s] = F->clock;
-                    ++nh;
+                    // UMA DIRECT: no VRAM slot, a RAM one - read in place: a RAM-tier use (recent there), not a hit
+                    const int rsd = s < 0 && F->md.ram_direct ? F->ram_of[(size_t) key] : -1;
+                    if (rsd >= 0) {
+                        R.tick[(size_t) rsd] = F->clock;
+                        ++nd;
+                    } else {
+                        ++nh;
+                    }
                 } else {
                     const int rs0 = F->ram_of[(size_t) key];   // used from the RAM tier: recent there
                     if (rs0 >= 0) R.tick[(size_t) rs0] = F->clock;
@@ -4312,8 +4397,9 @@ void Glm5Model::fast_service() {
                     F->prefetches.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            F->ram_hits.fetch_add((uint64_t) std::popcount((unsigned) (fetch)), std::memory_order_relaxed);
-            F->misses.fetch_add((uint64_t) std::popcount((unsigned) (fetch | miss | cpu)), std::memory_order_relaxed);
+            F->ram_hits.fetch_add((uint64_t) std::popcount((unsigned) (fetch)) + nd, std::memory_order_relaxed);
+            F->misses.fetch_add((uint64_t) std::popcount((unsigned) (fetch | miss | cpu)) + nd, std::memory_order_relaxed);
+            if (nd > 0) F->direct_reads.fetch_add(nd, std::memory_order_relaxed);
             if (F->n_ahead > 0) fast_ahead_route(il, ids, miss, rq->ahead);
             // EARLY LANE: a route with disk reads and lane experts starts the iGPU on those before its reads (they used
             // to wait for the reads, ~3 ms, and the device then for the lane after the last chunk); collected below
@@ -6637,6 +6723,21 @@ size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
         avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
     }
     return avail;
+}
+
+// pool_avail on unified memory with STRATA_GLM_VRAM_GB: the cap counts what this process holds (the dense weights,
+// state, activations, arenas + 1 GB for the context), as fast_setup's sizing does - the device's total - free counts the
+// page cache and every other process (a GB10 at 16 GB: 67 GB "in use", so the prompt path saw no pool and ran token by
+// token, 3.8K tokens in 129 s)
+size_t Glm5Model::pool_avail_uma(size_t free_b, size_t total_b) const {
+    const FastState* F = fast_;
+    const size_t cap = vram_cap();
+    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b));
+    const size_t used = (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_ + (F != nullptr ? F->arena_bytes : 0)) +
+                        ((size_t) 1 << 30);
+    size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
+    if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+    return std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
 }
 
 // the VRAM this part behaves as having, bytes (0 = the card's own): STRATA_GLM_VRAM_GB_PARTS=a,b,... one per part of a

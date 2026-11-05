@@ -386,8 +386,9 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
-    // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
-    static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+    // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it, and so
+    // does a CPU without AVX2 (aarch64: the kernel is x86 only)
+    static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr && cpu_avx2_ok();
     if (nt >= 2 && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
