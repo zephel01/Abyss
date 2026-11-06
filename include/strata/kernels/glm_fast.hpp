@@ -41,6 +41,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 /// table's or STRATA_GLM_MV_Q6K_SPLIT's), and a forced one for the calls that follow (1 / 0; -1 = back to the choice)
 bool mv_q6k_split_choice();
 void mv_force_q6k_split(int split4);
+void mv_force_split(int split);   // gpu_tune: every typed GEMV launch at 1 / 2 / 4 warps a row (other: the engine's rule)
 /// mv() for nc activation columns at once (1..8 a launch, wider calls in runs) - a verify window's tokens, the DSpark
 /// drafter's block: the weight rows are read once. Column c
 /// of a job reads xq + c * n_in / 32 (q8_1 blocks) or xf + c * n_in (BF16 / F32) and writes y + c * n_out.

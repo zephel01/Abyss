@@ -157,6 +157,14 @@ struct V41Engram {
     float* a_dst = nullptr;
     unsigned int* a_flag = nullptr;
     unsigned int a_seq = 0;
+    // a verify WINDOW's rows the same way (2026-11-06, STRATA_DS41_ENGRAM_WINDOW_ASYNC, default on): a_T columns,
+    // table-major in a_wrows (table k's a_T * 24 rows, then the other's), into a_dst at the same layout; the window's
+    // first layer of each table waits on its flag (dsv41_engram_window_add)
+    std::vector<uint64_t> a_wrows;
+    int a_T = 0;
+    bool w_async = false, w_waited[2] = {false, false};
+    int w_T = 0;
+    unsigned int w_seq = 0;
     bool a_started = false;   // the worker, started once (detached like the pools: it lives as long as the process)
     // a prompt chunk's rows PREFETCHED into the row cache (table 0's while layer 0 runs, then table 1's for layer 14)
     // (STRATA_DS41_ENGRAM_PREFETCH, default on; needs the row cache): its own few threads, stopped at the next chunk or
@@ -644,8 +652,10 @@ void engram_async_loop(V41Engram* E) {
         std::unique_lock<std::mutex> l(E->am);
         E->acv.wait(l, [&] { return E->a_have; });
         E->a_have = false;
-        uint64_t rows[2 * kEngCols];
-        std::memcpy(rows, E->a_rows, sizeof rows);
+        const int T = std::max(1, E->a_T);   // (a token: one column)
+        std::vector<uint64_t> rows;
+        if (E->a_T > 0) rows = E->a_wrows;
+        else rows.assign(E->a_rows, E->a_rows + 2 * kEngCols);
         float* dst = E->a_dst;
         unsigned int* flag = E->a_flag;
         const unsigned int seq = E->a_seq;
@@ -653,8 +663,8 @@ void engram_async_loop(V41Engram* E) {
         std::string e;
         bool ok = true;
         for (int k = 0; k < 2; ++k) {
-            if (ok && !engram_rows_par(*E, kEngCols, rows + (size_t) k * kEngCols, k, nullptr,
-                                       dst + (size_t) k * kEngCols * kEngDim, e))
+            if (ok && !engram_rows_par(*E, T * kEngCols, rows.data() + (size_t) k * T * kEngCols, k, nullptr,
+                                       dst + (size_t) k * T * kEngCols * kEngDim, e))
                 ok = false;
             std::atomic_thread_fence(std::memory_order_release);
             // even on a failure: the layer's kernel spins on this flag (engram_wait) and must not hang the GPU; the
@@ -741,6 +751,7 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
         if (++F->v41_eng_seq == 0u) F->v41_eng_seq = 1u;
         std::lock_guard<std::mutex> l(E->am);
         std::memcpy(E->a_rows, rows, sizeof rows);
+        E->a_T = 0;
         E->a_dst = F->v41_eng_h;
         E->a_flag = F->v41_eng_flag;
         E->a_seq = F->v41_eng_seq;
@@ -824,15 +835,47 @@ bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std:
     if (T < 1 || T * 2 > kV41Blk) { err = "deepseek41: a verify window of " + std::to_string(T) + " columns"; return false; }
     if (!engram_sync(*E, err)) return false;   // (the pool is the background reader's too)
     engram_pf_stop(*E);
-    // column t's table k: rows (t * 2 + k) * 24 .. of the prompt path's block buffers (pinned, then the device's)
+    // TABLE-MAJOR: table k, column t: rows (k * T + t) * 24 .. of the prompt path's block buffers (pinned, then the
+    // device's) - so each table's rows are one block the background reader fills and flags on its own
     std::vector<uint64_t> rows((size_t) T * 2 * kEngCols);
-    std::vector<int> ks(rows.size());
     for (int t = 0; t < T; ++t) {
-        if (!engram_rows(*E, toks[t], p0 + t, rows.data() + (size_t) t * 2 * kEngCols, err, is_image_pos(p0 + t)))
-            return false;
-        for (int j = 0; j < 2 * kEngCols; ++j) ks[(size_t) t * 2 * kEngCols + j] = j / kEngCols;
+        uint64_t r[2 * kEngCols];
+        if (!engram_rows(*E, toks[t], p0 + t, r, err, is_image_pos(p0 + t))) return false;
+        for (int k = 0; k < 2; ++k)
+            std::memcpy(rows.data() + ((size_t) k * T + t) * kEngCols, r + (size_t) k * kEngCols, kEngCols * sizeof(uint64_t));
     }
-    if (!engram_rows_par(*E, (int) rows.size(), rows.data(), 0, ks.data(), F->v41_pblk_h, err)) return false;
+    static const bool wasync = [] {
+        const char* v = getenv("STRATA_DS41_ENGRAM_WINDOW_ASYNC");
+        const char* a = getenv("STRATA_DS41_ENGRAM_ASYNC");
+        return (v == nullptr || std::atoi(v) != 0) && (a == nullptr || std::atoi(a) != 0);
+    }();
+    E->w_T = T;
+    E->w_waited[0] = E->w_waited[1] = false;
+    // (one device: a split's later parts hold layers whose adds read this part's buffers - kept synchronous there)
+    E->w_async = wasync && F->v41_eng_flag != nullptr && split_next_ == nullptr && next_port_ == nullptr;
+    if (E->w_async) {
+        if (++F->v41_eng_seq == 0u) F->v41_eng_seq = 1u;
+        F->v41_eng_async = true;   // (dsv41_engram_ok reports the reader's failure after the window)
+        E->w_seq = F->v41_eng_seq;
+        std::lock_guard<std::mutex> l(E->am);
+        E->a_wrows = std::move(rows);
+        E->a_T = T;
+        E->a_dst = F->v41_pblk_h;
+        E->a_flag = F->v41_eng_flag;
+        E->a_seq = F->v41_eng_seq;
+        E->a_have = true;
+        E->a_busy = true;
+        if (!E->a_started) {
+            E->a_started = true;
+            std::thread(engram_async_loop, E).detach();
+        }
+        E->acv.notify_all();
+        return true;
+    }
+    for (int k = 0; k < 2; ++k)
+        if (!engram_rows_par(*E, T * kEngCols, rows.data() + (size_t) k * T * kEngCols, k, nullptr,
+                             F->v41_pblk_h + (size_t) k * T * kEngCols * kEngDim, err))
+            return false;
     cudaMemcpyAsync(F->v41_pblk, F->v41_pblk_h, rows.size() * kEngDim * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     return true;
 }
@@ -841,7 +884,15 @@ bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& er
     FastState* F = fast_;
     const int k = F->L[(size_t) il].eng;
     if (k < 0) { err = "deepseek41: layer " + std::to_string(il) + " has no Engram table"; return false; }
-    return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) (t * 2 + k) * kEngCols * kEngDim);
+    auto* E = (V41Engram*) v41_eng_;
+    const int T = E != nullptr && E->w_T > 0 ? E->w_T : 1;
+    const size_t blk = (size_t) T * kEngCols * kEngDim;   // one table's rows of the window
+    if (E != nullptr && E->w_async && !E->w_waited[k]) {   // the table's first use this window: its rows landed?
+        d41::engram_wait(F->v41_eng_flag + k, E->w_seq, F->v41_pblk_h + (size_t) k * blk, F->v41_pblk + (size_t) k * blk,
+                         (int) blk, F->cs);
+        E->w_waited[k] = true;
+    }
+    return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) k * blk + (size_t) t * kEngCols * kEngDim);
 }
 
 // after a token's layers: the background reader's failure for this token, if any (its rows were never written, the

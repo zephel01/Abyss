@@ -102,6 +102,34 @@ void q8_0_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+void q5_1_dequant_row(const uint8_t* row, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * 24;   // ggml's block_q5_1
+        uint16_t dbits, mbits;
+        uint32_t qh;
+        std::memcpy(&dbits, blk, 2);
+        std::memcpy(&mbits, blk + 2, 2);
+        std::memcpy(&qh, blk + 4, 4);
+        const float d = f32_from_f16(dbits), m = f32_from_f16(mbits);
+        const uint8_t* qs = blk + 8;
+        for (int j = 0; j < 16; ++j) {
+            const int x0 = (qs[j] & 0x0F) | (int) (((qh >> j) & 1u) << 4);
+            const int x1 = (qs[j] >> 4) | (int) (((qh >> (j + 16)) & 1u) << 4);
+            out160[b * 32 + j] = d * (float) x0 + m;
+            out160[b * 32 + j + 16] = d * (float) x1 + m;
+        }
+    }
+}
+
+void bf16_row(const uint8_t* row, float* out160) {
+    for (int i = 0; i < PLE_HEAD_DIM; ++i) {
+        uint16_t b;
+        std::memcpy(&b, row + 2 * i, 2);
+        const uint32_t u = (uint32_t) b << 16;
+        std::memcpy(&out160[i], &u, 4);
+    }
+}
+
 void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
         const uint8_t* blk = row + (size_t) b * 18;
@@ -126,13 +154,17 @@ struct PleTable::Impl {
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
-    // the table's type: IQ4_NL (90-byte rows, the original release) or Q8_0 (170-byte rows, e.g. magnitudedev's NVFP4
-    // GGUF keeps the table at Q8_0)
-    bool q8 = false;
+    // the table's type: IQ4_NL (90-byte rows, the original release), Q8_0 (170, e.g. magnitudedev's NVFP4 GGUF), or
+    // unsloth's separate engram files (2026-11-04: Q5_1 120, BF16 320 - and IQ4_NL / Q8_0 again)
+    enum Kind { kIq4Nl, kQ8_0, kQ5_1, kBf16 } kind = kIq4Nl;
     int rb = PLE_ROW_BYTES;
     void dq(const uint8_t* row, float* out160) const {
-        if (q8) q8_0_dequant_row(row, out160);
-        else iq4nl_dequant_row(row, out160);
+        switch (kind) {
+        case kQ8_0: q8_0_dequant_row(row, out160); break;
+        case kQ5_1: q5_1_dequant_row(row, out160); break;
+        case kBf16: bf16_row(row, out160); break;
+        default: iq4nl_dequant_row(row, out160);
+        }
     }
     strata::ngram::PleReader reader;
     strata::ngram::PleReader::Ticket ticket;
@@ -178,10 +210,13 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    impl_->q8 = std::strcmp(t->type_name(), "Q8_0") == 0;
-    impl_->rb = impl_->q8 ? PLE_ROW_BYTES_Q8_0 : PLE_ROW_BYTES;
-    if (std::strcmp(t->type_name(), "IQ4_NL") != 0 && !impl_->q8) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL or Q8_0";
+    const std::string ty = t->type_name();
+    if (ty == "IQ4_NL") { impl_->kind = Impl::kIq4Nl; impl_->rb = PLE_ROW_BYTES; }
+    else if (ty == "Q8_0") { impl_->kind = Impl::kQ8_0; impl_->rb = PLE_ROW_BYTES_Q8_0; }
+    else if (ty == "Q5_1") { impl_->kind = Impl::kQ5_1; impl_->rb = PLE_ROW_BYTES_Q5_1; }
+    else if (ty == "BF16") { impl_->kind = Impl::kBf16; impl_->rb = PLE_ROW_BYTES_BF16; }
+    else {
+        err = "per_layer_token_embd.weight is " + ty + ", not IQ4_NL, Q5_1, Q8_0 or BF16";
         close();
         return false;
     }

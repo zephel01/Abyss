@@ -6,7 +6,8 @@
 //
 // Checks now: the device (name, architecture, compute units, VRAM, a device-to-device copy's bandwidth) and the Q6_K
 // dense GEMV split (STRATA_GLM_MV_Q6K_SPLIT: 4 warps a row up to 4,096 blocks, or a warp a row) over the row counts
-// the models' Q6_K projections have (1,024-32,768 rows of 4,096 / 5,120).  Random weights: only the time is read.
+// the models' Q6_K projections have (1,024-32,768 rows of 4,096 / 5,120); and (a report only) the Q4_K / Q5_K / Q8_0
+// row split at 1 / 2 / 4 warps a row.  Random weights: only the time is read.
 #include "strata/kernels/glm_fast.hpp"
 #include <cuda_runtime.h>
 
@@ -183,6 +184,54 @@ int main(int argc, char** argv) {
         rows_json += row;
     }
     if (!ok(cudaGetLastError(), "the GEMVs")) return 1;
+    // 3. (2026-11-06) the other dense types' row split - 1 / 2 / 4 warps a row for every launch (the engine's rule:
+    // 4 under 256 blocks, else 1; STRATA_GLM_MV_SPLIT forces one) - a report for the per-SM-count table (48-SM Spark
+    // vs 170-SM 5090): no env is written from it yet
+    std::string split_json;
+    {
+        struct TypeInfo { int type; const char* name; int qk; size_t bytes; size_t dpos; };
+        const TypeInfo types[] = {{12, "Q4_K", 256, 144, 0}, {13, "Q5_K", 256, 176, 0}, {8, "Q8_0", 32, 34, 0}};
+        std::printf("\ndense GEMV row split (us a call, 1 / 2 / 4 warps a row; the engine: 4 under 256 blocks):\n");
+        for (const TypeInfo& ti : types) {
+            std::vector<uint8_t> tw(wmax);
+            for (auto& v : tw) v = (uint8_t) rng();
+            for (size_t b = 0; b + ti.bytes <= wmax; b += ti.bytes) {   // finite scales (2^-10), dmin too for K types
+                tw[b + ti.dpos] = 0x00;
+                tw[b + ti.dpos + 1] = 0x14;
+                if (ti.qk == 256) { tw[b + 2] = 0x00; tw[b + 3] = 0x14; }
+            }
+            for (size_t o = 0; o + wmax <= pool; o += wmax) cudaMemcpy((uint8_t*) w + o, tw.data(), wmax, cudaMemcpyHostToDevice);
+            double tt[3] = {0, 0, 0};
+            for (const Shape& sh : shapes) {
+                gf::MvJob j;
+                j.xq = xq;
+                j.y = y;
+                j.type = ti.type;
+                j.n_in = sh.n_in;
+                j.n_out = sh.n_out;
+                const size_t wb = (size_t) sh.n_out * (sh.n_in / ti.qk) * ti.bytes;
+                if (wb > wmax) continue;
+                const int calls = std::max(20, (int) (200000000.0 / ((double) sh.n_out * sh.n_in)));
+                double t[3];
+                const int sp[3] = {1, 2, 4};
+                for (int k = 0; k < 3; ++k) {
+                    gf::mv_force_split(sp[k]);
+                    t[k] = time_mv(j, (const uint8_t*) w, pool, wb, calls, rounds, s);
+                    tt[k] += t[k];
+                }
+                gf::mv_force_split(-1);
+                std::printf("  %-5s %7d x %-6d %9.1f %9.1f %9.1f\n", ti.name, sh.n_out, sh.n_in, t[0], t[1], t[2]);
+            }
+            const int bi = tt[1] < tt[0] && tt[1] <= tt[2] ? 1 : tt[2] < tt[0] && tt[2] < tt[1] ? 2 : 0;
+            std::printf("  %-5s total %21.1f %9.1f %9.1f   (best: %d warp%s a row)\n", ti.name, tt[0], tt[1], tt[2],
+                        1 << bi, bi ? "s" : "");
+            char row[160];
+            std::snprintf(row, sizeof row, "%s\"%s\": {\"split1_us\": %.1f, \"split2_us\": %.1f, \"split4_us\": %.1f}",
+                          split_json.empty() ? "" : ", ", ti.name, tt[0], tt[1], tt[2]);
+            split_json += row;
+        }
+        if (!ok(cudaGetLastError(), "the split GEMVs")) return 1;
+    }
     // a choice is changed only for a clear win (2% of the total) - else the table's stays
     const bool best = tot[0] < tot[1] * 0.98 ? true : tot[1] < tot[0] * 0.98 ? false : chosen;
     std::printf("  total %37.1f %10.1f\n", tot[0], tot[1]);
@@ -196,9 +245,10 @@ int main(int argc, char** argv) {
                          "{\"device\": %d, \"name\": \"%s\", \"arch\": \"%s\", \"backend\": \"%s\", \"cus\": %d, "
                          "\"vram_gb\": %.1f, \"pci\": \"%s\", \"copy_gbs\": %.0f,\n \"q6k\": {\"choice_split4\": %s, "
                          "\"best_split4\": %s, \"total_split4_us\": %.1f, \"total_split1_us\": %.1f, \"rows\": [%s]},\n"
+                         " \"split\": {%s},\n"
                          " \"env\": {%s}}\n",
                          dev, prop.name, arch, backend, prop.multiProcessorCount, vram_gb, pci, copy_gbs,
-                         chosen ? "true" : "false", best ? "true" : "false", tot[0], tot[1], rows_json.c_str(),
+                         chosen ? "true" : "false", best ? "true" : "false", tot[0], tot[1], rows_json.c_str(), split_json.c_str(),
                          best == chosen ? "" : (best ? "\"STRATA_GLM_MV_Q6K_SPLIT\": \"1\"" : "\"STRATA_GLM_MV_Q6K_SPLIT\": \"0\""));
             std::fclose(f);
         }

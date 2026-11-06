@@ -90,6 +90,10 @@ struct VerifyBuf {
     int* tok = nullptr;                       // device argmax per column
     int* tok_h = nullptr;                     // pinned, host-mapped (tok_hd: its device address)
     int* tok_hd = nullptr;
+    // a sampled window's draws (verify_sample): all T columns in one sampler launch at column 0 into tok_h[32..],
+    // row t with counter c0 + t - the same Philox draws the column-at-a-time path made (sp.counter + 1 a column)
+    uint64_t samp_c0 = 0;
+    bool samp_ok = false;
     int* tok_in_h = nullptr;                  // the window's tokens, host-mapped for the embedding kernel
     int* tok_in_d = nullptr;
     float* emb_h = nullptr;                   // pinned [TM][n_embd]
@@ -1042,6 +1046,10 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     const Glm5Model* tail = verify_tail();
     auto* VT = (VerifyBuf*) tail->vb_;
     if (gp) cudaEventRecord(F->ev_ge[F->gap_par], s);
+    { auto* VS = (VerifyBuf*) verify_tail()->vb_; if (VS) VS->samp_ok = false; }   // (a new window: no stale draws)
+    // the drafter's expert-cache uploads (the misses its last draft found) while the window runs: its own slots and
+    // table on its own stream, which the next draft waits for (ev_up) - generate.cpp's call after verify() was serial
+    if (dsp_ != nullptr) dspark_upload();
     const auto tw = std::chrono::steady_clock::now();
     if (next_port_ != nullptr) {   // (the last part's argmax per column, through the port)
         if (!next_port_->window_wait(win_tok_, err)) return false;
@@ -1062,6 +1070,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     }
     for (Glm5Model* m = this; m != nullptr; m = next_port_ != nullptr ? nullptr : m->split_next_.get())
         if (!m->fast_->route_ok(err)) return false;   // (the port's parts: in window_wait)
+    if (g_.v41 && !dsv41_engram_ok(err)) return false;   // (a window's Engram row the reader never delivered)
     if (gf::launch_errors() > 0) {
         err = "deepseek4 verify: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
         return false;
@@ -2088,6 +2097,52 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
         return -1;
     }
     if (sp.greedy) return V->tok_h[i];
+    // all columns at once (STRATA_GLM_SAMPLE_COLS=0: one column a call, the old way): one launch and one wait a window
+    // instead of a copy, a launch and a wait per column
+    static const bool cols = [] { const char* v = getenv("STRATA_GLM_SAMPLE_COLS"); return !(v && v[0] == '0'); }();
+    if (cols && V->T <= 32) {
+        if (i == 0) {
+            V->samp_ok = false;
+            cudaSetDevice(tail->dev_);
+            FastState* TF = tail->fast_;
+            if (TF->zero_copy) {
+                strata::kernels::sample_tokens(V->logits, V->T, (int) g_.n_vocab, nullptr, 0, sp, V->tok_hd + 32, TF->cs);
+            } else {
+                strata::kernels::sample_tokens(V->logits, V->T, (int) g_.n_vocab, nullptr, 0, sp, V->tok + 32, TF->cs);
+                cudaMemcpyAsync(V->tok_h + 32, V->tok + 32, (size_t) V->T * sizeof(int), cudaMemcpyDeviceToHost, TF->cs);
+            }
+            const bool ok = glmfast::cuda_ok(cudaStreamSynchronize(TF->cs), "glm sampler (window)", err) &&
+                            TF->route_ok(err) && (!g_.v41 || tail->dsv41_engram_ok(err));
+            cudaSetDevice(dev_);
+            if (!ok) return -1;
+            V->samp_c0 = sp.counter;
+            V->samp_ok = true;
+        }
+        if (V->samp_ok && sp.counter == V->samp_c0 + (uint64_t) i) {
+            // STRATA_GLM_SAMPLE_COLS_CHECK=1: each column drawn the old way as well (the same logits, the same counter)
+            // and compared - a test, not for use (it is the old cost plus the new)
+            static const bool chk = [] { const char* v = getenv("STRATA_GLM_SAMPLE_COLS_CHECK"); return v && v[0] == '1'; }();
+            const int got = V->tok_h[32 + i];
+            // the column's row where a sampled pick leaves it: the end-of-turn guard (end_guard_pick) reads it after
+            // this pick (a copy on the stream, no wait)
+            cudaSetDevice(tail->dev_);
+            cudaMemcpyAsync(tail->sc_ + tail->sc_logits, V->logits + (size_t) i * g_.n_vocab,
+                            (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, tail->fast_->cs);
+            cudaSetDevice(dev_);
+            if (chk) {
+                cudaSetDevice(tail->dev_);
+                const int ref = tail->fast_sample(sp, err);
+                cudaSetDevice(dev_);
+                static long long n_chk = 0, n_bad = 0;
+                ++n_chk;
+                if (ref != got) ++n_bad;
+                if (ref != got || (n_chk & 255) == 0)
+                    std::fprintf(stderr, "glm sample cols check: %lld columns, %lld differ%s\n", n_chk, n_bad,
+                                 ref != got ? " (this one)" : "");
+            }
+            return got;
+        }
+    }
     cudaSetDevice(tail->dev_);
     cudaMemcpyAsync(tail->sc_ + tail->sc_logits, V->logits + (size_t) i * g_.n_vocab,
                     (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, tail->fast_->cs);

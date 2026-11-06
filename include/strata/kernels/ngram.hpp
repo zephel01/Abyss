@@ -46,7 +46,9 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;      // 170 (a Q8_0 table)
-inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q8_0;
+inline constexpr int PLE_ROW_BYTES_Q5_1 = (PLE_HEAD_DIM / 32) * 24;      // 120 (unsloth's engram-Q5_1 table)
+inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;               // 320 (engram-BF16)
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
@@ -99,6 +101,11 @@ int iq4nl_code(int code);
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 /// One 170-byte Q8_0 row (5 blocks of [f16 scale | 32 int8]) -> 160 floats, as ggml's dequantize_row_q8_0.
 void q8_0_dequant_row(const uint8_t* row, float* out160);
+/// One 120-byte Q5_1 row (5 blocks of [f16 d | f16 m | u32 high bits | 16 bytes of low nibbles]) -> 160 floats, as
+/// ggml's dequantize_row_q5_1: byte j carries elements j and j+16, the fifth bit of element i is bit i of the u32.
+void q5_1_dequant_row(const uint8_t* row, float* out160);
+/// One 320-byte BF16 row -> 160 floats.
+void bf16_row(const uint8_t* row, float* out160);
 
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the

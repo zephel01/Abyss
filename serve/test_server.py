@@ -309,6 +309,48 @@ class GlmThinkingLevels(unittest.TestCase):
         self.assertEqual([budget_effort(n)["reasoning_effort"] for n in (1024, 4096, 16384)], ["low", "high", "max"])
 
 
+class V41ThinkingLevels(unittest.TestCase):
+    """DeepSeek V4.1 1017's template takes reasoning_effort low / medium / high / max or an integer 1..100 (high when
+    absent): the client's own value reaches it; other templates get the nearest of the server's levels."""
+
+    SRC = ("{%- if thinking is defined and thinking -%}T{%- else -%}C{%- endif -%}"
+           "{%- if reasoning_effort is not defined or reasoning_effort is none -%}{%- set reasoning_effort = 'high' -%}"
+           "{%- endif -%}{%- set effort_map = {'low': 50, 'medium': 62, 'high': 75, 'max': 100} -%}"
+           "{%- if reasoning_effort is string and reasoning_effort in effort_map -%}{{ effort_map[reasoning_effort] }}"
+           "{%- elif reasoning_effort is integer -%}{{ reasoning_effort }}{%- endif -%}\uff5cDSML\uff5c")
+
+    def render(self, effort=None):
+        import tempfile
+        from serve.frontend import effort_kwargs
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(self.SRC, encoding="utf-8")
+            t = ChatTemplate(p)
+            self.assertTrue(t.dsv4 and t.v41_effort)
+            return t.render([{"role": "user", "content": "hi"}], **effort_kwargs(effort))[:4]
+
+    def test_levels(self):
+        self.assertEqual(self.render(), "T75\uff5c")             # (thinks, the template's high)
+        self.assertEqual(self.render("low"), "T50\uff5c")
+        self.assertEqual(self.render("medium"), "T62\uff5c")
+        self.assertEqual(self.render("high"), "T75\uff5c")
+        self.assertEqual(self.render("max"), "T100")
+        self.assertEqual(self.render("xhigh"), "T100")
+        self.assertEqual(self.render(40), "T40\uff5c")
+        self.assertEqual(self.render("90"), "T90\uff5c")
+        self.assertTrue(self.render("none").startswith("C"))
+
+    def test_integers_elsewhere(self):
+        from serve.frontend import effort_kwargs
+        self.assertEqual(effort_kwargs(50)["reasoning_effort"], "low")
+        self.assertEqual(effort_kwargs(75)["reasoning_effort"], "high")
+        self.assertEqual(effort_kwargs(100)["reasoning_effort"], "max")
+        with self.assertRaises(ValueError):
+            effort_kwargs(0)
+        with self.assertRaises(ValueError):
+            effort_kwargs(101)
+
+
 class SpelledStopMarker(unittest.TestCase):
     """GLM-5.3 sometimes writes its turn's end, <|user|>, out of ordinary pieces: the answer must end there, and a
     '<|' that is not a marker must still reach the client."""

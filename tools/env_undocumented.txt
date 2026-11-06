@@ -29,7 +29,6 @@ STRATA_DS4_DUMP_FEAT_LAYERS  # src/core/glm_fast_path.cu
 STRATA_DS4_IDX_ALL  # src/core/dsv4_fast_path.cu
 STRATA_DS4_OQ_FUSE  # src/kernels/cuda/dsv4_fast.cu
 STRATA_DS4_SPEC_ADAPT  # src/program/generate.cpp
-STRATA_DS4_SPEC_COST  # src/program/generate.cpp
 STRATA_DS4_SPEC_GATE_LEARN  # src/program/generate.cpp
 STRATA_DS4_WIN_TIMING  # src/core/dsv4_verify.cu
 STRATA_FORCE_AVX2  # src/kernels/cpu/exl3_cpu.cpp
@@ -209,7 +208,6 @@ STRATA_Q35_MTP_K  # src/core/qwen35_fast_path.cu
 STRATA_Q35_MTP_MIN  # src/core/qwen35_fast_path.cu
 STRATA_Q4X_DENSE  # src/core/qwen35_fast_path.cu
 STRATA_Q4X_MTP_FULLHEAD  # src/core/q4x_drafter.cu
-STRATA_Q4X_PLE_GGUF  # src/core/glm_model.cu
 STRATA_Q4X_PLE_SYNC  # src/core/dsv4_verify.cu
 STRATA_QSA_DUMP  # src/prefill/prefill.cpp
 STRATA_QSA_DUMP_LAST  # src/prefill/prefill.cpp

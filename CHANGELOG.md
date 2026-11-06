@@ -7,6 +7,33 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.117 - 2026-11-07
+
+- **DeepSeek V4.1 gets its own thinking levels**: `reasoning_effort` `low` / `medium` / `high` / `max` (the template's
+  effort 50 / 62 / 75 / 100) or an integer 1-100 now reach V4.1 1017's template as it expects; it used to get
+  DeepSeek V4's levels. Other models map an integer to the nearest level. The server's shared defaults take the same
+  values.
+- **Qwen3.8's PLE table in Q5_1 or BF16** besides IQ4_NL and Q8_0 (`STRATA_Q4X_PLE_GGUF=<file>`). 16G64G (M16b) on an
+  RTX 5090, KL against NVFP4: IQ4_NL 0.0826 -> Q5_1 0.0732 (Q8_0 0.0714), same speed; the table is read row by row,
+  so the bigger type costs disk (+9.6 GB), not VRAM.
+- **Verify windows, same tokens, less waiting**: with temperature > 0 a window's columns are drawn in one launch and
+  one wait instead of a copy, a launch and a wait each (`STRATA_GLM_SAMPLE_COLS=0`: the old way); DeepSeek V4.1's
+  window reads its Engram rows in the background as tokens do (the window's Engram wait 0.39 -> 0 ms,
+  `STRATA_DS41_ENGRAM_WINDOW_ASYNC=0`: the old way); the DSpark drafter's expert uploads start before the window's
+  wait instead of after it.
+- GLM-5.3-Flash's Q4_K token embedding is gathered on the GPU (bit-identical to ggml) instead of dequantized on the
+  host and copied.
+- **A note when a prompt goes token by token**: the batched prompt path can decline a prompt (too short, or a part
+  lent to the vision encoder); the engine now says so and why. For the slow long prompts through the server on
+  DGX Spark.
+- `STRATA_DETERMINISTIC=1` (a test mode, slower): the choices that follow wall-clock timing are switched off,
+  including the pack's `expert_usage.txt`, so two runs of one request give the same tokens - for checking that a
+  change does not change them.
+- Opt-in, off by default: `STRATA_DS4_NGRAM_LONG=1` (n-gram drafts from the longest earlier match; Qwen3.8 copy task
+  +8%, DeepSeek V4 0731 -12%) and a reworked `STRATA_DS4_SPEC_COST=1` (same speed as off on V4 0731).
+- `./abyss.sh --gpu-tune` also reports the Q4_K / Q5_K / Q8_0 dense GEMV split (1 / 2 / 4 warps a row); nothing is
+  written from it yet.
+
 ## v1.3.116 - 2026-11-06
 
 - **A reasoning block closed by the thinking budget no longer spills into the answer (#36, thanks @hondaru)**: the

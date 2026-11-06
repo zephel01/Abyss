@@ -955,31 +955,66 @@ double probe_pcie_h2d_gbps() {
 // propose() continues the latest earlier occurrence of the current suffix by up to k tokens.  swe-bench's prompts and
 // DeepSeek V4's answers (fixed files echo their source): ~1.7 tokens a step at k = 3, n = 3 (offline).
 struct NgramDrafter {
-    explicit NgramDrafter(int n) : n_(n) {}
+    // long = STRATA_DS4_NGRAM_LONG=1 (2026-11-06, measuring): each n-gram keeps its 4 latest occurrences and propose()
+    // continues the one whose match reaches furthest back (the longest suffix match, ties to the latest), and reports
+    // that match length so a caller can size the window by it.  Off: the latest occurrence, as before.  Drafts are
+    // proposals only (every one is verified), so either way the output is the same; only acceptance changes.
+    explicit NgramDrafter(int n) : n_(n) {
+        const char* v = std::getenv("STRATA_DS4_NGRAM_LONG");
+        long_ = v != nullptr && std::atoi(v) != 0;
+    }
     void push(int32_t t) {
         h_.push_back(t);
         // the n-gram that ended one token ago becomes findable (the newest one is the suffix being matched)
         const int64_t end = (int64_t) h_.size() - 2;
-        if (end + 1 >= n_) last_[key(end)] = end + 1;
+        if (end + 1 >= n_) {
+            Occ& o = last_[key(end)];
+            o.at[o.n++ & 3] = end + 1;
+        }
     }
-    void propose(int k, std::vector<int32_t>& out) const {
+    bool long_mode() const { return long_; }
+    // up to k tokens after the chosen earlier occurrence of the current suffix; *match: how many tokens of the
+    // suffix that occurrence matches (n.. 64)
+    void propose(int k, std::vector<int32_t>& out, int* match = nullptr) const {
         out.clear();
+        if (match) *match = 0;
         const int64_t end = (int64_t) h_.size() - 1;
         if (k <= 0 || end + 1 < n_) return;
         const auto it = last_.find(key(end));
         if (it == last_.end()) return;
-        for (int64_t i = it->second; i < (int64_t) h_.size() && (int) out.size() < k; ++i) out.push_back(h_[(size_t) i]);
+        const Occ& o = it->second;
+        int64_t best = o.at[(o.n - 1) & 3];
+        int best_len = n_;
+        if (long_ || match) {
+            best_len = -1;
+            for (int j = 0; j < std::min(o.n, 4); ++j) {
+                const int64_t c = o.at[(o.n - 1 - j) & 3];   // latest first: ties keep the latest
+                int len = 0;
+                while (len < 64 && c - 1 - len >= 0 && end - len > c - 1 - len &&
+                       h_[(size_t) (c - 1 - len)] == h_[(size_t) (end - len)])
+                    ++len;
+                if (len > best_len) { best_len = len; best = c; }
+                if (!long_) break;   // (off: the latest, its length only reported)
+            }
+        }
+        if (match) *match = best_len;
+        for (int64_t i = best; i < (int64_t) h_.size() && (int) out.size() < k; ++i) out.push_back(h_[(size_t) i]);
     }
 
 private:
+    struct Occ {
+        int64_t at[4] = {0, 0, 0, 0};
+        int n = 0;
+    };
     uint64_t key(int64_t end) const {   // the n tokens ending at `end`
         uint64_t x = 1469598103934665603ull;
         for (int64_t i = end - n_ + 1; i <= end; ++i) x = (x ^ (uint64_t) (uint32_t) h_[(size_t) i]) * 1099511628211ull;
         return x;
     }
     int n_;
+    bool long_ = false;
     std::vector<int32_t> h_;
-    std::unordered_map<uint64_t, int64_t> last_;
+    std::unordered_map<uint64_t, Occ> last_;
 };
 
 // A GLM-5.3-Flash pack (tools/iq_pack.py output) runs the VERIFIED runner - Glm5Model, the same
@@ -1351,6 +1386,28 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGPIPE, SIG_IGN);
     }
 #endif
+    // STRATA_DETERMINISTIC=1 (a test mode for A/B equality checks, slower): the switches whose choices follow wall-clock
+    // timing off - the prompt path's CPU / iGPU share, the decode CPU / iGPU lane, the background tier moves and the
+    // n-gram gate, the usage file - so two runs of the same tokens compute every expert on the same path in the same order.  Without it
+    // greedy output can differ between runs (near-tied tokens flip).  A switch the environment already sets is kept.
+    if (const char* dv = std::getenv("STRATA_DETERMINISTIC"); dv != nullptr && std::atoi(dv) != 0) {
+        static const char* const kOff[] = {"STRATA_GLM_PREFILL_CPU", "STRATA_GLM_PREFILL_IGPU", "STRATA_GLM_CPU_LANE",
+                                           "STRATA_GLM_IGPU", "STRATA_GLM_PROMOTE", "STRATA_GLM_PROMOTE_FILL",
+                                           "STRATA_DS4_SPEC_GATE",
+                                           // (2026-11-06) the pack's expert_usage.txt, rewritten after every answer and
+                                           // read at the next start: it seeds which experts each tier holds, so two
+                                           // runs started from different files; and the read-ahead / RAM fill moves
+                                           "STRATA_GLM_USAGE", "STRATA_GLM_AHEAD", "STRATA_GLM_RAM_FILL",
+                                           "STRATA_GLM_PRESTAGE_ADAPT"};
+        std::string kept;
+        for (const char* k : kOff) {
+            if (std::getenv(k) == nullptr) set_env(k, "0");
+            else kept += std::string(" ") + k + "=" + std::getenv(k);
+        }
+        std::fprintf(stderr, "NOTE: STRATA_DETERMINISTIC: timing-driven choices off (CPU / iGPU lanes, tier moves, the "
+                             "n-gram gate) - slower, for equality tests%s%s\n",
+                     kept.empty() ? "" : "; kept as set:", kept.c_str());
+    }
     // STRATA_DS4_SPEC=<k> (1..3, default 1; 0 off): deepseek4's n-gram speculative decode with k drafted tokens a
     // window; STRATA_DS4_SPEC_MIN=<n> (2..4, default 3): the suffix length that must match.  STRATA_DS4_SPEC_GATE=0:
     // every proposal goes through a window (the gate below off)
@@ -1961,6 +2018,15 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         }
+        // a prompt of 32+ tokens that goes the token path (8 a step, ~6x slower than the batched path) says so and why,
+        // once per request (2026-11-06: a Spark server's slow long prompts could not be told apart from the logs)
+        if (model.fast() && prompt.size() - i_first > 32 && finish != std::string("cancel")) {
+            const char* why = pchunk == 0 ? model.prefill_off_reason()
+                                          : "the batched path declined this prompt (shorter than STRATA_GLM_PREFILL_MIN, "
+                                            "or a tail lent to the vision encoder)";
+            std::fprintf(stderr, "NOTE: the prompt's %zu tokens go through the token path: %s\n",
+                         prompt.size() - i_first, why);
+        }
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
@@ -2252,18 +2318,36 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_DS4_SPEC_COST");
                 return v != nullptr && std::atoi(v) != 0;
             }();
-            double cw[7] = {0, 0, 0, 0, 0, 0, 0};
-            int cw_n[7] = {0, 0, 0, 0, 0, 0, 0};
-            double cal_h[8], cal_n[8];
-            for (int b = 0; b < 8; ++b) {
-                cal_h[b] = 4.0 * (b + 0.5) / 8.0;
-                cal_n[b] = 4.0;
-            }
+            // (2026-11-06) the tables live as long as the process - the same model, the same machine - instead of
+            // starting over every request (a short request's choices came from a handful of samples); a width's cost is
+            // the MEDIAN of its last 16 steps (one slow step - an SSD spell - moved the old running mean for many);
+            // and the single token is re-measured too: every 32nd cost choice goes alone when width 1 has not run
+            // for 32 steps (a window-heavy run never refreshed it, so the comparison drifted)
+            struct CostTab {
+                double cw[7] = {0, 0, 0, 0, 0, 0, 0};
+                int cw_n[7] = {0, 0, 0, 0, 0, 0, 0};
+                double ring[7][16] = {};
+                double cal_h[8], cal_n[8];
+                int64_t n_cost = 0, since1 = 0;
+                CostTab() {
+                    for (int b = 0; b < 8; ++b) {
+                        cal_h[b] = 4.0 * (b + 0.5) / 8.0;
+                        cal_n[b] = 4.0;
+                    }
+                }
+            };
+            static CostTab ct;
+            double* cw = ct.cw;
+            int* cw_n = ct.cw_n;
+            double* cal_h = ct.cal_h;
+            double* cal_n = ct.cal_n;
+            int64_t& n_cost = ct.n_cost;
             const auto cal_bin = [](float p) { return std::max(0, std::min(7, (int) (p * 8.0f))); };
-            int64_t n_cost = 0;
             const auto cost_pick = [&](const double* a, int kmax, int fallback) {
                 if (cw_n[1] == 0) return fallback;   // (nothing measured yet)
-                if ((++n_cost & 15) == 0)
+                ++n_cost;
+                if ((n_cost & 31) == 0 && ct.since1 >= 32) return 0;   // (width 1 refreshed)
+                if ((n_cost & 15) == 0)
                     for (int c2 = 2; c2 <= kmax + 1; ++c2)
                         if (cw_n[c2] < 3) return c2 - 1;
                 double best = -1.0, e = 1.0, q = 1.0, t_last = cw[1];
@@ -2290,8 +2374,15 @@ static int glm_pack_generate(const Options& o) {
                 return bk;
             };
             const auto cw_add = [&](int cols, double ms) {
-                cw[cols] = cw_n[cols] > 0 ? 0.9 * cw[cols] + 0.1 * ms : ms;
+                double* r = ct.ring[cols];
+                r[cw_n[cols] & 15] = ms;
                 ++cw_n[cols];
+                const int n = std::min(cw_n[cols], 16);
+                double v[16];
+                std::copy(r, r + n, v);
+                std::nth_element(v, v + n / 2, v + n);
+                cw[cols] = v[n / 2];
+                ct.since1 = cols == 1 ? 0 : ct.since1 + 1;
             };
             for (;;) {
                 if (stop_req.load()) {
@@ -2392,7 +2483,7 @@ static int glm_pack_generate(const Options& o) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                model.dspark_upload();   // (the expert cache's copies under the window)
+                model.dspark_upload();   // (none left: verify() made them while the window ran)
                 model.spec_steps_ += (uint64_t) k;
                 ++spec_rounds;
                 ++n_win;
@@ -2513,8 +2604,21 @@ static int glm_pack_generate(const Options& o) {
                 if (!on_token(tok)) break;
                 dr.push(tok);
                 const int64_t p0 = model.position();
-                const int room = (int) std::min<int64_t>(spec_k, o.max_context - p0 - 1);
-                dr.propose(room, draft);
+                // NGRAM_LONG: the window sized by the match - 1 token under 6 matched, 2 under 12, 3 under 24, else
+                // up to the window's limit (kVerifyMax - 1 drafts; STRATA_DS4_SPEC does not cap this mode)
+                int room = (int) std::min<int64_t>(spec_k, o.max_context - p0 - 1);
+                if (dr.long_mode()) {
+                    int ml = 0;
+                    const int cap = (int) std::min<int64_t>(std::max(spec_k, strata::core::Glm5Model::kVerifyMax - 1),
+                                                            o.max_context - p0 - 1);
+                    dr.propose(cap, draft, &ml);
+                    const int want = ml < 6 ? 1 : ml < 12 ? 2 : ml < 24 ? 3 : cap;
+                    if ((int) draft.size() > want) draft.resize((size_t) want);
+                    room = (int) draft.size();
+                } else {
+                    dr.propose(room, draft);
+                }
+                (void) room;
                 if (!draft.empty() && spec_gate && g_one > 0.0 && g_win > 0.0 &&
                     (1.0 + g_p * (double) draft.size()) * g_one < g_win && (++n_prop & 15) != 0) {
                     gated0 = gate_learn ? draft[0] : -1;

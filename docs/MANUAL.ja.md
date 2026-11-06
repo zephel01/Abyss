@@ -277,6 +277,9 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
   | `high` | 思考あり + DeepSeek の「Reasoning Effort: Absolute maximum」の指示 |
   | `max` | 思考あり + 「Beyond maximum」の指示 |
 
+  DeepSeek V4.1 1017 は、自分のテンプレートがレベルをそのまま受け取る（v1.3.117）: `low` / `medium` / `high` / `max`
+  （テンプレートの effort 50 / 62 / 75 / 100）か、1〜100 の整数。`none` は上と同じく思考なし。ほかのモデルには近いレベルが渡る。
+
   サーバーは回答に最低 1024 トークン（または `max_tokens` の 4 分の 1）を必ず残す。`max_tokens` が小さい（数百）と、
   思考はほぼすぐに打ち切られる。思考させるときは `max_tokens` を数千にする。
 - **ツール呼び出し:** OpenAI の `tools`、Anthropic の `tools` が使える。1 回の応答で複数の呼び出しも可。モデルは
@@ -791,6 +794,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_MV_FUSE` | on（HIP） | 型の違う小さな GEMV の組（DeepSeek V4 の x の射影）を 1 回の起動で、1 行 4 wave で計算する（v1.3.40。AI PRO R9700 では小さな GEMV が大きさによらず 1 回 15〜29 µs かかる）。`0`: 型ごとに起動。型ごとのカーネルとはビットが一致しない |
 | `STRATA_GLM_GRID_PAD` | on（HIP、gfx11 以外） | wave 数が GPU の wave スロット数の倍数ちょうどかその直前になる起動に、空のブロックを足す（v1.3.40）。gfx1201 ではそういう起動の次の起動が 8〜14 µs 遅れ（ROCm/TheRock#9300）、DeepSeek V4 の 4096 行の GEMV と expert の down が 1 token に約 275 回当たっていた（AI PRO R9700: 22.2 → 20.2 ms/token）。ビット一致。gfx11 では既定でオフ（issue #9、RX 7900 XT で遅れは出ず、差は誤差の範囲。v1.3.54）。`0` ですべてオフ、`1` ですべてオン |
 | `STRATA_GLM_HC_CPU` | on（HIP）、off（NVIDIA） | deepseek4: MoE の層のうち CPU / iGPU レーンが計算した分を、専用の待ちカーネルではなく次の層の attention 側の mHC 読み出し（hc3）の中で足す（1 層あたり起動が 1 回減り、答えは hc3 の 32 ブロックで読む。v1.3.42）。ビット一致。`0` で待ちカーネル、NVIDIA でも `1` で有効（未測定） |
+| `STRATA_Q4X_PLE_GGUF` | pack のもの | Qwen3.8-Flash-Next: PLE 表（`per_layer_token_embd`）をこの GGUF から読む。IQ4_NL、Q5_1、Q8_0、BF16（Q5_1 / BF16 は v1.3.117 から）。RTX 5090、16G64G（M16b）、NVFP4 版との KL: IQ4_NL 0.0826、Q5_1 0.0732、Q8_0 0.0714、速さは同じ。表は 1 行ずつ読むので、大きい型で増えるのはディスクで、VRAM は増えない |
 | `STRATA_Q4X_PLE_PREFETCH` | on | Qwen3.8-Flash-Next で MTP ドラフターを使うとき: 検証窓の PLE 表の行（1 トークン 16 回の SSD 読み）を、ドラフターがそのトークンを出した時点で行キャッシュに先読みする（窓が使う 1 下書き分前、v1.3.87）。RTX 5090、ISTA IQ3_S: 窓の行の待ち 0.8〜1.1 ms → 0.1〜0.25 ms、ドラフターあり +3%。`0` で窓の開始時に読む |
 | `STRATA_Q4X_HC_FUSE` | on（NVIDIA）、off（HIP） | Qwen3.8-Flash-Next: 1 トークンの hyper-connection の混合（97 回）を 5 回ではなく 2 回の起動で行う。結果は同じビット（v1.3.86。`hc4_fused_parity` で確認）。RTX 5090、ISTA IQ3_S: 混合 2.98 → 2.21 ms/トークン、1 トークンずつの経路 +8%。v1.3.87 から MTP の検証窓も（1 窓 97 回の混合が 2 列で 2.6 → 1.8 ms、5 列で 5.5 → 2.6 ms。ドラフターあり +8%）。`0` で 5 回の起動、`2` でトークンは融合・窓は 5 回（比較用） |
 | `STRATA_Q4X_GDN_FUSE` | on（NVIDIA）、off（HIP） | Qwen3.8-Flash-Next: delta-net 層の中間（q / k の L2 norm とゲート、再帰、ゲート付き出力 norm とその q8_1）を 4 回ではなく 1 回の起動で行う。1 トークンずつの経路と MTP の検証窓の両方（窓はゲートの後の 3 回を 1 回に）。結果は同じビット（`gdn_core_parity`）。RTX 5090: 36 層で単体 0.44 → 0.33 ms/トークン、decode は約 +1%（bench の揺れの範囲）。`0` で別々の起動 |
@@ -829,10 +833,15 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_DISK_LANE` | オフ | `1`: SSD から RAM に読んだエキスパートを、VRAM に送らずその場で CPU / iGPU レーンが計算する（v1.3.29。V4.1 の Q2_K/Q3_K エキスパートで −5%、小さい Q2 では効果なし） |
 | `STRATA_DS41_ENGRAM_CACHE_MB` / `_THREADS` | 256 / 15 | DeepSeek V4.1: Engram の行キャッシュと、行を読むスレッド数（v1.3.29） |
 | `STRATA_DS41_ENGRAM_ASYNC` | オン | DeepSeek V4.1: トークンの Engram 48 行を、層 0 の計算中に裏のスレッドが読み、層 1 / 14 が GPU 上で到着を待つ（v1.3.36。1 トークン −0.5 ms、出力は同じ）。`0`: トークンの前に読む |
+| `STRATA_DS41_ENGRAM_WINDOW_ASYNC` | オン | DeepSeek V4.1: 検証窓の Engram 行も同じように裏で読み、各表を最初に使う層が GPU 上で到着を待つ（v1.3.117。RTX 5090 で窓の Engram の待ち 0.39 → 0 ms、出力は同じ）。`0`: 窓の前に読む |
 | `STRATA_DS41_ENGRAM_PREFETCH` | 8 | DeepSeek V4.1: prompt の chunk の hash の直後に、その Engram 行を行キャッシュへ読むスレッド数（v1.3.36。1K トークンの prompt で Engram 1.7〜1.9 → 0.6 秒、prompt 全体 −6〜7%）。`0`: オフ |
 | `STRATA_DS4_SPEC` | 1（オン） | prompt と応答から作る投機デコード。1 回に試す候補トークン数（1〜3。実測では 1 が最速）。`0` でオフ |
 | `STRATA_DS4_SPEC_GATE` | オン | リクエストの採用率が検証窓の分に見合わない間は候補を出さない。`0`: 常に出す |
 | `STRATA_DS4_SPEC_MIN` | 3 | 候補を探すときに一致させるトークン数（2〜4） |
+| `STRATA_DS4_SPEC_COST` | オフ | `1`: 窓の大きさを、決まった規則ではなく、この機械での幅ごとのかかる時間と下書きが残る割合から決める（v1.3.117 で作り直し: 表はプロセスのあいだ持ち続け、幅ごとの時間は直近 16 回の中央値、1 トークンだけの時間もときどき測り直す）。RTX 5090 の DeepSeek V4 0731 ではオフと同じ速さ |
+| `STRATA_DS4_NGRAM_LONG` | オフ | `1`: n-gram の下書きを、前に出てきたいちばん長い一致から出し、一致が長いほど多く下書きする（n-gram だけの生成。v1.3.117）。Qwen3.8 の写す作業で +8%、DeepSeek V4 0731 では窓が増えて −12% なので既定はオフ |
+| `STRATA_GLM_SAMPLE_COLS` | オン | 温度が 0 より大きいとき、検証窓の列を、列ごとのコピー・起動・待ちではなく、1 回の起動と 1 回の待ちでまとめて引く（v1.3.117。出力は同じ。`STRATA_GLM_SAMPLE_COLS_CHECK=1` で各列を前のやり方でも引いて食い違いを数える）。`0`: 1 列ずつ |
+| `STRATA_DETERMINISTIC` | オフ | `1`（確かめ用、遅くなる）: 時計の時間で決まる選択を止める。prompt の CPU / iGPU の分担、生成の CPU / iGPU レーン、裏でのエキスパートの移動と先読み、n-gram の判定、pack の `expert_usage.txt`。同じリクエストを 2 回走らせると同じトークンになる（出力を変えないはずの変更の A/B 用）。環境変数ですでに指定したものはそのまま |
 | `STRATA_DS4_SPEC_PIPE` | auto（HIP）、1（NVIDIA） | 検証の窓: `1` pipelined（v1.3.43 から列を 2 つのグループに分けて 2 本の HW キューに流し、グループの中はまとめて計算）、`0` batched（dense の重みを窓で 1 回だけ読む）、`auto`: 窓の幅ごとに、最初の窓で両方を 3 回ずつ測り、速いほうをその幅で使い続ける（v1.3.40。幅ごとは v1.3.43 から。HIP の既定。NVIDIA ではまだ確認していない）。RTX 5090 + iGPU では pipelined（swe-bench 90 対 73 tok/s）、AI PRO R9700（HW キュー 2 本、v1.3.43）ではどの幅も pipelined（2 / 4 / 6 / 8 列で 34〜36 / 52〜56 / 71 / 88 ms、batched は 41 / 68.5 / 98 / 133） |
 | `STRATA_DS4_SPEC_GROUP` | 窓の半分 | pipelined の窓の 1 グループの列数（v1.3.43）。既定は ceil(T / 2) 列ずつの 2 グループ |
 | `STRATA_DS4_WIN_COLS` | オン | 窓のグループで、VRAM にある expert の gate/up と down を列ごとではなく全列まとめて 1 回ずつ起動する（v1.3.43。ビット一致: `STRATA_DS4_WIN_COLS_CHECK=1` で 16 グループに 1 回、列ごとの起動と照合）。`0`: 列ごと |

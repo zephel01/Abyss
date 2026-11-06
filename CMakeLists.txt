@@ -718,6 +718,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
   # INSIDE the test.  A test that passes by finding nothing to compare is the failure mode this project keeps
   # re-learning.
+  add_executable(embed_rows_parity src/kernels/embed_rows_parity.cpp)
+  target_include_directories(embed_rows_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(embed_rows_parity PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
+  add_test(NAME embed_rows_parity COMMAND embed_rows_parity)
+  set_tests_properties(embed_rows_parity PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(ple_rows_test src/kernels/ple_rows_test.cpp)
+  target_include_directories(ple_rows_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(ple_rows_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME ple_rows_test COMMAND ple_rows_test)
   add_executable(ple_parity src/kernels/ple_parity.cpp)
   target_include_directories(ple_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})

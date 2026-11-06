@@ -3280,8 +3280,11 @@ def clean_shared_defaults(d) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
             if effort_level(value) is None:
-                raise ValueError("reasoning_effort: none, low, high or max")
-            value = effort_level(value)
+                raise ValueError("reasoning_effort: none, low, medium, high, max or 1..100")
+            # the client's own spelling stays (DeepSeek V4.1's template has medium and 1..100 of its own); a level name
+            # otherwise
+            raw = str(value).strip().lower()
+            value = int(raw) if raw.isdigit() else raw if raw == "medium" else effort_level(value)
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")

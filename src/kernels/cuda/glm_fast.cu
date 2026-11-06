@@ -1284,6 +1284,7 @@ static const MvTune& mv_tune() {
 
 // (abyss_gpu_tune: a forced choice for the calls that follow, -1 = mv_tune's)
 static std::atomic<int> g_q6k_force{-1};
+std::atomic<int> g_split_force{-1};   // gpu_tune: 1 / 2 / 4 rows-split for every typed launch (-1: the rule)
 
 // ---------------------------------------------------------------- multi-job GEMV
 struct MvBatch {
@@ -2025,6 +2026,33 @@ __global__ void embed_q5k_rows_kernel(const block_q5_K* __restrict__ table, cons
         y[64 * j + 32 + l] = d2 * (float) ((ql >> 4) + ((qh & u2) ? 16 : 0)) - m2;
         u1 <<= 2;
         u2 <<= 2;
+    }
+}
+
+// Q4_K rows (GLM-5.3-Flash UD-IQ2_XXS's token_embd): a thread a (super-block, l) - its 8 values, ggml's
+// dequantize_row_q4_K order (64-value groups: low nibbles with scale 2j, high nibbles with 2j+1)
+__global__ void embed_q4k_rows_kernel(const block_q4_K* __restrict__ table, const int* __restrict__ toks, int n_embd,
+                                      float* __restrict__ out) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // super-block * 32 + l
+    const int nsb = n_embd / 256;
+    const int sb = i >> 5, l = i & 31;
+    if (sb >= nsb) return;
+    const block_q4_K* q = table + (size_t) toks[t] * nsb + sb;
+    const float2 dm = __half22float2(q->dm);
+    const float d = dm.x, dmin = dm.y;
+    float* y = out + (size_t) t * n_embd + (size_t) sb * 256;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint8_t sc, m;
+        emb_scale_min_k4(2 * j, q->scales, sc, m);
+        const float d1 = __fmul_rn(d, sc), m1 = __fmul_rn(dmin, m);
+        emb_scale_min_k4(2 * j + 1, q->scales, sc, m);
+        const float d2 = __fmul_rn(d, sc), m2 = __fmul_rn(dmin, m);
+        const uint8_t ql = q->qs[32 * j + l];
+        // (two roundings, as ggml's dequantize_row_q4_K on the host under -ffp-contract=off: nvcc would fuse a * b - c)
+        y[64 * j + l] = __fsub_rn(__fmul_rn(d1, (float) (ql & 0xF)), m1);
+        y[64 * j + 32 + l] = __fsub_rn(__fmul_rn(d2, (float) (ql >> 4)), m2);
     }
 }
 
@@ -4332,6 +4360,7 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
 }
 
 void mv_force_q6k_split(int split4) { g_q6k_force.store(split4); }
+void mv_force_split(int split) { g_split_force.store(split == 2 || split == 4 || split == 1 ? split : -1); }
 bool mv_q6k_split_choice() { return mv_tune().q6k_split; }
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
@@ -4421,7 +4450,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             if (m == 0) continue;
             b.n = m;
             b.pf = pf;
-            const int split = split_env >= 0 ? (split_env == 2 || split_env == 4 ? split_env : 1)
+            const int sforce = g_split_force.load(std::memory_order_relaxed);
+            const int split = sforce > 0 ? sforce
+                            : split_env >= 0 ? (split_env == 2 || split_env == 4 ? split_env : 1)
                             : (acc < 256 || (q6k_split && T == 14 && acc <= 4096)) ? 4 : 1;
             if (split > 1) {   // the block ranges at MV_ROWS / split rows a block
                 const int rpb = MV_ROWS / split;
@@ -4574,6 +4605,13 @@ bool embed_rows_q(int type, const void* table, const int* toks, int T, int n_emb
         launch_check("embed_q8_rows");
         return true;
     }
+    if (type == 12 && n_embd % 256 == 0) {
+        const int n = n_embd / 256 * 32;
+        embed_q4k_rows_kernel<<<dim3((unsigned) ((n + 127) / 128), (unsigned) T), 128, 0, s>>>(
+            (const block_q4_K*) table, toks, n_embd, out);
+        launch_check("embed_q4k_rows");
+        return true;
+    }
     if (type == 13 && n_embd % 256 == 0) {
         const int n = n_embd / 256 * 32;
         embed_q5k_rows_kernel<<<dim3((unsigned) ((n + 127) / 128), (unsigned) T), 128, 0, s>>>(
@@ -4592,7 +4630,7 @@ bool embed_rows_q(int type, const void* table, const int* toks, int T, int n_emb
 }
 
 bool embed_rows_q_supported(int type, int n_embd) {
-    return (type == 8 && n_embd % 32 == 0) || ((type == 13 || type == 14) && n_embd % 256 == 0);
+    return (type == 8 && n_embd % 32 == 0) || ((type == 12 || type == 13 || type == 14) && n_embd % 256 == 0);
 }
 
 void kda_prep(const KdaPrepArgs& a, cudaStream_t s) {

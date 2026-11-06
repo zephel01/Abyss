@@ -58,6 +58,10 @@ class ChatTemplate:
         # GLM's own (low / high / max, or thinking off: the think block closed the way the template writes a turn
         # without reasoning).  Another model's template gets them in its own words (Qwen: low / medium / xhigh).
         self.glm_effort = "reasoning_effort in ['low', 'high']" in self.source
+        # DeepSeek V4.1 1017's template: reasoning_effort low / medium / high / max (50 / 62 / 75 / 100) or an integer
+        # 1..100, "high" when absent - the client's own value goes through (not the four levels above: its "medium"
+        # was sent as "high" and "low" as none, so both thought at the template's high)
+        self.v41_effort = "reasoning_effort is integer" in self.source and "effort_map" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -65,19 +69,28 @@ class ChatTemplate:
         if self.dsv4:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
+            raw = kwargs.pop("effort_raw", None)
             kwargs["thinking"] = not off and level != "none"
-            kwargs["reasoning_effort"] = level if level in ("high", "max") else None
+            if self.v41_effort:
+                kwargs["reasoning_effort"] = (raw if raw in ("low", "medium", "high", "max") or isinstance(raw, int)
+                                              else level if level in ("low", "high", "max") else None)
+            else:
+                kwargs["reasoning_effort"] = level if level in ("high", "max") else None
             kwargs.setdefault("bos_token", self.bos_token)
             # the template reads OpenAI's form ({"type": "function", "function": {...}}); the server's are flat
             if tools:
                 tools = [t if t.get("type") == "function" and "function" in t else {"type": "function", "function": t}
                          for t in tools]
         elif self.glm_effort:
+            kwargs.pop("effort_raw", None)
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
             kwargs["reasoning_effort"] = "low" if off else level if level in ("low", "high") else "max"
         elif kwargs.get("reasoning_effort") in QWEN_EFFORT:
+            kwargs.pop("effort_raw", None)
             kwargs["reasoning_effort"] = QWEN_EFFORT[kwargs["reasoning_effort"]]
+        else:
+            kwargs.pop("effort_raw", None)
         out = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                    **kwargs)
         if off and add_generation_prompt and out.endswith("<think>"):
@@ -110,7 +123,12 @@ def effort_level(value) -> str | None:
         return None
     if value is False:
         return "none"
+    if value is True:
+        return None
     key = str(value).strip().lower()
+    if key.isdigit():   # DeepSeek V4.1's 1..100 scale: the nearest level (low 50, high 75, max 100)
+        n = int(key)
+        return ("low" if n <= 56 else "high" if n <= 87 else "max") if 1 <= n <= 100 else None
     return (EFFORT[key] or "none") if key in EFFORT else None
 
 
@@ -121,10 +139,17 @@ def effort_kwargs(value) -> dict:
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
+    # an integer 1..100 (DeepSeek V4.1's own scale: low 50, medium 62, high 75, max 100): that template gets it as is
+    # (effort_raw), every other one the nearest of the four levels
+    if isinstance(value, int) and not isinstance(value, bool) or key.isdigit():
+        n = int(key)
+        if not 1 <= n <= 100:
+            raise ValueError(f"reasoning effort {value!r}: an integer must be 1..100")
+        return {"reasoning_effort": "low" if n <= 56 else "high" if n <= 87 else "max", "effort_raw": n}
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, high or max")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
     level = EFFORT[key]
-    return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
+    return {"enable_thinking": False} if level is None else {"reasoning_effort": level, "effort_raw": key}
 
 
 def budget_effort(tokens) -> dict:

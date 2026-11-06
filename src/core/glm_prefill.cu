@@ -596,6 +596,11 @@ struct Glm5Model::PrefillState {
 };
 
 int Glm5Model::prefill_chunk() const { return pf_ ? pf_->T : 0; }
+const char* Glm5Model::prefill_off_reason() const {
+    if (pf_ != nullptr) return vis_lent_ ? "its tail is lent to the vision encoder" : "none";
+    return "this engine has no batched prompt path (see the 'glm prefill: ... token by token' line at start-up; "
+           "--prefill off, or the pool could not lend a chunk)";
+}
 
 // --prefill as the engine reads it: STRATA_GLM_PREFILL (generate sets it from the config's args), unset = auto;
 // STRATA_GLM_PREFILL_CHUNK=N (the older knob) is --prefill N

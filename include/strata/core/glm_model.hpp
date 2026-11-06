@@ -809,6 +809,7 @@ public:
     bool prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token = -1);
     bool prefill_run(const std::vector<int32_t>& tokens, std::string& err);   // prefill() between lend and return
     int prefill_chunk() const;                             // tokens per chunk (0: no prompt path)
+    const char* prefill_off_reason() const;                // why prefill_chunk() is 0 (the line glm prefill printed)
     /// Called (from any thread) when a chunk has gone through every layer: (positions done, total); false cancels
     /// the prompt (prefill then returns false with err "cancelled" and the sequence must be reset).
     std::function<bool(int64_t, int64_t)> prefill_progress;
