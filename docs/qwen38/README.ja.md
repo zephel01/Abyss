@@ -9,7 +9,8 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
 計測は orcarouter の
 [Qwen3.8-Flash-Next-Uncensored-GGUF](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) IQ3_XXS
 （2 シャード、85.2 GB）で、AI PRO R9700（32 GB、PCIe Gen4 x4）、RAM 94 GB（`STRATA_GLM_RAM_GB=60`）、iGPU レーンありの
-環境です。NVIDIA ではこの経路をまだビルドも計測もしていません。
+環境です。NVIDIA でも動きます: RTX 5090 は v1.3.83 から、DGX Spark は v1.3.113 から（ベータ）。数字は
+[NVIDIA での計測](#nvidia-での計測rtx-5090dgx-spark)にあります。
 
 ## モデルの形
 
@@ -59,6 +60,8 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
    }
    ```
 
+   NVIDIA では `"exe": "build/strata"`、`"backend": "cuda"` にします（ほかは同じ）。
+
    起動は `.venv/bin/python serve/server.py --engine strata --config abyss-<名前>.json --port 8082` です（実際に使われる
    ポートはコマンドラインの `--port` です）。
 
@@ -73,6 +76,11 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
 | `STRATA_Q4X_DENSE=1` | オフ | デバッグ用: QSA の選択を使わず、すべてのセルに注意します |
 | `STRATA_Q4X_PLE_SYNC=1` | オフ | デバッグ用: 検証窓の PLE の行を、層 0 と並行ではなく層 0 の前に読みます |
 | `STRATA_GLM_NO_MTP=1` | オフ | `STRATA_Q4X_MTP` があってもドラフターを切ります |
+| `STRATA_GLM_PRIOR` | サーバーが設定 | v1.3.86 から、pack に自分のプロファイルが無いとき、サーバーは Abyss に入っているこのモデル用のルーティングのプロファイル（`data/expert_counts/qwen38-flash-next.txt`）を指します。エキスパートはその順に温まり、層ごとの VRAM の割り当てもルーティングに合わせます |
+
+v1.3.112 の検証窓の CUDA グラフとまとめた待ちには、それぞれのスイッチがあります（`STRATA_GLM_GRAPH`、
+`STRATA_GLM_GRAPH_MOE`、`STRATA_GLM_CPU_WAIT_COLS`、`STRATA_GLM_FETCH_COLS`、`STRATA_GLM_BG_SPLIT`）。
+[MANUAL](../MANUAL.ja.md) を見てください。
 
 ## 計測（R9700、2026-10-28）
 
@@ -93,6 +101,21 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
 品質: 5,600 トークンより後の 494 位置で llama.cpp と比べると、トークン経路で KL 0.026 / top-1 92.3%、プロンプト経路で
 0.035 / 90.9% でした。このモデルでは llama.cpp 自身の HIP と CPU の差が KL 0.045 です。貪欲生成では、下書きがあっても
 無くても同じトークンが出ます。
+
+## NVIDIA での計測（RTX 5090、DGX Spark）
+
+RTX 5090（PCIe Gen4 x4）+ RAM 94 GB、MTP ドラフターあり:
+
+| ファイル | Abyss | 結果 |
+| --- | --- | --- |
+| ISTA-DASLab GSQ-RCO IQ3_S、コンテキスト 32K | v1.3.83 | ドラフターあり 100.4 tok/s、なし 72.0。数学はどちらも 43 / 50 |
+| | v1.3.86 / v1.3.87 | `--bench` の生成 116.1 / 128.5〜129.5 tok/s。bench/ref との KL 0.0022 |
+| | v1.3.88 | プロンプト 8K 2,240〜2,376 tok/s、32K 3,002〜3,027 tok/s |
+| zephel01 の 16G64G 版 | v1.3.112 | 4K プロンプト、512 トークン（3 回の中央値）: 32 GB でドラフターあり 131.3 tok/s、なし 90.0。16 GB で 96.4 / 71.4 |
+
+DGX Spark（GB10、共有メモリ 128 GB、レンタル）、16G64G 版、v1.3.113: ドラフターありで 47.05 tok/s（CLI、4K、
+512 トークン × 3 回の中央値。なしで 31.2）、サーバー経由で 43〜54 tok/s、8K のプロンプトは約 1,040 tok/s
+（[docs/DGX-SPARK.ja.md](../DGX-SPARK.ja.md)）。
 
 ## ほかの GGUF（ベータ）
 
@@ -116,7 +139,7 @@ v1.3.76 から、速い経路で下の人気の量子化も使えます。どれ
 R9700 まるごとでの値です。かっこ内の GPU + RAM は `STRATA_GLM_VRAM_GB` と `STRATA_GLM_RAM_GB=46` で制限した値です。
 回ごとに数 tok/s ぶれます。
 
-選び方: 上から順に見て、常駐分が「GPU のメモリ + エンジンが使える RAM（RAM のおよそ 75%、`STRATA_GLM_RAM_GB`）」に
+選び方（v1.3.76、R9700、unsloth の UD 3.1 より前。新しいおすすめは[いまの選び方](#いまの選び方)）: 上から順に見て、常駐分が「GPU のメモリ + エンジンが使える RAM（RAM のおよそ 75%、`STRATA_GLM_RAM_GB`）」に
 収まる最初のファイルを選んでください。PLE 表（28.8 GB）は SSD に置いたままなので、ファイル全体が収まる必要はありません。
 
 | GPU + RAM | ファイル | 常駐分 |
@@ -186,8 +209,47 @@ iGPU レーンなしで確かめました:
 
 品質は UD-IQ1_S と 16G64G の間です。ファイルが大きいぶん VRAM に載る割合が下がり、UD-IQ1_S より遅くなります。
 
+### unsloth のほかの UD 3.1 セット（v1.3.115、ベータ）
+
+[unsloth の UD 3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) のほかの 6 セットも動きます。
+UD-IQ4_XS（33 層）と UD-Q3_K_XL（20 層）には Q5_0 の down エキスパートがあり、v1.3.115 より前のプロンプト経路は
+それを 1 つずつ FP16 に戻して読んでいました（正しいが遅い）。v1.3.115 からは、ほかの型と同じくプロンプトの MMQ を
+通ります（UD-IQ4_XS の 8K プロンプト: 1,365〜1,564 → 1,769〜1,776 tok/s）。パックは `tools/iq_pack.py --fast` で
+作ります。RTX 5090（PCIe Gen4 x4）+ RAM 94 GB（RAM 層 50 GB）、iGPU レーンなし。KL は NVFP4 教師との比較（seq 0〜9、
+コンテキスト 2,048）、生成は 4K のプロンプトで 512 トークン、3 回の中央値:
+
+| セット | 大きさ | KL（同じファイルの llama.cpp） | 1 位一致 | 32 GB ドラフターあり / なし | 16 GB あり / なし | `--check --quick` |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| UD-IQ4_XS | 93.7 GB | 0.0767（0.0757） | 89.6% | 117.0 / 81.2 tok/s | 80.9 / 64.0 | 7 / 7 |
+| UD-Q3_K_XL | 89.5 GB | 0.0840（0.0833） | 89.1% | 126.1 / 80.1 | 85.2 / 64.6 | 7 / 7 |
+| UD-IQ3_XXS | 83.6 GB | 0.0988（0.0984） | 88.1% | 133.0 / 92.7 | 87.4 / 65.3 | 7 / 7 |
+| UD-Q2_K_XL | 79.6 GB | 0.1200（0.1198） | 87.2% | 126.9 / 88.2 | 73.5 / 57.7 | 7 / 7 |
+| UD-Q2_0 | 70.5 GB | 0.1705（0.1714） | 84.6% | 139.2 / 95.7 | 64.4 / 53.0 | 7 / 7 |
+| UD-IQ1_M | 68.0 GB | 0.1898（0.1901） | 83.7% | 151.8 / 102.0 | 77.0 / 61.5 | 7 / 7 |
+
+おすすめ: GPU 32 GB + RAM 96 GB で品質を取るなら UD-IQ4_XS（自作の 16G64G の 0.083 より良い）、速さと品質の釣り合いなら
+UD-IQ3_XXS、いちばん小さく速いのは UD-IQ1_M。UD-Q2_K_XL は、品質も速さも UD-IQ3_XXS に負けます。70 GB 前後のセット
+（UD-Q2_0、UD-IQ2_XS）は RAM 64 GB の機械の候補ですが、その機械では測っていません。`tools/gguf_remote_types.py` は、
+ダウンロードせずにヘッダーだけからセットのエキスパートの型を読みます。`tools/test_unsloth_types.py` は、これらのセットの
+型と組み合わせを、エンジンがすべて扱えることを確かめます。
+
+### いまの選び方
+
+上の RTX 5090 での計測（v1.3.112〜v1.3.115）から:
+
+| GPU + RAM | ファイル |
+| --- | --- |
+| 32 GB + 96 GB、品質重視 | unsloth UD 3.1 の UD-IQ4_XS（KL 0.077） |
+| 32 GB + 96 GB、速さと品質の釣り合い | unsloth UD 3.1 の UD-IQ3_XXS（KL 0.099、ドラフターあり 133 tok/s） |
+| 16 GB + 64 GB | zephel01 の [16G64G 版](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF)（KL 0.083。16 GB でドラフターあり 96.4 tok/s） |
+| 12 GB + 32 GB | zephel01 の [12G32G 版](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)（L448: 512 個中 448 個のエキスパート、67.5 GB、ベータ） |
+| いちばん小さく速い | unsloth UD 3.1 の UD-IQ1_M（KL 0.190、32 GB でドラフターあり 152 tok/s） |
+
 ## 制限
 
-- GPU は 1 枚: 複数枚への分割はこのモデルでは試していません。ドラフターは 1 枚でモデル全体を動かすときだけ読み込まれます。
-- `--uncensor` の編集ファイルはこのモデル用にはありません（ここで使った GGUF はもともと無検閲版です）。
-- この経路の NVIDIA でのビルドは確認していません。
+- GPU 2 枚（ベータ、v1.3.109〜v1.3.110）: `--gpus 0,1` で層を分けます。ドラフターは最後のカードに置きます。分割中は会話の
+  再利用がオフです。16 GB + 16 GB の組では、`--layer-split auto` はまだ 1 枚を選びますが、層 32 で分けると長いリクエストで
+  22% 速いと測られています（#35）。コストモデルを合わせ直すまでは、手で分けてください（`--layer-split 32`）。
+- `--abl-build` / `--uncensor` は v1.3.84 からこのモデルでも動きます（[UNCENSOR](../UNCENSOR.ja.md)）。
+- AMD: v1.3.86〜v1.3.88 の高速化のいくつかは HIP では既定でオフ、v1.3.112 のグラフは CUDA だけです。AMD のカードでは
+  動かしていません。

@@ -1039,7 +1039,7 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k mxfp4 nvfp4)   # mxfp4: deepseek4 experts; nvfp4: NVIDIA FP4 checkpoints; q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/maya/QUANT-PLAN.md)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_0 iq1_s q2_k q3_k q4_k q5_k q6_k mxfp4 nvfp4)   # mxfp4: deepseek4 experts; nvfp4: NVIDIA FP4 checkpoints; q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/maya/QUANT-PLAN.md)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
@@ -1078,7 +1078,7 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k mxfp4 nvfp4)   # mxfp4: deepseek4 (moe_mmq.cu's case 39), nvfp4 (case 40)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_0 iq1_s q2_k q3_k q4_k q5_k q6_k mxfp4 nvfp4)   # mxfp4: deepseek4 (moe_mmq.cu's case 39), nvfp4 (case 40)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)

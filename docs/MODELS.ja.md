@@ -34,7 +34,7 @@ unsloth の 0731（12 万）、0xSero の EXL3（11 万）。この大きさ（�
 | huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF（0422） | 約 87〜100 GB | 未計測 | 未計測 | – | 動くか未確認 |
 | `UD-Q2_K_XL`（[unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)、セットアップの既定。attention を Q5_K にした pack が既定、KL 0.0055 → 0.0119） | 96.8 GB | llama.cpp との KL 0.0096。swe-bench 60 問 × 5: 59/60 解決、pass@1 95.8%（v1.3.27） | 5090: swe 60 問 106.7 tok/s（v1.3.27）、1 トークンずつ 92〜95。R9700 + レーン + DSpark: swe 60 問 70.2（v1.3.43 直前のビルド） | VRAM 32 GB + RAM 約 70 GB で全エキスパートが載る | **既定。まずこれ** |
 | 0xSero の DGX-Spark 向け EXL3 | – | 未計測 | – | – | DeepSeek の EXL3 はまだ読めない |
-| DSpark ドラフトモデル `DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`（[bleysg](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`） | 6.94 GB | 答えは変わらない（受理するのは本体のサンプルと一致したものだけ） | R9700、swe 6 問: レーンなし 48.4 → 61.9、レーンあり 51.7 → 67.3 tok/s（v1.3.43） | VRAM 6.5 GB 追加（その分のエキスパートは SSD へ） | R9700 で速さが欲しいとき。NVIDIA では未計測 |
+| DSpark ドラフトモデル `DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`（[bleysg](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`） | 6.94 GB | 答えは変わらない（受理するのは本体のサンプルと一致したものだけ） | R9700、swe 6 問: レーンなし 48.4 → 61.9、レーンあり 51.7 → 67.3 tok/s（v1.3.43） | VRAM 6.5 GB 追加（その分のエキスパートは SSD へ） | R9700 で速さが欲しいとき。DGX Spark では 21.0 → 22.8 tok/s（v1.3.114） |
 
 lossy な設定（V4 0731、5090、v1.2.1 / v1.3.2x）: `STRATA_GLM_TAIL_SKIP=4` は 1 トークンずつ +7%（iGPU レーン）、KL 0.0226。
 `STRATA_GLM_DEFER=1` は +12〜15%、KL 0.08（オフ 0.012）、L7 の解決 14 → 13 問。`TAIL_SKIP=1` / `=2` の KL は未計測。
@@ -106,11 +106,28 @@ GiB、手順は[VRAM の小さいカード](SMALL-VRAM.ja.md)）。そこでは 
 | --- | ---: | --- | --- | --- |
 | `UD-Q4_K_XL`（[unsloth/Ornith-1.5-122B-GGUF](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)） + NextN ドラフト（`tools/nextn_pack.py`） | 79.7 GB + 1.5 GB | llama.cpp との KL 0.024（v1.3.46）。swe-bench L7: 11/16 解決（v1.3.49） | R9700 + レーン: 1 トークンずつ 41〜43、NextN でコード 59 / 文章 50（v1.3.46）、19K の後 51.0（v1.3.49）、swe L7 54.9 tok/s（v1.3.49）。レーンなし: コード 42 / 文章 39（v1.3.46） | 40〜50 tok/s を SSD なしで |
 | `UD-IQ3_XXS`（unsloth） | 49.5 GB | 未計測 | ユーザー報告のみ（下の #8） | 16 GB のカード向け |
+| `IQ3_XXS-B`（[zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)） | 51.7 GB | KL は UD-IQ3_XXS とほぼ同じ（0.138〜0.140）。swe-bench 60 問中 56 問解決 | 5090、`--model ornith` が書く設定: 116 tok/s、NextN の下書きの採用率 75%（v1.3.100） | GPU 16 GB + RAM 64 GB |
+
+### Qwen3.8-Flash-Next（qwen4exp）
+
+詳細、pack、ドラフターは [docs/qwen38](qwen38/README.ja.md)。KL は特に書かない限り NVFP4 教師との比較（seq 0〜9、
+コンテキスト 2,048）。速さは 4K のプロンプトで 512 トークン、3 回の中央値、MTP ドラフターあり、RTX 5090（PCIe Gen4 x4）+
+RAM 94 GB、iGPU レーンなし。
+
+| ファイル（入手先） | サイズ | 品質 | 速さ | おすすめ |
+| --- | ---: | --- | --- | --- |
+| UD 3.1 `UD-IQ4_XS`（[unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)、ベータ） | 93.7 GB | KL 0.077（同じファイルの llama.cpp は 0.076） | 32 GB: 117.0、16 GB: 80.9（v1.3.115） | 32 GB + 96 GB で品質重視 |
+| UD 3.1 `UD-IQ3_XXS`（unsloth、ベータ） | 83.6 GB | KL 0.099 | 32 GB: 133.0、16 GB: 87.4（v1.3.115） | 速さと品質の釣り合い |
+| UD 3.1 `UD-IQ1_M`（unsloth、ベータ） | 68.0 GB | KL 0.190 | 32 GB: 151.8、16 GB: 77.0（v1.3.115） | いちばん小さく速い |
+| `16G64G`（[zephel01/Qwen3.8-Flash-Next-16G64G-GGUF](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF)、ベータ） | モデルカード参照 | KL 0.083 | 32 GB: 131.3、16 GB: 96.4（v1.3.112）。DGX Spark 47.05（v1.3.113） | GPU 16 GB + RAM 64 GB |
+| `12G32G` L448（[zephel01/Qwen3.8-Flash-Next-12G32G-GGUF](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)、512 個中 448 個のエキスパート、ベータ） | 67.5 GB | 本ページの尺度では未計測 | 本ページの尺度では未計測 | GPU 12 GB + RAM 32 GB |
+| ISTA-DASLab GSQ-RCO `IQ3_S` | 83.6 GB | llama.cpp との KL 0.026（R9700、v1.3.76） | 5090、コンテキスト 32K: `--bench` 128.5〜129.5（v1.3.87）。プロンプト 8K 2,240〜2,376、32K 3,002〜3,027（v1.3.88） | – |
+| magnitudedev `NVFP4` | 127.8 GB | llama.cpp との KL 0.015 / 0.018（トークン経路 / プロンプト経路） | 5090 + 96 GB: swe 3 問 105.3、32K プロンプト 2,515（v1.3.101） | Blackwell の FP4 でプロンプト経路 |
 
 ## 2. GPU 別の参考ベンチマーク（作者の環境）
 
-RTX 5090 の値はすべて **2026-10-23 の SSD 交換より前**（ORICO 約 3.4 GB/s）。5090 は今は外していて、交換後の SSD・ISTA・UD-IQ1_S・
-V4.1 DSpark の 5090 での値は次に付けたときにまとめて測ります。
+RTX 5090 の v1.3.38 までの値は **2026-10-23 の SSD 交換より前**（ORICO 約 3.4 GB/s）。5090 は 2026-10-31 に戻し、v1.3.82
+以降の行は NM790 での値です。V4.1 の ISTA と UD-IQ1_S は 5090 で測り直していません。
 
 | モデル / ファイル | 項目 | RTX 5090 + 8060S レーン | AI PRO R9700 単体（CPU レーン） | R9700 + 8060S レーン | RTX 3090（USB4）+ レーン |
 | --- | --- | --- | --- | --- | --- |
@@ -124,17 +141,40 @@ V4.1 DSpark の 5090 での値は次に付けたときにまとめて測りま�
 | V4.1 UD-IQ1_S + TAIL_SKIP（KL 0.359） | 1 トークンずつ | 45.6（v1.3.38） | 未計測 | 31.9（v1.3.46） | 未計測 |
 | | swe 8 問（NM790） | 未計測 | 未計測 | 43.7（+ affinity、KL 0.3573）、DSpark 54.4（2026-10-24） | 未計測 |
 | V4.1 ISTA IQ2_XXS + TAIL_SKIP（KL 0.3266） | swe 8 問（NM790） | 未計測 | 未計測 | 42.2 / 41.3、DSpark 48.3 / 47.3（2026-10-24） | 未計測 |
-| GLM Maya-S-v2 | 1 トークンずつ | 64.7〜75.4（v1.3.27） | 未計測 | 34.3〜38.3（v1.3.40） | 40.5〜42.4（v1.3.27） |
+| V4.1 UD-IQ2_XXS、コンテキスト 64K | `--bench` の生成 / 8K prompt（DSpark なし） | 23.1 / 357（v1.3.82）、22.9 / 360（v1.3.87） | 未計測 | 未計測 | 未計測 |
+| | swe 3 問、普段の設定 + DSpark | 51.0（v1.3.89） | 未計測 | 未計測 | 未計測 |
+| GLM Maya-S-v2 | 1 トークンずつ | 64.7〜75.4（v1.3.27）。`--bench` 64.0〜64.6（v1.3.82〜87） | 未計測 | 34.3〜38.3（v1.3.40） | 40.5〜42.4（v1.3.27） |
 | | swe 6 問 | 64.1（v1.3.27） | 25.8（v1.3.39） | 35.8（v1.3.39） | 39.7（v1.3.27） |
+| | prompt 8K | 1,087〜1,113（v1.3.82〜87） | 未計測 | 未計測 | 未計測 |
 | GLM EXL3 sc_2.10bpw | 1 トークンずつ | 約 53（v1.3.36） | 未計測 | 未計測 | 未計測 |
 | GLM exlr8 K2 | 1 トークンずつ | 未計測 | 未計測 | 約 22.9（2026-10-24） | 未計測 |
 | GLM exlr8 K3 | 1 トークンずつ | 未計測 | 未計測 | 約 11.2（2026-10-24） | 未計測 |
 | Ornith UD-Q4_K_XL + NextN | コード / 文章 | 未計測 | 42 / 39（v1.3.46） | 59 / 50（v1.3.46） | 未計測 |
 | | swe L7 | 未計測 | 未計測 | 54.9（v1.3.49） | 未計測 |
+| Qwen3.8 ISTA IQ3_S + MTP | `--bench` の生成 | 128.5〜129.5（v1.3.87） | 未計測 | 文章 51 / コード 77（v1.3.76） | 未計測 |
+| Qwen3.8 16G64G + MTP | 4K プロンプト、512 トークン | 32 GB で 131.3、16 GB で 96.4（v1.3.112） | 未計測 | 未計測 | 未計測 |
 
 V4.1 の R9700 の 1 トークンずつの値は 8 系列の平均で、ORICO の SSD（2026-10-22）。swe 8 問は NM790 に替えた後。
 R9700 単体の UD-IQ1_S は 1 トークンずつ約 22.7 tok/s（44.0 ms、v1.3.46。TAIL_SKIP の有無は記載なし）。
 5090 + 3090 で層を分けると 5090 1 枚より遅い（87〜90 tok/s、v1.3.25 前後）。
+
+### DGX Spark
+
+レンタルの DGX Spark（GB10、共有メモリ 128 GB）、Abyss v1.3.113〜v1.3.114（2026-11-05 / 06）、ベータ
+（[DGX Spark](DGX-SPARK.ja.md)）:
+
+| モデル / ファイル | 生成 | prompt |
+| --- | --- | --- |
+| Qwen3.8 16G64G + MTP（v1.3.113） | 47.05 tok/s（CLI、4K、512 トークン × 3 回の中央値。なしで 31.2）。サーバー経由で 43〜54 | 8K 約 1,040 tok/s |
+| GLM-5.3-Flash Maya-S-v2 IQ2_XXS / unsloth UD-IQ2_XXS | 19〜20 tok/s（ここでは MTP ドラフターの効果なし） | 8K 730〜750 tok/s。CLI で 32K 675〜796 |
+| DeepSeek V4 0731 | 21.0 tok/s、DSpark ありで 22.8（下書きの採用率 78%） | 8K 814 tok/s |
+| DeepSeek V4.1 Compact JA256（207 GB、メモリに収まらない） | 約 18 tok/s | 未計測 |
+
+同じ Spark の llama.cpp（8K prompt、コンテキスト 4K 分を埋めた状態）: V4 0731 は 20.2 tok/s / prompt 360、GLM は 19.3 / 321。
+Abyss は生成が同じかそれより速く、prompt は約 2.3 倍速く読みます。既知の問題（未解決、Spark だけで出る）: サーバー経由では
+32K〜121K の prompt が約 120〜130 tok/s で、CLI の 675〜796 より遅くなります。調査中です（RTX 5090 では出ません）。
+v1.3.115 から、ほかのプロセスが共有メモリを 16 GB より多く使っていて、そのためにエキスパートが収まらないときは、エンジンは
+起動しません（`STRATA_GLM_UMA_SHARE=1` で起動を続け、`STRATA_GLM_UMA_OTHERS_GB` で上限を変えられます）。
 
 ## 3. ユーザー報告（参考）
 
@@ -159,6 +199,10 @@ GitHub の issue で利用者が報告した値です。**利用者が測った�
 | #1 | AI PRO R9700 + i5-14400F + RAM 128 GB、Ubuntu（ROCm 7.0、v1.3.42 から ROCm 10） | v1.3.20 | V4 0731 UD-Q2_K_XL | 既定 | 28.4〜31.1、温まると 36.6 |
 | #1 | 同上 | v1.3.31 | 同上、393K コンテキスト | 既定 | 291K の prompt を 279 tok/s で読み、生成 19.5 |
 | #1 | 同上 | v1.3.35 / v1.3.37 / v1.3.42 | V4.1 nazeshinjite Q2、RAM 層 80 GB | `TAIL_SKIP=3` + `_DISK=1`（KL 0.241） | 24〜28 / 30.5 / 22〜25。8K prompt 42〜48 → 60（v1.3.42） |
+| #23 | RTX A2000 Laptop 8 GB + RAM 64 GB、PCIe Gen4 x8 | v1.3.82 より前 | GLM Maya-S-v2（IQ4_XS の dense pack）、Ornith IQ3_XXS-B | route より小さいエキスパートの置き場（8 スロット中 6） | GLM 4〜4.7（512 GB の SSD の読みが上限）。v1.3.82 でこうした置き場でも起動し、prompt をまとめて読めるようになった（[VRAM の小さいカード](SMALL-VRAM.ja.md)） |
+| #31 | RTX 4090 + RAM 96 GB、Windows | v1.3.107 より前 | – | `STRATA_GLM_RAM_GB=72` | –（約 20K トークンからの prompt が失敗し、約 40K からエンジンが落ちた。v1.3.107 で、CPU 分担の pinned バッファが確保できないときは PCIe に回すようにした） |
+| #35 | 16 GB の GeForce 2 枚 | v1.3.109〜v1.3.110 | Qwen3.8-Flash-Next、GPU 2 枚への分割（ベータ） | `--layer-split 32` と 1 枚の比較 | –（長いリクエストで分割が 22% 速い。`auto` はまだ 1 枚を選ぶので、手で分ける） |
+| #37 | DGX Spark | v1.3.113〜v1.3.114 | – | `./abyss.sh --check`、`--gpu-tune` | –（短くて正しい日本語の答えが `--check` で不合格になった。v1.3.114 で修正。`--gpu-tune` は v1.3.115 から手でビルドしたエンジンを見つける） |
 
 #8 の行と #11 の「レーン有効」の行は、iGPU レーンが誤って 9070 XT 自身の上で動いた状態で測ったもの（iGPU が見えないとき、
 レーンがエンジンのカードに落ちていた。issue #11、v1.3.54 で修正）。レーンを切ると V4.1 で約 30%、Ornith で 40〜50% 速い。

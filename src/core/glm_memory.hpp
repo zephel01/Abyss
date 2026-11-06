@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 
 namespace strata::core::glmfast {
@@ -46,6 +47,23 @@ inline size_t uma_ram_tier(size_t budget, size_t pool_bytes) { return budget > p
 // go through.  Everything this process allocates BEFORE the pool (dense weights, KV, prompt buffers) is already out of
 // MemAvailable when the pool is priced, so it is not in the headroom.
 inline double uma_headroom_default_gb(bool hip) { return hip ? 16.0 : 8.0; }
+
+// the shared memory other processes hold, GB: MemTotal - MemAvailable - what this process already allocated (page
+// cache is in MemAvailable, so it does not count).  A DGX Spark with nothing else running: about 5 GB (the OS, the
+// server); with a second GLM engine left running: about 95 GB
+inline double uma_others_gb(int64_t mem_total, int64_t mem_available, int64_t held) {
+    const int64_t o = mem_total - mem_available - held;
+    return mem_total > 0 && mem_available > 0 && o > 0 ? (double) o / 1073741824.0 : 0.0;
+}
+
+// stop instead of starting: other processes hold more than STRATA_GLM_UMA_OTHERS_GB (default 16) AND the experts do
+// not fit because of it.  A model that is bigger than the machine (V4.1 on one Spark) on a machine with nothing else
+// running is not stopped: there "others" is small
+inline bool uma_others_block(double others_gb, bool experts_short) {
+    const char* v = std::getenv("STRATA_GLM_UMA_OTHERS_GB");
+    const double lim = v != nullptr && v[0] != '\0' ? std::atof(v) : 16.0;
+    return experts_short && lim > 0.0 && others_gb > lim;
+}
 
 // STRATA_GLM_UMA_DIRECT: the device reads RAM-tier experts IN PLACE (their pinned host address in the plan) instead
 // of copying them into a VRAM slot first.  Unset: `integrated` (fast_setup passes false - the copy mode is the default

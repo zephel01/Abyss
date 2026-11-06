@@ -9,7 +9,8 @@ fast path is several times faster on prompts and faster on answers.
 Measured with orcarouter's
 [Qwen3.8-Flash-Next-Uncensored-GGUF](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) IQ3_XXS
 (two shards, 85.2 GB) on an AI PRO R9700 (32 GB, PCIe Gen4 x4), 94 GB of RAM (`STRATA_GLM_RAM_GB=60`) and the iGPU
-lane. NVIDIA: not built or measured on this path yet.
+lane. NVIDIA runs it too: an RTX 5090 from v1.3.83 and a DGX Spark from v1.3.113 (beta); their numbers are under
+[Measured on NVIDIA](#measured-on-nvidia-rtx-5090-dgx-spark).
 
 ## The model
 
@@ -58,6 +59,8 @@ lane. NVIDIA: not built or measured on this path yet.
    }
    ```
 
+   On NVIDIA: `"exe": "build/strata"` and `"backend": "cuda"` (the rest the same).
+
    Start it with `.venv/bin/python serve/server.py --engine strata --config abyss-<name>.json --port 8082` (the
    `--port` on the command line is the one used).
 
@@ -72,6 +75,11 @@ lane. NVIDIA: not built or measured on this path yet.
 | `STRATA_Q4X_DENSE=1` | off | debug: dense attention everywhere instead of QSA's selection |
 | `STRATA_Q4X_PLE_SYNC=1` | off | debug: the verify window reads its PLE rows before layer 0 instead of during it |
 | `STRATA_GLM_NO_MTP=1` | off | the drafter off even with `STRATA_Q4X_MTP` set |
+| `STRATA_GLM_PRIOR` | set by the server | from v1.3.86 the server points it at the routing profile Abyss ships for this model (`data/expert_counts/qwen38-flash-next.txt`) when the pack has none of its own: the experts warm in its order and each layer gets a VRAM share by its routing |
+
+The verify window's CUDA graphs and batched waits of v1.3.112 have their own switches (`STRATA_GLM_GRAPH`,
+`STRATA_GLM_GRAPH_MOE`, `STRATA_GLM_CPU_WAIT_COLS`, `STRATA_GLM_FETCH_COLS`, `STRATA_GLM_BG_SPLIT`): see the
+[MANUAL](../MANUAL.md).
 
 ## Measured (R9700, 2026-10-28)
 
@@ -92,6 +100,21 @@ code; a window costs 30 ms against 18.6 ms for a token alone.
 Quality: against llama.cpp on 494 positions past 5,600 tokens, KL 0.026 / top-1 92.3% (the token path) and 0.035 /
 90.9% (the prompt path); llama.cpp's own HIP-vs-CPU difference on this model is KL 0.045. Greedy answers with and
 without drafts are the same tokens.
+
+## Measured on NVIDIA (RTX 5090, DGX Spark)
+
+RTX 5090 (PCIe Gen4 x4) + 94 GB RAM, MTP drafter on:
+
+| File | Abyss | Result |
+| --- | --- | --- |
+| ISTA-DASLab GSQ-RCO IQ3_S, ctx 32K | v1.3.83 | 100.4 tok/s with the drafter, 72.0 without; math 43 / 50 either way |
+| | v1.3.86 / v1.3.87 | `--bench` decode 116.1 / 128.5-129.5 tok/s; KL against bench/ref 0.0022 |
+| | v1.3.88 | prompts 8K 2,240-2,376 tok/s, 32K 3,002-3,027 tok/s |
+| zephel01's 16G64G build | v1.3.112 | 4K prompt, 512 tokens (median of 3): 32 GB 131.3 tok/s with the drafter, 90.0 without; 16 GB 96.4 / 71.4 |
+
+DGX Spark (GB10, 128 GB unified memory, rented), the 16G64G build, v1.3.113: 47.05 tok/s with the drafter (CLI, 4K,
+median of 3 x 512 tokens; 31.2 without), 43-54 tok/s through the server, 8K prompts ~1,040 tok/s
+([docs/DGX-SPARK.md](../DGX-SPARK.md)).
 
 ## Other GGUFs (beta)
 
@@ -115,9 +138,10 @@ better); "Engine vs llama.cpp" is Abyss against llama.cpp on the same file (the 
 iGPU lane on the whole R9700; the GPU + RAM figures in brackets cap the engine with `STRATA_GLM_VRAM_GB` and
 `STRATA_GLM_RAM_GB=46`. Runs vary by several tok/s.
 
-Which to pick: go down this list and take the first file whose resident part fits in your GPU's memory + the RAM
-the engine may use (about 75% of the RAM: `STRATA_GLM_RAM_GB`). The PLE table (28.8 GB) stays on the SSD, so the
-file's full size does not have to fit.
+Which to pick (v1.3.76, the R9700, before unsloth's UD 3.1 upload; for newer picks see
+[Which to pick now](#which-to-pick-now)): go down this list and take the first file whose resident part fits in your
+GPU's memory + the RAM the engine may use (about 75% of the RAM: `STRATA_GLM_RAM_GB`). The PLE table (28.8 GB) stays
+on the SSD, so the file's full size does not have to fit.
 
 | Your GPU + RAM | File | Resident |
 | --- | --- | ---: |
@@ -186,9 +210,48 @@ off:
 
 Between UD-IQ1_S and the 16G64G build in quality; slower than UD-IQ1_S because less of the larger file fits in VRAM.
 
+### unsloth's other UD 3.1 sets (v1.3.115, beta)
+
+Six more sets of [unsloth's UD 3.1 upload](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) run. UD-IQ4_XS
+(33 layers) and UD-Q3_K_XL (20 layers) have Q5_0 down experts, which the prompt path read one expert at a time in
+FP16 before v1.3.115 (correct, slower); they now go through the prompt's MMQ like the other types (UD-IQ4_XS 8K
+prompt 1,365-1,564 -> 1,769-1,776 tok/s). Make each pack with `tools/iq_pack.py --fast`. RTX 5090 (PCIe Gen4 x4) +
+94 GB RAM (50 GB RAM tier), iGPU lane off; KL to the NVFP4 teacher (seq 0-9, 2,048 context); decode 4K prompt,
+512 tokens, median of 3:
+
+| Set | Size | KL (llama.cpp, same file) | Same top token | 32 GB with / without the drafter | 16 GB with / without | `--check --quick` |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| UD-IQ4_XS | 93.7 GB | 0.0767 (0.0757) | 89.6% | 117.0 / 81.2 tok/s | 80.9 / 64.0 | 7 / 7 |
+| UD-Q3_K_XL | 89.5 GB | 0.0840 (0.0833) | 89.1% | 126.1 / 80.1 | 85.2 / 64.6 | 7 / 7 |
+| UD-IQ3_XXS | 83.6 GB | 0.0988 (0.0984) | 88.1% | 133.0 / 92.7 | 87.4 / 65.3 | 7 / 7 |
+| UD-Q2_K_XL | 79.6 GB | 0.1200 (0.1198) | 87.2% | 126.9 / 88.2 | 73.5 / 57.7 | 7 / 7 |
+| UD-Q2_0 | 70.5 GB | 0.1705 (0.1714) | 84.6% | 139.2 / 95.7 | 64.4 / 53.0 | 7 / 7 |
+| UD-IQ1_M | 68.0 GB | 0.1898 (0.1901) | 83.7% | 151.8 / 102.0 | 77.0 / 61.5 | 7 / 7 |
+
+Picks: UD-IQ4_XS for quality on 32 GB + 96 GB (better than the 16G64G build's 0.083), UD-IQ3_XXS for speed and
+quality together, UD-IQ1_M for the smallest and fastest. UD-Q2_K_XL loses to UD-IQ3_XXS on both. The sets around
+70 GB (UD-Q2_0, UD-IQ2_XS) are the candidates for 64 GB of RAM, not measured on such a machine.
+`tools/gguf_remote_types.py` reads a set's expert types from its headers without downloading it, and
+`tools/test_unsloth_types.py` checks that the engine takes every type and pairing of these sets.
+
+### Which to pick now
+
+From the RTX 5090 runs above (v1.3.112-v1.3.115):
+
+| Your GPU + RAM | File |
+| --- | --- |
+| 32 GB + 96 GB, quality | unsloth UD 3.1 UD-IQ4_XS (KL 0.077) |
+| 32 GB + 96 GB, speed and quality | unsloth UD 3.1 UD-IQ3_XXS (KL 0.099, 133 tok/s with the drafter) |
+| 16 GB + 64 GB | zephel01's [16G64G build](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF) (KL 0.083; 16 GB: 96.4 tok/s with the drafter) |
+| 12 GB + 32 GB | zephel01's [12G32G build](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF) (L448: 448 of 512 experts, 67.5 GB, beta) |
+| the smallest and fastest | unsloth UD 3.1 UD-IQ1_M (KL 0.190, 152 tok/s with the drafter at 32 GB) |
+
 ## Limits
 
-- One GPU: a split across cards has not been tried with this model, and the drafter loads only when one card runs
-  the whole model.
-- `--uncensor` has no file for this model (the GGUF used here is already uncensored).
-- NVIDIA builds of this path have not been checked.
+- Two GPUs (beta, v1.3.109-v1.3.110): `--gpus 0,1` splits the layers, the drafter on the last card; conversation
+  reuse is off under a split. On a 16 GB + 16 GB pair `--layer-split auto` still picks one card where a split at
+  layer 32 measured 22% faster on long requests (#35): set the split by hand (`--layer-split 32`) until the cost model
+  is refitted.
+- `--abl-build` / `--uncensor` work on this model from v1.3.84 ([UNCENSOR](../UNCENSOR.md)).
+- AMD: several of the v1.3.86-v1.3.88 speed-ups are off by default on HIP, and the v1.3.112 graphs are CUDA only;
+  they were not run on an AMD card.

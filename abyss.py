@@ -2153,13 +2153,23 @@ def gpu_tune(a) -> int:
     backend = a.backend or (read_json(cfgs[0]).get("backend", "cuda") if cfgs else ("hip" if S.amd_gpus() else "cuda"))
     cfgs = [p for p in cfgs if read_json(p).get("backend", "cuda") == backend]
     select_build_backend(backend)
-    tool = BUILD / ("abyss_gpu_tune.exe" if WIN else "abyss_gpu_tune")
+    tool_name = "abyss_gpu_tune.exe" if WIN else "abyss_gpu_tune"
+    tool = BUILD / tool_name
+    if not tool.exists() and not (BUILD / "CMakeCache.txt").exists():
+        # an engine built by hand in another folder (build-cuda, a DGX Spark kit; issue #37 "not built here yet"):
+        # the build folder of the engine the configs run
+        for p in cfgs:
+            d = Path(str(read_json(p).get("exe") or "")).parent
+            if str(d) not in ("", ".") and ((d / tool_name).exists() or (d / "CMakeCache.txt").exists()):
+                tool = d / tool_name
+                break
+    build_dir = tool.parent
     if not tool.exists():
-        if not (BUILD / "CMakeCache.txt").exists():
+        if not (build_dir / "CMakeCache.txt").exists():
             fail(f"the {backend.upper()} engine is not built here yet", f"run {ME} --setup first")
         say("  Compiling the GPU check (abyss_gpu_tune) ...")
         cmake = shutil.which("cmake") or "cmake"
-        if subprocess.run([cmake, "--build", str(BUILD), "--target", "abyss_gpu_tune", "-j", str(os.cpu_count() or 4)]
+        if subprocess.run([cmake, "--build", str(build_dir), "--target", "abyss_gpu_tune", "-j", str(os.cpu_count() or 4)]
                           ).returncode != 0 or not tool.exists():
             fail("abyss_gpu_tune did not compile", f"{ME} --setup --rebuild compiles the engine again")
     if not WIN and subprocess.run(["pgrep", "-x", "strata"], capture_output=True).returncode == 0:

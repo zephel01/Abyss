@@ -7,6 +7,30 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.115 - 2026-11-06
+
+- **unsloth's other UD 3.1 sets of Qwen3.8-Flash-Next run** (beta): UD-IQ4_XS, UD-Q3_K_XL, UD-IQ3_XXS, UD-Q2_K_XL,
+  UD-Q2_0 and UD-IQ1_M. Their Q5_0 down experts (UD-IQ4_XS: 33 layers, UD-Q3_K_XL: 20) now go through the prompt's
+  MMQ instead of one expert at a time in FP16 (UD-IQ4_XS 8K prompt 1,365-1,564 -> 1,769-1,776 tok/s). RTX 5090:
+  KL 0.077 (UD-IQ4_XS) to 0.190 (UD-IQ1_M), each within 0.001 of llama.cpp on the same file; 117-152 tok/s with the
+  MTP drafter at 32 GB; `./abyss.sh --check --quick` 7 / 7 for all six ([docs/qwen38](docs/qwen38/README.md)).
+  `tools/gguf_remote_types.py` reads a set's expert types from its headers without a download, and
+  `tools/test_unsloth_types.py` checks the engine takes every type and pairing of these sets.
+- **An integrated GPU (DGX Spark) no longer starts on memory another process holds**: when other processes hold more
+  than 16 GB of the shared memory and the experts no longer fit because of it, the engine stops at load and names the
+  biggest ones. A second engine left running had made one start on 20 GB of free memory and the machine ran out of
+  memory. `STRATA_GLM_UMA_SHARE=1` starts anyway, `STRATA_GLM_UMA_OTHERS_GB` sets the limit; a model bigger than the
+  machine with nothing else running is not stopped.
+- **Saved conversations are written to disk in the background**: the next prompt no longer waits for the file. On a
+  machine with little free RAM for the page cache the 0.25 GB write took 5-50 s before the prompt started.
+- `./abyss.sh --gpu-tune` finds an engine built by hand in another folder (the configs' `exe`, e.g. `build-cuda`)
+  instead of stopping with "not built here yet" (issue #37).
+- **Docs caught up** (English and Japanese): DGX Spark results for GLM-5.3-Flash (19-20 tok/s), DeepSeek V4 0731
+  (21.0, 22.8 with DSpark) and V4.1 against llama.cpp on the same box, and the open issue (GLM's long prompts through
+  the server ~120-130 tok/s on the Spark only); our Qwen3.8 16G64G / 12G32G builds; the NVIDIA results that several
+  pages still called "not built / not measured" (Qwen3.8, Ornith, DSpark); V4.1's one-command setup, images and
+  DSpark in the MANUAL; the Qwen3.8 two-GPU split result (#35); `/health`'s 503 while loading.
+
 ## v1.3.114 - 2026-11-06
 
 - **unsloth's UD 3.1 UD-IQ2_XS of Qwen3.8-Flash-Next (75.8 GB) runs** (beta). One of its layers has Q5_0 down

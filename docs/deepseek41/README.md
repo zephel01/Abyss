@@ -170,7 +170,8 @@ and texts as below (AI PRO R9700 + 8060S lane, 60 GB RAM tier, Lexar NM790 SSD, 
 ```
 
 **The DSpark drafter** (v1.3.53, opt-in): Lucebox's DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf
-(`deepseek41-dflash-draft`, 4.9 GB) proposes up to five tokens; the model verifies them, so it does not change what is
+(`deepseek41-dflash-draft`, 4.9 GB; its Hugging Face repository is no longer there, so the setup does not install it -
+v1.3.100 - and a copy you already have is set by hand) proposes up to five tokens; the model verifies them, so it does not change what is
 sampled. `STRATA_DS4_DSPARK=<file> STRATA_DS4_DSPARK_CHAIN=0.6` in the config's `env`. swe-bench 8 tasks on UD-IQ1_S:
 40.4 -> 46.7 tok/s (+16%, 4 runs, Lexar NM790); on the old ~3.4 GB/s SSD it measured no gain, since a verify window's
 columns wait on the disk. With an iGPU, leave its lane on: the windows are CPU-lane bound and the lane takes part of that work (+25-33% above). Its 1.67 GB of VRAM (dense 0.46 GB, 48 / 40 / 24 expert slots a stage) come out of the expert pool.
@@ -308,14 +309,14 @@ Quality is measured against the unquantized 1017's top-256 log-probs on Lucebox'
 | hybrid: Lucebox Q8_0 dense + 8-bit Engram, mrfakename Q2_K/Q3_K experts | 118 ms/token (8.5 tok/s) | 0.168 | 83.4% | 9.25 |
 | (Lucebox ROCMFP2S-IM1017, their numbers) | - | 0.253 | 78.7% | 9.78 |
 
-swe-bench with the config above (v1.3.31, a partial run: the first 35 of 60 tasks x 5; the full run is still owed): of those 35 tasks it resolved 34 (quality 84.9;
+swe-bench with the config above (v1.3.31, the first 35 of 60 tasks x 5): of those 35 tasks it resolved 34 (quality 84.9;
 DeepSeek V4 Flash 35 and 85.0) at **51.6 tok/s** end to end, 38-59 a task (V4 Flash on the same 35 tasks: 107.2).
 The engine averaged 19.1 ms a token over those 175 answers: 15.3 ms where it read under 0.5 experts a token from the
-SSD, 28.2 ms past 1.5. The run is valid only up to task 35, where a 15K-token reasoning hit the 16K bug fixed in
-v1.3.32; a full re-run is pending. On the 16 long tasks of the L7 set it resolved 14 at 28.9 tok/s.
+SSD, 28.2 ms past 1.5. The run stops at task 35, where a 15K-token reasoning hit the 16K bug fixed in v1.3.32; the
+later tasks were not run with this config. On the 16 long tasks of the L7 set it resolved 14 at 28.9 tok/s.
 
 On the same GGUF Abyss matches llama.cpp's V4.1 pull request (teacher KL 0.639 against 0.636). The prompt path
-(batched MoE, the attention a token at a time) agrees with the token path at KL 0.013; a chat's next turn reuses the
+(batched MoE; in v1.3.31 the attention ran a token at a time, batched since v1.3.60) agrees with the token path at KL 0.013; a chat's next turn reuses the
 previous state (1,132-token turn: 44 s -> 4.7 s of prompt, identical text). Prompts are slow: on the hybrid pack a
 1K-token prompt took ~27 s with 8 SSD readers, most of it reading the experts the prompt touches.
 
@@ -352,6 +353,6 @@ but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead; r
 ## Not yet for V4.1
 
 MTP drafts from the model's own layers (the 1017 FP8 release has three MTP layers; no GGUF carries them - the DSpark
-drafter above, v1.3.53, is the opt-in alternative), conversation slots on disk, a layer split, and the
-one-command setup. Images work in a limited way (see the Images row in SPEC.md section 8): the `vision` entry of the config is written by hand, and large or several pictures and the GPU encoder are untried. The prompt's attention has been batched since v1.3.60 (it ran a token at a time, ~5 ms each,
+drafter above, v1.3.53, is the opt-in alternative), conversation slots on disk and a layer split. (The
+one-command setup is there from v1.3.100: `./setup-deepseek.sh --model v41`, above.) Images work in a limited way (see the Images row in SPEC.md section 8): the `vision` entry of the config is written by hand, and large or several pictures and the GPU encoder are untried. The prompt's attention has been batched since v1.3.60 (it ran a token at a time, ~5 ms each,
 before).

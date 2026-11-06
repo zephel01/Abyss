@@ -6,8 +6,8 @@ v1.3.113 から、Abyss は DGX Spark でビルドして動かせます。DGX Sp
 （sm_121）が、128 GB の LPDDR5X を 1 つのメモリとして分け合う機械です。ほかの GB10 の機械（ASUS Ascent GX10 など）も
 同じチップですが、まだ動かしていません。
 
-測ったもの: 借りた DGX Spark で 1 日、**Qwen3.8-Flash-Next 16G64G** を動かしました。もっと大きいモデル（DeepSeek V4.1、
-DeepSeek V4、GLM-5.3-Flash）は、**本物の Spark ではまだ試していません**（[まだ試していないこと](#まだ試していないこと)）。
+測ったもの: 借りた DGX Spark で **Qwen3.8-Flash-Next 16G64G** を動かしました（2026-11-05）。続いて、借りた DGX Spark で
+v1.3.114 の **GLM-5.3-Flash、DeepSeek V4 0731、DeepSeek V4.1** も動かしました（2026-11-06、[下](#測った数字大きいモデル借りた-dgx-spark2026-11-06)）。
 `./abyss.sh --bench` の結果を [bench の issue](https://github.com/zephel01/Abyss/issues/new?template=bench.md) で
 教えてもらえると助かります。
 
@@ -28,6 +28,11 @@ DeepSeek V4、GLM-5.3-Flash）は、**本物の Spark ではまだ試してい�
 - **x86 用の CPU カーネルはない。** CPU でのエキスパートの計算は ggml-cpu のもの（NEON。dotprod / i8mm / fp16 は
   `/proc/cpuinfo` を見て使う）です。Q2_0 のエキスパートを持つ pack（DeepSeek V4 の canonical pack）は AVX が要るので
   ARM では動きません。native の pack（`--native`、`iq_pack.py --fast`）は動きます。
+- **ほかのプロセスが使っているメモリの上では始めない**（v1.3.115）。ほかのプロセスが共有メモリを 16 GB より多く使っていて、
+  そのせいでエキスパートが入りきらないときは、読み込みの段階で止まり、メモリを多く使っているプロセスの名前を出します
+  （エンジンを 2 つ動かしたままにしていたため、空きが 20 GB しかないところで始まり、機械のメモリが尽きました）。
+  `STRATA_GLM_UMA_SHARE=1` で止めずに動かし、`STRATA_GLM_UMA_OTHERS_GB` で上限を変えます。ほかに何も動いていないときに、
+  機械より大きいモデルを動かす場合は止めません。
 
 ## 準備
 
@@ -97,7 +102,9 @@ DGX OS には NVIDIA のドライバーと CUDA 13（`/usr/local/cuda`）が入�
    ./abyss.sh --report         # issue に貼る abyss-report.txt（パスや名前は消してある）
    ```
 
-   Spark では、PC で PCIe のつなぎ方が出るところに「memory unified」と出ます。
+   Spark では、PC で PCIe のつなぎ方が出るところに「memory unified」と出ます。v1.3.115 から、`--gpu-tune` は設定ファイルの
+   `exe` を見て、手でビルドした `build-cuda` のエンジンを見つけます（それまでは「not built here yet」で止まっていました。#37）。
+   v1.3.114 から、`--check` の日本語の計算問題は、短い正しい答えを不合格にしなくなりました（#37）。
 
 ## 測った数字（借りた DGX Spark、2026-11-05）
 
@@ -131,6 +138,22 @@ GB10、共有メモリ 121 GB、Qwen3.8-Flash-Next 16G64G、既定の予算（�
 （16 GB では 42.5）。v1.3.113 では、このときのプロンプトの道を直しました。上限を付けると、ページキャッシュを「使用中」
 と数えて、プロンプトを 1 トークンずつ読んでいました（3.8K トークン: 129 秒 → 6.5 秒）。
 
+## 測った数字：大きいモデル（借りた DGX Spark、2026-11-06）
+
+借りた DGX Spark（共有メモリ 128 GB）、Abyss v1.3.114、既定の予算。
+
+| モデル | 生成 | 8K のプロンプト | メモ |
+|---|---:|---:|---|
+| GLM-5.3-Flash（Maya-S-v2 IQ2_XXS、unsloth UD-IQ2_XXS） | 19〜20 tok/s | 730〜750 tok/s | 32K のプロンプトは CLI で 675〜796 tok/s。MTP の下書きは、ここでは速くならない |
+| DeepSeek V4 0731 | 21.0 tok/s、**DSpark の下書きありで 22.8**（78% が採用） | 814 tok/s | |
+| DeepSeek V4.1 Compact（zephel01 の 207 GB 版。メモリに入りきらない） | 約 18 tok/s | | |
+
+**同じ Spark での llama.cpp**（8K のプロンプト、4K の文脈を埋めた状態）: V4 0731 は生成 20.2 tok/s、プロンプト 360 tok/s。
+GLM-5.3-Flash は 19.3 / 321。Abyss は、生成が同じかそれより速く、プロンプトは約 2.3 倍速く読みます。
+
+**分かっている問題（未解決、Spark でだけ出る）:** GLM-5.3-Flash で、32K〜121K のプロンプトをサーバー経由で読むと約 120〜130
+tok/s になります（CLI では 675〜796）。調べています。RTX 5090 では出ません。
+
 ## SSD の層
 
 メモリより大きいモデルは、答えている間に、残りのエキスパートを SSD から読みます。借りた機械のディスクはループデバイスで
@@ -151,8 +174,6 @@ GB10、共有メモリ 121 GB、Qwen3.8-Flash-Next 16G64G、既定の予算（�
 
 ## まだ試していないこと
 
-- 本物の Spark での DeepSeek V4.1 / V4 と GLM-5.3-Flash（PDL、共有メモリでの大きさの決め方、写す方式は同じコードなので
-  効くはずですが、測っていません）。
 - Spark の NVMe を SSD の層に使うこと（上のとおり、借りた機械のディスクはループデバイスでした）。
 - ARM での `./setup.sh`（ビルドは [準備](#準備) のとおり手で行いました）。
 - Spark 2 台をつなぐこと、ASUS Ascent GX10。

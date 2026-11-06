@@ -15,6 +15,7 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 - [設定と起動](#設定と起動)
 - [使い方](#使い方)
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
+- [Qwen3.8-Flash-Next](#qwen38-flash-next)
 - [Ornith-1.5-122B](#ornith-15-122b)
 - [EXL3 量子化（GLM-5.3-Flash）](#exl3-量子化glm-53-flash)
 - [メモリと速度](#メモリと速度)
@@ -36,7 +37,8 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 | CUDA | 13.3 | `nvcc` を含む。V100 は 12.9（`--nvcc`） |
 | コンパイラ | g++ 13 | CUDA が受け付けるバージョン |
 | Python | 3.12 | Abyss のフォルダ内の `.venv` |
-| ROCm（任意） | 7（`hipcc`） | AMD APU の内蔵 GPU が RAM 層のエキスパートを計算する（下の「iGPU レーン」）。なければ CPU が計算する |
+| ROCm（任意） | 10（HIP 7.14 以上、`hipcc`） | AMD APU の内蔵 GPU が RAM 層のエキスパートを計算する（下の「iGPU レーン」）。なければ CPU が計算する |
+| ARM（ベータ） | NVIDIA DGX Spark（GB10、aarch64） | エンジンは CUDA 12.9 以上で `121a` 向けに手でビルドする。下の「NVIDIA DGX Spark」 |
 
 `./abyss.sh`（Maya のインストーラの名前を変えたもの）は、今も Maya の GLM-5.3-Flash を入れるためのもの。
 DeepSeek V4 は `./setup-deepseek.sh`（次の節）か、その後の手順を手で行って準備する。
@@ -348,7 +350,7 @@ Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.s
   レイアウト名が出る。
 - **複数の GPU**（2-10 枚、世代の混在も）: カード毎に役割、負荷、VRAM、レイヤ分割で受け持つレイヤとエキスパート
   プール（`L0-13`、この PC のエンジンログから）、温度、そのカード自身の上限に対する電力、そのカード自身の最大に対する
-  PCIe リンク、1 トークンの時間の分担（phase 2 までは `--`）。一番忙しいカードに ★、作業中にリンクが落ちたカードや
+  PCIe リンク、1 トークンの時間の分担（エンジンの STAT 行から。v1.3.80）。一番忙しいカードに ★、作業中にリンクが落ちたカードや
   他の半分未満のリンク（x1 ライザー、Gen2/Gen3 x4）のカードはピンクでバナーにも出る。ドライブは何台でも MB/s と
   エキスパート読み出しの分担を出す。80x24 ではカードを 1 行に要約（一番忙しい / VRAM / 一番熱い / 一番遅いリンク）し、
   要るカードだけ並べる。
@@ -369,8 +371,9 @@ Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.s
   トークン数が加わり、プロンプト読込中は prompt タイルに再利用トークン数とここまでの SSD 待ちが出る。ヘッダのバッジ
   （`TAIL SKIP`、`DEFER`、`MIRROR`、`HELPER`、ドラフタ）はエンジンの INFO 行から取るので、リモートでも出る。
 - **起動中のサーバー（1.3.80 以降）:** エンジンを起動する前にポートを開くので、`/health` が `status: "loading"` と
-  段階・warm-up の % と GB・経過秒を返す。Terminal は別の PC からでもこの PC と同じように進捗を出す。他のリクエストは
-  準備できるまで 503 + Retry-After。コンテキスト変更のリロード中も同じ進捗が `reloading` の下に出る。
+  段階・warm-up の % と GB・経過秒を返す。Terminal は別の PC からでもこの PC と同じように進捗を出す。v1.3.81 から、
+  この応答は 503 と `Retry-After: 5` になる（200 を「準備できた」と読むクライアント、たとえば llama-swap の health check も
+  エンジンを待つ）。準備ができたら 200。他のリクエストも準備できるまで 503 + Retry-After。コンテキスト変更のリロード中も同じ進捗が `reloading` の下に出る。
 - **`--` は「報告されていない」**で、0 ではない。まだエンジンのカウンタ待ちなのは、ヘルパーカードのトークン時間の
   分担（E6、CUDA 2 枚が要る）。
 - **リモート:** 読み取りのみ（この PC の設定ファイルを読む Models は出ない）。キーは `--key-env` で指定した環境変数
@@ -450,8 +453,11 @@ NVIDIA の GPU が 2 枚以上あれば、層を分けて載せられる（layer
   最後の part に置く（最後の残差と head を使うため。その part も token_embd の pinned コピーを持ち、RAM を 497 MB 多く
   使う）。最初の境目は層 2 以降（層ごとの埋め込みは最初の part が足す）。`auto` は、文脈ぶんの delta-net の状態、K / V
   キャッシュ、QSA の鍵と、最後の part のドラフターを数える。RTX 5090 1 枚を 2 つに見立てて確認した（M16b 版、層 24 で
-  分割）: KL は分けない場合と同じ、実用テストも同じ、候補の採用率 84.7%（分けない場合 83.2%）。本物の 2 枚での速さは
-  まだ測っていない。2 枚で動かした方の報告を歓迎する（ベンチの issue フォーム）。分割中は会話の使い回し
+  分割）: KL は分けない場合と同じ、実用テストも同じ、候補の採用率 84.7%（分けない場合 83.2%）。本物の 16 GB + 16 GB の
+  GeForce 2 枚（#35）では、層 32 で分けると長いリクエストで 22% 速かったが、そこでも `auto` は 1 枚目だけを選ぶ（この数字で
+  コストのモデルを合わせ直す予定）。それまでは `--layer-split 32` を手で指定する。v1.3.110 から、手で決めた分割はモデル
+  自身の層の数で確かめる（それまでは、48 層のモデルで `--layer-split 46` が断られていた）。`auto` が 1 枚で動かすときは、
+  そのカード自身の `STRATA_GLM_VRAM_GB_PARTS` の値を使う。2 枚で動かした方の報告を歓迎する（ベンチの issue フォーム）。分割中は会話の使い回し
   （スナップショット）がオフになる。
 - **境目での受け渡し**（試験用）: `STRATA_GLM_HOP=host`（既定。pinned のホストバッファ）、`peer`（デバイスからデバイスへ。
   peer アクセスのないカードは host になる）、`sock`（バイト列。別のプロセスや別の PC へのつなぎと同じ形）。RTX 5090 1 枚を
@@ -510,7 +516,8 @@ Radeon 8060S（gfx1151）。
 エンジンの選択より 2% 以上速いものがあれば、インストール済みの設定の `env`（`STRATA_GLM_MV_Q6K_SPLIT`）に書き込み、
 次の起動から使う。結果は `abyss-gpu-tune.txt` にも保存する。この 2 機種以外の GPU なら、
 [issue](https://github.com/zephel01/Abyss/issues/new?template=gpu-tune.md) に貼ってほしい。その GPU の既定値は、
-こうした報告をもとに決める。
+こうした報告をもとに決める。v1.3.115 から、別のフォルダーで手でビルドしたエンジン（設定ファイルの `exe`。例: `build-cuda`）
+も見つけるので、「not built here yet」で止まらない（#37）。
 
 ## NVIDIA DGX Spark（GB10、ARM、ベータ）
 
@@ -518,12 +525,16 @@ v1.3.113 から、エンジンは aarch64 + sm_121 でビルドでき、DGX Spar
 メモリを分け合うので、エキスパートの置き場と RAM 層を 1 つの予算から決め（`STRATA_GLM_UMA_HEADROOM_GB` を空けておく）、
 programmatic dependent launch を有効にし（`STRATA_GLM_PDL`）、RAM 層のエキスパートは置き場の枠に写してから使い
 （`STRATA_GLM_UMA_DIRECT=1` でその場で読む）、CPU レーンは無効にする。借りた Spark で Qwen3.8 16G64G を測ったところ、
-MTP の下書きありで 47.05 tok/s（CLI、4K）、サーバー経由で 43〜54 tok/s、8K のプロンプトは約 1,040 tok/s。
-ビルドの手順、測った数字、まだ試していないこと（大きいモデル）は [docs/DGX-SPARK.ja.md](DGX-SPARK.ja.md) にある。
+MTP の下書きありで 47.05 tok/s（CLI、4K）、サーバー経由で 43〜54 tok/s、8K のプロンプトは約 1,040 tok/s。v1.3.114
+（2026-11-06）では、GLM-5.3-Flash が 19〜20 tok/s、DeepSeek V4 0731 が 21.0（DSpark の下書きありで 22.8）、DeepSeek V4.1
+Compact が約 18。GLM の長いプロンプトは、そこではサーバー経由だとまだ遅い（約 120〜130 tok/s、CLI では 675〜796。未解決）。
+v1.3.115 から、ほかのプロセスが使っているメモリの上では始めない（`STRATA_GLM_UMA_SHARE`、`STRATA_GLM_UMA_OTHERS_GB`）。
+ビルドの手順、測った数字、まだ試していないことは [docs/DGX-SPARK.ja.md](DGX-SPARK.ja.md) にある。
 
 ## DeepSeek V4.1 Flash
 
-v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準備は手作業（まとめてセットアップが入れるのは V4 だけ）。
+v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。`./setup-deepseek.sh --model v41`（v1.3.100）が zephel01 の
+LDLQ GGUF を入れる（[まとめてセットアップ](#まとめてセットアップ)）。ほかの GGUF は手作業で準備する。
 読める GGUF、pack の作り方、設定例、測定結果は [docs/deepseek41/README.md](deepseek41/README.md)、V4 から変わった計算は
 [docs/deepseek41/SPEC.md](deepseek41/SPEC.md)（どちらも英語）。要点:
 
@@ -534,21 +545,39 @@ v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準�
 - **速さは SSD で決まる。** SSD からエキスパートを読まないトークンは 13〜15 ms。読むたびに 3.4 GB/s で約 3〜4 ms 増える。
   `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1`（ルートの 4〜6 位が SSD にしかないときは計算しない。量子化前の
   モデルに対する KL は 0.229 → 0.240）で生成は約 28 tok/s、なしで 17.7 tok/s。swe-bench のコーディング問題は通しで
-  51.6 tok/s。prompt は遅い（アテンションを 1 トークンずつ計算し、prompt のエキスパートも SSD から読む）。
+  51.6 tok/s。prompt は V4 より遅い。prompt のエキスパートを SSD から読むため（アテンションは v1.3.60 からまとめて計算する）。
 - **軽い dense pack**（v1.3.36、任意）: `attn_q_b` / `attn_output_a` / `attn_output_b` を Q8_0 から Q5_K にすると、
   dense が 8.14 → 6.50 GB、VRAM のエキスパート枠が 177 増え、生成が 10〜15% 速くなる。KL は 0.242 → 0.251。作り方は
   [docs/deepseek41/README.md](deepseek41/README.md#a-lighter-dense-pack-q5_k)。
 - **メモリ上限つきのスコープで起動する**（`systemd-run --user --scope -p MemoryMax=88G ...`）。ページキャッシュと pinned の
   層が重なると、systemd-oomd がデスクトップのセッションを止めることがある。
-- **投機デコード**（v1.3.53、任意）: V4.1 用の DSpark ドラフター（`--dspark`）と n-gram 窓。モデル自身の MTP 層はどの GGUF にも
-  入っていない。prompt の attention は v1.3.60 からまとめて計算する。
-- **まだできないこと:** 層の分割、会話のディスク保存、画像。
+- **投機デコード**（v1.3.53、任意）: Lucebox の V4.1 用 DSpark ドラフターを、`STRATA_DS4_DSPARK=<ファイル>` で手で指定する
+  （セットアップの `--dspark` が入れるのは V4 0731 用のドラフターで、これではない。Lucebox の V4.1 ドラフターのリポジトリは
+  Hugging Face から消えている。v1.3.100）。n-gram 窓も使う。モデル自身の MTP 層はどの GGUF にも入っていない。
+- **画像**（v1.3.93、PR #28。ISTA-DASLab の新しい形式のテンプレートは v1.3.105 から）: ISTA-DASLab の V4.1 用 mmproj と
+  画像用のルーターのバイアスを手で設定する: [docs/SETTINGS.ja.md](SETTINGS.ja.md#deepseek-v41-の画像)。
+- **まだできないこと:** 層の分割、会話のディスク保存。
+
+## Qwen3.8-Flash-Next
+
+v1.3.74 から、エンジンは Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）を速い経路（`--glm-pack`）で動かす。prompt の経路、
+検証窓、MTP ドラフターも使える。準備は手作業。読める GGUF、pack の作り方（`tools/iq_pack.py --fast`）、ドラフター、
+設定例、測定結果は [docs/qwen38/README.ja.md](qwen38/README.ja.md) にある。要点:
+
+- **自前の版:** [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF)（KL 0.083。RTX 5090 で、32 GB なら
+  MTP ドラフターありで 128.7 tok/s、16 GB なら 95.1）と、
+  [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)（L448: 512 個のうち 448 個のエキスパート、67.5 GB。
+  GPU 12 GB + RAM 32 GB 向け）。
+- **ほかの GGUF**（ベータ）: NVIDIA の NVFP4 チェックポイント（v1.3.101）、unsloth の UD 3.1 のセット（v1.3.112〜v1.3.115）。
+  それぞれの数字は docs/qwen38 にある。
+- **GPU 2 枚**（ベータ、v1.3.109）: [複数の GPU](#複数の-gpu)。**DGX Spark**（ベータ、v1.3.113）:
+  [NVIDIA DGX Spark](#nvidia-dgx-sparkgb10armベータ)。
 
 ## Ornith-1.5-122B
 
 v1.3.46 から、同じエンジンが [Ornith-1.5-122B](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)（Qwen3.5-MoE 系、
 llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full attention 層 12、1 層 256 エキスパート（8 個を
-使用 + ゲート付きの共有エキスパート）、残差は普通の 1 本です。V4.1 と同じく手動でセットアップします。GGUF、pack の
+使用 + ゲート付きの共有エキスパート）、残差は普通の 1 本です。`./setup-deepseek.sh --model ornith`（v1.3.100）が zephel01 の IQ3_XXS-B（GPU 16 GB + RAM 64 GB 向け）を入れます。ほかの GGUF は手動でセットアップします。GGUF、pack の
 コマンド、設定例、測定は [docs/ornith/README.md](ornith/README.md)（英語）に。要点:
 
 - **メモリ。** unsloth の UD-Q4_K_XL は 79.7 GB: エキスパート 70.4 GB（256 × 48 層、3072 × 1024、IQ4_XS〜Q6_K）と、
@@ -561,8 +590,9 @@ llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full a
   コピー課題で 1 ドラフト 57 tok/s、3 ドラフト 76 tok/s。GGUF の NextN ブロックもドラフターになります（エキスパートを
   `tools/nextn_pack.py` で詰め直して `STRATA_GLM_MTP_GGUF` で読む）: コード 59 tok/s、散文 50、コピー課題 85
   （iGPU なしでは コード 36 → 42、散文 33 → 39）。
-- **まだないもの:** 会話スロット、レイヤー分割、画像。CUDA ビルドはコンパイルは通るが未実行。エキスパートカーネルは
-  この形状にまだ調整していない。
+- **NVIDIA:** RTX 5090 で、IQ3_XXS-B は NextN ドラフターありで 116 tok/s（75% が採用、v1.3.100）。エキスパートの置き場を
+  1.45 GB にしたとき（issue #23 の 8 GB のカード）は、プロンプトが 356 tok/s（2K）、デコードが 45.5 tok/s（v1.3.82）。
+- **まだないもの:** 会話スロット、レイヤー分割、画像。エキスパートカーネルはこの形状にまだ調整していない。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 
@@ -644,7 +674,7 @@ v1.3.43 から、DeepSeek V4 Flash 0731 に DeepSeek の DSpark ブロックド�
 そのあとサーバーを再起動する（`../Abyss-tools/abyss.sh restart`）。`./setup-deepseek.sh --no-dspark`（またはこの行を消す）で
 オフに戻る。起動時のエンジンのログの `dspark:` の行に、読んだファイルと使った VRAM が出る（`3 stages over target layers
 40-42, 5 drafts a step; 6.48 GB on CUDA0 ...`）。使えるのは DeepSeek V4 Flash 0731 を GPU 1 枚で動かすときだけで、層の分割、
-DeepSeek V4.1、MTP ブロックとは併用できない。そのときは `dspark: not loaded - <理由>` と出て、本体はドラフトモデルなしで動く。
+MTP ブロックとは併用できない（DeepSeek V4.1 は専用のドラフターのファイルを使う。[DeepSeek V4.1 Flash](#deepseek-v41-flash)）。そのときは `dspark: not loaded - <理由>` と出て、本体はドラフトモデルなしで動く。
 
 **かかるもの。** ドラフトモデルは重みと expert をすべて VRAM に置く。6.48 GB で、その分 expert のプールが小さくなる。RAM 層は
 ドラフトモデルなしのときの大きさのままにするので、いちばん使われない約 6.5 GB の expert は SSD から読むことになる（下の
@@ -665,8 +695,8 @@ DeepSeek V4.1、MTP ブロックとは併用できない。そのときは `dspa
 swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68〜82% が受理され、1 回の確認で 2.7〜3.7 トークン進む（コードを
 写す問題では 4.7）。散文の伸びがいちばん小さい（1 回 2 トークンほど）。検証の窓は 1 列あたり約 9 ms かかり、これは CPU
 レーンが 1 トークン分の RAM 層 expert を計算する時間（8.4 ms。RAM の約 93 GB/s で約 93 個）とほぼ同じ。速さを決めているのは
-ドラフトモデルではなく窓なので、速い GPU より速い CPU / RAM や内蔵 GPU レーンのほうが効く。NVIDIA はビルドが通るだけで、
-まだ動かしていない。
+ドラフトモデルではなく窓なので、速い GPU より速い CPU / RAM や内蔵 GPU レーンのほうが効く。NVIDIA では、借りた
+DGX Spark（v1.3.114）で生成が 21.0 → 22.8 tok/s になり、下書きの 78% が受理された。
 
 **1 回ごとの選び方。** 直前の 3 トークンが prompt か回答の前のほうに出ていれば、その続き（最大 5 トークン）を窓の下書きに
 して、ドラフトモデルは動かさない。ただし、その繰り返しが当たり続けている間だけ: 毎回、繰り返しの提案を実際に出たトークンと
@@ -773,6 +803,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | CUDA は 1 / 1、HIP は 0 | Qwen3.8 の確かめる窓で、delta-net の層を CUDA graph で流す（0: 1 つずつ起動。`_MOE=0`: MoE の振り分けは graph の外）。出力は同じ。1 トークンの起動回数 453 → 254（RTX 5090: 速さは変わらない。DGX Spark で PDL と合わせて: 43.4 → 47.1 tok/s） |
 | `STRATA_GLM_PDL` / `STRATA_GLM_PDL_PREFETCH` | 内蔵 GPU（sm_90 以上）は有効、外付けのカードは無効 / 1 | programmatic dependent launch: 前のカーネルが終わりかけたところで次を始める（DGX Spark、Qwen3.8 16G64G: MTP なし 25.0 → 30.7 tok/s、MTP あり 43.4 → 46.5）。`_PREFETCH`: GEMV が重みの行を早めに L2 へ読む（0: 読まない。2: PDL なしでも読む） |
 | `STRATA_GLM_UMA` / `STRATA_GLM_UMA_HEADROOM_GB` | 1 / 8（CUDA） | 内蔵 GPU（DGX Spark）は共有メモリから層の大きさを決め、`_HEADROOM_GB` を空けておく（0: 外付けのカードと同じ決め方。比べる用） |
+| `STRATA_GLM_UMA_SHARE` / `STRATA_GLM_UMA_OTHERS_GB` | 0 / 16 | 内蔵 GPU で、ほかのプロセスが共有メモリを `_OTHERS_GB` より多く使っていて、そのせいでエキスパートが入りきらないときは、読み込みの段階で止まり、メモリを多く使っているプロセスの名前を出す（エンジンを 2 つ動かしたままにして、DGX Spark のメモリが尽きたため）。`STRATA_GLM_UMA_SHARE=1` で、止めずに動かす。ほかに何も動いていないときに、機械より大きいモデルを動かす場合は止めない |
 | `STRATA_GLM_UMA_DIRECT` | 0 | 内蔵 GPU で、RAM 層のエキスパートを VRAM の枠に写さず、その場で読む。既定は無効: 入れ替えが止まり、ヒット率が低いままになる（DGX Spark、Qwen3.8 16G64G 32 GB: 写す方式 45.8、その場で読む方式 34.9 tok/s） |
 | `STRATA_GLM_DISK_BUFFERED` | 0 | （試験用）SSD からのエキスパートの読み込みを、O_DIRECT ではなくページキャッシュ経由にする |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。`0`: 従来どおり境目で |
@@ -830,8 +861,9 @@ prompt）まで測った。アテンションのキャッシュは小さい（65
 
 ## 制限
 
-- ドラフトモデルはない。この GGUF には MTP ブロックがなく、DeepSeek の DSpark（ドラフトモデル）には未対応。
-  投機デコードは文章自体から候補を作る（`STRATA_DS4_SPEC`）。
+- MTP のドラフトはない。この GGUF には MTP ブロックがない。DeepSeek の DSpark ドラフトモデルは v1.3.43 から使える
+  （`--dspark`、GPU 1 枚。[DSpark のドラフトモデル](#dspark-のドラフトモデルdeepseek-v4-flash)）。使わないときの投機デコードは、
+  文章自体から候補を作る（`STRATA_DS4_SPEC`）。
 - 会話のディスク保存（`STRATA_GLM_SLOTS`）は DeepSeek V4 では無効。直前の会話の再利用は動く。
 - 画像は扱わない（ここでは DeepSeek V4 Flash はテキストのみ）。
 - 複数 GPU: 層の分割は動く（「複数の GPU」）が、遅い 2 枚目を足しても速い 1 枚 + iGPU レーンには

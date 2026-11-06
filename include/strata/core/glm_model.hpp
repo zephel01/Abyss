@@ -213,7 +213,9 @@ public:
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
     /// written to a file; slot_load puts them back as the live state and the snapshot, so a conversation set aside
     /// while others ran continues where it was.  The bytes written, or 0 + err.
-    uint64_t slot_save(const std::string& path, std::string& err);
+    // mem != nullptr: the file's bytes go into *mem instead (the server writes them on a thread: a 0.25 GB write took
+    // 4-23 s on a 94 GB machine whose RAM tier pins 60 GB, and the next prompt waited for it)
+    uint64_t slot_save(const std::string& path, std::string& err, std::string* mem = nullptr);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the

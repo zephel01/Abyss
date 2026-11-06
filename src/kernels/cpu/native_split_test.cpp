@@ -165,6 +165,90 @@ int main() {
                 }
         }
     }
+    // every uniform gate/up + down pair in unsloth's UD 3.1 Qwen3.8 sets (tools/fixtures/unsloth_q38_ud31_types.txt,
+    // read from the files' headers; tools/test_unsloth_types.py checks this table covers them): the split path equal to ggml's own dots and the blob path within float rounding, one token and three
+    {
+        struct ComboCase { ggml_type gu, dn; };
+        // BEGIN unsloth-ud31-combos
+        static const ComboCase kUnslothCombos[] = {
+            {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0},   {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_NL},
+            {GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_0},    {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0},
+            {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL},   {GGML_TYPE_IQ2_S, GGML_TYPE_Q5_0},
+            {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL},
+            {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0},   {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL},
+            {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0},
+        };
+        // END unsloth-ud31-combos
+        const int64_t E = 1024, FF = 640;   // (Qwen3.8's 640-wide down rows; n_embd cut from 2560 for time)
+        uint32_t st = 4242u;
+        const auto rnd = [&st] {
+            st = st * 1664525u + 1013904223u;
+            return ((float) (st >> 8) / 16777216.0f - 0.5f) * 0.1f;
+        };
+        const std::vector<float> im_e((size_t) E, 1.0f), im_f((size_t) FF, 1.0f);   // flat importance matrices
+        for (const auto& c : kUnslothCombos) {
+            const std::string name = std::string(ggml_type_name(c.gu)) + " + " + ggml_type_name(c.dn);
+            cpu::NativeFmt q;
+            check(cpu::native_fmt(c.gu, c.dn, E, FF, q, err), (name + ": format").c_str());
+            ggml_quantize_init(c.gu);
+            ggml_quantize_init(c.dn);
+            std::vector<unsigned char> qb(q.bytes);
+            std::vector<float> w((size_t) 2 * FF * E);
+            for (auto& v : w) v = rnd();
+            ggml_quantize_chunk(c.gu, w.data(), qb.data(), 0, 2 * FF, E, im_e.data());   // gate rows, then up rows
+            w.resize((size_t) E * FF);
+            for (auto& v : w) v = rnd();
+            ggml_quantize_chunk(c.dn, w.data(), qb.data() + q.down_off, 0, E, FF, im_f.data());
+            const int NT = 3;
+            std::vector<std::vector<unsigned char>> a(NT, std::vector<unsigned char>(q.act_bytes)),
+                hb(NT, std::vector<unsigned char>(q.h_bytes));
+            std::vector<const void*> ap(NT), hp(NT);
+            for (int t = 0; t < NT; ++t) {
+                std::vector<float> xt(E), ht(FF);
+                for (auto& v : xt) v = rnd() * 20.0f;
+                for (auto& v : ht) v = rnd() * 20.0f;
+                cpu::native_quant_act(q, xt.data(), a[t].data());
+                cpu::native_quant_h(q, ht.data(), hb[t].data());
+                ap[t] = a[t].data();
+                hp[t] = hb[t].data();
+            }
+            const auto* tg = ggml_get_type_traits_cpu(c.gu);
+            const auto* td = ggml_get_type_traits_cpu(c.dn);
+            for (int nt : {1, NT}) {
+                std::vector<std::vector<float>> g1(nt, std::vector<float>(FF)), g2(nt, std::vector<float>(FF)),
+                    d1(nt, std::vector<float>(E)), d2(nt, std::vector<float>(E));
+                std::vector<float*> pg1(nt), pg2(nt), pd1(nt), pd2(nt);
+                for (int t = 0; t < nt; ++t) {
+                    pg1[t] = g1[t].data();
+                    pg2[t] = g2[t].data();
+                    pd1[t] = d1[t].data();
+                    pd2[t] = d2[t].data();
+                }
+                cpu::native_gu_rows_split(q, qb.data(), qb.data() + q.up_off, ap.data(), nt, pg1.data(), 0, (int) FF,
+                                          std::numeric_limits<float>::infinity());
+                cpu::native_gu_rows(q, qb.data(), ap.data(), nt, pg2.data(), 0, (int) FF);
+                cpu::native_down_rows(q, qb.data(), hp.data(), nt, pd1.data(), 0, (int) E);
+                cpu::native_down_rows_split(q, qb.data() + q.down_off, hp.data(), nt, pd2.data(), 0, (int) E);
+                for (int t = 0; t < nt; ++t) {
+                    for (int r = 0; r < FF; ++r) {
+                        float g = 0.f, u = 0.f;
+                        tg->vec_dot(E, &g, 0, qb.data() + (size_t) r * q.gu_row, 0, ap[t], 0, 1);
+                        tg->vec_dot(E, &u, 0, qb.data() + q.up_off + (size_t) r * q.gu_row, 0, ap[t], 0, 1);
+                        const float ref = (g / (1.f + std::exp(-g))) * u;
+                        check(g1[t][r] == ref, (name + ": split gate/up equals ggml's dots").c_str());
+                        check(std::abs(g2[t][r] - ref) <= 1e-6f * (1.0f + std::abs(ref)), (name + ": blob gate/up").c_str());
+                    }
+                    for (int r = 0; r < E; ++r) {
+                        float ref = 0.f;
+                        td->vec_dot(FF, &ref, 0, qb.data() + q.down_off + (size_t) r * q.d_row, 0, hp[t], 0, 1);
+                        // (the blob path's IQ4_NL multi-token kernel sums in its own order: float rounding)
+                        check(d2[t][r] == ref, (name + ": split down equals ggml's dots").c_str());
+                        check(std::abs(d1[t][r] - ref) <= 1e-6f * (1.0f + std::abs(ref)), (name + ": blob down").c_str());
+                    }
+                }
+            }
+        }
+    }
     std::puts("native_split_test: ok");
     return 0;
 }

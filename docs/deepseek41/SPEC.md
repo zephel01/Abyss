@@ -350,10 +350,10 @@ collapses with the last FFN `pre` (`head_kernel`).
 | Piece | State |
 | --- | --- |
 | Token path (decode) | done; same GGUF as llama.cpp's PR: teacher KL 0.639 against its 0.636 |
-| Prompt path | batched MoE, the Engram rows per 256-token block; the attention a token at a time (~5 ms a token) |
+| Prompt path | batched MoE, the Engram rows per 256-token block; the attention batched since v1.3.60 (before, a token at a time, ~5 ms a token) |
 | Conversation reuse | done (window rings + pending pair halves); file slots: no |
 | Candidate blocks past 16K | done (fixed in v1.3.32: 24,005 tokens through the decode path) |
-| Speculative decoding / verify window | not yet (the 1017 FP8 release has MTP layers; the GGUFs do not) |
+| Speculative decoding / verify window | done from v1.3.53: Lucebox's DSpark drafter (opt-in, `STRATA_DS4_DSPARK`) and the n-gram drafts through the verify window; the model's own MTP layers: no (the 1017 FP8 release has them; the GGUFs do not) |
 | Layer split | not yet |
 | Images | partly: the image encoder is llama.cpp's `strata-vision` (b11870 or later, projector `deepseek41v`), run on the CPU; image positions take the encoder's vectors, route with `exp_probs_b_vl` and skip the Engram. Tried on one GPU with one 4-file GGUF (three pictures); not tried: the GPU encoder lending expert memory, large or several pictures, GGUFs of the newer 6-file layout, HIP. Setup does not install it (the `vision` entry is written by hand) |
 

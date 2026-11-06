@@ -374,6 +374,48 @@ static int64_t mem_total() {
     return (int64_t) kb * 1024;
 }
 
+// the n processes (not this one) that hold the most RAM, "name 12.3 GB, ..." - who to stop when the shared memory of
+// an integrated GPU is short (Linux; "unknown" elsewhere)
+static std::string top_rss_procs(int n) {
+#ifdef __linux__
+    std::vector<std::pair<double, std::string>> v;
+    const int self = (int) getpid();
+    if (DIR* d = opendir("/proc")) {
+        while (dirent* e = readdir(d)) {
+            const int pid = std::atoi(e->d_name);
+            if (pid <= 0 || pid == self) continue;
+            long long pages = 0, rss = 0;
+            char path[64], name[64] = {0};
+            std::snprintf(path, sizeof path, "/proc/%d/statm", pid);
+            if (FILE* f = std::fopen(path, "r")) {
+                if (std::fscanf(f, "%lld %lld", &pages, &rss) != 2) rss = 0;
+                std::fclose(f);
+            }
+            std::snprintf(path, sizeof path, "/proc/%d/comm", pid);
+            if (FILE* f = std::fopen(path, "r")) {
+                if (std::fgets(name, sizeof name, f) == nullptr) name[0] = 0;
+                std::fclose(f);
+            }
+            name[std::strcspn(name, "\n")] = 0;
+            const double gb = (double) rss * (double) sysconf(_SC_PAGESIZE) / 1073741824.0;
+            if (gb >= 0.5) v.emplace_back(gb, std::string(name) + " (pid " + std::to_string(pid) + ")");
+        }
+        closedir(d);
+    }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string s;
+    for (int i = 0; i < n && i < (int) v.size(); ++i) {
+        char b[32];
+        std::snprintf(b, sizeof b, " %.1f GB", v[(size_t) i].first);
+        s += (i ? ", " : "") + v[(size_t) i].second + b;
+    }
+    return s.empty() ? "none above 0.5 GB of RAM: GPU memory of another process" : s;
+#else
+    (void) n;
+    return "unknown";
+#endif
+}
+
 // the RAM free now: MemAvailable (Windows: the smaller of the free RAM and the free commit, which pinning is charged to);
 // 0 when unknown
 static int64_t avail_ram_now() {
@@ -1074,6 +1116,20 @@ bool Glm5Model::fast_setup(std::string& err) {
                                  "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", bk, dev_,
                          (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
                          (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
+            // another process holding the shared memory (a second engine left running: a DGX Spark container ran out
+            // of memory and restarted twice, 2026-11-06, after an engine started on 20 GB and only warned).  Stop with
+            // who holds it instead of running on a pool the experts do not fit; STRATA_GLM_UMA_SHARE=1 runs anyway
+            const double others_gb = glmfast::uma_others_gb(
+                mem_total(), (int64_t) std::max(0LL, avail_kb) * 1024,
+                (int64_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_ + F->arena_bytes));
+            const char* share = getenv("STRATA_GLM_UMA_SHARE");
+            if (glmfast::uma_others_block(others_gb, avail < expert_bytes) && (share == nullptr || std::atoi(share) == 0)) {
+                err = "glm fast: " + std::to_string((int) (others_gb + 0.5)) +
+                      " GB of the shared memory is held by other processes (" + top_rss_procs(3) +
+                      "), so the experts would not fit and the engine would run slowly or run the machine out of "
+                      "memory; stop the other engine (or set STRATA_GLM_UMA_SHARE=1 to run anyway)";
+                return false;
+            }
         }
         if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
@@ -7359,7 +7415,7 @@ std::vector<std::pair<int64_t, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bo
 }
 }  // namespace
 
-uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
+uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, std::string* mem) {
     if (g_.dsv4()) {
         err = "deepseek4: conversation slots are not implemented (the live snapshot is)";
         return 0;
@@ -7372,13 +7428,21 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         }
         halves.push_back(m);
     }
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        err = "cannot write " + path;
-        return 0;
+    std::ofstream f;
+    if (mem == nullptr) {
+        f.open(path, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            err = "cannot write " + path;
+            return 0;
+        }
+    } else {
+        mem->clear();
     }
     const int64_t n = snap_pos_;
-    const auto put = [&](const void* p, size_t bytes) { f.write((const char*) p, (std::streamsize) bytes); };
+    const auto put = [&](const void* p, size_t bytes) {
+        if (mem != nullptr) mem->append((const char*) p, bytes);
+        else f.write((const char*) p, (std::streamsize) bytes);
+    };
     const uint32_t nh = (uint32_t) halves.size();
     put(&kSlotMagic, 8);
     put(&nh, 4);
@@ -7429,6 +7493,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     if (getenv("STRATA_GLM_SLOT_TIMING"))
         std::fprintf(stderr, "glm slots: save %lld positions - sync %.0f ms, copy %.0f ms, write %.0f ms\n",
                      (long long) n, t_sync, t_copy, t_write);
+    if (mem != nullptr) return (uint64_t) mem->size();
     f.flush();
     if (!f) {
         err = "writing " + path + " failed (disk full?)";

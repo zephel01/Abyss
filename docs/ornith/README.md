@@ -133,7 +133,10 @@ accepted, 22.3 -> 16.9 ms a token (59 tok/s); prose 68-74% accepted, 21.6 -> 20.
 Without the iGPU the gain is larger (the lane's latency is paid once a window): code 35.7 -> 41.7 tok/s, prose
 33 -> 39. `STRATA_GLM_NO_MTP=1` leaves the block out.
 
-NVIDIA: the CUDA build compiles; it has not been run yet.
+NVIDIA: on an RTX 5090, zephel01's IQ3_XXS-B decodes at 116 tok/s with its NextN drafter (75% of the drafts accepted;
+v1.3.100, from the config `./setup-deepseek.sh --model ornith` writes). Given issue #23's small pool (1.45 GB of
+experts, an 8 GB card's) it read prompts at 356 tok/s (2K) / 347 (8K) and decoded at 45.5 tok/s, KL 0.0073 against a
+16 GB run (v1.3.82).
 
 ## Not yet
 

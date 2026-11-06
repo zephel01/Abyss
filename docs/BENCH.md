@@ -227,11 +227,11 @@ For a problem, open a [bug report](https://github.com/zephel01/Abyss/issues/new?
 
 ## Platforms
 
-| | Linux, AMD | Linux, NVIDIA | Windows, NVIDIA | Windows, AMD |
-|---|---|---|---|---|
-| speed, counters, verdict, quality, `--deep` | yes | yes | yes | yes |
-| PCIe link | yes (sysfs, the narrowest link up to the root port) | yes (nvidia-smi) | yes (nvidia-smi) | no |
-| SSD speed | yes | yes | yes (unbuffered read) | yes (unbuffered read) |
+| | Linux, AMD | Linux, NVIDIA | Linux ARM, DGX Spark | Windows, NVIDIA | Windows, AMD |
+|---|---|---|---|---|---|
+| speed, counters, verdict, quality, `--deep` | yes | yes | yes (v1.3.113) | yes | yes |
+| PCIe link | yes (sysfs, the narrowest link up to the root port) | yes (nvidia-smi) | – ("memory unified": the GPU shares the system memory) | yes (nvidia-smi) | no |
+| SSD speed | yes | yes | yes | yes (unbuffered read) | yes (unbuffered read) |
 
 An AMD card shows its own internal switch as x16; the benchmark walks up to the root port, so an OCuLink x4 or a
 chipset slot shows as what it is.

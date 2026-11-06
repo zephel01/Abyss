@@ -70,5 +70,19 @@ int main() {
     assert(uma_direct_on(true, "") && !uma_direct_on(false, ""));
     assert(!uma_direct_on(true, "0") && uma_direct_on(false, "1") && uma_direct_on(true, "1"));
     assert(uma_headroom_default_gb(true) == 16.0 && uma_headroom_default_gb(false) == 8.0);
+    // another process holding the shared memory (Spark, 2026-11-06): about 5 GB of others with nothing else running,
+    // about 95 GB with a second engine left running; only a shortfall the others cause stops the start
+    {
+        using strata::core::glmfast::uma_others_gb;
+        using strata::core::glmfast::uma_others_block;
+        const int64_t T = (int64_t) (121.6 * (double) G);
+        const double alone = uma_others_gb(T, (int64_t) (109.7 * (double) G), (int64_t) (6.5 * (double) G));
+        const double second = uma_others_gb(T, (int64_t) (20.1 * (double) G), (int64_t) (6.5 * (double) G));
+        assert(alone > 4.0 && alone < 7.0 && second > 90.0 && second < 100.0);
+        assert(!uma_others_block(alone, true));      // V4.1 bigger than the Spark, nothing else running: runs
+        assert(uma_others_block(second, true));      // a second engine and the experts short: stops
+        assert(!uma_others_block(second, false));    // a second engine but the experts still fit: runs
+        assert(uma_others_gb(0, 0, 0) == 0.0 && uma_others_gb(T, 0, 0) == 0.0);   // MemAvailable unknown: never stops
+    }
     std::puts("GLM memory policy checks passed (CPU only)");
 }

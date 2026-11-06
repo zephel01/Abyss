@@ -73,6 +73,7 @@
 #include <chrono>
 #include <algorithm>
 #include <iostream>
+#include <functional>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -1672,7 +1673,85 @@ static int glm_pack_generate(const Options& o) {
             slot_max = 0;
         }
     }
+    // slot files are written by one thread from a queue (slot_put): the next prompt never waits for the disk - a
+    // 0.28 GB write took 5-50 s on a 94 GB machine whose RAM tier pins most of the RAM.  A slot is read back only
+    // after its own write ended (slot_take waits for that one), and a failed write drops the slot
+    struct SlotWriter {
+        struct Job { std::string path; std::string bytes; std::vector<int32_t> toks; uint64_t n; };
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Job> q;
+        std::set<std::string> pending, failed;
+        bool stop = false;
+        std::thread t;
+        std::function<bool(const Job&)> write;
+        void push(Job j) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return q.size() < 3; });   // (at most 3 waiting: their bytes are in RAM)
+            pending.insert(j.path);
+            q.push_back(std::move(j));
+            if (!t.joinable()) t = std::thread([this] { run(); });
+            cv.notify_all();
+        }
+        void run() {
+            std::unique_lock<std::mutex> lk(mu);
+            for (;;) {
+                cv.wait(lk, [&] { return stop || !q.empty(); });
+                if (q.empty()) return;
+                Job j = std::move(q.front());
+                q.pop_front();
+                cv.notify_all();
+                lk.unlock();
+                const bool ok = write(j);
+                lk.lock();
+                pending.erase(j.path);
+                if (!ok) failed.insert(j.path);
+                cv.notify_all();
+            }
+        }
+        void wait_for(const std::string& path) {   // until that file is written (or failed)
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return pending.count(path) == 0; });
+        }
+        bool take_failed(const std::string& path) {
+            std::lock_guard<std::mutex> lk(mu);
+            return failed.erase(path) > 0;
+        }
+        std::vector<std::string> take_all_failed() {
+            std::lock_guard<std::mutex> lk(mu);
+            std::vector<std::string> v(failed.begin(), failed.end());
+            failed.clear();
+            return v;
+        }
+        void finish() {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
+            }
+            cv.notify_all();
+            if (t.joinable()) t.join();
+        }
+        ~SlotWriter() { finish(); }
+    } slot_w;
+    slot_w.write = [&](const SlotWriter::Job& j) {
+        std::error_code wec;
+        bool ok = false;
+        {
+            std::ofstream f(j.path + ".tmp", std::ios::binary | std::ios::trunc);
+            f.write(j.bytes.data(), (std::streamsize) j.bytes.size());
+            f.flush();
+            ok = (bool) f;
+        }
+        ok = ok && !(std::filesystem::rename(j.path + ".tmp", j.path, wec), wec) && meta_write(meta_of(j.path), j.toks, j.n);
+        if (!ok) {
+            std::filesystem::remove(j.path + ".tmp", wec);
+            std::filesystem::remove(j.path, wec);
+        }
+        return ok;
+    };
     const auto slot_drop = [&](size_t i) {
+        slot_w.wait_for(slots[i].path);   // (its file may still be being written)
+        slot_w.take_failed(slots[i].path);
         std::error_code ec;
         std::filesystem::remove(slots[i].path, ec);
         std::filesystem::remove(meta_of(slots[i].path), ec);
@@ -1705,16 +1784,22 @@ static int glm_pack_generate(const Options& o) {
                                std::chrono::system_clock::now().time_since_epoch()).count();
         const std::string path = (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) +
                                               ".bin")).string();
-        std::string e;
-        const uint64_t bytes = model.slot_save(path + ".tmp", e);
-        if (bytes == 0 || (std::filesystem::rename(path + ".tmp", path, ec), ec) ||
-            !meta_write(meta_of(path), snap_tokens, bytes)) {
-            std::filesystem::remove(path + ".tmp", ec);
-            std::filesystem::remove(path, ec);
+        std::string e, buf;
+        for (const auto& fp : slot_w.take_all_failed()) {   // an earlier write that failed: that slot is gone
+            for (size_t i = 0; i < slots.size(); ++i)
+                if (slots[i].path == fp) {
+                    slots.erase(slots.begin() + (long) i);
+                    break;
+                }
+            note("setting a conversation aside failed (writing its files) - it is not kept");
+        }
+        const uint64_t bytes = model.slot_save(path + ".tmp", e, &buf);
+        if (bytes == 0) {
             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
-                         e.empty() ? "writing its files" : e.c_str());
+                         e.empty() ? "no snapshot" : e.c_str());
             return;
         }
+        slot_w.push({path, std::move(buf), snap_tokens, bytes});
         slots.push_back({snap_tokens, path, bytes, ++slot_clock});
         snap_in_slot = true;
         uint64_t total = 0;
@@ -1745,6 +1830,14 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (best == SIZE_MAX) return 0;
+        {   // its file may still be being written (slot_put)
+            slot_w.wait_for(slots[best].path);
+            if (slot_w.take_failed(slots[best].path)) {
+                note("setting a conversation aside failed (writing its files) - reading its prompt again");
+                slots.erase(slots.begin() + (long) best);
+                return 0;
+            }
+        }
         const auto t0 = std::chrono::steady_clock::now();
         std::string e;
         if (!model.slot_load(slots[best].path, (int64_t) len, e)) {
@@ -2978,6 +3071,7 @@ static int glm_pack_generate(const Options& o) {
     }
     // the engine ends (QUIT, or the server gone): the conversation in the model is kept for the next start
     if (slot_keep) slot_put(" on shutdown");
+    slot_w.finish();   // (every queued conversation on disk before the engine ends)
     return 0;
 }
 

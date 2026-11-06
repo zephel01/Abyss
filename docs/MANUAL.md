@@ -15,6 +15,7 @@ installer) is kept under [docs/maya/](maya/README.md).
 - [Configure and start](#configure-and-start)
 - [Using it](#using-it)
 - [DeepSeek V4.1 Flash](#deepseek-v41-flash)
+- [Qwen3.8-Flash-Next](#qwen38-flash-next)
 - [Ornith-1.5-122B](#ornith-15-122b)
 - [EXL3 quants (GLM-5.3-Flash)](#exl3-quants-glm-53-flash)
 - [Memory and speed](#memory-and-speed)
@@ -36,7 +37,8 @@ installer) is kept under [docs/maya/](maya/README.md).
 | CUDA | 13.3 | with `nvcc`; 12.9 for a V100 (`--nvcc`) |
 | Compiler | g++ 13 | a version your CUDA accepts |
 | Python | 3.12 | a private `.venv` in the Abyss folder |
-| ROCm (optional) | 7 (`hipcc`) | an AMD APU's integrated GPU computes the RAM-tier experts (the iGPU lane, below); without it the CPU does |
+| ROCm (optional) | 10 (HIP 7.14 or newer, `hipcc`) | an AMD APU's integrated GPU computes the RAM-tier experts (the iGPU lane, below); without it the CPU does |
+| ARM (beta) | NVIDIA DGX Spark (GB10, aarch64) | the engine built by hand for `121a` with CUDA 12.9 or newer; see "NVIDIA DGX Spark" below |
 
 `./abyss.sh` (Maya's installer, renamed) still installs Maya's GLM-5.3-Flash models. DeepSeek V4 is set up with
 `./setup-deepseek.sh` (next section), or by hand with the steps after it.
@@ -358,7 +360,7 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
   with 3+ cards opens on Devices. The footer names the layout.
 - **Several GPUs** (2-10 cards, mixed generations): each card shows its role, load, VRAM, the layers and expert pool
   it holds in a layer split (`L0-13`, from the engine log on this PC), temperatures, power against its own limit, its
-  PCIe link against its own max, and its share of the token time (`--` until phase 2). The busiest card is starred;
+  PCIe link against its own max, and its share of the token time (from the engine's STAT line, v1.3.80). The busiest card is starred;
   a card whose link fell while working, or that sits on a link under half the others' (an x1 riser, Gen2/Gen3 x4), is
   pink and named in a banner. Every drive shows its MB/s and its share of the expert reads (any number of drives). At
   80x24 the cards are summed up in one line (busiest / VRAM / hottest / lowest link) with the cards that matter.
@@ -383,7 +385,9 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
   drafter) come from the engine's INFO line, so a remote server shows them too.
 - **A server still loading (1.3.80+):** the port is bound before the engine starts, so `/health` answers
   `status: "loading"` with the stage, the warm-up's percent and GB and the seconds so far - the Terminal shows it on
-  another PC as on this one; every other request gets 503 + Retry-After until the model is ready. A context reload
+  another PC as on this one. From v1.3.81 that answer is a 503 with `Retry-After: 5` (a client that reads 200 as
+  "ready", such as a llama-swap health check, waits for the engine), and 200 once the model is ready; every other
+  request gets 503 + Retry-After until then. A context reload
   shows the same under `reloading`.
 - **`--` means not reported**, never 0. Still waiting for an engine counter: the helper card's share of the token
   time (E6, needs two CUDA cards).
@@ -467,8 +471,12 @@ experts in VRAM, so the second card's VRAM holds more of them.
   copy of token_embd, +497 MB of RAM). The first boundary is layer 2 or later (the first part applies the per-layer
   embeddings). `auto` counts its delta-net states, K / V caches and QSA keys at the context, and the drafter on the last
   part. Checked on one RTX 5090 seen as two devices (M16b build, split 24): KL the same as unsplit, real-use tasks the
-  same, drafts accepted 84.7% (83.2% unsplit). A real two-card speed has not been measured: reports from two-card
-  machines are welcome (the bench issue form). Conversation reuse (snapshots) is off under a split.
+  same, drafts accepted 84.7% (83.2% unsplit). On a real 16 GB + 16 GB GeForce pair (#35) a split at layer 32 was 22%
+  faster on long requests, but `auto` still picks the first card alone there (its cost model is to be refitted with
+  those numbers): set `--layer-split 32` by hand. From v1.3.110 a hand split is checked against the model's own layer
+  count (before, `--layer-split 46` on the 48-layer model was refused), and when `auto` runs on one card, that card
+  keeps its own `STRATA_GLM_VRAM_GB_PARTS` entry. Reports from two-card machines are welcome (the bench issue form).
+  Conversation reuse (snapshots) is off under a split.
 - **How the rows cross a boundary** (testing): `STRATA_GLM_HOP=host` (default: the pinned host buffer), `peer`
   (device to device; cards without peer access use host) or `sock` (a byte stream, the shape a link to another process
   or PC will take). On one RTX 5090 seen as two devices all three give the same KL and 44.6-46.1 tok/s.
@@ -538,7 +546,8 @@ measures them on your GPU(s) without a model, in under a minute each, with the m
 A choice clearly faster than the engine's own (2% or more) goes into the installed configs' `env`
 (`STRATA_GLM_MV_Q6K_SPLIT`) and applies at the next start. `abyss-gpu-tune.txt` gets a report: for a GPU other than
 those two, please paste it into an [issue](https://github.com/zephel01/Abyss/issues/new?template=gpu-tune.md) - the
-engine's defaults for that GPU come from such reports.
+engine's defaults for that GPU come from such reports. From v1.3.115 it also finds an engine built by hand in another
+folder (the configs' `exe`, e.g. `build-cuda`) instead of stopping with "not built here yet" (#37).
 
 ## NVIDIA DGX Spark (GB10, ARM, beta)
 
@@ -546,13 +555,17 @@ From v1.3.113 the engine builds for aarch64 + sm_121 and runs on a DGX Spark's G
 memory: the expert pool and the RAM tier are sized from one budget (`STRATA_GLM_UMA_HEADROOM_GB` left free),
 programmatic dependent launch is on (`STRATA_GLM_PDL`), RAM-tier experts are copied into the pool's slots
 (`STRATA_GLM_UMA_DIRECT=1`: read in place) and the CPU lane is off. Measured on a rented Spark with Qwen3.8 16G64G:
-47.05 tok/s with the MTP drafter (CLI, 4K), 43-54 through the server, 8K prompts ~1,040 tok/s. Build steps, the
-measurements and what is untested (the big models): [docs/DGX-SPARK.md](DGX-SPARK.md).
+47.05 tok/s with the MTP drafter (CLI, 4K), 43-54 through the server, 8K prompts ~1,040 tok/s. With v1.3.114
+(2026-11-06): GLM-5.3-Flash 19-20 tok/s, DeepSeek V4 0731 21.0 (22.8 with the DSpark drafter), DeepSeek V4.1 Compact
+~18; GLM's long prompts through the server are still slow there (~120-130 tok/s, the CLI 675-796; open). From
+v1.3.115 the engine does not start on memory another process holds (`STRATA_GLM_UMA_SHARE`,
+`STRATA_GLM_UMA_OTHERS_GB`). Build steps, the measurements and what is untested: [docs/DGX-SPARK.md](DGX-SPARK.md).
 
 ## DeepSeek V4.1 Flash
 
-From v1.3.29 the same engine runs DeepSeek-V4.1-Flash-1017. It is set up by hand (the one-command setup installs V4
-only); [docs/deepseek41/README.md](deepseek41/README.md) has the GGUFs that load, the pack command, a config and the
+From v1.3.29 the same engine runs DeepSeek-V4.1-Flash-1017. `./setup-deepseek.sh --model v41` (v1.3.100) installs
+zephel01's LDLQ GGUF ([Setup in one command](#setup-in-one-command)); other GGUFs are set up by hand.
+[docs/deepseek41/README.md](deepseek41/README.md) has the GGUFs that load, the pack command, a config and the
 measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model changes against V4. In short:
 
 - **Disk and memory.** nazeshinjite's Q2 GGUF is 366 GB: 153 GB of experts (384 a layer, 9.95 MB each), ~200 GB of
@@ -562,23 +575,41 @@ measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model c
 - **Speed is the SSD's.** A token that reads no expert from the SSD takes 13-15 ms; each read adds ~3-4 ms at
   3.4 GB/s. With `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` (a route's 4th-6th experts left out when they
   are only on disk; KL 0.229 -> 0.240 against the unquantized model) decode is ~28 tok/s, 17.7 without; swe-bench
-  coding tasks ran at 51.6 tok/s end to end. Prompts are slow (the attention runs a token at a time and the prompt's
-  experts come from the SSD).
+  coding tasks ran at 51.6 tok/s end to end. Prompts are slower than V4's: the prompt's experts come from the SSD (the
+  attention runs batched since v1.3.60).
 - **A lighter dense pack** (v1.3.36, optional): `attn_q_b` / `attn_output_a` / `attn_output_b` at Q5_K instead of
   Q8_0 (dense 8.14 -> 6.50 GB, 177 more VRAM expert slots) decodes 10-15% faster for KL 0.242 -> 0.251; see
   [docs/deepseek41/README.md](deepseek41/README.md#a-lighter-dense-pack-q5_k).
 - **Start it in a memory-capped scope** (`systemd-run --user --scope -p MemoryMax=88G ...`): the page cache and the
   pinned tier together can push systemd-oomd into killing the desktop session.
-- **Speculative decoding** (v1.3.53, opt-in): the DSpark drafter for V4.1 (`--dspark`), with the n-gram window; the
-  model's own MTP layers are in no GGUF. The prompt's attention is batched since v1.3.60.
-- **Not yet:** a layer split, conversation slots on disk, images.
+- **Speculative decoding** (v1.3.53, opt-in): Lucebox's DSpark drafter for V4.1, set by hand with
+  `STRATA_DS4_DSPARK=<file>` (the setup's `--dspark` installs V4 0731's drafter, not this one; Lucebox's V4.1 drafter
+  repository is no longer on Hugging Face, v1.3.100), with the n-gram window; the model's own MTP layers are in no GGUF.
+- **Images** (v1.3.93, PR #28; ISTA-DASLab's new-format templates from v1.3.105): with ISTA-DASLab's V4.1 mmproj and
+  the image router bias, set up by hand: [docs/SETTINGS.md](SETTINGS.md#images-on-deepseek-v41).
+- **Not yet:** a layer split, conversation slots on disk.
+
+## Qwen3.8-Flash-Next
+
+From v1.3.74 the engine runs Qwen3.8-Flash-Next (llama.cpp's `qwen4exp`) on the fast path (`--glm-pack`), with its
+prompt path, verify window and MTP drafter. It is set up by hand; [docs/qwen38/README.md](qwen38/README.md) has the
+GGUFs that load, the pack command (`tools/iq_pack.py --fast`), the drafter, a config and the measurements. In short:
+
+- **Our builds:** [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF) (KL 0.083; RTX 5090 at
+  32 GB 128.7 tok/s with the MTP drafter, at 16 GB 95.1) and
+  [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF) (L448: 448 of 512 experts, 67.5 GB, for a
+  12 GB GPU + 32 GB RAM).
+- **Other GGUFs** (beta): NVIDIA's NVFP4 checkpoints (v1.3.101) and unsloth's UD 3.1 sets (v1.3.112-v1.3.115), each
+  with its numbers in docs/qwen38.
+- **Two GPUs** (beta, v1.3.109): see [Several GPUs](#several-gpus). **DGX Spark** (beta, v1.3.113): see
+  [NVIDIA DGX Spark](#nvidia-dgx-spark-gb10-arm-beta).
 
 ## Ornith-1.5-122B
 
 From v1.3.46 the engine also runs [Ornith-1.5-122B](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF), a
 Qwen3.5-MoE model (llama.cpp's `qwen35moe`): 36 gated delta-net layers and 12 full-attention layers, 256 experts a
-layer with 8 routed and a gated shared expert, a plain residual. It is set up by hand like V4.1;
-[docs/ornith/README.md](ornith/README.md) has the GGUF, the pack command, a config and the measurements. In short:
+layer with 8 routed and a gated shared expert, a plain residual. `./setup-deepseek.sh --model ornith` (v1.3.100) installs zephel01's IQ3_XXS-B for a 16 GB GPU +
+64 GB RAM; other GGUFs are set up by hand. [docs/ornith/README.md](ornith/README.md) has the GGUF, the pack command, a config and the measurements. In short:
 
 - **Memory.** unsloth's UD-Q4_K_XL is 79.7 GB: 70.4 GB of experts (256 x 48, 3072 x 1024, IQ4_XS-Q6_K) and 5.4 GB of
   Q8_0 dense weights that stay on the GPU. A 32 GB card holds ~25 GB of experts; a 60 GB RAM tier the rest, so on a
@@ -590,8 +621,9 @@ layer with 8 routed and a gated shared expert, a plain residual. It is set up by
   `STRATA_DS4_SPEC=<k>` more): a copy task 57 tok/s with one, 76 with three. The GGUF's NextN block drafts too once
   its experts are repacked (`tools/nextn_pack.py`, `STRATA_GLM_MTP_GGUF`): code 59 tok/s, prose 50, the copy task 85
   (without the iGPU: code 36 -> 42, prose 33 -> 39).
-- **Not yet:** conversation slots, a layer split, images; the CUDA build compiles and has not been run; the expert
-  kernels are not yet tuned for its shapes.
+- **NVIDIA:** on an RTX 5090, IQ3_XXS-B decodes at 116 tok/s with its NextN drafter (75% accepted, v1.3.100); with a
+  1.45 GB expert pool (issue #23's 8 GB card) prompts ran at 356 tok/s (2K) and decode at 45.5 (v1.3.82).
+- **Not yet:** conversation slots, a layer split, images; the expert kernels are not yet tuned for its shapes.
 
 ## EXL3 quants (GLM-5.3-Flash)
 
@@ -677,7 +709,7 @@ The file is bleysg's GGUF of the official drafter,
 Then restart the server (`../Abyss-tools/abyss.sh restart`). `./setup-deepseek.sh --no-dspark` (or taking the line
 out) turns it off. At start the engine log's `dspark:` line names the file and the VRAM it took (`3 stages over
 target layers 40-42, 5 drafts a step; 6.48 GB on CUDA0 ...`). It runs with DeepSeek V4 Flash 0731 on one GPU - not
-with a layer split, DeepSeek V4.1 or the MTP block; then the line says `dspark: not loaded - <why>` and the model runs
+with a layer split or the MTP block (DeepSeek V4.1 takes its own drafter file, see [DeepSeek V4.1 Flash](#deepseek-v41-flash)); then the line says `dspark: not loaded - <why>` and the model runs
 on without it.
 
 **What it costs.** The drafter keeps its weights and all of its experts in VRAM: 6.48 GB that the expert pool gives
@@ -699,8 +731,8 @@ attention pack, through the server):
 Per swe-bench task the drafter gives +16-32%. On these tasks 68-82% of the drafts are accepted and a step moves 2.7-3.7
 tokens (4.7 on a task that copies code); prose gains least (~2 tokens a step). A window's column costs ~9 ms here,
 about what the CPU lane needs for one token's RAM-tier experts (8.4 ms: ~93 experts at the RAM's ~93 GB/s), so the
-window, not the drafter, sets the speed - a faster CPU / RAM or an iGPU lane helps more than a faster GPU. NVIDIA: the
-build compiles; it has not been run there yet.
+window, not the drafter, sets the speed - a faster CPU / RAM or an iGPU lane helps more than a faster GPU. NVIDIA: on a
+rented DGX Spark (v1.3.114) decode went 21.0 -> 22.8 tok/s with 78% of the drafts accepted.
 
 **How a step is chosen.** When the last 3 tokens occurred earlier in the prompt or the answer, their continuation
 (up to 5 tokens) is the window's drafts and the drafter does not run - while those repeats keep being right: every
@@ -808,6 +840,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_GRAPH` / `STRATA_GLM_GRAPH_MOE` | 1 / 1 on CUDA, 0 on HIP | Qwen3.8's verify window replays each delta-net layer from a CUDA graph (0: launched kernel by kernel; `_MOE=0`: the MoE dispatch outside the graph). The same tokens; launches a token 453 -> 254 (RTX 5090: no change in speed; DGX Spark, with PDL: 43.4 -> 47.1 tok/s) |
 | `STRATA_GLM_PDL` / `STRATA_GLM_PDL_PREFETCH` | on for an integrated GPU (sm_90+), off for a discrete card / 1 | programmatic dependent launch: a kernel starts while the one before finishes (DGX Spark, Qwen3.8 16G64G: 25.0 -> 30.7 tok/s without MTP, 43.4 -> 46.5 with it). `_PREFETCH`: the GEMVs pull their weight rows into L2 early (0: not; 2: also without PDL) |
 | `STRATA_GLM_UMA` / `STRATA_GLM_UMA_HEADROOM_GB` | 1 / 8 (CUDA) | an integrated GPU (DGX Spark) sizes its tiers from the unified memory, leaving `_HEADROOM_GB` free (0: the discrete-card policy, A/B) |
+| `STRATA_GLM_UMA_SHARE` / `STRATA_GLM_UMA_OTHERS_GB` | 0 / 16 | an integrated GPU: when other processes hold more than `_OTHERS_GB` of the shared memory and the experts no longer fit because of it, the engine stops at load and names the biggest ones (a second engine left running ran a DGX Spark out of memory); `STRATA_GLM_UMA_SHARE=1` starts anyway. A model bigger than the machine with nothing else running is not stopped |
 | `STRATA_GLM_UMA_DIRECT` | 0 | an integrated GPU reads RAM-tier experts in place instead of copying them into VRAM slots. Off by default: it stops promotions, so the hit rate stays low (DGX Spark, Qwen3.8 16G64G at 32 GB: copy 45.8, direct 34.9 tok/s) |
 | `STRATA_GLM_DISK_BUFFERED` | 0 | (test) expert reads from the SSD through the page cache instead of O_DIRECT |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | the tier moves' copies (the refill after a prompt, the swaps) go in pieces of up to this many KB a MoE layer, while the next layer's mixer runs, instead of all at the token boundary - there they held up the next token's host-mapped reads until they had landed (after an 8K prompt ~10 tokens at 35-39 ms). `0`: at the boundary, as before |
@@ -866,8 +899,9 @@ KL 0.009 over 3000 tokens, with the same next-token accuracy.
 
 ## Limitations
 
-- No draft model: this GGUF has no MTP block, and DSpark (DeepSeek's drafter) is not supported - speculative decoding
-  drafts from the text itself (`STRATA_DS4_SPEC`).
+- No MTP drafter: this GGUF has no MTP block. DeepSeek's DSpark drafter runs from v1.3.43 (`--dspark`, one GPU; see
+  [The DSpark drafter](#the-dspark-drafter-deepseek-v4-flash)); without it speculative decoding drafts from the text
+  itself (`STRATA_DS4_SPEC`).
 - Conversation slots on disk (`STRATA_GLM_SLOTS`) are off for DeepSeek V4; the live reuse of the last conversation works.
 - No images (DeepSeek V4 Flash is text-only here).
 - Several GPUs: the layer split runs (see "Several GPUs"), and a slower second card

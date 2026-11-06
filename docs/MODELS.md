@@ -35,7 +35,7 @@ of RAM with no SSD reads.
 | huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF (0422) | ~87-100 GB | not measured | not measured | – | loads: not yet checked |
 | `UD-Q2_K_XL` ([unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF), the setup's default; the default pack has Q5_K attention, KL 0.0055 -> 0.0119) | 96.8 GB | KL against llama.cpp 0.0096. swe-bench 60 x 5: 59/60 resolved, pass@1 95.8% (v1.3.27) | 5090: swe 60 tasks 106.7 tok/s (v1.3.27), one token at a time 92-95. R9700 + lane + DSpark: swe 60 tasks 70.2 (the build just before v1.3.43) | 32 GB VRAM + ~70 GB RAM hold every expert | **the default; start here** |
 | 0xSero's DGX-Spark EXL3 | – | not measured | – | – | DeepSeek EXL3 does not load yet |
-| DSpark drafter `DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf` ([bleysg](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF), `--dspark`) | 6.94 GB | the answers do not change (a draft is kept only when the target's own sample agrees) | R9700, swe 6 tasks: no lane 48.4 -> 61.9, with the lane 51.7 -> 67.3 tok/s (v1.3.43) | +6.5 GB VRAM (as many experts move to the SSD) | speed on an R9700; not measured on NVIDIA |
+| DSpark drafter `DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf` ([bleysg](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF), `--dspark`) | 6.94 GB | the answers do not change (a draft is kept only when the target's own sample agrees) | R9700, swe 6 tasks: no lane 48.4 -> 61.9, with the lane 51.7 -> 67.3 tok/s (v1.3.43) | +6.5 GB VRAM (as many experts move to the SSD) | speed on an R9700; a DGX Spark 21.0 -> 22.8 tok/s (v1.3.114) |
 
 Lossy settings (V4 0731, 5090, v1.2.1 / v1.3.2x): `STRATA_GLM_TAIL_SKIP=4` +7% one token at a time (iGPU lane), KL 0.0226.
 `STRATA_GLM_DEFER=1` +12-15%, KL 0.08 (0.012 off), L7 resolved 14 -> 13. `TAIL_SKIP=1` / `=2`: KL not measured.
@@ -109,11 +109,28 @@ Download counts not surveyed. UD-Q4_K_XL holds all its experts in 32 GB of VRAM 
 | --- | ---: | --- | --- | --- |
 | `UD-Q4_K_XL` ([unsloth/Ornith-1.5-122B-GGUF](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)) + the NextN drafter (`tools/nextn_pack.py`) | 79.7 GB + 1.5 GB | KL against llama.cpp 0.024 (v1.3.46). swe-bench L7: 11/16 resolved (v1.3.49) | R9700 + lane: one token at a time 41-43, with NextN code 59 / prose 50 (v1.3.46), 51.0 after 19K tokens (v1.3.49), swe L7 54.9 tok/s (v1.3.49). No lane: code 42 / prose 39 (v1.3.46) | 40-50 tok/s without the SSD |
 | `UD-IQ3_XXS` (unsloth) | 49.5 GB | not measured | user report only (#8 below) | 16 GB cards |
+| `IQ3_XXS-B` ([zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)) | 51.7 GB | KL about UD-IQ3_XXS's (0.138-0.140); swe-bench 56 of 60 resolved | 5090, the config `--model ornith` writes: 116 tok/s, 75% of the NextN drafts accepted (v1.3.100) | 16 GB GPU + 64 GB RAM |
+
+### Qwen3.8-Flash-Next (qwen4exp)
+
+Details, packing and the drafter: [docs/qwen38](qwen38/README.md). KL is against the NVFP4 teacher (seq 0-9, 2,048
+context) unless it says llama.cpp; speeds are a 4K prompt, 512 tokens, median of 3, with the MTP drafter, RTX 5090
+(PCIe Gen4 x4) + 94 GB RAM, iGPU lane off.
+
+| file (source) | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| UD 3.1 `UD-IQ4_XS` ([unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), beta) | 93.7 GB | KL 0.077 (llama.cpp on the same file 0.076) | 32 GB: 117.0, 16 GB: 80.9 (v1.3.115) | quality on 32 GB + 96 GB |
+| UD 3.1 `UD-IQ3_XXS` (unsloth, beta) | 83.6 GB | KL 0.099 | 32 GB: 133.0, 16 GB: 87.4 (v1.3.115) | speed and quality together |
+| UD 3.1 `UD-IQ1_M` (unsloth, beta) | 68.0 GB | KL 0.190 | 32 GB: 151.8, 16 GB: 77.0 (v1.3.115) | the smallest and fastest |
+| `16G64G` ([zephel01/Qwen3.8-Flash-Next-16G64G-GGUF](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF), beta) | see the model card | KL 0.083 | 32 GB: 131.3, 16 GB: 96.4 (v1.3.112); DGX Spark 47.05 (v1.3.113) | 16 GB GPU + 64 GB RAM |
+| `12G32G` L448 ([zephel01/Qwen3.8-Flash-Next-12G32G-GGUF](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF), 448 of 512 experts, beta) | 67.5 GB | not on this page's scale | not measured on this page's scale | 12 GB GPU + 32 GB RAM |
+| ISTA-DASLab GSQ-RCO `IQ3_S` | 83.6 GB | KL against llama.cpp 0.026 (R9700, v1.3.76) | 5090, ctx 32K: `--bench` 128.5-129.5 (v1.3.87); prompts 8K 2,240-2,376, 32K 3,002-3,027 (v1.3.88) | – |
+| magnitudedev `NVFP4` | 127.8 GB | KL against llama.cpp 0.015 / 0.018 (token / prompt path) | 5090 + 96 GB: swe 3 tasks 105.3, 32K prompt 2,515 (v1.3.101) | Blackwell's FP4 prompt path |
 
 ## 2. Reference benchmarks per GPU (the author's PC)
 
-Every RTX 5090 number is from **before the 2026-10-23 SSD swap** (ORICO, ~3.4 GB/s). The 5090 is detached now; its
-numbers on the new SSD, for ISTA, UD-IQ1_S and the V4.1 DSpark drafter will be measured together when it is back.
+RTX 5090 numbers up to v1.3.38 are from **before the 2026-10-23 SSD swap** (ORICO, ~3.4 GB/s); the 5090 is back from
+2026-10-31, and the rows from v1.3.82 on are on the NM790. ISTA and UD-IQ1_S on V4.1 are not re-measured on the 5090.
 
 | model / file | item | RTX 5090 + 8060S lane | AI PRO R9700 alone (CPU lane) | R9700 + 8060S lane | RTX 3090 (USB4) + lane |
 | --- | --- | --- | --- | --- | --- |
@@ -127,18 +144,41 @@ numbers on the new SSD, for ISTA, UD-IQ1_S and the V4.1 DSpark drafter will be m
 | V4.1 UD-IQ1_S + TAIL_SKIP (KL 0.359) | one token at a time | 45.6 (v1.3.38) | not measured | 31.9 (v1.3.46) | not measured |
 | | swe 8 tasks (NM790) | not measured | not measured | 43.7 (+ affinity, KL 0.3573), DSpark 54.4 (2026-10-24) | not measured |
 | V4.1 ISTA IQ2_XXS + TAIL_SKIP (KL 0.3266) | swe 8 tasks (NM790) | not measured | not measured | 42.2 / 41.3, DSpark 48.3 / 47.3 (2026-10-24) | not measured |
-| GLM Maya-S-v2 | one token at a time | 64.7-75.4 (v1.3.27) | not measured | 34.3-38.3 (v1.3.40) | 40.5-42.4 (v1.3.27) |
+| V4.1 UD-IQ2_XXS, ctx 64K | `--bench` decode / 8K prompt (no DSpark) | 23.1 / 357 (v1.3.82), 22.9 / 360 (v1.3.87) | not measured | not measured | not measured |
+| | swe 3 tasks, everyday settings + DSpark | 51.0 (v1.3.89) | not measured | not measured | not measured |
+| GLM Maya-S-v2 | one token at a time | 64.7-75.4 (v1.3.27); `--bench` 64.0-64.6 (v1.3.82-87) | not measured | 34.3-38.3 (v1.3.40) | 40.5-42.4 (v1.3.27) |
 | | swe 6 tasks | 64.1 (v1.3.27) | 25.8 (v1.3.39) | 35.8 (v1.3.39) | 39.7 (v1.3.27) |
+| | prompt 8K | 1,087-1,113 (v1.3.82-87) | not measured | not measured | not measured |
 | GLM EXL3 sc_2.10bpw | one token at a time | ~53 (v1.3.36) | not measured | not measured | not measured |
 | GLM exlr8 K2 | one token at a time | not measured | not measured | ~22.9 (2026-10-24) | not measured |
 | GLM exlr8 K3 | one token at a time | not measured | not measured | ~11.2 (2026-10-24) | not measured |
 | Ornith UD-Q4_K_XL + NextN | code / prose | not measured | 42 / 39 (v1.3.46) | 59 / 50 (v1.3.46) | not measured |
 | | swe L7 | not measured | not measured | 54.9 (v1.3.49) | not measured |
+| Qwen3.8 ISTA IQ3_S + MTP | `--bench` decode | 128.5-129.5 (v1.3.87) | not measured | 51 prose / 77 code (v1.3.76) | not measured |
+| Qwen3.8 16G64G + MTP | 4K prompt, 512 tokens | 131.3 at 32 GB, 96.4 at 16 GB (v1.3.112) | not measured | not measured | not measured |
 
 The R9700's V4.1 one-token numbers are 8-sequence means on the ORICO SSD (2026-10-22); the swe 8-task runs are after
 the switch to the NM790. UD-IQ1_S on the R9700 alone: ~22.7 tok/s one token at a time (44.0 ms, v1.3.46; the source
 does not say whether TAIL_SKIP was on). A 5090 + 3090 layer split is slower than the 5090 alone (87-90 tok/s, around
 v1.3.25).
+
+### DGX Spark
+
+A rented DGX Spark (GB10, 128 GB unified memory), Abyss v1.3.113-v1.3.114 (2026-11-05 / 06), beta
+([DGX Spark](DGX-SPARK.md)):
+
+| model / file | decode | prompt |
+| --- | --- | --- |
+| Qwen3.8 16G64G + MTP (v1.3.113) | 47.05 tok/s (CLI, 4K, median of 3 x 512; 31.2 without); 43-54 through the server | 8K ~1,040 tok/s |
+| GLM-5.3-Flash Maya-S-v2 IQ2_XXS / unsloth UD-IQ2_XXS | 19-20 tok/s (the MTP drafter gives no gain here) | 8K 730-750 tok/s; 32K from the CLI 675-796 |
+| DeepSeek V4 0731 | 21.0 tok/s, 22.8 with DSpark (78% of the drafts accepted) | 8K 814 tok/s |
+| DeepSeek V4.1 Compact JA256 (207 GB, does not fit in memory) | ~18 tok/s | not measured |
+
+llama.cpp on the same Spark (8K prompt, 4K of context filled): V4 0731 20.2 tok/s / prompt 360, GLM 19.3 / 321 - Abyss
+decodes the same or faster and reads prompts ~2.3x faster. Known (open, seen only on the Spark): through the server,
+32K-121K prompts run at ~120-130 tok/s against the CLI's 675-796; being investigated (the RTX 5090 does not show it).
+From v1.3.115 the engine does not start when other processes hold more than 16 GB of the shared memory and the experts
+no longer fit because of it (`STRATA_GLM_UMA_SHARE=1` starts anyway, `STRATA_GLM_UMA_OTHERS_GB` sets the limit).
 
 ## 3. User reports (for reference)
 
@@ -164,6 +204,10 @@ tables above.
 | #1 | AI PRO R9700 + i5-14400F + 128 GB RAM, Ubuntu (ROCm 7.0, ROCm 10 from v1.3.42) | v1.3.20 | V4 0731 UD-Q2_K_XL | defaults | 28.4-31.1, 36.6 warm |
 | #1 | same | v1.3.31 | same, 393K context | defaults | a 291K prompt read at 279 tok/s, decode 19.5 |
 | #1 | same | v1.3.35 / v1.3.37 / v1.3.42 | V4.1 nazeshinjite Q2, 80 GB RAM tier | `TAIL_SKIP=3` + `_DISK=1` (KL 0.241) | 24-28 / 30.5 / 22-25; 8K prompt 42-48 -> 60 (v1.3.42) |
+| #23 | RTX A2000 Laptop 8 GB + 64 GB RAM, PCIe Gen4 x8 | before v1.3.82 | GLM Maya-S-v2 (IQ4_XS dense pack), Ornith IQ3_XXS-B | an expert pool under a route (6 of 8 slots) | GLM 4-4.7 (bound by a 512 GB SSD); v1.3.82 lets such pools start and read prompts in chunks ([Small VRAM](SMALL-VRAM.md)) |
+| #31 | RTX 4090 + 96 GB RAM, Windows | before v1.3.107 | – | `STRATA_GLM_RAM_GB=72` | – (prompts from ~20K tokens failed, from ~40K the engine died; v1.3.107 moves the CPU's share to PCIe when its pinned buffers do not allocate) |
+| #35 | two 16 GB GeForce cards | v1.3.109-v1.3.110 | Qwen3.8-Flash-Next, two-GPU split (beta) | `--layer-split 32` against one card | – (the split 22% faster on long requests; `auto` still picks one card: set the split by hand) |
+| #37 | DGX Spark | v1.3.113-v1.3.114 | – | `./abyss.sh --check`, `--gpu-tune` | – (a short right Japanese answer failed `--check`'s check, fixed in v1.3.114; `--gpu-tune` finds a hand-built engine from v1.3.115) |
 
 The #8 rows and #11's "lane on" ones were measured with the iGPU lane wrongly running on the 9070 XT itself (no
 iGPU visible, the lane fell back to the engine's card: issue #11, fixed in v1.3.54). With it off V4.1 is about 30%

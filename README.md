@@ -5,10 +5,10 @@
 **Run DeepSeek V4 Flash (284B) and V4.1 Flash (1017) — mixture-of-experts models — on a single consumer GPU.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20(x86__64%2C%20ARM64)-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900?logo=nvidia&logoColor=white)
 ![ROCm](https://img.shields.io/badge/ROCm-7%20(experimental)-ED1C24?logo=amd&logoColor=white)
-![GPU](https://img.shields.io/badge/tested-RTX%205090%20%C2%B7%20RTX%203090%20%C2%B7%20Radeon%208060S-76B900)
+![GPU](https://img.shields.io/badge/tested-RTX%205090%20%C2%B7%20RTX%203090%20%C2%B7%20AI%20PRO%20R9700%20%C2%B7%20Radeon%208060S%20%C2%B7%20DGX%20Spark%20(GB10)-76B900)
 ![Model](https://img.shields.io/badge/model-DeepSeek--V4%20%2F%20V4.1--Flash-4D6BFE)
 [![Release](https://img.shields.io/github/v/release/zephel01/Abyss?label=release)](https://github.com/zephel01/Abyss/releases)
 
@@ -41,10 +41,9 @@ KL 0.194, 67.5 tok/s on coding tasks; `139G` (quality): KL 0.182, the best quali
 24 GB cards, 64 / 128 GB RAM...): `./abyss.sh --bench --deep` → [this issue form](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU), or quality problems in an
 issue / the HF Community tab. Reports go into the model card's GPU table and shape the next versions.
 
-**New: [DeepSeek V4.1 Flash (1017)](docs/deepseek41/README.md)** (v1.3.29-1.3.32) — on an RTX 5090 + 94 GB RAM + NVMe
-with nazeshinjite's Q2 GGUF: ~28 tok/s decode with the disk tail skip (17.7 with exact routing), 51.6 tok/s end to end
-on swe-bench coding tasks. Its 366 GB include ~200 GB of Engram tables, read row by row from the SSD, and ~43% of its
-experts stay on the SSD. What changed from V4: [the V4.1 spec](docs/deepseek41/SPEC.md).
+**[DeepSeek V4.1 Flash (1017)](docs/deepseek41/README.md)** runs from v1.3.29; from v1.3.100 `./setup-deepseek.sh
+--model v41` sets it up in one command with the LDLQ GGUF above. Its Engram tables (~110-200 GB) are read row by row
+from the SSD, and the experts that do not fit stay there. What changed from V4: [the V4.1 spec](docs/deepseek41/SPEC.md).
 
 **New: [DeepSeek's DSpark drafter](docs/MANUAL.md#the-dspark-drafter-deepseek-v4-flash)** (v1.3.43, opt-in:
 `./setup-deepseek.sh --dspark`) — a 6.9 GB block drafter proposes up to 5 tokens a step and the model checks them in
@@ -85,8 +84,11 @@ the APU's iGPU as a lane).
 - **Abyss Terminal** — `./abyss.sh --terminal`: decode / prompt tok/s, where a token's time goes with `--bench`'s
   verdict, GPUs, memory and requests in the terminal, for this PC's server or another's; it starts, stops and switches
   models and leaves the server running when it closes ([MANUAL](docs/MANUAL.md#abyss-terminal-abysssh---terminal)).
-- **Several GPUs, AMD, V100** — a layer split across NVIDIA cards, an experimental HIP build for Radeon, and an sm_70
-  build with CUDA 12.
+- **Several GPUs, AMD, V100** — a layer split across NVIDIA cards (Qwen3.8-Flash-Next too, beta from v1.3.109), an
+  experimental HIP build for Radeon, and an sm_70 build with CUDA 12.
+- **NVIDIA DGX Spark (beta, v1.3.113)** — the GB10's ARM CPU and unified memory: an aarch64 + sm_121 build, one memory
+  budget for the expert pool and the RAM tier; Qwen3.8-Flash-Next at 47 tok/s with its MTP drafter
+  ([DGX Spark](docs/DGX-SPARK.md)).
 - **One-command setup** — engine, model, pack, config and the `Abyss-tools` helper scripts.
 - **EXL3 quants (GLM-5.3-Flash, experimental)** — exllamav3's trellis quants read in place: turboderp's sc_2.10bpw
   predicts text better than Maya-S-v2 at 8 GB less (nll 1.59 vs 1.63), decoding at ~80% of its speed on an APU lane (v1.3.36); the
@@ -99,7 +101,7 @@ the APU's iGPU as a lane).
 | DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) (the setup's default) | 96.8 GB | measured, swe-bench 59 of 60 resolved |
 | | huihui-ai's abliterated Q2, antirez's deepseek-v4-gguf (`--compat-bf16`) | ~83 GB | runs (KL 0.0075 against llama.cpp) |
 | | unsloth's other quants with these expert types: IQ1_S-IQ4_XS, Q2_K-Q6_K, MXFP4 | | should run, untested |
-| | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); NVIDIA: builds, not measured |
+| | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); on a DGX Spark decode 21.0 -> 22.8 tok/s, 78% of the drafts accepted (v1.3.114) |
 | DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for quality) | 300 GB | measured on an AI PRO R9700: KL 0.141 (old file 0.188), swe-bench 8 tasks 33.9 tok/s on 32 GB + 96 GB, 29.5 on 32 GB + 64 GB ([which file](docs/deepseek41/README.md#ggufs-that-load)) |
 | | unsloth [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for speed) | 250 GB | measured the same way: KL 0.199 (old 0.270), **40.6 tok/s** on 32 GB + 96 GB, 30.5 on 32 GB + 64 GB |
 | | our [LDLQ 132G / 139G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF) for a 32 GB GPU + 96 GB RAM (BETA, 2026-11-02; reports welcome) | 275.8 / 283.0 GB | measured on an RTX 5090 + 96 GB: KL 0.194 / 0.182, swe 3 tasks 67.5 / 57.9 tok/s (UD-IQ1_M 71.8), 10 hard tasks 10/10 both; `--uncensor` OK ([details](docs/deepseek41/README.md#ggufs-that-load)) |
@@ -112,15 +114,18 @@ the APU's iGPU as a lane).
 | | the Lucebox DSpark drafter, DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf (`STRATA_DS4_DSPARK=<file>`, v1.3.53) | 4.9 GB | measured on an AI PRO R9700: swe-bench +16%, no gain on a ~3.4 GB/s SSD |
 | | orcarouter's abliterated [Mix-256G](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF) (uncensored; its Engram shard is byte for byte unsloth's UD-IQ1_S shard 5) | 236 GB + Engram | measured on an AI PRO R9700: KL 0.083 (the best V4.1 measured), swe-bench 8 tasks 22.4 tok/s with the tail skip (SSD-bound on 94 GB of RAM) |
 | | mrfakename's abliteration edit (`STRATA_GLM_ABL`, or an overlay with `tools/dense_overlay.py --abl`) | 43 KB | measured: refusals 12 of 16 -> 0, KL +0.002 ([UNCENSOR](docs/UNCENSOR.md)) |
-| Ornith-1.5-122B (Qwen3.5-MoE, [docs/ornith](docs/ornith/README.md)) | unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) (v1.3.46) | 79.7 GB | measured on an AI PRO R9700: 42 tok/s, KL 0.024 against llama.cpp; NVIDIA: builds, not measured |
-| | our [IQ3_XXS-B](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF) for a 16 GB GPU + 64 GB RAM | 51.7 GB | measured (VRAM capped at 16 GB, no iGPU lane): 42.6 tok/s with its NextN drafter, swe-bench 56 of 60 resolved (UD-Q4_K_XL 54) |
+| Ornith-1.5-122B (Qwen3.5-MoE, [docs/ornith](docs/ornith/README.md)) | unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) (v1.3.46) | 79.7 GB | measured on an AI PRO R9700: 42 tok/s, KL 0.024 against llama.cpp; on NVIDIA see IQ3_XXS-B below |
+| | our [IQ3_XXS-B](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF) for a 16 GB GPU + 64 GB RAM | 51.7 GB | measured (VRAM capped at 16 GB, no iGPU lane): 42.6 tok/s with its NextN drafter, swe-bench 56 of 60 resolved (UD-Q4_K_XL 54); RTX 5090 with the config `--model ornith` writes: decode 116 tok/s, 75% of the NextN drafts accepted (v1.3.100) |
 | | unsloth [UD-IQ3_XXS](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) | 49.5 GB | measured the same way: IQ3_XXS-B's quality (KL 0.140 vs 0.138), ~3% faster |
 | Qwen3.5-122B-A10B (Qwen3.5-MoE, Ornith's layout) | our [IQ3_XXS-B2](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF) for a 16 GB GPU + 64 GB RAM | 51 GB | measured: KL 0.035, 41.2 tok/s, swe-bench 53 of 60 resolved |
 | Qwen3.8-35B-A3B Distill (Qwen3.5-MoE, a small Ornith layout) | empero-ai [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF) (v1.3.92) | 21.7 GB | measured on an RTX 5090: swe-bench 3 tasks 399 tok/s with its NextN drafter (85% of drafts accepted); VRAM capped at 16 GB: 297 tok/s |
-| Qwen3.8-Flash-Next (qwen4exp, [docs/qwen38](docs/qwen38/README.md)) | orcarouter's [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) on the fast path (v1.3.74); beta from v1.3.76: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S, unsloth UD-IQ4_XS / UD-Q4_K_XL (which fits where: [docs/qwen38](docs/qwen38/README.md#other-ggufs-beta)) | 85.2 GB | measured on an AI PRO R9700: prompts 1,037 tok/s at 30K, answers 64-65 tok/s prose / 86 code with its MTP drafter, KL 0.026 against llama.cpp; NVIDIA: not built |
+| Qwen3.8-Flash-Next (qwen4exp, [docs/qwen38](docs/qwen38/README.md)) | orcarouter's [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) on the fast path (v1.3.74); beta from v1.3.76: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S, unsloth UD-IQ4_XS / UD-Q4_K_XL (which fits where: [docs/qwen38](docs/qwen38/README.md#other-ggufs-beta)) | 85.2 GB | measured on an AI PRO R9700: prompts 1,037 tok/s at 30K, answers 64-65 tok/s prose / 86 code with its MTP drafter, KL 0.026 against llama.cpp; NVIDIA: RTX 5090 from v1.3.83 (ISTA IQ3_S 128.5-129.5 tok/s with the drafter, v1.3.87), DGX Spark from v1.3.113 ([numbers](docs/qwen38/README.md#measured-on-nvidia-rtx-5090-dgx-spark)) |
+| | our [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF) for a 16 GB GPU + 64 GB RAM (beta; reports welcome) | | measured on an RTX 5090 + 94 GB: KL 0.083, 131.3 tok/s with its MTP drafter at 32 GB, 96.4 at 16 GB (v1.3.112); a rented DGX Spark 47.05 (v1.3.113) |
+| | our [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF) (L448: 448 of 512 experts) for a 12 GB GPU + 32 GB RAM (beta, 2026-11-04; reports welcome) | 67.5 GB | its MTP drafter loads from v1.3.106; 8 of 8 right answers on #33's prompt after v1.3.108's fix |
 | | magnitudedev's [NVFP4](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF) (v1.3.101, beta, [docs/qwen38](docs/qwen38/README.md#nvfp4-nvidias-fp4-checkpoints-v13101-beta)) | 127.8 GB | measured on an RTX 5090 + 96 GB: KL 0.018 against llama.cpp, prompts 2,515 tok/s at 32K, swe-bench 3 tasks 105.3 tok/s with its MTP drafter |
 | | unsloth [UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (v1.3.112, beta: its gate and up experts differ in type on one layer, [docs/qwen38](docs/qwen38/README.md#unsloth-ud-iq1_s-ud-31-v13112-beta)) | 66.4 GB | measured on an RTX 5090 + 94 GB: KL 0.201 (llama.cpp on the same file 0.201), 153 tok/s with its MTP drafter at 32 GB, code 4 / 5 |
 | | unsloth [UD 3.1 UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (v1.3.114, beta: one layer has Q5_0 down experts, [docs/qwen38](docs/qwen38/README.md#unsloth-ud-iq2_xs-ud-31-v13114-beta)) | 75.8 GB | measured on an RTX 5090 + 94 GB: KL 0.136 (llama.cpp on the same file 0.136), 134 tok/s with its MTP drafter at 32 GB, `--check --quick` 7 / 7 |
+| | unsloth's other UD 3.1 sets: UD-IQ4_XS, UD-Q3_K_XL, UD-IQ3_XXS, UD-Q2_K_XL, UD-Q2_0, UD-IQ1_M (v1.3.115, beta, [docs/qwen38](docs/qwen38/README.md#unsloths-other-ud-31-sets-v13115-beta)) | 68-94 GB | measured on an RTX 5090 + 94 GB: KL 0.077 (UD-IQ4_XS) to 0.190 (UD-IQ1_M), each within 0.001 of llama.cpp on the same file; 117-152 tok/s with the MTP drafter at 32 GB; `--check --quick` 7 / 7 for all six |
 | GLM-5.3-Flash (Maya's) | Maya-S-v2 IQ2_XXS, Maya-S24 | 96.5 / 94.7 GB | measured |
 | | turboderp's EXL3 sc_2.10bpw ([EXL3](docs/exl3/README.md)) | | measured, experimental |
 | | kindlingai's [exlr8](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) K2, converted with `tools/exlr8_convert.py` (v1.3.53) | 86 GB | measured on an AI PRO R9700: ~23 tok/s, nll 1.61 (Maya-S-v2 1.634, lower is better); K3 (125 GB): nll 1.548 at ~11 tok/s |
@@ -189,7 +194,8 @@ The drafter proposes up to 5 tokens after each one; on these tasks 68–82% of t
 2.7–3.7 tokens (4.7 on a task that copies code). Its 6.5 GB of VRAM push the coldest ~6.5 GB of experts to the SSD
 (0.01 reads a token). A window's extra column costs about what the CPU lane needs for a token's RAM-tier experts, so a
 faster CPU / RAM or an iGPU lane helps more than a faster GPU. The answers and prompts without the drafter are the same
-v1.3.43 build. Not measured on NVIDIA yet. Details: [the manual](docs/MANUAL.md#the-dspark-drafter-deepseek-v4-flash).
+v1.3.43 build. On NVIDIA, a rented DGX Spark (v1.3.114): decode 21.0 -> 22.8 tok/s with DSpark, 78% of the drafts
+accepted. Details: [the manual](docs/MANUAL.md#the-dspark-drafter-deepseek-v4-flash).
 
 </details>
 
@@ -206,7 +212,7 @@ Same machine, nazeshinjite's [Q2 GGUF](https://huggingface.co/nazeshinjite/DeepS
 | swe-bench, a partial run (v1.3.31: the first 35 of 60 tasks x 5, tail skip; the full 60 still owed) | 51.6 tok/s end to end, 34 of 35 resolved | (DeepSeek V4 Flash: 107.2 tok/s, 35 of 35) |
 
 Speed follows the experts read from the SSD a token: answers that read almost none run at 65–75 tok/s. The 60-task
-run broke at task 35 on the 16K bug fixed in v1.3.32 and is being re-run. Details:
+run broke at task 35 on the 16K bug fixed in v1.3.32. Details:
 [docs/deepseek41/README.md](docs/deepseek41/README.md).
 
 </details>
@@ -253,11 +259,12 @@ Every step is skipped when done, so it is safe to run again. Options: `--quant`,
 
 | | |
 | --- | --- |
-| OS | Linux (tested on Ubuntu) |
-| GPU | NVIDIA: RTX 5090 32 GB and RTX 3090 measured; a V100 builds with CUDA 12 (not run yet). AMD Radeon through HIP, experimental: Radeon 8060S and AI PRO R9700 (with the 8060S as its lane) run; see [docs/amd](docs/amd/README.md) |
+| OS | Linux (tested on Ubuntu); ARM64 on a DGX Spark (DGX OS, beta) |
+| GPU | NVIDIA: RTX 5090 32 GB and RTX 3090 measured, DGX Spark (GB10) beta; a V100 builds with CUDA 12 (not run yet). AMD Radeon through HIP, experimental: Radeon 8060S and AI PRO R9700 (with the 8060S as its lane) run; see [docs/amd](docs/amd/README.md) |
 | Memory | VRAM + RAM ≳ 100 GB to keep every expert in memory (less works, reading from the SSD) |
 | Disk | NVMe SSD with ~100 GB free (DeepSeek V4.1: ~370 GB, the faster the better) |
 | Toolchain | CUDA 13.x (`nvcc`; 12.9 for a V100), g++, Python 3.10+; ROCm 10 on Linux, AMD's ROCm SDK 7.14 on Windows (`hipcc`, HIP 7.14 or newer) for the iGPU lane on an AMD APU or for an AMD build - ROCm 7.0-7.2 fail with current drivers ([docs/amd](docs/amd/README.md)) |
+| ARM / DGX Spark | aarch64 + sm_121 (GB10), CUDA 12.9 or newer (DGX OS ships CUDA 13); no x86 kernels: the Q2_0-expert packs (the canonical DeepSeek V4 pack) need AVX and do not run there, the native packs (`--native`, `iq_pack.py --fast`) do ([DGX Spark](docs/DGX-SPARK.md)) |
 
 ## 🧠 How it works
 
@@ -336,6 +343,10 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | [Port notes](docs/deepseek4/PORT.md) | what Abyss adds and how it was validated |
 | [Spec](docs/deepseek4/SPEC.md) | DeepSeek V4's forward pass as implemented |
 | [DeepSeek V4.1](docs/deepseek41/README.md) | V4.1 Flash (1017): which GGUFs load, packing, running it, quality and speed, its options |
+| [Qwen3.8-Flash-Next](docs/qwen38/README.md) · [日本語](docs/qwen38/README.ja.md) | the fast path, the GGUFs that run, the MTP drafter, which file to pick, measurements |
+| [Ornith-1.5-122B](docs/ornith/README.md) | Ornith (Qwen3.5-MoE): files, the NextN drafter, setup, measurements |
+| [Models](docs/MODELS.md) · [日本語](docs/MODELS.ja.md) | quality and speed of every measured file, reference numbers per GPU, users' reports |
+| [Benchmark](docs/BENCH.md) · [日本語](docs/BENCH.ja.md) | `./abyss.sh --bench` and `--check`: what they measure, the verdict, what limits a PC, how to report |
 | [Decode expert helper](docs/EXPERT_HELPER.md) | opt-in CUDA second-GPU expert tier (`STRATA_GLM_EXPERT_HELPER`), CPU fallback, and memory-capacity comparisons |
 | [V4.1 spec](docs/deepseek41/SPEC.md) | what V4.1 changes against V4's forward pass, and where Abyss implements it |
 | [EXL3](docs/exl3/README.md) | exllamav3 quants of GLM-5.3-Flash: which PCs they suit, the quants offered, packing, measurements, settings |
@@ -356,12 +367,15 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 - [x] V100 (sm_70) builds with CUDA 12
 - [x] EXL3 quants of GLM-5.3-Flash (exllamav3), on the GPU, the iGPU lane and the CPU lane; a per-PC recommendation in the installer
 - [ ] EXL3 quants of DeepSeek V4 / V4.1; an iGPU trellis kernel built for RDNA
-- [x] DeepSeek's DSpark drafter for V4 Flash 0731 (v1.3.43, opt-in; measured on an AI PRO R9700, not yet on NVIDIA)
+- [x] DeepSeek's DSpark drafter for V4 Flash 0731 (v1.3.43, opt-in; measured on an AI PRO R9700 and a DGX Spark)
 - [ ] Conversation slots on disk
 - [ ] Windows for DeepSeek V4 (Linux tested; community builds on an RX 7900 XT, see [AMD HIP](docs/maya/AMD_HIP.md))
 - [x] DeepSeek V4.1: speculative decoding (the DSpark drafter, v1.3.53, opt-in) and a batched prompt attention (v1.3.60)
-- [ ] DeepSeek V4.1: its own MTP layers as the drafter (no GGUF carries them), a layer split, the one-command setup,
-  fewer SSD reads (eviction policy, the lane computing disk-landed experts)
+- [x] DeepSeek V4.1 in the one-command setup with our own GGUF (`./setup-deepseek.sh --model v41`, v1.3.100)
+- [x] Qwen3.8-Flash-Next on two GPUs (a layer split with the MTP drafter; beta, v1.3.109-v1.3.110)
+- [x] NVIDIA DGX Spark (GB10, ARM, unified memory; beta, v1.3.113)
+- [ ] DeepSeek V4.1: its own MTP layers as the drafter (no GGUF carries them), a layer split, fewer SSD reads
+  (eviction policy, the lane computing disk-landed experts)
 - [ ] Speed with several cards: a split's prompts (30% behind one RTX 5090 here); a run on a V100; discrete Radeon cards
 - [ ] Prompt-path tuning at short lengths (staging RAM-tier experts still dominates an 8K prompt)
 

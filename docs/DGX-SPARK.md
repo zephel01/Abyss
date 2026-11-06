@@ -5,9 +5,9 @@
 From v1.3.113 Abyss builds and runs on the DGX Spark: a Grace ARM CPU (aarch64) and a GB10 GPU (sm_121) sharing one
 128 GB LPDDR5X memory. Other GB10 boxes (ASUS Ascent GX10 and the like) are the same chip; we have not run one.
 
-What is measured: **Qwen3.8-Flash-Next 16G64G** on a rented DGX Spark for one day. Bigger models (DeepSeek V4.1,
-DeepSeek V4, GLM-5.3-Flash) are **not tested on a real Spark yet** (see [Not tested yet](#not-tested-yet)). Reports
-are welcome: [a bench issue](https://github.com/zephel01/Abyss/issues/new?template=bench.md) with `./abyss.sh --bench`.
+What is measured: **Qwen3.8-Flash-Next 16G64G** on a rented DGX Spark (2026-11-05), then **GLM-5.3-Flash, DeepSeek V4
+0731 and DeepSeek V4.1** on a rented DGX Spark with v1.3.114 (2026-11-06, [below](#measured-big-models-rented-dgx-spark-2026-11-06)).
+Reports are welcome: [a bench issue](https://github.com/zephel01/Abyss/issues/new?template=bench.md) with `./abyss.sh --bench`.
 
 ## What is different on a Spark
 
@@ -25,6 +25,11 @@ are welcome: [a bench issue](https://github.com/zephel01/Abyss/issues/new?templa
 - **No x86 CPU kernels.** The CPU's expert dots are ggml-cpu's own (NEON, dotprod / i8mm / fp16 from
   `/proc/cpuinfo`). Packs with Q2_0 experts (the canonical DeepSeek V4 pack) need AVX and do not run on ARM; the
   native packs (`--native`, `iq_pack.py --fast`) do.
+- **No start on memory another process holds** (v1.3.115). When other processes hold more than 16 GB of the shared
+  memory and the experts no longer fit because of it, the engine stops at load and names the biggest ones (a second
+  engine left running had made one start on 20 GB of free memory, and the machine ran out of memory).
+  `STRATA_GLM_UMA_SHARE=1` starts anyway, `STRATA_GLM_UMA_OTHERS_GB` sets the limit; a model bigger than the machine
+  with nothing else running is not stopped.
 
 ## Setup
 
@@ -94,7 +99,9 @@ DGX OS ships the NVIDIA driver and CUDA 13 (`/usr/local/cuda`). CUDA 12.9 or new
    ./abyss.sh --report         # abyss-report.txt for an issue (paths and names removed)
    ```
 
-   On a Spark the reports say "memory unified" where a PC's say the PCIe link.
+   On a Spark the reports say "memory unified" where a PC's say the PCIe link. `--gpu-tune` finds the hand-built
+   `build-cuda` engine through the config's `exe` from v1.3.115 (before, it stopped with "not built here yet"; #37),
+   and `--check`'s Japanese arithmetic task no longer fails a short right answer from v1.3.114 (#37).
 
 ## Measured (rented DGX Spark, 2026-11-05)
 
@@ -128,6 +135,22 @@ end with each turn's prompt reused (0.26-0.63 s a turn).
 v1.3.113 fixes the prompt path there: under a cap it counted the page cache as used and read prompts token by token
 (3.8K tokens: 129 s -> 6.5 s).
 
+## Measured: big models (rented DGX Spark, 2026-11-06)
+
+A rented DGX Spark (128 GB unified memory), Abyss v1.3.114, the default budget.
+
+| model | decode | 8K prompt | notes |
+|---|---:|---:|---|
+| GLM-5.3-Flash (Maya-S-v2 IQ2_XXS, unsloth UD-IQ2_XXS) | 19-20 tok/s | 730-750 tok/s | 32K prompt from the CLI 675-796 tok/s; the MTP drafter gives no gain here |
+| DeepSeek V4 0731 | 21.0 tok/s, **22.8 with the DSpark drafter** (78% accepted) | 814 tok/s | |
+| DeepSeek V4.1 Compact (zephel01's 207 GB build, does not fit in memory) | ~18 tok/s | | |
+
+**llama.cpp on the same Spark** (8K prompt, 4K context filled): V4 0731 decode 20.2 tok/s, prompt 360 tok/s;
+GLM-5.3-Flash 19.3 / 321. Abyss decodes the same or faster and reads prompts ~2.3x faster.
+
+**Known issue (open, seen only on the Spark):** GLM-5.3-Flash's 32K-121K prompts through the server run at ~120-130
+tok/s, while the CLI reads them at 675-796. Being investigated; an RTX 5090 does not show it.
+
 ## The SSD tier
 
 Models bigger than the memory read the rest of their experts from the SSD while answering. The rented machine's disk
@@ -148,8 +171,6 @@ Spark's numbers - only the shape:
 
 ## Not tested yet
 
-- DeepSeek V4.1 / V4 and GLM-5.3-Flash on a real Spark (PDL, the unified-memory sizing and the copy mode are the same
-  code, so they apply; not measured).
 - A Spark's own NVMe as the SSD tier (above: the rented disk was a loop device).
 - `./setup.sh` on ARM (the build was done by hand, as in [Setup](#setup)).
 - Two Sparks together, and the ASUS Ascent GX10.
