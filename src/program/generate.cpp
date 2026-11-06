@@ -1507,6 +1507,11 @@ static int glm_pack_generate(const Options& o) {
     // marks an open reasoning block
     bool req_end_guard = false;
     std::vector<int64_t> req_ws_ids;
+    // GEN key think_close=<a,b,..> (the server, STRATA_GLM_THINK_BRIDGE): what a reasoning block closed by the budget
+    // or the loop guard ends with before its </think> - a short sentence that the thinking stops here and the answer
+    // follows in the question's language.  A bare </think> in the middle of a thought let a model go on thinking in
+    // the answer (issue #36: English deliberation as the visible reply, 1 in 40 budget closes)
+    std::vector<int32_t> req_think_close;
     // GEN key end_ids=<a,b,..>: the turn's end tokens as the server stops on them (Qwen3.8's <|im_end|> on the glm
     // path, whose own end list is GLM's); the guard watches these, else the engine's end list
     std::vector<int64_t> req_end_ids;
@@ -2029,6 +2034,13 @@ static int glm_pack_generate(const Options& o) {
             }
             return 0;
         };
+        bool think_closing = false;   // the bridge and </think> are being forced (the reasoning is still open)
+        const auto close_think = [&]() {
+            std::vector<int32_t> seq(req_think_close);
+            seq.push_back(req_think_end);
+            model.force_seq(seq);
+            think_closing = true;
+        };
         const auto on_token = [&](int tok) -> bool {
             if (model.end_guard_fired() && o.serve)
                 std::printf("NOTE the turn ended %s: the model was kept going\n",
@@ -2038,10 +2050,9 @@ static int glm_pack_generate(const Options& o) {
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
             strata::core::progress_beat();
             gen_hist.push_back(tok);
-            if (in_think && tok != req_think_end) {
+            if (in_think && tok != req_think_end && !think_closing) {
                 if (const int per = looping(loop_w_think)) {
-                    model.force_next(req_think_end);   // as the budget does: the next token closes the reasoning
-                    in_think = false;
+                    close_think();   // as the budget does: the bridge, then </think>
                     char m[200];
                     std::snprintf(m, sizeof m, "thinking was repeating a %d-token pattern (%d tokens in): closed, "
                                   "answering", per, (int) produced);
@@ -2084,10 +2095,12 @@ static int glm_pack_generate(const Options& o) {
                     }
                 }
             }
-            if (in_think && (tok == req_think_end || (req_think_budget > 0 && produced >= req_think_budget) ||
-                             wrap_req.load())) {
-                if (tok != req_think_end) model.force_next(req_think_end);   // the budget: the next token closes it
+            if (in_think && tok != req_think_end && !think_closing &&
+                ((req_think_budget > 0 && produced >= req_think_budget) || wrap_req.load())) {
+                close_think();   // the budget: the bridge, then </think>; the reasoning ends when that comes out
+            } else if (in_think && tok == req_think_end) {
                 in_think = false;
+                think_closing = false;
                 gen_hist.clear();
                 if (req_end_guard) {   // the answer's first tokens: an end there is guarded (once)
                     model.end_guard(&guard_ids, -1);
@@ -2975,6 +2988,7 @@ static int glm_pack_generate(const Options& o) {
             req_end_guard = false;
             req_ws_ids.clear();
             req_end_ids.clear();
+            req_think_close.clear();
             req_spec = true;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
@@ -3001,6 +3015,12 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "end_guard") { req_end_guard = std::atoi(v.c_str()) != 0; }
                 else if (k == "ws_ids") { std::string e; parse_i64_list(v.c_str(), req_ws_ids, e); }
+                else if (k == "think_close") {
+                    std::vector<int64_t> c;
+                    std::string e;
+                    parse_i64_list(v.c_str(), c, e);
+                    for (int64_t x : c) if (x >= 0 && c.size() <= 96) req_think_close.push_back((int32_t) x);
+                }
                 else if (k == "end_ids") { std::string e; parse_i64_list(v.c_str(), req_end_ids, e); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }

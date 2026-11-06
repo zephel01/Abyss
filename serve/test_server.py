@@ -447,6 +447,17 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("ws_ids=198,271", k)
         self.assertIn("end_ids=151645", k)
         self.assertEqual(self.keys(temperature=0.7, _think_budget=4096, _ws_ids=[198]), ["temperature=0.7"])   # no </think>
+        # the bridge a forced </think> comes after (issue #36): with the open reasoning only
+        k = self.keys(temperature=0.7, _think_budget=750, _think_end=151668, _think_close=[271, 40, 614])
+        self.assertIn("think_close=271,40,614", k)
+        self.assertFalse([x for x in self.keys(temperature=0.7, _think_close=[271]) if x.startswith("think_close=")])
+        self.assertFalse([x for x in self.keys(temperature=0.7, _think_end=151668, _think_close=[])
+                          if x.startswith("think_close=")])
+        from serve.server import question_language
+        self.assertEqual(question_language("寝坊した上司への謝罪メールの件名を提案してください。"), "Japanese")
+        self.assertEqual(question_language("请用中文解释三省两指南。"), "Chinese")
+        self.assertEqual(question_language("한국어로 설명해 주세요"), "Korean")
+        self.assertIsNone(question_language("Explain the 3 ministries guidelines."))
 
     def test_uncensor_key(self):
         # the refusal-direction edit's per-request switch: a bool only, greedy and sampled lines alike

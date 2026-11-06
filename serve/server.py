@@ -87,6 +87,24 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
+# the thinking budget's bridge (STRATA_GLM_THINK_BRIDGE): said inside the reasoning just before a forced </think>
+THINK_BRIDGE = ("\n\nI have used up my thinking budget, so I stop thinking here and write the final answer now, "
+                "in the language of the user's question.\n")
+
+
+def question_language(text: str):
+    """The language a question's script shows, for the thinking bridge: kana -> Japanese, Hangul -> Korean, Han with
+    neither -> Chinese; None otherwise (Latin and other scripts: the bridge names no language)."""
+    kana = sum(1 for c in text if "\u3040" <= c <= "\u30ff")
+    hangul = sum(1 for c in text if "\uac00" <= c <= "\ud7a3")
+    han = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    if kana >= 2:
+        return "Japanese"
+    if hangul >= 2:
+        return "Korean"
+    if han >= 4:
+        return "Chinese"
+    return None
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
@@ -551,6 +569,9 @@ class StrataEngine:
         # the end-of-turn guard (STRATA_GLM_END_GUARD, default on): a turn ended inside the reasoning closes it, a turn
         # ended right after it with nothing but whitespace takes the next most likely token - once each (a quantized
         # model's empty answers); ws_ids: the whitespace-only tokens that do not count as an answer yet
+        tc = sampling.get("_think_close")
+        if think and tc:
+            think += " think_close=" + ",".join(str(int(i)) for i in tc)
         ws = sampling.get("_ws_ids")
         if think and ws:
             think += " end_guard=1 ws_ids=" + ",".join(str(int(i)) for i in ws)
@@ -1323,6 +1344,14 @@ class Service:
         self.think_budget = 0
         end = _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # what a reasoning block closed by the budget or the loop guard says before its </think> (the engine forces these
+        # tokens, then </think>): that the thinking stops here and the answer follows in the question's language.  A bare
+        # </think> in the middle of a thought let Qwen3.8 go on thinking in the answer, in English (issue #36).
+        # STRATA_GLM_THINK_BRIDGE=<text> another sentence (as given), 0 a bare </think> as before.  The default names the
+        # language of the last user turn when its script says it (Japanese, Chinese, Korean): "the language of the
+        # question" alone still let an English chain of thought answer in English (1 in 75)
+        self.think_bridge = os.environ.get("STRATA_GLM_THINK_BRIDGE")   # None: THINK_BRIDGE with the question's language
+        self.think_close_cache = {}
         # whitespace-only single tokens (the template's "\n\n" after </think>): the end guard's "no answer yet"
         self.ws_ids = sorted({i for w in ("\n", "\n\n", "\n\n\n", " ", "  ", " \n", "\n ", " \n\n")
                               for i in tokenizer.encode(w, parse_special=False)[:1]
@@ -1783,6 +1812,27 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def think_close_ids(self, ids) -> list[int]:
+        """The bridge's tokens for this prompt (THINK_BRIDGE, see __init__); [] = a bare </think>."""
+        b = self.think_bridge
+        if self.think_end_id is None or b == "0" or b == "":
+            return []
+        if b is None:
+            tail = self.tok.decode(ids[-768:])
+            for m in ("<|im_start|>user", "<|user|>", "<\uff5cUser\uff5c>"):
+                k = tail.rfind(m)
+                if k >= 0:
+                    tail = tail[k + len(m):]
+                    break
+            lang = question_language(tail)
+            b = THINK_BRIDGE.replace("in the language of the user's question",
+                                     f"in {lang}, the language of the user's question" if lang else
+                                     "in the language of the user's question")
+        if b not in self.think_close_cache:
+            t = self.tok.encode(b, parse_special=False)
+            self.think_close_cache[b] = t if 0 < len(t) <= 96 else []
+        return self.think_close_cache[b]
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -1847,7 +1897,7 @@ class Service:
                     # think_end marks the open reasoning block (the loop guard's thinking window, the end guard); the
                     # budget only when the run config sets one
                     sampling = {**(sampling or {}), "_think_budget": think_budget if in_think else 0,
-                                "_think_end": self.think_end_id}
+                                "_think_end": self.think_end_id, "_think_close": self.think_close_ids(ids)}
                     if os.environ.get("STRATA_GLM_END_GUARD", "1") != "0" and self.ws_ids:
                         sampling["_ws_ids"] = self.ws_ids
                         sampling["_end_ids"] = sorted(self.stop_ids)
@@ -1865,7 +1915,7 @@ class Service:
                         is_think_end = self.think_end_id is not None and t == self.think_end_id
                         if in_think and t == self.think_end_id:
                             in_think = False
-                            if n == think_budget + 1:
+                            if n > think_budget:
                                 print(f"[maya] thinking reached its budget ({think_budget} tokens): closed, "
                                       "answering", flush=True)
                         if t in self.stop_ids:

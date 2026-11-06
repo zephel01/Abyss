@@ -803,6 +803,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_NO_REUSE` | off | `1`: no conversation reuse |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | (server) tokens a thinking block always leaves for the answer (at most half of the request's `max_tokens`) |
 | `STRATA_GLM_END_GUARD` | 1 | (server) the end-of-turn guard: a turn that ends inside the reasoning closes the reasoning instead, and a turn that ends right after it with no answer takes the next most likely token, once each (a heavily quantized model's empty answers); `0` = off |
+| `STRATA_GLM_THINK_BRIDGE` | (a sentence) | (server) what a reasoning block closed by the thinking budget or the loop guard says just before its `</think>`: that the thinking stops here and the answer follows in the question's language (a bare `</think>` mid-thought let Qwen3.8 go on thinking in English in the answer, issue #36); another text replaces it, `0` = a bare `</think>` as before |
 | `STRATA_ENGINE_STALL_S` | 90 | (server) an engine silent that long with no CPU, disk or GPU work is ended and started again by the next request; `0` off |
 | `STRATA_ENGINE_START_S` | 1800 | (server) the most a start may take before READY (a model loading from the SSD takes minutes); past it the engine is ended and the start fails with a line; `0` no limit (v1.3.78) |
 | `STRATA_ENGINE_DRAIN_S` | 120 | (server) a request stopped early (the client left) is drained to its DONE; an engine silent that long after the STOP is ended; `0` no limit (v1.3.78) |

@@ -7,6 +7,17 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.116 - 2026-11-06
+
+- **A reasoning block closed by the thinking budget no longer spills into the answer (#36, thanks @hondaru)**: the
+  budget (and the loop guard) used to force a bare `</think>` in the middle of a thought, and Qwen3.8 now and then went
+  on thinking in English as the visible answer. It now closes with one short sentence first - the thinking stops here
+  and the answer follows in the question's language, named when the question's script shows it (Japanese, Chinese,
+  Korean) - then `</think>`. Qwen3.8 12G32G L448, RTX 5090, temperature 1.0, three of the reported Japanese prompts with
+  `max_tokens` 1000 (the budget closed 70 of 75 replies): English as the answer 2 of 75 -> 0 of 75; the
+  3-ministries prompt no longer runs into the cap (8 -> 0 of 25). The sentence shows in `reasoning_content`.
+  `STRATA_GLM_THINK_BRIDGE=<text>` sets another sentence, `0` the bare `</think>` as before.
+
 ## v1.3.115 - 2026-11-06
 
 - **unsloth's other UD 3.1 sets of Qwen3.8-Flash-Next run** (beta): UD-IQ4_XS, UD-Q3_K_XL, UD-IQ3_XXS, UD-Q2_K_XL,

@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 #include <condition_variable>
 #include <functional>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -237,7 +238,11 @@ public:
     /// The next decoded token is `tok` instead of the sampled one (once; -1 clears): the serve loop's thinking budget
     /// closes the reasoning block this way inside the running decode - the speculative loop takes it as the truth
     /// for its position, like a rejected draft, so nothing is read again.
-    void force_next(int32_t tok) { force_tok_ = tok; }
+    void force_next(int32_t tok) { force_q_.clear(); if (tok >= 0) force_q_.push_back(tok); }
+    /// force_next for a run of tokens: the next decoded tokens are `toks`, in order (the thinking budget's bridge text
+    /// and its </think>); one per position, each taken by the speculative loops as the truth for its position.
+    void force_seq(const std::vector<int32_t>& toks) { force_q_.assign(toks.begin(), toks.end()); }
+    bool forcing() const { return !force_q_.empty(); }
     /// The on-demand vision encoder (serve VLEND / VRECLAIM; STRATA_GLM_VISION_LEND_MB at load): the first GPU's
     /// lendable pool tail is emptied and freed so the encoder's process can use that VRAM, and allocated again
     /// once it has ended (false while the memory is still taken).  vision_lend_bytes(): 0 when unavailable.
@@ -245,9 +250,9 @@ public:
     bool vision_reclaim(std::string& err);
     size_t vision_lend_bytes() const;
     int32_t forced(int32_t sampled) {
-        if (force_tok_ >= 0) {
-            const int32_t t = force_tok_;
-            force_tok_ = -1;
+        if (!force_q_.empty()) {
+            const int32_t t = force_q_.front();
+            force_q_.pop_front();
             return t;
         }
         return guard_ids_ != nullptr ? end_guard_pick(sampled) : sampled;
@@ -468,7 +473,7 @@ public:
     bool fast_mode_ = false;                               // decided at load (STRATA_GLM_SLOW=1 turns it off)
     bool host_logits_ = true;
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
-    int32_t force_tok_ = -1;                               // force_next()
+    std::deque<int32_t> force_q_;                          // force_next() / force_seq()
     const std::vector<int64_t>* guard_ids_ = nullptr;      // end_guard()
     int32_t guard_tok_ = -1;
     bool guard_fired_ = false;
