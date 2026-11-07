@@ -40,6 +40,8 @@ jobs:
           if (-not (Test-Path "$cuda\bin\nvcc.exe")) { Write-Error "nvcc not found under $cuda"; exit 1 }
           "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # (CUDA 13 on Windows keeps its DLLs - cuBLAS among them - in bin\x64)
+          if (Test-Path "$cuda\bin\x64") { "$cuda\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
           & "$cuda\bin\nvcc.exe" --version
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -70,4 +72,8 @@ jobs:
         run: |
           $exe = Get-ChildItem -Path build -Recurse -Filter strata.exe | Select-Object -First 1
           & $exe.FullName --help > $null
-          if ($LASTEXITCODE -ne 0) { Write-Error "strata --help exited $LASTEXITCODE"; exit 1 }
+          if ($LASTEXITCODE -ne 0) {
+            # (-1073741515 = 0xC0000135, a DLL not found: list what the binary loads)
+            dumpbin /dependents $exe.FullName
+            Write-Error "strata --help exited $LASTEXITCODE"; exit 1
+          }
