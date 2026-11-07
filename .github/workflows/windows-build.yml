@@ -54,8 +54,16 @@ jobs:
           -DSTRATA_GGML_DIR="$env:GITHUB_WORKSPACE/third_party/llama.cpp"
       - name: Build the engine and the GPU tuner
         # (nvcc takes 2-4 GB a job on the big kernels: the runner's 16 GB allow four)
+        # (the first compiler errors also go out as annotations, readable without the full log)
         shell: pwsh
-        run: cmake --build build --target strata abyss_gpu_tune -j4
+        run: |
+          cmake --build build --target strata abyss_gpu_tune -j4 2>&1 | Tee-Object -FilePath build.log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            Select-String -Path build.log -Pattern ': (fatal )?error|error:|FAILED:' | Select-Object -First 15 |
+              ForEach-Object { Write-Output ("::error::" + $_.Line.Trim()) }
+            exit $rc
+          }
       - name: The engine starts
         # no GPU here: only that the binary loads (CUDA's DLLs on PATH) and prints its usage (exit 0)
         shell: pwsh
