@@ -1,0 +1,65 @@
+# Windows x64 (MSVC + CUDA 13, as setup on a Windows PC builds it) on GitHub's Windows runners - no GPU there, so
+# compile only: the CUDA engine for sm_120a (RTX 50) and the GPU tuner, then that the binary starts.  It catches
+# POSIX-only headers and calls in the engine (v1.3.109-119 failed to build on Windows over hop_link.cu's
+# sys/socket.h, issue #31) before a release.
+name: windows-build
+
+on:
+  push:
+    branches: [main, ci-windows]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # llama.cpp at the commit the installer pins (setup.py LLAMA_CPP_COMMIT; tests.yml and arm-build.yml use the same)
+  LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+  CUDA_FULL: "13.3.0"
+  CUDA_MM: "13.3"
+
+jobs:
+  cuda-build:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: CUDA toolkit (NVIDIA's network installer, silent)
+        shell: pwsh
+        run: |
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_FULL/network_installers/cuda_${env:CUDA_FULL}_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\cuda.exe" -ArgumentList "-s" -Wait -NoNewWindow
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$env:CUDA_MM"
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { Write-Error "nvcc not found under $cuda"; exit 1 }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$cuda\bin\nvcc.exe" --version
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
+          -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
+          -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF -DSTRATA_PORTABLE=ON
+          -DSTRATA_GGML_DIR="$env:GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build the engine and the GPU tuner
+        # (nvcc takes 2-4 GB a job on the big kernels: the runner's 16 GB allow four)
+        shell: pwsh
+        run: cmake --build build --target strata abyss_gpu_tune -j4
+      - name: The engine starts
+        # no GPU here: only that the binary loads (CUDA's DLLs on PATH) and prints its usage (exit 0)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build -Recurse -Filter strata.exe | Select-Object -First 1
+          & $exe.FullName --help > $null
+          if ($LASTEXITCODE -ne 0) { Write-Error "strata --help exited $LASTEXITCODE"; exit 1 }
