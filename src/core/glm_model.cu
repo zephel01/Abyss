@@ -221,9 +221,40 @@ static int native_rows(const strata::TensorInfo* t) {
     return (int) n;
 }
 
+// STRATA_GLM_DENSE_Q8 (default on; =0: the BF16 rows as before): glm5's pack rows that dense.bin carries as BF16 but
+// the GGUF stores as Q8_0 - the mHC mixes, KDA's f/g/beta projections, the indexer's k / gate / q_b, MLA's absorbed
+// k_b / v_b - go to the device as the GGUF's own Q8_0 blocks: half the bytes every token reads (GLM-5.3-Flash: 0.79 ->
+// 0.42 GB), and exactly llama.cpp's weights (the BF16 expansion rounded each d * q).  The NextN block keeps BF16.
+static bool dense_q8_env() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_DENSE_Q8");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+static bool dense_q8_row(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
+                         bool glm5) {
+    if (!fast || !glm5 || kind != "4" || t == nullptr || t->type != 8 || t->shape.empty() || t->shape[0] % 32 != 0 ||
+        name.rfind("blk.", 0) != 0 || !dense_q8_env())
+        return false;
+    static const char* const kNames[] = {".hc_attn_fn.weight", ".hc_ffn_fn.weight", ".ssm_f_a.weight", ".ssm_g_a.weight",
+                                         ".ssm_f_b.weight", ".ssm_g_b.weight", ".ssm_beta.weight",
+                                         ".indexer.attn_k.weight", ".indexer_compressor_gate.weight",
+                                         ".indexer.attn_q_b.weight", ".attn_k_b.weight", ".attn_v_b.weight"};
+    for (const char* n : kNames) {
+        const size_t l = std::strlen(n);
+        if (name.size() > l && name.compare(name.size() - l, l, n) == 0) return true;
+    }
+    return false;
+}
+
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
-                              std::string* how = nullptr) {
+                              std::string* how = nullptr, bool glm5 = false) {
     if (fast && name == "token_embd.weight") return 0;
+    if (dense_q8_row(name, kind, t, fast, glm5)) {
+        if (how) *how = " q8";
+        return ((uint64_t) t->elements() / 32 * 34 + 255u) & ~(uint64_t) 255u;
+    }
     if (t->type == 26) {   // I32 (deepseek4's hash-routing tables): uploaded as they are
         if (how) *how = " i32";
         return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
@@ -1231,6 +1262,7 @@ void Glm5Model::reset() {
     }
     pos_ = 0;
     if (g_.qwen35()) qwen35_reset();
+    if (g_.arch == 0) q35_pend_pos_ = q35_row_done_ = -1;   // (glm5-next's NextN drafter on one part)
     dspark_reset();
     if (split_next_) {
         split_next_->reset();
@@ -1575,7 +1607,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             const strata::TensorInfo* t = find(nm);
             const auto xm = xtab.mats.find(nm);
             if (t == nullptr && (kind != "x" || xm == xtab.mats.end())) continue;
-            const double b = kind == "x" ? (double) xm->second.vram() : (double) pack_row_vram(nm, kind, t, fast);
+            const double b = kind == "x" ? (double) xm->second.vram()
+                                         : (double) pack_row_vram(nm, kind, t, fast, nullptr, !g.dsv4() && !g.qwen35());
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
@@ -3164,6 +3197,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
+    const bool glm5_q8 = !g_.dsv4() && !g_.qwen35();   // (dense_q8_row: glm5 only)
     uint64_t bytes = 0;
     std::map<std::string, uint64_t> by_kind;   // STRATA_GLM_TIMING: the dense weights' VRAM by kind and storage
     const auto kind_of = [](const std::string& n) -> std::string {
@@ -3202,7 +3236,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
         if (skip_upload(r)) continue;
         std::string how;
-        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how);
+        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how, glm5_q8);
         bytes += b;
         by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + how] += b;
     }
@@ -3280,6 +3314,21 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             pack_emb_src_ = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             pack_emb_type_ = (int) ti->type;
+            continue;
+        }
+        if (dense_q8_row(r.name, r.kind, t, fast_mode_, glm5_q8)) {
+            // the GGUF's Q8_0 blocks, raw (STRATA_GLM_DENSE_Q8)
+            const int si = find_shard_of(r.name);
+            const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;
+            if (ti == nullptr || ti->type != 8 || ti->elements() != t->elements()) {
+                err = "pack: Q8_0 row " + r.name + " not found in any shard";
+                return false;
+            }
+            const size_t nbytes = (size_t) ti->elements() / 32 * 34;
+            const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            w8_[r.name] = (const void*) ((uint8_t*) w_arena_ + at);
+            at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
         if (keep16(r, t)) {
@@ -3431,7 +3480,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
-        (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr)) {   // any split: the speculative decode runs on 2+ parts; qwen35moe: its drafter
+        (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr || (g_.arch == 0 && l0_ == 0 && glm_window_env()))) {
+        // (glm5-next on one part with STRATA_GLM_WINDOW=1: the block drafts for the verify window, dsv4_verify.cu)   // any split: the speculative decode runs on 2+ parts; qwen35moe: its drafter
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
     }

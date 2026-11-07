@@ -775,7 +775,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         } else {
             has_dsa = true;
             deq_ok(Ly.q_a, "attn_q_a", il);
-            if (Ly.idx_q_b == nullptr) deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);
+            if (Ly.idx_q_b == nullptr && Ly.idx_q_b8 == nullptr) deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
@@ -2080,12 +2080,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const float one = 1.0f, zero = 0.0f;
 
     // Y[t][N] (row stride ldy) = alpha * X[t][K] (F32, row stride ldx) . W[N][K]^T, W BF16 (widened in slices)
+    // (W8 != nullptr: W is the GGUF's Q8_0 blocks instead - STRATA_GLM_DENSE_Q8 - widened the same way)
     const auto sgemm_bf16 = [&](const uint16_t* W, int N, int Kd, const float* X, int ldx, float* Y, int ldy, int Tn,
-                                float alpha) {
+                                float alpha, const void* W8 = nullptr) {
         const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w32_elems / Kd));
         for (int r0 = 0; r0 < N; r0 += rows) {
             const int n = std::min(rows, N - r0);
-            gb::bf16_to_f32(W + (size_t) r0 * Kd, S->w32, (int64_t) n * Kd, s);
+            if (W8 != nullptr)
+                strata::kernels::glmf::q8_0_to_f32((const uint8_t*) W8 + (size_t) r0 * (Kd / 32) * 34, S->w32,
+                                                   (int64_t) n * Kd, s);
+            else
+                gb::bf16_to_f32(W + (size_t) r0 * Kd, S->w32, (int64_t) n * Kd, s);
             blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &alpha, S->w32, Kd, X, ldx, &zero, Y + r0,
                                 ldy),
                     "sgemm");
@@ -2286,10 +2291,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return true;
     };
     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16
-    const auto hc_read = [&](const float* block_out, const uint16_t* fn, const float* scale, const float* base,
-                             const float* norm, const float* pre_use = nullptr, float* pre_out = nullptr) {
+    const auto hc_read = [&](const float* block_out, const uint16_t* fn, const void* fn8, const float* scale,
+                             const float* base, const float* norm, const float* pre_use = nullptr,
+                             float* pre_out = nullptr) {
         gb::hc_update(block_out, S->R, S->post, S->comb, S->ss, T, E, s);
-        sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
+        sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f, fn8);
         gb::HcFinishArgs h;
         h.mix = S->mix;
         h.ss = S->ss;
@@ -2721,7 +2727,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 blk = nullptr;
                 S->mark("engram", s);
             }
-            hc_read(blk, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm,
+            hc_read(blk, Ly.hc_attn_fn, Ly.hc_attn_fn8, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm,
                     il == l0_ ? S->onehot : S->pre2, S->pre);
             if (dsp_ != nullptr && il > l0_) dspark_capture_rows(il - 1, S->R, T, s);   // DSpark's features
         } else if (g.q4x) {
@@ -2737,7 +2743,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
         } else {
-            hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
+            hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_fn8, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
             if (dsp_ != nullptr && il > l0_) dspark_capture_rows(il - 1, S->R, T, s);   // DSpark's features
         }
         S->mark("hc", s);
@@ -2833,16 +2839,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
                 hgemm_q(Ly.k, DI, E, x16, E, B.proj[1], DI, tn, 0.0f);
                 hgemm_q(Ly.v, DI, E, x16, E, B.proj[2], DI, tn, 0.0f);
-                sgemm_bf16(Ly.f_a, HD, E, xs, E, B.fa, HD, tn, 1.0f);
-                sgemm_bf16(Ly.g_a, HD, E, xs, E, B.ga, HD, tn, 1.0f);
-                sgemm_bf16(Ly.beta, g.n_head, E, xs, E, B.beta, g.n_head, tn, 1.0f);
+                sgemm_bf16(Ly.f_a, HD, E, xs, E, B.fa, HD, tn, 1.0f, Ly.f_a8);
+                sgemm_bf16(Ly.g_a, HD, E, xs, E, B.ga, HD, tn, 1.0f, Ly.g_a8);
+                sgemm_bf16(Ly.beta, g.n_head, E, xs, E, B.beta, g.n_head, tn, 1.0f, Ly.beta8);
                 const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
                 float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
                 float* cst = state_ + kda_conv_[(size_t) il];
                 gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
                 gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
-                sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
-                sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
+                sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f, Ly.f_b8);
+                sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f, Ly.g_b8);
                 S->mark("kda_proj", s);
                 gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
                             state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
@@ -2855,8 +2861,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
                 hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
                 hgemm_q(Ly.kv_a, g.kv_lora, E, x16, E, B.kv_raw, g.kv_lora, tn, 0.0f);
-                sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f);
-                sgemm_bf16(Ly.idx_gate, g.idx_key, E, xs, E, B.ig_raw, g.idx_key, tn, 1.0f);
+                sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f, Ly.idx_k8);
+                sgemm_bf16(Ly.idx_gate, g.idx_key, E, xs, E, B.ig_raw, g.idx_key, tn, 1.0f, Ly.idx_gate8);
                 sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn, prescale);
                 gb::DsaPrepArgs d;
                 d.qr_raw = B.qr_raw;
@@ -2894,7 +2900,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             g.idx_heads * g.idx_key, tn, 0.0f);
                 else
                     sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
-                               g.idx_heads * g.idx_key, tn, 1.0f);
+                               g.idx_heads * g.idx_key, tn, 1.0f, Ly.idx_q_b8);
                 S->mark("dsa_proj", s);
                 const int max_vis = (pt + tn) / kp;
                 if (max_vis > g.top_pools_max())
@@ -2913,7 +2919,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 uint16_t* const hp_q = (uint16_t*) B.attn;
                 uint16_t* const hp_c = (uint16_t*) B.q_abs;
                 if (f16) {
-                    bf16_to_f16<<<1024, 256, 0, s>>>(Ly.k_b, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope);
+                    if (Ly.k_b8 != nullptr)
+                        strata::kernels::glmf::q8_0_to_f16(Ly.k_b8, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
+                    else
+                        bf16_to_f16<<<1024, 256, 0, s>>>(Ly.k_b, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.q, hp_q, tn, g.n_head, g.qk_nope);
                     blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
                                                         S->w16, HIP_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
@@ -2924,7 +2933,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 } else
 #endif
                 {
-                gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
+                if (Ly.k_b8 != nullptr)
+                    strata::kernels::glmf::q8_0_to_f32(Ly.k_b8, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
+                else
+                    gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
                 blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
                                                   S->w32, g.qk_nope, (long long) g.kv_lora * g.qk_nope, B.q,
                                                   g.n_head * g.qk_nope, g.qk_nope, &zero, B.q_abs, g.n_head * g.kv_lora,
@@ -2949,7 +2961,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
 #if defined(STRATA_USE_HIP)
                 if (f16) {
-                    bf16_to_f16<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
+                    if (Ly.v_b8 != nullptr)
+                        strata::kernels::glmf::q8_0_to_f16(Ly.v_b8, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora, s);
+                    else
+                        bf16_to_f16<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.ctx, hp_c, tn, g.n_head, g.kv_lora);
                     blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
                                                         S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
@@ -2960,7 +2975,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 } else
 #endif
                 {
-                gb::bf16_to_f32(Ly.v_b, S->w32, (int64_t) g.n_head * g.v_head * g.kv_lora, s);
+                if (Ly.v_b8 != nullptr)
+                    strata::kernels::glmf::q8_0_to_f32(Ly.v_b8, S->w32, (int64_t) g.n_head * g.v_head * g.kv_lora, s);
+                else
+                    gb::bf16_to_f32(Ly.v_b, S->w32, (int64_t) g.n_head * g.v_head * g.kv_lora, s);
                 blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
                                                   S->w32, g.kv_lora, (long long) g.v_head * g.kv_lora, B.ctx,
                                                   g.n_head * g.kv_lora, g.kv_lora, &zero, B.attn, g.n_head * g.v_head,
@@ -2990,13 +3008,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         abl_out(il, 0, S->mixer, T, E, s);
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
         if (g.v41)
-            hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm, S->pre, S->pre2);
+            hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_fn8, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm, S->pre, S->pre2);
         else if (g.q4x)
             q4_mix(il, 1, S->mixer, S->pre, S->post, false);
         else if (g.qwen35())
             q35::add_rms_rows(S->R, 4 * E, S->mixer, Ly.post_norm, g.norm_eps, T, E, S->x, S->x16, s);
         else
-            hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
+            hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_fn8, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
         dump_row("ffn_norm-" + std::to_string(il), S->x, E);
         // the CPU lane's x (this layer's FFN input) goes down now, under the shared expert and the routing - not
@@ -4181,8 +4199,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
             gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
             hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
-            sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
-            sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
+            sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f, Ly.idx_k8);
+            sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f, Ly.idx_gate8);
             gb::DsaPrepArgs d;
             d.kv_raw = kv;
             d.kv_norm = Ly.kv_a_norm;

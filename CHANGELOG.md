@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.118 - 2026-11-07
+
+- **GLM-5.3-Flash on DGX Spark: speculative decode on one GPU, the same tokens** (`STRATA_GLM_WINDOW`). Until now GLM
+  could only speculate across two GPUs; on one, drafts just added work (a Spark: 18.9 tok/s without, 16.6 with the NextN
+  drafter). Now the model's own NextN block drafts up to 3 tokens and one batched verify window checks them: the dense
+  weights are read once for all columns, the KDA (recurrent) layers' state is kept after the first column and the
+  accepted columns are replayed after a rejection. DGX Spark (GB10), 4K prompt, median of 3 x 512 tokens:
+  - our GLM-5.3-Flash S1 (94 GB): 21.4 -> **24.3 tok/s (+14%)**, drafts accepted 74%;
+  - unsloth UD-IQ2_XXS: 19.8 -> **22.9 tok/s (+16%)**.
+  The window gives the same tokens as one token at a time (512 greedy tokens identical on the Spark for both files;
+  in-run checks: 499 columns re-run on the token path, logits and the KDA / DSA state 0 differences; 125 rewinds, 0
+  differences). On by default where the GPU shares the host's memory (CUDA, integrated: DGX Spark); off on a discrete
+  card, where the CPU lane computes the RAM tier's experts and a window is break-even (RTX 5090: 69.0 vs 69.6 tok/s at
+  2 drafts, 65.7 at 3). `STRATA_GLM_WINDOW=1` / `0` force it. Note: loading the NextN block takes VRAM from the expert
+  pool, which by itself can change greedy output a little on a card with a RAM tier (not on a Spark).
+- **GLM-5.3-Flash reads its Q8_0 dense weights as Q8_0** (`STRATA_GLM_DENSE_Q8`, on): the attention k_b / v_b, the
+  indexer's, the KDA f / g / beta projections and the hc weights were widened to BF16 at load; now the GGUF's own blocks
+  are read (llama.cpp's product). 0.37 GB less read a token, KL 0.2708 -> 0.2667 (S1, 10 sequences); DGX Spark
+  19.2 -> 19.7 tok/s (UD-IQ2_XXS), 20.9 -> 21.4 (S1); RTX 5090 63.9 -> 66.1. `0`: the BF16 copy as before.
+- Greedy verify windows copy the column's logits to the row the end-of-turn guard reads (it read a stale row).
+- `STRATA_GLM_KDA_SPLIT=1` (off): the KDA recurrence in 4 column blocks a head - the same tokens, no gain measured.
+
 ## v1.3.117 - 2026-11-07
 
 - **DeepSeek V4.1 gets its own thinking levels**: `reasoning_effort` `low` / `medium` / `high` / `max` (the template's

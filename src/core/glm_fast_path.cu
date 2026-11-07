@@ -668,6 +668,15 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (it == w16_.end()) { missing += P + n + " (bf16) "; return nullptr; }
             return it->second;
         };
+        // a row load_pack kept as the GGUF's Q8_0 (STRATA_GLM_DENSE_Q8): q8 set, no BF16 pointer
+        const auto b16q = [&](const char* n, const void*& q8) -> const uint16_t* {
+            const auto it = w8_.find(P + n);
+            if (it != w8_.end()) {
+                q8 = it->second;
+                return nullptr;
+            }
+            return b16(n);
+        };
         const auto q = [&](const char* n) -> WSlot {
             auto it = ws_map_.find(P + n);
             if (it == ws_map_.end() || it->second.type == 0 || !gf::mv_supported(it->second.type)) {
@@ -699,8 +708,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.hnorm = f32("nextn.hnorm.weight");
             Ly.shnorm = f32("nextn.shared_head_norm.weight");
         } else {
-            Ly.hc_attn_fn = b16("hc_attn_fn.weight");
-            Ly.hc_ffn_fn = b16("hc_ffn_fn.weight");
+            Ly.hc_attn_fn = b16q("hc_attn_fn.weight", Ly.hc_attn_fn8);
+            Ly.hc_ffn_fn = b16q("hc_ffn_fn.weight", Ly.hc_ffn_fn8);
             Ly.hc_attn_scale = f32("hc_attn_scale.weight");
             Ly.hc_attn_base = f32("hc_attn_base.weight");
             Ly.hc_ffn_scale = f32("hc_ffn_scale.weight");
@@ -714,11 +723,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.q = q("attn_q.weight");
             Ly.k = q("attn_k.weight");
             Ly.v = q("attn_v.weight");
-            Ly.f_a = b16("ssm_f_a.weight");
-            Ly.g_a = b16("ssm_g_a.weight");
-            Ly.f_b = b16("ssm_f_b.weight");
-            Ly.g_b = b16("ssm_g_b.weight");
-            Ly.beta = b16("ssm_beta.weight");
+            Ly.f_a = b16q("ssm_f_a.weight", Ly.f_a8);
+            Ly.g_a = b16q("ssm_g_a.weight", Ly.g_a8);
+            Ly.f_b = b16q("ssm_f_b.weight", Ly.f_b8);
+            Ly.g_b = b16q("ssm_g_b.weight", Ly.g_b8);
+            Ly.beta = b16q("ssm_beta.weight", Ly.beta8);
             Ly.conv[0] = f32("ssm_conv1d_q.weight");
             Ly.conv[1] = f32("ssm_conv1d_k.weight");
             Ly.conv[2] = f32("ssm_conv1d_v.weight");
@@ -734,16 +743,18 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.k_norm_w = f32("indexer.k_norm.weight");
             Ly.k_norm_b = f32("indexer.k_norm.bias");
             Ly.ape = f32("indexer_compressor_ape.weight");
-            Ly.idx_k = b16("indexer.attn_k.weight");
-            Ly.idx_gate = b16("indexer_compressor_gate.weight");
+            Ly.idx_k = b16q("indexer.attn_k.weight", Ly.idx_k8);
+            Ly.idx_gate = b16q("indexer_compressor_gate.weight", Ly.idx_gate8);
             if (const auto xi = ws_map_.find(P + "indexer.attn_q_b.weight");
                 xi != ws_map_.end() && xi->second.type == strata::kernels::exl3::kTypeEXL3)
                 Ly.idx_q_b_x = xi->second;   // an EXL3 pack quantizes it
             else
-                Ly.idx_q_b = b16("indexer.attn_q_b.weight");
+                Ly.idx_q_b = b16q("indexer.attn_q_b.weight", Ly.idx_q_b8);
             Ly.idx_proj = b16("indexer.proj.weight");
-            Ly.k_b = b16("attn_k_b.weight");
-            Ly.v_b = b16("attn_v_b.weight");
+            Ly.k_b = b16q("attn_k_b.weight", Ly.k_b8);
+            Ly.v_b = b16q("attn_v_b.weight", Ly.v_b8);
+            if ((Ly.k_b8 == nullptr) != (Ly.v_b8 == nullptr))   // (gf::mla takes both or neither)
+                missing += P + "attn_k_b / attn_v_b (one Q8_0, one BF16) ";
         }
         if (!g.dsv4()) Ly.out = q("attn_output.weight");
         }   // (!qwen35)
@@ -942,6 +953,26 @@ bool Glm5Model::fast_setup(std::string& err) {
             return false;
         }
     }
+    // glm5-next's NextN block as the one-GPU drafter (STRATA_GLM_WINDOW=1, qwen35_fast_path.cu's q35_mtp_* hooks): the
+    // pending hidden, the rows' scratch (a window's columns at most) and the chain's host-mapped confidence
+    if (mtp_il_ >= 0 && g.arch == 0 && glm_window_env() && l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr) {
+        const size_t TM = (size_t) kVerifyMax, E1 = (size_t) g.n_embd;
+        const auto dm = [](void** p, size_t b) { return cudaMalloc(p, b) == cudaSuccess; };
+        if (!dm((void**) &F->q35_pend_h, E1 * 4) || !dm((void**) &F->q35_mt_emb, TM * E1 * 4) ||
+            !dm((void**) &F->q35_mt_hid, TM * E1 * 4) || !dm((void**) &F->q35_mt_x, TM * E1 * 4) ||
+            !dm(&F->q35_mt_xq, TM * (E1 / 32) * 36) || !dm(&F->q35_mt_cat, TM * (2 * E1 / 32) * 36) ||
+            !dm((void**) &F->q35_mt_conf, TM * 4) || !dm((void**) &F->q35_mt_tok, 64) ||
+            !dm((void**) &glm_mt_kv_, TM * g.kv_lora * 4) || !dm((void**) &glm_mt_ik_, TM * g.idx_key * 4) ||
+            !dm((void**) &glm_mt_ig_, TM * g.idx_key * 4) || !dm((void**) &glm_mt_ids_, 64 * sizeof(int)) ||
+            cudaHostAlloc((void**) &F->q35_mt_conf_h, 256, cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &F->q35_mt_conf_d, F->q35_mt_conf_h, 0) != cudaSuccess ||
+            cudaHostAlloc((void**) &glm_ids_h_, 64 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
+            cudaEventCreateWithFlags(&glm_ids_ev_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "glm fast: the one-GPU NextN drafter's buffers did not allocate";
+            return false;
+        }
+        std::fprintf(stderr, "glm fast: CUDA%d the NextN block drafts for the verify window (STRATA_GLM_WINDOW)\n", dev_);
+    }
 
     // ---- host-mapped routing ring + response, pinned staging for the embedding / hop / token
     void* hp = nullptr;
@@ -1010,7 +1041,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     const char* q4m = getenv("STRATA_Q4X_MTP");
     const bool q4_draft = g.q4x && l1_ == g.n_layers && q4m != nullptr && q4m[0] != '\0' &&
                           getenv("STRATA_GLM_NO_MTP") == nullptr;
-    if (g.qwen35() && (mtp_il_ >= 0 || q4_draft) && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
+    const bool glm_draft = g.arch == 0 && mtp_il_ >= 0 && F->q35_pend_h != nullptr;   // (the one-GPU NextN drafter)
+    if ((g.qwen35() || glm_draft) && (mtp_il_ >= 0 || q4_draft) && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
         const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
         const int E = (int) g.n_embd;
@@ -5850,8 +5882,12 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     gf::MvJob j[5];
     j[0] = {Ly.q_a.q, F->xq, F->x, F->qr_raw, nullptr, 1.0f, Ly.q_a.type, g.n_embd, g.q_lora};
     j[1] = {Ly.kv_a.q, F->xq, F->x, F->kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.kv_lora};
-    j[2] = {Ly.idx_k, nullptr, F->x, F->ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
-    j[3] = {Ly.idx_gate, nullptr, F->x, F->ig_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
+    // (STRATA_GLM_DENSE_Q8: the Q8_0 rows on the typed GEMV, against x's q8_1 - llama.cpp's own product)
+    j[2] = Ly.idx_k8 != nullptr ? gf::MvJob{Ly.idx_k8, F->xq, F->x, F->ik_raw, nullptr, 1.0f, 8, g.n_embd, g.idx_key}
+                                : gf::MvJob{Ly.idx_k, nullptr, F->x, F->ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
+    j[3] = Ly.idx_gate8 != nullptr
+               ? gf::MvJob{Ly.idx_gate8, F->xq, F->x, F->ig_raw, nullptr, 1.0f, 8, g.n_embd, g.idx_key}
+               : gf::MvJob{Ly.idx_gate, nullptr, F->x, F->ig_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
     j[4] = {Ly.idx_proj, nullptr, F->x, F->iw, nullptr, prescale, gf::kTypeBF16, g.n_embd, g.idx_heads};
     if (!gf::mv(j, 5, s)) { err = "glm fast: dsa projections"; return false; }
     if (F->prof_on) F->mark("dsa_proj_mv");
@@ -5886,6 +5922,8 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     j2[1] = Ly.idx_q_b_x.q != nullptr
                 ? gf::MvJob{Ly.idx_q_b_x.q, F->qr_q, F->qr, F->iq, nullptr, 1.0f, Ly.idx_q_b_x.type, g.q_lora,
                             g.idx_heads * g.idx_key}
+                : Ly.idx_q_b8 != nullptr
+                ? gf::MvJob{Ly.idx_q_b8, F->qr_q, F->qr, F->iq, nullptr, 1.0f, 8, g.q_lora, g.idx_heads * g.idx_key}
                 : gf::MvJob{Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
     if (!gf::mv(j2, 2, s)) { err = "glm fast: dsa q"; return false; }
@@ -5904,7 +5942,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
     if (F->prof_on) F->mark("dsa_score_select");
     gf::mla(F->q, Ly.k_b, Ly.v_b, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), F->cells, n_sel, g.n_head, g.qk_nope,
-            g.kv_lora, g.v_head, F->attn_q, s, lat_q8_);
+            g.kv_lora, g.v_head, F->attn_q, s, lat_q8_, Ly.k_b8, Ly.v_b8);
     if (F->prof_on) F->mark("mla");
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type,
                    g.n_head * g.v_head, g.n_embd};
@@ -6276,6 +6314,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         h.post = F->post;
         h.comb = F->comb;
         h.w_fn = Ly.hc_attn_fn;
+        h.w_fn_q8 = Ly.hc_attn_fn8;
         h.w_scale = Ly.hc_attn_scale;
         h.w_base = Ly.hc_attn_base;
         h.norm_w = Ly.attn_norm;
@@ -6323,9 +6362,13 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             j[0] = {Ly.q.q, F->xq, F->x, F->proj[0], nullptr, 1.0f, Ly.q.type, g.n_embd, DI};
             j[1] = {Ly.k.q, F->xq, F->x, F->proj[1], nullptr, 1.0f, Ly.k.type, g.n_embd, DI};
             j[2] = {Ly.v.q, F->xq, F->x, F->proj[2], nullptr, 1.0f, Ly.v.type, g.n_embd, DI};
-            j[3] = {Ly.f_a, nullptr, F->x, F->fa, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
-            j[4] = {Ly.g_a, nullptr, F->x, F->ga, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
-            j[5] = {Ly.beta, nullptr, F->x, F->beta, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_head};
+            const auto bq = [&](const uint16_t* w16, const void* w8, float* y, int n_out) {
+                return w8 != nullptr ? gf::MvJob{w8, F->xq, F->x, y, nullptr, 1.0f, 8, g.n_embd, n_out}
+                                     : gf::MvJob{w16, nullptr, F->x, y, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, n_out};
+            };
+            j[3] = bq(Ly.f_a, Ly.f_a8, F->fa, g.kda_head_dim);
+            j[4] = bq(Ly.g_a, Ly.g_a8, F->ga, g.kda_head_dim);
+            j[5] = bq(Ly.beta, Ly.beta8, F->beta, g.n_head);
             if (!gf::mv(j, 6, s)) { err = "glm fast: kda projections"; return false; }
             if (F->prof_on) F->mark("kda_proj_mv");
             gf::KdaPrepArgs k;
@@ -6339,6 +6382,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             k.ga = F->ga;
             k.f_b = Ly.f_b;
             k.g_b = Ly.g_b;
+            k.f_b_q8 = Ly.f_b8;
+            k.g_b_q8 = Ly.g_b8;
             k.dt_bias = Ly.dt_bias;
             k.ssm_a = Ly.ssm_a;
             k.lower_bound = g.kda_lb;
@@ -6373,6 +6418,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         h.R_old = Rc;
         h.R_new = Ro;
         h.w_fn = Ly.hc_ffn_fn;
+        h.w_fn_q8 = Ly.hc_ffn_fn8;
         h.w_scale = Ly.hc_ffn_scale;
         h.w_base = Ly.hc_ffn_base;
         h.norm_w = Ly.ffn_norm;
@@ -6578,6 +6624,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     } else {
         gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
                       FT->cs);
+        if (q35_mtp_on()) q35_mtp_pend_set(p, FT->head_x);   // (glm5-next's NextN drafter: the row waits for the next token)
     }
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
     // NextN/MTP block reads) as n_embd floats

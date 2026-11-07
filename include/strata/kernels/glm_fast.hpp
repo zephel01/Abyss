@@ -47,6 +47,11 @@ void mv_force_split(int split);   // gpu_tune: every typed GEMV launch at 1 / 2 
 /// of a job reads xq + c * n_in / 32 (q8_1 blocks) or xf + c * n_in (BF16 / F32) and writes y + c * n_out.
 bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s);
 bool mvn_supported(int type);
+/// mvn with mv()'s sums: every column gets the same bits a mv() call of the same jobs gives it (the same split of a
+/// row over warps that mv() picks for the call's per-type block count; one warp a row otherwise) - GLM-5.3's verify
+/// window (STRATA_GLM_WINDOW), where the token path's bits are the reference.  Types mvn has no kernel for, and HIP:
+/// a mv() a column.
+bool mvn_mv(const MvJob* jobs, int n, int nc, cudaStream_t s);
 /// Whether mv() serves this weight type.
 bool mv_supported(int type);
 /// Whether moe_gate_up() / moe_down() serve routed experts of this type.
@@ -79,6 +84,7 @@ struct HcArgs {
     float* post = nullptr;
     float* comb = nullptr;
     const uint16_t* w_fn = nullptr;   // BF16 [hc_mix_dim][hc * n_embd]
+    const void* w_fn_q8 = nullptr;    // or Q8_0 (the GGUF's own blocks; STRATA_GLM_DENSE_Q8) - set: w_fn is not read
     const float* w_scale = nullptr;   // 3
     const float* w_base = nullptr;    // hc_mix_dim
     const float* norm_w = nullptr;    // n_embd
@@ -130,6 +136,8 @@ struct KdaPrepArgs {
     const float* ga = nullptr;                              // head_dim (g_a output)
     const uint16_t* f_b = nullptr;                          // BF16 [d_inner][head_dim]
     const uint16_t* g_b = nullptr;
+    const void* f_b_q8 = nullptr;                           // or Q8_0 (STRATA_GLM_DENSE_Q8): set, f_b / g_b are not
+    const void* g_b_q8 = nullptr;                           // read
     const float* dt_bias = nullptr;                         // d_inner
     const float* ssm_a = nullptr;                           // n_head
     float lower_bound = -5.0f;
@@ -171,8 +179,14 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
 /// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
+/// wk_b_q8 / wv_b_q8 (both or neither): the absorbed projections as Q8_0 blocks (the GGUF's own, STRATA_GLM_DENSE_Q8)
+/// in place of the BF16 wk_b / wv_b - dotted against the F32 activations.
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false);
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
+         const void* wk_b_q8 = nullptr, const void* wv_b_q8 = nullptr);
+/// Q8_0 blocks (n values, n % 32 == 0) -> F32 / FP16 (the prompt path's weight slices)
+void q8_0_to_f32(const void* src, float* dst, int64_t n, cudaStream_t s);
+void q8_0_to_f16(const void* src, uint16_t* dst, int64_t n, cudaStream_t s);
 /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
 /// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.
 __host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv_lora + kv_lora / 16; }

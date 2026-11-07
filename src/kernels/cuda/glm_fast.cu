@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <map>
+#include <mutex>
 #include <cstdlib>
 
 #if defined(STRATA_USE_HIP)
@@ -427,6 +429,32 @@ __device__ __forceinline__ float row_dot_bf16(const uint16_t* row, const float* 
              __uint_as_float(w.y << 16) * a.z + __uint_as_float(w.y & 0xffff0000u) * a.w +
              __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
              __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
+    }
+    return warp_sum(s);
+}
+
+// Q8_0 weights read as floats (STRATA_GLM_DENSE_Q8: the GGUF's own 34-byte blocks - an FP16 scale and 32 int8 - in
+// place of the pack's BF16 expansion, half the bytes; rows of whole blocks, so value i of a run is block i / 32's)
+__device__ __forceinline__ float q8_0_at(const uint8_t* W, size_t i) {
+    const uint8_t* b = W + (i >> 5) * 34;
+    return __half2float(*(const __half*) b) * (float) (int8_t) b[2 + (i & 31)];
+}
+// values 4 * i4 .. 4 * i4 + 3 (one block's quarter of a quarter: never across blocks); the codes are 2-byte aligned
+__device__ __forceinline__ float4 q8_0_at4(const uint8_t* W, size_t i4) {
+    const uint8_t* b = W + (i4 >> 3) * 34;
+    const float d = __half2float(*(const __half*) b);
+    const uint16_t* q = (const uint16_t*) (b + 2) + (i4 & 7) * 2;
+    const uint32_t v = (uint32_t) q[0] | ((uint32_t) q[1] << 16);
+    return make_float4(d * (float) (int8_t) (v & 0xffu), d * (float) (int8_t) ((v >> 8) & 0xffu),
+                       d * (float) (int8_t) ((v >> 16) & 0xffu), d * (float) (int8_t) (v >> 24));
+}
+// a Q8_0 row (n_in % 32 == 0) . x (F32, 16-byte aligned)
+__device__ __forceinline__ float row_dot_q8_0f(const uint8_t* row, const float* x, int n_in, int lane) {
+    float s = 0.0f;
+    const float4* x4 = (const float4*) x;
+    for (int k = lane; k < n_in / 4; k += 32) {
+        const float4 w = q8_0_at4(row, (size_t) k), a = x4[k];
+        s += w.x * a.x + w.y * a.y + w.z * a.z + w.w * a.w;
     }
     return warp_sum(s);
 }
@@ -1501,6 +1529,53 @@ __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restr
     q8_1_store_warp(x[i], y + i / 32, threadIdx.x & 31);
 }
 
+// ... and SPLIT warps a row against NC activations (mvn_mv): each column's partial sums exactly as mv_kernel_ts makes
+// them for one activation (the same k ranges a warp, the same lane-strided loop, the parts added in order)
+template<int T, int SPLIT, int NC>
+__global__ void __launch_bounds__(256) mvn_kernel_ts(const __grid_constant__ MvBatch b) {
+    constexpr int RPB = MV_ROWS / SPLIT;
+    __shared__ float s_part[NC][MV_ROWS];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = (bid - blk0) * RPB + warp / SPLIT, part = warp % SPLIT;
+    using Fm = F<T>;
+    const int xs = J.xs ? J.xs : J.n_in / 32;
+    const size_t ys = J.ys ? (size_t) J.ys : (size_t) J.n_out;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    if (row < J.n_out) {
+        const uint8_t* w = (const uint8_t*) J.w + (size_t) row * rbytes<T>(J.n_in);
+        const block_q8_1* x = (const block_q8_1*) J.xq;
+        const int nk = J.n_in / Fm::qk * Fm::ipb;
+        const int k0 = nk * part / SPLIT, k1 = nk * (part + 1) / SPLIT;
+        for (int k = k0 + lane; k < k1; k += 32) {
+            const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) acc[c] += Fm::dot(w, x + (size_t) c * xs + kbx * (Fm::qk / 32), kbx, iqs);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0) s_part[c][warp] = v;
+    }
+    __syncthreads();
+    if (part == 0 && lane == 0 && row < J.n_out) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float t = 0.0f;
+#pragma unroll
+            for (int p = 0; p < SPLIT; ++p) t += s_part[c][warp + p];
+            J.y[(size_t) c * ys + row] = J.alpha * t + (J.bias ? J.bias[row] : 0.0f);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- mHC
 constexpr int HC_CHUNK = 512;
 constexpr int HC_THREADS = 256;
@@ -1535,9 +1610,13 @@ __global__ void __launch_bounds__(HC_THREADS) hc_kernel(const __grid_constant__ 
     }
     __syncthreads();
     for (int m = warp; m < HC_MIX; m += HC_THREADS / 32) {
-        const uint16_t* wr = a.w_fn + (size_t) m * hc_dim + (size_t) b * HC_CHUNK;
+        const size_t w0 = (size_t) m * hc_dim + (size_t) b * HC_CHUNK;
+        const uint16_t* wr = a.w_fn + w0;
         float acc = 0.0f;
-        for (int i = lane; i < HC_CHUNK; i += 32) acc += sR[i] * bf(wr[i]);
+        if (a.w_fn_q8 != nullptr)
+            for (int i = lane; i < HC_CHUNK; i += 32) acc += sR[i] * q8_0_at((const uint8_t*) a.w_fn_q8, w0 + i);
+        else
+            for (int i = lane; i < HC_CHUNK; i += 32) acc += sR[i] * bf(wr[i]);
         acc = warp_sum(acc);
         if (lane == 0) spart[m] = acc;
     }
@@ -1665,11 +1744,13 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__
     }
     __syncthreads();
     for (int m = warp; m < HC_MIX; m += HC_THREADS / 32) {
-        const uint16_t* wr = a.w_fn + (size_t) m * hc_dim + e0;
+        const size_t w0 = (size_t) m * hc_dim + e0;
+        const uint16_t* wr = a.w_fn + w0;
         float acc = 0.0f;
         for (int i = lane; i < 4 * HC2_EB; i += 32) {
             const int d = i / HC2_EB, j = i - d * HC2_EB;
-            acc += sR[d][j] * bf(wr[(size_t) d * n_embd + j]);
+            acc += sR[d][j] * (a.w_fn_q8 != nullptr ? q8_0_at((const uint8_t*) a.w_fn_q8, w0 + (size_t) d * n_embd + j)
+                                                    : bf(wr[(size_t) d * n_embd + j]));
         }
         acc = warp_sum(acc);
         if (lane == 0) spart[m] = acc;
@@ -1763,13 +1844,26 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
     __shared__ float s_mixed[HC2_EB];
     // the weights first: warp w owns mix rows w, w + 8, w + 16; per row and stream segment d a lane loads the 4 bf16
     // values j = 4 * lane .. 4 * lane + 3 of [e0, e0 + 128)
+    // (Q8_0: the 4 values' codes in wv.x and their block's scale in wv.y, as float bits)
     uint2 wv[3][4];
+    const bool wq8 = a.w_fn_q8 != nullptr;
 #pragma unroll
     for (int r = 0; r < 3; ++r) {
         const int m = warp + 8 * r;
-        const uint16_t* wr = a.w_fn + (size_t) m * (hc * n_embd) + e0 + 4 * lane;
+        const size_t w0 = (size_t) m * (hc * n_embd) + e0 + 4 * lane;
+        const uint16_t* wr = a.w_fn + w0;
 #pragma unroll
-        for (int d = 0; d < 4; ++d) wv[r][d] = *(const uint2*) (wr + (size_t) d * n_embd);
+        for (int d = 0; d < 4; ++d) {
+            if (wq8) {
+                const size_t i = w0 + (size_t) d * n_embd;
+                const uint8_t* bp = (const uint8_t*) a.w_fn_q8 + (i >> 5) * 34;
+                const uint16_t* q = (const uint16_t*) (bp + 2) + ((i & 31) >> 1);
+                wv[r][d].x = (uint32_t) q[0] | ((uint32_t) q[1] << 16);
+                wv[r][d].y = __float_as_uint(__half2float(*(const __half*) bp));
+            } else {
+                wv[r][d] = *(const uint2*) (wr + (size_t) d * n_embd);
+            }
+        }
     }
     // the CPU LANE's answer for the last route (moe_cpu_wait, fused): block 0 alone polls the host-mapped answer and
     // passes its seq on in device memory (cpu_seq[2]), where the other blocks wait - each poll is a PCIe read the
@@ -1835,8 +1929,14 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
         for (int d = 0; d < 4; ++d) {
             const uint2 w = wv[r][d];
             const float* x = &sR[d][4 * lane];
-            acc += __uint_as_float(w.x << 16) * x[0] + __uint_as_float(w.x & 0xffff0000u) * x[1] +
-                   __uint_as_float(w.y << 16) * x[2] + __uint_as_float(w.y & 0xffff0000u) * x[3];
+            if (wq8) {
+                const float sc = __uint_as_float(w.y);
+                acc += sc * ((float) (int8_t) (w.x & 0xffu) * x[0] + (float) (int8_t) ((w.x >> 8) & 0xffu) * x[1] +
+                             (float) (int8_t) ((w.x >> 16) & 0xffu) * x[2] + (float) (int8_t) (w.x >> 24) * x[3]);
+            } else {
+                acc += __uint_as_float(w.x << 16) * x[0] + __uint_as_float(w.x & 0xffff0000u) * x[1] +
+                       __uint_as_float(w.y << 16) * x[2] + __uint_as_float(w.y & 0xffff0000u) * x[3];
+            }
         }
         acc = warp_sum(acc);
         if (lane == 0) part[(size_t) m * nb + b] = acc;
@@ -2140,6 +2240,7 @@ __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ K
     const int quarter = (role - 3) & 3;
     const float* in = is_g1 ? a.fa : a.ga;
     const uint16_t* W = is_g1 ? a.f_b : a.g_b;
+    const uint8_t* W8 = (const uint8_t*) (is_g1 ? a.f_b_q8 : a.g_b_q8);
     sv[tid] = in[tid];
     __syncthreads();
     const int rbase = quarter * (hd / 4) + warp * (hd / 16);
@@ -2147,7 +2248,10 @@ __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ K
         const int c = h * hd + r;
         const uint16_t* wr = W + (size_t) c * hd;
         float acc = 0.0f;
-        for (int j = lane; j < hd; j += 32) acc += bf(wr[j]) * sv[j];
+        if (W8 != nullptr)
+            for (int j = lane; j < hd; j += 32) acc += q8_0_at(W8, (size_t) c * hd + j) * sv[j];
+        else
+            for (int j = lane; j < hd; j += 32) acc += bf(wr[j]) * sv[j];
         acc = warp_sum(acc);
         if (lane == 0) {
             if (is_g1) {
@@ -2205,6 +2309,69 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
     __syncthreads();
     const float o = (sacc[0][j] + sacc[1][j]) * rsqrtf((float) HD);
     // out gate over the head (threads 0..127 own j; the upper half mirrors and does not write)
+    float ss = half == 0 ? o * o : 0.0f;
+    ss = block_sum(ss, sred);
+    const float inv = rsqrtf(ss / (float) HD + eps);
+    if (half == 0) {
+        const float gv = o * inv * norm_w[j] * dsigmoid(g2[h * HD + j]);
+        q8_1_store_warp(gv, out + h * (HD / 32) + (j >> 5), lane);
+    }
+}
+
+// kda_rec split by columns (GB10 has 48 SMs: one block per head is 64 blocks = two waves on Spark and 64 of the 5090's
+// 170 SMs). A column j of the state only needs its own column: blocks (head, quarter) take 32 columns each, a thread
+// one (column, half) and the same 64-row loop as kda_rec_kernel, so A, the delta and O are the same sums in the same
+// order. The head's RMS needs all 128 columns: kda_out_kernel does it after, with kda_rec_kernel's block_sum layout
+// (256 threads, the upper half zero), so the result is bit-identical.
+__global__ void __launch_bounds__(64) kda_rec_cols_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                                          const float* __restrict__ v, const float* __restrict__ g1,
+                                                          const float* __restrict__ beta_raw, float* __restrict__ state,
+                                                          float* __restrict__ o_out) {
+    constexpr int HD = 128;
+    const int h = blockIdx.x, t = threadIdx.x, jl = t & 31, half = t >> 5, j = blockIdx.y * 32 + jl;
+    __shared__ float sq[HD], sk[HD], sdec[HD];
+    __shared__ float sacc[2][32];
+    for (int i = t; i < HD; i += 64) {
+        sq[i] = q[h * HD + i];
+        sk[i] = k[h * HD + i];
+        sdec[i] = __expf(g1[h * HD + i]);
+    }
+    const float b = 1.0f / (1.0f + expf(-beta_raw[h]));
+    __syncthreads();
+    float* Sh = state + (size_t) h * HD * HD;
+    float reg[64];
+    float A = 0.0f;
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) {
+        const int i = half * 64 + ii;
+        const float s = Sh[i * HD + j] * sdec[i];
+        reg[ii] = s;
+        A += s * sk[i];
+    }
+    sacc[half][jl] = A;
+    __syncthreads();
+    const float dl = b * (v[h * HD + j] - (sacc[0][jl] + sacc[1][jl]));
+    float O = 0.0f;
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) {
+        const int i = half * 64 + ii;
+        const float s2 = reg[ii] + sk[i] * dl;
+        Sh[i * HD + j] = s2;
+        O += s2 * sq[i];
+    }
+    __syncthreads();
+    sacc[half][jl] = O;
+    __syncthreads();
+    if (half == 0) o_out[h * HD + j] = (sacc[0][jl] + sacc[1][jl]) * rsqrtf((float) HD);
+}
+
+__global__ void __launch_bounds__(256) kda_out_kernel(const float* __restrict__ o_in, const float* __restrict__ g2,
+                                                      const float* __restrict__ norm_w, float eps,
+                                                      block_q8_1* __restrict__ out) {
+    constexpr int HD = 128;
+    const int h = blockIdx.x, t = threadIdx.x, j = t & (HD - 1), half = t >> 7, lane = t & 31;
+    __shared__ float sred[32];
+    const float o = o_in[h * HD + j];
     float ss = half == 0 ? o * o : 0.0f;
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) HD + eps);
@@ -2349,7 +2516,8 @@ __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restric
 __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, const uint16_t* __restrict__ wk_b,
                                                   const uint16_t* __restrict__ wv_b, const uint16_t* __restrict__ lat,
                                                   const int* __restrict__ cells, int n_sel, int qk_nope, int kv_lora,
-                                                  int v_head, block_q8_1* __restrict__ out, bool q8) {
+                                                  int v_head, block_q8_1* __restrict__ out, bool q8,
+                                                  const uint8_t* __restrict__ wk8, const uint8_t* __restrict__ wv8) {
     extern __shared__ float smem[];
     float* s_q = smem;                    // qk_nope
     float* s_qa = s_q + qk_nope;          // kv_lora
@@ -2363,8 +2531,9 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
     const uint16_t* wk = wk_b + (size_t) qk_nope * kv_lora * h;
     for (int c = warp; c < kv_lora; c += nw) {
         const uint16_t* wr = wk + (size_t) qk_nope * c;
+        const size_t w0 = (size_t) qk_nope * kv_lora * h + (size_t) qk_nope * c;
         float acc = 0.0f;
-        for (int e = lane; e < qk_nope; e += 32) acc += bf(wr[e]) * s_q[e];
+        for (int e = lane; e < qk_nope; e += 32) acc += (wk8 != nullptr ? q8_0_at(wk8, w0 + e) : bf(wr[e])) * s_q[e];
         acc = warp_sum(acc);
         if (lane == 0) s_qa[c] = acc;
     }
@@ -2404,8 +2573,9 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
     const uint16_t* wv = wv_b + (size_t) kv_lora * v_head * h;
     for (int vv = warp; vv < v_head; vv += nw) {
         const uint16_t* wr = wv + (size_t) kv_lora * vv;
+        const size_t w0 = (size_t) kv_lora * v_head * h + (size_t) kv_lora * vv;
         float acc = 0.0f;
-        for (int c = lane; c < kv_lora; c += 32) acc += bf(wr[c]) * s_ctx[c];
+        for (int c = lane; c < kv_lora; c += 32) acc += (wv8 != nullptr ? q8_0_at(wv8, w0 + c) : bf(wr[c])) * s_ctx[c];
         acc = warp_sum(acc);
         if (lane == 0) s_out[vv] = acc;
     }
@@ -2417,7 +2587,8 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
 // ---- MLA, take two: the absorbed projections as head-wise GEMVs over the whole GPU (warp per row, 32 rows per
 // block - 4 per warp) and the attention proper in between
 // out[h * R + r] = W[h][r][:] . in[h * K : h * K + K] (W BF16, rows of K); q8 != nullptr also writes the q8_1
-__global__ void __launch_bounds__(256) headwise_gemv_kernel(const uint16_t* __restrict__ W, const float* __restrict__ in,
+template<bool Q8>
+__global__ void __launch_bounds__(256) headwise_gemv_kernel(const void* __restrict__ W, const float* __restrict__ in,
                                                            int R, int K, float* __restrict__ out,
                                                            block_q8_1* __restrict__ q8) {
     __shared__ float s_o[32];
@@ -2428,7 +2599,8 @@ __global__ void __launch_bounds__(256) headwise_gemv_kernel(const uint16_t* __re
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int row = row0 + warp * 4 + j;
-        const float s = row_dot_bf16(W + (size_t) row * K, x, K, lane);
+        const float s = Q8 ? row_dot_q8_0f((const uint8_t*) W + (size_t) row * (K / 32) * 34, x, K, lane)
+                           : row_dot_bf16((const uint16_t*) W + (size_t) row * K, x, K, lane);
         if (lane == 0) s_o[warp * 4 + j] = s;
     }
     __syncthreads();
@@ -4363,6 +4535,144 @@ void mv_force_q6k_split(int split4) { g_q6k_force.store(split4); }
 void mv_force_split(int split) { g_split_force.store(split == 2 || split == 4 || split == 1 ? split : -1); }
 bool mv_q6k_split_choice() { return mv_tune().q6k_split; }
 
+bool mvn_mv(const MvJob* jobs, int n, int nc, cudaStream_t s) {
+    if (nc == 1) return mv(jobs, n, s);
+    if (n <= 0 || n > kMaxMvJobs || nc < 1) return false;
+    // a mv() a column: its pointers at column c (the strides as mvn's)
+    const auto per_column = [&](const MvJob* js, int m) {
+        for (int c = 0; c < nc; ++c) {
+            MvJob sub[kMaxMvJobs];
+            for (int i = 0; i < m; ++i) {
+                const MvJob& J = js[i];
+                sub[i] = J;
+                const bool f = J.type == kTypeBF16 || J.type == kTypeF32;
+                const size_t xs = J.xs ? (size_t) J.xs : (size_t) (f ? J.n_in : J.n_in / 32);
+                if (f) {
+                    if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c * xs;
+                } else {
+                    if (J.xq != nullptr) sub[i].xq = (const uint8_t*) J.xq + (size_t) c * xs * sizeof(block_q8_1);
+                    if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c * J.n_in;
+                }
+                sub[i].y = J.y + (size_t) c * (J.ys ? (size_t) J.ys : (size_t) J.n_out);
+                sub[i].xs = sub[i].ys = 0;
+            }
+            if (!mv(sub, m, s)) return false;
+        }
+        return true;
+    };
+#if defined(STRATA_USE_HIP)
+    return per_column(jobs, n);   // (HIP's mv fuses small calls of mixed types: not reproduced here)
+#else
+    if (nc > 8) {   // (runs of up to 8 columns: a column's sum does not depend on the run)
+        for (int c0 = 0; c0 < nc; c0 += 8) {
+            const int take = std::min(8, nc - c0);
+            MvJob sub[kMaxMvJobs];
+            for (int i = 0; i < n; ++i) {
+                const MvJob& J = jobs[i];
+                sub[i] = J;
+                const bool f = J.type == kTypeBF16 || J.type == kTypeF32;
+                const size_t xs = J.xs ? (size_t) J.xs : (size_t) (f ? J.n_in : J.n_in / 32);
+                if (f) {
+                    if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c0 * xs;
+                } else {
+                    if (J.xq != nullptr) sub[i].xq = (const uint8_t*) J.xq + (size_t) c0 * xs * sizeof(block_q8_1);
+                    if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c0 * J.n_in;
+                }
+                sub[i].y = J.y + (size_t) c0 * (J.ys ? (size_t) J.ys : (size_t) J.n_out);
+                if (!sub[i].xs) sub[i].xs = (int) xs;
+                if (!sub[i].ys) sub[i].ys = J.n_out;
+            }
+            if (!mvn_mv(sub, n, take, s)) return false;
+        }
+        return true;
+    }
+    for (int i = 0; i < n; ++i)
+        if (!mv_type_ok(jobs[i].type) || jobs[i].type == exl3::kTypeEXL3) {
+            std::fprintf(stderr, "glm_fast mvn_mv: type %d unsupported\n", jobs[i].type);
+            return false;
+        }
+    // mv()'s rule, for the same call: the typed kernels (Q6_K, Q8_0, Q4_K, Q5_K) with the split of a row its per-type
+    // block count picks, the rest one warp a row (row_dot<T> / the F32 and BF16 dots - mvn's kernels sum the same way)
+    static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
+    static const int split_env = [] { const char* v = getenv("STRATA_GLM_MV_SPLIT"); return v ? std::atoi(v) : -1; }();
+    const int q6k_force = g_q6k_force.load(std::memory_order_relaxed);
+    const bool q6k_split = q6k_force >= 0 ? q6k_force != 0 : mv_tune().q6k_split;
+    bool done[kMaxMvJobs] = {};
+    constexpr int kTyped[] = {14, 8, 12, 13};
+    if (typed) {
+        for (const int T : kTyped) {
+            MvBatch b{};
+            int acc = 0, m = 0;
+            for (int i = 0; i < n; ++i)
+                if (jobs[i].type == T) {
+                    b.j[m] = jobs[i];
+                    acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+                    b.blk_end[m++] = acc;
+                    done[i] = true;
+                }
+            if (m == 0) continue;
+            b.n = m;
+            const int sforce = g_split_force.load(std::memory_order_relaxed);
+            const int split = sforce > 0 ? sforce
+                            : split_env >= 0 ? (split_env == 2 || split_env == 4 ? split_env : 1)
+                            : (acc < 256 || (q6k_split && T == 14 && acc <= 4096)) ? 4 : 1;
+            if (split > 1) {
+                const int rpb = MV_ROWS / split;
+                acc = 0;
+                for (int q = 0; q < m; ++q) {
+                    acc += (b.j[q].n_out + rpb - 1) / rpb;
+                    b.blk_end[q] = acc;
+                }
+            }
+#define GF_MVNS(TT, SP)                                                                  \
+            switch (nc) {                                                                \
+                case 2: mvn_kernel_ts<TT, SP, 2><<<acc, 256, 0, s>>>(b); break;          \
+                case 3: mvn_kernel_ts<TT, SP, 3><<<acc, 256, 0, s>>>(b); break;          \
+                case 4: mvn_kernel_ts<TT, SP, 4><<<acc, 256, 0, s>>>(b); break;          \
+                case 5: mvn_kernel_ts<TT, SP, 5><<<acc, 256, 0, s>>>(b); break;          \
+                case 6: mvn_kernel_ts<TT, SP, 6><<<acc, 256, 0, s>>>(b); break;          \
+                case 7: mvn_kernel_ts<TT, SP, 7><<<acc, 256, 0, s>>>(b); break;          \
+                default: mvn_kernel_ts<TT, SP, 8><<<acc, 256, 0, s>>>(b); break;         \
+            }
+#define GF_MVN1(TT)                                                                      \
+            switch (nc) {                                                                \
+                case 2: mvn_kernel_t<TT, 2><<<acc, 256, 0, s>>>(b); break;               \
+                case 3: mvn_kernel_t<TT, 3><<<acc, 256, 0, s>>>(b); break;               \
+                case 4: mvn_kernel_t<TT, 4><<<acc, 256, 0, s>>>(b); break;               \
+                case 5: mvn_kernel_t<TT, 5><<<acc, 256, 0, s>>>(b); break;               \
+                case 6: mvn_kernel_t<TT, 6><<<acc, 256, 0, s>>>(b); break;               \
+                case 7: mvn_kernel_t<TT, 7><<<acc, 256, 0, s>>>(b); break;               \
+                default: mvn_kernel_t<TT, 8><<<acc, 256, 0, s>>>(b); break;              \
+            }
+#define GF_MVNT(TT)                                                                      \
+            if (split == 4) { GF_MVNS(TT, 4) } else if (split == 2) { GF_MVNS(TT, 2) } else { GF_MVN1(TT) }
+            switch (T) {
+                case 14: GF_MVNT(14) break;
+                case 8: GF_MVNT(8) break;
+                case 12: GF_MVNT(12) break;
+                case 13: GF_MVNT(13) break;
+            }
+#undef GF_MVNT
+#undef GF_MVN1
+#undef GF_MVNS
+        }
+    }
+    // the rest: mvn's one-warp-a-row kernels where it has them (the same loop as row_dot<T> / row_dot_bf16 / _f32),
+    // else a mv() a column
+    MvJob rest[kMaxMvJobs], other[kMaxMvJobs];
+    int nr = 0, no = 0;
+    for (int i = 0; i < n; ++i) {
+        if (done[i]) continue;
+        if (mvn_supported(jobs[i].type)) rest[nr++] = jobs[i];
+        else other[no++] = jobs[i];
+    }
+    if (nr > 0 && !mvn(rest, nr, nc, s)) return false;
+    if (no > 0 && !per_column(other, no)) return false;
+    launch_check("mvn_mv");
+    return true;
+#endif
+}
+
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > kMaxMvJobs) return false;
     for (int i = 0; i < n; ++i)
@@ -4645,8 +4955,40 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
         std::fprintf(stderr, "glm_fast kda_rec: head_dim %d (the kernel is built for 128)\n", head_dim);
         return;
     }
-    kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
-                                          (block_q8_1*) out_q8_1);
+    // the column split (STRATA_GLM_KDA_SPLIT=1, default off - no gain measured on GB10 or the 5090; off: one block a head); its o buffer is made outside a graph capture
+    static const bool split_on = [] { const char* e = std::getenv("STRATA_GLM_KDA_SPLIT"); return e != nullptr && std::atoi(e) != 0; }();
+    static std::mutex mu;
+    static std::map<int, std::pair<float*, int>> obuf;   // device -> (buffer, floats)
+    float* ob = nullptr;
+    if (split_on) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = obuf.find(dev);
+        if (it != obuf.end() && it->second.second >= n_head * 128) {
+            ob = it->second.first;
+        } else {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cs);
+            if (cs == cudaStreamCaptureStatusNone) {
+                float* p = nullptr;
+                if (cudaMalloc(&p, (size_t) n_head * 128 * sizeof(float)) == cudaSuccess) {
+                    if (it != obuf.end()) cudaFree(it->second.first);
+                    obuf[dev] = {p, n_head * 128};
+                    ob = p;
+                } else {
+                    cudaGetLastError();
+                }
+            }
+        }
+    }
+    if (ob) {
+        kda_rec_cols_kernel<<<dim3(n_head, 4), 64, 0, s>>>(q, k, v, g1, beta_raw, state, ob);
+        kda_out_kernel<<<n_head, 256, 0, s>>>(ob, g2, norm_w, eps, (block_q8_1*) out_q8_1);
+    } else {
+        kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
+                                              (block_q8_1*) out_q8_1);
+    }
     launch_check("kda_rec");
 }
 
@@ -4670,7 +5012,10 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
 }
 
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8) {
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8,
+         const void* wk_b_q8, const void* wv_b_q8) {
+    const uint8_t* wk8 = (const uint8_t*) wk_b_q8;
+    const uint8_t* wv8 = (const uint8_t*) wv_b_q8;
     // scratch for q_abs and ctx (n_head * kv_lora each), per device
     static float* scratch[16] = {};
     int dev = 0;
@@ -4678,7 +5023,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
     if (getenv("STRATA_GLM_MLA1") != nullptr || dev >= 16 || kv_lora % 32 || v_head % 32) {
         const size_t smem = ((size_t) qk_nope + 2 * kv_lora + v_head + n_sel) * sizeof(float);
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
-                                             (block_q8_1*) out_q8_1, lat_q8);
+                                             (block_q8_1*) out_q8_1, lat_q8, wk8, wv8);
         launch_check("mla");
         return;
     }
@@ -4687,13 +5032,16 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         cudaGetLastError();
         const size_t smem = ((size_t) qk_nope + 2 * kv_lora + v_head + n_sel) * sizeof(float);
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
-                                             (block_q8_1*) out_q8_1, lat_q8);
+                                             (block_q8_1*) out_q8_1, lat_q8, wk8, wv8);
         launch_check("mla");
         return;
     }
     float* q_abs = scratch[dev];
     float* ctx = q_abs + (size_t) n_head * kv_lora;
-    headwise_gemv_kernel<<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, q, kv_lora, qk_nope, q_abs, nullptr);
+    if (wk8 != nullptr)
+        headwise_gemv_kernel<true><<<n_head * kv_lora / 32, 256, 0, s>>>(wk8, q, kv_lora, qk_nope, q_abs, nullptr);
+    else
+        headwise_gemv_kernel<false><<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, q, kv_lora, qk_nope, q_abs, nullptr);
     // the split attention: chunks of MLA_CHUNK cells, partials per (chunk, head), then the merge
     static float* part[16] = {};
     static int part_chunks[16] = {};
@@ -4737,9 +5085,30 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         mla_attn_kernel<<<n_head, 256, ((size_t) kv_lora + n_sel) * sizeof(float), s>>>(q_abs, lat, cells, n_sel,
                                                                                         qk_nope, kv_lora, ctx, lat_q8);
     }
-    headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
-                                                              (block_q8_1*) out_q8_1);
+    if (wv8 != nullptr)
+        headwise_gemv_kernel<true><<<n_head * v_head / 32, 256, 0, s>>>(wv8, ctx, v_head, kv_lora, nullptr,
+                                                                        (block_q8_1*) out_q8_1);
+    else
+        headwise_gemv_kernel<false><<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
+                                                                         (block_q8_1*) out_q8_1);
     launch_check("mla2");
+}
+
+template<typename T>
+__global__ void q8_0_widen_kernel(const uint8_t* __restrict__ src, T* __restrict__ dst, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const float v = q8_0_at(src, (size_t) i);
+        if constexpr (sizeof(T) == 4) dst[i] = v;
+        else dst[i] = __half_as_ushort(__float2half_rn(v));
+    }
+}
+void q8_0_to_f32(const void* src, float* dst, int64_t n, cudaStream_t s) {
+    q8_0_widen_kernel<float><<<1024, 256, 0, s>>>((const uint8_t*) src, dst, n);
+    launch_check("q8_0_to_f32");
+}
+void q8_0_to_f16(const void* src, uint16_t* dst, int64_t n, cudaStream_t s) {
+    q8_0_widen_kernel<uint16_t><<<1024, 256, 0, s>>>((const uint8_t*) src, dst, n);
+    launch_check("q8_0_to_f16");
 }
 
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s) {

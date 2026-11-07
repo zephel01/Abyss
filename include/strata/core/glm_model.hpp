@@ -479,6 +479,7 @@ public:
     bool guard_fired_ = false;
     int32_t end_guard_pick(int32_t sampled);
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
+    std::map<std::string, const void*> w8_;                // glm5's Q8_0 rows kept Q8_0 (STRATA_GLM_DENSE_Q8, fast mode)
     std::map<std::string, const int*> wi32_;               // I32 tensors (deepseek4's hash-routing tables)
     // ---- deepseek4 (src/core/dsv4_fast_path.cu)
     void* dsv4_state_ = nullptr;                           // the window rings, compressed caches and compressor rings
@@ -567,6 +568,24 @@ public:
     bool verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // deepseek41's (one part)
     bool verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen35moe's (one part)
     void verify_rewind_q35(int64_t pos);   // qwen35moe: the recurrent states back to after the kept columns
+    // glm5-next (GLM-5.3-Flash) on one part, STRATA_GLM_WINDOW=1 (dsv4_verify.cu): the token path's layers over the
+    // columns - the dense GEMVs one mvn_mv launch (mv()'s bits), the KDA columns through the token path's own
+    // kda_prep / kda_rec in order (the state after column 0 kept: verify_rewind_glm restores it and replays the kept
+    // columns from the window's saved inputs), the DSA rows written in position order before the reads
+    static bool glm_window_env();
+    bool glm_window() const { return g_.arch == 0 && !g_.v41 && glm_window_env(); }
+    bool verify_part_glm(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
+    void verify_rewind_glm(int64_t pos);
+    bool glm_mvn(const void* jobs, int n, int T, cudaStream_t s);   // gf::MvJob[n] (STRATA_GLM_MVN_CHECK)
+    bool glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // STRATA_GLM_WINDOW_CHECK
+    void kda_copy_layer(int il, int li, bool restore, float* bak = nullptr);   // one KDA layer's S + conv <-> kda_bak_
+    // the NextN block (blk.<n_layers>) as the drafter on one GPU (qwen35_fast_path.cu, behind the q35_mtp_* hooks)
+    bool glm_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_stride, const int32_t* next, std::string& err);
+    bool glm_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err);
+    float *glm_mt_kv_ = nullptr, *glm_mt_ik_ = nullptr, *glm_mt_ig_ = nullptr;
+    int* glm_mt_ids_ = nullptr;
+    int* glm_ids_h_ = nullptr;                             // (pinned: the rows' next tokens, staged)
+    cudaEvent_t glm_ids_ev_ = nullptr;
     bool verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen4exp's (one part)
     bool q4x_mix_cols(float* R, int T, const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject,
                       const float* out, const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);

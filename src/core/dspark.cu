@@ -732,6 +732,8 @@ void Glm5Model::spec_rewind(int64_t pos) {
             m->pos_ = pos;
         }
         cudaSetDevice(dev_);
+    } else if (g_.arch == 0) {   // glm5-next's window (one part): the KDA states back to after the kept columns
+        verify_rewind_glm(pos);
     }
     pos_ = pos;
     dspark_settle();

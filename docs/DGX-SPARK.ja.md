@@ -144,7 +144,8 @@ GB10、共有メモリ 121 GB、Qwen3.8-Flash-Next 16G64G、既定の予算（�
 
 | モデル | 生成 | 8K のプロンプト | メモ |
 |---|---:|---:|---|
-| GLM-5.3-Flash（Maya-S-v2 IQ2_XXS、unsloth UD-IQ2_XXS） | 19〜20 tok/s | 730〜750 tok/s | 32K のプロンプトは CLI で 675〜796 tok/s。MTP の下書きは、ここでは速くならない |
+| GLM-5.3-Flash（Maya-S-v2 IQ2_XXS、unsloth UD-IQ2_XXS） | 19〜20 tok/s | 730〜750 tok/s | 32K のプロンプトは CLI で 675〜796 tok/s。MTP の下書きは、v1.3.117 までは速くならなかった（下の行） |
+| GLM-5.3-Flash、v1.3.118（GPU 1 枚の検算の窓 + NextN の下書き。ここでは既定でオン） | **S1（zephel01、94 GB）24.3 tok/s**（なしで 21.4）、**UD-IQ2_XXS 22.9**（なしで 19.8）、出力は同じ | | 4K のあと、3 回の中央値 x 512 トークン。下書きの採用 74〜80% |
 | DeepSeek V4 0731 | 21.0 tok/s、**DSpark の下書きありで 22.8**（78% が採用） | 814 tok/s | |
 | DeepSeek V4.1 Compact（zephel01 の 207 GB 版。メモリに入りきらない） | 約 18 tok/s | | |
 

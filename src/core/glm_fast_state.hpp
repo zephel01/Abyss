@@ -376,6 +376,11 @@ struct Glm5Model::FastState {
         const float *q_a_norm = nullptr, *kv_a_norm = nullptr, *k_norm_w = nullptr, *k_norm_b = nullptr, *ape = nullptr;
         const uint16_t *idx_k = nullptr, *idx_gate = nullptr, *idx_q_b = nullptr, *idx_proj = nullptr;
         const uint16_t *k_b = nullptr, *v_b = nullptr;
+        // STRATA_GLM_DENSE_Q8 (glm5): the GGUF's Q8_0 blocks of the rows above in place of the pack's BF16 expansion
+        // (half the bytes a token reads); a set one's BF16 pointer is null
+        const void *hc_attn_fn8 = nullptr, *hc_ffn_fn8 = nullptr, *f_a8 = nullptr, *g_a8 = nullptr, *f_b8 = nullptr,
+                   *g_b8 = nullptr, *beta8 = nullptr, *idx_k8 = nullptr, *idx_gate8 = nullptr, *idx_q_b8 = nullptr,
+                   *k_b8 = nullptr, *v_b8 = nullptr;
         const uint16_t* router = nullptr;
         int router_type = gf::kTypeBF16;                            // deepseek41: kTypeF32 (router then points at F32)
         const float* router_bias = nullptr;

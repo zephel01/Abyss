@@ -173,6 +173,29 @@ struct VerifyBuf {
     int q4_nattn = 0;
     float *q4_tsnap = nullptr, *q4_rawk = nullptr;
     bool q4_ple_on = false;                   // the last window ran the PLE (its rows and snapshot are valid)
+    // glm5-next (verify_part_glm), a column each: the KDA layers' gated output (q8_1); the DSA layers' raw latent,
+    // indexer key / gate rows, q, the attention's q8_1, its cells and pool scores; the dense FFN's gate / up / h.
+    // A KDA layer x a column: its inputs (q, k, v, f_a, g_a, beta: glm_ki floats) - the rewind replays the kept columns
+    // from them through the token path's kda_prep / kda_rec onto the state kept after column 0 (kda_bak_)
+    int glm_rec = 0;                          // KDA layers in this part
+    std::vector<int> glm_li;                  // layer -> its KDA index (-1: a DSA layer)
+    size_t glm_ki = 0, glm_run = 0;           // floats: a (layer, column)'s inputs; a layer's S + conv state
+    float* glm_kin = nullptr;
+    void* glm_gq = nullptr;
+    size_t glm_gq_b = 0, glm_aq_b = 0, glm_score_n = 0;
+    float *glm_kv = nullptr, *glm_ik = nullptr, *glm_ig = nullptr, *glm_q = nullptr, *glm_score = nullptr;
+    void* glm_aq = nullptr;
+    int* glm_cells = nullptr;
+    int glm_nsel = 0;
+    float *glm_dg = nullptr, *glm_du = nullptr;
+    void* glm_dhq = nullptr;
+    int64_t glm_p0 = -1;                      // the last window's first position (-1: none)
+    int32_t glm_toks[Glm5Model::kVerifyMax] = {};
+    // the checks (STRATA_GLM_WINDOW_CHECK / _REWIND_CHECK / _MVN_CHECK): the KDA states before and after the window, a
+    // replay's scratch state, a mv() reference's outputs
+    float *chk_pre = nullptr, *chk_post = nullptr, *chk_ref = nullptr, *mvn_ref = nullptr;
+    size_t mvn_ref_n = 0;
+    bool chk_pre_ok = false;
 };
 }  // namespace
 
@@ -181,6 +204,16 @@ bool Glm5Model::verify_ready() const {
     // MoE layers; the head's weights on the last
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
+        if (F != nullptr && m->g_.arch == 0) {
+            // glm5-next: one part, the batched window (STRATA_GLM_WINDOW=1); its NextN block allowed (the drafter);
+            // no prefetch / lookahead / deferral / refusal edit; no EXL3 layers (verify_moe runs the ggml experts)
+            if (!m->glm_window() || F->max_pf > 0 || F->n_ahead > 0 || F->defer || m->split_next_ != nullptr ||
+                m != this || m->next_port_ != nullptr || m->abl_loaded())
+                return false;
+            for (int il = m->l0_; il < m->l1_; ++il)
+                if (F->L[(size_t) il].exl3 || F->L[(size_t) il].idx_q_b_x.q != nullptr) return false;
+            continue;
+        }
         if (F == nullptr || !(m->g_.dsv4() || m->g_.qwen35()) || (m->mtp_il_ >= 0 && !m->g_.qwen35()) || F->max_pf > 0 ||
             F->n_ahead > 0) return false;
         if ((m->g_.v41 || m->g_.qwen35()) && F->defer) return false;   // (no deferral)
@@ -285,6 +318,35 @@ bool Glm5Model::verify_alloc(std::string& err) {
              cudaMalloc((void**) &V->v41_keep, V->v41_b_n * TM) == cudaSuccess;
         if (ok) cudaMemset(V->v41_keep, 0, V->v41_b_n * TM);
     }
+    if (ok && g.arch == 0) {
+        const size_t DI = (size_t) g.d_inner(), HDk = (size_t) g.kda_head_dim;
+        V->glm_li.assign((size_t) g.n_layers + 1, -1);
+        int nrec = 0;
+        for (int il = l0_; il < l1_; ++il)
+            if (fast_->L[(size_t) il].recr) V->glm_li[(size_t) il] = nrec++;
+        V->glm_rec = nrec;
+        V->glm_ki = (3 * DI + 2 * HDk + (size_t) g.n_head + 63) / 64 * 64;
+        V->glm_run = DI * HDk + 3 * DI * (size_t) (g.d_conv - 1);
+        V->glm_gq_b = DI / 32 * kQ8;
+        V->glm_aq_b = (size_t) g.n_head * g.v_head / 32 * kQ8;
+        V->glm_nsel = g.n_sel_max();
+        V->glm_score_n = (size_t) std::max<int64_t>(64, max_ctx_ / std::max(1, g.idx_kpool) + 64);
+        const size_t L = (size_t) std::max(nrec, 1);
+        ok = cudaMalloc((void**) &V->glm_kin, L * TM * V->glm_ki * sizeof(float)) == cudaSuccess &&
+             cudaMalloc((void**) &V->glm_cells, (size_t) V->glm_nsel * TM * sizeof(int)) == cudaSuccess &&
+             cudaMalloc((void**) &V->glm_score, V->glm_score_n * TM * sizeof(float)) == cudaSuccess;
+        b(V->glm_gq, V->glm_gq_b);
+        f(V->glm_kv, (size_t) g.kv_lora); f(V->glm_ik, (size_t) g.idx_key); f(V->glm_ig, (size_t) g.idx_key);
+        f(V->glm_q, (size_t) g.n_head * g.qk_nope); b(V->glm_aq, V->glm_aq_b);
+        f(V->glm_dg, (size_t) g.n_ff_dense); f(V->glm_du, (size_t) g.n_ff_dense);
+        b(V->glm_dhq, (size_t) g.n_ff_dense / 32 * kQ8);
+        // the state after column 0 (the rewind's start): kda_bak_, the two-part decode's buffer (one layout)
+        if (ok && nrec > 0 && kda_bak_ == nullptr)
+            ok = cudaMalloc((void**) &kda_bak_, (size_t) nrec * V->glm_run * sizeof(float)) == cudaSuccess;
+        std::fprintf(stderr, "glm verify: CUDA%d the window's buffers - %d KDA layers' replay inputs %.0f MB, the state "
+                             "after column 0 %.0f MB\n", dev_, nrec,
+                     (double) L * TM * V->glm_ki * 4 / 1048576.0, (double) nrec * V->glm_run * 4 / 1048576.0);
+    }
     V->st[0] = fast_->cs;
     for (int t = 0; t < TM && ok; ++t) {
         if (t > 0) ok = cudaStreamCreateWithFlags(&V->st[t], cudaStreamNonBlocking) == cudaSuccess;
@@ -334,7 +396,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
     const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;
     // (sets for up to 4 groups: the 8-column window keeps 4 columns' worth, 192 MB a 8 MB blob)
     // (deepseek41, qwen35moe / qwen4exp: their windows are batched only - a set a column, up to kScrSets + 1 columns)
-    const int NS = std::min(TM - 1, g.v41 || g.qwen35() ? (int) VerifyBuf::kScrSets : 3);
+    const int NS = std::min(TM - 1, g.v41 || g.qwen35() || g.arch == 0 ? (int) VerifyBuf::kScrSets : 3);
     V->scr_set[0] = fast_->md.scratch;
     if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * KS * sstride) == cudaSuccess) {
         for (int k = 1; k <= NS && ok; ++k) {
@@ -349,7 +411,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
         }
         for (int t = 1; t < TM; ++t) V->md[(size_t) t].scratch = V->scr_set[std::min(t, NS)];
         V->n_scr = NS;
-        V->pipe = ok && !g.v41;   // (deepseek41: the batched window only)
+        V->pipe = ok && !g.v41 && g.arch != 0;   // (deepseek41, glm5-next: the batched window only)
     } else {
         cudaGetLastError();
         std::fprintf(stderr, "deepseek4 verify: no VRAM for the pipelined window's scratch slots (%.0f MB) - batched\n",
@@ -668,7 +730,8 @@ bool Glm5Model::verify_moe_router(int il, int tb, int T, cudaStream_t s, std::st
             Ly.sh_gate.type, E, FFs};
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
-    if (!gf::mvn(j, verify_sh_late() && FFs > 0 ? 1 : 3, T, s)) { err = "deepseek4 verify: router / shared expert"; return false; }
+    const int nj = verify_sh_late() && FFs > 0 ? 1 : 3;
+    if (!(g.arch == 0 ? glm_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
     return true;
 }
 
@@ -740,7 +803,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         ++F->expected;
     }
     if (late) {
-        if (!gf::mvn(j + 1, 2, T, s)) { err = "deepseek4 verify: shared expert"; return false; }
+        if (!(g.arch == 0 ? glm_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
         gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, g.swiglu_shexp, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
@@ -951,8 +1014,8 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         return 1;
 #endif
     }();
-    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.v41 && !g.qwen35();
-    const bool use_pipe = g.v41 || g.qwen35() ? false   // (deepseek41, qwen35moe: the batched window)
+    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.v41 && !g.qwen35() && g.arch != 0;
+    const bool use_pipe = g.v41 || g.qwen35() || g.arch == 0 ? false   // (deepseek41, qwen35moe, glm5-next: batched)
                         : pipe_env >= 0 ? pipe_env != 0
                         : V->pipe_choice[T] >= 0 ? V->pipe_choice[T] != 0
                         : V->ms_pipe[T].size() <= V->ms_batch[T].size();   // (timing: alternate a width, pipelined first)
@@ -1037,7 +1100,8 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         cudaSetDevice(m->dev_);
         m->pos_ = pos_;
         ((VerifyBuf*) m->vb_)->T = T;
-        if (!(g.v41 ? m->verify_part_v41(toks, p0, err) : g.q4x ? m->verify_part_q4x(toks, p0, err)
+        if (!(g.arch == 0 ? m->verify_part_glm(toks, p0, err)
+              : g.v41 ? m->verify_part_v41(toks, p0, err) : g.q4x ? m->verify_part_q4x(toks, p0, err)
               : g.qwen35() ? m->verify_part_q35(toks, p0, err)
                                                                        : m->verify_part(toks, p0, err))) return false;
     }
@@ -1101,6 +1165,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     cudaSetDevice(dev_);
     last_tok_ = next_port_ != nullptr ? win_tok_[(size_t) T - 1] : VT->tok_h[T - 1];
     if (gp) fast_gap_mark(tw);
+    if (g.arch == 0 && !glm_window_check(toks, p0, err)) return false;   // (STRATA_GLM_WINDOW_CHECK; off: nothing)
     return true;
 }
 
@@ -2052,6 +2117,580 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
     }
 }
 
+// ---------------------------------------------------------------- glm5-next (GLM-5.3-Flash): the batched window
+// STRATA_GLM_WINDOW: verify windows on one part - the speculative decode's NextN drafter (the model's own
+// blk.<n_layers>) or the n-gram drafts. Default: on for a CUDA integrated GPU with unified memory (DGX Spark / GB10:
+// +14-16% decode, the same tokens), off elsewhere (a discrete card: the CPU lane's share makes it break-even or slower);
+// =1 / =0 force it.  Exactness: every kernel of a column is the token path's (hc, kda_prep /
+// kda_rec, dsa_prep / score / select / mla, swiglu_q8, hc_post, head_prep, the routes and experts' kernels) except the
+// dense GEMVs, which are mvn_mv - mv()'s sums a column, the weights read once (STRATA_GLM_MVN_CHECK shows it) - and the
+// column-batched experts (STRATA_DS4_WIN_COLS_CHECK).
+bool Glm5Model::glm_window_env() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_WINDOW");
+        if (v != nullptr) return std::atoi(v) != 0;
+#if defined(STRATA_USE_HIP) || defined(_WIN32)
+        return false;
+#else
+        const char* uv = getenv("STRATA_GLM_UMA");   // (the unified-memory policy off: the discrete defaults)
+        if (uv != nullptr && std::atoi(uv) == 0) return false;
+        int integrated = 0, dev = 0;   // (the model's device is current when the load asks)
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return integrated != 0;
+#endif
+    }();
+    return on;
+}
+
+namespace {
+int glm_env_int(const char* name) {
+    const char* v = getenv(name);
+    return v != nullptr ? std::atoi(v) : 0;
+}
+}  // namespace
+
+// one KDA layer's state (S then the conv rows, contiguous) <-> its slot li of kda_bak_ (or bak)
+void Glm5Model::kda_copy_layer(int il, int li, bool restore, float* bak) {
+    const Glm5Geometry& g = g_;
+    const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
+    float* live = state_ + kda_S_[(size_t) il];
+    float* b = (bak != nullptr ? bak : kda_bak_) + (size_t) li * run;
+    cudaMemcpyAsync(restore ? live : b, restore ? b : live, run * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);
+}
+
+// the window's GEMVs: mvn_mv; STRATA_GLM_MVN_CHECK=1: every 16th call also as a mv() a column into a scratch copy of
+// the outputs, compared bit by bit (a count every 64 checks and at the first differences)
+bool Glm5Model::glm_mvn(const void* jobs, int n, int T, cudaStream_t s) {
+    const auto* j = (const gf::MvJob*) jobs;
+    if (!gf::mvn_mv(j, n, T, s)) return false;
+    static const bool chk = glm_env_int("STRATA_GLM_MVN_CHECK") != 0;
+    if (!chk || T < 2) return true;
+    static unsigned long long calls = 0, checked = 0, cols = 0, diff = 0;
+    if ((calls++ % 16) != 0) return true;
+    auto* V = (VerifyBuf*) vb_;
+    size_t need = 0;
+    for (int i = 0; i < n; ++i) need += (size_t) T * j[i].n_out;
+    if (V->mvn_ref_n < need) {
+        if (V->mvn_ref) cudaFree(V->mvn_ref);
+        V->mvn_ref = nullptr;
+        V->mvn_ref_n = 0;
+        if (cudaMalloc((void**) &V->mvn_ref, need * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            return true;
+        }
+        V->mvn_ref_n = need;
+    }
+    size_t off = 0;
+    std::vector<size_t> offs((size_t) n);
+    for (int c = 0; c < T; ++c) {
+        gf::MvJob sub[gf::kMaxMvJobs];
+        off = 0;
+        for (int i = 0; i < n; ++i) {
+            const gf::MvJob& J = j[i];
+            sub[i] = J;
+            const bool f = J.type == gf::kTypeBF16 || J.type == gf::kTypeF32;
+            const size_t xs = J.xs ? (size_t) J.xs : (size_t) (f ? J.n_in : J.n_in / 32);
+            if (f) {
+                if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c * xs;
+            } else {
+                if (J.xq != nullptr) sub[i].xq = (const uint8_t*) J.xq + (size_t) c * xs * kQ8;
+                if (J.xf != nullptr) sub[i].xf = J.xf + (size_t) c * J.n_in;
+            }
+            offs[(size_t) i] = off;
+            sub[i].y = V->mvn_ref + off + (size_t) c * J.n_out;
+            sub[i].xs = sub[i].ys = 0;
+            off += (size_t) T * J.n_out;
+        }
+        if (!gf::mv(sub, n, s)) return false;
+    }
+    std::vector<float> a, b;
+    cudaStreamSynchronize(s);
+    for (int i = 0; i < n; ++i) {
+        const gf::MvJob& J = j[i];
+        const size_t ys = J.ys ? (size_t) J.ys : (size_t) J.n_out;
+        a.resize((size_t) J.n_out);
+        b.resize((size_t) J.n_out);
+        for (int c = 0; c < T; ++c) {
+            cudaMemcpy(a.data(), J.y + (size_t) c * ys, a.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(b.data(), V->mvn_ref + offs[(size_t) i] + (size_t) c * J.n_out, b.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+            ++cols;
+            if (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0) {
+                ++diff;
+                if (diff <= 8)
+                    std::fprintf(stderr, "glm mvn check: DIFFERENT - job %d of %d (type %d, %d x %d), column %d of %d\n", i,
+                                 n, J.type, J.n_out, J.n_in, c, T);
+            }
+        }
+    }
+    if ((++checked & 63) == 1)
+        std::fprintf(stderr, "glm mvn check: %llu calls checked, %llu columns, %llu differ\n", checked, cols, diff);
+    return true;
+}
+
+bool Glm5Model::verify_part_glm(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int T = V->T, TM = V->TM;
+    const size_t E = (size_t) g.n_embd, HCE = (size_t) g.hc * E, q8e = (E / 32) * kQ8;
+    const int DI = g.d_inner(), HDk = g.kda_head_dim, KI = (int) V->glm_ki;
+    std::vector<float*> Rc((size_t) T), Ro((size_t) T);
+    for (int t = 0; t < T; ++t) {
+        Rc[(size_t) t] = V->R + (size_t) t * 2 * HCE;
+        Ro[(size_t) t] = Rc[(size_t) t] + HCE;
+    }
+    V->glm_p0 = p0;
+    for (int t = 0; t < T; ++t) V->glm_toks[t] = toks[(size_t) t];
+    if (q35_mtp_on() && !q35_mtp_pend_commit(toks[0], err)) return false;   // (the drafter: the last position's row)
+    // the checks' copy of the KDA states before the window
+    static const bool chk_pre = glm_env_int("STRATA_GLM_WINDOW_CHECK") != 0 || glm_env_int("STRATA_GLM_REWIND_CHECK") != 0;
+    V->chk_pre_ok = false;
+    if (chk_pre && V->glm_rec > 0) {
+        if (V->chk_pre == nullptr &&
+            cudaMalloc((void**) &V->chk_pre, (size_t) V->glm_rec * V->glm_run * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            V->chk_pre = nullptr;
+        }
+        if (V->chk_pre != nullptr) {
+            for (int il = l0_; il < l1_; ++il)
+                if (V->glm_li[(size_t) il] >= 0) kda_copy_layer(il, V->glm_li[(size_t) il], false, V->chk_pre);
+            V->chk_pre_ok = true;
+        }
+    }
+    const auto hc_read = [&](int il, int t, const float* block_out, bool attn) {
+        const auto& Ly = F->L[(size_t) il];
+        gf::HcArgs h;
+        h.block_out = block_out;
+        h.R_old = Rc[(size_t) t];
+        h.R_new = Ro[(size_t) t];
+        h.post_in = V->post + (size_t) t * 8;
+        h.comb_in = V->comb + (size_t) t * 16;
+        h.pre = V->pre + (size_t) t * 8;
+        h.post = V->post + (size_t) t * 8;
+        h.comb = V->comb + (size_t) t * 16;
+        h.w_fn = attn ? Ly.hc_attn_fn : Ly.hc_ffn_fn;
+        h.w_fn_q8 = attn ? Ly.hc_attn_fn8 : Ly.hc_ffn_fn8;
+        h.w_scale = attn ? Ly.hc_attn_scale : Ly.hc_ffn_scale;
+        h.w_base = attn ? Ly.hc_attn_base : Ly.hc_ffn_base;
+        h.norm_w = attn ? Ly.attn_norm : Ly.ffn_norm;
+        h.norm_eps = g.norm_eps;
+        h.hc_eps = g.hc_eps;
+        h.iters = g.sinkhorn_iters;
+        h.n_embd = g.n_embd;
+        h.x = V->x + (size_t) t * E;
+        h.xq = (uint8_t*) V->xq + (size_t) t * q8e;
+        h.part = V->hpart + (size_t) t * V->hpart_n;
+        h.counter = V->hcnt + (size_t) t * 16;
+        if (attn && block_out != nullptr && V->hc_cpu[t]) {   // the column's last MoE answer, added here
+            h.cpu_seq = V->md[(size_t) t].cpu_seq;
+            h.cpu_ans = V->md[(size_t) t].cpu_ans;
+            V->hc_cpu[t] = false;
+        }
+        gf::hc(h, s);
+        if (block_out != nullptr) std::swap(Rc[(size_t) t], Ro[(size_t) t]);
+        if (attn && V->bg_after[t]) {
+            V->bg_after[t] = false;
+            F->bg_drain(s, F->bg_pace);
+        }
+    };
+    const bool prof = F->prof_on;
+    static std::vector<std::string> names;
+    if (prof && names.empty())
+        for (int n = 1; n <= kVerifyMax; ++n)
+            for (const char* ph : {"hc_attn", "attn", "hc_ffn", "moe", "head"}) names.push_back("v" + std::to_string(n) + "_" + ph);
+    const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 5 + ph].c_str()); };
+    if (prof) F->mark("v_start");
+    for (int t = 0; t < kVerifyMax; ++t) V->hc_cpu[t] = V->bg_after[t] = false;
+    const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        for (int t = 0; t < T; ++t) hc_read(il, t, il != l0_ ? V->ffn + (size_t) t * E : nullptr, true);
+        mark(0);
+        if (Ly.recr) {
+            // ---- KDA: the projections over the columns (into the replay inputs), then column after column the token
+            //      path's conv + recurrence on the live state; the state after column 0 kept
+            const int li = V->glm_li[(size_t) il];
+            float* kin = V->glm_kin + (size_t) li * TM * V->glm_ki;
+            const auto bq = [&](const uint16_t* w16, const void* w8, int off, int n_out) {
+                return w8 != nullptr ? gf::MvJob{w8, V->xq, V->x, kin + off, nullptr, 1.0f, 8, (int) E, n_out, 0, KI}
+                                     : gf::MvJob{w16, nullptr, V->x, kin + off, nullptr, 1.0f, gf::kTypeBF16, (int) E, n_out, 0, KI};
+            };
+            gf::MvJob j[6];
+            j[0] = {Ly.q.q, V->xq, V->x, kin, nullptr, 1.0f, Ly.q.type, (int) E, DI, 0, KI};
+            j[1] = {Ly.k.q, V->xq, V->x, kin + DI, nullptr, 1.0f, Ly.k.type, (int) E, DI, 0, KI};
+            j[2] = {Ly.v.q, V->xq, V->x, kin + 2 * DI, nullptr, 1.0f, Ly.v.type, (int) E, DI, 0, KI};
+            j[3] = bq(Ly.f_a, Ly.f_a8, 3 * DI, HDk);
+            j[4] = bq(Ly.g_a, Ly.g_a8, 3 * DI + HDk, HDk);
+            j[5] = bq(Ly.beta, Ly.beta8, 3 * DI + 2 * HDk, g.n_head);
+            if (!glm_mvn(j, 6, T, s)) { err = "glm verify: kda projections"; return false; }
+            for (int t = 0; t < T; ++t) {
+                float* in = kin + (size_t) t * KI;
+                gf::KdaPrepArgs k;
+                for (int i = 0; i < 3; ++i) {
+                    k.proj[i] = in + (size_t) i * DI;
+                    k.conv_w[i] = Ly.conv[i];
+                    k.out[i] = F->conv[i];
+                }
+                k.conv_state = state_ + kda_conv_[(size_t) il];
+                k.fa = in + 3 * DI;
+                k.ga = in + 3 * DI + HDk;
+                k.f_b = Ly.f_b;
+                k.g_b = Ly.g_b;
+                k.f_b_q8 = Ly.f_b8;
+                k.g_b_q8 = Ly.g_b8;
+                k.dt_bias = Ly.dt_bias;
+                k.ssm_a = Ly.ssm_a;
+                k.lower_bound = g.kda_lb;
+                k.g1 = F->g1;
+                k.g2 = F->g2;
+                k.n_head = g.n_head;
+                k.head_dim = HDk;
+                k.d_conv = g.d_conv;
+                gf::kda_prep(k, s);
+                gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, in + 3 * DI + 2 * HDk, state_ + kda_S_[(size_t) il],
+                            F->g2, Ly.ssm_norm, g.norm_eps, g.n_head, HDk, (uint8_t*) V->glm_gq + (size_t) t * V->glm_gq_b, s);
+                if (t == 0) kda_copy_layer(il, li, false);   // (column 0 is always kept: the rewind starts here)
+            }
+            gf::MvJob o = {Ly.out.q, V->glm_gq, nullptr, V->mixer, nullptr, 1.0f, Ly.out.type, DI, (int) E};
+            if (!glm_mvn(&o, 1, T, s)) { err = "glm verify: kda output"; return false; }
+        } else {
+            // ---- MLA + DSA: the projections over the columns, the rows in position order (latent, indexer key / gate,
+            //      a completed pool's key), q_b, then a column at a time the pool scores, the selection, the attention
+            gf::MvJob j[5];
+            j[0] = {Ly.q_a.q, V->xq, V->x, V->qr_raw, nullptr, 1.0f, Ly.q_a.type, (int) E, g.q_lora};
+            j[1] = {Ly.kv_a.q, V->xq, V->x, V->glm_kv, nullptr, 1.0f, Ly.kv_a.type, (int) E, g.kv_lora};
+            j[2] = Ly.idx_k8 != nullptr ? gf::MvJob{Ly.idx_k8, V->xq, V->x, V->glm_ik, nullptr, 1.0f, 8, (int) E, g.idx_key}
+                                        : gf::MvJob{Ly.idx_k, nullptr, V->x, V->glm_ik, nullptr, 1.0f, gf::kTypeBF16, (int) E, g.idx_key};
+            j[3] = Ly.idx_gate8 != nullptr
+                       ? gf::MvJob{Ly.idx_gate8, V->xq, V->x, V->glm_ig, nullptr, 1.0f, 8, (int) E, g.idx_key}
+                       : gf::MvJob{Ly.idx_gate, nullptr, V->x, V->glm_ig, nullptr, 1.0f, gf::kTypeBF16, (int) E, g.idx_key};
+            j[4] = {Ly.idx_proj, nullptr, V->x, V->iw, nullptr, prescale, gf::kTypeBF16, (int) E, g.idx_heads};
+            if (!glm_mvn(j, 5, T, s)) { err = "glm verify: dsa projections"; return false; }
+            for (int t = 0; t < T; ++t) {
+                gf::DsaPrepArgs d;
+                d.qr_raw = V->qr_raw + (size_t) t * g.q_lora;
+                d.q_a_norm = Ly.q_a_norm;
+                d.qr = V->qr + (size_t) t * g.q_lora;
+                d.qr_q = (uint8_t*) V->qr_q + (size_t) t * (g.q_lora / 32) * kQ8;
+                d.q_lora = g.q_lora;
+                d.kv_raw = V->glm_kv + (size_t) t * g.kv_lora;
+                d.kv_norm = Ly.kv_a_norm;
+                d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                d.kv_lora = g.kv_lora;
+                d.lat_q8 = lat_q8_;
+                d.ik_raw = V->glm_ik + (size_t) t * g.idx_key;
+                d.k_norm_w = Ly.k_norm_w;
+                d.k_norm_b = Ly.k_norm_b;
+                d.ik_cache = state_ + dsa_ik_[(size_t) il];
+                d.ig_raw = V->glm_ig + (size_t) t * g.idx_key;
+                d.ig_cache = state_ + dsa_ig_[(size_t) il];
+                d.ape = Ly.ape;
+                d.pooled = state_ + dsa_pool_[(size_t) il];
+                d.idx_key = g.idx_key;
+                d.kpool = g.idx_kpool;
+                d.ring = ik_ring_;
+                d.p = (int) (p0 + t);
+                d.eps = g.norm_eps;
+                gf::dsa_prep(d, s);
+            }
+            const int IQ = g.idx_heads * g.idx_key;
+            gf::MvJob j2[2];
+            j2[0] = {Ly.q_b.q, V->qr_q, V->qr, V->glm_q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
+            j2[1] = Ly.idx_q_b8 != nullptr ? gf::MvJob{Ly.idx_q_b8, V->qr_q, V->qr, V->iq, nullptr, 1.0f, 8, g.q_lora, IQ}
+                                           : gf::MvJob{Ly.idx_q_b, nullptr, V->qr, V->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora, IQ};
+            if (!glm_mvn(j2, 2, T, s)) { err = "glm verify: dsa q"; return false; }
+            for (int t = 0; t < T; ++t) {
+                const int64_t p = p0 + t;
+                const int pool_done = (int) ((p + 1) / g.idx_kpool);
+                float* sc = V->glm_score + (size_t) t * V->glm_score_n;
+                int* cells = V->glm_cells + (size_t) t * V->glm_nsel;
+                if (pool_done > 0)
+                    gf::dsa_score(V->iq + (size_t) t * IQ, state_ + dsa_pool_[(size_t) il], V->iw + (size_t) t * g.idx_heads,
+                                  g.idx_key, g.idx_heads, pool_done, sc, s);
+                const int top_pools = std::min(g.top_pools_max(), pool_done);
+                const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
+                gf::dsa_select(sc, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, cells, s);
+                gf::mla(V->glm_q + (size_t) t * g.n_head * g.qk_nope, Ly.k_b, Ly.v_b,
+                        (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), cells, n_sel, g.n_head, g.qk_nope, g.kv_lora,
+                        g.v_head, (uint8_t*) V->glm_aq + (size_t) t * V->glm_aq_b, s, lat_q8_, Ly.k_b8, Ly.v_b8);
+            }
+            gf::MvJob o = {Ly.out.q, V->glm_aq, nullptr, V->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, (int) E};
+            if (!glm_mvn(&o, 1, T, s)) { err = "glm verify: dsa output"; return false; }
+        }
+        mark(1);
+        for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false);
+        mark(2);
+        if (!Ly.moe) {
+            gf::MvJob jd[2];
+            jd[0] = {Ly.ffn_gate.q, V->xq, V->x, V->glm_dg, nullptr, 1.0f, Ly.ffn_gate.type, (int) E, g.n_ff_dense};
+            jd[1] = {Ly.ffn_up.q, V->xq, V->x, V->glm_du, nullptr, 1.0f, Ly.ffn_up.type, (int) E, g.n_ff_dense};
+            if (!glm_mvn(jd, 2, T, s)) { err = "glm verify: dense ffn"; return false; }
+            for (int t = 0; t < T; ++t)
+                gf::swiglu_q8(V->glm_dg + (size_t) t * g.n_ff_dense, V->glm_du + (size_t) t * g.n_ff_dense, g.swiglu_shexp,
+                              g.n_ff_dense, (uint8_t*) V->glm_dhq + (size_t) t * (g.n_ff_dense / 32) * kQ8, s);
+            gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, nullptr, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
+                            (int) E};
+            if (!glm_mvn(&dn, 1, T, s)) { err = "glm verify: dense ffn down"; return false; }
+        } else if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) {
+            return false;
+        }
+        mark(3);
+    }
+    for (int t = 0; t < T; ++t) {   // (verify_moe leaves no answer past the last layer; the check is for safety)
+        if (V->hc_cpu[t]) {
+            gf::moe_cpu_wait(V->md[(size_t) t], g.n_embd, V->ffn + (size_t) t * E, s);
+            V->hc_cpu[t] = false;
+        }
+        if (V->bg_after[t]) {
+            V->bg_after[t] = false;
+            F->bg_drain(s, F->bg_pace);
+        }
+    }
+    const auto nw = w_.find("output_norm.weight");
+    if (nw == w_.end()) { err = "glm verify: output_norm.weight"; return false; }
+    for (int t = 0; t < T; ++t) {
+        gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16, g.n_embd,
+                    Ro[(size_t) t], s);
+        gf::head_prep(Ro[(size_t) t], nw->second, g.norm_eps, g.n_embd, V->head_x + (size_t) t * E,
+                      (uint8_t*) V->head_xq + (size_t) t * q8e, s);
+    }
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
+    if (!glm_mvn(&o, 1, T, s)) { err = "glm verify: output head (type " + std::to_string(ow.type) + ")"; return false; }
+    if (F->zero_copy) {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
+    } else {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
+        cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
+    }
+    mark(4);
+    cudaEventRecord(V->done, s);
+    return true;
+}
+
+namespace {
+// a KDA layer's columns c0 .. c1 - 1 replayed from the window's saved inputs onto the state at S (S, then the conv rows)
+void glm_kda_replay(const Glm5Geometry& g, const float* kin, int KI, int c0, int c1, float* S,
+                    const float* const conv_w[3], const uint16_t* f_b, const uint16_t* g_b, const void* f_b8,
+                    const void* g_b8, const float* dt_bias, const float* ssm_a, const float* ssm_norm, float* const conv[3],
+                    float* g1, float* g2, void* gq, cudaStream_t s) {
+    const int DI = g.d_inner(), HDk = g.kda_head_dim;
+    for (int t = c0; t < c1; ++t) {
+        const float* in = kin + (size_t) t * KI;
+        gf::KdaPrepArgs k;
+        for (int i = 0; i < 3; ++i) {
+            k.proj[i] = in + (size_t) i * DI;
+            k.conv_w[i] = conv_w[i];
+            k.out[i] = conv[i];
+        }
+        k.conv_state = S + (size_t) DI * HDk;
+        k.fa = in + 3 * DI;
+        k.ga = in + 3 * DI + HDk;
+        k.f_b = f_b;
+        k.g_b = g_b;
+        k.f_b_q8 = f_b8;
+        k.g_b_q8 = g_b8;
+        k.dt_bias = dt_bias;
+        k.ssm_a = ssm_a;
+        k.lower_bound = g.kda_lb;
+        k.g1 = g1;
+        k.g2 = g2;
+        k.n_head = g.n_head;
+        k.head_dim = HDk;
+        k.d_conv = g.d_conv;
+        gf::kda_prep(k, s);
+        gf::kda_rec(conv[0], conv[1], conv[2], g1, in + 3 * DI + 2 * HDk, S, g2, ssm_norm, g.norm_eps, g.n_head, HDk, gq, s);
+    }
+}
+}  // namespace
+
+// the window's tail dropped (positions >= pos): the drafter's rows of the kept columns; every KDA layer back to its
+// state after column 0, then columns 1 .. kept - 1 replayed (the DSA caches need nothing: a row past pos is rewritten
+// before anything reads it, and a pool a dropped column completed is recomputed when its last position runs again)
+void Glm5Model::verify_rewind_glm(int64_t pos) {
+    auto* V = (VerifyBuf*) vb_;
+    FastState* F = fast_;
+    if (V == nullptr || F == nullptr || V->glm_p0 < 0) return;
+    const int64_t p0 = V->glm_p0;
+    const int kept = (int) (pos - p0), T = V->T, TM = V->TM;
+    V->glm_p0 = -1;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const size_t E = (size_t) g.n_embd;
+    if (q35_mtp_on() && kept >= 1) {
+        std::string err;
+        if (kept >= 2 && !q35_mtp_rows(p0, kept - 1, V->head_x, E, V->glm_toks + 1, err))
+            std::fprintf(stderr, "glm mtp: the window's rows: %s\n", err.c_str());
+        q35_mtp_pend_set(p0 + kept - 1, V->head_x + (size_t) (kept - 1) * E);
+    }
+    if (kept >= T || kept < 1) return;   // (every column kept: the states are after the window already)
+    const int KI = (int) V->glm_ki;
+    for (int il = l0_; il < l1_; ++il) {
+        const int li = V->glm_li[(size_t) il];
+        if (li < 0) continue;
+        const auto& Ly = F->L[(size_t) il];
+        kda_copy_layer(il, li, true);
+        if (kept > 1)
+            glm_kda_replay(g, V->glm_kin + (size_t) li * TM * V->glm_ki, KI, 1, kept, state_ + kda_S_[(size_t) il], Ly.conv,
+                           Ly.f_b, Ly.g_b, Ly.f_b8, Ly.g_b8, Ly.dt_bias, Ly.ssm_a, Ly.ssm_norm, F->conv, F->g1, F->g2,
+                           V->glm_gq, s);
+    }
+    // STRATA_GLM_REWIND_CHECK=1: the state before the window replayed through columns 0 .. kept - 1 (scratch) against the
+    // live state, bit by bit - the kept count, the rows and the layers the rewind used
+    static const bool rchk = glm_env_int("STRATA_GLM_REWIND_CHECK") != 0;
+    if (!rchk || !V->chk_pre_ok) return;
+    const size_t run = V->glm_run;
+    if (V->chk_ref == nullptr && cudaMalloc((void**) &V->chk_ref, run * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        V->chk_ref = nullptr;
+        return;
+    }
+    static unsigned long long n_chk = 0, n_layers = 0, n_diff = 0, by_kept[Glm5Model::kVerifyMax + 1] = {};
+    std::vector<float> a(run), b(run);
+    int bad = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const int li = V->glm_li[(size_t) il];
+        if (li < 0) continue;
+        const auto& Ly = F->L[(size_t) il];
+        cudaMemcpyAsync(V->chk_ref, V->chk_pre + (size_t) li * run, run * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        glm_kda_replay(g, V->glm_kin + (size_t) li * TM * V->glm_ki, KI, 0, kept, V->chk_ref, Ly.conv, Ly.f_b, Ly.g_b,
+                       Ly.f_b8, Ly.g_b8, Ly.dt_bias, Ly.ssm_a, Ly.ssm_norm, F->conv, F->g1, F->g2, V->glm_gq, s);
+        cudaMemcpyAsync(a.data(), V->chk_ref, run * sizeof(float), cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(b.data(), state_ + kda_S_[(size_t) il], run * sizeof(float), cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+        ++n_layers;
+        if (std::memcmp(a.data(), b.data(), run * sizeof(float)) != 0) {
+            ++n_diff;
+            ++bad;
+        }
+    }
+    ++n_chk;
+    ++by_kept[kept];
+    std::fprintf(stderr, "glm rewind check: %llu rewinds (kept 1..7: %llu %llu %llu %llu %llu %llu %llu), %llu layer "
+                             "states compared, %llu differ%s\n", n_chk, by_kept[1], by_kept[2], by_kept[3], by_kept[4],
+                     by_kept[5], by_kept[6], by_kept[7], n_layers, n_diff, bad > 0 ? " (this one)" : "");
+}
+
+// STRATA_GLM_WINDOW_CHECK=1: after each window, the token path from the state before it on column 0's token - its
+// logits against the window's column 0 and its KDA states against the window's state after column 0, bit by bit; =2:
+// every column's token (the logits of each column, and the states after the window).  Then the window's state again.
+bool Glm5Model::glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
+    static const int mode = glm_env_int("STRATA_GLM_WINDOW_CHECK");
+    auto* V = (VerifyBuf*) vb_;
+    if (mode <= 0 || V == nullptr || !V->chk_pre_ok) return true;
+    const Glm5Geometry& g = g_;
+    FastState* F = fast_;
+    cudaStream_t s = F->cs;
+    const int T = V->T, n = mode >= 2 ? T : 1;
+    const size_t run = V->glm_run, NV = (size_t) g.n_vocab;
+    if (V->chk_post == nullptr &&
+        cudaMalloc((void**) &V->chk_post, (size_t) V->glm_rec * run * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        V->chk_post = nullptr;
+        return true;
+    }
+    std::vector<float> wl((size_t) n * NV), tl(NV);
+    cudaMemcpyAsync(wl.data(), V->logits, wl.size() * sizeof(float), cudaMemcpyDeviceToHost, s);
+    std::vector<int> wtok(V->tok_h, V->tok_h + T);
+    for (int il = l0_; il < l1_; ++il)
+        if (V->glm_li[(size_t) il] >= 0) kda_copy_layer(il, V->glm_li[(size_t) il], false, V->chk_post);
+    for (int il = l0_; il < l1_; ++il)
+        if (V->glm_li[(size_t) il] >= 0) kda_copy_layer(il, V->glm_li[(size_t) il], true, V->chk_pre);
+    const int64_t pend = q35_pend_pos_, done = q35_row_done_, pos_after = pos_;
+    const int last = last_tok_;
+    q35_pend_pos_ = -1;
+    pos_ = p0;
+    static unsigned long long n_win = 0, n_cols = 0, n_ldiff = 0, n_tdiff = 0, n_sdiff = 0, n_states = 0;
+    int bad = 0;
+    const auto cmp_states = [&](float* ref) {
+        std::vector<float> a(run), b(run);
+        for (int il = l0_; il < l1_; ++il) {
+            const int li = V->glm_li[(size_t) il];
+            if (li < 0) continue;
+            cudaMemcpyAsync(a.data(), state_ + kda_S_[(size_t) il], run * sizeof(float), cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(b.data(), ref + (size_t) li * run, run * sizeof(float), cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+            ++n_states;
+            if (std::memcmp(a.data(), b.data(), run * sizeof(float)) != 0) {
+                ++n_sdiff;
+                ++bad;
+            }
+        }
+    };
+    // the DSA rows the window wrote (latent, indexer key / gate, the pools it closed), to compare with the re-run's
+    const auto dsa_rows = [&](std::vector<uint8_t>& out) {
+        out.clear();
+        cudaStreamSynchronize(s);
+        const size_t lat_b = lat_q8_ ? (size_t) gf::lat8_rec_bytes(g.kv_lora) : (size_t) g.kv_lora * 2;
+        const size_t kb = (size_t) g.idx_key * sizeof(float);
+        for (int il = l0_; il < l1_; ++il) {
+            if (V->glm_li[(size_t) il] >= 0) continue;
+            for (int t = 0; t < n; ++t) {
+                const int64_t p = p0 + t;
+                const size_t o = out.size();
+                out.resize(o + lat_b + 2 * kb + ((p + 1) % g.idx_kpool == 0 ? kb : 0));
+                cudaMemcpy(out.data() + o, (const uint8_t*) (state_ + dsa_lat_[(size_t) il]) + (size_t) p * lat_b, lat_b,
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(out.data() + o + lat_b, state_ + dsa_ik_[(size_t) il] + (size_t) g.idx_key * (p % ik_ring_), kb,
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(out.data() + o + lat_b + kb, state_ + dsa_ig_[(size_t) il] + (size_t) g.idx_key * (p % ik_ring_), kb,
+                           cudaMemcpyDeviceToHost);
+                if ((p + 1) % g.idx_kpool == 0)
+                    cudaMemcpy(out.data() + o + lat_b + 2 * kb,
+                               state_ + dsa_pool_[(size_t) il] + (size_t) g.idx_key * ((p + 1) / g.idx_kpool - 1), kb,
+                               cudaMemcpyDeviceToHost);
+            }
+        }
+    };
+    std::vector<uint8_t> rows_w, rows_t;
+    dsa_rows(rows_w);
+    static unsigned long long n_rdiff = 0;
+    for (int t = 0; t < n; ++t) {
+        if (!fast_token(toks[(size_t) t], err)) return false;
+        cudaMemcpy(tl.data(), sc_ + sc_logits, NV * sizeof(float), cudaMemcpyDeviceToHost);
+        ++n_cols;
+        if (std::memcmp(tl.data(), wl.data() + (size_t) t * NV, NV * sizeof(float)) != 0) {
+            ++n_ldiff;
+            ++bad;
+            if (n_ldiff <= 8) {
+                double md = 0.0;
+                for (size_t i = 0; i < NV; ++i) md = std::max(md, (double) std::fabs(tl[i] - wl[(size_t) t * NV + i]));
+                std::fprintf(stderr, "glm window check: column %d of %d at position %lld: logits DIFFER (max |d| %.3g)%s\n",
+                             t, T, (long long) (p0 + t), md, last_tok_ != wtok[(size_t) t] ? ", argmax too" : "");
+            }
+        }
+        if (last_tok_ != wtok[(size_t) t]) ++n_tdiff;
+        if (t == 0) cmp_states(kda_bak_);
+    }
+    if (n == T) cmp_states(V->chk_post);
+    dsa_rows(rows_t);
+    if (rows_t != rows_w) {
+        ++n_rdiff;
+        ++bad;
+    }
+    for (int il = l0_; il < l1_; ++il)
+        if (V->glm_li[(size_t) il] >= 0) kda_copy_layer(il, V->glm_li[(size_t) il], true, V->chk_post);
+    cudaStreamSynchronize(s);
+    pos_ = pos_after;
+    q35_pend_pos_ = pend;
+    q35_row_done_ = done;
+    last_tok_ = last;
+    ++n_win;
+    static unsigned long long by_mod[4] = {}, by_w[Glm5Model::kVerifyMax + 1] = {};
+    ++by_mod[p0 & 3];
+    ++by_w[T];
+    std::fprintf(stderr, "glm window check: %llu windows (p0 %% 4 = 0..3: %llu %llu %llu %llu; widths 2..6: %llu %llu %llu %llu "
+                         "%llu), %llu columns re-run on the token path - logits differ in %llu (argmax in %llu), KDA states "
+                         "compared %llu, differ %llu; DSA rows differ in %llu windows%s\n", n_win, by_mod[0], by_mod[1], by_mod[2], by_mod[3], by_w[2], by_w[3],
+                 by_w[4], by_w[5], by_w[6], n_cols, n_ldiff, n_tdiff, n_states, n_sdiff, n_rdiff, bad > 0 ? " (this one)" : "");
+    return true;
+}
+
 int Glm5Model::verify_argmax(int i) const {
     if (next_port_ != nullptr) return i >= 0 && (size_t) i < win_tok_.size() ? win_tok_[(size_t) i] : -1;
     const auto* V = (const VerifyBuf*) verify_tail()->vb_;
@@ -2096,7 +2735,18 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
         err = "deepseek4 verify: no such column";
         return -1;
     }
-    if (sp.greedy) return V->tok_h[i];
+    if (sp.greedy) {
+        // the end-of-turn guard reads the sampler's row (end_guard_pick): the column's row there, as a sampled pick
+        // leaves it - else the guard saw another position's logits and let the pick stand
+        if (guard_ids_ != nullptr) {
+            cudaSetDevice(tail->dev_);
+            cudaMemcpyAsync(tail->sc_ + tail->sc_logits, V->logits + (size_t) i * g_.n_vocab,
+                            (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, tail->fast_->cs);
+            cudaStreamSynchronize(tail->fast_->cs);
+            cudaSetDevice(dev_);
+        }
+        return V->tok_h[i];
+    }
     // all columns at once (STRATA_GLM_SAMPLE_COLS=0: one column a call, the old way): one launch and one wait a window
     // instead of a copy, a launch and a wait per column
     static const bool cols = [] { const char* v = getenv("STRATA_GLM_SAMPLE_COLS"); return !(v && v[0] == '0'); }();

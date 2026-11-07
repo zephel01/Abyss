@@ -141,7 +141,8 @@ A rented DGX Spark (128 GB unified memory), Abyss v1.3.114, the default budget.
 
 | model | decode | 8K prompt | notes |
 |---|---:|---:|---|
-| GLM-5.3-Flash (Maya-S-v2 IQ2_XXS, unsloth UD-IQ2_XXS) | 19-20 tok/s | 730-750 tok/s | 32K prompt from the CLI 675-796 tok/s; the MTP drafter gives no gain here |
+| GLM-5.3-Flash (Maya-S-v2 IQ2_XXS, unsloth UD-IQ2_XXS) | 19-20 tok/s | 730-750 tok/s | 32K prompt from the CLI 675-796 tok/s; the MTP drafter gave no gain until v1.3.118 (below) |
+| GLM-5.3-Flash, v1.3.118 (one-GPU verify window + NextN drafter, on by default here) | **S1 (zephel01, 94 GB) 24.3 tok/s** (21.4 without), **UD-IQ2_XXS 22.9** (19.8 without), same tokens | | 4K prompt, median of 3 x 512 tokens; drafts accepted 74-80% |
 | DeepSeek V4 0731 | 21.0 tok/s, **22.8 with the DSpark drafter** (78% accepted) | 814 tok/s | |
 | DeepSeek V4.1 Compact (zephel01's 207 GB build, does not fit in memory) | ~18 tok/s | | |
 
