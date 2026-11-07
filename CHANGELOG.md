@@ -7,6 +7,44 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.119 - 2026-11-07
+
+- **GLM-5.3-Flash's one-GPU verify window is faster on DGX Spark.** Three changes to v1.3.118's window, each with the
+  same sums as before: the absorbed attention k_b / v_b GEMVs of all columns run in one launch each, every weight read
+  once (`STRATA_GLM_MLA_COLS`); column 0 writes its KDA state straight into the rewind copy and the next column reads
+  it from there - no 2 x 146 MB of state copies a window (`STRATA_GLM_KDA_OOP`); and the column-batched expert
+  launches put the column first in the grid, so an expert two columns share is read from memory once and from L2 the
+  second time (`STRATA_GLM_COLS_ORDER`, CUDA). DGX Spark (GB10), 4K prompt, median of 3 x 512 tokens, 512 greedy
+  tokens identical to v1.3.118:
+  - our GLM-5.3-Flash S1 (94 GB): 24.3 -> **27.4 tok/s (+13%)**;
+  - unsloth UD-IQ2_XXS: 22.9 -> **24.2 tok/s (+6%)**.
+- **DeepSeek V4 / V4.1 windows and the DSpark drafter take the same launch order** (`STRATA_GLM_COLS_ORDER`, one
+  switch for every model): DGX Spark, DeepSeek V4 0731 + DSpark drafter 23.74 -> **25.22 tok/s (+6%)**, the same
+  tokens. RTX 5090: 48.9 -> 50.7 tok/s (within noise), the same tokens.
+- **Unified memory (DGX Spark): the prompt path's tail goes on top of a pool that holds every expert**, as on a
+  discrete card since v1.3.104 (`STRATA_GLM_TAIL_ON_TOP=0`: the old layout). A prompt no longer takes 20-46 slots a
+  layer from the experts, so the decode after it stops re-reading experts from the SSD (Qwen3.8 after a 32K prompt:
+  1.3 a token -> 0); the pool takes the tail's few GB more of the shared memory. The experts that sat on the SSD now
+  come from memory, so greedy tokens differ from v1.3.118's on the Spark (with `=0` they are v1.3.118's: checked for
+  Qwen3.8 MTP off at 4K / 32K, GLM S1 and V4 0731 + DSpark). Spark, the whole release, 4K: GLM S1 28.6 tok/s, V4
+  0731 + DSpark 26.0.
+- **Qwen3.8 on DGX Spark: the decode after a long prompt +13%.** ISTA IQ3_XXS with the MTP drafter, median of 3 x 512
+  tokens: 4K prompt 54.7 -> **55.8 tok/s (+2%)**, 32K prompt 47.5 -> **53.4 tok/s (+13%)** - the tail above and:
+  - a verify window's routes, one per column, run in one launch (`STRATA_GLM_ROUTE_COLS`, on for Qwen3.8; it was
+    48 x T launches a window, ~13 us each on a Spark) - the same plans in the same order, the same tokens;
+  - the window's dense GEMVs start with programmatic dependent launch and pull their weight rows into L2 before they
+    wait, as the token path's do (`STRATA_GLM_MVN_PDL`, CUDA; the same tokens): Spark 4K 52.5 -> 55.8 tok/s, 32K
+    51.5 -> 53.4 of the gain; RTX 5090 the same speed.
+- Build switches `-DGLMF_GU_DEC_WARPS=8|16|32` and `-DGLMF_DOWN_ROWS=2|4|8` (defaults 16 / 4, as before): the decode's
+  expert gate/up warps a block and down rows a block, for per-GPU tuning; every choice gives the same bits.
+- `STRATA_Q35_MTP_Q4=1` (experiment, off): Qwen3.8's MTP drafter reads 4-bit copies of its Q8_0 projections and head,
+  made at load - a faster draft step, fewer drafts kept (DGX Spark 87.6% -> ~80%).
+- Same-token checks on the RTX 5090 (`STRATA_DETERMINISTIC=1`, 512 tokens): GLM-5.3-Flash S1 (token path and
+  `STRATA_GLM_WINDOW=1`), DeepSeek V4 0731 + DSpark, and Qwen3.8 ISTA IQ3_S (MTP off at 4K and 32K, MTP on at 4K)
+  give v1.3.118's tokens. Qwen3.8 was compared with the expert pool pinned (`STRATA_GLM_POOL_GB`): another engine
+  build can leave one expert slot more or less in VRAM, which by itself changes greedy tokens on a card with a RAM
+  tier.
+
 ## v1.3.118 - 2026-11-07
 
 - **GLM-5.3-Flash on DGX Spark: speculative decode on one GPU, the same tokens** (`STRATA_GLM_WINDOW`). Until now GLM

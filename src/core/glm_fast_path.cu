@@ -1117,6 +1117,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         // headroom: the context's own growth is already allocated (state arena); see default_reserve_mb
         const size_t reserve = glmfast::vram_reserve_bytes(F->unified_memory ? 1024 : glmfast::default_reserve_mb(total_b));
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
+        // what a pool holding every expert AND the prompt's lendable tail on top may take (below): a discrete card's
+        // budget; unified memory's is capped at the experts' bytes, so its room is kept here
+        size_t avail_top = avail;
         if (F->unified_memory) {
             // Measure after dense/KV/scratch and pinned prompt staging are allocated.
             // Prompt device buffers borrow the pool, so their budget is not subtracted again.
@@ -1135,6 +1138,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             avail = glmfast::expert_pool_budget(true, free_b, (size_t) std::max(0LL, avail_kb) * 1024,
                                                 reserve, (size_t) (head_gb * 1073741824.0), expert_bytes);
+            avail_top = glmfast::expert_pool_budget(true, free_b, (size_t) std::max(0LL, avail_kb) * 1024,
+                                                    reserve, (size_t) (head_gb * 1073741824.0), SIZE_MAX);
             // the one budget the pool and the RAM tier share (the tier takes what the pool leaves of it, below)
             F->uma_budget = glmfast::uma_budget((size_t) std::max(0LL, avail_kb) * 1024, (size_t) (head_gb * 1073741824.0));
             F->uma_avail_gb = (double) avail_kb / 1048576.0;
@@ -1163,7 +1168,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 return false;
             }
         }
-        if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+        if (getenv("STRATA_GLM_POOL_GB")) {
+            avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+            avail_top = std::min(avail_top, avail);
+        }
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
         if (const size_t cap = vram_cap(); cap > 0) {
@@ -1177,6 +1185,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
             avail = std::min(avail, room);
+            avail_top = std::min(avail_top, room);
         }
         // a layer's slot stride: MMQ-addressable (glmfast::expert_stride), so the prompt path multiplies the pool
         // partition in place
@@ -1266,13 +1275,17 @@ bool Glm5Model::fast_setup(std::string& err) {
         // gets the tail on top: the main slots keep every expert while a prompt borrows the tail, so a prompt
         // evicts nothing and the decode after it runs from VRAM alone, not the CPU lane.  (Without the room, the
         // tail is cut from the experts' slots as before.)  STRATA_GLM_TAIL_ON_TOP=0 keeps the old layout (A/B)
+        // Unified memory too (2026-11-07): a DGX Spark's pool held all 24,576 Qwen3.8 experts but lent ~46 slots a
+        // layer of them to each prompt, and the decode after a 32K prompt re-read 1.3 experts a token from the SSD
+        // (1.55 ms a token); the tail on top costs the shared memory the tail's 3.7 GB, where it has the room
         int cap_main = g.n_expert + gf::kSpares;
-        if (k_extra > 0 && !F->unified_memory && per >= g.n_expert &&
-            (size_t) (g.n_expert + gf::kSpares + k_extra) * stride_sum <= avail) {
+        if (k_extra > 0 && per >= g.n_expert &&
+            (size_t) (g.n_expert + gf::kSpares + k_extra) * stride_sum <= avail_top) {
             const char* tv = getenv("STRATA_GLM_TAIL_ON_TOP");
             if (tv == nullptr || std::atoi(tv) != 0) {
                 per = g.n_expert + gf::kSpares + k_extra;
                 cap_main += k_extra;
+                avail = std::max(avail, (size_t) per * stride_sum);   // (unified memory: the budget now covers it)
                 std::fprintf(stderr, "glm fast: CUDA%d every expert fits beside the prompt's %d-slot tail: a prompt "
                                      "evicts none\n", dev_, k_extra);
             }

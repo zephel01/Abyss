@@ -143,7 +143,10 @@ A rented DGX Spark (128 GB unified memory), Abyss v1.3.114, the default budget.
 |---|---:|---:|---|
 | GLM-5.3-Flash (Maya-S-v2 IQ2_XXS, unsloth UD-IQ2_XXS) | 19-20 tok/s | 730-750 tok/s | 32K prompt from the CLI 675-796 tok/s; the MTP drafter gave no gain until v1.3.118 (below) |
 | GLM-5.3-Flash, v1.3.118 (one-GPU verify window + NextN drafter, on by default here) | **S1 (zephel01, 94 GB) 24.3 tok/s** (21.4 without), **UD-IQ2_XXS 22.9** (19.8 without), same tokens | | 4K prompt, median of 3 x 512 tokens; drafts accepted 74-80% |
+| GLM-5.3-Flash, v1.3.119 (faster verify window) | **S1 27.4 tok/s**, **UD-IQ2_XXS 24.2** with the window changes alone (the same tokens as v1.3.118); S1 28.6 with the whole release | | 4K prompt, median of 3 x 512 tokens; the whole release changes greedy tokens here (the prompt tail on top: `STRATA_GLM_TAIL_ON_TOP`) |
 | DeepSeek V4 0731 | 21.0 tok/s, **22.8 with the DSpark drafter** (78% accepted) | 814 tok/s | |
+| DeepSeek V4 0731, v1.3.119 | **25.2 tok/s with the DSpark drafter** with the window change alone (23.7 with v1.3.118 the same day, the same tokens); 26.0 with the whole release | | 4K prompt, median of 3 x 512 tokens |
+| Qwen3.8 ISTA IQ3_XXS, v1.3.119 (with the MTP drafter) | **55.8 tok/s after a 4K prompt, 53.4 after 32K** (v1.3.118 the same day: 54.7 / 47.5) | | median of 3 x 512 tokens; the decode after a long prompt no longer re-reads experts from the SSD |
 | DeepSeek V4.1 Compact (zephel01's 207 GB build, does not fit in memory) | ~18 tok/s | | |
 
 **llama.cpp on the same Spark** (8K prompt, 4K context filled): V4 0731 decode 20.2 tok/s, prompt 360 tok/s;

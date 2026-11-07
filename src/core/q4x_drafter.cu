@@ -37,6 +37,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::core {
@@ -52,6 +53,7 @@ struct Q4xDrafter {
     };
     std::map<std::string, W> w;
     void* dense = nullptr;
+    void* dense4 = nullptr;   // STRATA_Q35_MTP_Q4: the 4-bit copies of the Q8_0 projections (and the head's)
     uint8_t* experts = nullptr;
     uint16_t *kc = nullptr, *vc = nullptr;
     void* arena = nullptr;
@@ -81,6 +83,32 @@ bool read_all(const std::string& path, std::vector<uint8_t>& out) {
     out.resize((size_t) f.tellg());
     f.seekg(0);
     return (bool) f.read((char*) out.data(), (std::streamsize) out.size());
+}
+// rows x n_in values of type `from` (host) re-quantized to `to` (ggml's own quantizers, no importance matrix),
+// row-parallel over the host's threads; false when either type has no row converter
+bool requant_rows(const void* src, int from, int to, int64_t rows, int64_t n_in, std::vector<uint8_t>& out) {
+    const ggml_type_traits* tf = ggml_get_type_traits((ggml_type) from);
+    if (tf == nullptr || tf->to_float == nullptr || n_in % ggml_blck_size((ggml_type) to) != 0) return false;
+    const size_t rb_from = ggml_row_size((ggml_type) from, n_in), rb_to = ggml_row_size((ggml_type) to, n_in);
+    out.assign((size_t) rows * rb_to, 0);
+    const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    const int64_t per = (rows + nt - 1) / nt;
+    for (int t = 0; t < nt; ++t) {
+        const int64_t r0 = (int64_t) t * per, r1 = std::min(rows, r0 + per);
+        if (r0 >= r1) break;
+        th.emplace_back([&, r0, r1] {
+            std::vector<float> f((size_t) n_in * 64);
+            for (int64_t r = r0; r < r1; r += 64) {
+                const int64_t m = std::min<int64_t>(64, r1 - r);
+                for (int64_t i = 0; i < m; ++i)
+                    tf->to_float((const uint8_t*) src + (size_t) (r + i) * rb_from, f.data() + (size_t) i * n_in, n_in);
+                ggml_quantize_chunk((ggml_type) to, f.data(), out.data() + (size_t) r * rb_to, 0, m, n_in, nullptr);
+            }
+        });
+    }
+    for (auto& t : th) t.join();
+    return true;
 }
 }  // namespace
 
@@ -153,6 +181,42 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
             err = std::string("q4x mtp: dense.txt has no ") + n;
             return false;
         }
+    // STRATA_Q35_MTP_Q4=1: the draft step reads 4-bit copies of its Q8_0 projections (IQ4_NL: 18 bytes a 32 values,
+    // as Q4_0, with the mv kernels' own codebook) and of its head (below) - a draft step read ~325 MB, the Q8_0 rows
+    // and the Q5_K head ~60% of it.  The drafter only proposes: the verify window decides every token, so this moves
+    // the acceptance, never the output
+    static const bool q4 = [] {
+        const char* v = getenv("STRATA_Q35_MTP_Q4");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (q4) {
+        std::vector<uint8_t> blob4;
+        std::vector<std::pair<std::string, size_t>> at;
+        for (auto& kv : M->w) {
+            const Q4xDrafter::W& t = kv.second;
+            if (t.type != 8) continue;
+            std::vector<uint8_t> r;
+            const size_t off = (size_t) ((const uint8_t*) t.p - (const uint8_t*) M->dense);
+            if (!requant_rows(blob.data() + off, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, t.n_out, t.n_in, r)) continue;
+            at.push_back({kv.first, blob4.size()});
+            blob4.insert(blob4.end(), r.begin(), r.end());
+            blob4.resize((blob4.size() + 255) & ~(size_t) 255, 0);
+        }
+        if (!blob4.empty() && cudaMalloc(&M->dense4, blob4.size()) == cudaSuccess) {
+            cudaMemcpy(M->dense4, blob4.data(), blob4.size(), cudaMemcpyHostToDevice);
+            M->vram += blob4.size();
+            for (auto& a : at) {
+                Q4xDrafter::W& t = M->w[a.first];
+                t.type = GGML_TYPE_IQ4_NL;
+                t.p = (const uint8_t*) M->dense4 + a.second;
+            }
+            std::fprintf(stderr, "q4x mtp: CUDA%d %zu Q8_0 projections read as IQ4_NL copies (%.1f MB; STRATA_Q35_MTP_Q4)\n",
+                         dev_, at.size(), (double) blob4.size() / 1048576.0);
+        } else if (!blob4.empty()) {
+            cudaGetLastError();
+            std::fprintf(stderr, "q4x mtp: CUDA%d the IQ4_NL copies did not allocate: Q8_0 as before\n", dev_);
+        }
+    }
     // ---- the experts, resident
     {
         const size_t bytes = (size_t) NE * strata::kernels::cpu::BLOB;
@@ -190,6 +254,17 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
                 ok = id[i] >= 0 && id[i] < g.n_vocab;
                 if (ok) std::memcpy(sub.data() + (size_t) i * rb, full.data() + (size_t) id[i] * rb, rb);
             }
+            // STRATA_Q35_MTP_Q4: the head's rows as Q4_K (144 bytes a 256 values; the GGUF's Q5_K is 176)
+            if (ok && q4 && ow.type != 0 && ow.type != GGML_TYPE_Q4_K && E % 256 == 0) {
+                std::vector<uint8_t> r4;
+                if (requant_rows(sub.data(), ow.type, GGML_TYPE_Q4_K, n, E, r4)) {
+                    std::fprintf(stderr, "q4x mtp: CUDA%d the head's %lld rows read as Q4_K (%.0f -> %.0f MB; "
+                                         "STRATA_Q35_MTP_Q4)\n", dev_, (long long) n, (double) sub.size() / 1048576.0,
+                                 (double) r4.size() / 1048576.0);
+                    sub.swap(r4);
+                    M->head_type = GGML_TYPE_Q4_K;
+                }
+            }
             if (ok && cudaMalloc(&M->head, sub.size()) == cudaSuccess &&
                 cudaMalloc((void**) &M->dvocab, raw.size()) == cudaSuccess) {
                 cudaMemcpy(M->head, sub.data(), sub.size(), cudaMemcpyHostToDevice);
@@ -198,6 +273,7 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
                 M->vram += sub.size() + raw.size();
             } else {
                 M->head = (void*) (ow.type == 0 ? (const void*) ow.f32 : ow.q);
+                M->head_type = ow.type;
                 M->dvocab = nullptr;
             }
         }
@@ -307,7 +383,7 @@ bool Glm5Model::q4x_mtp_forward(int64_t p0, int n, const float* Rin, size_t r_st
         const Q4xDrafter::W& t = W.at(name);
         gf::MvJob j{};
         j.w = t.p;
-        j.xq = t.type == 8 ? xq : nullptr;
+        j.xq = t.type != 0 && t.type != gf::kTypeBF16 ? xq : nullptr;   // (Q8_0, or STRATA_Q35_MTP_Q4's IQ4_NL)
         j.xf = xf;
         j.y = y;
         j.type = t.type;

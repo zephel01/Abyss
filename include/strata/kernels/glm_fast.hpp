@@ -150,7 +150,9 @@ void kda_prep(const KdaPrepArgs& a, cudaStream_t s);
 /// sigmoid(g2)) + q8_1 of the gated output (the attn_output GEMV's input).
 void kda_rec(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw,
              float* state, const float* g2, const float* norm_w, float eps, int n_head, int head_dim,
-             void* out_q8_1, cudaStream_t s);
+             void* out_q8_1, cudaStream_t s, const float* state_in = nullptr);
+/// (state_in != nullptr and != state: the recurrence reads the state from state_in and writes the new one to state -
+/// the same sums, out of place; the verify window keeps the state after its column 0 that way without a copy)
 
 /// DSA, after the first projections: q_a norm (-> qr f32 + q8_1), kv_a norm into the latent cache
 /// at position p, the indexer key's layer norm into its cache, the compressor gate into its cache,
@@ -184,6 +186,13 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
          int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
          const void* wk_b_q8 = nullptr, const void* wv_b_q8 = nullptr);
+/// mla() for nc (2..8) verify-window columns: the absorbed k_b / v_b GEMVs over all columns in one launch each (each
+/// weight read once; every column's sums those of mla()'s), the attention a column at a time.  Column c: q at
+/// q + c * q_cs, its cells at cells + c * cells_cs, n_sel[c] (host), its output at out + c * out_cs q8_1 blocks.
+/// false: not run (the caller runs mla() a column)
+bool mla_cols(int nc, const float* q, size_t q_cs, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat,
+              const int* cells, size_t cells_cs, const int* n_sel, int n_head, int qk_nope, int kv_lora, int v_head,
+              void* out_q8_1, size_t out_cs, cudaStream_t s, bool lat_q8, const void* wk_b_q8, const void* wv_b_q8);
 /// Q8_0 blocks (n values, n % 32 == 0) -> F32 / FP16 (the prompt path's weight slices)
 void q8_0_to_f32(const void* src, float* dst, int64_t n, cudaStream_t s);
 void q8_0_to_f16(const void* src, uint16_t* dst, int64_t n, cudaStream_t s);
@@ -315,6 +324,16 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int gating = 0,
                const int* hash_ids = nullptr, float skip_w = 0.0f, int skip_disk = 0, const void* xq = nullptr,
                int win_more = 0);
+/// moe_route for a verify window's nc (2..8) columns of one layer in one launch, the same plans and requests as nc
+/// launches in column order (each column's turn at the shared tables comes after the one before it): column t routes
+/// logits + t * logit_stride over x + t * x_stride (x_stride = n_embd) into mds[t]'s plan, hash_ids[t] its hash ids
+/// (null: none).  No shared expert, prediction or lookahead.  sync: 2 device words, zero (they are again after it).
+/// false (nothing launched): a setting the batched launch does not take - route the columns one by one.
+bool moe_route_cols(const float* logits, size_t logit_stride, const float* bias, int n_expert, int k, float w_scale,
+                    bool norm_w, int layer, const float* x, size_t x_stride, const MoeDev* mds, int nc,
+                    unsigned int* sync, cudaStream_t s, int skip_from = 8, unsigned long long cpu_plan = 0,
+                    int promote_min = 0, int pf_rank = 0, int gating = 0, const int* const* hash_ids = nullptr,
+                    float skip_w = 0.0f, int skip_disk = 0);
 /// The shared expert's swiglu + q8_1 alone (what moe_route's extra blocks do when it is given sh_gate / sh_up): for
 /// the token path's late shared expert, whose gate/up GEMV runs after the route (STRATA_GLM_SH_LATE).
 void sh_swiglu(const float* sh_gate, const float* sh_up, float sh_limit, int n_ff_sh, void* sh_hq, cudaStream_t s);
