@@ -7,6 +7,13 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.120 - 2026-11-08
+
+- **Windows builds again (#31).** Since v1.3.109 `src/core/hop_link.cu` included `sys/socket.h` and `unistd.h`, which
+  Windows does not have, so a stock Windows build failed. They are now behind `#ifndef _WIN32`. On Windows
+  `STRATA_GLM_HOP=sock` (the in-process socket hop of a two-GPU split) logs one line and uses the host-memory hop,
+  the default; nothing else changes. Linux and DGX Spark builds are unchanged.
+
 ## v1.3.119 - 2026-11-07
 
 - **GLM-5.3-Flash's one-GPU verify window is faster on DGX Spark.** Three changes to v1.3.118's window, each with the

@@ -4,8 +4,10 @@
 
 #include "strata/core/hop_link.hpp"
 
+#ifndef _WIN32   // the sock transport is an AF_UNIX socketpair: not on Windows (falls back to host there)
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <condition_variable>
 #include <cstdio>
@@ -233,6 +235,7 @@ struct PeerLink : Base {
 // The sender's half: put copies into its pinned out-slot, ship hands the round to the writer thread, which waits for
 // the copies (the event) and writes {slot, bytes} + the bytes.  The receiver's half: arrive reads messages (in order;
 // one for another slot lands in that slot's in-buffer) until the slot's round is in, then get copies it in.
+#ifndef _WIN32
 struct SockLink : Base {
     struct Out {
         uint8_t* h = nullptr;
@@ -431,6 +434,7 @@ struct SockLink : Base {
                mark_used(slot, sb, err);
     }
 };
+#endif  // !_WIN32
 
 }  // namespace
 
@@ -453,11 +457,15 @@ std::unique_ptr<HopLink> HopLink::make(int dev_a, int dev_b) {
         std::fprintf(stderr, "glm split: CUDA%d -> CUDA%d has no peer access - the hop goes through host memory\n",
                      dev_a, dev_b);
     } else if (want == "sock") {
+#ifndef _WIN32
         auto* l = new SockLink(dev_a, dev_b);
         std::string err;
         if (l->open(err)) return std::unique_ptr<HopLink>(l);
         delete l;
         std::fprintf(stderr, "glm split: %s - the hop goes through host memory\n", err.c_str());
+#else
+        std::fprintf(stderr, "glm split: STRATA_GLM_HOP=sock is not available on Windows - the hop goes through host memory\n");
+#endif
     } else if (want != "host") {
         std::fprintf(stderr, "glm split: STRATA_GLM_HOP=%s is not host / peer / sock - host\n", want.c_str());
     }
