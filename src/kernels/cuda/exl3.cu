@@ -102,20 +102,20 @@ __device__ __forceinline__ float e4m3_round(float v) {
 // The mcg values stay far below E4M3's 448, so nothing saturates
 __device__ __forceinline__ __half2 e4m3_round2(__half2 h) {
     uint32_t u;
-    __builtin_memcpy(&u, &h, 4);
+    memcpy(&u, &h, 4);
     const uint32_t sg = u & 0x80008000u, a = u & 0x7fff7fffu;
     const uint32_t nrm = (a + 0x003f003fu + ((a >> 7) & 0x00010001u)) & 0xff80ff80u;
     __half2 ah;
-    __builtin_memcpy(&ah, &a, 4);
+    memcpy(&ah, &a, 4);
     const __half2 big = __half2half2(__ushort_as_half(0x6400));   // 1024
     const __half2 q = __hsub2(__hadd2(__hmul2(ah, __half2half2(__ushort_as_half(0x6000))), big), big);   // x 512
     const __half2 sub = __hmul2(q, __half2half2(__ushort_as_half(0x1800)));                              // x 2^-9
     uint32_t sb;
-    __builtin_memcpy(&sb, &sub, 4);
+    memcpy(&sb, &sub, 4);
     const uint32_t m = ((a & 0xffffu) < 0x2400u ? 0x0000ffffu : 0u) | ((a >> 16) < 0x2400u ? 0xffff0000u : 0u);
     const uint32_t r = ((sb & m) | (nrm & ~m)) | sg;
     __half2 o;
-    __builtin_memcpy(&o, &r, 4);
+    memcpy(&o, &r, 4);
     return o;
 }
 
