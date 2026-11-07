@@ -3343,7 +3343,10 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
-        else if (a == "--prefill") {
+        else goto args_part2;   // (two chains: one else-if chain this long passes MSVC's nesting limit, C1061)
+        continue;
+    args_part2:
+        if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_arg = v;
             o.prefill_auto = v == "auto";
