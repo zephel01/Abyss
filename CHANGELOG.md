@@ -7,6 +7,27 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.121 - 2026-11-09
+
+- **ISTA-DASLab's GSQ-RCO IQ1_M (DeepSeek V4.1) reads prompts at full speed again.** Its layers keep IQ1_S gate / up
+  experts beside IQ1_M down experts; the prompt path's expert decoder did not list IQ1_S, so such a layer fell back to
+  one token at a time (~5 tok/s). IQ1_S is now decoded like the other i-quants: an 8K prompt 5 -> **234 tok/s**
+  (RTX 5090 capped at 12 GB + 128 GB RAM), decode unchanged (26.7 tok/s). The prompt path against one token at a time over 463 positions: KL
+  0.0017, the same top token 97.8%.
+- **One-command setup for every own GGUF.** `./setup-deepseek.sh --model qwen38` (`--quant 12G32G`, `16G64G` - the
+  default - or `24G64G`), `--model glm` (`32G96G` or `32G128G`), `--model ornith --quant 24G64G`, and our DeepSeek V4
+  0731 files as `--quant 16G64G` / `32G64G` / `32G96G`. The quant names the PC size and picks the Hugging Face repo;
+  the setup says when the PC is smaller than the file was made for, writes the RAM tier the model card was measured
+  with (64 GB PC: 46 GB), and leaves the DSpark drafter off for our V4 files (faster without it on a discrete GPU).
+- **README: pick a model for your PC first.** A table of our GGUFs by GPU and RAM size with the setup command for
+  each, then the quick start, requirements and the disk space each model needs (GGUF + pack + drafter); our files
+  under their current Hugging Face names (the earlier names in a note); the news at the end.
+- **`--calibrate` and temperature 0 in the docs (#39).** The setup ends by pointing to `./abyss.sh --calibrate` (the
+  CPU lane / PCIe split for this PC: +12% on an RTX 4090 + 96 GB in #39), and the manual has a section on it. For coding
+  agents the manual notes that temperature 0 (`"sampling": {"temperature": 0.0, "top_p": 1.0, "top_k": 1}`) raises the
+  drafter's acceptance (76 -> 86%, ~+20% in #39); the default stays the model card's sampling. `--spec-min-p 0.5` as a
+  default is still being measured.
+
 ## v1.3.120 - 2026-11-08
 
 - **Windows builds again (#31).** Since v1.3.109 `src/core/hop_link.cu` included `sys/socket.h` and `unistd.h`, which

@@ -658,7 +658,9 @@ void Glm5Model::prefill_settle(double pinned_share) {
 // 0.2.4's gfx12 i-quant tiles and Maya's DS4_FAT_ROWS (a prompt expert's weights decoded once, not once per row tile)
 static bool mmq_layer(int gu, int d) { return mmq::supported(gu) && mmq::supported(d); }
 static bool deq_expert_type(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29 || strata::kernels::dequant_bf16_supported(t);
+    // (19 IQ1_S: ISTA's GSQ-RCO IQ1_M files keep IQ1_S gate/up beside IQ1_M down - such a layer comes here whole)
+    return t == 16 || t == 17 || t == 18 || t == 19 || t == 21 || t == 22 || t == 29 ||
+           strata::kernels::dequant_bf16_supported(t);
 }
 // rows a decoded expert's FP16 activations take beside its 2 n_ff x n_embd gate/up (run_blas_dq's X16)
 static constexpr int64_t kDqRows = 512;

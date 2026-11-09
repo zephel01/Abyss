@@ -452,6 +452,12 @@ ABYSS_KEY=... ./abyss.sh --connect claude --url http://192.168.1.20:8082 --key-e
 - **OpenCode:** provider `abyss` (`@ai-sdk/openai-compatible`, base URL `.../v1`, `limit.context` = the server's
   context, the key as `{env:ABYSS_API_KEY}`). Your default model is kept if you have one; pick `abyss/<model>` with
   `/models`. A config with comments (JSONC) is not touched: copy the printed block by hand.
+- **Temperature 0 for coding agents (optional).** The config keeps the model card's sampling (e.g. Qwen3.8:
+  temperature 1.0, top_p 0.95, top_k 20). For coding and agent work you can set `"sampling": {"temperature": 0.0,
+  "top_p": 1.0, "top_k": 1}` in `abyss-<name>.json`: the model always takes its most probable token, so the drafter's
+  guesses match more often - on an RTX 4090 with Qwen3.8-Flash-Next the drafts accepted went 76 -> 86% and a long coding
+  prompt ran ~20% faster ([#39](https://github.com/zephel01/Abyss/issues/39)). Greedy answers can repeat themselves on
+  open-ended text, so keep the default for chat and writing. A request's own `temperature` wins over the config.
 - The key is never written into a file. Tested with Claude Code 2.1.316 against Qwen3.8-35B-A3B-Distill on one RTX 5090
   (a file-writing tool call).
 
@@ -540,6 +546,16 @@ three questions, prefill at 2k / 8k tokens, then where a token's time goes (SSD 
 copies, the GPU), the likely bottleneck with what moves it, and a quality check against a known-good run of the same
 model (`bench/ref`). `--deep` adds the GPU timeline and a sweep of the PCIe / lane share; `--full` repeats the answers
 and adds a 32k prompt. It writes `abyss-bench.txt` to paste into an issue. [BENCH.md](BENCH.md) explains each line.
+
+### Tuning the lane for this PC (`./abyss.sh --calibrate`)
+
+Run it once after the setup (Abyss stopped, ~10-15 minutes, the model loads first): it measures decode with a few
+splits of the RAM-tier experts between the CPU lane and the PCIe link, and with fewer CPU threads, and keeps a setting
+that is more than 3% faster than the engine's own choice (`STRATA_GLM_PCIE_SHARE`, `STRATA_GLM_CPU_LANE` in the
+config's `env`, and `~/.config/project-maya/calibration.json` so a setup again keeps it). The best split depends on
+the PC: on an RTX 4090 + 96 GB with Qwen3.8-Flash-Next UD-Q4_K_XL the share went 0.08 -> 0.10 and decode 50.2 -> 56.5
+tok/s (+12%, [#39](https://github.com/zephel01/Abyss/issues/39)). Run it again after a new GPU, more RAM, another
+model or a setup that rewrote the config.
 
 ### Checking that the model runs right (`./abyss.sh --check`)
 

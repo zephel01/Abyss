@@ -78,7 +78,8 @@ curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/jso
   -d '{"messages":[{"role":"user","content":"日本の首都はどこですか？"}],"max_tokens":4000}'
 ```
 
-この PC で正しく動くかは `../Abyss-tools/abyss.sh --check`、速さは `--bench --deep` で確かめられる（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
+そのあと一度 `../Abyss-tools/abyss.sh --calibrate` で、CPU のレーンと PCIe の分け方をこの PC に合わせる（約 10〜15 分。
+RTX 4090 で +12%、[#39](https://github.com/zephel01/Abyss/issues/39)）。正しく動くかは `--check`、速さは `--bench --deep` で確かめられる（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
 
 <details>
 <summary><b>セットアップがやること</b></summary>

@@ -578,6 +578,8 @@ def main() -> int:
     S.say()
     S.say(f"Done. Start it with:  {tools / 'abyss.sh'} start {name}")
     S.say(f"then open http://127.0.0.1:{a.port}/  (the manual: {ROOT / 'docs' / 'MANUAL.md'})")
+    S.say(f"Once, with it stopped: {tools / 'abyss.sh'} --calibrate  tunes the CPU lane / PCIe split for this PC "
+          "(~10-15 minutes; +12% on an RTX 4090, issue #39)")
     return 0
 
 

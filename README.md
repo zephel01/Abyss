@@ -79,8 +79,9 @@ curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/jso
   -d '{"messages":[{"role":"user","content":"What is 17*23?"}],"max_tokens":4000}'
 ```
 
-Check that it runs right on your PC with `../Abyss-tools/abyss.sh --check`, and measure it with `--bench --deep`
-([docs/BENCH.md](docs/BENCH.md)).
+Then tune the CPU lane / PCIe split for your PC once with `../Abyss-tools/abyss.sh --calibrate` (~10-15 minutes;
++12% on an RTX 4090 in [#39](https://github.com/zephel01/Abyss/issues/39)), check that it runs right with `--check`,
+and measure it with `--bench --deep` ([docs/BENCH.md](docs/BENCH.md)).
 
 <details>
 <summary><b>What the setup does</b></summary>

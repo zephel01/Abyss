@@ -437,6 +437,12 @@ ABYSS_KEY=... ./abyss.sh --connect claude --url http://192.168.1.20:8082 --key-e
 - **OpenCode:** provider `abyss`（`@ai-sdk/openai-compatible`、ベース URL `.../v1`、`limit.context` = サーバーの
   コンテキスト、キーは `{env:ABYSS_API_KEY}`）。既定のモデルがあればそのまま残すので、`/models` で `abyss/<モデル>` を
   選ぶ。コメント入りの設定（JSONC）は書き換えないので、表示されたブロックを手で貼る。
+- **コーディング・エージェントには温度 0 も選べる（任意）。** 設定の既定はモデルカードのサンプリングのまま（例: Qwen3.8 は
+  temperature 1.0、top_p 0.95、top_k 20）。コーディングやエージェントの作業では、`abyss-<名前>.json` に `"sampling":
+  {"temperature": 0.0, "top_p": 1.0, "top_k": 1}` と書けます。いつも一番確率の高いトークンを選ぶので、ドラフターの下書きが
+  当たりやすくなります。RTX 4090 の Qwen3.8-Flash-Next で、下書きの採用率が 76 → 86%、長いコーディングのプロンプトが約 20% 速く
+  なりました（[#39](https://github.com/zephel01/Abyss/issues/39)）。自由な文章では同じ言い回しを繰り返すことがあるので、会話や
+  文章書きには既定のままがおすすめです。リクエストの `temperature` は設定より優先されます。
 - キーはファイルに書かない。Claude Code 2.1.316 と RTX 5090 1 枚の Qwen3.8-35B-A3B-Distill で、ファイルを書くツール呼び出しまで確認した。
 
 ## 複数の GPU
@@ -518,6 +524,16 @@ Radeon 8060S（gfx1151）。
 ### この PC を測る（`./abyss.sh --bench`）
 
 `./abyss.sh --bench`（Abyss を止めて実行、数分）は、入っているモデルをどの PC でも同じ方法で測ります。3 つの質問での生成速度、2k / 8k トークンのプロンプトを読む速度に加えて、1 トークンの時間がどこで使われているか（SSD 待ち、CPU / iGPU レーン、PCIe での転送、GPU）、一番ありそうなボトルネックと速くする方法、同じモデルの正常な実行と比べた品質チェック（`bench/ref`）を出します。`--deep` は GPU の稼働率と、PCIe / レーンの分担率の振り分けを足します。`--full` は回答を繰り返し、32k トークンのプロンプトも測ります。結果は `abyss-bench.txt` に書き出すので、issue に貼ってください。各行の意味は [BENCH.ja.md](BENCH.ja.md) にあります。
+
+### この PC に合わせてレーンを調整する（`./abyss.sh --calibrate`）
+
+セットアップのあとに一度実行してください（Abyss を止めて、約 10〜15 分。最初にモデルを読み込みます）。RAM の枠にある
+エキスパートを CPU のレーンと PCIe にどう分けるか、CPU のスレッド数をいくつか試して生成の速さを測り、エンジンの既定より
+3% 以上速い設定を残します（設定の `env` の `STRATA_GLM_PCIE_SHARE`、`STRATA_GLM_CPU_LANE` と、
+`~/.config/project-maya/calibration.json`。もう一度セットアップしても残ります）。一番よい分け方は PC によって違います:
+RTX 4090 + RAM 96 GB の Qwen3.8-Flash-Next UD-Q4_K_XL では、割合が 0.08 → 0.10 になり、生成が 50.2 → 56.5 tok/s（+12%、
+[#39](https://github.com/zephel01/Abyss/issues/39)）。GPU を替えた、RAM を増やした、モデルを替えた、設定を書き直す
+セットアップをした、というときはもう一度実行してください。
 
 ### モデルが正しく動くか確かめる（`./abyss.sh --check`）
 
