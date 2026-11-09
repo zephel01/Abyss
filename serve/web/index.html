@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#090a14">
-<title>Project Maya</title>
+<title>Abyss</title>
 <link rel="manifest" href="web/manifest.webmanifest">
 <link rel="icon" href="web/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
@@ -34,7 +34,7 @@
       <svg viewBox="0 0 24 24" fill="none"><path d="M9 4.5h6v3H9z" fill="currentColor" opacity=".95"/>
         <path d="M6.5 9h11v3.5h-11z" fill="currentColor" opacity=".8"/><path d="M4 14h16v4.5H4z" fill="currentColor" opacity=".65"/></svg>
     </span>
-    <span class="brand__text"><span class="brand__name">Maya</span><span class="brand__sub">local AI</span></span>
+    <span class="brand__text"><span class="brand__name">Abyss</span><span class="brand__sub">local AI</span></span>
   </div>
   <button class="st-btn st-btn--icon chats-toggle" id="chats-toggle" title="Chats" aria-label="Chats" aria-controls="chats" aria-expanded="false">
     <svg class="st-icon"><use href="web/sprite.svg#i-menu"/></svg></button>
@@ -100,7 +100,7 @@
           <button type="button" class="st-btn st-btn--secondary st-btn--sm" id="edit-cancel">Cancel</button>
         </div>
         <div class="attachments" id="attachments" hidden></div>
-        <textarea id="input" rows="2" placeholder="Message Maya&hellip;" aria-label="Message"></textarea>
+        <textarea id="input" rows="2" placeholder="Message Abyss&hellip;" aria-label="Message"></textarea>
         <div class="st-composer__bar">
           <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
@@ -130,9 +130,20 @@
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
       <div class="page-head">
-        <div><h1 class="page-title">Monitor</h1><p class="muted page-sub" id="mon-sub">Live view of the model, its experts and the hardware</p></div>
+        <div class="mon-id"><h1 class="page-title">Monitor</h1>
+          <p class="mon-model" id="mon-model" hidden><b id="mon-name"></b><span class="mon-quant" id="mon-quant"></span><span class="mon-badges" id="mon-badges"></span></p>
+          <p class="muted page-sub" id="mon-sub">Live view of the model, its experts and the hardware</p></div>
+        <span class="st-badge mon-state" id="mon-state" data-s="idle" hidden></span>
       </div>
       <div class="banners" id="banners"></div>
+
+      <!-- the bottleneck: the Abyss Terminal's verdict (--bench's rules, computed by the server) and what moves it -->
+      <div class="bneck" id="bneck" data-tone="info" hidden role="status" aria-live="polite">
+        <div class="bneck__head"><span class="bneck__kicker">Bottleneck</span><span class="bneck__label" id="bneck-label"></span>
+          <span class="bneck__share" id="bneck-share"></span><span class="muted small bneck__src" id="bneck-src"></span></div>
+        <p class="bneck__what" id="bneck-what"></p>
+        <p class="bneck__fix"><b>Fix:</b> <span id="bneck-fix"></span></p>
+      </div>
 
       <!-- hero: what the model is doing right now -->
       <div class="st-card hero">
@@ -175,6 +186,20 @@
         </div>
       </div>
 
+      <!-- where a token's time goes (the Terminal's TOKEN TIME): one stacked bar, the lane alongside it -->
+      <div class="st-card tt-card" id="tt-card">
+        <div class="card-head"><span class="card-title">Token time</span><span class="muted small" id="tt-sub"></span></div>
+        <div class="tt-head" id="tt-head"></div>
+        <div class="ttbar" id="ttbar" aria-label="A token's time"></div>
+        <div class="ttlane" id="ttlane" hidden><span class="ttlane__bar"><i id="ttlane-fill"></i></span><span class="small" id="ttlane-text"></span></div>
+        <div class="tt-legend" id="tt-legend"></div>
+        <div class="tt-facts" id="tt-facts"></div>
+        <p class="muted small tt-why" id="tt-why" hidden></p>
+        <details class="tt-more" id="tt-more" hidden><summary class="small">Evidence (the --bench rules) and the lane</summary>
+          <ul class="tt-evidence small" id="tt-evidence"></ul><div class="tt-facts" id="tt-lane"></div>
+          <ul class="tt-evidence small" id="tt-diagnose"></ul></details>
+      </div>
+
       <!-- the expert tiers (the engine's STAT lines): shown only when the engine reports them -->
       <div class="st-card tiers-card" id="tiers-card" hidden>
         <div class="card-head">
@@ -195,10 +220,16 @@
         <p class="tier-advice muted small" id="tier-advice" hidden></p>
       </div>
 
+      <!-- the Terminal's MEMORY · TIERS: the context, the experts' tiers, system RAM, the drafter -->
+      <div class="st-card mem-card" id="mem-card" hidden>
+        <div class="card-head"><span class="card-title">Memory &middot; tiers</span><span class="muted small" id="mem-sub"></span></div>
+        <div class="meters" id="meters"></div>
+      </div>
+
       <div class="st-card gpus-card" id="gpus-card" hidden>
-        <div class="card-head"><span class="card-title">GPUs</span><span class="muted small" id="gpus-sub"></span></div>
+        <div class="card-head"><span class="card-title">Cards</span><span class="muted small" id="gpus-sub"></span></div>
         <div class="table-wrap">
-          <table class="st-table"><thead><tr><th>GPU</th><th class="num">Load</th><th class="num">VRAM</th><th class="num">Power</th>
+          <table class="st-table"><thead><tr><th>Role</th><th>Card</th><th class="num">Load</th><th class="num">VRAM</th><th class="num">Power</th>
             <th class="num">Temp</th><th class="num">PCIe</th></tr></thead><tbody id="gpus-body"></tbody></table>
         </div>
       </div>
@@ -215,8 +246,8 @@
             <table class="st-table">
               <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num" title="Prompt tokens the conversation cache already held">Reused</th>
                 <th class="num" title="Prompt tokens read per second (the reused ones not counted)">Prefill</th><th class="num">Output</th>
-                <th class="num" title="Answer tokens written per second">Decode</th><th class="num" title="While writing the answer: the share of the routed experts that were already in VRAM">VRAM hit</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
+                <th class="num" title="Answer tokens written per second">Decode</th><th class="num" title="While writing the answer: the share of the routed experts that were already in VRAM">VRAM hit</th><th class="num" title="The drafter's drafts accepted (MTP / NextN / DSpark)">Draft</th><th class="num">Duration</th></tr></thead>
+              <tbody id="req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
           <p class="muted req-totals" id="req-totals"></p>

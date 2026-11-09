@@ -1,4 +1,4 @@
-// serve/web/app.js - the Project Maya web app: Chat, Monitor, About. No framework, no network beyond this server.
+// serve/web/app.js - the Abyss web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor is built on the server's own /metrics (hardware, requests) and the engine's STAT lines (expert tiers).
 "use strict";
 
@@ -231,13 +231,13 @@ function renderModelLine() {
   const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
   const ver = health.version ? `v${health.version}` : "";
   $("side-model").innerHTML = `<b>${esc(health.model)}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}`;
-  $("chat-empty-model").textContent = [health.model, ctx, ver ? `Project Maya ${ver}` : ""].filter(Boolean).join(" · ");
+  $("chat-empty-model").textContent = [health.model, ctx, ver ? `Abyss ${ver}` : ""].filter(Boolean).join(" · ");
 }
 
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
   {key: "gpu", label: "GPU active", icon: "gpu", unit: "%", series: "gpu_util", max: 100,
-   tip: "NVIDIA's counter: the share of time any GPU kernel is running. While Maya answers it reads 100% - between "
+   tip: "NVIDIA's counter: the share of time any GPU kernel is running. While Abyss answers it reads 100% - between "
         + "bursts of work the GPU waits (inside a kernel) for experts from RAM and the CPU. Power shows how hard it "
         + "really works."},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
@@ -334,7 +334,8 @@ let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    // view=1: the Abyss Terminal's View of the same readings (the token's time, the bottleneck, the cards ...)
+    const r = await fetch(reqShowAll ? "metrics?view=1&requests=all" : "metrics?view=1", {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
@@ -377,11 +378,17 @@ function render(m) {
   if (live.queued > 0 && !reloadWatch) setPill("queued", `${live.queued} queued`);
   liveCtx();                                     // the context meter follows the answer being written
   if (tab === "monitor") {
+    const v = m.view || null;                    // null: an older server, or its View failed - the rest still shows
     renderBanners(m);
     renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
     renderTiers(m.tiers, eng);
     renderHero(live, h, last, eng, m.tiers, m.totals);
-    renderGpus(hw);
+    renderGpus(hw, v);
+    renderIdentity(v);
+    renderBottleneck(v);
+    renderTokenTime(v);
+    renderMemory(v);
+    renderViewHardware(v);
   }
   if (tab === "about") renderAbout(eng, hw, st, m.storage);
 }
@@ -395,9 +402,19 @@ function renderBanners(m) {
   } else if (rl && rl.state === "failed" && rl.ended && Date.now() / 1000 - rl.ended < 600) {
     out.push(["error", `The context change did not work: ${rl.error || "the engine did not start"}. It runs with ${ctxfmt(rl.context)} again.`]);
   }
-  const gpus = modelGpus(m.hardware || {});
-  for (const g of gpus.length ? gpus : [{index: null, temp: (m.hardware || {}).gpu_temp}]) {
-    if (g.temp != null && g.temp >= 87) out.push(["warn", `${g.index == null ? "The GPU" : `GPU ${g.index}`} is at ${fmt(g.temp)} °C: it may slow itself down to cool off.`]);
+  const v = m.view;
+  if (v && Array.isArray(v.banners)) {
+    // the Terminal's warnings (GPU hot or throttling, a PCIe link that fell, memory pressure, the watchdog, the lane);
+    // its "SSD-bound" line is the bottleneck card below
+    for (const [text, tone] of v.banners) {
+      if (/^SSD-bound:/.test(text)) continue;
+      out.push([tone === "alert" ? "error" : tone === "warn" ? "warn" : "info", text]);
+    }
+  } else {
+    const gpus = modelGpus(m.hardware || {});
+    for (const g of gpus.length ? gpus : [{index: null, temp: (m.hardware || {}).gpu_temp}]) {
+      if (g.temp != null && g.temp >= 87) out.push(["warn", `${g.index == null ? "The GPU" : `GPU ${g.index}`} is at ${fmt(g.temp)} °C: it may slow itself down to cool off.`]);
+    }
   }
   $("banners").innerHTML = out.map(([k, t]) => `<div class="banner banner--${k}" role="${k === "error" ? "alert" : "status"}">${icon(k === "info" ? "info" : k === "error" ? "error" : "warning", "st-icon st-icon--sm")}<span>${esc(t)}</span></div>`).join("");
 }
@@ -441,9 +458,42 @@ function modelGpus(hw) {
   return (hw.gpus || []).filter((g) => !g.role || g.role === "main" || g.role === "split");
 }
 
-// five GPUs or more: one row each (up to four, the hardware cards list every GPU's own value - each figure once)
+// five GPUs or more: one row each (up to four, the hardware cards list every GPU's own value - each figure once);
+// with the Terminal's View, its CARDS table: every card (the model's, a helper, the iGPU lane's) and the CPU
 const GPU_TABLE_FROM = 5;
-function renderGpus(hw) {
+const ROLE = {main: "Main", split: "Split", helper: "Helper", igpu: "iGPU"};
+const linkText = (gen, wid) => (gen ? `Gen${fmt(gen)}${wid ? ` x${fmt(wid)}` : ""}` : "–");
+function renderGpus(hw, v) {
+  const cards = v && Array.isArray(v.cards) ? v.cards : null;
+  if (cards && cards.length) {
+    const target = v.bottleneck ? v.bottleneck.target : null;
+    $("gpus-card").hidden = false;
+    $("gpus-sub").textContent = `${cards.length} device${cards.length > 1 ? "s" : ""}`;
+    const rows = cards.map((c) => {
+      const hot = (target === "igpu" && c.role === "igpu") || (target === "pcie" && v.gpu && v.gpu.slowest_link_card === c.index && c.role !== "igpu");
+      const link = c.role === "igpu" || !c.pcie_gen ? "–" : `${linkText(c.pcie_gen, c.pcie_width)}` +
+        (c.pcie_gen_max ? ` / ${linkText(c.pcie_gen_max, c.pcie_width_max)}` : "") +
+        (c.drop ? " · fell" : c.weak ? " · weak" : c.behind ? " · behind" : "");
+      const vram = c.mem_used == null ? "–" : c.mem_total ? `${gb(c.mem_used)} / ${gb(c.mem_total, 0)} GB` : "shared";
+      return `<tr${hot ? ' class="is-bottleneck"' : ""}><td><span class="role role--${esc(c.role || "main")}">${esc(ROLE[c.role] || c.role || "–")}</span></td>` +
+        `<td>${esc(c.index)} ${esc(c.short || c.name || "")}${c.layers ? ` <span class="muted small">L${esc(c.layers[0])}-${esc(c.layers[1] - 1)}</span>` : ""}</td>` +
+        `<td class="num">${c.util == null ? "–" : `${fmt(c.util)}%`}</td><td class="num">${vram}</td>` +
+        `<td class="num">${c.power == null ? "–" : `${fmt(c.power)}${c.power_limit ? ` / ${fmt(c.power_limit)}` : ""} W`}</td>` +
+        `<td class="num">${c.temp == null ? "–" : `${fmt(c.temp)}${c.temp_junction != null ? ` / ${fmt(c.temp_junction)}` : ""} °C`}</td>` +
+        `<td class="num${c.drop || c.weak ? " is-bad" : ""}">${esc(link)}</td></tr>`;
+    });
+    const cpu = v.cpu || {};
+    if (cpu.pct != null || cpu.name) {
+      const mhz = cpu.mhz ? `${fmt(cpu.mhz)} MHz` : "";
+      rows.push(`<tr class="cpu-row${target === "cpu" ? " is-bottleneck" : ""}"><td><span class="role role--cpu">CPU</span></td>` +
+        `<td>${esc(cpu.name || "CPU")}${cpu.isa ? ` <span class="muted small">${esc(cpu.isa)}</span>` : ""}</td>` +
+        `<td class="num">${cpu.pct == null ? "–" : `${fmt(cpu.pct)}%`}</td><td class="num">${esc(mhz) || "–"}</td>` +
+        `<td class="num">${cpu.power == null ? "–" : `${fmt(cpu.power)} W`}</td><td class="num">${cpu.temp == null ? "–" : `${fmt(cpu.temp)} °C`}</td>` +
+        `<td class="num">${cpu.cores ? `${fmt(cpu.cores)}c / ${fmt(cpu.threads)}t` : "–"}</td></tr>`);
+    }
+    $("gpus-body").innerHTML = rows.join("");
+    return;
+  }
   const gpus = modelGpus(hw);
   $("gpus-card").hidden = gpus.length < GPU_TABLE_FROM;
   if (gpus.length < GPU_TABLE_FROM) return;
@@ -451,11 +501,186 @@ function renderGpus(hw) {
   $("gpus-body").innerHTML = gpus.map((g) => {
     const gen = g.pcie_gen_max || g.pcie_gen;
     const pcie = gen ? `Gen${gen}${g.pcie_width ? ` x${g.pcie_width}` : ""}${g.pcie_rx_mb != null ? ` · ${fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0)} MB/s` : ""}` : "–";
-    return `<tr><td>GPU ${esc(g.index)}</td><td class="num">${g.util == null ? "–" : `${fmt(g.util)}%`}</td>` +
+    return `<tr><td>${esc(ROLE[g.role] || "Main")}</td><td>GPU ${esc(g.index)}</td><td class="num">${g.util == null ? "–" : `${fmt(g.util)}%`}</td>` +
       `<td class="num">${g.mem_used == null ? "–" : `${gb(g.mem_used)}${g.mem_total ? ` / ${gb(g.mem_total, 0)}` : ""} GB`}</td>` +
       `<td class="num">${g.power == null ? "–" : `${fmt(g.power)}${g.power_limit ? ` / ${fmt(g.power_limit)}` : ""} W`}</td>` +
       `<td class="num">${g.temp == null ? "–" : `${fmt(g.temp)} °C`}</td><td class="num">${esc(pcie)}</td></tr>`;
   }).join("");
+}
+
+// ------------------------------------------------------------------ Monitor: the Abyss Terminal's View
+// Every number here comes from the server's "view" (serve/terminal_view.py: the Terminal's own code) - nothing is
+// re-derived in the page; a reading the server could not get is null and shows as a dash or hides its row.
+const STATE_TEXT = {idle: "Idle", reading: "Reading prompt", generating: "Generating", queued: "Queued",
+                    reloading: "Reloading", updating: "Updating", loading: "Loading", error: "Error"};
+const STATE_BADGE = {reading: "reading", generating: "generating", queued: "queued", reloading: "queued",
+                     updating: "queued", loading: "queued", error: "error"};
+const pctf = (x, d = 0) => (x == null ? "–" : `${fmt(100 * x, d)}%`);
+const cap1 = (t) => (t ? t[0].toUpperCase() + t.slice(1) : "");
+function renderIdentity(v) {
+  const has = !!(v && v.name);
+  $("mon-model").hidden = !has;
+  $("mon-state").hidden = !has;
+  if (!has) { $("mon-sub").textContent = "Live view of the model, its experts and the hardware"; return; }
+  $("mon-name").textContent = v.name;
+  $("mon-quant").textContent = v.quant || "";
+  $("mon-quant").hidden = !v.quant;
+  $("mon-badges").innerHTML = (v.badges || []).map(([t, tone]) =>
+    `<span class="mbadge" data-tone="${esc(tone)}" title="${tone === "alert" ? "changes the answers" : "how the model runs"}">${esc(t)}</span>`).join("");
+  $("mon-sub").textContent = [v.config, v.ctx ? `ctx ${ctxfmt(v.ctx)}` : "", v.backend,
+                              v.version ? `Abyss v${v.version}` : ""].filter(Boolean).join(" · ");
+  const k = v.state_key || "idle";
+  let t = STATE_TEXT[k] || cap1(k);
+  if (k === "reading" && v.prompt && v.prompt.total) t += ` ${kfmt(v.prompt.read)}/${kfmt(v.prompt.total)}`;
+  else if (k === "generating" && v.decode && v.decode.generated != null)
+    t += ` ${fmt(v.decode.generated)}${v.decode.max_tokens ? `/${fmt(v.decode.max_tokens)}` : ""}`;
+  if (v.queued && (k === "reading" || k === "generating")) t += ` +${fmt(v.queued)} queued`;
+  $("mon-state").textContent = t;
+  $("mon-state").dataset.s = STATE_BADGE[k] || "idle";
+}
+
+// the bottleneck: the banner, and the Monitor card it points at (accent border + a "bottleneck" tag)
+const BN_METRIC = {disk: "disk", cpu: "cpu", pcie: "pcie", gpu: "gpu"};
+function renderBottleneck(v) {
+  const b = v && v.bottleneck, el = $("bneck");
+  el.hidden = !b;
+  const target = b ? b.target : null;
+  for (const m of METRICS) $(`mv-${m.key}`).closest(".metric-card").classList.toggle("is-bottleneck", BN_METRIC[target] === m.key);
+  $("tier-disk-text").closest(".tierlegend__item").classList.toggle("is-bottleneck", target === "disk");
+  if (!b) return;
+  el.dataset.tone = b.tone;
+  el.dataset.verdict = b.verdict;
+  $("bneck-label").textContent = b.label;
+  $("bneck-share").textContent = b.share != null ? `${fmt(100 * b.share)}% of a token` : "";
+  $("bneck-src").textContent = b.source_text || "";
+  $("bneck-what").textContent = cap1(b.what);
+  $("bneck-fix").textContent = b.moves || "–";
+}
+
+// where a token's time goes: SSD wait | RAM-tier wait | GPU as one bar (the bottleneck's part highlighted, the
+// biggest part's share written on it), the lane alongside on its own line
+const SEG_OF_VERDICT = {ssd: "ssd", pcie: "ram", gpu: "gpu"};
+function renderTokenTime(v) {
+  const card = $("tt-card");
+  card.hidden = !v;
+  if (!v) return;
+  const tt = v.tt, b = v.bottleneck, sp = b && b.split;
+  $("tt-why").hidden = !!sp;
+  $("tt-why").textContent = sp ? "" : cap1(v.tt_why || "not known yet");
+  $("tt-more").hidden = !sp;
+  $("ttlane").hidden = !sp || !sp.parallel || !sp.parallel.ms;
+  if (!sp) {
+    $("tt-sub").textContent = "";
+    $("tt-head").textContent = "";
+    $("ttbar").innerHTML = "";
+    $("ttbar").classList.add("is-empty");
+    $("tt-legend").innerHTML = "";
+    const t = v.tiers || {};
+    $("tt-facts").innerHTML = t.vram_hit == null ? "" : factRow([["VRAM hit", pctf(t.vram_hit, 1)],
+      ["RAM→GPU", `${fmt(t.ram_fetch, 2)}/tok`], ["SSD reads", `${fmt(t.disk, 2)}/tok`]]);
+    return;
+  }
+  $("ttbar").classList.remove("is-empty");
+  $("tt-sub").textContent = b.source_text || "";
+  $("tt-head").innerHTML = `A token <b>${fmt(tt.ms, 1)} ms</b> <span class="muted">(${fmt(1000 / tt.ms, 1)} tok/s)</span>`;
+  const hotSeg = SEG_OF_VERDICT[b.verdict];
+  $("ttbar").innerHTML = sp.segments.map((s) => {
+    const hot = s.key === hotSeg, big = s.key === sp.biggest;
+    return `<span class="ttbar__seg ttbar__seg--${esc(s.key)}${hot ? " is-bottleneck" : ""}${big ? " is-biggest" : ""}" style="width:${(100 * s.share).toFixed(2)}%"` +
+      ` title="${esc(s.label)} ${fmt(s.ms, 1)} ms (${fmt(100 * s.share)}%)"><span>${hot ? "▶ " : ""}${esc(s.label)} ${fmt(s.ms, 1)} ms · ${fmt(100 * s.share)}%</span></span>`;
+  }).join("");
+  const lane = sp.parallel;
+  $("ttlane").classList.toggle("is-bottleneck", b.verdict === "cpu");
+  $("ttlane-fill").style.width = `${Math.min(100, 100 * lane.share).toFixed(2)}%`;
+  $("ttlane-text").textContent = `${lane.label} ${fmt(lane.ms, 1)} ms · ${fmt(100 * lane.share)}% · alongside the GPU, not added`;
+  $("tt-legend").innerHTML = sp.segments.map((s) =>
+    `<span class="tt-legend__item${s.key === hotSeg ? " is-bottleneck" : ""}"><i class="dot dot--${esc(s.key)}"></i>${esc(s.label)} <b>${fmt(s.ms, 1)} ms</b>` +
+    ` <span class="muted">${fmt(100 * s.share)}%${s.key === sp.biggest ? " · biggest" : ""}${s.key === hotSeg ? " · bottleneck" : ""}</span></span>`).join("") +
+    (lane.ms ? `<span class="tt-legend__item${b.verdict === "cpu" ? " is-bottleneck" : ""}"><i class="dot dot--lane"></i>${esc(lane.label)} <b>${fmt(lane.ms, 1)} ms</b> <span class="muted">parallel</span></span>` : "");
+  const facts = [["PCIe", `${fmt(tt.ram_fetch, 1)} fetch/tok`, b.verdict === "pcie"], ["VRAM hit", `${fmt(tt.vram_hit)}%`],
+                 ["SSD", `${fmt(tt.disk_reads, 1)} reads/tok`, b.verdict === "ssd"], ["SSD waits", `${fmt(tt.disk_waits, 1)}/tok`]];
+  if (tt.miss_ms != null) facts.push(["Misses", `${fmt(tt.miss_ms, 1)} ms/tok`]);
+  if (tt.tail_skip) facts.push(["Tail skip", `${fmt(tt.tail_skip, 1)}/tok`, true]);
+  if (tt.spec) facts.push(["Drafts", `${fmt(tt.spec[0])} of ${fmt(tt.spec[1])}`]);
+  $("tt-facts").innerHTML = factRow(facts);
+  $("tt-evidence").innerHTML = (b.evidence || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  const l = v.lane || {};
+  $("tt-lane").innerHTML = factRow([["Lane", `${l.name || "–"}${l.state ? ` (${l.state})` : ""}`],
+    ["Threads", v.cpu && v.cpu.lane_threads != null ? fmt(v.cpu.lane_threads) : "–"],
+    ["Experts", l.experts == null ? "–" : `${fmt(l.experts, 1)}/tok`], ["Busy", l.busy_ms == null ? "–" : `${fmt(l.busy_ms, 1)} ms/tok`],
+    ["Bandwidth", l.gbs == null ? "–" : `${fmt(l.gbs, 1)} GB/s est.`]]);
+  $("tt-diagnose").innerHTML = (v.diagnose || []).map(([x]) => `<li>${esc(x)}</li>`).join("");
+}
+function factRow(items) {
+  return items.map(([k, val, hot]) => `<span class="fact${hot ? " is-hot" : ""}"><span class="muted">${esc(k)}</span> <b>${esc(val)}</b></span>`).join("");
+}
+
+// the Terminal's MEMORY · TIERS: one meter a row, a row only when its reading exists
+function meter(label, frac, value, tone = "", hot = false) {
+  const w = frac == null ? 0 : Math.max(0, Math.min(1, frac)) * 100;
+  return `<div class="meter${hot ? " is-bottleneck" : ""}"><span class="meter__k">${esc(label)}</span>` +
+    `<span class="meter__bar"><i style="width:${w.toFixed(1)}%"${tone ? ` data-tone="${tone}"` : ""}></i></span><span class="meter__v">${value}</span></div>`;
+}
+function renderMemory(v) {
+  const card = $("mem-card");
+  if (!v) { card.hidden = true; return; }
+  const rows = [], c = v.context || {}, t = v.tiers || {}, r = v.ram || {}, d = v.drafter || {};
+  if (c.max) {
+    rows.push(meter(c.live ? "Context (now)" : "Context (last)", c.used != null ? c.used / c.max : null,
+      `${c.used == null ? "–" : kfmt(c.used)} / ${ctxfmt(c.max)}${c.reused ? ` <small>${kfmt(c.reused)} reused</small>` : ""}` +
+      `${c.kv_gb != null ? ` <small>KV ${fmt(c.kv_gb, 2)} GB</small>` : ""}`));
+  }
+  if (t.vram_used != null || t.vram_gb != null) {
+    rows.push(meter("Experts in VRAM", t.vram_used != null && t.vram_slots ? t.vram_used / t.vram_slots : null,
+      `${fmt(t.vram_used)}${t.vram_slots ? ` / ${fmt(t.vram_slots)}` : ""}${t.vram_gb != null ? ` <small>${fmt(t.vram_gb, 1)} GB</small>` : ""}` +
+      `${v.experts && t.vram_used != null ? ` <small>${fmt((100 * t.vram_used) / v.experts)}% of all</small>` : ""}`));
+  }
+  if (t.ram_used != null || t.ram_gb != null) {
+    rows.push(meter("RAM tier", t.ram_used != null && t.ram_slots ? t.ram_used / t.ram_slots : null,
+      `${fmt(t.ram_used)}${t.ram_slots ? ` / ${fmt(t.ram_slots)}` : ""}${t.ram_gb != null ? ` <small>${fmt(t.ram_gb, 1)} GB</small>` : ""}`, "info"));
+  }
+  if (r.used != null && r.total) {
+    const tight = (r.psi_full || 0) >= 5 || (r.psi_some || 0) >= 10;
+    rows.push(meter("System RAM", r.used / r.total,
+      `${gb(r.used)} / ${gb(r.total, 0)} GB${r.swap_used != null ? ` <small>swap ${gb(r.swap_used)}</small>` : ""}` +
+      `${r.psi_some != null ? ` <small>PSI ${fmt(r.psi_some, 1)} / ${fmt(r.psi_full, 1)}%</small>` : ""}`, tight ? "warn" : "info"));
+  }
+  if (d.kind || d.total != null) {
+    const main = d.live != null ? d.live : d.last != null ? d.last : d.total;
+    rows.push(meter(`Drafter${d.kind ? ` (${d.kind.toUpperCase()})` : ""}`, main,
+      `${d.live != null ? `${pctf(d.live)} live` : d.last != null ? `${pctf(d.last)} last` : ""}` +
+      `${d.total != null ? ` <small>${pctf(d.total)} total (${fmt(d.accepted)} of ${fmt(d.offered)})</small>` : ""}` +
+      `${d.step != null ? ` <small>${fmt(d.step, 2)} tok/step</small>` : ""}`, "ok"));
+  }
+  card.hidden = !rows.length;
+  $("meters").innerHTML = rows.join("");
+  $("mem-sub").textContent = t.age != null && t.age > 30 ? `tiers from the last answer, ${ago(t.age)} ago` : "";
+}
+
+// the hardware cards' extra lines from the View: the PCIe link against its max, the CPU's temp / clocks / watts, the
+// SSDs' shares of the expert reads; the decode / prefill lines' mean, last and --bench figures
+function renderViewHardware(v) {
+  if (!v) return;
+  const p = v.pcie, cpu = v.cpu || {}, dk = v.disk || {};
+  const add = (key, text, title) => {
+    if (!text) return;
+    const el = $(`ms-${key}`);
+    if (el.classList.contains("is-each")) return;          // (2-4 GPUs: the line lists every card's own value)
+    el.textContent = el.textContent ? `${el.textContent} · ${text}` : text;
+    if (title) el.title = title;
+  };
+  if (p && p.gen_max) add("pcie", `max ${linkText(p.gen_max, p.width_max)}${p.dropped ? " · fell while working" : ""}`);
+  const ghz = cpu.mhz ? `${fmt(cpu.mhz / 1000, 1)} GHz` : "";
+  add("cpu", [cpu.temp != null ? `${fmt(cpu.temp)} °C` : "", ghz, cpu.power != null ? `${fmt(cpu.power)} W` : ""].filter(Boolean).join(" · "),
+      cpu.isa ? `${cpu.name || "CPU"} · ISA ${cpu.isa}` : "");
+  const shares = (dk.drives || []).filter((x) => x.share != null);
+  if (shares.length > 1) add("disk", shares.map((x, i) => `SSD${i + 1} ${fmt(100 * x.share)}%`).join(" "),
+                             shares.map((x) => `${x.name} (${x.roles.join(", ")})`).join(" · "));
+  const dec = v.decode || {}, pr = v.prompt || {}, bench = v.bench || {};
+  const dx = [dec.mean != null ? `mean ${fmt(dec.mean, 1)}` : "", dec.now != null && dec.last != null ? `last ${fmt(dec.last, 1)}` : "",
+              bench.decode != null ? `bench ${fmt(bench.decode, 1)}` : ""].filter(Boolean);
+  if (dx.length) $("hero-speed-sub").textContent += ` · ${dx.join(" · ")}`;
+  if (bench.prompt8k != null) $("hero-prefill-sub").textContent += ` · bench 8k ${fmt(bench.prompt8k)}`;
 }
 
 function renderTotals(t) {
@@ -550,7 +775,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="10" class="muted">No requests yet</td></tr>`;
   } else {
     const badges = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                     disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
@@ -561,9 +786,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
       const pre = r.prefill_tok_s != null ? r.prefill_tok_s
                 : r.prompt_ms > 0 && r.prompt_tokens > (r.reused || 0) ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null;
+      const reusedPct = r.reused != null && r.prompt_tokens ? ` <small class="muted">${fmt((100 * r.reused) / r.prompt_tokens)}%</small>` : "";
+      const draft = r.drafts_accepted != null && r.drafts_offered ? `${fmt((100 * r.drafts_accepted) / r.drafts_offered)}%` : "–";
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${api}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(pre)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+        <td class="num">${fmt(r.reused)}${reusedPct}</td><td class="num">${fmt(pre)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+        <td class="num">${hit}</td><td class="num">${draft}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
   const all = $("req-all");
@@ -614,7 +841,7 @@ function renderAbout(eng, hw, st, storage) {
     kv = k ? `${k}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null;
   }
   facts($("facts-engine"), [
-    ["Version", ver ? `Project Maya v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
+    ["Version", ver ? `Abyss v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
     ["Model", eng.model],
     ["Engine", eng.engine_kind ? `${eng.engine_kind === "glm-fast" ? "GLM fast path" : eng.engine_kind}` : null],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens (Settings changes it)` : null],
@@ -687,8 +914,8 @@ function renderUpdate() {
     tone = "accent"; ic = "download";
     title = `Updating to v${to}…`;
     text = updateWatch && updateWatch.down
-      ? "Maya is starting again: it compiles what changed in the engine and loads the model (a few minutes; the terminal shows the progress). This page reloads when it is back."
-      : "Maya finishes the answer it is writing, then downloads the update.";
+      ? "Abyss is starting again: it compiles what changed in the engine and loads the model (a few minutes; the terminal shows the progress). This page reloads when it is back."
+      : "Abyss finishes the answer it is writing, then downloads the update.";
   } else if (state && state.state === "failed") {
     tone = "error"; ic = "error";
     title = "The update did not happen";
@@ -696,14 +923,14 @@ function renderUpdate() {
     acts = notes + (u.can_update ? `<button class="st-btn st-btn--primary" type="button" data-update="go">Try again</button>` : "");
   } else if (u.newer) {
     tone = "accent"; ic = "download";
-    title = `Project Maya v${latest.version} is out`;
+    title = `Abyss v${latest.version} is out`;
     text = latest.summary || "";
     if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
     acts = notes + (u.can_update ? `<button class="st-btn st-btn--primary" type="button" data-update="go">${icon("download")}Update to v${esc(latest.version)}</button>` : "");
   } else if (u.error) {
     ic = "warning";
     title = "Couldn't check for updates";
-    text = `${u.error}. Project Maya v${u.current || "?"} is running.`;
+    text = `${u.error}. Abyss v${u.current || "?"} is running.`;
     acts = again("Try again");
   } else if (u.latest) {
     tone = "ok"; ic = "check";
@@ -729,9 +956,9 @@ $("update-card").addEventListener("click", (e) => {
 async function startUpdate() {
   const v = update && update.latest && update.latest.version;
   if (!v) return;
-  const ok = await confirmDialog(`Update Project Maya to v${v}?`,
-    "<p>Only Maya's code is updated: <b>the model is not downloaded again</b>, and its files, your settings and the " +
-    "chats in this browser stay.</p><p>Maya finishes the answer it is writing, downloads the new code (git), compiles " +
+  const ok = await confirmDialog(`Update Abyss to v${v}?`,
+    "<p>Only Abyss's code is updated: <b>the model is not downloaded again</b>, and its files, your settings and the " +
+    "chats in this browser stay.</p><p>Abyss finishes the answer it is writing, downloads the new code (git), compiles " +
     "only the engine files that changed (usually a few minutes; the terminal shows the progress) and loads the model " +
     "again. Apps using the API are asked to try again meanwhile.</p>", `Update to v${v}`);
   if (!ok) return;
@@ -776,7 +1003,7 @@ async function watchUpdate(to) {
     updateWatch = null;
     await loadUpdate();
     if (!restarted) toast("error", "The update did not happen", (update && update.state && update.state.error) || "", 9000);
-    else toast("warn", "Maya started again on the same version", "The update's files did not arrive; the terminal shows why.", 9000);
+    else toast("warn", "Abyss started again on the same version", "The update's files did not arrive; the terminal shows why.", 9000);
     return;
   }
 }

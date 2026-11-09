@@ -75,10 +75,10 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
             return
         if pid not in pids:
             if time.time() - t0 > 1:
-                print(f"[maya] the GPUs freed the engine's memory in {time.time() - t0:.0f} s", flush=True)
+                print(f"[abyss] the GPUs freed the engine's memory in {time.time() - t0:.0f} s", flush=True)
             return
         time.sleep(0.5)
-    print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s; starting anyway", flush=True)
+    print(f"[abyss] the GPUs still list the old engine after {timeout:.0f} s; starting anyway", flush=True)
 
 
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
@@ -280,9 +280,9 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
         if key in LOAD_STAGES and LOAD_STAGES.index(key) >= LOAD_STAGES.index(LOADING.get("stage") or "weights"):
-            LOADING["stage"], LOADING["text"] = key, text.split("\n", 1)[0].replace("[maya] ", "", 1)[:160]
+            LOADING["stage"], LOADING["text"] = key, text.split("\n", 1)[0].replace("[abyss] ", "", 1)[:160]
 
-    say("weights", "[maya] starting the engine: reading the model's weights ...")
+    say("weights", "[abyss] starting the engine: reading the model's weights ...")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -296,24 +296,24 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line:
-                    say("experts", f"[maya] loading the experts into RAM ({size}) and locking part of them for the GPU.\n"
+                    say("experts", f"[abyss] loading the experts into RAM ({size}) and locking part of them for the GPU.\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                                  "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
-                    say("loaded", "[maya] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
+                    say("loaded", "[abyss] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("warming", f"[maya] filling the GPU's expert cache ({n}) ...")
+                    say("warming", f"[abyss] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
-                    say("up", "[maya] almost ready ...")
+                    say("up", "[abyss] almost ready ...")
                 elif "WARNING - " in line:   # the engine's own (e.g. Windows' commit limit capping the RAM tier)
-                    print("[maya] WARNING: " + line.split("WARNING - ", 1)[1].strip(), flush=True)
+                    print("[abyss] WARNING: " + line.split("WARNING - ", 1)[1].strip(), flush=True)
                 else:
                     load_line(line)          # (the warm-up's GB: GET /health's `load` while the port waits)
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[maya] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            print(f"[abyss] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
 def engine_model_path(args: list[str]) -> str:
@@ -378,7 +378,7 @@ class StrataEngine:
             if line is None:
                 break
             if line.startswith("NOTE "):
-                print("[maya] " + line[5:].strip(), flush=True)
+                print("[abyss] " + line[5:].strip(), flush=True)
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -486,7 +486,7 @@ class StrataEngine:
 
     def _end(self, why: str):
         """End a stuck engine now; the next request starts it again (Service.run)."""
-        print(f"[maya] {why}", flush=True)
+        print(f"[abyss] {why}", flush=True)
         self.ended = True
         try:
             self.proc.kill()
@@ -696,7 +696,7 @@ class StrataEngine:
                 elif line.startswith("STAT "):
                     self._parse_stat(line)
                 elif line.startswith("NOTE "):                # what happens to the kept conversations
-                    print("[maya] " + line[5:].strip(), flush=True)
+                    print("[abyss] " + line[5:].strip(), flush=True)
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
@@ -807,10 +807,10 @@ class StrataEngine:
                 if not line:
                     break
                 if line.startswith("NOTE "):
-                    print("[maya] " + line[5:].strip(), flush=True)
+                    print("[abyss] " + line[5:].strip(), flush=True)
             self.proc.wait(timeout=max(0.1, end - time.monotonic()))
         except Exception:
-            print(f"[maya] the engine did not end within {wait:.0f} s: stopped", flush=True)
+            print(f"[abyss] the engine did not end within {wait:.0f} s: stopped", flush=True)
             self.proc.kill()
 
 
@@ -877,7 +877,7 @@ class Vision:
                 if self.settle():
                     return
                 time.sleep(0.25)
-            print("[maya] the vision encoder's GPU memory is not back yet: prompts are read token by token until "
+            print("[abyss] the vision encoder's GPU memory is not back yet: prompts are read token by token until "
                   "it is", flush=True)
 
     def settle(self) -> bool:
@@ -1007,7 +1007,7 @@ def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple
         if m is None:
             args = [vcfg["exe"], "--mmproj", vcfg["mmproj"], "--model", vcfg["model"], "--gpu", "--max-tokens", str(cap),
                     "--measure"] + (["--no-flash-attn"] if vcfg.get("no_flash_attn") else [])
-            print(f"[maya] images: measuring the vision encoder on this GPU ({cap} image tokens) ...", flush=True)
+            print(f"[abyss] images: measuring the vision encoder on this GPU ({cap} image tokens) ...", flush=True)
             try:
                 r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=env)
                 # only a measurement that ran to its end (an encoder whose warm-up failed exits 1 without one)
@@ -1367,7 +1367,7 @@ class Service:
                 else:
                     Path(self.shared_path).unlink(missing_ok=True)
             except OSError as e:
-                print(f"[maya] could not save the shared settings: {e}", flush=True)
+                print(f"[abyss] could not save the shared settings: {e}", flush=True)
         return self.shared
 
     def with_shared(self, req: dict, api: str) -> dict:
@@ -1400,7 +1400,7 @@ class Service:
                 if part is not None and hasattr(part, "close"):
                     part.close()
             except Exception as e:  # noqa: BLE001 - ending anyway
-                print(f"[maya] stopping {type(part).__name__}: {e}", flush=True)
+                print(f"[abyss] stopping {type(part).__name__}: {e}", flush=True)
 
     def reloading(self) -> bool:
         with self.status_lock:
@@ -1444,20 +1444,20 @@ class Service:
         with self.fifo:                                  # the request in flight finishes first
             with self.status_lock:
                 self.reload["state"] = "running"
-            print(f"[maya] reloading the model with a {n}-token context (was {old}) ...", flush=True)
+            print(f"[abyss] reloading the model with a {n}-token context (was {old}) ...", flush=True)
             err = None
             try:
                 self._restart_with(n)
             except Exception as e:  # noqa: BLE001 - any failed start: put the old context back
                 err = f"the engine did not start with a {n}-token context ({e})"
-                print(f"[maya] {err}; starting it again with {old} ...", flush=True)
+                print(f"[abyss] {err}; starting it again with {old} ...", flush=True)
                 try:
                     self._restart_with(old)
                 except Exception as e2:  # noqa: BLE001
                     err += f"; starting again with {old} failed too ({e2}) - the next request tries once more"
             if err is None:
                 self._save_context(n)
-                print(f"[maya] the model runs with a {n}-token context now", flush=True)
+                print(f"[abyss] the model runs with a {n}-token context now", flush=True)
             with self.status_lock:
                 self.reload.update(state="failed" if err else "done", error=err, ended=time.time(),
                                    context=self.engine.max_context)
@@ -1479,7 +1479,7 @@ class Service:
             tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
             os.replace(tmp, p)
         except (OSError, ValueError) as e:
-            print(f"[maya] could not save the new context in {self.config_path}: {e}", flush=True)
+            print(f"[abyss] could not save the new context in {self.config_path}: {e}", flush=True)
 
     def storage(self) -> dict | None:
         """The model's folder and the free space on its drive (About)."""
@@ -1499,7 +1499,7 @@ class Service:
         hw, st = tel.get("now") or {}, tel.get("static") or {}
         gib = lambda b: f"{b / 2**30:.1f} GB" if isinstance(b, (int, float)) else "?"  # noqa: E731
         import platform
-        out = [f"Project Maya {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
+        out = [f"Abyss {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
                f"System: {platform.platform()}, Python {platform.python_version()}",
                f"GPU: {st.get('gpu_name') or 'not readable'} ({gib(hw.get('gpu_mem_total'))} VRAM)",
                f"CPU: {st.get('cpu_name') or '?'}, {st.get('threads') or '?'} threads; RAM {gib(hw.get('ram_total'))}",
@@ -1625,6 +1625,35 @@ class Service:
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+
+    def health(self) -> dict:
+        """GET /health: what this server is and whether it is ready (no key needed)."""
+        # the run config's recommended settings: the web app's Chat defaults until its user picks their own
+        rec = {k: v for k, v in self.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
+        if self.default_effort:
+            rec["reasoning_effort"] = effort_level(self.default_effort) or self.default_effort
+        reloading = self.reloading()
+        return {"status": "updating" if self.updater.busy() else "reloading" if reloading else "ok",
+                "max_context": self.engine.max_context, "model": self.model,
+                "images": self.vision is not None, "api_key": bool(self.api_key), "defaults": rec,
+                "version": MAYA_VERSION, "mcp_tools": bool(self.mcp),
+                # which server this is (Strata answers "strata"): Abyss and Maya share this
+                # /health and llama.cpp's /props, so a client tells them apart by this field
+                "service": "abyss", "config": self.label.get("config"),
+                # a reload's engine start, as the first start's (loading_handler)
+                "load": load_progress() if reloading else None}
+
+    def terminal_view(self, metrics: dict) -> dict | None:
+        """GET /metrics?view=1's "view": the Abyss Terminal's View of these readings (serve/terminal_view.py - the
+        Terminal's own code: the token's time split, the bottleneck verdict, the banners ...); None if it fails."""
+        try:
+            if getattr(self, "_tview", None) is None:
+                from serve.terminal_view import TerminalView
+                self._tview = TerminalView(self)
+            return self._tview.view(metrics, self.health())
+        except Exception as e:                       # (a reading the View cannot take must not cost /metrics)
+            print(f"[abyss] the Monitor's view failed: {type(e).__name__}: {e}", flush=True)
+            return None
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -1805,10 +1834,10 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[maya] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"[abyss] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[maya] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            print(f"[abyss] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -1868,10 +1897,10 @@ class Service:
                 if hasattr(self.engine, "alive") and not self.engine.alive():
                     # issue #27: it died in an earlier request - start it again instead of failing every request
                     code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-                    print(f"[maya] the engine had stopped (exit code {code}); starting it again "
+                    print(f"[abyss] the engine had stopped (exit code {code}); starting it again "
                           "(a minute or two) ...", flush=True)
                     self.engine.restart()
-                    print("[maya] the engine is running again", flush=True)
+                    print("[abyss] the engine is running again", flush=True)
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
@@ -1916,7 +1945,7 @@ class Service:
                         if in_think and t == self.think_end_id:
                             in_think = False
                             if n > think_budget:
-                                print(f"[maya] thinking reached its budget ({think_budget} tokens): closed, "
+                                print(f"[abyss] thinking reached its budget ({think_budget} tokens): closed, "
                                       "answering", flush=True)
                         if t in self.stop_ids:
                             finish = "stop"
@@ -1955,13 +1984,13 @@ class Service:
                 except EngineDied as e:
                     finish = "error"
                     note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
-                    print(f"[maya] {e}. {note} The next request starts the engine again."
+                    print(f"[abyss] {e}. {note} The next request starts the engine again."
                           f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
                           flush=True)
                     raise
                 except ValueError as e:                 # the engine's ERR line (it may have ended after it)
                     finish = "error"
-                    print(f"[maya] the engine reported an error: {e}", flush=True)
+                    print(f"[abyss] the engine reported an error: {e}", flush=True)
                     raise
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
@@ -2017,10 +2046,10 @@ class Service:
                     ft = self.status.get("first_token")
                     rate = n / max(1e-6, now - ft) if ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                    print(f"[maya] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                    print(f"[abyss] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
-                        print(f"[maya] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                        print(f"[abyss] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
         for ev in parser.finish():
             yield "event", ev
@@ -2057,7 +2086,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
     if isinstance(body, list):
         body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
     preview = (str(body or "")[:80]).replace("\n", " ")
-    print(f"[maya] req {api}: msgs={len(messages)} tools={len(tools or [])} "
+    print(f"[abyss] req {api}: msgs={len(messages)} tools={len(tools or [])} "
           f"max_tokens_raw={req.get('max_tokens')!r}/{req.get('max_completion_tokens')!r} "
           f"max_new={max_new} thinking={thinking} stream={bool(req.get('stream'))} "
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
@@ -2136,7 +2165,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
-            print(f"[maya] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+            print(f"[abyss] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
@@ -2277,7 +2306,7 @@ class StreamJob:
             with self.cv:
                 orphan = not self.done and self.readers == 0 and time.time() - self.unread_since > self.ORPHAN_S
             if orphan:
-                print(f"[maya] nobody read answer {self.id} for {self.ORPHAN_S} s: stopped", flush=True)
+                print(f"[abyss] nobody read answer {self.id} for {self.ORPHAN_S} s: stopped", flush=True)
                 self.cancel.set()
                 return
 
@@ -2735,8 +2764,12 @@ def make_handler(svc: Service):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35);
+                    # `view=1` adds the Terminal's View (serve/terminal_view.py)
+                    m = svc.metrics(all_requests="requests=all" in self.path)
+                    if "view=1" in self.path:      # the Monitor: the Abyss Terminal's View of the same readings
+                        m["view"] = svc.terminal_view(m)
+                    self._json(200, m)
                 return
             if path == "/settings":
                 if self._authorized():
@@ -2755,20 +2788,7 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/health":
-                # the run config's recommended settings: the web app's Chat defaults until its user picks their own
-                rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
-                if svc.default_effort:
-                    rec["reasoning_effort"] = effort_level(svc.default_effort) or svc.default_effort
-                reloading = svc.reloading()
-                self._json(200, {"status": "updating" if svc.updater.busy() else "reloading" if reloading else "ok",
-                                 "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
-                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp),
-                                 # which server this is (Strata answers "strata"): Abyss and Maya share this
-                                 # /health and llama.cpp's /props, so a client tells them apart by this field
-                                 "service": "abyss", "config": svc.label.get("config"),
-                                 # a reload's engine start, as the first start's (loading_handler)
-                                 "load": load_progress() if reloading else None})
+                self._json(200, svc.health())
             elif path == "/api/log":
                 # Abyss Terminal on another PC: the engine log's tail (`since` = a byte offset the last answer gave as
                 # `next`, else the last `max` bytes; `max` at most 1 MiB), the API key's values masked
@@ -2868,7 +2888,7 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
-                    why = ("Project Maya is updating and starts again in a few minutes" if svc.updater.busy() else
+                    why = ("Abyss is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
                     body = json.dumps({"error": {"type": "overloaded_error", "message": why}}).encode()
                     self.send_response(503)
@@ -2930,7 +2950,7 @@ def make_handler(svc: Service):
                 return False
             origin = self.headers.get("Origin")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
-                self._json(403, {"error": {"message": f"{what} only from Maya's own page"}})
+                self._json(403, {"error": {"message": f"{what} only from Abyss's own page"}})
                 return False
             return True
 
@@ -3001,8 +3021,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            print("[maya] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[maya] other apps use their own settings again", flush=True)
+            print("[abyss] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
+                  if shared else "[abyss] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
@@ -3196,7 +3216,7 @@ def apply_server_env(cfg: dict) -> None:
         if v is not None:
             os.environ[k] = str(v)
     for what in clean_server_env():
-        print(f"[maya] {what} is not a number: ignored (the default applies)", flush=True)
+        print(f"[abyss] {what} is not a number: ignored (the default applies)", flush=True)
     ENGINE_STALL_S = _stall_seconds()
     Server.request_queue_size = _backlog()
 
@@ -3214,7 +3234,7 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[maya] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
+        print(f"[abyss] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + ("Linux may stop the engine in the middle of an answer. " if os.name != "nt" else
                  "Windows will slow down (paging to disk). ")
@@ -3325,47 +3345,47 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "temperature":
             if not number or value < 0:
-                raise SystemExit(f"[maya] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+                raise SystemExit(f"[abyss] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
             if not number or not 0 < value <= 1:
-                raise SystemExit(f"[maya] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+                raise SystemExit(f"[abyss] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
             if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[maya] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+                raise SystemExit(f"[abyss] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
             if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[maya] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+                raise SystemExit(f"[abyss] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[maya] config sampling.presence_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[abyss] config sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[maya] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[abyss] config sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
             if not number or value <= 0:
-                raise SystemExit(f"[maya] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+                raise SystemExit(f"[abyss] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
             if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[maya] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+                raise SystemExit(f"[abyss] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[maya] config sampling.seed={value!r}: expected a positive integer")
+                raise SystemExit(f"[abyss] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key in ("experimental_speed_projection", "uncensor"):
             if not isinstance(value, bool):
-                raise SystemExit(f"[maya] config sampling.{key}={value!r}: expected true or false (the default for "
+                raise SystemExit(f"[abyss] config sampling.{key}={value!r}: expected true or false (the default for "
                                  "requests that leave it out, when the engine has the vector / the edit)")
             out[key] = value
         else:
-            print(f"[maya] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[abyss] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
 
@@ -3406,7 +3426,7 @@ def main() -> int:
             "model": cfg.get("model_name"), "api_key": a.api_key or cfg.get("api_key", ""),
             "config": Path(a.config).name if a.config else None})
     except OSError:
-        ap.error(f"port {a.port} is already in use - is Maya (or another server) already running? "
+        ap.error(f"port {a.port} is already in use - is Abyss (or another server) already running? "
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
@@ -3426,7 +3446,7 @@ def main() -> int:
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[maya] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[abyss] sampling defaults from the config: {pretty}", flush=True)
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
@@ -3440,20 +3460,20 @@ def main() -> int:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
                                   (gpu_list(cfg) or [0])[0])
             if fp is None:
-                print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
+                print("[abyss] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
                       flush=True)
                 vcfg, on_demand = dict(vcfg, gpu=False), False
             else:
                 vcfg = dict(vcfg, max_tokens=fp[0])
                 engine_env = dict(env, STRATA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
-                print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
+                print(f"[abyss] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
-            print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
+            print(f"[abyss] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
         warn_tight_ram(engine.info.get("arena_mib"))
         if on_demand:
@@ -3462,10 +3482,10 @@ def main() -> int:
                 vision = Vision(vcfg, log=vlog, env=venv, start=False)
                 vision.lend = lambda: engine.command("VLEND", "VLENT")
                 vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
-                print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
+                print(f"[abyss] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
                       "the model lends it", flush=True)
             else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
-                print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
+                print("[abyss] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
                       "runs on the CPU", flush=True)
                 vision = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
     else:
@@ -3486,14 +3506,14 @@ def main() -> int:
         try:
             effort_kwargs(cfg["reasoning_effort"])
         except ValueError as e:
-            raise SystemExit(f"[maya] config reasoning_effort: {e}")
+            raise SystemExit(f"[abyss] config reasoning_effort: {e}")
         svc.default_effort = cfg["reasoning_effort"]
-        print(f"[maya] thinking level when a request names none: {effort_level(svc.default_effort) or 'none'}"
+        print(f"[abyss] thinking level when a request names none: {effort_level(svc.default_effort) or 'none'}"
               f"{'' if effort_level(svc.default_effort) == svc.default_effort else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0) if svc.think_end_id is not None else 0
     if svc.think_budget:
-        print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
+        print(f"[abyss] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.allow_shutdown = cfg.get("allow_shutdown", True) is not False
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
@@ -3525,14 +3545,14 @@ def main() -> int:
         try:
             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
             if svc.shared:
-                print("[maya] other apps use the Chat settings: " +
+                print("[abyss] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
     if hub is not None:
         import atexit
         svc.mcp = hub
-        print(f"[maya] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+        print(f"[abyss] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
@@ -3555,7 +3575,7 @@ def main() -> int:
                   "to the config (clients send it as their API key; the web page asks for it)", flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
-                  "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Maya " + str(a.port) + "\" "
+                  "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Abyss " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
     if a.open:
@@ -3570,7 +3590,7 @@ def main() -> int:
         if stop.is_set():
             return
         stop.set()
-        print("[maya] stopping: the engine ends", flush=True)
+        print("[abyss] stopping: the engine ends", flush=True)
         raise KeyboardInterrupt
 
     if os.name != "nt":
@@ -3600,14 +3620,14 @@ def main() -> int:
         # Requests still queued are refused. Then the engine ends (and keeps its conversation).
         wrap_s = float(os.environ.get("STRATA_ENGINE_WRAP_S", "40") or 0)
         if wrap_s > 0 and hasattr(engine, "wrap") and svc.status.get("busy"):
-            print(f"[maya] stopping: the request in progress closes its thinking and answers (up to {wrap_s:.0f} s)",
+            print(f"[abyss] stopping: the request in progress closes its thinking and answers (up to {wrap_s:.0f} s)",
                   flush=True)
             engine.wrap()
             if svc.fifo.acquire(timeout=wrap_s):
                 svc.fifo.release()
-                print("[maya] stopping: the request in progress finished", flush=True)
+                print("[abyss] stopping: the request in progress finished", flush=True)
             else:
-                print(f"[maya] stopping: the answer was not done after {wrap_s:.0f} s - cut there", flush=True)
+                print(f"[abyss] stopping: the answer was not done after {wrap_s:.0f} s - cut there", flush=True)
                 engine.stop()
                 # the cut request ends at its next step (DONE, or an error if the engine died): only then QUIT, so its
                 # last lines are read by the request and not by close()

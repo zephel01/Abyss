@@ -113,7 +113,7 @@ class Dashboard(unittest.TestCase):
         s, h, b = self.req("GET", "/api/report")
         text = b.decode()
         self.assertEqual(s, 200)
-        self.assertIn("Project Maya", text)
+        self.assertTrue(text.startswith("Abyss "), text[:80])
         self.assertIn("STRATA_GLM_RAM_GB", text)
         self.assertNotIn("secret", text)
 
@@ -581,6 +581,78 @@ class Phase2Lines(unittest.TestCase):
                          ((2048, 5210), 787.0, 1024, 310.5))
         e._parse_pp("PP 3072 5210 3900.0 785.0")                          # (an older engine's line)
         self.assertEqual((e.progress, e.prompt_reused, e.prompt_disk_ms), ((3072, 5210), None, None))
+
+
+class TerminalViewTest(unittest.TestCase):
+    """GET /metrics?view=1: the Abyss Terminal's View of the server's own readings (serve/terminal_view.py), the
+    numbers the Monitor shows beside /metrics' - the token's time, the bottleneck and the card it points at."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import terminal_fixtures as F
+        import terminal_model as M
+        self.F, self.M = F, M
+
+    def fixture_view(self, name):
+        from serve.terminal_view import view_json
+        log = None
+        if name in self.F.LOGS:
+            log = self.M.EngineLog(None)
+            for x in self.F.LOGS[name]:
+                log.feed(x, None)
+        v = view_json(self.F.metrics(name), self.F.health(name), self.F.local(name), log, {})
+        json.dumps(v)                                          # (JSON-ready)
+        return v
+
+    def test_bottleneck_of_an_ssd_bound_run(self):
+        v = self.fixture_view("r9700")
+        b = v["bottleneck"]
+        self.assertEqual((b["verdict"], b["label"], b["target"], b["source"], b["tone"]), ("ssd", "SSD", "disk", "live", "warn"))
+        self.assertAlmostEqual(b["share"], 17.5 / 40.1, places=3)
+        self.assertIn("RAM tier", b["what"])
+        self.assertTrue(b["moves"])
+        sp = b["split"]
+        self.assertAlmostEqual(sum(s["ms"] for s in sp["segments"]), sp["ms"], places=6)
+        self.assertEqual([s["key"] for s in sp["segments"]], ["ssd", "ram", "gpu"])
+        self.assertEqual(sp["parallel"]["label"], "iGPU lane")
+        self.assertEqual((v["name"], v["quant"], v["state_key"]), ("DeepSeek V4.1 Flash 1017", "UD-IQ2_XXS", "generating"))
+        self.assertIn(["UNCENSOR", "alert"], v["badges"])
+        self.assertEqual([c["short"] for c in v["cards"]], ["AI PRO R9700", "8060S"])
+        for gone in ("requests", "totals", "_keyed"):
+            self.assertNotIn(gone, v)
+
+    def test_token_split_and_tone(self):
+        from serve.terminal_view import token_split, bottleneck
+        self.assertIsNone(token_split(None))
+        sp = token_split({"ms": 50.0, "disk_ms": 30.0, "miss_ms": None, "lane_ms": 0.0, "lane_name": "CPU lane"})
+        self.assertEqual([(s["key"], s["ms"]) for s in sp["segments"]], [("ssd", 30.0), ("gpu", 20.0)])
+        self.assertEqual(sp["biggest"], "ssd")
+        tt = {"ms": 50.0, "disk_ms": 30.0, "lane_ms": 0.0, "miss_ms": None, "verdict": "ssd", "source": "stat",
+              "lane_name": "CPU lane", "what": "x", "moves": "y", "evidence": [], "window": False, "n": 1}
+        self.assertEqual(bottleneck({"tt": tt})["tone"], "info")     # (the last answer's: not live)
+        self.assertEqual(bottleneck({"tt": dict(tt, source="live")})["tone"], "error")
+        self.assertIsNone(bottleneck({"tt": None}))
+
+    def test_the_server_sends_it_with_view_1(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nhello", max_context=32768), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            with urllib.request.urlopen(base + "/metrics?view=1", timeout=10) as r:
+                m = json.loads(r.read())
+            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                plain = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertNotIn("view", plain)
+        v = m["view"]
+        # a mock engine: no STAT, no log - the View says so instead of inventing numbers
+        self.assertEqual((v["state_key"], v["tt"], v["bottleneck"], v["ctx"]), ("idle", None, None, 32768.0))
+        self.assertEqual(v["tt_why"], "no answer written yet")
+        self.assertEqual(v["version"], MAYA_VERSION)
 
 
 if __name__ == "__main__":

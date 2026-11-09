@@ -85,7 +85,7 @@ class Updater:
         repo = origin_repo(self.root) if (self.root / ".git").exists() else REPO
         req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
                                      headers={"Accept": "application/vnd.github+json",
-                                              "User-Agent": f"project-maya/{self.current or '?'}"})
+                                              "User-Agent": f"abyss/{self.current or '?'}"})
         try:
             with urllib.request.urlopen(req, timeout=8) as r:
                 rel = json.loads(r.read().decode("utf-8"))
@@ -130,7 +130,7 @@ class Updater:
         return {"current": self.current, "enabled": self.enabled(), "latest": self.latest, "newer": newer,
                 "checked": self.checked or None, "error": self.error, "can_update": newer and why is None,
                 "blocker": why, "state": state,
-                "by_hand": ("git pull, then start Maya again (./setup.sh or START-ABYSS.bat)" if (self.root / ".git").exists()
+                "by_hand": ("git pull, then start Abyss again (./setup.sh or START-ABYSS.bat)" if (self.root / ".git").exists()
                             else "download the new release from GitHub into a new folder")}
 
     def busy(self) -> bool:
@@ -143,7 +143,7 @@ class Updater:
             raise ValueError("this is the latest version")
         why = self.blocker()
         if why:
-            raise ValueError(f"Maya can't update itself here: {why}")
+            raise ValueError(f"Abyss can't update itself here: {why}")
         if self.busy():
             raise ValueError("an update is already running")
         self.state = {"state": "updating", "to": self.latest["version"], "started": time.time(), "error": None}
@@ -153,7 +153,7 @@ class Updater:
 
     def _update(self, svc, tag: str):
         with svc.fifo:                                  # the request in flight finishes first
-            print(f"[maya] updating Project Maya to {tag} ...", flush=True)
+            print(f"[abyss] updating Abyss to {tag} ...", flush=True)
             before = None
             try:
                 before = git(self.root, "rev-parse", "HEAD", timeout=20).stdout.strip()
@@ -166,10 +166,10 @@ class Updater:
                                        "update it by hand: git pull")
             except (OSError, subprocess.SubprocessError, RuntimeError) as e:
                 err = str(e)
-                print(f"[maya] the update did not happen: {err}", flush=True)
+                print(f"[abyss] the update did not happen: {err}", flush=True)
                 self.state.update(state="failed", error=err, ended=time.time())
                 return
-            print(f"[maya] updated the files {before[:9] if before else ''} -> {tag}; Maya starts again (abyss.py "
+            print(f"[abyss] updated the files {before[:9] if before else ''} -> {tag}; Abyss starts again (abyss.py "
                   "compiles what changed in the engine, then loads the model) ...", flush=True)
             svc.close_for_restart()
             os._exit(UPDATE_EXIT)
