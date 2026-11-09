@@ -692,6 +692,7 @@ struct Glm5Model::FastState {
     unsigned int* cpu_seq_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)
     std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
+    std::vector<uint8_t> cpu_exact;                          // per layer: the lane in the device's arithmetic (lane_q81)
     std::vector<uint8_t> cpu_act, cpu_hq;                    // x's activation quant; 8 h quants
     std::vector<float> cpu_ff, cpu_dn;                       // 8 x n_ff; 8 x n_embd
     // fast_cpu_experts_multi's: a window's columns' activations, and its (expert, column) pairs' h, h quants and downs

@@ -45,6 +45,7 @@ STRATA_GLM_BOUNCE  # src/core/glm_model.cu
 STRATA_GLM_BOUNDARY_SYNC  # src/core/glm_fast_path.cu
 STRATA_GLM_CPU_CAL_VERBOSE  # src/core/glm_fast_path.cu
 STRATA_GLM_CPU_COLD  # src/core/glm_fast_path.cu
+STRATA_GLM_CPU_EXACT_XQ  # src/core/glm_fast_path.cu
 STRATA_GLM_CPU_EXPERTS  # src/core/glm_model.cu
 STRATA_GLM_CPU_LANE_CHECK  # src/core/glm_fast_path.cu
 STRATA_GLM_CPU_LANE_VERIFY  # src/core/glm_fast_path.cu
@@ -63,7 +64,11 @@ STRATA_GLM_DSA_SCORE  # src/kernels/cuda/glm_batch.cu
 STRATA_GLM_EMB_PROBE  # src/core/glm_model.cu
 STRATA_GLM_EXL3_MMA_ROWS  # src/core/glm_prefill.cu
 STRATA_GLM_EXL3_ROT  # src/core/glm_prefill.cu
+STRATA_GLM_EXPERT_HELPER_CHECK  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
 STRATA_GLM_EXPERT_HELPER_GIB  # src/core/glm_fast_path.cu
+STRATA_GLM_EXPERT_HELPER_PROMOTE  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
+STRATA_GLM_EXPERT_HELPER_RESYNC  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
+STRATA_GLM_EXPERT_HELPER_SAME_GPU  # src/core/glm_expert_helper.hpp (docs/EXPERT_HELPER.md)
 STRATA_GLM_HC1  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_HC2  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_HC3_V41  # src/kernels/cuda/glm_fast.cu
@@ -84,6 +89,7 @@ STRATA_GLM_MLA_ATTN1  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_MLA_F16  # src/core/glm_prefill.cu
 STRATA_GLM_MLA_WMMA  # src/core/glm_prefill.cu
 STRATA_GLM_MTP  # src/core/glm_model.cu
+STRATA_GLM_MTP_CHAIN_H  # src/core/qwen35_fast_path.cu (experiment)
 STRATA_GLM_MTP_KEEP  # src/core/glm_fast_path.cu
 STRATA_GLM_MTP_MISS  # src/core/glm_fast_path.cu
 STRATA_GLM_MV_GENERIC  # src/kernels/cuda/glm_fast.cu
@@ -170,6 +176,7 @@ STRATA_GLM_TOKEN_SPIN  # src/core/glm_fast_path.cu
 STRATA_GLM_TRACE  # src/core/glm_model.cu
 STRATA_GLM_UNIFORM_SLOTS  # src/core/glm_fast_path.cu
 STRATA_GLM_VISION_LEND_MB  # src/core/glm_fast_path.cu
+STRATA_GLM_WINDOW_JUNK  # src/core/dsv4_verify.cu (tests only: random drafts, all rejected)
 STRATA_GROUP_COPY  # src/prefill/prefill.cpp
 STRATA_GR_UNFUSED  # src/prefill/prefill.cpp
 STRATA_HIPBLASLT_TUNING  # src/core/glm_prefill.cu
@@ -231,9 +238,3 @@ STRATA_VERIFY_DEBUG  # src/core/verify.cpp
 STRATA_VERIFY_DEVICE_PLAN  # src/core/verify.cpp
 STRATA_VERIFY_NODES  # src/core/verify.cpp
 STRATA_VERIFY_PROFILE  # src/core/verify.cpp
-STRATA_GLM_EXPERT_HELPER_CHECK  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
-STRATA_GLM_EXPERT_HELPER_PROMOTE  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
-STRATA_GLM_EXPERT_HELPER_RESYNC  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER.md)
-STRATA_GLM_EXPERT_HELPER_SAME_GPU  # src/core/glm_expert_helper.hpp (docs/EXPERT_HELPER.md)
-STRATA_GLM_WINDOW_JUNK  # src/core/dsv4_verify.cu (tests only: random drafts, all rejected)
-STRATA_GLM_MTP_CHAIN_H  # src/core/qwen35_fast_path.cu (experiment)
