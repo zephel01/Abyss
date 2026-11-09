@@ -22,6 +22,8 @@
 // flags: nothing in it runs before that check (no initializers at namespace scope; the tables are built on the
 // first call).
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/lane_q81.hpp"
+#include "lane_q81_impl.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -428,7 +430,154 @@ void rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* cons
     }
 }
 
+
+// ---- lane_q81 (lane_q81.hpp): the same decoded blocks against a Q81 activation (q8_1: a scale a 32 values), in the
+// device's integer and float steps.  Per token and 64-value chunk: dpbusd (VNNI) - 16 int32 lanes, 4
+// products each; three unpack+add steps give every 16 values' sum (U: lane 4q + j = chunk j's quarter q) and one
+// permute the sub-blocks' first and second 16 (A, B: as lane_q81_avx2.cpp's).  The finish takes the device's integer
+// steps on them (IQ2_XXS's sumi * ls / 8, ... truncated toward zero) and its d_w * d_x per 32 values; IQ1_S's sums are
+// of the grid's values -1/0/1, the device's of the values + 1: plus the sub-block's code sum (an identity of integers).
+template <int K> inline __m256i tdiv(__m256i x) {
+    return _mm256_srai_epi32(_mm256_add_epi32(x, _mm256_and_si256(_mm256_srai_epi32(x, 31), _mm256_set1_epi32((1 << K) - 1))), K);
+}
+
+struct Q81Tok {
+    const int8_t* q;
+    const float* d;
+    const float* s;
+    const int16_t* b8;
+};
+
+template <int TY, int NT>
+void rows_q81(const Dec<TY>& D, const uint8_t* w, size_t row_bytes, int nb, const Q81Tok* tk, float* const* out, int r0,
+              int r1, int ahead) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i pab = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+    const __m256i one32 = _mm256_set1_epi32(1);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * row_bytes;
+        __m256 acc[NT];
+        for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* b = row + (size_t) i * Dec<TY>::bytes;
+            if (ahead > 0) {
+                _mm_prefetch((const char*) b + ahead, _MM_HINT_T0);
+                _mm_prefetch((const char*) b + ahead + 64, _MM_HINT_T0);
+            }
+            __m512i g[4], sc[4];
+            __m256i dw;
+            alignas(32) uint64_t m[4];
+            if constexpr (TY == 19) D.block(b, g, m, sc, dw);
+            else D.block(b, g, m, sc);
+            const float dx = h2f(u16(b));
+            // the block's integer scales (and IQ1_S's float factors), one lane a sub-block
+            __m256i l0, l1;
+            __m256 d1q, dl;
+            if constexpr (TY == 16) {
+                const __m256i aux = _mm512_cvtepi64_epi32(_mm512_srli_epi64(_mm512_loadu_si512(b + 2), 32));
+                l0 = _mm256_or_si256(_mm256_srli_epi32(aux, 27), one32);
+            } else if constexpr (TY == 18) {
+                l0 = _mm256_srli_epi32(_mm256_loadu_si256((const __m256i*) (b + 66)), 28);
+            } else if constexpr (TY == 17 || TY == 22) {
+                const __m256i s8 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (b + (TY == 17 ? 66 : 74))));
+                l0 = _mm256_and_si256(s8, _mm256_set1_epi32(15));
+                l1 = _mm256_srli_epi32(s8, 4);
+            } else {   // 19
+                const __m256i qh = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (b + 34)));
+                d1q = _mm256_mul_ps(_mm256_set1_ps(dx), _mm256_cvtepi32_ps(_mm256_add_epi32(
+                    _mm256_and_si256(_mm256_srli_epi32(qh, 11), _mm256_set1_epi32(0x0E)), one32)));
+                const __m256 neg = _mm256_castsi256_ps(_mm256_cmpeq_epi32(
+                    _mm256_and_si256(qh, _mm256_set1_epi32(0x8000)), _mm256_set1_epi32(0x8000)));
+                dl = _mm256_blendv_ps(_mm256_set1_ps(-1.0f + IQ1S_DELTA), _mm256_set1_ps(-1.0f + IQ1S_DELTA - 2.0f * IQ1S_DELTA), neg);
+            }
+            for (int t = 0; t < NT; ++t) {
+                const int8_t* yq = tk[t].q + 256 * i;
+                __m512i Q[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const __m512i yv = _mm512_loadu_si512(yq + 64 * j);
+                    const __m512i ys = _mm512_mask_sub_epi8(yv, _cvtu64_mask64(m[j]), zero, yv);
+                    Q[j] = _mm512_dpbusd_epi32(zero, g[j], ys);   // (= madd(maddubs(g, ys), 1): no pair saturates)
+                }
+                const __m512i T0 = _mm512_add_epi32(_mm512_unpacklo_epi32(Q[0], Q[1]), _mm512_unpackhi_epi32(Q[0], Q[1]));
+                const __m512i T1 = _mm512_add_epi32(_mm512_unpacklo_epi32(Q[2], Q[3]), _mm512_unpackhi_epi32(Q[2], Q[3]));
+                const __m512i U = _mm512_add_epi32(_mm512_unpacklo_epi64(T0, T1), _mm512_unpackhi_epi64(T0, T1));
+                const __m512i AB = _mm512_permutexvar_epi32(pab, U);
+                const __m256i A = _mm512_castsi512_si256(AB), B = _mm512_extracti64x4_epi64(AB, 1);
+                const __m256 d8 = _mm256_loadu_ps(tk[t].d + 8 * i);
+                __m256 c;
+                if constexpr (TY == 16) {
+                    const __m256i s = tdiv<3>(_mm256_mullo_epi32(_mm256_add_epi32(A, B), l0));
+                    c = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s));
+                } else if constexpr (TY == 18) {
+                    const __m256i S = _mm256_add_epi32(A, B);
+                    const __m256i s = tdiv<1>(_mm256_add_epi32(_mm256_mullo_epi32(l0, S), tdiv<1>(S)));
+                    c = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s));
+                } else if constexpr (TY == 17 || TY == 22) {
+                    const __m256i s = tdiv<2>(_mm256_add_epi32(
+                        _mm256_add_epi32(_mm256_mullo_epi32(A, l0), _mm256_mullo_epi32(B, l1)), tdiv<1>(_mm256_add_epi32(A, B))));
+                    c = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s));
+                } else {   // 19: + each sub-block's code sum (its 4 sums of 8)
+                    const __m256i b4 = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*) (tk[t].b8 + 32 * i)));
+                    const __m256i b4h = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*) (tk[t].b8 + 32 * i + 8)));
+                    const __m256i b4c = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*) (tk[t].b8 + 32 * i + 16)));
+                    const __m256i b4d = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*) (tk[t].b8 + 32 * i + 24)));
+                    // [sub0's 4 | sub1's 4], ... -> hadd twice -> the 8 sub-blocks' sums in order (after a lane fix)
+                    const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(b4, b4h), _mm256_hadd_epi32(b4c, b4d));
+                    const __m256i us = _mm256_permutevar8x32_epi32(h, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+                    const __m256i S = _mm256_add_epi32(_mm256_add_epi32(A, B), us);
+                    const __m256 s8 = _mm256_loadu_ps(tk[t].s + 8 * i);
+                    c = _mm256_mul_ps(d1q, _mm256_add_ps(_mm256_mul_ps(d8, _mm256_cvtepi32_ps(S)), _mm256_mul_ps(s8, dl)));
+                }
+                acc[t] = _mm256_add_ps(acc[t], c);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = hsum_ggml(acc[t]);
+    }
+}
+
+template <int TY>
+void rows_q81_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
+                 int r1, int ahead) {
+    static const Dec<TY> D;
+    const int nb = n / QK_K;
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        Q81Tok tk[4];
+        for (int t = 0; t < k; ++t) {
+            const q81::View v = q81::view(act[t0 + t], n);
+            tk[t] = Q81Tok{v.q, v.d, v.s, v.b8};
+        }
+        switch (k) {
+            case 1: rows_q81<TY, 1>(D, w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+            case 2: rows_q81<TY, 2>(D, w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+            case 3: rows_q81<TY, 3>(D, w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+            default: rows_q81<TY, 4>(D, w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+        }
+    }
+}
+
 }  // namespace
+
+bool lane_q81_vbmi_type(int type) noexcept {
+    return (type == 16 || type == 17 || type == 18 || type == 19 || type == 22) && iq512v_ready();
+}
+
+void lane_q81_vbmi_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                        float* const* out, int r0, int r1) {
+    static const int ahead = [] {
+        const char* v = std::getenv("STRATA_IQ_PREFETCH");
+        return v ? std::atoi(v) : 2048;
+    }();
+    switch (type) {
+        case 16: rows_q81_nt<16>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        case 17: rows_q81_nt<17>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        case 18: rows_q81_nt<18>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        case 19: rows_q81_nt<19>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        case 22: rows_q81_nt<22>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        default: break;
+    }
+}
 
 bool iq512v_supported(int type) noexcept { return type == 16 || type == 17 || type == 18 || type == 19 || type == 22; }
 

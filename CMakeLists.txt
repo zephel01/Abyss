@@ -949,10 +949,12 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/lane_q81.cpp
+                                           src/kernels/cpu/lane_q81_gpu_tables.cpp)
   if(STRATA_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx512_vbmi.cpp
-                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp)
+                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
+                                             src/kernels/cpu/lane_q81_avx2.cpp)
   endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(NOT STRATA_X86)
@@ -962,12 +964,23 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx512_vbmi.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/kernels/cpu/lane_q81_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+    set_source_files_properties(src/kernels/cpu/lane_q81.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
   else()
     # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
     # ggml-cpu's float steps exactly, see iq_avx512.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma;-ffp-contract=off")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
+    # (lane_q81: the device's arithmetic - each product rounded on its own, as nvcc's kernels round them when it does
+    # not contract; the scalar reference too)
+    set_source_files_properties(src/kernels/cpu/lane_q81_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
+    set_source_files_properties(src/kernels/cpu/lane_q81.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
+                                COMPILE_DEFINITIONS "STRATA_LANE_Q81_VNNI=1")
+    # (the same rows with AVX-VNNI's dpbusd: lane_q81_rows picks them on the CPUs that have it)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/lane_q81_vnni.cpp)
+    set_source_files_properties(src/kernels/cpu/lane_q81_vnni.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx2;-mfma;-mf16c;-mavxvnni;-ffp-contract=off")
     # (the register-lookup rows: VNNI and VBMI too - cpu_avx512_ok() picks them; no FP contraction, as above)
     set_source_files_properties(src/kernels/cpu/iq_avx512_vbmi.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma;-ffp-contract=off")
@@ -987,6 +1000,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
     target_link_libraries(native_rows_exact_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
+    # the CPU lane's device-arithmetic rows (lane_q81) against the device's dot functions transcribed, every type
+    add_executable(lane_q81_test src/kernels/cpu/lane_q81_test.cpp)
+    target_link_libraries(lane_q81_test PRIVATE strata_kernels_cpu)
+    target_include_directories(lane_q81_test PRIVATE third_party/ggml)
+    add_test(NAME lane_q81_test COMMAND lane_q81_test)
   endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled

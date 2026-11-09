@@ -23,6 +23,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/lane_q81.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 
@@ -2356,6 +2357,45 @@ void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, co
 }
 }  // namespace
 
+// The CPU lane's four steps, in the device's arithmetic (exact: lane_q81 - the q8_1 activation and the device expert
+// kernels' integer and float steps, so an expert gives the GPU's numbers to float rounding) or ggml-cpu's (Q8_K /
+// Q8_0 activations and ggml's dots, ~2% from the device's).  x's activation: the device's own q8_1 blocks when the
+// request carries them (the same bytes the GPU's experts read), else x quantized here as the device does
+static void lane_quant_x(bool exact, const strata::kernels::cpu::NativeFmt& nf, const float* x, const void* xq, void* dst) {
+    namespace kc = strata::kernels::cpu;
+    static const bool own = getenv("STRATA_GLM_CPU_EXACT_XQ") != nullptr && std::atoi(getenv("STRATA_GLM_CPU_EXACT_XQ")) == 0;
+    if (!exact)
+        kc::native_quant_act(nf, x, dst);
+    else if (xq != nullptr && !own)
+        kc::lane_q81_from_blocks(xq, nf.n_embd, dst);
+    else
+        kc::lane_q81_quant(x, nf.n_embd, dst);
+}
+static void lane_quant_h(bool exact, const strata::kernels::cpu::NativeFmt& nf, const float* h, void* dst) {
+    namespace kc = strata::kernels::cpu;
+    if (exact)
+        kc::lane_q81_quant(h, nf.n_ff, dst);
+    else
+        kc::native_quant_h(nf, h, dst);
+}
+static void lane_gu_rows(bool exact, const strata::kernels::cpu::NativeFmt& nf, const uint8_t* gate, const uint8_t* up,
+                         const void* const* act, int nt, float* const* ff, int r0, int r1, float limit, float scale) {
+    namespace kc = strata::kernels::cpu;
+    if (exact)
+        kc::lane_q81_gu_rows(nf.gu_type, nf.mixed() ? nf.up_type : nf.gu_type, gate, nf.gu_row, up,
+                             nf.mixed() ? nf.up_row : nf.gu_row, (int) nf.n_embd, act, nt, ff, r0, r1, limit, scale);
+    else
+        kc::native_gu_rows_split(nf, gate, up, act, nt, ff, r0, r1, limit, scale);
+}
+static void lane_down_rows(bool exact, const strata::kernels::cpu::NativeFmt& nf, const uint8_t* down,
+                           const void* const* h, int nt, float* const* out, int r0, int r1) {
+    namespace kc = strata::kernels::cpu;
+    if (exact)
+        kc::lane_q81_rows(nf.d_type, down, nf.d_row, (int) nf.n_ff, h, nt, out, r0, r1);
+    else
+        kc::native_down_rows_split(nf, down, h, nt, out, r0, r1);
+}
+
 void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
                                  const void* xq, const float* gs) {
     FastState* F = fast_;
@@ -2479,7 +2519,8 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     }
     const int threads = F->cpu_pool->active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
-    kc::native_quant_act(nf, x, F->cpu_act.data());
+    const bool exact = F->cpu_exact[(size_t) il] != 0;
+    lane_quant_x(exact, nf, x, xq, F->cpu_act.data());
     const int gu_tot = ne * n_ff;
     F->cpu_pool->run(T, [&](int job) {
         const void* a[1] = {F->cpu_act.data()};
@@ -2487,13 +2528,13 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
             float* o[1] = {F->cpu_ff.data() + (size_t) i * n_ff};
-            kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp,
-                                     gs != nullptr ? gs[i] : 1.0f);
+            lane_gu_rows(exact, nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp,
+                         gs != nullptr ? gs[i] : 1.0f);
             q += r1 - r0;
         }
     });
     for (int i = 0; i < ne; ++i)
-        kc::native_quant_h(nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
+        lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
     const int dn_tot = ne * n_embd;
     F->cpu_pool->run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
@@ -2501,7 +2542,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
             const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
             float* o[1] = {F->cpu_dn.data() + (size_t) i * n_embd};
-            kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+            lane_down_rows(exact, nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
             q += r1 - r0;
         }
     });
@@ -2636,7 +2677,8 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
         F->cpu_dn_m.resize((size_t) kPairs * n_embd);
     }
     uint8_t* act = F->cpu_act_m.data();
-    for (int t = 0; t < n; ++t) kc::native_quant_act(nf, x[t], act + (size_t) t * kc::kNativeActBytes);
+    const bool exact = F->cpu_exact[(size_t) il] != 0;
+    for (int t = 0; t < n; ++t) lane_quant_x(exact, nf, x[t], xq ? xq[t] : nullptr, act + (size_t) t * kc::kNativeActBytes);
     static const int kSplit = [] {
         const char* v = getenv("STRATA_GLM_CPU_SPLIT");
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
@@ -2655,12 +2697,12 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
                 a[k] = act + (size_t) ucol[u][k] * kc::kNativeActBytes;
                 o[k] = F->cpu_ff_m.data() + (size_t) upair[u][k] * n_ff;
             }
-            kc::native_gu_rows_split(nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp, ugs[u]);
+            lane_gu_rows(exact, nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp, ugs[u]);
             q += r1 - r0;
         }
     });
     for (int p = 0; p < np; ++p)
-        kc::native_quant_h(nf, F->cpu_ff_m.data() + (size_t) p * n_ff, F->cpu_hq_m.data() + (size_t) p * kc::kNativeHBytes);
+        lane_quant_h(exact, nf, F->cpu_ff_m.data() + (size_t) p * n_ff, F->cpu_hq_m.data() + (size_t) p * kc::kNativeHBytes);
     const int dn_tot = nu * n_embd;
     F->cpu_pool->run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
@@ -2672,7 +2714,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
                 h[k] = F->cpu_hq_m.data() + (size_t) upair[u][k] * kc::kNativeHBytes;
                 o[k] = F->cpu_dn_m.data() + (size_t) upair[u][k] * n_embd;
             }
-            kc::native_down_rows_split(nf, ub[u] + Ly.down_off, h, ucnt[u], o, r0, r1);
+            lane_down_rows(exact, nf, ub[u] + Ly.down_off, h, ucnt[u], o, r0, r1);
             q += r1 - r0;
         }
     });
@@ -2862,6 +2904,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
 #endif
     namespace kc = strata::kernels::cpu;
     F->cpu_fmt.assign(F->L.size(), kc::NativeFmt{});
+    F->cpu_exact.assign(F->L.size(), 0);
     int il_cal = -1;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -2880,8 +2923,20 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         }
         std::string e2;
         kc::NativeFmt f;
-        if (kc::native_fmt(Ly.gu_type, Ly.up_type, Ly.d_type, g.n_embd, g.n_ff_exp, f, e2) && f.h_bytes <= kc::kNativeHBytes)
+        if (kc::native_fmt(Ly.gu_type, Ly.up_type, Ly.d_type, g.n_embd, g.n_ff_exp, f, e2) && f.h_bytes <= kc::kNativeHBytes) {
             F->cpu_fmt[(size_t) il] = f;
+            // the lane in the device's arithmetic (lane_q81: q8_1 activations, the device kernels' integer and float
+            // steps), so an expert gives the same numbers on either side - where lane_q81 has vector rows for the
+            // layer's types (x86 AVX2 / AVX-512; elsewhere its portable rows would slow the lane: ggml-cpu's dots
+            // stay); STRATA_GLM_CPU_EXACT=0: ggml-cpu's dots everywhere
+            static const bool exact_on = [] {
+                const char* v = getenv("STRATA_GLM_CPU_EXACT");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            F->cpu_exact[(size_t) il] =
+                exact_on && kc::lane_q81_fast(Ly.gu_type) && kc::lane_q81_fast(f.up_type) && kc::lane_q81_fast(Ly.d_type) &&
+                kc::lane_q81_act_bytes(g.n_embd) <= kc::kNativeActBytes && kc::lane_q81_act_bytes(g.n_ff_exp) <= kc::kNativeHBytes;
+        }
         if (il_cal < 0 && F->cpu_fmt[(size_t) il].n_ff > 0) il_cal = il;
     }
     if (il_cal < 0) return true;
