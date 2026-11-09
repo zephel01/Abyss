@@ -241,8 +241,8 @@ UD-IQ3_XXS、いちばん小さく速いのは UD-IQ1_M。UD-Q2_K_XL は、品�
 | --- | --- |
 | 32 GB + 96 GB、品質重視 | unsloth UD 3.1 の UD-IQ4_XS（KL 0.077） |
 | 32 GB + 96 GB、速さと品質の釣り合い | unsloth UD 3.1 の UD-IQ3_XXS（KL 0.099、ドラフターあり 133 tok/s） |
-| 16 GB + 64 GB | zephel01 の [16G64G 版](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF)（KL 0.083。16 GB でドラフターあり 96.4 tok/s） |
-| 12 GB + 32 GB | zephel01 の [12G32G 版](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)（L448: 512 個中 448 個のエキスパート、67.5 GB、ベータ） |
+| 16 GB + 64 GB | zephel01 の [16G64G 版](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF)（KL 0.083。16 GB でドラフターあり 96.4 tok/s） |
+| 12 GB + 32 GB | zephel01 の [12G32G 版](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF)（L448: 512 個中 448 個のエキスパート、67.5 GB、ベータ） |
 | いちばん小さく速い | unsloth UD 3.1 の UD-IQ1_M（KL 0.190、32 GB でドラフターあり 152 tok/s） |
 
 ## 制限

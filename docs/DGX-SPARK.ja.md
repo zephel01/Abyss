@@ -66,7 +66,7 @@ DGX OS には NVIDIA のドライバーと CUDA 13（`/usr/local/cuda`）が入�
 3. **モデルと pack**（Qwen3.8 16G64G、3 つのファイルで 86.9 GB）:
 
    ```sh
-   .venv/bin/hf download zephel01/Qwen3.8-Flash-Next-16G64G-GGUF --local-dir ~/models/q38-16g64g
+   .venv/bin/hf download zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF --local-dir ~/models/q38-16g64g
    (cd ~/models/q38-16g64g && sha256sum -c SHA256SUMS)
    PYTHONPATH=third_party/llama.cpp/gguf-py .venv/bin/python tools/iq_pack.py --fast \
      --gguf ~/models/q38-16g64g/Qwen3.8-Flash-Next-16G64G-00001-of-00003.gguf --out ~/models/q38-16g64g/pack-fast

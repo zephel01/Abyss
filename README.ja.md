@@ -2,130 +2,127 @@
 
 # Abyss
 
-**MoE モデルの DeepSeek V4 Flash（284B）と V4.1 Flash（1017）を、家庭用の GPU 1 枚で動かす。**
+**50〜280 GB の MoE モデル — DeepSeek V4 / V4.1 Flash、GLM-5.3-Flash、Qwen3.8-Flash-Next、Ornith-1.5 — を、
+家庭用の GPU 1 枚で動かす。エキスパートは VRAM・RAM・SSD に分けて置く。**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux%20(x86__64%2C%20ARM64)-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900?logo=nvidia&logoColor=white)
 ![ROCm](https://img.shields.io/badge/ROCm-7%20(experimental)-ED1C24?logo=amd&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-RTX%205090%20%C2%B7%20RTX%203090%20%C2%B7%20AI%20PRO%20R9700%20%C2%B7%20Radeon%208060S%20%C2%B7%20DGX%20Spark%20(GB10)-76B900)
-![Model](https://img.shields.io/badge/model-DeepSeek--V4%20%2F%20V4.1--Flash-4D6BFE)
+![Model](https://img.shields.io/badge/models-DeepSeek%20V4%20%2F%20V4.1%20%C2%B7%20GLM--5.3%20%C2%B7%20Qwen3.8%20%C2%B7%20Ornith-4D6BFE)
 [![Release](https://img.shields.io/github/v/release/zephel01/Abyss?label=release)](https://github.com/zephel01/Abyss/releases)
 
 [English](README.md) · **日本語**
 
-[クイックスタート](#-クイックスタート) · [性能](#-性能) · [しくみ](#-しくみ) ·
-[マニュアル](docs/MANUAL.ja.md) · [更新履歴](CHANGELOG.md) · [クレジット](#-クレジット)
+[PC に合うモデル](#pick-a-model) · [クイックスタート](#-クイックスタート) · [ディスク容量](#ディスク容量) ·
+[性能](#-性能) · [マニュアル](docs/MANUAL.ja.md) · [更新履歴](CHANGELOG.md) · [クレジット](#-クレジット)
 
 </div>
 
 ---
 
-Abyss は [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) を GGUF から NVIDIA の GPU 1 枚で
-動かす。よく使うエキスパートを VRAM に、次に使うものを pinned RAM に、残りを NVMe SSD に置き、会話に合わせて入れ替える。
-ブラウザのチャットと、OpenAI / Anthropic 互換の API（思考とツール呼び出しに対応）が、すべて手元のマシンだけで動く。
-
-**新しく公開: 日本語が崩れない、小さい DeepSeek V4.1 GGUF（[Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF)、207 GB、BETA、2026-11-03）**
-- 各層 384 個のエキスパートのうち 256 個を残した版です。日本語・中国語・英語・コード・数学・ツール呼び出しの文章で「どのエキスパートが選ばれるか」を数えて選びました。
-- 残るルート：日本語 95%、数学 94%、ツール 94%、英語 91%、コード 84%。コードだけで選ぶと日本語のルートは 45% しか残らず、実際に日本語の質問に中国語で答えました。
-- RTX 5090 + RAM 96 GB で、コーディング課題 87 tok/s（削っていない 132G は 67.5）、32K の入力処理 1,833 tok/s、KL 0.383、難しめ 10 問は 8/10。llama.cpp でも動きます。
-- 本格的なコーディングには、下の削っていない 132G / 139G がおすすめです。
-- trench-gguf の `prune_experts.py` と `requant_table.py` で作りました。
-
-**新しく公開: GPU 32 GB + RAM 96 GB 向けの自作 DeepSeek V4.1 GGUF（[BETA 版](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)）**
-- エキスパートはすべて、元の FP4 から LDLQ で作り直しました（[trench-gguf](https://github.com/zephel01/trench-gguf)）。1 つも削っていません。
-- `132G`（速さ重視）：KL 0.194、コーディング課題で 67.5 tok/s。
-- `139G`（品質重視）：KL 0.182。この大きさでは品質点が一番です。
-- 比較：unsloth UD-IQ1_M は KL 0.198、71.8 tok/s（RTX 5090 + RAM 96 GB、DSpark あり）。
-- 2 本とも、難しめのコーディング課題、8K / 32K の長文検索、ツールを使う作業、日本語、`--uncensor`（拒否率 92% → 0〜2%、断りすぎも減少）をすべて通過しました。
-- **お使いの PC で動かした結果を教えてください。** R9700、V100、24 GB のカード、RAM 64 / 128 GB など、何でも歓迎です。
-  - 速さは `./abyss.sh --bench --deep` の結果を[こちらの issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)へ。
-  - 品質の問題は issue か、HF の Community タブへ。
-  - いただいた報告は、モデルカードの GPU の表に載せ、次の版に反映します。
-
-**[DeepSeek V4.1 Flash（1017）](docs/deepseek41/README.md)** は v1.3.29 から動く。v1.3.100 からは `./setup-deepseek.sh
---model v41` で、上の LDLQ GGUF をコマンド 1 つでセットアップできる。Engram の表（約 110〜200 GB）は SSD から行単位で読み、
-載りきらないエキスパートも SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPEC.md)。
-
-**新しく対応: [DeepSeek の DSpark ドラフトモデル](docs/MANUAL.ja.md#dspark-のドラフトモデルdeepseek-v4-flash)**（v1.3.43、
-任意: `./setup-deepseek.sh --dspark`）— 6.9 GB の下書きモデルが 1 回に最大 5 トークンを提案し、本体がまとめて 1 回で確かめる。
-内蔵 GPU なしの AMD AI PRO R9700 で、swe-bench のコーディング問題が 48.4 → 61.9 tok/s（APU の内蔵 GPU をレーンに使うと 67.3）。
+Abyss は、大きな MoE（Mixture of Experts）モデルを PC 1 台で動かす推論エンジン。よく使うエキスパートを VRAM に、
+次に使うものを pinned RAM に、残りを NVMe SSD に置き、会話に合わせて入れ替える。GPU より大きいモデルでも、実用になる
+速さで動く。ブラウザのチャットと、OpenAI / Anthropic 互換の API（思考とツール呼び出しに対応）が、すべて手元のマシンだけで動く。
 
 > [!NOTE]
 > Abyss は [Project Maya](https://github.com/mw00/project-maya) をコピーして作ったフォークで、Maya は
-> [Strata](https://github.com/Niko1221/Strata) から生まれたプロジェクト。Maya のエンジンに DeepSeek V4 と V4.1 への対応を足した。
-> [クレジット](#-クレジット)を参照。
+> [Strata](https://github.com/Niko1221/Strata) から生まれたプロジェクト。Maya のエンジンに DeepSeek V4 / V4.1、
+> Qwen3.8-Flash-Next、Ornith への対応を足した。[クレジット](#-クレジット)を参照。
 
-## ✨ 特長
+<a id="pick-a-model"></a>
 
-- **284B の MoE を GPU 1 枚で** — 層ごとに 256 個あるエキスパートを VRAM・pinned RAM・SSD に分けて置く。どれを先に載せるかは使い方から学ぶ
-- **DeepSeek V4.1 Flash にも対応** — 層ごとに 384 個のエキスパート、共有の圧縮 KV スロット、Engram の n-gram 表。表は GGUF から 1 トークン 48 行だけ読む。載りきらないエキスパートは SSD から読みながら VRAM に流し込む
-- **生成は llama.cpp の約 3 倍、prompt の読み込みは約 5 倍**（同じ GGUF・同じマシン。llama.cpp は `-ncmoe` で調整した状態。エキスパートを CPU に置いた llama.cpp と比べると 10 倍以上）。prompt は約 1,600〜3,300 tok/s、生成は約 92〜95 tok/s
-- **長いコンテキストでも落ちない** — lightning indexer と prompt の attention を tensor core で計算する。125K トークンの prompt を約 2,800 tok/s で読み、125K でも生成は約 65 tok/s
-- **AMD APU の内蔵 GPU を 2 本目のレーンに** — Ryzen AI Max では Radeon の内蔵 GPU が RAM 層のエキスパートをその場で計算する。生成でも prompt でも使う（ROCm。起動時に CPU より速ければ使う）
-- **RAID なしで SSD を 2 枚（オプトイン）** — モデルのシャードを 2 枚目の NVMe にコピーして `STRATA_GLM_MIRROR=<フォルダ>`
-  を指定すると、エキスパートを読むたびに早く終わりそうな方の SSD から読む。SSD 待ち −20%、GPU 32 GB + メモリ 64 GB の
-  DeepSeek V4.1 UD-IQ2_XXS は、2 枚目が半分の速さの USB4 でも 21% 速くなった（[SSD2](docs/SSD2.ja.md)）
-- **ドラフトモデルなしの投機デコード** — prompt や応答に出てきた並び（n-gram）を候補にして、次のトークンと一緒に 1 回で確かめる。出力は同じで、コードで +10〜13%。既定でオン
-- **DeepSeek の DSpark ドラフトモデル（任意）** — DeepSeek V4 の 3 層が本体の 40〜42 層の出力を読んで次の 5 トークンを下書きし、最大 6 トークンの検証の窓でまとめて確かめる。AI PRO R9700 の swe-bench で +28%（内蔵 GPU なしで 48.4 → 61.9 tok/s）。VRAM を約 6.5 GB 使う
-- **実行時の無検閲化（任意）** — `--uncensor <file>` で、動かしながら残差への書き込みすべてから拒否の方向を取り除く。
-  リクエストごとに入り切りでき、16〜82 KB のファイルは `--abl-build` で公開の質問セットから作れる。V4.1 / V4 /
-  GLM-5.3-Flash: 有害な質問の拒否 85〜88% → 3〜8%、文章の KL 0.013〜0.053（[UNCENSOR](docs/UNCENSOR.ja.md)）。
-- **llama.cpp と照合済み** — 3,000 トークンで次トークンの的中率が同じ（KL 0.009）
-- **DeepSeek V4 / V4.1 のアテンションを全部実装** — スライディングウィンドウ、CSA/HCA 圧縮 KV（V4.1 は 4 つの共有スロットと 16K 超の候補ブロック）、インデクサの top-512、sinks
-- **思考とツール呼び出し** — 思考レベル `none` / `low` / `high` / `max`、DeepSeek の DSML 形式のツール呼び出し（同時呼び出しも可）
-- **OpenAI / Anthropic 互換 API** と、エキスパートの配置をリアルタイムで見られるブラウザのダッシュボード
-- **Abyss Terminal** — `./abyss.sh --terminal`: decode / prompt の tok/s、1 トークンの時間の行き先と `--bench` と同じ
-  判定、GPU、メモリ、リクエストをターミナルで。この PC でも別の PC のサーバーでも見られ、モデルの起動・停止・切替もでき、
-  閉じてもサーバーは動き続ける（[MANUAL](docs/MANUAL.ja.md#abyss-terminalabysssh---terminal)）。
-- **複数 GPU、AMD、V100** — NVIDIA の複数カードに層を分けて載せる（Qwen3.8-Flash-Next も v1.3.109 からベータで対応）。Radeon 向けの HIP ビルド（試験的）、CUDA 12 での sm_70 ビルド
-- **NVIDIA DGX Spark（ベータ、v1.3.113）** — GB10 の ARM CPU と共有メモリ: aarch64 + sm_121 のビルド、エキスパートの置き場と RAM 層をひとつのメモリ予算で管理。Qwen3.8-Flash-Next は MTP ドラフターありで 47 tok/s（[DGX Spark](docs/DGX-SPARK.ja.md)）
-- **コマンド 1 つでセットアップ** — エンジン、モデル、pack、設定、運用スクリプトの `Abyss-tools` まで
-- **EXL3 量子化（GLM-5.3-Flash、試験的）** — exllamav3 のトレリス量子化をそのまま読む。turboderp の sc_2.10bpw は
-  Maya-S-v2 より 8 GB 小さく、文章の予測が良い（nll 1.59 対 1.63）。APU の lane では生成が約 8 割の速さ（v1.3.36）。
-  どちらが合うかはインストーラが PC を見て示す（[EXL3](docs/exl3/README.md)）
+## 🖥️ PC に合うモデルを選ぶ
 
-## 📦 対応モデル
+Hugging Face で公開している自作の GGUF です。PC の大きさごとに 1 つのリポジトリで（名前の最後が `<GPU の GB>G<RAM の GB>G`）、
+どれもその大きさの PC の設定で Abyss で計測しています。どれもコマンド 1 つでセットアップできます（下）。
 
-| モデル | GGUF / 量子化 | サイズ | 状態 |
-| --- | --- | ---: | --- |
-| DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)（セットアップの既定） | 96.8 GB | 計測済み、swe-bench 60問中59問解決 |
-| | huihui-ai の abliterated Q2、antirez の deepseek-v4-gguf（`--compat-bf16`） | 約 83 GB | 動作確認済み（llama.cpp との KL 0.0075） |
-| | unsloth のほかの量子化で、expert の型が IQ1_S〜IQ4_XS、Q2_K〜Q6_K、MXFP4 のもの | | 動くはず、未確認 |
-| | DeepSeek の DSpark ドラフトモデル（bleysg の [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`、v1.3.43） | 6.9 GB | AI PRO R9700 で計測済み（swe-bench +28%）。DGX Spark では生成 21.0 → 22.8 tok/s、下書きの採用率 78%（v1.3.114） |
-| DeepSeek V4.1 Flash 1017 | unsloth の [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（品質重視のおすすめ） | 300 GB | AI PRO R9700 で計測済み: KL 0.141（旧版 0.188）、swe-bench 8 問で GPU 32 GB + メモリ 96 GB 33.9 tok/s、32 GB + 64 GB 29.5 tok/s（[どれを選ぶか](docs/deepseek41/README.md#ggufs-that-load)） |
-| | unsloth の [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（速さ重視のおすすめ） | 250 GB | 同じ測り方で: KL 0.199（旧版 0.270）、32 GB + 96 GB で **40.6 tok/s**、32 GB + 64 GB で 30.5 tok/s |
-| | 自作の [LDLQ 132G / 139G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)（GPU 32 GB + RAM 96 GB 向け、BETA、2026-11-02。報告歓迎） | 275.8 / 283.0 GB | RTX 5090 + RAM 96 GB で計測: KL 0.194 / 0.182、swe 3 問 67.5 / 57.9 tok/s（UD-IQ1_M は 71.8）、難しめ 10 問は両方 10/10、`--uncensor` も問題なし（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
-| | 自作の [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF)：エキスパート 384 個中 256 個、コード専用ではない汎用版（BETA、2026-11-03。報告歓迎） | 207.1 GB | RTX 5090 + RAM 96 GB で計測: KL 0.383、swe 3 問 **87.0 tok/s**、難しめ 10 問 8/10、32K の入力処理 1,833 tok/s、日本語・ツール・長文検索 OK、llama.cpp でも動作（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
-| | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | 計測済み、swe-bench 35 問中 34（v1.3.31 の部分実行: 60 問のうち最初の 35 問。全問の再実行は未了） |
-| | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（2026-10-28 の再アップロード版） | 233 GB | 計測済み: 動くがおすすめしない（KL 0.257、旧版 0.36） |
-| | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
-| | unsloth のほかの量子化、Project Maya の Maya-S | 178〜508 GB | UD-IQ1_S と同じ形式、未確認 |
-| | ISTA-DASLab の [GSQ-RCO](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) IQ2_XXS / IQ1_M（v1.3.53、Engram の表は別の GGUF） | 138 / 121 GB | AI PRO R9700 で計測済み: KL 0.31 / 0.38。サイズは Engram の表を除いた値。表を除くと UD-IQ1_M は 139.5 GB で KL 0.27 なので、同じサイズなら unsloth のほうが良い（v1.3.53 で「サイズあたりの品質が最も高い」と書いたのは、表を含むサイズと含まないサイズを比べた誤り） |
-| | Lucebox の DSpark ドラフトモデル DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf（`STRATA_DS4_DSPARK=<ファイル>`、v1.3.53） | 4.9 GB | AI PRO R9700 で計測済み: swe-bench +16%。約 3.4 GB/s の SSD では効果なし |
-| | orcarouter の abliterated [Mix-256G](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF)（制限解除版。Engram の shard は unsloth の UD-IQ1_S の shard 5 とバイト単位で同じ） | 236 GB + Engram | AI PRO R9700 で計測済み: KL 0.083（V4.1 で測った中で最良）、swe-bench 8 問で tail skip あり 22.4 tok/s（RAM 94 GB では SSD 待ちで頭打ち） |
-| | mrfakename の abliteration の編集（`STRATA_GLM_ABL`、または `tools/dense_overlay.py --abl` のオーバーレイ） | 43 KB | 計測済み: 16 問中 12 問の拒否が 0 に、KL +0.002（[UNCENSOR](docs/UNCENSOR.ja.md)） |
-| Ornith-1.5-122B（Qwen3.5-MoE、[docs/ornith](docs/ornith/README.md)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)（v1.3.46） | 79.7 GB | AI PRO R9700 で計測済み: 42 tok/s、llama.cpp との KL 0.024。NVIDIA では下の IQ3_XXS-B を参照 |
-| | 自作の [IQ3_XXS-B](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け） | 51.7 GB | 計測済み（VRAM を 16 GB に制限、iGPU レーンなし）: NextN ドラフトありで 42.6 tok/s、swe-bench 60 問中 56 問解決（UD-Q4_K_XL は 54）。`--model ornith` が書く設定の RTX 5090 で生成 116 tok/s、NextN の下書きの採用率 75%（v1.3.100） |
-| | unsloth の [UD-IQ3_XXS](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) | 49.5 GB | 同じ条件で計測済み: IQ3_XXS-B と同じ品質（KL 0.140 / 0.138）で約 3% 速い |
-| Qwen3.5-122B-A10B（Qwen3.5-MoE、Ornith と同じ形式） | 自作の [IQ3_XXS-B2](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け） | 51 GB | 計測済み: KL 0.035、41.2 tok/s、swe-bench 60 問中 53 問解決 |
-| Qwen3.8-35B-A3B Distill（Qwen3.5-MoE、Ornith を小さくした形式） | empero-ai の [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF)（v1.3.92） | 21.7 GB | RTX 5090 で計測: swe-bench 3 問で 399 tok/s（NextN 下書きあり、採用率 85%）、VRAM を 16 GB に制限して 297 tok/s |
-| Qwen3.8-Flash-Next（qwen4exp、[docs/qwen38](docs/qwen38/README.ja.md)） | orcarouter の [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) を速い経路で（v1.3.74）。v1.3.76 からベータ: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S、unsloth UD-IQ4_XS / UD-Q4_K_XL（どの PC にどれか: [docs/qwen38](docs/qwen38/README.ja.md#ほかの-ggufベータ)） | 85.2 GB | AI PRO R9700 で計測: プロンプト 30K で 1,037 tok/s、答えは MTP ドラフターありで文章 64〜65 tok/s / コード 86、llama.cpp 比 KL 0.026。NVIDIA: RTX 5090 は v1.3.83 から（ISTA IQ3_S でドラフターあり 128.5〜129.5 tok/s、v1.3.87）、DGX Spark は v1.3.113 から（[数字](docs/qwen38/README.ja.md#nvidia-での計測rtx-5090dgx-spark)） |
-| | 自作の [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け、ベータ。報告歓迎） | | RTX 5090 + 94 GB で計測: KL 0.083、MTP ドラフターありで 32 GB 131.3 tok/s、16 GB 96.4（v1.3.112）。レンタルの DGX Spark で 47.05（v1.3.113） |
-| | 自作の [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)（L448: 512 個中 448 個のエキスパート。GPU 12 GB + RAM 32 GB 向け、ベータ、2026-11-04。報告歓迎） | 67.5 GB | MTP ドラフターは v1.3.106 から読み込める。#33 のプロンプトは v1.3.108 の修正後 8 回中 8 回正解 |
-| | magnitudedev の [NVFP4](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF)（v1.3.101、ベータ、[docs/qwen38](docs/qwen38/README.ja.md#nvfp4nvidia-の-fp4-チェックポイントv13101ベータ)） | 127.8 GB | RTX 5090 + 96 GB で計測: llama.cpp 比 KL 0.018、プロンプト 32K で 2,515 tok/s、swe-bench 3 問 105.3 tok/s（MTP ドラフターあり） |
-| | unsloth の [UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（v1.3.112、ベータ。1 つの層で gate と up のエキスパートの型が違う、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-ud-iq1_sud-31v13112ベータ)） | 66.4 GB | RTX 5090 + 94 GB で計測: KL 0.201（同じファイルの llama.cpp も 0.201）、32 GB で MTP ドラフターあり 153 tok/s、コード 4 / 5 |
-| | unsloth の [UD 3.1 UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（v1.3.114、ベータ。1 つの層の down が Q5_0、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-ud-iq2_xsud-31v13114ベータ)） | 75.8 GB | RTX 5090 + 94 GB で計測: KL 0.136（同じファイルの llama.cpp も 0.136）、32 GB で MTP ドラフターあり 134 tok/s、`--check --quick` 7 / 7 |
-| | unsloth のほかの UD 3.1 セット: UD-IQ4_XS、UD-Q3_K_XL、UD-IQ3_XXS、UD-Q2_K_XL、UD-Q2_0、UD-IQ1_M（v1.3.115、ベータ、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-のほかの-ud-31-セットv13115ベータ)） | 68〜94 GB | RTX 5090 + 94 GB で計測: KL 0.077（UD-IQ4_XS）〜0.190（UD-IQ1_M）、どれも同じファイルの llama.cpp と 0.001 以内、32 GB で MTP ドラフターあり 117〜152 tok/s、`--check --quick` は 6 セットとも 7 / 7 |
-| GLM-5.3-Flash（Maya のもの） | Maya-S-v2 IQ2_XXS、Maya-S24 | 96.5 / 94.7 GB | 計測済み |
-| | turboderp の EXL3 sc_2.10bpw（[EXL3](docs/exl3/README.md)） | | 計測済み、試験的 |
-| | kindlingai の [exlr8](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) K2 を `tools/exlr8_convert.py` で変換（v1.3.53） | 86 GB | AI PRO R9700 で計測済み: 約 23 tok/s、nll 1.61（Maya-S-v2 は 1.634、低いほど良い）。K3（125 GB）は nll 1.548、約 11 tok/s |
+| GPU（VRAM） | RAM | Hugging Face のモデル | ダウンロード | `./setup-deepseek.sh` のオプション |
+| --- | --- | --- | ---: | --- |
+| 12 GB | 32 GB | [Qwen3.8-Flash-Next-E448-IQ2_M-12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF) | 67.5 GB | `--model qwen38 --quant 12G32G` |
+| 16 GB | 64 GB | [Qwen3.8-Flash-Next-IQ3_M-16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF) | 86.9 GB | `--model qwen38` |
+| 16 GB | 64 GB | [Ornith-1.5-122B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF) | 51.7 GB | `--model ornith` |
+| 16 GB | 64 GB | [Qwen3.5-122B-A10B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF) | 51.4 GB | `--model qwen35` |
+| 16 GB | 64 GB | [DeepSeek-V4-Flash-0731-IQ1_S-16G64G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ1_S-16G64G-GGUF) | 61.7 GB | `--quant 16G64G` |
+| 24 GB | 64 GB | [Qwen3.8-Flash-Next-IQ3_M-24G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF) | 93.7 GB | `--model qwen38 --quant 24G64G` |
+| 24〜32 GB | 64 GB | [Ornith-1.5-122B-IQ4_XS-24G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ4_XS-24G64G-GGUF) | 68.9 GB | `--model ornith --quant 24G64G` |
+| 32 GB | 64 GB | [DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G-GGUF) | 72.0 GB | `--quant 32G64G` |
+| 32 GB | 96 GB | [DeepSeek-V4-Flash-0731-IQ2_M-32G96G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF) | 96.8 GB | `--quant 32G96G` |
+| 32 GB | 96 GB | [GLM-5.3-Flash-IQ2_XS-32G96G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ2_XS-32G96G-GGUF) | 94.1 GB | `--model glm` |
+| 32 GB | 96 GB | [DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF) | 275.8 GB | `--model v41` |
+| 32 GB | 96 GB | [DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF) | 207.1 GB | 手動: [docs/deepseek41](docs/deepseek41/README.md) |
+| 32 GB | 128 GB | [GLM-5.3-Flash-IQ3_XXS-32G128G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ3_XXS-32G128G-GGUF) | 127.9 GB | `--model glm --quant 32G128G` |
+| DGX Spark | 共有メモリ 128 GB | [Qwen3.8](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-DGX-Spark-GGUF) · [GLM-5.3-Flash](https://huggingface.co/zephel01/GLM-5.3-Flash-DGX-Spark-GGUF) · [V4 0731](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-DGX-Spark-GGUF)（DGX-Spark） | 86.9〜96.8 GB | [docs/DGX-SPARK](docs/DGX-SPARK.ja.md) |
 
-V4.1 でどのファイルを選ぶかと、それぞれの測り方: [docs/deepseek41/README.md](docs/deepseek41/README.md#ggufs-that-load)。
-測ったファイルすべての品質と速さ、GPU ごとの参考値（こちらの実測と、利用者の報告）: [docs/MODELS.ja.md](docs/MODELS.ja.md)。
-自作の量子化（`zephel01/...` の行）を、こちらで測っていない GPU で動かしたら、`--bench --deep` の結果を[issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)で送ってください。名前を添えてモデルカードに載せます。
-自分の PC を同じ方法で測り、どこで時間がかかっているかを見るには `./abyss.sh --bench --deep` を実行してください（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
-入れたモデルがこの PC で正しく動くか（落ちないか、答えが合っているか、長いプロンプト、長い会話）を確かめるには `./abyss.sh --check` を実行してください（v1.3.112、[docs/BENCH.ja.md](docs/BENCH.ja.md)）。結果は[バグ報告](https://github.com/zephel01/Abyss/issues/new?template=bug.md)に添えられます。
+- 大きさは目安で、速さの保証ではありません。大きい PC なら小さいファイルがもっと速く動きます。小さい PC でも大きい
+  ファイルは動きます（入りきらないエキスパートを SSD から読むので遅くなります）。
+- 迷ったら：16 GB + 64 GB なら Qwen3.8-Flash-Next（その大きさで一番速い）、32 GB + 96 GB なら GLM-5.3-Flash か
+  DeepSeek V4 0731。各モデルカードに品質（KL）、速さ、実用チェックの結果と、ほかの大きさの一覧があります。
+- `--model` を付けないと、DeepSeek V4 Flash 0731 の unsloth `UD-Q2_K_XL`（96.8 GB、下の性能表を測ったファイル）が入ります。
+  自作以外も含めて読み込めるファイルの一覧は[対応モデル](#-対応モデル)。
+
+## 🚀 クイックスタート
+
+```sh
+git clone https://github.com/zephel01/Abyss.git ~/llm/apps/Abyss
+cd ~/llm/apps/Abyss
+./setup-deepseek.sh --model qwen38 --download-model   # エンジン、モデル、pack、設定、../Abyss-tools（表から選ぶ）
+../Abyss-tools/abyss.sh start                         # → http://127.0.0.1:8082/
+```
+
+API で試す:
+
+```sh
+curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"日本の首都はどこですか？"}],"max_tokens":4000}'
+```
+
+この PC で正しく動くかは `../Abyss-tools/abyss.sh --check`、速さは `--bench --deep` で確かめられる（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
+
+<details>
+<summary><b>セットアップがやること</b></summary>
+
+1. PC の確認（GPU、RAM）。選んだファイルがこの PC に合うかも表示する
+2. Python パッケージを `.venv` に入れ、固定コミットの llama.cpp のソースを取る
+3. GPU に合わせてエンジンをビルド（RTX 50 は `120a`）
+4. モデルを `../Abyss-data` にダウンロード（`--download-model` がなければ先に確認）し、全ファイルの SHA-256 を照合
+5. シャードと同じフォルダに pack を作る
+6. `abyss-<名前>.json` と `run-abyss-<名前>.sh` を書く（RAM の枠はモデルカードを測ったときの値）
+7. DeepSeek V4 を unsloth のファイルで入れるとき: DSpark ドラフトモデル。設定が新しいときに確認する（`--dspark` なら確認なし）
+8. `../Abyss-tools` を作る — `abyss.sh start | stop | restart | status | update | build | log | models`
+
+済んだ手順は飛ばすので、何度実行してもよい。オプション（`--quant`、`--context`、`--port`、`--gpus 0,1`（層の分割）、
+`--backend hip`（AMD）、`--nvcc`（V100 用の CUDA 12）、`--dspark` / `--no-dspark`、`--tools-only` など）は
+[マニュアル](docs/MANUAL.ja.md#まとめてセットアップ)。
+
+</details>
+
+### 必要なもの
+
+| | |
+| --- | --- |
+| OS | Linux（Ubuntu で確認）。DGX Spark では ARM64（DGX OS、ベータ） |
+| GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定、DGX Spark（GB10）はベータ。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S と AI PRO R9700（8060S をレーンに）で動作。[docs/amd](docs/amd/README.ja.md) |
+| メモリ | VRAM + RAM がファイルの大きさくらいあれば、全エキスパートがメモリに載る（少なくても SSD から読んで動く） |
+| ディスク | 下の容量が空いた NVMe SSD（モデルがメモリに入りきらないときは、速いほどよい） |
+| ツール | CUDA 13.x（`nvcc`。V100 は 12.9）、g++、Python 3.10 以上。AMD APU の iGPU レーンと AMD ビルドには、Linux は ROCm 10、Windows は AMD の ROCm SDK 7.14（`hipcc`。HIP 7.14 以降。ROCm 7.0〜7.2 はいまのドライバと組み合わせると失敗する: [docs/amd](docs/amd/README.ja.md)） |
+| ARM / DGX Spark | aarch64 + sm_121（GB10）、CUDA 12.9 以降（DGX OS には CUDA 13 が入っている）。x86 のカーネルは無いので、Q2_0 のエキスパートの pack（DeepSeek V4 の標準の pack）は AVX が要って動かない。ネイティブの pack（`--native`、`iq_pack.py --fast`）は動く（[DGX Spark](docs/DGX-SPARK.ja.md)） |
+
+### ディスク容量
+
+セットアップがディスクに置くもの（pack は GGUF の隣に作る索引で、エキスパートはコピーしない）:
+
+| モデル | GGUF | pack | ドラフトモデル（任意） |
+| --- | ---: | ---: | ---: |
+| Qwen3.8-Flash-Next（12G32G / 16G64G / 24G64G） | 67.5 / 86.9 / 93.7 GB | 約 0.3 GB | GGUF に含まれる（MTP） |
+| Ornith-1.5-122B（16G64G / 24G64G）、Qwen3.5-122B | 51.4〜68.9 GB | 約 0.2 GB | GGUF に含まれる（NextN、Ornith） |
+| DeepSeek V4 Flash 0731（自作 16G64G / 32G64G / 32G96G、unsloth UD-Q2_K_XL） | 61.7 / 72.0 / 96.8、96.8 GB | 約 0.2 GB | DSpark 6.9 GB（unsloth のファイルのときだけ） |
+| GLM-5.3-Flash（32G96G / 32G128G） | 94.1 / 127.9 GB | 約 0.9 GB | - |
+| DeepSeek V4.1 Flash 1017（IQ2_XXS 132G / 139G、E256） | 275.8 / 283.0、207.1 GB（Engram の表を含む） | 約 0.4 GB | DSpark（手動、docs を参照） |
+
+ほかに、エンジンのビルド・llama.cpp のソース・Python パッケージで約 3 GB。モデルは NVMe SSD に置く。VRAM + RAM に
+入りきらないときは、SSD の速さが生成の速さを決める。
 
 ## 📊 性能
 
@@ -207,53 +204,84 @@ RAM 層 60 GB、モデルは NVMe（3.4 GB/s）、Abyss v1.3.31:
 
 </details>
 
-## 🚀 クイックスタート
+## ✨ 特長
 
-```sh
-git clone https://github.com/zephel01/Abyss.git ~/llm/apps/Abyss
-cd ~/llm/apps/Abyss
-./setup-deepseek.sh --download-model     # エンジン、モデル（96.8 GB）、pack、設定、../Abyss-tools
-../Abyss-tools/abyss.sh start            # → http://127.0.0.1:8082/
-```
+- **50〜280 GB の MoE を GPU 1 枚で** — DeepSeek V4（284B）と V4.1、GLM-5.3-Flash、Qwen3.8-Flash-Next、Ornith-1.5 / Qwen3.5-122B。エキスパートを VRAM・pinned RAM・SSD に分けて置き、どれを先に載せるかは使い方から学ぶ
+- **DeepSeek V4.1 Flash にも対応** — 層ごとに 384 個のエキスパート、共有の圧縮 KV スロット、Engram の n-gram 表。表は GGUF から 1 トークン 48 行だけ読む。載りきらないエキスパートは SSD から読みながら VRAM に流し込む
+- **生成は llama.cpp の約 3 倍、prompt の読み込みは約 5 倍**（同じ GGUF・同じマシン。llama.cpp は `-ncmoe` で調整した状態。エキスパートを CPU に置いた llama.cpp と比べると 10 倍以上）。prompt は約 1,600〜3,300 tok/s、生成は約 92〜95 tok/s
+- **長いコンテキストでも落ちない** — lightning indexer と prompt の attention を tensor core で計算する。125K トークンの prompt を約 2,800 tok/s で読み、125K でも生成は約 65 tok/s
+- **AMD APU の内蔵 GPU を 2 本目のレーンに** — Ryzen AI Max では Radeon の内蔵 GPU が RAM 層のエキスパートをその場で計算する。生成でも prompt でも使う（ROCm。起動時に CPU より速ければ使う）
+- **RAID なしで SSD を 2 枚（オプトイン）** — モデルのシャードを 2 枚目の NVMe にコピーして `STRATA_GLM_MIRROR=<フォルダ>`
+  を指定すると、エキスパートを読むたびに早く終わりそうな方の SSD から読む。SSD 待ち −20%、GPU 32 GB + メモリ 64 GB の
+  DeepSeek V4.1 UD-IQ2_XXS は、2 枚目が半分の速さの USB4 でも 21% 速くなった（[SSD2](docs/SSD2.ja.md)）
+- **ドラフトモデルなしの投機デコード** — prompt や応答に出てきた並び（n-gram）を候補にして、次のトークンと一緒に 1 回で確かめる。出力は同じで、コードで +10〜13%。既定でオン
+- **DeepSeek の DSpark ドラフトモデル（任意）** — DeepSeek V4 の 3 層が本体の 40〜42 層の出力を読んで次の 5 トークンを下書きし、最大 6 トークンの検証の窓でまとめて確かめる。AI PRO R9700 の swe-bench で +28%（内蔵 GPU なしで 48.4 → 61.9 tok/s）。VRAM を約 6.5 GB 使う
+- **実行時の無検閲化（任意）** — `--uncensor <file>` で、動かしながら残差への書き込みすべてから拒否の方向を取り除く。
+  リクエストごとに入り切りでき、16〜82 KB のファイルは `--abl-build` で公開の質問セットから作れる。V4.1 / V4 /
+  GLM-5.3-Flash: 有害な質問の拒否 85〜88% → 3〜8%、文章の KL 0.013〜0.053（[UNCENSOR](docs/UNCENSOR.ja.md)）。
+- **llama.cpp と照合済み** — 3,000 トークンで次トークンの的中率が同じ（KL 0.009）
+- **DeepSeek V4 / V4.1 のアテンションを全部実装** — スライディングウィンドウ、CSA/HCA 圧縮 KV（V4.1 は 4 つの共有スロットと 16K 超の候補ブロック）、インデクサの top-512、sinks
+- **思考とツール呼び出し** — 思考レベル `none` / `low` / `high` / `max`、DeepSeek の DSML 形式のツール呼び出し（同時呼び出しも可）
+- **OpenAI / Anthropic 互換 API** と、エキスパートの配置をリアルタイムで見られるブラウザのダッシュボード
+- **Abyss Terminal** — `./abyss.sh --terminal`: decode / prompt の tok/s、1 トークンの時間の行き先と `--bench` と同じ
+  判定、GPU、メモリ、リクエストをターミナルで。この PC でも別の PC のサーバーでも見られ、モデルの起動・停止・切替もでき、
+  閉じてもサーバーは動き続ける（[MANUAL](docs/MANUAL.ja.md#abyss-terminalabysssh---terminal)）。
+- **複数 GPU、AMD、V100** — NVIDIA の複数カードに層を分けて載せる（Qwen3.8-Flash-Next も v1.3.109 からベータで対応）。Radeon 向けの HIP ビルド（試験的）、CUDA 12 での sm_70 ビルド
+- **NVIDIA DGX Spark（ベータ、v1.3.113）** — GB10 の ARM CPU と共有メモリ: aarch64 + sm_121 のビルド、エキスパートの置き場と RAM 層をひとつのメモリ予算で管理。Qwen3.8-Flash-Next は MTP ドラフターありで 47 tok/s（[DGX Spark](docs/DGX-SPARK.ja.md)）
+- **コマンド 1 つでセットアップ** — エンジン、モデル、pack、設定、運用スクリプトの `Abyss-tools` まで
+- **EXL3 量子化（GLM-5.3-Flash、試験的）** — exllamav3 のトレリス量子化をそのまま読む。turboderp の sc_2.10bpw は
+  Maya-S-v2 より 8 GB 小さく、文章の予測が良い（nll 1.59 対 1.63）。APU の lane では生成が約 8 割の速さ（v1.3.36）。
+  どちらが合うかはインストーラが PC を見て示す（[EXL3](docs/exl3/README.md)）
 
-DeepSeek の DSpark ドラフトモデルで回答を速くするには（6.9 GB 追加、VRAM 約 6.5 GB、GPU 1 枚のとき）:
-`./setup-deepseek.sh --dspark` のあと `../Abyss-tools/abyss.sh restart`。
+## 📦 対応モデル
 
-API で試す:
+| モデル | GGUF / 量子化 | サイズ | 状態 |
+| --- | --- | ---: | --- |
+| DeepSeek V4 Flash 0731 | unsloth [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)（セットアップの既定） | 96.8 GB | 計測済み、swe-bench 60問中59問解決 |
+| | 自作の [IQ2_M-32G96G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF) / [IQ2_XXS-32G64G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G-GGUF) / [IQ1_S-16G64G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ1_S-16G64G-GGUF)（LDLQ、BETA、2026-11-08） | 96.8 / 72.0 / 61.7 GB | RTX 5090 で計測: 32G96G は KL 0.150（UD-Q2_K_XL は 0.186）、DSpark なしで 4K 69.1 tok/s |
+| | huihui-ai の abliterated Q2、antirez の deepseek-v4-gguf（`--compat-bf16`） | 約 83 GB | 動作確認済み（llama.cpp との KL 0.0075） |
+| | unsloth のほかの量子化で、expert の型が IQ1_S〜IQ4_XS、Q2_K〜Q6_K、MXFP4 のもの | | 動くはず、未確認 |
+| | DeepSeek の DSpark ドラフトモデル（bleysg の [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`、v1.3.43） | 6.9 GB | AI PRO R9700 で計測済み（swe-bench +28%）。DGX Spark では生成 21.0 → 22.8 tok/s、下書きの採用率 78%（v1.3.114） |
+| DeepSeek V4.1 Flash 1017 | unsloth の [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（品質重視のおすすめ） | 300 GB | AI PRO R9700 で計測済み: KL 0.141（旧版 0.188）、swe-bench 8 問で GPU 32 GB + メモリ 96 GB 33.9 tok/s、32 GB + 64 GB 29.5 tok/s（[どれを選ぶか](docs/deepseek41/README.md#ggufs-that-load)） |
+| | unsloth の [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（速さ重視のおすすめ） | 250 GB | 同じ測り方で: KL 0.199（旧版 0.270）、32 GB + 96 GB で **40.6 tok/s**、32 GB + 64 GB で 30.5 tok/s |
+| | 自作の [DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF)（132G / 139G、GPU 32 GB + RAM 96 GB 向け、BETA、2026-11-02。報告歓迎） | 275.8 / 283.0 GB | RTX 5090 + RAM 96 GB で計測: KL 0.194 / 0.182、swe 3 問 67.5 / 57.9 tok/s（UD-IQ1_M は 71.8）、難しめ 10 問は両方 10/10、`--uncensor` も問題なし（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
+| | 自作の [DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF)：エキスパート 384 個中 256 個、コード専用ではない汎用版（BETA、2026-11-03。報告歓迎） | 207.1 GB | RTX 5090 + RAM 96 GB で計測: KL 0.383、swe 3 問 **87.0 tok/s**、難しめ 10 問 8/10、32K の入力処理 1,833 tok/s、日本語・ツール・長文検索 OK、llama.cpp でも動作（[詳細](docs/deepseek41/README.md#ggufs-that-load)） |
+| | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | 計測済み、swe-bench 35 問中 34（v1.3.31 の部分実行: 60 問のうち最初の 35 問。全問の再実行は未了） |
+| | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（2026-10-28 の再アップロード版） | 233 GB | 計測済み: 動くがおすすめしない（KL 0.257、旧版 0.36） |
+| | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
+| | unsloth のほかの量子化、Project Maya の Maya-S | 178〜508 GB | UD-IQ1_S と同じ形式、未確認 |
+| | ISTA-DASLab の [GSQ-RCO](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) IQ2_XXS / IQ1_M（v1.3.53、Engram の表は別の GGUF） | 138 / 121 GB | AI PRO R9700 で計測済み: KL 0.31 / 0.38。サイズは Engram の表を除いた値。表を除くと UD-IQ1_M は 139.5 GB で KL 0.27 なので、同じサイズなら unsloth のほうが良い（v1.3.53 で「サイズあたりの品質が最も高い」と書いたのは、表を含むサイズと含まないサイズを比べた誤り） |
+| | Lucebox の DSpark ドラフトモデル DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf（`STRATA_DS4_DSPARK=<ファイル>`、v1.3.53） | 4.9 GB | AI PRO R9700 で計測済み: swe-bench +16%。約 3.4 GB/s の SSD では効果なし |
+| | orcarouter の abliterated [Mix-256G](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF)（制限解除版。Engram の shard は unsloth の UD-IQ1_S の shard 5 とバイト単位で同じ） | 236 GB + Engram | AI PRO R9700 で計測済み: KL 0.083（V4.1 で測った中で最良）、swe-bench 8 問で tail skip あり 22.4 tok/s（RAM 94 GB では SSD 待ちで頭打ち） |
+| | mrfakename の abliteration の編集（`STRATA_GLM_ABL`、または `tools/dense_overlay.py --abl` のオーバーレイ） | 43 KB | 計測済み: 16 問中 12 問の拒否が 0 に、KL +0.002（[UNCENSOR](docs/UNCENSOR.ja.md)） |
+| Ornith-1.5-122B（Qwen3.5-MoE、[docs/ornith](docs/ornith/README.md)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)（v1.3.46） | 79.7 GB | AI PRO R9700 で計測済み: 42 tok/s、llama.cpp との KL 0.024。NVIDIA では下の自作版を参照 |
+| | 自作の [Ornith-1.5-122B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け） | 51.7 GB | 計測済み（VRAM を 16 GB に制限、iGPU レーンなし）: NextN ドラフトありで 42.6 tok/s、swe-bench 60 問中 56 問解決（UD-Q4_K_XL は 54）。`--model ornith` が書く設定の RTX 5090 で生成 116 tok/s、NextN の下書きの採用率 75%（v1.3.100） |
+| | unsloth の [UD-IQ3_XXS](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF) | 49.5 GB | 同じ条件で計測済み: 自作 16G64G と同じ品質（KL 0.140 / 0.138）で約 3% 速い |
+| | 自作の [Ornith-1.5-122B-IQ4_XS-24G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ4_XS-24G64G-GGUF)（GPU 24〜32 GB + RAM 64 GB 向け、BETA、2026-11-08） | 68.9 GB | RTX 5090 を 24 GB に制限、RAM 64 GB の設定で計測: NextN ドラフトありで生成 52.4 tok/s（32 GB では 63.8）、8K の入力 1,594 tok/s、SSD 待ちなし |
+| Qwen3.5-122B-A10B（Qwen3.5-MoE、Ornith と同じ形式） | 自作の [Qwen3.5-122B-A10B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け） | 51.4 GB | 計測済み: KL 0.035、41.2 tok/s、swe-bench 60 問中 53 問解決 |
+| Qwen3.8-35B-A3B Distill（Qwen3.5-MoE、Ornith を小さくした形式） | empero-ai の [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF)（v1.3.92） | 21.7 GB | RTX 5090 で計測: swe-bench 3 問で 399 tok/s（NextN 下書きあり、採用率 85%）、VRAM を 16 GB に制限して 297 tok/s |
+| Qwen3.8-Flash-Next（qwen4exp、[docs/qwen38](docs/qwen38/README.ja.md)） | orcarouter の [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) を速い経路で（v1.3.74）。v1.3.76 からベータ: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S、unsloth UD-IQ4_XS / UD-Q4_K_XL（どの PC にどれか: [docs/qwen38](docs/qwen38/README.ja.md#ほかの-ggufベータ)） | 85.2 GB | AI PRO R9700 で計測: プロンプト 30K で 1,037 tok/s、答えは MTP ドラフターありで文章 64〜65 tok/s / コード 86、llama.cpp 比 KL 0.026。NVIDIA: RTX 5090 は v1.3.83 から（ISTA IQ3_S でドラフターあり 128.5〜129.5 tok/s、v1.3.87）、DGX Spark は v1.3.113 から（[数字](docs/qwen38/README.ja.md#nvidia-での計測rtx-5090dgx-spark)） |
+| | 自作の [Qwen3.8-Flash-Next-IQ3_M-16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け、ベータ。報告歓迎） | 86.9 GB | RTX 5090 + 94 GB で計測: KL 0.083、MTP ドラフターありで 32 GB 131.3 tok/s、16 GB 96.4（v1.3.112）。レンタルの DGX Spark で 47.05（v1.3.113） |
+| | 自作の [Qwen3.8-Flash-Next-IQ3_M-24G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF)（GPU 24 GB + RAM 64 GB 向け、ベータ） | 93.7 GB | VRAM を 24 GB に制限して計測（[モデルカード](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF)） |
+| | 自作の [Qwen3.8-Flash-Next-E448-IQ2_M-12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF)（512 個中 448 個のエキスパート。GPU 12 GB + RAM 32 GB 向け、ベータ、2026-11-04。報告歓迎） | 67.5 GB | MTP ドラフターは v1.3.106 から読み込める。#33 のプロンプトは v1.3.108 の修正後 8 回中 8 回正解 |
+| | magnitudedev の [NVFP4](https://huggingface.co/magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF)（v1.3.101、ベータ、[docs/qwen38](docs/qwen38/README.ja.md#nvfp4nvidia-の-fp4-チェックポイントv13101ベータ)） | 127.8 GB | RTX 5090 + 96 GB で計測: llama.cpp 比 KL 0.018、プロンプト 32K で 2,515 tok/s、swe-bench 3 問 105.3 tok/s（MTP ドラフターあり） |
+| | unsloth の [UD 3.1 UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（v1.3.112、ベータ。1 つの層で gate と up のエキスパートの型が違う、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-ud-iq1_sud-31v13112ベータ)） | 66.4 GB | RTX 5090 + 94 GB で計測: KL 0.201（同じファイルの llama.cpp も 0.201）、32 GB で MTP ドラフターあり 153 tok/s、コード 4 / 5 |
+| | unsloth の [UD 3.1 UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（v1.3.114、ベータ。1 つの層の down が Q5_0、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-ud-iq2_xsud-31v13114ベータ)） | 75.8 GB | RTX 5090 + 94 GB で計測: KL 0.136（同じファイルの llama.cpp も 0.136）、32 GB で MTP ドラフターあり 134 tok/s、`--check --quick` 7 / 7 |
+| | unsloth のほかの UD 3.1 セット: UD-IQ4_XS、UD-Q3_K_XL、UD-IQ3_XXS、UD-Q2_K_XL、UD-Q2_0、UD-IQ1_M（v1.3.115、ベータ、[docs/qwen38](docs/qwen38/README.ja.md#unsloth-のほかの-ud-31-セットv13115ベータ)） | 68〜94 GB | RTX 5090 + 94 GB で計測: KL 0.077（UD-IQ4_XS）〜0.190（UD-IQ1_M）、どれも同じファイルの llama.cpp と 0.001 以内、32 GB で MTP ドラフターあり 117〜152 tok/s、`--check --quick` は 6 セットとも 7 / 7 |
+| GLM-5.3-Flash | 自作の [GLM-5.3-Flash-IQ2_XS-32G96G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ2_XS-32G96G-GGUF) / [IQ3_XXS-32G128G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ3_XXS-32G128G-GGUF)（BETA） | 94.1 / 127.9 GB | RTX 5090 + RAM 96 GB で計測、`--check` 12 問中 12（32G96G）、DGX Spark で 27.4 tok/s（[モデルカード](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ2_XS-32G96G-GGUF)） |
+| | Maya の Maya-S-v2 IQ2_XXS、Maya-S24 | 96.5 / 94.7 GB | 計測済み |
+| | turboderp の EXL3 sc_2.10bpw（[EXL3](docs/exl3/README.md)） | | 計測済み、試験的 |
+| | kindlingai の [exlr8](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) K2 を `tools/exlr8_convert.py` で変換（v1.3.53） | 86 GB | AI PRO R9700 で計測済み: 約 23 tok/s、nll 1.61（Maya-S-v2 は 1.634、低いほど良い）。K3（125 GB）は nll 1.548、約 11 tok/s |
 
-```sh
-curl http://127.0.0.1:8082/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"日本の首都はどこですか？"}],"max_tokens":4000}'
-```
+自作ファイルの以前の名前（ファイルの中身は同じ）: LDLQ 132G / 139G = DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G、Compact JA256 =
+DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G、IQ3_XXS-B = Ornith-1.5-122B-IQ3_XXS-16G64G、IQ3_XXS-B2 = Qwen3.5-122B-A10B-IQ3_XXS-16G64G、
+12G32G L448 = Qwen3.8-Flash-Next-E448-IQ2_M-12G32G、16G64G = Qwen3.8-Flash-Next-IQ3_M-16G64G。
 
-<details>
-<summary><b>セットアップがやること</b></summary>
-
-1. PC の確認（NVIDIA GPU、RAM）
-2. Python パッケージを `.venv` に入れ、固定コミットの llama.cpp のソースを取る
-3. GPU に合わせてエンジンをビルド（RTX 50 は `120a`）
-4. モデルを `../Abyss-data` にダウンロード（`--download-model` がなければ先に確認）し、全ファイルの SHA-256 を照合
-5. シャードと同じフォルダに pack を作る
-6. `abyss-<名前>.json` と `run-abyss-<名前>.sh` を書く
-7. DSpark ドラフトモデル: 設定が新しいときに確認する（`--dspark` なら確認なし）。ダウンロードして SHA-256 を照合し、設定に書く
-8. `../Abyss-tools` を作る — `abyss.sh start | stop | restart | status | update | build | log | models`
-
-済んだ手順は飛ばすので、何度実行してもよい。オプション（`--quant`、`--context`、`--port`、`--gpus 0,1`（層の分割）、
-`--backend hip`（AMD）、`--nvcc`（V100 用の CUDA 12）、`--dspark` / `--no-dspark`、`--tools-only` など）は
-[マニュアル](docs/MANUAL.ja.md#まとめてセットアップ)。
-
-</details>
-
-### 必要なもの
-
-| | |
-| --- | --- |
-| OS | Linux（Ubuntu で確認）。DGX Spark では ARM64（DGX OS、ベータ） |
-| GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定、DGX Spark（GB10）はベータ。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S と AI PRO R9700（8060S をレーンに）で動作。[docs/amd](docs/amd/README.ja.md) |
-| メモリ | 全エキスパートをメモリに置くには VRAM + RAM が約 100 GB 以上（少なくても SSD から読んで動く） |
-| ディスク | 空き約 100 GB の NVMe SSD（DeepSeek V4.1 は約 370 GB。速いほどよい） |
-| ツール | CUDA 13.x（`nvcc`。V100 は 12.9）、g++、Python 3.10 以上。AMD APU の iGPU レーンと AMD ビルドには、Linux は ROCm 10、Windows は AMD の ROCm SDK 7.14（`hipcc`。HIP 7.14 以降。ROCm 7.0〜7.2 はいまのドライバと組み合わせると失敗する: [docs/amd](docs/amd/README.ja.md)） |
-| ARM / DGX Spark | aarch64 + sm_121（GB10）、CUDA 12.9 以降（DGX OS には CUDA 13 が入っている）。x86 のカーネルは無いので、Q2_0 のエキスパートの pack（DeepSeek V4 の標準の pack）は AVX が要って動かない。ネイティブの pack（`--native`、`iq_pack.py --fast`）は動く（[DGX Spark](docs/DGX-SPARK.ja.md)） |
+V4.1 でどのファイルを選ぶかと、それぞれの測り方: [docs/deepseek41/README.md](docs/deepseek41/README.md#ggufs-that-load)。
+測ったファイルすべての品質と速さ、GPU ごとの参考値（こちらの実測と、利用者の報告）: [docs/MODELS.ja.md](docs/MODELS.ja.md)。
+自作の量子化（`zephel01/...` の行）を、こちらで測っていない GPU で動かしたら、`--bench --deep` の結果を[issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md&title=Bench:+DeepSeek-V4.1+LDLQ-132G+on+YOUR_GPU)で送ってください。名前を添えてモデルカードに載せます。
+自分の PC を同じ方法で測り、どこで時間がかかっているかを見るには `./abyss.sh --bench --deep` を実行してください（[docs/BENCH.ja.md](docs/BENCH.ja.md)）。
+入れたモデルがこの PC で正しく動くか（落ちないか、答えが合っているか、長いプロンプト、長い会話）を確かめるには `./abyss.sh --check` を実行してください（v1.3.112、[docs/BENCH.ja.md](docs/BENCH.ja.md)）。結果は[バグ報告](https://github.com/zephel01/Abyss/issues/new?template=bug.md)に添えられます。
 
 ## 🧠 しくみ
 
@@ -366,6 +394,32 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 - [ ] 複数カードでの速度: 分割時の prompt（ここでは RTX 5090 1 枚より 30% 遅い）、V100 の実機、単体の Radeon
 - [ ] 短い prompt のまとめ処理の調整（8K では RAM 層のエキスパートを GPU に送る時間が大半）
 
+## 📰 お知らせ
+
+- **2026-11-08: 自作の DeepSeek V4 Flash 0731 GGUF** — GPU 16 GB + RAM 64 GB、32 GB + 64 GB、32 GB + 96 GB 向け（IQ1_S /
+  IQ2_XXS / IQ2_M、LDLQ、BETA）。Ornith-1.5-122B の IQ4_XS（24 GB + 64 GB 向け）も。32G96G は unsloth の UD-Q2_K_XL と同じ大きさで、
+  元のモデルに近く（KL 0.150 / 0.186）、少し速い。GPU 32 GB では DSpark ドラフトモデルなしで使う。
+  `./setup-deepseek.sh --quant 32G96G`（または 16G64G / 32G64G）。
+- **2026-11-05〜11-07: GLM-5.3-Flash の GGUF**（32 GB + 96 GB、32 GB + 128 GB 向け）と、DGX Spark 対応（ベータ）。Spark 向けの
+  Qwen3.8、GLM-5.3-Flash、V4 0731 の GGUF もある（[DGX Spark](docs/DGX-SPARK.ja.md)）。
+- **2026-11-04: Qwen3.8-Flash-Next の GGUF** — 12 GB + 32 GB（E448: 512 個中 448 個のエキスパート）、16 GB + 64 GB、24 GB + 64 GB 向け。
+- **2026-11-03: [DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF)**
+  （207 GB、BETA）— 各層 384 個中 256 個のエキスパートを、会話・数学・ツール・コード・多言語の文章で実際に選ばれる回数から
+  選んだ版。コード専用ではない（コードだけで選ぶと、日本語の質問に中国語で答えた）。RTX 5090 + RAM 96 GB でコーディング課題
+  87 tok/s、KL 0.383、難しめ 10 問 8/10。llama.cpp でも動く。本格的なコーディングには削っていない下の版がおすすめ。
+- **2026-11-02: [DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF)**
+  （BETA）— エキスパートをすべて元の FP4 から LDLQ で作り直した（[trench-gguf](https://github.com/zephel01/trench-gguf)）。
+  1 つも削っていない。`132G`（速さ重視）KL 0.194、コーディング課題 67.5 tok/s。`139G`（品質重視）KL 0.182。
+  `./setup-deepseek.sh --model v41` でセットアップできる（v1.3.100）。V4.1 は v1.3.29 から動く:
+  [docs/deepseek41](docs/deepseek41/README.md)、[V4.1 の仕様](docs/deepseek41/SPEC.md)。
+- **v1.3.43: [DeepSeek の DSpark ドラフトモデル](docs/MANUAL.ja.md#dspark-のドラフトモデルdeepseek-v4-flash)**（V4 Flash 0731 用、
+  任意: `./setup-deepseek.sh --dspark`）— 6.9 GB。1 回に最大 5 トークンを提案し、本体がまとめて確かめる。AI PRO R9700 で
+  swe-bench 48.4 → 61.9 tok/s。
+
+すべての版の変更は [CHANGELOG.md](CHANGELOG.md)。**自作の GGUF がお使いの PC でどう動いたか、教えてください。**
+`./abyss.sh --bench --deep` の結果を[issue フォーム](https://github.com/zephel01/Abyss/issues/new?template=bench.md)へ
+（R9700、V100、24 GB のカード、RAM 64 / 128 GB など）。名前を添えてモデルカードの GPU の表に載せます。
+
 ## 🙏 クレジット
 
 Abyss は **[Project Maya](https://github.com/mw00/project-maya)**（MIT、mw00 とコントリビューター）をコピーして作った
@@ -383,4 +437,4 @@ EXL3 対応は Maya（@needmorevram）のもので、[exllamav3](https://github.
 
 ## 📄 ライセンス
 
-Maya・Strata と同じく MIT — [LICENSE](LICENSE)。モデルの重みはそれぞれのライセンスに従う（DeepSeek V4: MIT。V4.1 はモデルカードを確認）。
+Maya・Strata と同じく MIT — [LICENSE](LICENSE)。モデルの重みはそれぞれのライセンスに従う（DeepSeek V4: MIT。ほかは各モデルカードを確認）。

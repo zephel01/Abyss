@@ -52,13 +52,13 @@ cd ~/llm/apps/Abyss
 ```
 
 DeepSeek V4.1 Flash 1017 は、GPU 32 GB + RAM 96 GB 向けの zephel01 の LDLQ GGUF で入れられる（BETA。既定は速さ重視の
-132G、品質重視は `--quant 139G`。[モデルカード](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)）:
+132G、品質重視は `--quant 139G`。[モデルカード](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF)）:
 
 ```sh
 ./setup-deepseek.sh --model v41 --download-model
 ```
 
-小さくて汎用の [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF)（207 GB、エキスパート 384 個中 256 個、日本語は崩れない、32 GB + 96 GB で約 3 割速い）は、まだセットアップに入っていない。`JA256/` フォルダをダウンロードし、[docs/deepseek41/README.md](deepseek41/README.md#ggufs-that-load) のとおり手作業で pack する。
+小さくて汎用の [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF)（207 GB、エキスパート 384 個中 256 個、日本語は崩れない、32 GB + 96 GB で約 3 割速い）は、まだセットアップに入っていない。`JA256/` フォルダをダウンロードし、[docs/deepseek41/README.md](deepseek41/README.md#ggufs-that-load) のとおり手作業で pack する。
 
 設定 `abyss-dsv41-132g.json` には、モデルカードの普段使いの設定（`STRATA_GLM_TAIL_SKIP=4`、`STRATA_GLM_TAIL_SKIP_DISK=1`、
 `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08`、ディスク読み出し 8 本）が入る。V4.1 の DSpark ドラフターはセットアップしない
@@ -68,8 +68,24 @@ Qwen3.5-MoE の 122B モデル 2 つは、GPU 16 GB + RAM 64 GB 向けの zephel
 2 つ目のシャードにある NextN 層で下書きする）:
 
 ```sh
-./setup-deepseek.sh --model ornith --download-model     # Ornith-1.5-122B IQ3_XXS-B
-./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B IQ3_XXS-B2
+./setup-deepseek.sh --model ornith --download-model     # Ornith-1.5-122B-IQ3_XXS-16G64G
+./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B-IQ3_XXS-16G64G
+```
+
+zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
+から、モデルカードを測ったときの値にする。Qwen3.8 はシャードにある MTP 層で下書きする。V4 の自作版は単体 GPU では DSpark
+なしのほうが速いので、DSpark は入れない）:
+
+```sh
+./setup-deepseek.sh --model ornith --quant 24G64G --download-model   # Ornith-1.5-122B-IQ4_XS-24G64G（68.9 GB）
+./setup-deepseek.sh --model qwen38 --quant 12G32G --download-model   # Qwen3.8-Flash-Next-E448-IQ2_M-12G32G（67.5 GB）
+./setup-deepseek.sh --model qwen38 --download-model                  # Qwen3.8-Flash-Next-IQ3_M-16G64G（86.9 GB）
+./setup-deepseek.sh --model qwen38 --quant 24G64G --download-model   # Qwen3.8-Flash-Next-IQ3_M-24G64G（93.7 GB）
+./setup-deepseek.sh --model glm --download-model                     # GLM-5.3-Flash-IQ2_XS-32G96G（94.1 GB）
+./setup-deepseek.sh --model glm --quant 32G128G --download-model     # GLM-5.3-Flash-IQ3_XXS-32G128G（127.9 GB）
+./setup-deepseek.sh --quant 16G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ1_S-16G64G（61.7 GB）
+./setup-deepseek.sh --quant 32G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G（72.0 GB）
+./setup-deepseek.sh --quant 32G96G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_M-32G96G（96.8 GB）
 ```
 
 `setup-deepseek.sh` は `.venv` を作ってから `tools/abyss_setup.py` を実行する。済んだ手順は飛ばすので、何度実行してもよい:
@@ -567,9 +583,9 @@ v1.3.74 から、エンジンは Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`�
 検証窓、MTP ドラフターも使える。準備は手作業。読める GGUF、pack の作り方（`tools/iq_pack.py --fast`）、ドラフター、
 設定例、測定結果は [docs/qwen38/README.ja.md](qwen38/README.ja.md) にある。要点:
 
-- **自前の版:** [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF)（KL 0.083。RTX 5090 で、32 GB なら
+- **自前の版:** [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF)（KL 0.083。RTX 5090 で、32 GB なら
   MTP ドラフターありで 128.7 tok/s、16 GB なら 95.1）と、
-  [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)（L448: 512 個のうち 448 個のエキスパート、67.5 GB。
+  [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF)（L448: 512 個のうち 448 個のエキスパート、67.5 GB。
   GPU 12 GB + RAM 32 GB 向け）。
 - **ほかの GGUF**（ベータ）: NVIDIA の NVFP4 チェックポイント（v1.3.101）、unsloth の UD 3.1 のセット（v1.3.112〜v1.3.115）。
   それぞれの数字は docs/qwen38 にある。

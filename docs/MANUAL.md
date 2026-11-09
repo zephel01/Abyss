@@ -52,13 +52,13 @@ cd ~/llm/apps/Abyss
 ```
 
 DeepSeek V4.1 Flash 1017 with zephel01's LDLQ GGUF, made for a 32 GB GPU + 96 GB RAM (BETA; `--quant 139G` for the
-quality build, 132G by default for speed; [the model card](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)):
+quality build, 132G by default for speed; [the model card](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF)):
 
 ```sh
 ./setup-deepseek.sh --model v41 --download-model
 ```
 
-The smaller, general-purpose [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF) (207 GB, 256 of 384 experts, Japanese intact, ~30% faster on
+The smaller, general-purpose [Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF) (207 GB, 256 of 384 experts, Japanese intact, ~30% faster on
 32 GB + 96 GB) is not in the setup yet: download its `JA256/` folder and pack it by hand as in
 [docs/deepseek41/README.md](deepseek41/README.md#ggufs-that-load).
 
@@ -70,8 +70,24 @@ The two Qwen3.5-MoE 122B models in zephel01's quants for a 16 GB GPU + 64 GB RAM
 NextN block in its second shard):
 
 ```sh
-./setup-deepseek.sh --model ornith --download-model     # Ornith-1.5-122B IQ3_XXS-B
-./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B IQ3_XXS-B2
+./setup-deepseek.sh --model ornith --download-model     # Ornith-1.5-122B-IQ3_XXS-16G64G
+./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B-IQ3_XXS-16G64G
+```
+
+zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
+card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
+off for the V4 sizes, which run faster without it on a discrete GPU):
+
+```sh
+./setup-deepseek.sh --model ornith --quant 24G64G --download-model   # Ornith-1.5-122B-IQ4_XS-24G64G (68.9 GB)
+./setup-deepseek.sh --model qwen38 --quant 12G32G --download-model   # Qwen3.8-Flash-Next-E448-IQ2_M-12G32G (67.5 GB)
+./setup-deepseek.sh --model qwen38 --download-model                  # Qwen3.8-Flash-Next-IQ3_M-16G64G (86.9 GB)
+./setup-deepseek.sh --model qwen38 --quant 24G64G --download-model   # Qwen3.8-Flash-Next-IQ3_M-24G64G (93.7 GB)
+./setup-deepseek.sh --model glm --download-model                     # GLM-5.3-Flash-IQ2_XS-32G96G (94.1 GB)
+./setup-deepseek.sh --model glm --quant 32G128G --download-model     # GLM-5.3-Flash-IQ3_XXS-32G128G (127.9 GB)
+./setup-deepseek.sh --quant 16G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ1_S-16G64G (61.7 GB)
+./setup-deepseek.sh --quant 32G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G (72.0 GB)
+./setup-deepseek.sh --quant 32G96G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_M-32G96G (96.8 GB)
 ```
 
 `setup-deepseek.sh` makes the `.venv`, then runs `tools/abyss_setup.py`. Each step is skipped when it is already done,
@@ -598,9 +614,9 @@ From v1.3.74 the engine runs Qwen3.8-Flash-Next (llama.cpp's `qwen4exp`) on the 
 prompt path, verify window and MTP drafter. It is set up by hand; [docs/qwen38/README.md](qwen38/README.md) has the
 GGUFs that load, the pack command (`tools/iq_pack.py --fast`), the drafter, a config and the measurements. In short:
 
-- **Our builds:** [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF) (KL 0.083; RTX 5090 at
+- **Our builds:** [16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF) (KL 0.083; RTX 5090 at
   32 GB 128.7 tok/s with the MTP drafter, at 16 GB 95.1) and
-  [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF) (L448: 448 of 512 experts, 67.5 GB, for a
+  [12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF) (L448: 448 of 512 experts, 67.5 GB, for a
   12 GB GPU + 32 GB RAM).
 - **Other GGUFs** (beta): NVIDIA's NVFP4 checkpoints (v1.3.101) and unsloth's UD 3.1 sets (v1.3.112-v1.3.115), each
   with its numbers in docs/qwen38.

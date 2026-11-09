@@ -77,7 +77,7 @@ replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the
 - `--uncensor` on UD-IQ1_M (the edit file built on UD-IQ2_XXS, reused): refusals 92% -> 0%, over-refusals 2% -> 0%,
   MMLU 90% -> 90%, math 19 -> 19 of 20, KL 0.018 against UD-IQ1_M ([UNCENSOR](../UNCENSOR.md)).
 - **Our own LDLQ GGUFs (BETA, 2026-11-02):**
-  [zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF).
+  [zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF).
   All experts re-quantized from the original FP4 with LDLQ ([trench-gguf](https://github.com/zephel01/trench-gguf));
   everything else and the Engram shard are unsloth UD-IQ2_XXS's bytes. Same PC and settings as above (RTX 5090 +
   Radeon 8060S lane, RAM tier 60 GB, DSpark drafter):
@@ -91,7 +91,7 @@ replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the
   Both also found the 8K / 32K needle, passed the 7-turn tool session and wrote clean Japanese. Pick `132G` for
   UD-IQ1_M's speed with a slightly lower KL, `139G` for the best quality at this size (15-20% slower decode on
   32 GB + 96 GB). Pack them with `tools/iq_pack.py --compat-bf16 --gguf <folder>/<name>-00001-of-00006.gguf --out <folder>/pack`.
-- **Compact JA256 (BETA, 2026-11-03):** [zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF), `JA256/`.
+- **Compact JA256 (BETA, 2026-11-03):** [zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF), `JA256/`.
   `132G` with 256 of its 384 experts per layer kept (sliced byte for byte, `expert_count` 256): the experts each layer
   routes to most on Japanese, Chinese, English, code, math and tool-call text, every domain weighted the same, picked on
   2/3 of the text and checked on the rest (kept routes: ja 94.8%, zh 93.6%, en 90.6%, code 83.6%, math 93.8%, tools

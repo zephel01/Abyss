@@ -220,5 +220,23 @@ class ToolkitSwitch(unittest.TestCase):
             cfg, _ = A.write_config("ornith-iq3_xxs-b", self.root / "pack", 65536, 8082, False, None, None, m)
         self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["sampling"]["top_k"], 20)
 
+
+
+class TestVariants(unittest.TestCase):
+    """--model qwen38 / glm / ornith: every quant the setup offers names a variant with a repo and a file prefix"""
+
+    def test_variants_cover_the_quants(self):
+        for name, m in A.MODELS.items():
+            if "variants" not in m:
+                continue
+            if m["quants"] is not None:   # (v4: any folder of unsloth's repo, or one of zephel01's sizes)
+                self.assertEqual(set(m["quants"]), set(m["variants"]), name)
+                self.assertIn(m["quant"], m["variants"], name)
+            for q, v in m["variants"].items():
+                full = {**m, **v}
+                self.assertTrue(full.get("repo", "").startswith("zephel01/"), (name, q))
+                self.assertTrue(full.get("prefix_file"), (name, q))
+                self.assertGreater(full.get("gb", 0), 0, (name, q))
+
 if __name__ == "__main__":
     unittest.main()

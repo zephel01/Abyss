@@ -3,10 +3,15 @@
 
     ./setup-deepseek.sh                      everything below; each step is skipped when it is already done
     ./setup-deepseek.sh --quant UD-IQ3_XXS   another quant of unsloth/DeepSeek-V4-Flash-0731-GGUF
+    ./setup-deepseek.sh --quant 32G96G       zephel01's V4 0731 GGUFs: 16G64G, 32G64G or 32G96G (the PC size)
     ./setup-deepseek.sh --model v41          DeepSeek V4.1 Flash 1017: zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM
                                              (--quant 132G, the default: speed; --quant 139G: quality)
     ./setup-deepseek.sh --model ornith       Ornith-1.5-122B, zephel01's IQ3_XXS-B for a 16 GB GPU + 64 GB RAM
+                                             (--quant 24G64G: the IQ4_XS file for a 24-32 GB GPU + 64 GB RAM)
     ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
+    ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
+                                             16G64G (the default) or 24G64G
+    ./setup-deepseek.sh --model glm          GLM-5.3-Flash, zephel01's GGUFs: --quant 32G96G (the default) or 32G128G
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
     ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
 
@@ -16,7 +21,7 @@ What it does:
   2. Python packages into .venv; llama.cpp's source at the pinned commit (third_party/llama.cpp)
   3. compiles the engine (build/strata) for the GPU - arch 120a on RTX 50, whose MXFP4 kernels need it
   4. the model: unsloth's DeepSeek-V4-Flash-0731-GGUF quant into <data>/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/<quant>
-     (--model v41: zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF, 132G or 139G)
+     (--model v41: zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF, 132G or 139G)
      (asks first, or --download-model), every file checked against Hugging Face's SHA-256
   5. the pack next to the shards (tools/iq_pack.py --compat-bf16)
   6. the run config abyss-<name>.json and the start script run-abyss-<name>.sh in the Abyss folder
@@ -48,23 +53,55 @@ REPO = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
 # the experts' size in GB at the default quant (for the RAM line)
 MODELS = {
     "v4": {"repo": REPO, "quant": "UD-Q2_K_XL", "quants": None, "model_name": "deepseek-v4-flash", "prefix": "dsv4",
-           "title": "DeepSeek V4 Flash 0731", "env": {}, "gb": 97},
+           "title": "DeepSeek V4 Flash 0731", "env": {}, "gb": 97,
+           # --quant 16G64G / 32G64G / 32G96G: zephel01's LDLQ GGUFs of the same model (2026-11-08, one repo a PC size;
+           # any other --quant is a folder of unsloth's repo)
+           "variants": {
+               "16G64G": {"repo": "zephel01/DeepSeek-V4-Flash-0731-IQ1_S-16G64G-GGUF", "folder": "L62",
+                          "prefix_file": "DeepSeek-V4-Flash-0731-L62-", "gb": 62, "vram": 16, "ram": 64},
+               "32G64G": {"repo": "zephel01/DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G-GGUF", "folder": "L72",
+                          "prefix_file": "DeepSeek-V4-Flash-0731-L72-", "gb": 72, "vram": 32, "ram": 64},
+               "32G96G": {"repo": "zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF", "folder": "L97",
+                          "prefix_file": "DeepSeek-V4-Flash-0731-L97-", "gb": 97, "vram": 32, "ram": 96}}},
     # zephel01's own LDLQ GGUF (2026-11-02, BETA): 132G = UD-IQ1_M's types with better rounding (speed), 139G = layers
     # 35-39 one step higher (quality).  The env is the model card's everyday settings (its speed and quality rows)
-    "v41": {"repo": "zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF", "quant": "132G", "quants": ("132G", "139G"),
+    "v41": {"repo": "zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF", "quant": "132G", "quants": ("132G", "139G"),
             "model_name": "deepseek-v4.1-flash-1017", "prefix": "dsv41", "title": "DeepSeek V4.1 Flash 1017",
             "env": {"STRATA_GLM_DISK_READERS": "8", "STRATA_GLM_TAIL_SKIP": "4", "STRATA_GLM_TAIL_SKIP_DISK": "1",
                     "STRATA_GLM_ROUTE_AFFINITY_RAM": "0.08"}, "gb": 140},
     # zephel01's 16 GB GPU + 64 GB RAM quants of the two Qwen3.5-MoE 122B models (the files at the repo's top level;
     # the quant names the local folder).  Ornith's NextN drafter is in its second shard: the engine reads it there
-    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B",),
+    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B", "24G64G"),
                "folder": "", "prefix_file": "Ornith-1.5-122B-IQ3_XXS-B-", "model_name": "ornith-1.5-122b",
                "prefix": "ornith", "title": "Ornith-1.5-122B", "env": {}, "gb": 52, "pack_args": [],
-               "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+               "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+               # (--quant 24G64G: the IQ4_XS file for a 24-32 GB GPU + 64 GB RAM, 2026-11-08)
+               "variants": {"IQ3_XXS-B": {"vram": 16, "ram": 64},
+                            "24G64G": {"repo": "zephel01/Ornith-1.5-122B-IQ4_XS-24G64G-GGUF",
+                                       "prefix_file": "Ornith-1.5-122B-24G64G-", "gb": 69, "vram": 24, "ram": 64}}},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
                "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+    # zephel01's Qwen3.8-Flash-Next and GLM-5.3-Flash GGUFs: one repo a PC size, so each quant (the size) names its
+    # repo, the folder inside it and the shards' file prefix ("variants").  Qwen3.8's MTP drafter is in the shards
+    "qwen38": {"quant": "16G64G", "quants": ("12G32G", "16G64G", "24G64G"), "model_name": "qwen3.8-flash-next",
+               "prefix": "qwen38", "title": "Qwen3.8-Flash-Next", "env": {}, "pack_args": ["--fast"],
+               "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+               "variants": {
+                   "12G32G": {"repo": "zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF", "folder": "L448",
+                              "prefix_file": "Qwen3.8-Flash-Next-12G32G-L448-", "gb": 67, "vram": 12, "ram": 32},
+                   "16G64G": {"repo": "zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF", "folder": "",
+                              "prefix_file": "Qwen3.8-Flash-Next-16G64G-", "gb": 87, "vram": 16, "ram": 64},
+                   "24G64G": {"repo": "zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF", "folder": "",
+                              "prefix_file": "Qwen3.8-Flash-Next-24G64G-", "gb": 94, "vram": 24, "ram": 64}}},
+    "glm": {"quant": "32G96G", "quants": ("32G96G", "32G128G"), "model_name": "glm-5.3-flash", "prefix": "glm",
+            "title": "GLM-5.3-Flash", "env": {}, "pack_args": [], "sampling": {"temperature": 1.0, "top_p": 0.95},
+            "variants": {
+                "32G96G": {"repo": "zephel01/GLM-5.3-Flash-IQ2_XS-32G96G-GGUF", "folder": "S1",
+                           "prefix_file": "GLM-5.3-Flash-S1-", "gb": 94, "vram": 32, "ram": 96},
+                "32G128G": {"repo": "zephel01/GLM-5.3-Flash-IQ3_XXS-32G128G-GGUF", "folder": "Q120d",
+                            "prefix_file": "GLM-5.3-Flash-Q120d-", "gb": 128, "vram": 32, "ram": 128}}},
 }
 HF_FILE = "https://huggingface.co/{repo}/resolve/main/{path}"
 HF_TREE = "https://huggingface.co/api/models/{repo}/tree/main/{folder}"
@@ -369,9 +406,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM)")
-    ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one); v41: 132G "
-                    "(default, speed) or 139G (quality)")
+                    "ornith: Ornith-1.5-122B, qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
+    ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default) or 24G64G; qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")
@@ -402,10 +440,13 @@ def main() -> int:
         make_tools(tools)
         return 0
     model = MODELS[a.model]
-    repo = model["repo"]
     quant = a.quant or model["quant"]
     if model["quants"] and quant not in model["quants"]:
         ap.error(f"--model {a.model} has the quants {', '.join(model['quants'])}")
+    own = quant in model.get("variants", {})   # (the quant is a PC size and picks zephel01's repo for it)
+    if own:
+        model = {**model, **model["variants"][quant]}
+    repo = model["repo"]
     if a.dspark and a.model != "v4":
         ap.error("--dspark: the DSpark drafter is set up for DeepSeek V4 only (V4.1: docs/deepseek41/README.md)")
     name = a.name or model["prefix"] + "-" + quant.lower().removeprefix("ud-")
@@ -435,7 +476,12 @@ def main() -> int:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
-    if a.model == "v4":
+    if own and a.model != "ornith" or quant == "24G64G":
+        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is made for a {model['vram']} GB GPU + {model['ram']} GB RAM: with "
+             f"VRAM, ~{model['gb']} GB holds every expert; less reads from the SSD)")
+        if S.ram_gb() + (gpus[0].get("vram_gb") or 0 if gpus else 0) < model["gb"] * 0.8:
+            S.say(f"  (this PC has less: a smaller --quant ({', '.join(model['variants'])}) may suit it better)")
+    elif a.model == "v4":
         S.ok(f"RAM {S.ram_gb():.0f} GB (with VRAM, ~100 GB holds every expert of the 97 GB quant; less reads from the SSD)")
     elif a.model in ("ornith", "qwen35"):
         S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 16 GB GPU + 64 GB RAM: with VRAM, ~60 GB holds every expert of the "
@@ -492,6 +538,11 @@ def main() -> int:
     extra = dict(hip_extra or {})
     if model["env"]:
         extra["env"] = {**model["env"], **extra.get("env", {})}
+    if a.model in ("qwen38", "glm") and S.ram_gb() < 160:
+        # the RAM tier the model cards were measured with: 64 GB PC -> 46, 32 GB -> 20, 96 GB -> 60 (the rest for the OS,
+        # the page cache - Qwen3.8's PLE table is read from the SSD through it - and the server)
+        ram = S.ram_gb()
+        extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(12, round(ram) - (12 if ram < 48 else 18 if ram < 80 else 34)))
     if a.model == "v41" and S.ram_gb() < 160:
         # a RAM tier that leaves ~34 GB to the page cache and the rest of the PC: V4.1's Engram rows and SSD experts keep
         # the page cache full, and without a cap systemd-oomd stops the server or the session that started it (the
@@ -511,11 +562,15 @@ def main() -> int:
         S.warn(f"the GPU check did not run ({e or 'see above'}): the engine's own choices stay")
 
     S.step(7, "the DSpark drafter")
-    if a.model == "v4":
+    if a.model == "v4" and own and not a.dspark:
+        # (the model cards: on a 32 GB GPU the drafter's ~6.5 GB push experts to the SSD - 69.1 -> 62.5 tok/s at 4K)
+        S.ok("DSpark drafter: off - zephel01's V4 GGUFs run faster without it on a discrete GPU (--dspark turns it on)")
+    elif a.model == "v4":
         dspark_step(a, data, cfg, fresh, had, gpus, backend)
     else:
         S.ok("DSpark drafter: set up for DeepSeek V4 only" + (" (V4.1: by hand, docs/deepseek41/README.md)" if a.model == "v41"
-             else " (Ornith drafts with its own NextN block from the shards)" if a.model == "ornith" else ""))
+             else " (Ornith drafts with its own NextN block from the shards)" if a.model == "ornith"
+             else " (Qwen3.8 drafts with its own MTP block from the shards)" if a.model == "qwen38" else ""))
 
     S.step(8, "Abyss-tools")
     make_tools(tools)

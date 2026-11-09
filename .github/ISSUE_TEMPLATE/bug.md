@@ -22,7 +22,7 @@ prompt or the conversation was):
 
 **What you expected**:
 
-**Which files** (the GGUF folder, e.g. `zephel01/Qwen3.8-Flash-Next-16G64G-GGUF`, and the quant):
+**Which files** (the GGUF folder, e.g. `zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF`, and the quant):
 
 **abyss-report.txt** (attach it, or paste it inside a ``` block):
 

@@ -242,8 +242,8 @@ From the RTX 5090 runs above (v1.3.112-v1.3.115):
 | --- | --- |
 | 32 GB + 96 GB, quality | unsloth UD 3.1 UD-IQ4_XS (KL 0.077) |
 | 32 GB + 96 GB, speed and quality | unsloth UD 3.1 UD-IQ3_XXS (KL 0.099, 133 tok/s with the drafter) |
-| 16 GB + 64 GB | zephel01's [16G64G build](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-16G64G-GGUF) (KL 0.083; 16 GB: 96.4 tok/s with the drafter) |
-| 12 GB + 32 GB | zephel01's [12G32G build](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF) (L448: 448 of 512 experts, 67.5 GB, beta) |
+| 16 GB + 64 GB | zephel01's [16G64G build](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF) (KL 0.083; 16 GB: 96.4 tok/s with the drafter) |
+| 12 GB + 32 GB | zephel01's [12G32G build](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF) (L448: 448 of 512 experts, 67.5 GB, beta) |
 | the smallest and fastest | unsloth UD 3.1 UD-IQ1_M (KL 0.190, 152 tok/s with the drafter at 32 GB) |
 
 ## Limits
