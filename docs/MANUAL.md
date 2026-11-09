@@ -30,7 +30,7 @@ installer) is kept under [docs/maya/](maya/README.md).
 
 | | Tested | Notes |
 | --- | --- | --- |
-| OS | Ubuntu (Linux) | Windows is not tested for DeepSeek V4 |
+| OS | Ubuntu (Linux) | Windows 11: run by users (`setup-deepseek.bat`; RTX 4090 #31, RX 7900 XT #5), not tested here |
 | GPU | RTX 5090 (32 GB), RTX 3090 | build for your GPU's architecture (`120a` for RTX 50, `86` for RTX 30; several at once for a split). On pre-Blackwell GPUs the MXFP4 expert rows run through the q8_1 path instead of FP4 MMA; before Ampere (sm_80) the indexer and the prompt attention use the older FP32 kernels. A V100 (sm_70) builds with a CUDA 12 toolkit but has not been run. AMD Radeon: see "AMD GPUs" (experimental) |
 | RAM | 94 GB | the model is 96.8 GB: with VRAM + RAM above ~100 GB every expert stays in memory; with less, the rest are read from the SSD (works, slower) |
 | Disk | NVMe SSD, ~100 GB free | the GGUF files; the pack adds 0.2 GB |

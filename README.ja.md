@@ -6,7 +6,7 @@
 家庭用の GPU 1 枚で動かす。エキスパートは VRAM・RAM・SSD に分けて置く。**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux%20(x86__64%2C%20ARM64)-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20(x86__64%2C%20ARM64)%20%C2%B7%20Windows-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900?logo=nvidia&logoColor=white)
 ![ROCm](https://img.shields.io/badge/ROCm-7%20(experimental)-ED1C24?logo=amd&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-RTX%205090%20%C2%B7%20RTX%203090%20%C2%B7%20AI%20PRO%20R9700%20%C2%B7%20Radeon%208060S%20%C2%B7%20DGX%20Spark%20(GB10)-76B900)
@@ -71,6 +71,9 @@ cd ~/llm/apps/Abyss
 ../Abyss-tools/abyss.sh start                         # → http://127.0.0.1:8082/
 ```
 
+Windows 11 では `setup-deepseek.bat` をダブルクリック（同じオプションも使えます。例: `setup-deepseek.bat --model qwen38
+--download-model`）。そのあと `START-ABYSS.bat --config abyss-<名前>.json`（セットアップが表示した名前）で起動します。
+
 API で試す:
 
 ```sh
@@ -103,7 +106,7 @@ RTX 4090 で +12%、[#39](https://github.com/zephel01/Abyss/issues/39)）。正�
 
 | | |
 | --- | --- |
-| OS | Linux（Ubuntu で確認）。DGX Spark では ARM64（DGX OS、ベータ） |
+| OS | Linux（Ubuntu で確認）。Windows 11 は利用者が動かして確認（`setup-deepseek.bat`。DeepSeek V4 Flash 0731 を RTX 4090 で [#31](https://github.com/zephel01/Abyss/issues/31)、RX 7900 XT で [#5](https://github.com/zephel01/Abyss/issues/5) / [#9](https://github.com/zephel01/Abyss/issues/9)、DeepSeek V4.1 は [#6](https://github.com/zephel01/Abyss/issues/6)。こちらの確認は Linux）。DGX Spark では ARM64（DGX OS、ベータ） |
 | GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定、DGX Spark（GB10）はベータ。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S と AI PRO R9700（8060S をレーンに）で動作。[docs/amd](docs/amd/README.ja.md) |
 | メモリ | VRAM + RAM がファイルの大きさくらいあれば、全エキスパートがメモリに載る（少なくても SSD から読んで動く） |
 | ディスク | 下の容量が空いた NVMe SSD（モデルがメモリに入りきらないときは、速いほどよい） |
@@ -386,7 +389,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 - [ ] DeepSeek V4 / V4.1 の EXL3 量子化、RDNA 向けに調整した iGPU のトレリス計算
 - [x] DeepSeek V4 Flash 0731 用の DSpark ドラフトモデル（v1.3.43、任意。AI PRO R9700 と DGX Spark で計測）
 - [ ] 会話のディスク保存
-- [ ] DeepSeek V4 での Windows（確認したのは Linux。RX 7900 XT でのコミュニティビルドは [AMD HIP](docs/maya/AMD_HIP.md)）
+- [x] Windows 11（`setup-deepseek.bat`）: 利用者が RTX 4090 と RX 7900 XT で動作を確認（[#31](https://github.com/zephel01/Abyss/issues/31)、[#5](https://github.com/zephel01/Abyss/issues/5)、[AMD HIP](docs/maya/AMD_HIP.md)）。こちらの確認は Linux
 - [x] DeepSeek V4.1: 投機デコード（DSpark のドラフト、v1.3.53、任意）と prompt の attention のまとめ処理（v1.3.60）
 - [x] DeepSeek V4.1 を自作の GGUF でコマンド 1 つのセットアップ（`./setup-deepseek.sh --model v41`、v1.3.100）
 - [x] Qwen3.8-Flash-Next を GPU 2 枚で（層の分割、MTP ドラフターも。ベータ、v1.3.109〜v1.3.110）

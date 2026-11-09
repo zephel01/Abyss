@@ -6,7 +6,7 @@
 on one consumer GPU, with the experts spread over VRAM, RAM and the SSD.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux%20(x86__64%2C%20ARM64)-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20(x86__64%2C%20ARM64)%20%C2%B7%20Windows-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900?logo=nvidia&logoColor=white)
 ![ROCm](https://img.shields.io/badge/ROCm-7%20(experimental)-ED1C24?logo=amd&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-RTX%205090%20%C2%B7%20RTX%203090%20%C2%B7%20AI%20PRO%20R9700%20%C2%B7%20Radeon%208060S%20%C2%B7%20DGX%20Spark%20(GB10)-76B900)
@@ -72,6 +72,9 @@ cd ~/llm/apps/Abyss
 ../Abyss-tools/abyss.sh start                         # → http://127.0.0.1:8082/
 ```
 
+Windows 11: double-click `setup-deepseek.bat` (or run it with the same options, e.g. `setup-deepseek.bat --model qwen38
+--download-model`), then start it with `START-ABYSS.bat --config abyss-<name>.json` (the name the setup printed).
+
 Then talk to it:
 
 ```sh
@@ -105,7 +108,7 @@ Every step is skipped when done, so it is safe to run again. Options: `--quant`,
 
 | | |
 | --- | --- |
-| OS | Linux (tested on Ubuntu); ARM64 on a DGX Spark (DGX OS, beta) |
+| OS | Linux (tested on Ubuntu); Windows 11, run by users (`setup-deepseek.bat`; RTX 4090 with DeepSeek V4 Flash 0731 in [#31](https://github.com/zephel01/Abyss/issues/31), RX 7900 XT in [#5](https://github.com/zephel01/Abyss/issues/5) / [#9](https://github.com/zephel01/Abyss/issues/9), DeepSeek V4.1 in [#6](https://github.com/zephel01/Abyss/issues/6); we test on Linux); ARM64 on a DGX Spark (DGX OS, beta) |
 | GPU | NVIDIA: RTX 5090 32 GB and RTX 3090 measured, DGX Spark (GB10) beta; a V100 builds with CUDA 12 (not run yet). AMD Radeon through HIP, experimental: Radeon 8060S and AI PRO R9700 (with the 8060S as its lane) run; see [docs/amd](docs/amd/README.md) |
 | Memory | VRAM + RAM of about the file's size keeps every expert in memory (less works, reading from the SSD) |
 | Disk | an NVMe SSD with the space below (the faster, the better when the model does not fit in memory) |
@@ -402,7 +405,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 - [ ] EXL3 quants of DeepSeek V4 / V4.1; an iGPU trellis kernel built for RDNA
 - [x] DeepSeek's DSpark drafter for V4 Flash 0731 (v1.3.43, opt-in; measured on an AI PRO R9700 and a DGX Spark)
 - [ ] Conversation slots on disk
-- [ ] Windows for DeepSeek V4 (Linux tested; community builds on an RX 7900 XT, see [AMD HIP](docs/maya/AMD_HIP.md))
+- [x] Windows 11 (`setup-deepseek.bat`): run by users on an RTX 4090 and an RX 7900 XT ([#31](https://github.com/zephel01/Abyss/issues/31), [#5](https://github.com/zephel01/Abyss/issues/5), [AMD HIP](docs/maya/AMD_HIP.md)); we test on Linux
 - [x] DeepSeek V4.1: speculative decoding (the DSpark drafter, v1.3.53, opt-in) and a batched prompt attention (v1.3.60)
 - [x] DeepSeek V4.1 in the one-command setup with our own GGUF (`./setup-deepseek.sh --model v41`, v1.3.100)
 - [x] Qwen3.8-Flash-Next on two GPUs (a layer split with the MTP drafter; beta, v1.3.109-v1.3.110)

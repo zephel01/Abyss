@@ -30,7 +30,7 @@ Abyss は [Project Maya](https://github.com/mw00/project-maya)（MIT）をコピ
 
 | | 確認した環境 | 補足 |
 | --- | --- | --- |
-| OS | Ubuntu (Linux) | Windows は DeepSeek V4 では未確認 |
+| OS | Ubuntu (Linux) | Windows 11 は利用者が確認（`setup-deepseek.bat`。RTX 4090 #31、RX 7900 XT #5）。こちらでは未確認 |
 | GPU | RTX 5090 (32 GB)、RTX 3090 | GPU のアーキテクチャに合わせてビルドする（RTX 50 は `120a`、RTX 30 は `86`。分割するときは複数まとめて）。Blackwell より前の GPU では MXFP4 のエキスパートは FP4 MMA ではなく q8_1 の経路で計算する。Ampere（sm_80）より前では indexer と prompt の attention は従来の FP32 カーネルを使う。V100（sm_70）は CUDA 12 でビルドできるが実機は未確認。AMD Radeon は「AMD の GPU」（試験的） |
 | RAM | 94 GB | モデルは 96.8 GB。VRAM + RAM が約 100 GB を超えれば全エキスパートがメモリに載る。足りない分は SSD から読む（動くが遅い） |
 | ディスク | NVMe SSD、空き約 100 GB | GGUF ファイル。pack は 0.2 GB |
