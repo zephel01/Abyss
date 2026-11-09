@@ -128,6 +128,15 @@ RTX 4090 で +12%、[#39](https://github.com/zephel01/Abyss/issues/39)）。正�
 ほかに、エンジンのビルド・llama.cpp のソース・Python パッケージで約 3 GB。モデルは NVMe SSD に置く。VRAM + RAM に
 入りきらないときは、SSD の速さが生成の速さを決める。
 
+## 🖼️ ダッシュボード
+
+![ダッシュボードの Monitor: 生成 92.1 tok/s、VRAM と pinned RAM にあるエキスパート、GPU](docs/img/dashboard-monitor.png)
+
+ブラウザのダッシュボード（`http://127.0.0.1:8082/` の Monitor タブ）で、3,000 トークンのコーディングの答えを書き終えた直後です。
+`./setup-deepseek.sh --model qwen38` で入れた Qwen3.8-Flash-Next-IQ3_M-16G64G を、RTX 5090（32 GB）+ RAM 123 GB で動かしています。
+生成 92.1 tok/s、1 トークンで使うエキスパートの 83.8% が VRAM にあり、残りは pinned RAM、SSD から読んだものは 0 です。Chat タブがチャットで、
+同じサーバーが OpenAI / Anthropic の API にも答えます。
+
 ## 📊 性能
 
 unsloth の [DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) `UD-Q2_K_XL`

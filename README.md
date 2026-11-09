@@ -130,6 +130,14 @@ What the setup puts on the disk, per model (the pack is an index next to the GGU
 Plus ~3 GB for the engine build, llama.cpp's source and the Python packages. Keep the model on an NVMe SSD; when it
 does not fit in VRAM + RAM, the SSD's speed sets the decode speed.
 
+## 🖼️ The dashboard
+
+![The dashboard's Monitor: decode 92.1 tok/s, the experts in VRAM and pinned RAM, the GPU](docs/img/dashboard-monitor.png)
+
+The browser dashboard (`http://127.0.0.1:8082/`, Monitor tab) right after a 3,000-token coding answer: Qwen3.8-Flash-Next-IQ3_M-16G64G
+set up with `./setup-deepseek.sh --model qwen38` on an RTX 5090 (32 GB) + 123 GB RAM - 92.1 tok/s decode, 83.8% of the
+experts a token found in VRAM, the rest in pinned RAM, none read from the SSD. The Chat tab is the chat; the same server answers the OpenAI / Anthropic APIs.
+
 ## 📊 Performance
 
 unsloth's [DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) `UD-Q2_K_XL`
