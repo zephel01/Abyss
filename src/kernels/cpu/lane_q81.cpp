@@ -704,6 +704,11 @@ bool lane_q81_vbmi_type(int) noexcept { return false; }
 void lane_q81_vbmi_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 #endif
 
+#if !defined(STRATA_LANE_Q81_VNNI)
+// (no AVX-VNNI build here - MSVC, or off x86: lane_q81_rows never calls it; the test's table needs the name)
+void lane_q81_vnni_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
+#endif
+
 bool lane_q81_fast(int t) noexcept {
 #if defined(__x86_64__) || defined(_M_X64)
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr &&
@@ -728,7 +733,7 @@ void lane_q81_rows(int t, const uint8_t* w, size_t row_bytes, int n, const void*
     }
     if (avx2 && lane_q81_avx2_type(t)) {
 #if defined(STRATA_LANE_Q81_VNNI)
-        static const bool vnni = __builtin_cpu_supports("avxvnni") && std::getenv("STRATA_NO_AVXVNNI") == nullptr;
+        static const bool vnni = cpu_avxvnni_ok() && std::getenv("STRATA_NO_AVXVNNI") == nullptr;
         if (vnni) {
             lane_q81_vnni_rows(t, w, row_bytes, n, act, nt, out, r0, r1);
             return;

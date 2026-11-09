@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
                 const double tn = time([&] { kc::lane_q81_rows(T.t, w.data(), rb, n, ap.data(), nt, op.data(), 0, rows); });
                 const double t2 = !kc::lane_q81_avx2_type(T.t) ? 0.0 : time([&] {
                     kc::lane_q81_avx2_rows(T.t, w.data(), rb, n, ap.data(), nt, op.data(), 0, rows); });
-                const double t3 = !kc::lane_q81_avx2_type(T.t) || !__builtin_cpu_supports("avxvnni") ? 0.0 : time([&] {
+                const double t3 = !kc::lane_q81_avx2_type(T.t) || !kc::cpu_avxvnni_ok() ? 0.0 : time([&] {
                     kc::lane_q81_vnni_rows(T.t, w.data(), rb, n, ap.data(), nt, op.data(), 0, rows); });
                 const double tv = !(kc::cpu_avx512_ok() && kc::lane_q81_vbmi_type(T.t)) ? 0.0 : time([&] {
                     kc::lane_q81_vbmi_rows(T.t, w.data(), rb, n, ap.data(), nt, op.data(), 0, rows); });
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
                 {"scalar", kc::lane_q81_rows_scalar, true},
                 {"avx2", kc::lane_q81_avx2_rows, kc::cpu_avx2_ok() && kc::lane_q81_avx2_type(T.t)},
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
-                {"vnni", kc::lane_q81_vnni_rows, kc::cpu_avx2_ok() && kc::lane_q81_avx2_type(T.t) && __builtin_cpu_supports("avxvnni")},
+                {"vnni", kc::lane_q81_vnni_rows, kc::cpu_avx2_ok() && kc::lane_q81_avx2_type(T.t) && kc::cpu_avxvnni_ok()},
 #endif
                 {"vbmi", kc::lane_q81_vbmi_rows, kc::cpu_avx512_ok() && kc::lane_q81_vbmi_type(T.t)},
             };
