@@ -621,6 +621,21 @@ class TerminalViewTest(unittest.TestCase):
         for gone in ("requests", "totals", "_keyed"):
             self.assertNotIn(gone, v)
 
+    def test_bench_drafter_and_old_swap_in_the_view(self):
+        from serve.terminal_view import view_json
+        other = {"line": "Abyss v1.3.122 | Ornith-1.5-397B-32G128G | ...", "decode": 44.2, "prompt8k": 681.0,
+                 "model": "Ornith-1.5-397B-32G128G", "config": "cfg_pc8.json"}
+        m = self.F.metrics("r9700")
+        m["engine"] = dict(m["engine"], drafter="none", mtp=1)
+        m["hardware"] = dict(m["hardware"], swap_used=int(2.2 * 2**30), psi_mem_some=0.0, psi_mem_full=0.0,
+                             ram_used=11 * 2**30, ram_total=123 * 2**30)
+        seen = {}
+        for _ in range(3):
+            v = view_json(m, self.F.health("r9700"), dict(self.F.local("r9700"), bench=other), None, seen)
+        self.assertIsNone(v["bench"])                            # another model's --bench: not shown
+        self.assertEqual(v["drafter"]["kind"], "mtp")            # the engine's "none" is not the drafter's name
+        self.assertFalse(any(t.lower().startswith(("memory is tight", "memory pressure")) for t, _ in v["banners"]))
+
     def test_token_split_and_tone(self):
         from serve.terminal_view import token_split, bottleneck
         self.assertIsNone(token_split(None))

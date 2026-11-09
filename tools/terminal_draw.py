@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import time
 
-from terminal_model import pretty_name
+from terminal_model import SWAP_GROWING, memory_tight, pretty_name
 
 # ------------------------------------------------------------------------------------------------ the palettes
 PALETTES = {
@@ -684,7 +684,7 @@ def memory_bars(v: dict, w: int) -> list:
     rf = r["used"] / r["total"] if r.get("used") is not None and r.get("total") else None
     sv = L(gib(r.get("used")), "ink b", f"/{gib(r.get('total'), 0)} GB", "muted")
     if r.get("swap_total"):
-        sv.add("  swap ", "muted").add(gib(r.get("swap_used")), "warn b" if (r.get("swap_used") or 0) > 2**30 else "ink")
+        sv.add("  swap ", "muted").add(gib(r.get("swap_used")), "warn b" if (r.get("swap_growth") or 0) >= SWAP_GROWING else "ink")
     if r.get("psi_some") is not None:
         sv.add("  psi ", "muted").add(f"{r['psi_some']:.0f}/{(r.get('psi_full') or 0):.0f}",
                                       "alert b" if (r.get("psi_full") or 0) >= 5 else
@@ -1261,7 +1261,7 @@ def speed_view(v: dict, w: int, h: int, ui: dict) -> list:
               kv("RAM of misses ", pct(t["ram_fetch"] / (t["ram_fetch"] + t["disk"])) if t.get("ram_fetch") is not None
                  and t.get("disk") is not None and t["ram_fetch"] + t["disk"] > 0 else DASH, kw=16),
               kv("tail skip ", f(tt["tail_skip"], 1) if tt else DASH, "/tok", kw=16)]
-    drafter = [kv("kind ", (dr.get("kind") or "none").upper(), kw=14),
+    drafter = [kv("kind ", (dr.get("kind") or ("--" if dr.get("total") is not None else "none")).upper(), kw=14),
                kv("live ", pct(dr.get("live")), kw=14) if dr.get("live") is not None else
                kv("last request ", pct(dr.get("last")), kw=14),
                kv("total ", pct(dr.get("total")), f"  ({f(dr.get('accepted'))} of {f(dr.get('offered'))})", kw=14),
@@ -1338,7 +1338,7 @@ def diagnose(v: dict) -> list:
     tt = v.get("tt")
     out = []
     r = v["ram"]
-    if (r.get("psi_full") or 0) >= 5 or (r.get("swap_used") or 0) > 2 * 2**30:
+    if (r.get("psi_full") or 0) >= 5 or memory_tight(r):
         out.append(("Memory pressure: the RAM tier and the page cache fight. Lower STRATA_GLM_RAM_GB or close apps.",
                     "alert b"))
     if not tt:

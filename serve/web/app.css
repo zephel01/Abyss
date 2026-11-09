@@ -540,3 +540,13 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
   .ttlane > span.small { max-width: 70%; }
 }
 .monitor .page-head { flex-wrap: wrap; }
+/* the bottleneck of the last answer (nothing running): the same places marked, in the info tone - not an alarm */
+[data-bn="info"] .metric-card.is-bottleneck { border-color: var(--st-info); box-shadow: 0 0 0 1px var(--st-info), var(--st-sh-card); }
+[data-bn="info"] .metric-card.is-bottleneck .st-metric__label::after,
+[data-bn="info"] .tierlegend__item.is-bottleneck::after { content: "last answer"; background: var(--st-info); color: var(--st-accent-ink); }
+[data-bn="info"] .st-table tr.is-bottleneck td { background: var(--st-info-tint); }
+[data-bn="info"] .st-table tr.is-bottleneck td:first-child { box-shadow: inset 4px 0 0 var(--st-info); }
+[data-bn="info"] .ttbar__seg.is-bottleneck { background: var(--st-info); }
+[data-bn="info"] .tt-legend__item.is-bottleneck, [data-bn="info"] .ttlane.is-bottleneck { color: var(--st-info-text); }
+[data-bn="info"] .tt-legend__item.is-bottleneck .dot, [data-bn="info"] .ttlane.is-bottleneck .ttlane__bar i { background: var(--st-info); }
+[data-bn="info"] .fact.is-hot b { color: var(--st-info-text); }

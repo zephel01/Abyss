@@ -582,6 +582,60 @@ def short_gpu(name: str) -> str:
     return " ".join(name.split())
 
 
+DRAFTERS = {"mtp": "MTP", "nextn": "NextN", "dspark": "DSpark", "dflash": "DFlash"}   # the drafter's name as shown
+NO_DRAFTER = ("", "none", "off", "0", "false", "no")
+
+
+def drafter_kind(eng: dict) -> str | None:
+    """The drafter this engine runs (INFO drafter=, else mtp=1 -> "mtp"); None when it names none ("none" is the
+    engine's word for no external drafter - its own MTP / NextN head still counts via mtp=1)."""
+    k = clean(eng.get("drafter") or "", 12).lower()
+    if k not in NO_DRAFTER:
+        return k
+    return "mtp" if str(eng.get("mtp") or "0") not in ("0", "") else None
+
+
+def _key(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def bench_for(bench: dict | None, cfg: dict | None, eng: dict | None, health: dict | None = None) -> dict | None:
+    """The last --bench (abyss-bench.txt) only when it measured the model running now: the same run config, else the
+    same model (its display name) - another model's numbers next to this one's would mislead.  None otherwise."""
+    if not bench:
+        return None
+    cfg, eng, health = cfg or {}, eng or {}, health or {}
+    here_cfg = {_key(Path(str(x)).name) for x in (cfg.get("file"), eng.get("config"), health.get("config")) if x}
+    if bench.get("config") and _key(Path(str(bench["config"])).name) in here_cfg:
+        return bench
+    names = {_key(x) for x in (eng.get("display_name"), cfg.get("display")) if x}
+    if bench.get("model") and _key(bench["model"]) in names:
+        return bench
+    return None
+
+
+SWAP_WINDOW_S = 60.0
+SWAP_GROWING = 256 * 2**20             # swap up this much within SWAP_WINDOW_S: the system is swapping now
+
+
+def swap_growth(used, seen: dict | None, now: float):
+    """How much swap grew over the last minute (bytes, >= 0), from the readings `seen` keeps; None without a history
+    (one reading) - old swap that just sits there is not pressure."""
+    if seen is None or used is None:
+        return None
+    hist = [(t, u) for t, u in seen.get("swap") or [] if now - t <= SWAP_WINDOW_S]
+    hist.append((now, used))
+    seen["swap"] = hist
+    if len(hist) < 2:
+        return None
+    return max(0.0, used - min(u for _, u in hist))
+
+
+def memory_tight(r: dict) -> bool:
+    """Memory pressure now: the kernel's PSI says tasks wait for memory, or swap is growing - not swap left over."""
+    return (r.get("psi_some") or 0) >= 10 or (r.get("swap_growth") or 0) >= SWAP_GROWING
+
+
 def derive(link: Link | None, local: dict | None = None, log: EngineLog | None = None, now: float | None = None,
            seen: dict | None = None) -> dict:
     """Everything the screen shows, from the last poll (`link`), this PC's facts (`local`: the config's info, whether
@@ -762,6 +816,7 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
                 "cached": num(hw.get("ram_cached")), "swap_used": num(hw.get("swap_used")),
                 "swap_total": num(hw.get("swap_total")), "psi_some": num(hw.get("psi_mem_some")),
                 "psi_full": num(hw.get("psi_mem_full")), "spark": list(hist.get("ram_used") or [])}
+    v["ram"]["swap_growth"] = swap_growth(v["ram"]["swap_used"], seen, now)
     drives = []
     sdrives = {d.get("name"): d for d in st.get("drives") or []}
     for dv in hw.get("drives") or []:
@@ -796,8 +851,7 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
     sr, sa, so = num(tn.get("spec_rounds")), num(tn.get("spec_acc")), num(tn.get("spec_offered"))
     gen_n = num(live.get("generated")) if gen else None
     v["drafter"] = {"last": da / do if da is not None and do else None, "total": ta / to if ta is not None and to
-                    else None, "accepted": ta, "offered": to, "kind": clean(eng.get("drafter") or "", 12) or
-                    ("mtp" if str(eng.get("mtp") or "0") not in ("0", "") else None),
+                    else None, "accepted": ta, "offered": to, "kind": drafter_kind(eng),
                     "live": sa / so if gen and sa is not None and so else None,
                     "step": gen_n / sr if gen and gen_n and sr else lg / lr if lg and lr else None,
                     "step_label": "live" if gen and gen_n and sr else "last request" if lg and lr else None}
@@ -827,7 +881,7 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
                         "gb": (num(hl.get("done_gb")), num(hl.get("total_gb"))) if hl else None}
     else:
         v["loading"] = None
-    v["bench"] = local.get("bench")
+    v["bench"] = bench_for(local.get("bench"), cfg, eng, health)
     v["banners"] = banners(v, log, now)
     return v
 
@@ -864,10 +918,11 @@ def banners(v: dict, log: EngineLog | None, now: float) -> list:
     if (r.get("psi_full") or 0) >= 5 or (avail is not None and avail < 2 * 2**30):
         out.append(("MEMORY PRESSURE: the system may stop the server (oomd) - lower STRATA_GLM_RAM_GB / close apps",
                     "alert"))
-    elif (r.get("psi_some") or 0) >= 10 or (r.get("swap_used") or 0) > 2 * 2**30 or \
-            (avail is not None and avail < 4 * 2**30):
+    elif memory_tight(r) or (avail is not None and avail < 4 * 2**30):
+        grow = r.get("swap_growth")
         out.append(("memory is tight: swapping or waiting for RAM (PSI some "
-                    f"{(r.get('psi_some') or 0):.0f}%, swap {(r.get('swap_used') or 0) / 2**30:.1f} GB)", "warn"))
+                    f"{(r.get('psi_some') or 0):.0f}%, swap {(r.get('swap_used') or 0) / 2**30:.1f} GB"
+                    + (f", +{grow / 2**20:.0f} MB in the last minute" if grow else "") + ")", "warn"))
     if v["conn"] == "stale":
         out.append((f"no answer from the server for {v['age']:.0f} s - the numbers are old", "warn"))
     if v["conn"] == "auth":

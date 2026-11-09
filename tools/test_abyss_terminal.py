@@ -207,6 +207,48 @@ class Numbers(unittest.TestCase):
         self.assertEqual(v["drafter"]["total"], 214 / 402)
         self.assertIn(("UNCENSOR", "alert"), v["badges"])
 
+    def test_bench_only_for_the_model_running(self):
+        # the r9700 fixture's --bench measured its own config: kept; another model's bench (an Ornith run left in
+        # abyss-bench.txt while Qwen3.8 serves) is not shown beside this one
+        self.assertEqual(view("r9700")["bench"]["decode"], 25.1)
+        other = {"line": "Abyss v1.3.122 | Ornith-1.5-397B-32G128G | ...", "decode": 44.2, "prompt8k": 681.0,
+                 "model": "Ornith-1.5-397B-32G128G", "config": "cfg_pc8.json"}
+        cfg = {"file": "qwen38.cfg.json", "display": "Qwen3.8-Flash-Next-IQ3_S"}
+        self.assertIsNone(M.bench_for(other, cfg, {"display_name": "Qwen3.8-Flash-Next-IQ3_S"}))
+        self.assertIsNone(M.bench_for(other, {}, {}))                              # (nothing known here: hidden)
+        self.assertIs(M.bench_for(other, {"file": "cfg_pc8.json"}, {}), other)      # the same config
+        self.assertIs(M.bench_for(other, {}, {"display_name": "Ornith-1.5-397B-32G128G"}), other)   # the same model
+        local = dict(F.local("r9700"), bench=other)
+        v = M.derive(FakeLink("r9700"), local, log_of("r9700"), seen={})
+        self.assertIsNone(v["bench"])
+        self.assertNotIn("bench", "".join(str(x) for ln in D.speed_tile(v, "decode", 40) for x in ln))
+
+    def test_the_drafter_s_kind(self):
+        self.assertEqual(M.drafter_kind({"drafter": "none", "mtp": 1}), "mtp")     # the engine's "none": its own head
+        self.assertEqual(M.drafter_kind({"drafter": "none", "mtp": 0}), None)
+        self.assertEqual(M.drafter_kind({"drafter": "dspark"}), "dspark")
+        self.assertEqual(M.drafter_kind({"drafter": "NextN"}), "nextn")
+        self.assertEqual(M.drafter_kind({}), None)
+
+    def test_old_swap_is_not_memory_pressure(self):
+        seen = {}
+        r = {"total": 123 * 2**30, "used": 11 * 2**30, "psi_some": 0.0, "psi_full": 0.0, "swap_used": 2.2 * 2**30}
+        now = 1000.0
+        for i in range(5):                                       # 2.2 GB of swap, still, PSI 0 / 0: no warning
+            r["swap_growth"] = M.swap_growth(r["swap_used"], seen, now + i)
+        v = {"gpu": {}, "cards": [], "pcie": None, "ram": r, "conn": "live", "remote": False, "url": None}
+        self.assertEqual(r["swap_growth"], 0.0)
+        self.assertFalse(M.memory_tight(r))
+        self.assertFalse(any(t.lower().startswith(("memory is tight", "memory pressure")) for t, _ in M.banners(v, None, now + 5)))
+        r["swap_growth"] = M.swap_growth(r["swap_used"] + 600 * 2**20, seen, now + 10)   # swap growing now: warned
+        r["swap_used"] += 600 * 2**20
+        self.assertTrue(M.memory_tight(r))
+        self.assertTrue(any(t.startswith("memory is tight") for t, _ in M.banners(v, None, now + 10)))
+        r["swap_growth"] = None                                   # PSI says tasks wait: warned too
+        r["psi_some"] = 25.0
+        self.assertTrue(M.memory_tight(r))
+        self.assertIsNone(M.swap_growth(1.0, None, now))         # (no history kept: unknown)
+
     def test_the_verdict_is_bench_s_own(self):
         lg = log_of("r9700")
         v = view("r9700")
