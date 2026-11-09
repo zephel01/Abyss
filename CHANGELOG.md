@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.124 - 2026-11-10
+
+- **The CPU lane computes in the GPU's arithmetic (x86).** For the RAM-tier experts the CPU lane quantized
+  activations its own way (one scale per 256 values), so an expert gave numbers 2-3% apart on the CPU and on the GPU.
+  It now uses the GPU kernels' 8-bit activations (one scale per 32) and their integer sums: the difference is about
+  1e-7, checked on all 20 quant types (`lane_q81_test`). On Ornith-1.5-397B the first token of the same question
+  changed in 2 runs of 48 (was 4 of 24). Same speed (RTX 5090: Ornith-397B 42.9 tok/s, Qwen3.8 84.5 tok/s, both
+  within run-to-run noise). `STRATA_GLM_CPU_EXACT=0` brings back the old dots; ARM CPUs (DGX Spark) keep them.
+- **Monitor and Terminal fixes** (found using v1.3.123's new view on real models): the "bench" numbers show only for
+  the running model's `--bench` (another model's run was shown); the drafter row says MTP / NextN / DSpark (or just
+  "Drafter") instead of "Drafter (NONE)"; "memory is tight" needs PSI some at 10% or more, or swap growing by 256 MB
+  in the last minute - not old, idle swap; while idle (the last answer's verdict) the highlighted card is blue with a
+  "LAST ANSWER" tag instead of a red alarm.
+
 ## v1.3.123 - 2026-11-09
 
 - **`./abyss.sh --check --finance`: Japanese finance rules on synthetic accounts.** 17 questions: FX / CFD / crypto
