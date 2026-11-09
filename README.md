@@ -54,6 +54,7 @@ on the PC size it is named for. Every one is set up with one command (below).
 | 32 GB | 96 GB | [DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF) | 275.8 GB | `--model v41` |
 | 32 GB | 96 GB | [DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF) | 207.1 GB | by hand: [docs/deepseek41](docs/deepseek41/README.md) |
 | 32 GB | 128 GB | [GLM-5.3-Flash-IQ3_XXS-32G128G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ3_XXS-32G128G-GGUF) | 127.9 GB | `--model glm --quant 32G128G` |
+| 32 GB | 128 GB | [Ornith-1.5-397B-IQ2_XXS-32G128G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF) | 114.2 GB | `--model ornith --quant 32G128G` |
 | DGX Spark | 128 GB unified | [Qwen3.8](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-DGX-Spark-GGUF) · [GLM-5.3-Flash](https://huggingface.co/zephel01/GLM-5.3-Flash-DGX-Spark-GGUF) · [V4 0731](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-DGX-Spark-GGUF) (DGX-Spark) | 86.9-96.8 GB | [docs/DGX-SPARK](docs/DGX-SPARK.md) |
 
 - The sizes are targets, not speed guarantees. A larger PC runs a smaller file faster; a smaller PC runs a larger one
@@ -425,6 +426,9 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 
 ## 📰 News
 
+- **2026-11-09: [Ornith-1.5-397B-IQ2_XXS-32G128G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF)**
+  (114 GB, BETA) for 32 GB + 128 GB: all 512 experts, 42.0 tok/s on an RTX 5090. And `./abyss.sh --check --finance`, a
+  Japanese finance rules check on synthetic accounts.
 - **2026-11-08: our own DeepSeek V4 Flash 0731 GGUFs** for 16 GB + 64 GB, 32 GB + 64 GB and 32 GB + 96 GB (IQ1_S /
   IQ2_XXS / IQ2_M, LDLQ, BETA), and Ornith-1.5-122B IQ4_XS for 24 GB + 64 GB. The 32G96G file is the size of unsloth's
   UD-Q2_K_XL, closer to the original (KL 0.150 vs 0.186) and a little faster; use it without the DSpark drafter on a

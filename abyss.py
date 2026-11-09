@@ -32,6 +32,8 @@ Speed and tuning:
                                                long prompts up to the context, a 10+ turn conversation, Japanese,
                                                code run against tests, a tool call, the drafter on / off, speeds,
                                                what limits this PC; --quick ~5 min, --long adds the biggest prompts
+    ./abyss.sh --check --finance               Japanese finance rules on synthetic accounts (17 items, ~10-30 min;
+                                               market-independent only - not investment advice), abyss-finance.txt
     ./abyss.sh --report                        write abyss-report.txt to attach to an issue (nothing is sent)
     ./abyss.sh --repack / --rebuild            build the model's pack / the engine again
 
@@ -3158,6 +3160,53 @@ def check_model_name(pack: Path | None, cfg: dict, cfg_path: Path) -> tuple:
                                    (f", {size / 1e9:.1f} GB of GGUF" if size else ""))
 
 
+def finance_check(cfg_path: Path, version: str) -> int:
+    """--check --finance: tools/finance_check.py's items through the model's own server (as --check starts it), every
+    answer and grade in abyss-finance.txt.  The only score is "n of N items as the rules say" on synthetic accounts."""
+    import urllib.request
+    cfg = read_json(cfg_path)
+    select_build_backend(cfg.get("backend", "cuda"))
+    if cfg.get("backend") == "hip":
+        cfg["exe"] = str(EXE)
+    port = cfg.get("port") or 8080
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+        fail(f"Abyss is running (port {port}): the check needs the GPU memory it holds",
+             f"stop it ({ME} stop, or Ctrl+C in its window), then run --check --finance again")
+    except OSError:
+        pass
+    refresh_engine(cfg)
+    sys.path.insert(0, str(ROOT))
+    import abyss_check as CK
+    import finance_check as FC
+    step(1, f"finance check: {cfg_path.name} ({len(FC.ITEMS)} items; Abyss must stay stopped while it runs)")
+    say("  synthetic accounts, Japanese rules; only what does not depend on the market is graded")
+    ccfg = dict(cfg, log=str(ROOT / "abyss-finance.log"))
+    ccfg.setdefault("cwd", str(ROOT))
+    ccfg.pop("api_key", None)
+    ccfg.pop("mcp_servers", None)
+    env = dict(os.environ, PYTHONUNBUFFERED="1", ABYSS_NO_BROWSER="1")
+    env.pop("STRATA_API_KEY", None)
+    srv = CK.Server(ROOT, ccfg, env, ROOT / "abyss-finance-server.log")
+    try:
+        why = srv.wait_ready(3600)
+        if why:
+            fail(f"the model did not start: {why}", f"its log: {ROOT / 'abyss-finance.log'}")
+        res = FC.run(srv.url, say=say)
+    finally:
+        srv.stop()
+    lines = [f"Abyss v{version} finance check | {cfg_path.name} | {FC.summary(res)}", "",
+             "Synthetic accounts and Japanese rules; graded only on what does not depend on the market. Not investment "
+             "advice, and not a measure of how good a model is at finance.", ""]
+    for r in res:
+        lines += [f"## {r['name']}: {'as the rules say' if r['ok'] else 'NOT as the rules say'} - {r['why']}", "",
+                  r["answer"].strip(), ""]
+    out = ROOT / "abyss-finance.txt"
+    out.write_text(CK.scrub("\n".join(lines)), encoding="utf-8")
+    ok(f"{FC.summary(res)} - every answer in {out.name}")
+    return 0
+
+
 def model_check(cfg_path: Path, version: str, mode: str) -> int:
     """--check with a model installed: tools/abyss_check.py's stability check of it through its own server (the way
     the dashboard starts it).  Writes abyss-check.txt (--report includes it)."""
@@ -3318,6 +3367,8 @@ def main() -> int:
                          "prompts, a long conversation, Japanese, code, a tool call, the drafter - that writes "
                          "abyss-check.txt; before the setup (or with --setup / --gpu / --gpus): only check this PC")
     ap.add_argument("--quick", action="store_true", help="with --check: the short check (~5 minutes)")
+    ap.add_argument("--finance", action="store_true", help="with --check: the Japanese finance rules check "
+                    "(tools/finance_check.py) instead of the stability check")
     ap.add_argument("--long", action="store_true", help="with --check: also the biggest prompts the context allows")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
     ap.add_argument("--yes", action="store_true",
@@ -3426,6 +3477,8 @@ def main() -> int:
         if a.backend:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if have:
+            if a.finance:
+                return finance_check(have[0], version)
             return model_check(have[0], version, "quick" if a.quick else "long" if a.long else "default")
     if a.bench:
         have = [a.config] if a.config is not None else all_configs()   # (setup-deepseek.sh's abyss-*.json too)

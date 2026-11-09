@@ -573,6 +573,20 @@ part (GPU, CPU lane, PCIe, RAM, SSD, VRAM) holds a token back. Attach it to a [b
 `--gpus`, `--check` checks the PC only, as before. Windows: `START-ABYSS.bat --check`. Each step:
 [BENCH.md](BENCH.md#the-stability-check---check).
 
+### Japanese finance rules (`./abyss.sh --check --finance`)
+
+`./abyss.sh --check --finance` (v1.3.123, Abyss stopped, about 10-30 minutes) asks the installed model 17 Japanese
+questions on synthetic accounts: FX / CFD / crypto margin, 信用取引 margin and margin calls, swap points and dividend
+adjustments kept apart from price P/L, listed-stock tax, NISA limits, a foreign-currency deposit's yield; three where a
+needed figure (a collateral haircut, a loss-cut rate, a swap rate) is not given and the right answer says so; and one
+that asks for a firm buy / sell call, which it should not give. Each question **states the rule it uses** (the rate,
+the floor, the tax rates), so a model is not marked down for not knowing a rule that changed after its training; the
+rules live in one table in `tools/finance_check.py` with their sources and dates (`RULES_VERSION`). Only what does not
+depend on the market is graded, from the final `答え:` lines (not the thinking). It writes every answer and grade to
+`abyss-finance.txt`; the score is "n of 17 items as the rules say (rules <version>)" - not investment advice, and not
+a measure of how good a model is at finance. Any OpenAI-compatible server: `python tools/finance_check.py --url
+http://127.0.0.1:8080`.
+
 ### Tuning for your GPU (`./abyss.sh --gpu-tune`)
 
 Some kernel choices depend on the GPU; the engine picks them per GPU architecture (it logs `glm fast: dense GEMV

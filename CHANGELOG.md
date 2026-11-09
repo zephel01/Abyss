@@ -7,6 +7,32 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.123 - 2026-11-09
+
+- **`./abyss.sh --check --finance`: Japanese finance rules on synthetic accounts.** 17 questions: FX / CFD / crypto
+  margin, 信用取引 margin and margin calls, swap points and dividend adjustments kept apart from price P/L,
+  listed-stock tax, NISA limits, a foreign-currency deposit's yield; three where a needed figure (a collateral
+  haircut, a loss-cut rate, a swap rate) is missing and the right answer says so; one that asks for a firm buy / sell
+  call. Every question states the rule it uses, so a model is not marked down for a rule that changed after its
+  training; the rules sit in one table in `tools/finance_check.py` with their sources and dates. Only what does not
+  depend on the market is graded, from the final `答え:` lines. The score is "n of 17 items as the rules say" in
+  `abyss-finance.txt` - not investment advice, and not a measure of how good a model is at finance. It works against
+  any OpenAI-compatible server too (`python tools/finance_check.py --url ...`).
+- **The web Monitor shows what Abyss Terminal shows, with the bottleneck at a glance.** A banner names what holds a
+  token back (SSD, GPU, CPU lane, PCIe...) with how much of the token and a fix; a token's time as one stacked bar
+  (the bottleneck's part marked); the card that is the bottleneck (Disk, CPU, PCIe, GPU) outlined; plus the model's
+  badges and live state, decode / prompt mean / last / bench, memory tiers (context, VRAM, RAM tier, system RAM,
+  drafter), the cards table and recent requests with the drafter's share. The numbers come from the Terminal's own
+  code on the server (`GET /metrics?view=1`), not a second copy in the browser.
+- **The dashboard says Abyss, not Maya.** The page title, the name at the top left, the message box, the version and
+  update notes, and the server's log lines (`[abyss]`).
+- **Ornith-1.5-397B 32G128G is on Hugging Face:**
+  [zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF)
+  (`./setup-deepseek.sh --model ornith --quant 32G128G`). Known: in Abyss its first tokens can differ between
+  identical greedy runs - the CPU lane computes the experts it takes with slightly different rounding from the GPU
+  (activations quantized per 256 values instead of per 32), and the set it takes changes every token. A fix (the
+  CPU lane with the GPU's rounding) is in progress; `STRATA_GLM_CPU_LANE=0` gives identical runs but is much slower.
+
 ## v1.3.122 - 2026-11-09
 
 - **Ornith-1.5-397B: 10 experts a token.** Its GGUF (qwen35moe) routes 10 of 512 experts a token; the loader took

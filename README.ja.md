@@ -53,6 +53,7 @@ Hugging Face で公開している自作の GGUF です。PC の大きさごと�
 | 32 GB | 96 GB | [DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF) | 275.8 GB | `--model v41` |
 | 32 GB | 96 GB | [DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G-GGUF) | 207.1 GB | 手動: [docs/deepseek41](docs/deepseek41/README.md) |
 | 32 GB | 128 GB | [GLM-5.3-Flash-IQ3_XXS-32G128G](https://huggingface.co/zephel01/GLM-5.3-Flash-IQ3_XXS-32G128G-GGUF) | 127.9 GB | `--model glm --quant 32G128G` |
+| 32 GB | 128 GB | [Ornith-1.5-397B-IQ2_XXS-32G128G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF) | 114.2 GB | `--model ornith --quant 32G128G` |
 | DGX Spark | 共有メモリ 128 GB | [Qwen3.8](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-DGX-Spark-GGUF) · [GLM-5.3-Flash](https://huggingface.co/zephel01/GLM-5.3-Flash-DGX-Spark-GGUF) · [V4 0731](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-DGX-Spark-GGUF)（DGX-Spark） | 86.9〜96.8 GB | [docs/DGX-SPARK](docs/DGX-SPARK.ja.md) |
 
 - 大きさは目安で、速さの保証ではありません。大きい PC なら小さいファイルがもっと速く動きます。小さい PC でも大きい
@@ -409,6 +410,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 
 ## 📰 お知らせ
 
+- **2026-11-09: [Ornith-1.5-397B-IQ2_XXS-32G128G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF)**（114 GB、BETA）を GPU 32 GB + RAM 128 GB 向けに公開しました。エキスパート 512 個をすべて残し、RTX 5090 で 42.0 tok/s です。あわせて、架空の口座で日本の金融の規則どおりに答えるかを見る `./abyss.sh --check --finance` を足しました。
 - **2026-11-08: 自作の DeepSeek V4 Flash 0731 GGUF** — GPU 16 GB + RAM 64 GB、32 GB + 64 GB、32 GB + 96 GB 向け（IQ1_S /
   IQ2_XXS / IQ2_M、LDLQ、BETA）。Ornith-1.5-122B の IQ4_XS（24 GB + 64 GB 向け）も。32G96G は unsloth の UD-Q2_K_XL と同じ大きさで、
   元のモデルに近く（KL 0.150 / 0.186）、少し速い。GPU 32 GB では DSpark ドラフトモデルなしで使う。
