@@ -1472,7 +1472,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                                  "encodes\n", dev_, (double) xtot / 1073741824.0);
         F->cnt.assign((size_t) NL * g.n_expert, 0);
         F->usage.assign((size_t) NL * g.n_expert, 0);
-        F->pred_of.assign((size_t) NL, std::array<int, 8>{-1, -1, -1, -1, -1, -1, -1, -1});
+        { std::array<int, gf::kMaxK> none; none.fill(-1); F->pred_of.assign((size_t) NL, none); }
         std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
                      dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
         fast_tail_skip_setup();
@@ -4822,9 +4822,9 @@ void Glm5Model::fast_service() {
                     fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr,
                                      gs1);
                 } else {
-                    int hn = 0, cn = 0, hi[8];
-                    float hw[8], cw[8];
-                    const uint8_t* cb[8];
+                    int hn = 0, cn = 0, hi[gf::kMaxK];
+                    float hw[gf::kMaxK], cw[gf::kMaxK];
+                    const uint8_t* cb[gf::kMaxK];
                     for (int i = 0; i < g.n_exp_used; ++i) if ((cm >> i) & 1u) {
                         if (H->owns(rq->layer * g.n_expert + rq->ids[i])) {
                             hi[hn] = rq->ids[i]; hw[hn++] = rq->w[i];
@@ -6015,7 +6015,7 @@ void Glm5Model::fast_tail_skip_setup() {
     const char* vd = getenv("STRATA_GLM_TAIL_SKIP_DISK");
     F->tail_skip_disk = vd != nullptr && std::atoi(vd) != 0;
     std::string rule;
-    if (r < 8) rule = "at rank " + std::to_string(r + 1) + " of " + std::to_string(g.n_exp_used) + " and below";
+    if (r < g.n_exp_used) rule = "at rank " + std::to_string(r + 1) + " of " + std::to_string(g.n_exp_used) + " and below";
     if (w > 0.0f) {
         char b[64];
         std::snprintf(b, sizeof b, "%sbelow %.3f of the route's weight", r < 8 ? " or " : "", (double) w);

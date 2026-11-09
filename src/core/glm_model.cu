@@ -696,7 +696,7 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
         out.n_vocab = (int) v->count;   // (the reader keeps only the first items of a long array)
     else
         out.n_vocab = 248320;
-    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_expert <= 0 || out.n_exp_used < 1 || out.n_exp_used > 8) {
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_expert <= 0 || out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK) {
         err = "qwen35moe: block_count / embedding_length / expert_count / expert_used_count are off";
         return false;
     }

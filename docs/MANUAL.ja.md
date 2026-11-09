@@ -150,8 +150,12 @@ unzip -q /tmp/llama.zip -d third_party && mv third_party/llama.cpp-$C third_part
 ROCm の `hipcc` が入っていれば、`build/libabyss_igpu.so`（下の「iGPU レーン」）も一緒にビルドされる
 （対象は既定で `-DSTRATA_IGPU_ARCH=gfx1151`。`-DSTRATA_IGPU_LANE=OFF` で作らない）。
 
-初回のビルドは数分。変更後は変わった部分だけを再コンパイルする。RTX 50 では `120` ではなく `120a` を使う
-（MXFP4 のカーネルが Blackwell 専用の FP4 MMA 命令を使い、`120` ではコンパイルできない）。
+初回のビルドは数分。変更後は変わった部分だけを再コンパイルする。
+
+> [!IMPORTANT]
+> RTX 50（と RTX PRO の Blackwell）では `120` ではなく `120a` を使う。MXFP4 のカーネルが Blackwell 専用の FP4 MMA
+> 命令を使い、`120` ではコンパイルできない（`ptxas error : Instruction 'mma with block scale' not supported on .target
+> 'sm_120'`、issue #40）。DGX Spark は `121a`。
 
 ## モデルを取る
 

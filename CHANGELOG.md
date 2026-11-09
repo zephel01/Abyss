@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.122 - 2026-11-09
+
+- **Ornith-1.5-397B: 10 experts a token.** Its GGUF (qwen35moe) routes 10 of 512 experts a token; the loader took
+  at most 8 and refused the file ("expert_used_count are off"). It now takes up to 16, as Qwen3.8 already did. On an
+  RTX 5090 + 128 GB RAM our 114 GB IQ2_XXS build runs at **42.0 tok/s** (8K prompt 882 tok/s, NextN drafter 79%
+  accepted). `./setup-deepseek.sh --model ornith --quant 32G128G` sets it up (the Hugging Face repo
+  zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF goes up next).
+- **Three buffers sized for 8 experts, now for up to 16:** the next-layer prediction statistics (they wrote past
+  their end with 10 experts, Qwen3.8 included - statistics only, the tokens were not affected), the #24 expert
+  helper's single-column buffer, and the iGPU lane's single-column buffer.
+- **`--model glm` setup: the pack step works again.** v1.3.121 built the GLM pack without `--compat-bf16`, so the
+  setup stopped at the pack (`hc_attn_base is F32`).
+- **`--bench` checks our GLM-5.3-Flash files too (#40).** bench/ref now has references for GLM-5.3-Flash-IQ3_XXS-32G128G
+  (Q120d) and GLM-5.3-Flash-IQ2_XS-32G96G (S1), so the bench prints a KL against a known-good run.
+- **Docs: `120a` on RTX 50 (#40).** The hand-build section of the manual has the note in a box, with the ptxas message
+  (`mma with block scale not supported on .target sm_120`) and `121a` for DGX Spark.
+
 ## v1.3.121 - 2026-11-09
 
 - **ISTA-DASLab's GSQ-RCO IQ1_M (DeepSeek V4.1) reads prompts at full speed again.** Its layers keep IQ1_S gate / up

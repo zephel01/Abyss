@@ -536,7 +536,7 @@ __attribute__((visibility("default"))) int abyss_igpu_open(int n_embd, int n_ff,
         (e = hm((void**) &L.plan_h, sizeof(Plan))) != hipSuccess ||
         (e = hipMalloc(&L.xq, (size_t) n_embd / 32 * kQ8)) != hipSuccess ||
         (e = hm(&L.xqh, (size_t) n_embd / 32 * kQ8)) != hipSuccess ||
-        (e = hipMalloc(&L.hq, (size_t) 8 * n_ff / 32 * kQ8)) != hipSuccess) {
+        (e = hipMalloc(&L.hq, (size_t) gf::kMaxK * n_ff / 32 * kQ8)) != hipSuccess) {
         say(err, err_n, "iGPU lane buffers", e);
         return -1;
     }

@@ -59,7 +59,7 @@ public:
     double launch_ms = 0, wait_ms = 0, prepare_ms = 0;
     // A verify window's columns (DSpark / NextN): up to kCols requests of one layer in one call, each column with
     // its own input, plan and output; begin() is column 0.
-    static constexpr int kCols = 8, kPer = 8;
+    static constexpr int kCols = 8, kPer = strata::kernels::glmf::kMaxK;   // (Ornith-397B and Qwen3.8 route 10)
     uint64_t col_calls = 0, cols = 0;
 
     GlmExpertHelper(int d, size_t cap) : device(d), budget(cap) {}

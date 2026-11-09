@@ -282,7 +282,7 @@ struct Glm5Model::FastState {
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
     // prediction quality (the next layer's router on this layer's FFN input)
-    std::vector<std::array<int, 8>> pred_of;   // per layer: the prediction made one layer earlier
+    std::vector<std::array<int, strata::kernels::glmf::kMaxK>> pred_of;   // per layer: the prediction made one layer earlier
     std::atomic<uint64_t> pred_n{0}, pred_overlap{0}, pred_miss{0}, pred_miss_hit{0};
     // ---- LOOKAHEAD (STRATA_GLM_AHEAD=<n layers>, 0 off): every route also names the top-k of the next n layers' routers
     //      on its FFN input; the disk-only experts among them are read into the RAM tier by the reader threads while

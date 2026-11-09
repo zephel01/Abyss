@@ -153,8 +153,12 @@ unzip -q /tmp/llama.zip -d third_party && mv third_party/llama.cpp-$C third_part
 With ROCm's `hipcc` installed, the build also makes `build/libabyss_igpu.so` (the iGPU lane, below;
 `-DSTRATA_IGPU_ARCH=gfx1151` is the default target, `-DSTRATA_IGPU_LANE=OFF` skips it).
 
-The first build takes a few minutes; after a change only what changed is compiled again. Use `120a`, not `120`, on
-RTX 50: the MXFP4 kernels use Blackwell's FP4 MMA instructions, which `120` cannot compile.
+The first build takes a few minutes; after a change only what changed is compiled again.
+
+> [!IMPORTANT]
+> RTX 50 (and the RTX PRO Blackwell cards): use `120a`, not `120`. The MXFP4 kernels use Blackwell's FP4 MMA
+> instructions, which `120` cannot compile (`ptxas error : Instruction 'mma with block scale' not supported on .target
+> 'sm_120'`, issue #40). DGX Spark: `121a`.
 
 ## Get the model
 

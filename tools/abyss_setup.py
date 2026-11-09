@@ -71,14 +71,18 @@ MODELS = {
                     "STRATA_GLM_ROUTE_AFFINITY_RAM": "0.08"}, "gb": 140},
     # zephel01's 16 GB GPU + 64 GB RAM quants of the two Qwen3.5-MoE 122B models (the files at the repo's top level;
     # the quant names the local folder).  Ornith's NextN drafter is in its second shard: the engine reads it there
-    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B", "24G64G"),
+    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B", "24G64G", "32G128G"),
                "folder": "", "prefix_file": "Ornith-1.5-122B-IQ3_XXS-B-", "model_name": "ornith-1.5-122b",
                "prefix": "ornith", "title": "Ornith-1.5-122B", "env": {}, "gb": 52, "pack_args": [],
                "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
                # (--quant 24G64G: the IQ4_XS file for a 24-32 GB GPU + 64 GB RAM, 2026-11-08)
                "variants": {"IQ3_XXS-B": {"vram": 16, "ram": 64},
                             "24G64G": {"repo": "zephel01/Ornith-1.5-122B-IQ4_XS-24G64G-GGUF",
-                                       "prefix_file": "Ornith-1.5-122B-24G64G-", "gb": 69, "vram": 24, "ram": 64}}},
+                                       "prefix_file": "Ornith-1.5-122B-24G64G-", "gb": 69, "vram": 24, "ram": 64},
+                            # (--quant 32G128G: Ornith-1.5-397B, 10 experts a token, for a 32 GB GPU + 128 GB RAM, 2026-11-09)
+                            "32G128G": {"repo": "zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF",
+                                        "prefix_file": "Ornith-1.5-397B-32G128G-", "model_name": "ornith-1.5-397b",
+                                        "title": "Ornith-1.5-397B", "gb": 114, "vram": 32, "ram": 128}}},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
