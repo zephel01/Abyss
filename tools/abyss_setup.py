@@ -96,7 +96,7 @@ MODELS = {
                    "24G64G": {"repo": "zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF", "folder": "",
                               "prefix_file": "Qwen3.8-Flash-Next-24G64G-", "gb": 94, "vram": 24, "ram": 64}}},
     "glm": {"quant": "32G96G", "quants": ("32G96G", "32G128G"), "model_name": "glm-5.3-flash", "prefix": "glm",
-            "title": "GLM-5.3-Flash", "env": {}, "pack_args": [], "sampling": {"temperature": 1.0, "top_p": 0.95},
+            "title": "GLM-5.3-Flash", "env": {}, "sampling": {"temperature": 1.0, "top_p": 0.95},
             "variants": {
                 "32G96G": {"repo": "zephel01/GLM-5.3-Flash-IQ2_XS-32G96G-GGUF", "folder": "S1",
                            "prefix_file": "GLM-5.3-Flash-S1-", "gb": 94, "vram": 32, "ram": 96},
