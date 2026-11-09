@@ -545,6 +545,8 @@ function renderBottleneck(v) {
   const b = v && v.bottleneck, el = $("bneck");
   el.hidden = !b;
   const target = b ? b.target : null;
+  // live: the alarm colours; from the last answer (tone "info"): a neutral outline tagged "last answer"
+  $("view-monitor").dataset.bn = b ? b.tone : "";
   for (const m of METRICS) $(`mv-${m.key}`).closest(".metric-card").classList.toggle("is-bottleneck", BN_METRIC[target] === m.key);
   $("tier-disk-text").closest(".tierlegend__item").classList.toggle("is-bottleneck", target === "disk");
   if (!b) return;
@@ -647,7 +649,8 @@ function renderMemory(v) {
   }
   if (d.kind || d.total != null) {
     const main = d.live != null ? d.live : d.last != null ? d.last : d.total;
-    rows.push(meter(`Drafter${d.kind ? ` (${d.kind.toUpperCase()})` : ""}`, main,
+    const DRAFTER = {mtp: "MTP", nextn: "NextN", dspark: "DSpark", dflash: "DFlash"};
+    rows.push(meter(`Drafter${d.kind ? ` (${DRAFTER[d.kind] || d.kind.toUpperCase()})` : ""}`, main,
       `${d.live != null ? `${pctf(d.live)} live` : d.last != null ? `${pctf(d.last)} last` : ""}` +
       `${d.total != null ? ` <small>${pctf(d.total)} total (${fmt(d.accepted)} of ${fmt(d.offered)})</small>` : ""}` +
       `${d.step != null ? ` <small>${fmt(d.step, 2)} tok/step</small>` : ""}`, "ok"));
