@@ -750,7 +750,8 @@ CPU computes part of the RAM-tier experts while the GPU copies others over PCIe;
 at ~240 GB/s against the CPU threads' ~75. With ROCm installed (the build then makes `libabyss_igpu.so`), the engine
 registers its RAM tier with the iGPU at start and lets it compute the RAM-tier experts instead of the CPU threads -
 the experts are not copied. The start-up log says which lane it chose and why (`iGPU lane: an expert 0.046 ms vs 0.107
-on the CPU's 16 threads`); it keeps the CPU when that is faster, and when the library or a HIP device is missing.
+on the CPU's 16 threads`); it keeps the CPU unless the iGPU is clearly faster (1.5x, `STRATA_GLM_IGPU_MARGIN`), with
+the exact combine (Qwen3.8), and when the library or a HIP device is missing.
 The prompt path uses the lane too: the RAM-tier experts a prompt chunk needs are computed on the iGPU instead of the
 CPU threads (an 8K prompt +40%). A lane call has a deadline (`STRATA_GLM_IGPU_TIMEOUT_MS`, 20 ms): when the kernel
 driver holds the iGPU's queue (it happens for a few minutes after a start, while the kernel reclaims memory after the
@@ -890,7 +891,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_HTTP_BACKLOG` | 256 | (server) the listen backlog: requests waiting to be accepted |
 | `STRATA_MAX_BODY_MIB` | 256 | (server) the largest request body; a larger one is answered 413 before it is read |
 | `GPU_MAX_HW_QUEUES` | 2 (HIP) | ROCm's hardware queues a device: the server passes 2 when neither the shell nor the config sets it (v1.3.40). AI PRO R9700 DeepSeek V4 prompts 8K / 16K: 586-650 / 676-684 tok/s on 1 (a value R9700 guides spread against a MES firmware's idle power; 12 W idle here either way), 653-737 / 748-756 on ROCm's 4, 866-995 / 999-1,011 on 2 |
-| `STRATA_GLM_IGPU` | auto | the iGPU lane: on when `libabyss_igpu.so` and a HIP device are there and it is faster than the CPU; `0` off, `1` on even when slower. `STRATA_GLM_IGPU_LIB=<path>`: another library |
+| `STRATA_GLM_IGPU` | auto | the iGPU lane: on when `libabyss_igpu.so` and a HIP device are there and it is clearly faster than the CPU (`STRATA_GLM_IGPU_MARGIN`); `0` off, `1` on even when slower. `STRATA_GLM_IGPU_LIB=<path>`: another library |
+| `STRATA_GLM_IGPU_MARGIN` | 1.5 | auto: the iGPU takes the lane only when its start-up timing of an expert is this many times faster than the CPU's (the timing leaves out what an iGPU call costs inside a real token: on a Ryzen AI Max+ 395 + RTX 5090, Qwen3.8 16G64G timed a near tie - 0.022 ms vs 0.019-0.025 - and every run that picked the iGPU decoded slower, MTP 141 -> 132 tok/s, default 94 -> 89; GLM-5.3 / V4 / V4.1 time the iGPU 1.9-2.7x faster and keep it). With the exact combine (`STRATA_GLM_LANE_XC`, Qwen3.8 by default) the CPU keeps the lane: the iGPU's sums are not the GPU's bits and the answers would depend on the lane again. `1` = the faster of the two (the older pick) |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | a lane call later than this goes to the CPU threads (0: wait) |
 | `STRATA_GLM_IGPU_POKE_MS` | 500 | how long after a route the service thread keeps the iGPU busy with a no-op kernel every 50 us (v1.3.40; was 20). DeepSeek V4.1 waits on the SSD between routes for longer than 20 ms, and an idle iGPU then took 21-27 ms to answer (AI PRO R9700 + 8060S, the slowest held-out sequence: 123 late calls and 80.4 ms a token; 500: 3 calls, 65.6 ms) |
 | `STRATA_GLM_IGPU_COLS` | on | a verify window's (DSpark / repeat drafts) iGPU-lane experts in one lane call for all its columns, each expert read once for every column that routes to it (v1.3.89; the same bits; RTX 5090 + Radeon 8060S, DeepSeek V4.1 UD-IQ2_XXS + DSpark: lane 60-62 -> 54-57 us an expert, decode -3-5% a token, swe-bench 48.6 -> 51.0 tok/s). `ABYSS_IGPU_COLS_UNION=0`: the one call keeps per-column grids (no shared reads); `0`: a lane call a column |
