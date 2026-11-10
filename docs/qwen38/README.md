@@ -101,7 +101,9 @@ code; a window costs 30 ms against 18.6 ms for a token alone.
 
 Quality: against llama.cpp on 494 positions past 5,600 tokens, KL 0.026 / top-1 92.3% (the token path) and 0.035 /
 90.9% (the prompt path); llama.cpp's own HIP-vs-CPU difference on this model is KL 0.045. Greedy answers with and
-without drafts are the same tokens.
+without drafts (MTP or DFlash 2) are the same tokens with `STRATA_DETERMINISTIC=1` - `tools/spec_exact_check.py` checks
+it (code, list, Japanese, a bug fix and a 4K prompt, 512 tokens, 3 runs each). In the normal mode the CPU lane and
+where the experts sit follow timing, so two runs can part at a near-tie, with or without drafts.
 
 ## Measured on NVIDIA (RTX 5090, DGX Spark)
 

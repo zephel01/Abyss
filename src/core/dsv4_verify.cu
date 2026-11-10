@@ -733,7 +733,7 @@ bool Glm5Model::verify_moe_router(int il, int tb, int T, cudaStream_t s, std::st
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     const int nj = verify_sh_late() && FFs > 0 ? 1 : 3;
-    if (!(g.arch == 0 ? glm_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
+    if (!(g.arch == 0 || g.q4x ? glm_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
     return true;
 }
 
@@ -824,7 +824,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         ++F->expected;
     }
     if (late) {
-        if (!(g.arch == 0 ? glm_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
+        if (!(g.arch == 0 || g.q4x ? glm_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
         gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, g.swiglu_shexp, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
@@ -852,7 +852,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     // 5-column MTP windows shared set 3 among columns 3-5 until 2026-10-31; a launch a column reads each in time)
     if (g.qwen35() && Ly.sh_gate_w != nullptr) {   // the shared expert's gate logit a column (sigmoid below)
         gf::MvJob jg = {Ly.sh_gate_w, nullptr, V->x + (size_t) tb * E, V->q35_shg + tb, nullptr, 1.0f, gf::kTypeF32, E, 1};
-        if (!gf::mvn(&jg, 1, T, s)) { err = "qwen35 verify: the shared expert's gate"; return false; }
+        if (!(g.q4x ? glm_mvn(&jg, 1, T, s) : gf::mvn(&jg, 1, T, s))) { err = "qwen35 verify: the shared expert's gate"; return false; }
     }
     // STRATA_DS4_WIN_COLS_CHECK=1: every 16th group of columns also through a launch a column, compared bit by bit
     static const bool cols_chk = getenv("STRATA_DS4_WIN_COLS_CHECK") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_COLS_CHECK")) != 0;
@@ -1669,10 +1669,10 @@ bool Glm5Model::q4x_mix_cols(float* R, int T, const float* norm, const WSlot& do
     gf::MvJob j[2];
     j[0] = {down.q, V->q4_xnq, V->q4_xn, V->q4_lo, nullptr, 1.0f, down.type, HE, LR};
     if (inject != nullptr) j[1] = {inject->q, V->q4_xnq, V->q4_xn, inj_out, nullptr, 1.0f, inject->type, HE, g.hc};
-    if (!gf::mvn(j, inject != nullptr ? 2 : 1, T, s)) { err = "qwen4exp verify: the hyper-connection's down / inject"; return false; }
+    if (!glm_mvn(j, inject != nullptr ? 2 : 1, T, s)) { err = "qwen4exp verify: the hyper-connection's down / inject"; return false; }
     q35::silu_scale(V->q4_lo, T * LR, 1.0f / (float) g.hc, s, V->q4_loq);
     gf::MvJob u = {up.q, V->q4_loq, V->q4_lo, V->q4_gate, nullptr, 1.0f, up.type, LR, HE};
-    if (!gf::mvn(&u, 1, T, s)) { err = "qwen4exp verify: the hyper-connection's up"; return false; }
+    if (!glm_mvn(&u, 1, T, s)) { err = "qwen4exp verify: the hyper-connection's up"; return false; }
     q35::hc4_mix(V->q4_xn, V->q4_gate, E, g.hc, T, x, s, xq);
     return true;
 }
@@ -1681,7 +1681,11 @@ bool Glm5Model::q4x_mix_cols(float* R, int T, const float* norm, const WSlot& do
 // columns (q4x_mix_cols), layer 1's PLE for the window's rows in one table read (its conv history kept before the
 // window and its rows for the rewind), the delta-net layers verify_part_q35's (their rows and states kept the same
 // way), the attention layers' indexer keys a column, each column's attention dense up to 2,051 cells and over its own
-// selection past them (fast_qwen35_attn's), the MoE verify_moe's, the output hyper-connection and the head
+// selection past them (fast_qwen35_attn's), the MoE verify_moe's, the output hyper-connection and the head.  Every
+// dense GEMV is glm_mvn (gf::mvn_mv: mv()'s sums a column, the weights read once): gf::mvn ran the small Q8_0 matrices
+// (hc down, the shared expert, attn k / v) one warp a row where the token path's mv() splits them four warps a row,
+// so greedy answers with drafts parted from spec=0 at tokens 7-30 (2026-11-10; tools/spec_exact_check.py)
+void q4x_trace(cudaStream_t s, int64_t p, int il, const char* name, const float* dev, int64_t n);   // (qwen35_fast_path.cu)
 bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
     FastState* F = fast_;
     auto* V = (VerifyBuf*) vb_;
@@ -1813,7 +1817,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             gf::MvJob j[2];
             j[0] = {F->ple_key_w.q, V->q4_embq, V->q4_emb, V->q4_key, nullptr, 1.0f, F->ple_key_w.type, E, HE};
             j[1] = {F->ple_val_w.q, V->q4_embq, V->q4_emb, V->q4_val, nullptr, 1.0f, F->ple_val_w.type, E, E};
-            if (!gf::mvn(j, 2, T, s)) { err = "qwen4exp verify: the PLE key / value"; return false; }
+            if (!glm_mvn(j, 2, T, s)) { err = "qwen4exp verify: the PLE key / value"; return false; }
             k::native_ple_postops_batch(V->q4_key, V->R, V->q4_val, F->ple_hist, F->ple_w, V->q4_qn, V->q4_gated, V->q4_g4,
                                         T, (void*) s);
             abl_res(V->R, T * g.hc, (int) E, s);   // (the PLE's rows are a residual write too)
@@ -1828,8 +1832,14 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                               V->q4_inj[1], V->q4_inj[0], V->x, V->xq, err))
                 return false;
             if (dfl_ != nullptr) dflash_capture(il, V->R, T, (size_t) HE, false, s);   // (DFlash 2's features a column)
+            for (int t = 0; t < T; ++t) {
+                q4x_trace(s, p0 + t, il, "a_R", V->R + (size_t) t * HE, HE);
+                q4x_trace(s, p0 + t, il, "b_x", V->x + (size_t) t * E, E);
+            }
             if (prof) F->mark("q4w_hc_attn");
             if (Ly.recr) {
+                q4x_trace(s, p0, il, "a0_state", Ly.gdn_state, (int64_t) state_n);
+                q4x_trace(s, p0, il, "a1_conv", Ly.gdn_conv, (int64_t) conv_n);
                 float* qkv = V->q35_qkv + (size_t) li * TM * C;
                 float* rws = V->q35_rows + (size_t) li * TM * C;
                 float* alpha = V->q35_alpha + (size_t) li * TM * HV;
@@ -1839,7 +1849,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                 j[1] = {Ly.zg.q, V->xq, V->x, V->q35_z, nullptr, 1.0f, Ly.zg.type, E, Vd};
                 j[2] = {Ly.alpha_w.q, V->xq, V->x, alpha, nullptr, 1.0f, Ly.alpha_w.type, E, HV};
                 j[3] = {Ly.beta_w.q, V->xq, V->x, beta, nullptr, 1.0f, Ly.beta_w.type, E, HV};
-                if (!gf::mvn(j, 4, T, s)) { err = "qwen4exp verify: the delta-net projections"; return false; }
+                if (!glm_mvn(j, 4, T, s)) { err = "qwen4exp verify: the delta-net projections"; return false; }
                 if (prof) F->mark("q4w_gdn_mv");
                 q35::conv_rows(qkv, T, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, rws, s);
                 q35::gdn_prep_gates(rws, T, C, HK, Sd, g.norm_eps, alpha, beta, Ly.dt_bias, Ly.ssm_a, HV, s);
@@ -1866,7 +1876,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                     gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
                 }
                 gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, E};
-                if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: ssm_out"; return false; }
+                if (!glm_mvn(&o, 1, T, s)) { err = "qwen4exp verify: ssm_out"; return false; }
                 if (prof) F->mark("q4w_gdn");
                 ++li;
             } else {
@@ -1874,7 +1884,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                 j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, E, 2 * HD};
                 j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
                 j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
-                if (!gf::mvn(j, 3, T, s)) { err = "qwen4exp verify: the attention projections"; return false; }
+                if (!glm_mvn(j, 3, T, s)) { err = "qwen4exp verify: the attention projections"; return false; }
                 q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                     g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
                 const float scale = 1.0f / std::sqrt((float) D);
@@ -1892,7 +1902,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                     gf::MvJob ij[2];
                     ij[0] = {Ly.q4_ik.q, nullptr, V->x, rawk, nullptr, 1.0f, Ly.q4_ik.type, E, ID};
                     ij[1] = {Ly.q4_iq.q, nullptr, V->x, V->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, IH * ID};
-                    if (!gf::mvn(ij, 2, T, s)) { err = "qwen4exp verify: the indexer projections"; return false; }
+                    if (!glm_mvn(ij, 2, T, s)) { err = "qwen4exp verify: the indexer projections"; return false; }
                     const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
                     if (rows_attn)   // (the window's keys in two launches, the same buffers)
                         k::indexer_key_append_rows(rawk, ID, p0, T, 0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin,
@@ -1947,14 +1957,16 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                 q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s);
                 gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
                 gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
-                if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: attn_output"; return false; }
+                if (!glm_mvn(&o, 1, T, s)) { err = "qwen4exp verify: attn_output"; return false; }
                 if (prof) F->mark("q4w_attn");
             }
             abl_out(il, 0, V->mixer, T, E, s);
+            for (int t = 0; t < T; ++t) q4x_trace(s, p0 + t, il, "c_mixer", V->mixer + (size_t) t * E, E);
             if (!q4x_mix_cols(V->R, T, Ly.hc4[1].norm, Ly.hc4[1].down, Ly.hc4[1].up, &Ly.hc4[1].inject, V->mixer,
                               V->q4_inj[0], V->q4_inj[1], V->x, V->xq, err))
                 return false;
             if (prof) F->mark("q4w_hc_ffn");
+            for (int t = 0; t < T; ++t) q4x_trace(s, p0 + t, il, "d_x2", V->x + (size_t) t * E, E);
             return !with_router || verify_moe_router(il, 0, T, s, err);
         };
         // stage 2 (STRATA_GLM_GRAPH_MOE, default on with the graphs): the MoE's dispatch in the same graph - the routes,
@@ -2033,6 +2045,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             return false;
         }
         if (prof) F->mark("q4w_moe");
+        for (int t = 0; t < T; ++t) q4x_trace(s, p0 + t, il, "e_ffn", V->ffn + (size_t) t * E, E);
     }
     if (split_next_) {
         // a part before the last: the last FFN combined into the columns' streams, which cross over to the next part
@@ -2050,7 +2063,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (gf::mvn_supported(ow.type)) {
-        if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: output head"; return false; }
+        if (!glm_mvn(&o, 1, T, s)) { err = "qwen4exp verify: output head"; return false; }
     } else {
         const size_t q8e = (size_t) (E / 32) * kQ8;
         for (int t = 0; t < T; ++t) {
@@ -2201,6 +2214,8 @@ bool Glm5Model::glm_mvn(const void* jobs, int n, int T, cudaStream_t s) {
     if (!gf::mvn_mv(j, n, T, s)) return false;
     static const bool chk = glm_env_int("STRATA_GLM_MVN_CHECK") != 0;
     if (!chk || T < 2) return true;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;   // (a layer graph being captured: no host check)
+    if (cudaStreamIsCapturing(s, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) return true;
     static unsigned long long calls = 0, checked = 0, cols = 0, diff = 0;
     if ((calls++ % 16) != 0) return true;
     auto* V = (VerifyBuf*) vb_;

@@ -1099,6 +1099,29 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     return true;
 }
 
+// STRATA_Q4X_TRACE=<dir> (debug, slow): the token path's and the verify window's per-layer values of positions
+// STRATA_Q4X_TRACE_LO..HI written as <dir>/p<pos>_l<layer>_<name>.f32 (a later write of a position replaces the
+// earlier one: a window's dropped column is computed again), so the two paths' files compare bit by bit
+// (tools/spec_exact_check.py's companion bisect).  Synchronous; skipped while a graph is captured (the windows'
+// per-layer graphs: run with STRATA_GLM_GRAPH=0)
+void q4x_trace(cudaStream_t s, int64_t p, int il, const char* name, const float* dev, int64_t n) {
+    static const char* dir = getenv("STRATA_Q4X_TRACE");
+    if (dir == nullptr || dir[0] == 0) return;
+    static const int64_t lo = getenv("STRATA_Q4X_TRACE_LO") ? std::atoll(getenv("STRATA_Q4X_TRACE_LO")) : 0;
+    static const int64_t hi = getenv("STRATA_Q4X_TRACE_HI") ? std::atoll(getenv("STRATA_Q4X_TRACE_HI")) : (int64_t) 1 << 40;
+    if (p < lo || p > hi) return;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return;
+    cudaStreamSynchronize(s);
+    std::vector<float> buf((size_t) n);
+    cudaMemcpy(buf.data(), dev, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost);
+    const std::string f = std::string(dir) + "/p" + std::to_string(p) + "_l" + std::to_string(il) + "_" + name + ".f32";
+    if (FILE* o = std::fopen(f.c_str(), "wb")) {
+        std::fwrite(buf.data(), 4, (size_t) n, o);
+        std::fclose(o);
+    }
+}
+
 // qwen4exp's layers (llama.cpp src/models/qwen4exp.cpp graph): the residual state_ is hc streams; a layer is
 // mix(attn) -> the mixer -> combine -> mix(ffn) -> the MoE -> combine (the FFN's combine runs inside the next mix);
 // the head is the output mixer (no output norm)
@@ -1126,6 +1149,8 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
                      F->q4_inj[1], F->q4_inj[0], F->x, F->xq, err))
             return false;
         abl_cap(il, state_, g.hc, s);   // (--abl-build: the residual entering the layer, the last FFN combined)
+        q4x_trace(s, p, il, "a_R", state_, (int64_t) g.hc * g.n_embd);
+        q4x_trace(s, p, il, "b_x", F->x, g.n_embd);
         if (dfl_ != nullptr) dflash_capture(il, state_, 1, 0, false, s);   // (DFlash 2's features)
         if (F->prof_on) F->mark("q4x_hc");
         if (dumps) {
@@ -1135,11 +1160,14 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
             q35_dump(s, "hc_inject", il, F->q4_inj[0], g.hc);
         }
         if (Ly.recr) {
+            q4x_trace(s, p, il, "a0_state", Ly.gdn_state, (int64_t) g.ssm_state * g.ssm_v_heads * g.ssm_state);
+            q4x_trace(s, p, il, "a1_conv", Ly.gdn_conv, (int64_t) g.ssm_conv_dim() * (g.d_conv - 1));
             if (!fast_qwen35_gdn(il, err)) return false;
         } else {
             if (!fast_qwen35_attn(il, p, err)) return false;
         }
         abl_out(il, 0, F->mixer, 1, g.n_embd, s);
+        q4x_trace(s, p, il, "c_mixer", F->mixer, g.n_embd);
         if (!q4x_mix(Ly.hc4[1].norm, Ly.hc4[1].down, Ly.hc4[1].up, &Ly.hc4[1].inject, F->mixer, F->q4_inj[0],
                      F->q4_inj[1], F->x, F->xq, err))
             return false;
@@ -1152,8 +1180,10 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
             q35_dump(s, "hc_inject2", il, F->q4_inj[1], g.hc);
         }
         if (!Ly.moe) { err = "qwen4exp: a dense FFN layer (not supported)"; return false; }
+        q4x_trace(s, p, il, "d_x2", F->x, g.n_embd);
         if (!fast_moe(il, pf_pending, err)) return false;
         abl_out(il, 1, F->ffn, 1, g.n_embd, s);
+        q4x_trace(s, p, il, "e_ffn", F->ffn, g.n_embd);
         if (dumps) q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
     }
     if (l1_ < g.n_layers) {

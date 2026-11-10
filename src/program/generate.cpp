@@ -1399,10 +1399,18 @@ static int glm_pack_generate(const Options& o) {
                                            // runs started from different files; and the read-ahead / RAM fill moves
                                            "STRATA_GLM_USAGE", "STRATA_GLM_AHEAD", "STRATA_GLM_RAM_FILL",
                                            "STRATA_GLM_PRESTAGE_ADAPT"};
+        // (2026-11-10) and the prompt path's sums in one order whatever the pool holds: MMQ a tile a block over the
+        // whole K (no stream-k split, which follows the launch's tile count) and every routed row in one output window
+        // (the window's flushes follow which experts are resident: a token's experts added in another order)
+        static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"}};
         std::string kept;
         for (const char* k : kOff) {
             if (std::getenv(k) == nullptr) set_env(k, "0");
             else kept += std::string(" ") + k + "=" + std::getenv(k);
+        }
+        for (const auto& kv : kOn) {
+            if (std::getenv(kv[0]) == nullptr) set_env(kv[0], kv[1]);
+            else kept += std::string(" ") + kv[0] + "=" + std::getenv(kv[0]);
         }
         std::fprintf(stderr, "NOTE: STRATA_DETERMINISTIC: timing-driven choices off (CPU / iGPU lanes, tier moves, the "
                              "n-gram gate) - slower, for equality tests%s%s\n",

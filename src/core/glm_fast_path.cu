@@ -592,6 +592,18 @@ bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
     auto* F = new FastState();
     fast_ = F;
+    // qwen4exp: the prompt path's MMQ products a tile a block over the whole K (STRATA_MMQ_WHOLE_K,
+    // third_party/ggml/mmq-whole-k.patch), not stream-k's split K - stream-k's split follows the launch's tile count,
+    // so an expert's rows summed apart with what else was resident: the same prompt came out ~1e-6 apart with another
+    // VRAM budget (a drafter loaded) or pool, and greedy answers parted later.  RTX 5090, Qwen3.8 16G64G: 8K / 32K
+    // prompts 2,025 / 2,945 tok/s either way.  Set as 0: stream-k as before
+    if (g_.q4x && getenv("STRATA_MMQ_WHOLE_K") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("STRATA_MMQ_WHOLE_K", "1");
+#else
+        setenv("STRATA_MMQ_WHOLE_K", "1", 0);
+#endif
+    }
     // Not on Windows: there an APU's GPU memory is a fixed carve-out (AMD's Variable Graphics Memory, or the BIOS)
     // that Windows does not count as RAM, so it is sized like a discrete card - the pool from what HIP reports free,
     // the RAM tier from the free RAM and commit (below).  CUDA too from the DGX Spark on (GB10: integrated, 128 GB

@@ -128,7 +128,6 @@ STRATA_GLM_PREFILL_SH_LATE  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_TAIL_SKIP  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_TRACE  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_VERBOSE  # src/core/glm_prefill.cu
-STRATA_GLM_PREFILL_WINDOW  # src/core/glm_prefill.cu
 STRATA_GLM_PRESTAGE_ADAPT  # src/core/glm_prefill.cu
 STRATA_GLM_PRESTAGE_CARVE  # src/core/glm_prefill.cu
 STRATA_GLM_PRESTAGE_PIECES  # src/core/glm_prefill.cu
@@ -217,6 +216,9 @@ STRATA_Q4X_DFLASH_DUMP  # src/core/dflash2.cu
 STRATA_Q4X_DFLASH_MASK  # src/core/dflash2.cu
 STRATA_Q4X_MTP_FULLHEAD  # src/core/q4x_drafter.cu
 STRATA_Q4X_PLE_SYNC  # src/core/dsv4_verify.cu
+STRATA_Q4X_TRACE  # src/core/qwen35_fast_path.cu
+STRATA_Q4X_TRACE_HI  # src/core/qwen35_fast_path.cu
+STRATA_Q4X_TRACE_LO  # src/core/qwen35_fast_path.cu
 STRATA_QSA_DUMP  # src/prefill/prefill.cpp
 STRATA_QSA_DUMP_LAST  # src/prefill/prefill.cpp
 STRATA_REFILL_BLOCKING  # src/program/generate.cpp

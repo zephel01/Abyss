@@ -1,0 +1,13 @@
+diff --git a/mmq.cuh b/mmq.cuh
+--- a/mmq.cuh
++++ b/mmq.cuh
+@@ -1568,7 +1568,8 @@
+     const int ntiles_dst = ntx * nty * ntzw;
+     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
++    static const bool strata_whole_k = [] { const char * v = getenv("STRATA_MMQ_WHOLE_K"); return v != nullptr && atoi(v) != 0; }();
++    const dim3 block_nums_stream_k((GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) || strata_whole_k ? ntiles_dst : nsm, 1, 1);
+ 
+     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+ 
