@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.126 - 2026-11-10
+
+- **Anthropic `/v1/messages`: images inside `tool_result` blocks reach the model (#41).** An image tool's result (a file
+  reader, a browser screenshot) went through the text-only path and lost its images; it goes through the same parts
+  path as role "tool" on `/v1/chat/completions` now (text-only results stay plain strings). A top-level image next to
+  a `tool_result` in the same user message is kept too. Reported with the fix by gyroid-eth.
+- **DFlash 2 draft step 1.96 -> 1.14 ms** (RTX 5090, Qwen3.8), the drafts bit for bit the same: the drafter's
+  attention reads each K/V chunk once into shared memory for the four q heads of a KV head (95 -> ~10 us a layer),
+  RoPE angles once a draft, q8_1 bytes written by the kernels that make the values (31 launches gone), and the whole
+  step as one CUDA graph (`STRATA_Q4X_DFLASH_GRAPH=0` launches kernel by kernel). Qwen3.8 16G64G: code 159.3 -> 165.1
+  tok/s (MTP 153.5), lists 153.6 -> 159.8 (MTP 158.7); Japanese prose and bug fixes unchanged (MTP still faster
+  there: it is the acceptance, not the step). MTP stays the default. Answers with `STRATA_DETERMINISTIC=1` still
+  equal the token path's for no drafter / MTP / DFlash 2.
+
 ## v1.3.125 - 2026-11-10
 
 - **Qwen3.8: greedy answers with drafts (MTP, DFlash 2) are the same tokens as without.** A few small Q8_0 matrices
