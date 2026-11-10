@@ -801,7 +801,7 @@ __device__ __forceinline__ uint4 direct_signs(unsigned b, bool parity) {
 }
 __device__ __forceinline__ uint2 quant_load8(const void* p) {
     uint2 words;
-    __builtin_memcpy(&words, p, sizeof(words)); // GGUF super-blocks are only 2-byte aligned.
+    memcpy(&words, p, sizeof(words));   // GGUF super-blocks are only 2-byte aligned (memcpy: MSVC has no __builtin_memcpy, #39)
     return words;
 }
 template<int T> constexpr int sign_count = T == 22 ? 256 : 128;

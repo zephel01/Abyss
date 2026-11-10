@@ -238,5 +238,29 @@ class TestVariants(unittest.TestCase):
                 self.assertTrue(full.get("prefix_file"), (name, q))
                 self.assertGreater(full.get("gb", 0), 0, (name, q))
 
+
+class VenvLayout(unittest.TestCase):
+    """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
+
+    def test_windows_and_posix_paths(self):
+        with mock.patch.object(A, "ROOT", Path("/abyss")):
+            self.assertEqual(A.venv_bin("cmake", windows=True), Path("/abyss/.venv/Scripts/cmake.exe"))
+            self.assertEqual(A.venv_bin("python", windows=False), Path("/abyss/.venv/bin/python"))
+
+    def test_build_engine_uses_the_windows_layout(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)), \
+                mock.patch.object(A, "WIN", True), mock.patch.object(A.S, "run") as run, \
+                mock.patch.object(A, "configured_archs", return_value=None):
+            (Path(d) / "build").mkdir()
+            nvcc = Path(d) / "nvcc"
+            nvcc.touch()
+            A.build_engine(None, [{"arch": "89", "name": "RTX 4090"}], str(nvcc))
+            calls = [[str(c) for c in call.args[0]] for call in run.call_args_list]
+        scripts = str(Path(d) / ".venv" / "Scripts")
+        self.assertEqual(calls[0][0], str(Path(scripts) / "cmake.exe"))
+        self.assertIn(f"-DCMAKE_MAKE_PROGRAM={Path(scripts) / 'ninja.exe'}", calls[0])
+        self.assertEqual(calls[-1][0], str(Path(scripts) / "cmake.exe"))
+
+
 if __name__ == "__main__":
     unittest.main()

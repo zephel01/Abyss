@@ -18,6 +18,7 @@
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
 #include "shard_io.hpp"
+#include "strata/core/knobs.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -3651,7 +3652,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         for (size_t c = 0; c < c_weight.size(); ++c) weight_sum += (double) c_weight[c] * (double) c_stride[c];
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const size_t reserve = (size_t) 1536 << 20;   // context growth + the driver's share
+        // context growth + the driver's share; STRATA_GLM_RESERVE_MB (--vram-reserve-mib) as on the fast path
+        const size_t reserve = (size_t) strata::core::env_num("STRATA_GLM_RESERVE_MB", 1536.0, 0.0, 1048576.0) << 20;
         const size_t pool_avail = free_b > reserve ? free_b - reserve : 0;
         // STRATA_GLM_POOL_SLOTS0=n caps the pool at n largest-class-equivalent slots (debug/tuning)
         size_t pool_bytes_cap = pool_avail;

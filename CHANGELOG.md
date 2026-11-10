@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+Four findings from LarsDrakblod's RTX 4090 field report (#39) - thank you:
+
+- **`--vram-reserve-mib` now works on every model.** The flag was parsed and honored by the qwen4exp path's
+  `--expert-cache auto`, but the GLM runner's expert pool (Qwen3.8, GLM-5.3, DeepSeek V4.1) read only
+  `STRATA_GLM_RESERVE_MB`, so the flag in a Qwen3.8 config did nothing. The flag now sets that reserve too (also the
+  verified runner's pool, which had 1536 MB written in). With both set, the flag wins and the log says so.
+- **Windows build**: `glm_fast.cu`'s `__builtin_memcpy` (which MSVC lacks) is a plain `memcpy`.
+- **Windows setup**: `tools/abyss_setup.py` finds CMake, Ninja and Python in `.venv/Scripts/` (Windows' venv layout)
+  instead of `.venv/bin/`.
+- **Manual**: `STRATA_DETERMINISTIC` is a test switch, not a runtime setting - it freezes the expert tiers, and on a
+  PCIe-bound RTX 4090 it cost 3.7x (54.1 -> 14.6 tok/s); for the same answers in normal use Qwen3.8 has the exact lane
+  combine (`STRATA_GLM_LANE_XC`). The DFlash 2 note adds the 4090's tie with the MTP layer (55.6 vs 56.4 tok/s at
+  86-89% vs 78% acceptance): on a PCIe-bound card a better drafter does not change each window's expert fetches.
+
 ## v1.3.129 - 2026-11-10
 
 - **GLM-5.3 and DeepSeek V4.1 decode back to v1.3.123's speed.** `STRATA_GLM_CPU_EXACT` (v1.3.124: the CPU lane in

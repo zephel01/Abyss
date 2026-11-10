@@ -45,6 +45,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+WIN = os.name == "nt"
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
 
@@ -222,10 +223,17 @@ def nvcc_major(nvcc: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def venv_bin(name: str, windows: bool | None = None) -> Path:
+    """A program in Abyss's .venv: .venv/Scripts/<name>.exe on Windows (setup-deepseek.bat makes it there),
+    .venv/bin/<name> elsewhere (issue #39: the Linux layout was hard-wired)."""
+    win = WIN if windows is None else windows
+    return ROOT / ".venv" / ("Scripts" if win else "bin") / (name + (".exe" if win else ""))
+
+
 def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
     exe = ROOT / "build" / "strata"
-    cmake = ROOT / ".venv" / "bin" / "cmake"
-    ninja = ROOT / ".venv" / "bin" / "ninja"
+    cmake = venv_bin("cmake")
+    ninja = venv_bin("ninja")
     cc = cuda_archs(arch, gpus)
     nvcc = nvcc_arg or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
     conf = [cmake, "-S", ROOT, "-B", ROOT / "build", "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
@@ -326,7 +334,7 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             **(extra or {}),
         }, indent=1) + "\n", encoding="utf-8")
         S.ok(f"{cfg.name} written (context {ctx}, port {port})")
-    py = ROOT / ".venv" / "bin" / "python"
+    py = venv_bin("python")
     run.write_text("#!/bin/sh\n"
                    f"# {model['title']} ({name}) on Abyss: the dashboard and API (written by setup-deepseek.sh)\n"
                    f'cd "{ROOT}" || exit 1\n'
