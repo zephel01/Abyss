@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.125 - 2026-11-10
+
+- **Qwen3.8: greedy answers with drafts (MTP, DFlash 2) are the same tokens as without.** A few small Q8_0 matrices
+  in the q4x verify window (router / shared expert, the shared expert's gate, the hyper-connection's down / up, the
+  PLE key / value) went through gf::mvn - one warp a row - where the token path's mv() splits them four warps a row;
+  the sums parted at near-ties (token 7 of a code prompt, token 29 of a Japanese one). They go through glm_mvn
+  (mv()'s sums a column) now. The prompt path's MMQ stream-k split its K by the tile count, which moved with the
+  expert placement; `STRATA_MMQ_WHOLE_K=1` (third_party/ggml/mmq-whole-k.patch, on by default for Qwen3.8) runs a tile
+  a block. With `STRATA_DETERMINISTIC=1`, 45 answers (code / list / Japanese / bug fix / 4K prompt, 3 runs each)
+  without a drafter, with MTP and with DFlash 2 equal the token path's; same speed. `tools/spec_exact_check.py`
+  checks it. In the normal mode the CPU lane's share follows timing, so runs can still part slightly.
+- **Qwen3.8 DFlash 2 drafter (opt-in, `STRATA_Q4X_DFLASH=<gguf>`).** `./setup-deepseek.sh --model qwen38 --dflash`
+  downloads it (0.65 GB, SHA-256 checked); `--no-dflash` takes it out. RTX 5090, Qwen3.8 16G64G: code 152.3 tok/s
+  (MTP 140.2), lists 142.1 (137.2), Japanese prose 91.9 (105.7), bug fixes 122.0 (128.2) - MTP stays the default.
+
 ## v1.3.124 - 2026-11-10
 
 - **The CPU lane computes in the GPU's arithmetic (x86).** For the RAM-tier experts the CPU lane quantized
