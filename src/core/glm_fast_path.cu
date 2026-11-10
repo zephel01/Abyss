@@ -2972,11 +2972,11 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             // the lane in the device's arithmetic (lane_q81: q8_1 activations, the device kernels' integer and float
             // steps), so an expert gives the same numbers on either side - where lane_q81 has vector rows for the
             // layer's types (x86 AVX2 / AVX-512; elsewhere its portable rows would slow the lane: ggml-cpu's dots
-            // stay); STRATA_GLM_CPU_EXACT=0: ggml-cpu's dots everywhere
-            static const bool exact_on = [] {
-                const char* v = getenv("STRATA_GLM_CPU_EXACT");
-                return v == nullptr || std::atoi(v) != 0;
-            }();
+            // stay); STRATA_GLM_CPU_EXACT=0: ggml-cpu's dots everywhere.  Default: Qwen3.8 (qwen4exp) only, whose exact
+            // combine (STRATA_GLM_LANE_XC) needs it; on GLM-5.3 its slower rows cost 14% of decode (44.6 -> 38.2 tok/s),
+            // on V4.1 5% (RTX 5090, 2026-11-10) - =1 turns it on there
+            static const char* exact_env = getenv("STRATA_GLM_CPU_EXACT");
+            const bool exact_on = exact_env == nullptr ? g.q4x : std::atoi(exact_env) != 0;
             F->cpu_exact[(size_t) il] =
                 exact_on && kc::lane_q81_fast(Ly.gu_type) && kc::lane_q81_fast(f.up_type) && kc::lane_q81_fast(Ly.d_type) &&
                 kc::lane_q81_act_bytes(g.n_embd) <= kc::kNativeActBytes && kc::lane_q81_act_bytes(g.n_ff_exp) <= kc::kNativeHBytes;
