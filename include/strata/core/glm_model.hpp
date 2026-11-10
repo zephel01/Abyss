@@ -693,13 +693,16 @@ public:
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
     // gs (NVFP4 layers): each expert's gate/up second-level scale (its down scale is folded into w by the caller)
-    void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
-                          const void* xq = nullptr, const float* gs = nullptr);
+    // fx (the exact combine, gf::CpuAnswer::fx): the experts' weighted rows summed in fixed point instead of out; true
+    // when it was written (the device's arithmetic, lane_q81 - not EXL3, not the iGPU lane)
+    bool fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
+                          const void* xq = nullptr, const float* gs = nullptr, long long* fx = nullptr);
     // a batched verify window's n columns of layer il at once on the CPU threads: column t's ne[t] experts at
     // blob / w [8 t + i], its x[t], its sum to out[t] - an expert several columns route decoded once for them
-    void fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
+    // (fx[t]: as fast_cpu_experts' - true when every column's was written)
+    bool fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
                                 const float* const* x, float* const* out, const void* const* xq = nullptr,
-                                const float* gs = nullptr);   // (gs at [8 t + i] as w)
+                                const float* gs = nullptr, long long* const* fx = nullptr);   // (gs at [8 t + i] as w)
     void fast_igpu_setup();   // the iGPU lane (STRATA_GLM_IGPU, src/igpu)
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half

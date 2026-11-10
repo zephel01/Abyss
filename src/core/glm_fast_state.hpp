@@ -690,6 +690,9 @@ struct Glm5Model::FastState {
     uint64_t settle_h0 = 0, settle_t0 = 0, settle_moves = 0;
     gf::CpuAnswer* cpu_ans_h = nullptr;                      // host-mapped
     unsigned int* cpu_seq_d = nullptr;
+    // the EXACT COMBINE (STRATA_GLM_LANE_XC, gf::MoeDev::xpart): the token path's fixed-point sum (device memory)
+    bool xc = false;
+    float* xpart_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)
     std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
     std::vector<uint8_t> cpu_exact;                          // per layer: the lane in the device's arithmetic (lane_q81)

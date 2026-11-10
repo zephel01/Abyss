@@ -153,5 +153,9 @@ void moe_combine_add(const float* out, int base, int lo, int hi, const int* pos,
                      float* ffn, cudaStream_t s);
 void moe_combine(const float* out, const int* pos, const float* w, const float* sh, int T, int k, int n_embd,
                  float* ffn, cudaStream_t s);
+/// moe_combine_add over two windows at once (out rows [lo, hi) from base, out2 rows [lo2, hi2) from base2): each token's
+/// routes in plan order whichever window holds them - the prompt's whole combine in one order, wherever the experts ran
+void moe_combine_add2(const float* out, int base, int lo, int hi, const float* out2, int base2, int lo2, int hi2,
+                      const int* pos, const float* w, int T, int k, int n_embd, float* ffn, cudaStream_t s);
 
 }  // namespace strata::kernels::glmb

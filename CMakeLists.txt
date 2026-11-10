@@ -289,6 +289,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_uma_direct_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_uma_direct_test COMMAND glm_uma_direct_test)
     set_tests_properties(glm_uma_direct_test PROPERTIES TIMEOUT 120)
+    # the CPU lane's experts (lane_q81) against the decode's expert kernels, bit for bit: each expert's swiglu q8_1,
+    # the layer's fixed-point sum and the prompt's exact light rows (STRATA_GLM_LANE_XC; skipped where the CPU's rows
+    # do not keep the device's order - no AVX2, HIP)
+    add_executable(lane_exact_test tests/lane_exact_test.cu)
+    target_link_libraries(lane_exact_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    add_test(NAME lane_exact_test COMMAND lane_exact_test)
+    set_tests_properties(lane_exact_test PROPERTIES TIMEOUT 120)
     # the EXL3 kernels against the scalar CPU reference (random matrices, no model)
     add_executable(exl3_test tests/exl3_test.cu)
     target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})

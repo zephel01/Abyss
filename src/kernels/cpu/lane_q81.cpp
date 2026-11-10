@@ -721,6 +721,21 @@ bool lane_q81_fast(int t) noexcept {
 #endif
 }
 
+bool lane_q81_dev_order(int t) noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr &&
+                               std::getenv("STRATA_NO_IQ512_VBMI") == nullptr;
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    // (as lane_q81_rows picks: the VBMI rows keep the device's order but IQ1_S's; the AVX2 rows for their fin2 types)
+    if (avx512 && lane_q81_vbmi_type(t)) return t != 19;
+    if (avx2 && lane_q81_avx2_type(t))
+        return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 39 || t == 6 ||
+               t == 42;
+#endif
+    (void) t;
+    return false;
+}
+
 void lane_q81_rows(int t, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                    int r0, int r1) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -769,7 +784,7 @@ void lane_q81_gu_rows(int gate_type, int up_type, const uint8_t* gate_base, size
         for (int r = 0; r < nr; ++r) {
             const float g = std::fmin(scale * go[(size_t) t][r], limit);
             const float u = std::fmin(std::fmax(scale * uo[(size_t) t][r], -limit), limit);
-            ff[t][r0 + r] = (g / (1.0f + std::exp(-g))) * u;
+            ff[t][r0 + r] = (g / (1.0f + q81::lane_expf(-g))) * u;   // (the device epilogue's exp)
         }
 }
 }  // namespace strata::kernels::cpu

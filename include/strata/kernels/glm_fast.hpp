@@ -255,7 +255,19 @@ struct MoeDev {
     // the VRAM pool but in the RAM tier is read IN PLACE, its RAM-tier address (host-mapped) in the plan: no fetch
     // into a spare or scratch slot, no promotion or prefetch by the route, no CPU lane share, never tail-skipped
     int ram_direct = 0;
+    // The CPU lane's EXACT COMBINE (STRATA_GLM_LANE_XC; null = off): xpart_floats(n_embd) floats of device memory.
+    // The layer's output is summed in FIXED POINT (fx_term: each weighted expert row, the disk lane's part and the
+    // shared expert's rows to an int64 of 2^-kFxShift, the sum rounded to a float once) - an integer sum, the same
+    // bits in any order and whoever adds what, so it does not depend on which experts the CPU took.  A route with
+    // CPU-lane experts: moe_down leaves the device's int64 sum here, moe_cpu_wait adds the CPU's (CpuAnswer::fx)
+    float* xpart = nullptr;
 };
+/// xpart's floats: one int64 a row
+constexpr size_t xpart_floats(int n_embd) { return (size_t) 2 * (size_t) n_embd; }
+/// The exact combine's fixed point: 2^-34 (5.8e-11) a unit; a term of |v| >= 2^24 (or not finite) marks the row
+/// kFxBad, and a row any of whose terms is bad comes out NaN.  Up to 16 terms of < 2^58 units: no int64 overflow
+constexpr int kFxShift = 34;
+constexpr long long kFxBad = -0x7fffffffffffffffLL - 1;   // INT64_MIN
 /// The host's answers to routes - the CPU LANE's (CpuAnswer) and the disk misses' (MoeResponse, with its pinned
 /// staging): kCpuAnswers of each, the route `seq`'s at index seq % kCpuAnswers - a verify window has several routes
 /// of a layer in flight, and the host answers them in order before the device reads them.  16: a window of 8
@@ -266,8 +278,10 @@ constexpr int kMaxEmbd = 5120;
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {
     volatile unsigned int seq;
-    unsigned int pad[3];
-    float part[kMaxEmbd];
+    unsigned int xmask;      // the exact combine (MoeDev::xpart): != 0 when fx holds the CPU's sum (0: part only)
+    unsigned int pad[2];
+    float part[kMaxEmbd];    // the CPU's experts' weighted sum
+    long long fx[kMaxEmbd];  // xmask != 0: the CPU's experts' weighted rows summed in fixed point (kFxShift)
 };
 constexpr int kRingSize = 64;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
@@ -342,13 +356,16 @@ void sh_swiglu(const float* sh_gate, const float* sh_up, float sh_limit, int n_f
 inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 * (f < 15 ? f : 15))) & 15ull); }
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to
 /// `out` (the layer's FFN output, which moe_down wrote first - its work runs while the CPU computes).
-void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int mode = 1);
+/// k > 0 with d.xpart (the exact combine): moe_down's fixed-point sum plus the CPU's (CpuAnswer::fx), rounded once.
+void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int mode = 1, int k = 0);
 /// moe_cpu_wait (mode 1) for up to 8 columns of a verify window in one launch: column t waits for the answer its
 /// seq[t] names and adds it into out[t] (seq[t] null: none)
 struct CpuWaitCols {
     const unsigned int* seq[8] = {};
     float* out[8] = {};
+    float* xpart[8] = {};   // (the columns' exact combine, MoeDev::xpart; k > 0: on)
     int n = 0;
+    int k = 0;
 };
 void moe_cpu_wait_cols(const CpuWaitCols& c, const void* cpu_ans, int n_embd, cudaStream_t s);
 /// Expert deferral: the last route's CPU-lane part into the 4 hyper-connection streams R with the write weights post
@@ -395,6 +412,8 @@ struct MoeColArgs {
     const int* cpu_flag = nullptr;
     const float* cpu_part = nullptr;
     const int* plan_id = nullptr;   // (NVFP4: the experts' ids, for MoeDev::nv_scale)
+    float* xpart = nullptr;                 // (MoeDev::xpart, MoeDev::cpu_seq: the column's exact combine)
+    const unsigned int* cpu_seq = nullptr;
 };
 /// moe_gate_up / moe_down for nc columns in one grid (cols: nc entries in device memory): column c's xq at
 /// xq + c * xq_cs bytes, hq + c * hq_cs bytes, sh_hq + c * sh_hq_cs bytes, sh_out / out + c * out_cs floats - the
@@ -418,6 +437,14 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
                   const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo, int rhi,
                   void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s,
                   const unsigned long long* ptrs = nullptr);
+/// rows_experts in the DECODE kernels' arithmetic (the exact combine, STRATA_GLM_LANE_XC): each (expert, token) pair's
+/// rows the bits moe_gate_up / moe_down give that token - and the CPU lane's (lane_q81) - so the prompt's CPU share
+/// does not change its numbers.  The same arguments; false: a type it does not take (rows_exact_type).
+bool rows_exact_type(int ggml_type);
+bool rows_experts_exact(int gu_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light,
+                        int n, const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo,
+                        int rhi, void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s,
+                        const unsigned long long* ptrs = nullptr);
 
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);

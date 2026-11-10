@@ -374,6 +374,13 @@ bool Glm5Model::verify_alloc(std::string& err) {
         m.cpu_flag = (int*) (blk + 4 * u + 64);
         m.cpu_part = (float*) (blk + 4 * u + 192);
         if (fast_->md.cpu_seq != nullptr) m.cpu_seq = (unsigned int*) (blk + 4 * u + 128);
+        m.xpart = nullptr;   // (the exact combine: a column's own fixed-point sum, STRATA_GLM_LANE_XC)
+        if (fast_->xc && m.cpu_seq != nullptr) {
+            const size_t xb = gf::xpart_floats(g.n_embd) * sizeof(float);
+            ok = cudaMalloc((void**) &m.xpart, xb) == cudaSuccess;
+            if (!ok) break;
+            cudaMemset(m.xpart, 0, xb);
+        }
         m.pf_src = fast_->pf_buf[0];
         m.pf_dst = fast_->pf_buf[0] + 8;
         m.pf_n = fast_->pf_n_buf[0];
@@ -382,7 +389,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
         std::vector<gf::MoeColArgs> ca((size_t) TM);
         for (int t = 0; t < TM; ++t) {
             const gf::MoeDev& m = V->md[(size_t) t];
-            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part, m.plan_id};
+            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part, m.plan_id, m.xpart, m.cpu_seq};
         }
         ok = cudaMalloc((void**) &V->cols_d, ca.size() * sizeof(gf::MoeColArgs)) == cudaSuccess &&
              cudaMemcpy(V->cols_d, ca.data(), ca.size() * sizeof(gf::MoeColArgs), cudaMemcpyHostToDevice) == cudaSuccess;
@@ -960,7 +967,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         return v != nullptr && std::atoi(v) != 0;
 #endif
     }();
-    const bool hc_cpu = lane && hc_cpu_env && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 && !abl_full() &&
+    const bool hc_cpu = lane && hc_cpu_env && !F->xc && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 && !abl_full() &&
                         !(g.v41 && F->L[(size_t) il + 1].eng >= 0) && gf::hc_fuses_cpu(E);   // (as fast_moe)
     if (F->defer && Ly.moe && !Ly.mtp && il != l1_ - 1) {
         if (lane)
@@ -977,13 +984,15 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         if ((wait_cols < 0 ? g.q4x : wait_cols != 0) && T > 1 && T <= 8 && V->md[(size_t) tb].cpu_seq != nullptr) {
             gf::CpuWaitCols c;
             c.n = T;
+            c.k = k;
             for (int t = 0; t < T; ++t) {
                 c.seq[t] = V->md[(size_t) (tb + t)].cpu_seq;
                 c.out[t] = V->ffn + (size_t) (tb + t) * E;
+                c.xpart[t] = V->md[(size_t) (tb + t)].xpart;
             }
             gf::moe_cpu_wait_cols(c, V->md[(size_t) tb].cpu_ans, E, s);
         } else {
-            for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s);
+            for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s, 1, k);
         }
         if (F->prof_on) F->mark("vm_cpu_wait");
     }
