@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.127 - 2026-11-10
+
+- **Qwen3.8: the same greedy answers run to run in the normal mode** (no `STRATA_DETERMINISTIC`), on x86 CUDA with
+  24 GB of VRAM or more. The CPU lane's share of the experts follows timing; its experts now give the GPU's bits
+  exactly (the GPU's float order and its exp in the SiLU) and the layer's expert sum is taken in fixed point (each
+  weighted row to a 64-bit integer of 2^-34, rounded to a float once), so it does not matter which experts the CPU
+  computed (`STRATA_GLM_LANE_XC`). The prompt's small experts follow the same arithmetic on either side
+  (`STRATA_GLM_PREFILL_XROWS`, 32 rows). RTX 5090, Qwen3.8 16G64G, MTP on, 5 prompts: runs that parted 15 of 20 -> 0
+  of 20; decode within noise. Prompt chunks longer than about 2,000 tokens can still part. With 16 GB of VRAM decode
+  was ~4% slower, so it stays off there for now (`STRATA_GLM_LANE_XC=1` turns it on); HIP, ARM and the other models
+  are off by default (`=1` on the other models: not measured yet).
+
 ## v1.3.126 - 2026-11-10
 
 - **Anthropic `/v1/messages`: images inside `tool_result` blocks reach the model (#41).** An image tool's result (a file
