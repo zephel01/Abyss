@@ -7,6 +7,11 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.128 - 2026-11-10
+
+- **Windows build fix**: v1.3.127's exact lane sum (`q81::dev_sum`) was guarded by `__FMA__`, which MSVC does not
+  define with `/arch:AVX2`, so `iq_avx512_vbmi.cpp` did not compile on Windows. Linux is unchanged.
+
 ## v1.3.127 - 2026-11-10
 
 - **Qwen3.8: the same greedy answers run to run in the normal mode** (no `STRATA_DETERMINISTIC`), on x86 CUDA with

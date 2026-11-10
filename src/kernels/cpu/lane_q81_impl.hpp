@@ -90,7 +90,7 @@ inline float lane_expf(float x) {
 
 }  // namespace strata::kernels::cpu::q81
 
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))   // (MSVC: /arch:AVX2 has FMA but defines no __FMA__)
 #include <immintrin.h>
 namespace strata::kernels::cpu::q81 {
 // A row's dot in the DEVICE's float order (glm_fast rows_dot): call j (one 32-value q8_1 block: the weight's and the
