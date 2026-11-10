@@ -11,6 +11,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 - **Windows build fix**: v1.3.127's exact lane sum (`q81::dev_sum`) was guarded by `__FMA__`, which MSVC does not
   define with `/arch:AVX2`, so `iq_avx512_vbmi.cpp` did not compile on Windows. Linux is unchanged.
+- **Qwen3.8: same answers run to run now also with 16 GB of VRAM** (the exact lane combine is on for every VRAM
+  size on x86 CUDA). With 16 GB it was ~4% slower in v1.3.127: the GPU read the CPU's int64 partial sums over PCIe,
+  8 bytes a row against 4. The kernel now also posts its own int64 sum to the host; when it is there by the time the
+  CPU finishes, the CPU adds both, rounds once and sends floats (else the int64 path as before; the same bits either
+  way), and the CPU's fixed-point sum is vectorized. RTX 5090, Qwen3.8 16G64G at 16 GB: 96.4 -> 103.0 tok/s (the
+  older behaviour 100.6), runs that parted 0 of 20 at 16 GB and at 32 GB.
 
 ## v1.3.127 - 2026-11-10
 

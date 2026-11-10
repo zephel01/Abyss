@@ -259,11 +259,15 @@ struct MoeDev {
     // The layer's output is summed in FIXED POINT (fx_term: each weighted expert row, the disk lane's part and the
     // shared expert's rows to an int64 of 2^-kFxShift, the sum rounded to a float once) - an integer sum, the same
     // bits in any order and whoever adds what, so it does not depend on which experts the CPU took.  A route with
-    // CPU-lane experts: moe_down leaves the device's int64 sum here, moe_cpu_wait adds the CPU's (CpuAnswer::fx)
+    // CPU-lane experts: moe_down leaves the device's int64 sum here, moe_cpu_wait adds the CPU's (CpuAnswer::fx).
+    // moe_down also posts it to the answer (CpuAnswer::gfx, gseq: the last of its blocks raises gseq - a counter after
+    // the rows): a CPU that finishes after it adds the two itself and sends the float (xmask kXmFinal), so the wait
+    // reads 4 bytes a row across PCIe as without the exact combine, not 8 (16 GB of VRAM, the CPU's larger share: the
+    // 8-byte read cost ~2% of decode on a 5090 over Gen4 x4)
     float* xpart = nullptr;
 };
-/// xpart's floats: one int64 a row
-constexpr size_t xpart_floats(int n_embd) { return (size_t) 2 * (size_t) n_embd; }
+/// xpart's floats: one int64 a row, then moe_down's block counter (and pad)
+constexpr size_t xpart_floats(int n_embd) { return (size_t) 2 * (size_t) n_embd + 4; }
 /// The exact combine's fixed point: 2^-34 (5.8e-11) a unit; a term of |v| >= 2^24 (or not finite) marks the row
 /// kFxBad, and a row any of whose terms is bad comes out NaN.  Up to 16 terms of < 2^58 units: no int64 overflow
 constexpr int kFxShift = 34;
@@ -280,9 +284,16 @@ struct CpuAnswer {
     volatile unsigned int seq;
     unsigned int xmask;      // the exact combine (MoeDev::xpart): != 0 when fx holds the CPU's sum (0: part only)
     unsigned int pad[2];
-    float part[kMaxEmbd];    // the CPU's experts' weighted sum
-    long long fx[kMaxEmbd];  // xmask != 0: the CPU's experts' weighted rows summed in fixed point (kFxShift)
+    float part[kMaxEmbd];    // the CPU's experts' weighted sum (xmask kXmFinal: the layer's whole output)
+    long long fx[kMaxEmbd];  // xmask kXmFx: the CPU's experts' weighted rows summed in fixed point (kFxShift)
+    // the exact combine's device half, posted by moe_down (MoeDev::xpart): its fixed-point sum, gseq = this answer's
+    // seq once all of it is written
+    volatile unsigned int gseq;
+    unsigned int gpad[3];
+    long long gfx[kMaxEmbd];
 };
+/// CpuAnswer::xmask: 0 part to add, kXmFx fx to add to the device's sum, kXmFinal part is the output (fx + gfx)
+constexpr unsigned int kXmFx = 1u, kXmFinal = 2u;
 constexpr int kRingSize = 64;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
 constexpr int kAhead = 4;
@@ -414,6 +425,7 @@ struct MoeColArgs {
     const int* plan_id = nullptr;   // (NVFP4: the experts' ids, for MoeDev::nv_scale)
     float* xpart = nullptr;                 // (MoeDev::xpart, MoeDev::cpu_seq: the column's exact combine)
     const unsigned int* cpu_seq = nullptr;
+    const void* cpu_ans = nullptr;          // (MoeDev::cpu_ans: where moe_down posts its sum, CpuAnswer::gfx)
 };
 /// moe_gate_up / moe_down for nc columns in one grid (cols: nc entries in device memory): column c's xq at
 /// xq + c * xq_cs bytes, hq + c * hq_cs bytes, sh_hq + c * sh_hq_cs bytes, sh_out / out + c * out_cs floats - the

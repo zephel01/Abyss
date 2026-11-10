@@ -3722,6 +3722,17 @@ __device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const 
         // bits whichever experts the CPU took.  xmask 0 (the CPU's experts went through the iGPU or the expert helper:
         // a float sum only): the device's sum, then the answer's part added
         const unsigned int xm = s_xm;
+        if (xm == kXmFinal) {   // (the CPU added moe_down's sum itself: its part is the output, rounded once)
+            for (int e4 = blk * blockDim.x + tid; 4 * e4 < n_embd; e4 += nblk * blockDim.x) {
+#if defined(__HIPCC__)
+                const volatile float* vp = (const volatile float*) r->part + 4 * e4;
+                ((float4*) out)[e4] = make_float4(vp[0], vp[1], vp[2], vp[3]);
+#else
+                ((float4*) out)[e4] = __ldcv((const float4*) r->part + e4);
+#endif
+            }
+            return;
+        }
         const long long* dv = (const long long*) xp;
         for (int e2 = blk * blockDim.x + tid; 2 * e2 < n_embd; e2 += nblk * blockDim.x) {
             const int e = 2 * e2;   // (two rows a thread: one 16-byte load across PCIe)
@@ -4222,16 +4233,37 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     // sum in xpart for moe_cpu_wait, the others' rows are done here - the same bits either way
     float* xp = ca != nullptr ? ca[col].xpart : d.xpart;
     if (xp != nullptr) {
+        const unsigned int* cseq = ca != nullptr ? ca[col].cpu_seq : d.cpu_seq;
+        const unsigned int need = cseq != nullptr ? cseq[0] : 0u;   // (this route's CPU answer; 0: none)
+        const void* ab = ca != nullptr ? ca[col].cpu_ans : d.cpu_ans;
+        CpuAnswer* ga = need != 0u && ab != nullptr ? (CpuAnswer*) ab + (need % kCpuAnswers) : nullptr;
         if (threadIdx.x < NR) {
-            const unsigned int* cseq = ca != nullptr ? ca[col].cpu_seq : d.cpu_seq;
             const int j = threadIdx.x, r = r0 + j;
             long long m = 0;
             for (int i = 0; i < k; ++i)
                 if (s_ptr[i] != 0ull) m = fx_add(m, fx_term(__fmul_rn(s_w[i], s_part[i][j])));
             if (*cpu_flag) m = fx_add(m, fx_term(cpu_part[r]));
             if (sh_out != nullptr) m = fx_add(m, fx_term(sh_out[r]));
-            if (cseq != nullptr && cseq[0] != 0u) ((long long*) xp)[r] = m;
-            else out[r] = fx_float(m);
+            if (need != 0u) {
+                ((long long*) xp)[r] = m;
+                if (ga != nullptr) {
+                    ga->gfx[r] = m;   // (host-mapped: a posted write, the CPU may add it itself)
+                    __threadfence_system();
+                }
+            } else {
+                out[r] = fx_float(m);
+            }
+        }
+        if (ga != nullptr) {   // the last block to finish raises gseq (the blocks' rows fenced before the count)
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                unsigned int* cnt = (unsigned int*) (xp + 2 * (size_t) n_embd);
+                if (atomicAdd(cnt, 1u) == (unsigned int) (n_embd / NR) - 1u) {
+                    *cnt = 0u;
+                    __threadfence_system();
+                    ga->gseq = need;
+                }
+            }
         }
         return;
     }

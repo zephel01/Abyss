@@ -2411,21 +2411,17 @@ static void lane_down_rows(bool exact, const strata::kernels::cpu::NativeFmt& nf
         kc::native_down_rows_split(nf, down, h, nt, out, r0, r1);
 }
 
-// the CPU lane's EXACT COMBINE (MoeDev::xpart): its experts' weighted rows summed in fixed point - each term
-// w_i * row_i[r] to int64 units of 2^-kFxShift (glm_fast.cu's fx_term, the same steps), the sum in any order the same
-static inline long long lane_fx_term(float v) {
-    const float sv = v * (float) (1ll << gf::kFxShift);
-    return std::fabs(sv) < 0x1p58f ? std::llrint(sv) : gf::kFxBad;
-}
-static void lane_fx_sum(int ne, const float* w, const float* const* rows, int r0, int r1, long long* fx) {
-    for (int r = r0; r < r1; ++r) {
-        long long m = 0;
-        for (int i = 0; i < ne && m != gf::kFxBad; ++i) {
-            const long long t = lane_fx_term(w[i] * rows[i][r]);
-            m = t == gf::kFxBad ? gf::kFxBad : m + t;
-        }
-        fx[r] = m;
+// the CPU's answer's xmask (the exact combine): fx (kXmFx) for the device to add to its own sum - or, when moe_down
+// has already posted that sum (gseq), the two added here and the float sent (kXmFinal): the device then reads 4
+// bytes a row across PCIe, not 8 (the same bits either way)
+static void lane_xc_answer(gf::CpuAnswer* a, unsigned int seq, bool fx, int n_embd) {
+    if (fx && a->gseq == seq) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        strata::kernels::cpu::lane_q81_fx_final(a->gfx, a->fx, n_embd, a->part, gf::kFxShift);
+        a->xmask = gf::kXmFinal;
+        return;
     }
+    a->xmask = fx ? gf::kXmFx : 0u;
 }
 
 bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
@@ -2570,19 +2566,6 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const bool slot_out = fx != nullptr && exact;   // (the exact combine: the fixed-point sum into fx, no part)
     float* const dn = F->cpu_dn.data();
     const int dn_tot = ne * n_embd;
-    if (slot_out)   // (each job a run of rows of every expert, then their fixed-point sums)
-        F->cpu_pool->run(T, [&](int job) {
-            const int r0 = (int) ((int64_t) n_embd * job / T), r1 = (int) ((int64_t) n_embd * (job + 1) / T);
-            const float* rows[gf::kMaxK];
-            for (int i = 0; i < ne; ++i) {
-                const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
-                float* o[1] = {dn + (size_t) i * n_embd};
-                lane_down_rows(exact, nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
-                rows[i] = o[0];
-            }
-            lane_fx_sum(ne, w, rows, r0, r1, fx);
-        });
-    else
     F->cpu_pool->run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
@@ -2593,6 +2576,11 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             q += r1 - r0;
         }
     });
+    if (slot_out) {   // (the exact combine: the rows' fixed-point sum, vectorised, as the float sum below)
+        const float* rows[gf::kMaxK];
+        for (int i = 0; i < ne; ++i) rows[i] = dn + (size_t) i * n_embd;
+        kc::lane_q81_fx_sum(ne, w, rows, 0, n_embd, fx, gf::kFxShift);
+    }
     for (int r = 0; r < n_embd && !slot_out; ++r) {
         float m = 0.0f;
         for (int i = 0; i < ne; ++i) m += w[i] * F->cpu_dn[(size_t) i * n_embd + r];
@@ -2754,25 +2742,6 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
         lane_quant_h(exact, nf, F->cpu_ff_m.data() + (size_t) p * n_ff, F->cpu_hq_m.data() + (size_t) p * kc::kNativeHBytes);
     const bool slot_out = fx != nullptr && exact;   // (the exact combine: as fast_cpu_experts)
     const int dn_tot = nu * n_embd;
-    if (slot_out)   // (each job a run of rows of every expert, then each column's fixed-point sums of them)
-        F->cpu_pool->run(T, [&](int job) {
-            const int r0 = (int) ((int64_t) n_embd * job / T), r1 = (int) ((int64_t) n_embd * (job + 1) / T);
-            for (int u = 0; u < nu; ++u) {
-                const void* h[kCols];
-                float* o[kCols];
-                for (int k = 0; k < ucnt[u]; ++k) {
-                    h[k] = F->cpu_hq_m.data() + (size_t) upair[u][k] * kc::kNativeHBytes;
-                    o[k] = F->cpu_dn_m.data() + (size_t) upair[u][k] * n_embd;
-                }
-                lane_down_rows(exact, nf, ub[u] + Ly.down_off, h, ucnt[u], o, r0, r1);
-            }
-            for (int t = 0; t < n; ++t) {
-                const float* rows[gf::kMaxK];
-                for (int i = 0; i < ne[t]; ++i) rows[i] = F->cpu_dn_m.data() + (size_t) pair_of[t][i] * n_embd;
-                lane_fx_sum(ne[t], w + gf::kMaxK * t, rows, r0, r1, fx[t]);
-            }
-        });
-    else
     F->cpu_pool->run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
@@ -2787,6 +2756,11 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             q += r1 - r0;
         }
     });
+    for (int t = 0; t < n && slot_out; ++t) {   // (the exact combine: as fast_cpu_experts)
+        const float* rows[gf::kMaxK];
+        for (int i = 0; i < ne[t]; ++i) rows[i] = F->cpu_dn_m.data() + (size_t) pair_of[t][i] * n_embd;
+        kc::lane_q81_fx_sum(ne[t], w + gf::kMaxK * t, rows, 0, n_embd, fx[t], gf::kFxShift);
+    }
     for (int t = 0; t < n && !slot_out; ++t)
         for (int r = 0; r < n_embd; ++r) {
             float m = 0.0f;
@@ -3397,10 +3371,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // gives each expert the device's bits, and with this the layer's sum is the same whoever computed what - in
     // fixed point (kFxShift: moe_down leaves the device's int64 sum, moe_cpu_wait adds the CPU's and rounds once) -
     // so greedy answers no longer change between runs (the prompt follows: glm_prefill's exact prompt).  RTX 5090,
-    // Qwen3.8 16G64G pack: decode within noise with 32 GB of VRAM, ~4% slower with STRATA_GLM_VRAM_GB=16 (the CPU
-    // lane's larger share; 2026-11-10).  Not with expert deferral or the hc-fused answer (they add a CPU sum
-    // elsewhere); on by default for qwen4exp only (measured); HIP: off by default (its RDNA expert kernels sum in
-    // another order than lane_q81)
+    // Qwen3.8 16G64G pack: decode as fast with 32 GB of VRAM, and with 16 GB too once the CPU adds the device's
+    // posted sum itself (CpuAnswer::gfx, kXmFinal: 4 bytes a row across PCIe, not 8; 2026-11-10).  Not with expert
+    // deferral or the hc-fused answer (they add a CPU sum elsewhere); on by default for qwen4exp only (measured);
+    // HIP: off by default (its RDNA expert kernels sum in another order than lane_q81)
     {
         const char* v = getenv("STRATA_GLM_LANE_XC");
 #if defined(STRATA_USE_HIP)
@@ -3409,15 +3383,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         // (default: qwen4exp on x86, where it was measured - the AVX2 / AVX-512 lane rows keep the device's order, the
         // portable ones (ARM) do not; set 1 for the others)
 #if defined(__x86_64__) || defined(_M_X64)
-        // (and only with 24 GB of VRAM or more for now: with 16 GB the lane's share is larger and decode was ~4% slower
-        // - under study; set 1 to have it there too)
-        size_t vram = vram_cap();
-        if (vram == 0) {
-            size_t free_b = 0, total_b = 0;
-            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) vram = total_b;
-            cudaGetLastError();
-        }
-        const bool want = v == nullptr ? (g.q4x && vram >= (size_t) 24 * 1073741824ull) : std::atoi(v) != 0;
+        const bool want = v == nullptr ? g.q4x : std::atoi(v) != 0;
 #else
         const bool want = v != nullptr && std::atoi(v) != 0;
 #endif
@@ -4468,7 +4434,8 @@ void Glm5Model::fast_service() {
             xs = fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr,
                                         nv != nullptr ? gsv : nullptr, F->xc ? sl : nullptr);
         }
-        for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->xmask = xs ? 1u : 0u;
+        for (int t = 0; t < wq_n; ++t)
+            lane_xc_answer(F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers), wq[t].seq, xs, g.n_embd);
         const auto t1 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
         for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->seq = wq[t].seq;
@@ -4995,7 +4962,7 @@ void Glm5Model::fast_service() {
                 if (!H || !H->active || H->failed || gs1 != nullptr) {   // (NVFP4: not on the helper yet)
                     if (fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part,
                                          rq->xq_ok ? (const void*) rq->xq : nullptr, gs1, F->xc ? ans->fx : nullptr))
-                        xmask = 1u;
+                        xmask = gf::kXmFx;
                 } else {
                     int hn = 0, cn = 0, hi[gf::kMaxK];
                     float hw[gf::kMaxK], cw[gf::kMaxK];
@@ -5033,7 +5000,7 @@ void Glm5Model::fast_service() {
                 }
             }
             const auto t1 = std::chrono::steady_clock::now();
-            ans->xmask = xmask;
+            lane_xc_answer(ans, next, xmask != 0u, g.n_embd);
             std::atomic_thread_fence(std::memory_order_release);
             ans->seq = next;
             F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
