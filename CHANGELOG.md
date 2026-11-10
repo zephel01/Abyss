@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.129 - 2026-11-10
+
+- **GLM-5.3 and DeepSeek V4.1 decode back to v1.3.123's speed.** `STRATA_GLM_CPU_EXACT` (v1.3.124: the CPU lane in
+  the GPU's arithmetic) was on for every model on x86, and its rows for GLM's and V4.1's quant types are slower than
+  ggml-cpu's: on an RTX 5090 (RAM tier 60 GB, iGPU off) GLM-5.3 Maya-S-v2 went 44.6 -> 38.2 tok/s and V4.1 UD-IQ2_XXS
+  21.4 -> 20.2. It is now on by default for Qwen3.8 only, whose same-answers-every-run combine needs it; `=1` turns it
+  on for the others. GLM-5.3: 38.2 -> 44.0 tok/s, V4.1: 20.2 -> 21.3; Qwen3.8 unchanged. Found by re-measuring each
+  week's last release on the same machine.
+
 ## v1.3.128 - 2026-11-10
 
 - **Windows build fix**: v1.3.127's exact lane sum (`q81::dev_sum`) was guarded by `__FMA__`, which MSVC does not
