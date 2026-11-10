@@ -3409,7 +3409,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         // (default: qwen4exp on x86, where it was measured - the AVX2 / AVX-512 lane rows keep the device's order, the
         // portable ones (ARM) do not; set 1 for the others)
 #if defined(__x86_64__) || defined(_M_X64)
-        const bool want = v == nullptr ? g.q4x : std::atoi(v) != 0;
+        // (and only with 24 GB of VRAM or more for now: with 16 GB the lane's share is larger and decode was ~4% slower
+        // - under study; set 1 to have it there too)
+        size_t vram = vram_cap();
+        if (vram == 0) {
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) vram = total_b;
+            cudaGetLastError();
+        }
+        const bool want = v == nullptr ? (g.q4x && vram >= (size_t) 24 * 1073741824ull) : std::atoi(v) != 0;
 #else
         const bool want = v != nullptr && std::atoi(v) != 0;
 #endif
