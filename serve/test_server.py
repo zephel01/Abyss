@@ -451,6 +451,27 @@ class ClientShapes(unittest.TestCase):
         msgs, _, _ = anthropic_to_messages({"system": "S", "messages": [{"role": "user", "content": "u"}]})
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
 
+    def test_anthropic_tool_result_images(self):
+        """#41: an image inside a tool_result block (an image tool, a browser screenshot) reaches the template, and so
+        does a top-level image next to a tool_result; text-only tool results stay plain strings."""
+        from serve.frontend import anthropic_to_messages, images_of
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}
+        req = {"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Open check.png"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "read_image", "input": {"path": "c"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "Read image"}, img]},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "plain"},
+                {"type": "text", "text": "and this one"}, img]}]}
+        msgs, _, _ = anthropic_to_messages(req)
+        tools = [m for m in msgs if m["role"] == "tool"]
+        self.assertEqual(tools[0]["content"][0], {"type": "text", "text": "Read image"})
+        self.assertEqual(tools[0]["content"][1]["type"], "image")
+        self.assertEqual(tools[1]["content"], "plain")
+        self.assertEqual(msgs[-1]["role"], "user")
+        self.assertEqual([i["type"] for i in msgs[-1]["content"]], ["text", "image"])
+        self.assertEqual(len(images_of(msgs)), 2)
+
 
 class SamplingKeys(unittest.TestCase):
     """The GEN line's sampling keys: top_k 0 ("off") or wider than the engine's 64 get the widest list, 64 (they used

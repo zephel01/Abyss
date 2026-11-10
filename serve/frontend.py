@@ -293,19 +293,23 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
-        text, reasoning, calls = [], [], []
+        text, reasoning, calls, rest = [], [], [], []   # rest: the text and image blocks, in order (#41)
         for block in content or []:
             kind = block.get("type")
             if kind == "text":
                 text.append(block.get("text", ""))
+                rest.append(block)
+            elif kind in IMAGE_PARTS:
+                rest.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
-            elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
-        if text or calls or reasoning:
-            out = {"role": m["role"], "content": "".join(text)}
+            elif kind == "tool_result":   # an image tool's result keeps its images, as role "tool" does on /v1/chat (#41)
+                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+        images = m.get("role") == "user" and _has_image(rest)
+        if text or calls or reasoning or images:
+            out = {"role": m["role"], "content": _parts_of(rest) if images else "".join(text)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
