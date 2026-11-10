@@ -65,6 +65,27 @@ inline bool uma_others_block(double others_gb, bool experts_short) {
     return experts_short && lim > 0.0 && others_gb > lim;
 }
 
+// ---- the RAM tier's cap on Linux with a discrete card (no STRATA_GLM_RAM_GB).  A share of MemTotal alone
+// (STRATA_GLM_RAM_FRAC, 0.73) was set on a 94 GB machine (67-68 GB pinned ran for days, 73.9 thrashed: the page cache
+// the shards and Engram tables go through, the server and the desktop need ~20-26 GB whatever the RAM's size), so on
+// bigger machines it left more free than that need: 34 GB on a 123 GB one (88.7 GB pinned; 100 decoded DeepSeek V4.1
+// 30.2 -> 35.8 tok/s, 110 was OOM-killed at load).  So the cap is the larger of the share and MemTotal less a fixed
+// keep (STRATA_GLM_RAM_KEEP_GB, 24): the share still rules below ~89 GB of RAM, the keep above.  An explicit
+// STRATA_GLM_RAM_FRAC (without STRATA_GLM_RAM_KEEP_GB) keeps the share alone, as before.  Bytes; 0 when MemTotal is
+// unknown (no cap).  *by_keep says which bound won
+inline int64_t ram_tier_cap(int64_t mem_total, double frac, double keep_gb, bool use_keep, bool* by_keep = nullptr) {
+    if (by_keep != nullptr) *by_keep = false;
+    if (mem_total <= 0) return 0;
+    const int64_t by_frac = (int64_t) ((double) mem_total * frac);
+    if (!use_keep) return by_frac;
+    const int64_t by_k = std::max<int64_t>(0, mem_total - (int64_t) (keep_gb * 1073741824.0));
+    if (by_k > by_frac) {
+        if (by_keep != nullptr) *by_keep = true;
+        return by_k;
+    }
+    return by_frac;
+}
+
 // STRATA_GLM_UMA_DIRECT: the device reads RAM-tier experts IN PLACE (their pinned host address in the plan) instead
 // of copying them into a VRAM slot first.  Unset: `integrated` (fast_setup passes false - the copy mode is the default
 // everywhere); "0" off; any other value on (a discrete card too: for tests - its reads then cross PCIe every token)
