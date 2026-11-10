@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+- **Opt-in: an expert's SSD chunks all read at once** (`STRATA_GLM_DISK_PAR=1`, off by default until measured). While
+  answering, an expert a token misses is read as 24 chunks (3 parts x `STRATA_GLM_READ_CHUNKS` 8) by 9 threads, about
+  three rounds; the switch gives these reads a pool of their own with a thread a chunk (`<n>`: n threads). Only the
+  order of the reads changes, so the answers are the same. fio on the 6.7 GB/s NVMe: 9 reads at once 4.64 GB/s, 24 at
+  once 5.10. `STRATA_GLM_TIMING=1` now also prints the disk waits fio-style (rate while waiting, mean / p50 / p90 / p99
+  of a one-expert wait), with the switch on or off.
+- **A GPU lost during the start-up fill now says so.** The warm-up checks its copies to VRAM and the table upload and
+  names the CUDA error with a hint (Xid in the kernel log, reboot, reseat an external link), instead of "the warmed
+  expert tables did not upload" (an RTX 5090 on OCuLink fell off the bus there on 2026-11-10).
+
 ## v1.3.129 - 2026-11-10
 
 - **GLM-5.3 and DeepSeek V4.1 decode back to v1.3.123's speed.** `STRATA_GLM_CPU_EXACT` (v1.3.124: the CPU lane in

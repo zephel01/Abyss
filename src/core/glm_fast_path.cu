@@ -1777,6 +1777,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel; pinned staging for when the RAM tier has no free slot
         F->workers.reset(new Workers(8));
+        F->shared_readers = F->workers->size();   // (for the disk-read stats, printed after the pool is gone)
         // (fast_warm streams 8 at a time; the service's disk misses take a set of 8 per in-flight route, by its seq
         // modulo kCpuAnswers - a verify window has several routes of a layer answered before the device reads them)
         F->stage.assign((size_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers, nullptr);
@@ -1800,6 +1801,19 @@ bool Glm5Model::fast_setup(std::string& err) {
         // past 31 - the device copied chunks that had not landed, and the routes read garbage)
         const char* rc = getenv("STRATA_GLM_READ_CHUNKS");
         F->read_chunks = std::max(1, std::min(10, rc ? std::atoi(rc) : 8));
+        // STRATA_GLM_DISK_PAR: the decode's miss reads on a pool of their own, every chunk of an expert at once (1:
+        // 3 x READ_CHUNKS threads, the caller included; <n> >= 2: n threads).  A read waits in pread, so the threads
+        // cost no CPU there; between misses they spin STRATA_GLM_DISK_PAR_SPIN_US (50) and then sleep, so they do not
+        // hold CPUs the CPU lane wants.  Off by default until measured (fio on an NM790: 9 x 424 KB reads 4.64 GB/s,
+        // 24 at once 5.10)
+        if (const char* dp = getenv("STRATA_GLM_DISK_PAR"); dp != nullptr && std::atoi(dp) > 0) {
+            const int v = std::atoi(dp);
+            F->disk_par = std::max(2, std::min(64, v == 1 ? 3 * F->read_chunks : v));
+            const int spin = (int) strata::core::env_num("STRATA_GLM_DISK_PAR_SPIN_US", 50.0, 0.0, 20000.0);
+            F->disk_pool.reset(new Workers(F->disk_par - 1, spin));
+            std::fprintf(stderr, "glm fast: CUDA%d disk reads: %d threads for a miss's %d chunks (STRATA_GLM_DISK_PAR, "
+                                 "spin %d us)\n", dev_, F->disk_par, 3 * F->read_chunks, spin);
+        }
         std::array<std::array<short, gf::kMaxK>, gf::kAhead> none;
         for (auto& r : none) r.fill(-1);
         F->ah_pred.assign((size_t) NL, none);
@@ -3838,6 +3852,15 @@ bool Glm5Model::fast_warm(std::string& err) {
             const size_t ia = (size_t) a.e * 9, ib = (size_t) b.e * 9;
             return std::make_pair(na.x_shard[ia], na.x_off[ia]) < std::make_pair(nb2.x_shard[ib], nb2.x_off[ib]);
         });
+    // a CUDA error here is almost always the GPU itself gone (2026-11-10: an RTX 5090 on OCuLink fell off the bus at the
+    // end of the warm-up - Xid 79 - and the old message, "the warmed expert tables did not upload", read like a bug)
+    auto warm_lost = [&](cudaError_t e, const char* what) {
+        err = "glm fast: CUDA" + std::to_string(dev_) + " failed in " + what + " while warming the expert tiers (" +
+              cudaGetErrorString(e) + ", CUDA error " + std::to_string((int) e) +
+              ") - GPU lost? (fell off the bus / reset: look for an Xid in the kernel log, `sudo dmesg | grep -i xid`; "
+              "nvidia-smi shows \"Unknown Error\" then; reboot, and reseat an external link)";
+        return false;
+    };
     // stream them: 8 experts per batch, 3 slices each in parallel; VRAM ones through the pinned staging
     size_t done_bytes = 0, total_bytes = 0;
     for (const auto& j : jobs) total_bytes += F->L[(size_t) j.il].blob;
@@ -3865,10 +3888,13 @@ bool Glm5Model::fast_warm(std::string& err) {
         for (int k = 0; k < nb; ++k) {
             const Job& J = jobs[b + (size_t) k];
             if (J.vram)
-                cudaMemcpyAsync(J.dst, F->stage[(size_t) k], F->L[(size_t) J.il].blob, cudaMemcpyHostToDevice, F->copy);
+                if (const cudaError_t e = cudaMemcpyAsync(J.dst, F->stage[(size_t) k], F->L[(size_t) J.il].blob,
+                                                          cudaMemcpyHostToDevice, F->copy);
+                    e != cudaSuccess)
+                    return warm_lost(e, "a copy to VRAM");
             done_bytes += F->L[(size_t) J.il].blob;
         }
-        cudaStreamSynchronize(F->copy);
+        if (const cudaError_t e = cudaStreamSynchronize(F->copy); e != cudaSuccess) return warm_lost(e, "the copies to VRAM");
         const int pct = (int) (100.0 * (double) done_bytes / (double) std::max<size_t>(1, total_bytes));
         if (pct / 10 != last_pct / 10) {
             last_pct = pct;
@@ -3877,10 +3903,9 @@ bool Glm5Model::fast_warm(std::string& err) {
                          (double) done_bytes / 1e9, (double) total_bytes / 1e9, s);
         }
     }
-    if (cudaMemcpy(F->tab, th.data(), th.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice) != cudaSuccess) {
-        err = "glm fast: the warmed expert tables did not upload";
-        return false;
-    }
+    if (const cudaError_t e = cudaMemcpy(F->tab, th.data(), th.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
+        e != cudaSuccess)
+        return warm_lost(e, "the expert tables' upload");
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "glm fast: CUDA%d tiers warm: %zu experts (%.1f GB) in %.0f s (%.2f GB/s)\n", dev_, jobs.size(),
                  (double) total_bytes / 1e9, s, (double) total_bytes / 1e9 / std::max(1e-9, s));
@@ -3913,6 +3938,7 @@ void Glm5Model::fast_destroy() {
     }
     F->ah_cv.notify_all();
     for (auto& t : F->ah_th) t.join();
+    F->disk_pool.reset();
     F->workers.reset();
     F->cpu_pool.reset();
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
@@ -3959,6 +3985,26 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->demotions.load(), (unsigned long long) F->drops.load(),
                      (unsigned long long) F->prefetches.load(), (unsigned long long) F->miss_layers.load(),
                      (double) F->miss_us.load() / 1000.0);
+        if (const uint64_t dw = F->miss_layers.load(), dr = F->disk_reads.load(); dr > 0) {
+            // the decode's disk waits, fio-style: the effective rate while waiting, and the one-expert waits' times
+            const uint64_t n1 = F->disk_one_waits.load();
+            auto pct = [&](double q) {
+                const uint64_t want = (uint64_t) std::ceil(q * (double) n1);
+                uint64_t c = 0;
+                for (int b = 0; b < FastState::kDiskHist; ++b)
+                    if ((c += F->disk_one_hist[(size_t) b].load()) >= std::max<uint64_t>(1, want))
+                        return (double) (b + 1) * FastState::kDiskHistUs / 1000.0;
+                return (double) FastState::kDiskHist * FastState::kDiskHistUs / 1000.0;
+            };
+            std::fprintf(stderr, "glm fast disk reads CUDA%d: %d threads (%s) | %llu waits, %llu reads, %.2f GB in %.2f s "
+                                 "of waiting = %.2f GB/s | one-expert waits %llu: mean %.2f ms, p50 %.2f p90 %.2f p99 %.2f "
+                                 "ms (bucket tops)\n", dev_, F->disk_par > 0 ? F->disk_par : F->shared_readers,
+                         F->disk_par > 0 ? "STRATA_GLM_DISK_PAR" : "shared pool", (unsigned long long) dw,
+                         (unsigned long long) dr, (double) F->disk_bytes.load() / 1e9, (double) F->miss_us.load() / 1e6,
+                         (double) F->disk_bytes.load() / 1e3 / (double) std::max<uint64_t>(1, F->miss_us.load()),
+                         (unsigned long long) n1, (double) F->disk_one_us.load() / 1000.0 / (double) std::max<uint64_t>(1, n1),
+                         pct(0.5), pct(0.9), pct(0.99));
+        }
         if (g_.v41) dsv41_engram_report();
         if (const uint64_t m0 = strata::core::shard_io::mirror_bytes[0].load(), m1 = strata::core::shard_io::mirror_bytes[1].load(); m1 > 0)
             std::fprintf(stderr, "glm fast mirror CUDA%d: %.2f GB from the shards' drive, %.2f GB from the mirror "
@@ -4825,7 +4871,8 @@ void Glm5Model::fast_service() {
                 }
                 if (nr > 0 && !dlane_now) lane_start();
                 F->disk_busy.store(1, std::memory_order_release);   // (the RAM fill's reads wait)
-                F->workers->run(nr * 3 * rch, [&](int job) {
+                glmfast::Workers& rpool = F->disk_pool ? *F->disk_pool : *F->workers;   // (STRATA_GLM_DISK_PAR)
+                rpool.run(nr * 3 * rch, [&](int job) {
                     const int m = rd[job / (3 * rch)], part = job % (3 * rch);
                     fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
                     if (stream) {   // the chunk is in the slot: tell the fetch kernel
@@ -4899,6 +4946,15 @@ void Glm5Model::fast_service() {
                 for (int r2 = 0; r2 < nr; ++r2) ++F->diag_disk[F->left[(size_t) il * g.n_expert + ids[mi[rd[r2]]]] & 3];
                 F->disk_us.fetch_add(us, std::memory_order_relaxed);
                 F->miss_us.fetch_add(us, std::memory_order_relaxed);
+                if (nr > 0) {   // (the read-time stats: bytes, and the one-expert waits' times)
+                    F->disk_bytes.fetch_add((uint64_t) nr * F->L[(size_t) il].blob, std::memory_order_relaxed);
+                    if (nr == 1) {
+                        F->disk_one_waits.fetch_add(1, std::memory_order_relaxed);
+                        F->disk_one_us.fetch_add(us, std::memory_order_relaxed);
+                        const size_t hb = std::min<size_t>(FastState::kDiskHist - 1, (size_t) (us / FastState::kDiskHistUs));
+                        F->disk_one_hist[hb].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 F->miss_layers.fetch_add(1, std::memory_order_relaxed);
                 static const bool trace = getenv("STRATA_GLM_SVC_TRACE") != nullptr;
                 if (trace)
