@@ -36,6 +36,13 @@ bool lane_q81_fast(int ggml_type) noexcept;
 /// Whether lane_q81_rows' form for this type on this CPU sums in the DEVICE's float order too (rows_dot's lanes and
 /// warp_sum: q81::dev_sum) - its rows then have the GPU's bits, not only its numbers (the exact combine's prompt).
 bool lane_q81_dev_order(int ggml_type) noexcept;
+/// The exact combine's CPU sum (glm_fast.hpp MoeDev::xpart): fx[r] = sum over i of round(w[i] * rows[i][r] * 2^shift)
+/// as int64 (nearest even; a term not finite or of 2^58 units or more makes the row INT64_MIN), rows [r0, r1) -
+/// glm_fast.cu's fx_term / fx_add steps, vectorised where the CPU has AVX2.
+void lane_q81_fx_sum(int ne, const float* w, const float* const* rows, int r0, int r1, long long* fx, int shift);
+/// out[r] = (a[r] + b[r]) * 2^-shift rounded to the nearest float, NaN when either is INT64_MIN (glm_fast.cu's
+/// fx_float(fx_add(a, b)): the exact combine's two halves, added on the CPU)
+void lane_q81_fx_final(const long long* a, const long long* b, int n, float* out, int shift);
 /// An expert's gate/up rows [r0, r1) for nt tokens and the device's epilogue (moe_gate_up_kernel): g = min(scale * gate,
 /// limit), u = clamp(scale * up, +-limit), ff[t][r] = g / (1 + exp(-g)) * u (limit infinite: no clamp; scale: NVFP4's
 /// second-level scale, else 1).  The rows of gate at gate_base + r * gate_row, of up likewise (a mixed layer: up's own

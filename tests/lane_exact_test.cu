@@ -173,6 +173,12 @@ int run_case(const TypeCase& tc, float limit) {
             float* dno[1] = {dn.data() + (size_t) i * E};
             kc::lane_q81_rows(tc.d, b + down_off, d_row, F, h, 1, dno, 0, E);
         }
+        std::vector<long long> fxl((size_t) E);   // (the lane's own sum, kc::lane_q81_fx_sum: the vector form)
+        {
+            const float* rows[gf::kMaxK];
+            for (int i = 0; i < K; ++i) rows[i] = dn.data() + (size_t) i * E;
+            kc::lane_q81_fx_sum(K, w.data(), rows, 0, E, fxl.data(), gf::kFxShift);
+        }
         for (int r = 0; r < E; ++r) {
             // the exact combine (glm_fast fx_term): each weighted row to int64 units of 2^-kFxShift, summed, one rounding
             long long sx = 0;
@@ -183,6 +189,11 @@ int run_case(const TypeCase& tc, float limit) {
                 sx = std::fabs(sv) < 0x1p58f && sx != gf::kFxBad ? sx + std::llrint(sv) : gf::kFxBad;
                 ref += (double) w[(size_t) i] * dn[(size_t) i * E + r];
                 fc = std::fma(w[(size_t) i], dn[(size_t) i * E + r], fc);
+            }
+            if (fxl[(size_t) r] != sx) {
+                ++out_bad;
+                if (out_bad <= 3) std::printf("  %s route %d row %d: lane_q81_fx_sum %lld vs %lld\n", tc.name, t, r,
+                                              fxl[(size_t) r], sx);
             }
             const float m = sx == gf::kFxBad ? NAN : (float) sx * (1.0f / (float) (1ll << gf::kFxShift));
             chain = fc;

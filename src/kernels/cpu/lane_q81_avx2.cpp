@@ -837,6 +837,31 @@ void lane_q81_quant_avx2(const float* x, int64_t n, void* dst) {
     }
 }
 
+// lane_q81_fx_sum's rows 4 at a time: w * row in float (as the device's __fmul_rn), then in double (exact: a float
+// times 2^shift) rounded to an integer by the 1.5 * 2^52 add (nearest even, as llrint) and taken from the bits - exact
+// while |term| < 2^51; a group with a larger or non-finite term goes to the scalar steps.  Returns the rows done.
+int lane_q81_fx_sum_avx2(int ne, const float* w, const float* const* rows, int r0, int r1, long long* fx, int shift) {
+    const __m256d sc = _mm256_set1_pd(std::ldexp(1.0, shift));
+    const __m256d magic = _mm256_set1_pd(6755399441055744.0);   // 1.5 * 2^52
+    const __m256d lim = _mm256_set1_pd(2251799813685248.0);     // 2^51
+    const __m256d sgn = _mm256_set1_pd(-0.0);
+    const __m256i mb = _mm256_castpd_si256(magic);
+    int r = r0;
+    for (; r + 4 <= r1; r += 4) {
+        __m256i acc = _mm256_setzero_si256();
+        __m256d big = _mm256_setzero_pd();
+        for (int i = 0; i < ne; ++i) {
+            const __m128 v = _mm_mul_ps(_mm_set1_ps(w[i]), _mm_loadu_ps(rows[i] + r));
+            const __m256d d = _mm256_mul_pd(_mm256_cvtps_pd(v), sc);
+            big = _mm256_or_pd(big, _mm256_cmp_pd(_mm256_andnot_pd(sgn, d), lim, _CMP_NLT_UQ));
+            acc = _mm256_add_epi64(acc, _mm256_sub_epi64(_mm256_castpd_si256(_mm256_add_pd(d, magic)), mb));
+        }
+        if (_mm256_movemask_pd(big) != 0) break;
+        _mm256_storeu_si256((__m256i*) (fx + r), acc);
+    }
+    return r;
+}
+
 #endif
 
 }  // namespace strata::kernels::cpu

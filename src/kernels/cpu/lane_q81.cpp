@@ -624,6 +624,7 @@ void quant_block(const float* x, int8_t* q, float& d_out, float& s_out, int16_t*
 
 // (lane_q81_avx2.cpp, lane_q81_vnni.cpp; x86 builds)
 void lane_q81_quant_avx2(const float* x, int64_t n, void* dst);
+int lane_q81_fx_sum_avx2(int ne, const float* w, const float* const* rows, int r0, int r1, long long* fx, int shift);
 
 bool lane_q81_type(int t) noexcept {
     Fmt f;
@@ -719,6 +720,31 @@ bool lane_q81_fast(int t) noexcept {
     (void) t;
     return false;
 #endif
+}
+
+void lane_q81_fx_sum(int ne, const float* w, const float* const* rows, int r0, int r1, long long* fx, int shift) {
+    constexpr long long kBad = -0x7fffffffffffffffLL - 1;
+    const float sc = std::ldexp(1.0f, shift);
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    if (avx2) r0 = lane_q81_fx_sum_avx2(ne, w, rows, r0, r1, fx, shift);
+#endif
+    for (int r = r0; r < r1; ++r) {   // (the rest, and any 4-row group with a term of 2^51 units or more)
+        long long m = 0;
+        for (int i = 0; i < ne && m != kBad; ++i) {
+            const float sv = (w[i] * rows[i][r]) * sc;
+            const long long t = std::fabs(sv) < 0x1p58f ? std::llrint(sv) : kBad;
+            m = t == kBad ? kBad : m + t;
+        }
+        fx[r] = m;
+    }
+}
+
+void lane_q81_fx_final(const long long* a, const long long* b, int n, float* out, int shift) {
+    constexpr long long kBad = -0x7fffffffffffffffLL - 1;
+    const float inv = std::ldexp(1.0f, -shift);
+    for (int r = 0; r < n; ++r)   // (as glm_fast.cu's fx_float(fx_add(a, b)): the integer sum to the nearest float)
+        out[r] = a[r] == kBad || b[r] == kBad ? std::nanf("") : (float) (a[r] + b[r]) * inv;
 }
 
 bool lane_q81_dev_order(int t) noexcept {

@@ -389,7 +389,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
         std::vector<gf::MoeColArgs> ca((size_t) TM);
         for (int t = 0; t < TM; ++t) {
             const gf::MoeDev& m = V->md[(size_t) t];
-            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part, m.plan_id, m.xpart, m.cpu_seq};
+            ca[(size_t) t] = gf::MoeColArgs{m.plan_ptr, m.plan_w, m.cpu_flag, m.cpu_part, m.plan_id, m.xpart, m.cpu_seq, m.cpu_ans};
         }
         ok = cudaMalloc((void**) &V->cols_d, ca.size() * sizeof(gf::MoeColArgs)) == cudaSuccess &&
              cudaMemcpy(V->cols_d, ca.data(), ca.size() * sizeof(gf::MoeColArgs), cudaMemcpyHostToDevice) == cudaSuccess;
