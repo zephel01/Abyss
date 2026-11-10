@@ -676,6 +676,8 @@ GGUFs that load, the pack command (`tools/iq_pack.py --fast`), the drafter, a co
   `STRATA_Q4X_DFLASH_PMIN` (0.9): the selector's confidence a draft needs; the walk stops at the first draft below it
   (0.75, the drafter's own default: list 137 against 142; 0.5 slower everywhere). The drafts match a numpy reference
   of the drafter (teacher-forced code: 3.62 of 3.83 drafts kept a step against the reference's 3.59 of 3.79).
+  A draft step runs as one CUDA graph (1.14 ms on an RTX 5090, was 1.96); `STRATA_Q4X_DFLASH_GRAPH=0` launches its
+  kernels one by one (the same drafts).
 
 ## Ornith-1.5-122B
 
