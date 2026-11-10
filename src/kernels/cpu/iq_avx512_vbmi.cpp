@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -454,8 +455,14 @@ void rows_q81(const Dec<TY>& D, const uint8_t* w, size_t row_bytes, int nb, cons
     const __m512i zero = _mm512_setzero_si512();
     const __m512i pab = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
     const __m256i one32 = _mm256_set1_epi32(1);
+    // (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS: each 32 values' d_w * d_x times the integer sum, in the device's float
+    // order - q81::dev_sum - so the CPU lane's expert has the GPU's bits; IQ1_S keeps the sum below)
+    constexpr bool dev = TY != 19;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
+        __m256 dv[dev ? NT : 1][4];   // (block i's 8 sub-blocks: the device's lanes 8 (i % 4) .. +7)
+        if constexpr (dev)
+            for (int t = 0; t < NT; ++t) dv[t][0] = dv[t][1] = dv[t][2] = dv[t][3] = _mm256_setzero_ps();
         __m256 acc[NT];
         for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
         for (int i = 0; i < nb; ++i) {
@@ -508,14 +515,26 @@ void rows_q81(const Dec<TY>& D, const uint8_t* w, size_t row_bytes, int nb, cons
                 __m256 c;
                 if constexpr (TY == 16) {
                     const __m256i s = tdiv<3>(_mm256_mullo_epi32(_mm256_add_epi32(A, B), l0));
+                    if constexpr (dev) {
+                        dv[t][i & 3] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s), dv[t][i & 3]);
+                        continue;
+                    }
                     c = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s));
                 } else if constexpr (TY == 18) {
                     const __m256i S = _mm256_add_epi32(A, B);
                     const __m256i s = tdiv<1>(_mm256_add_epi32(_mm256_mullo_epi32(l0, S), tdiv<1>(S)));
+                    if constexpr (dev) {
+                        dv[t][i & 3] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s), dv[t][i & 3]);
+                        continue;
+                    }
                     c = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s));
                 } else if constexpr (TY == 17 || TY == 22) {
                     const __m256i s = tdiv<2>(_mm256_add_epi32(
                         _mm256_add_epi32(_mm256_mullo_epi32(A, l0), _mm256_mullo_epi32(B, l1)), tdiv<1>(_mm256_add_epi32(A, B))));
+                    if constexpr (dev) {
+                        dv[t][i & 3] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s), dv[t][i & 3]);
+                        continue;
+                    }
                     c = _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(s));
                 } else {   // 19: + each sub-block's code sum (its 4 sums of 8)
                     const __m256i b4 = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*) (tk[t].b8 + 32 * i)));
@@ -532,7 +551,9 @@ void rows_q81(const Dec<TY>& D, const uint8_t* w, size_t row_bytes, int nb, cons
                 acc[t] = _mm256_add_ps(acc[t], c);
             }
         }
-        for (int t = 0; t < NT; ++t) out[t][r] = hsum_ggml(acc[t]);
+        for (int t = 0; t < NT; ++t)
+            if constexpr (dev) out[t][r] = q81::dev_sum(dv[t]);
+            else out[t][r] = hsum_ggml(acc[t]);
     }
 }
 

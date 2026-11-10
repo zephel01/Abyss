@@ -33,6 +33,9 @@ void lane_q81_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, con
                    float* const* out, int r0, int r1);
 /// Whether lane_q81_rows has a vector form for this type on this CPU (false: the portable scalar one).
 bool lane_q81_fast(int ggml_type) noexcept;
+/// Whether lane_q81_rows' form for this type on this CPU sums in the DEVICE's float order too (rows_dot's lanes and
+/// warp_sum: q81::dev_sum) - its rows then have the GPU's bits, not only its numbers (the exact combine's prompt).
+bool lane_q81_dev_order(int ggml_type) noexcept;
 /// An expert's gate/up rows [r0, r1) for nt tokens and the device's epilogue (moe_gate_up_kernel): g = min(scale * gate,
 /// limit), u = clamp(scale * up, +-limit), ff[t][r] = g / (1 + exp(-g)) * u (limit infinite: no clamp; scale: NVFP4's
 /// second-level scale, else 1).  The rows of gate at gate_base + r * gate_row, of up likewise (a mixed layer: up's own

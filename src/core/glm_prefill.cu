@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/lane_q81.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/gdn.hpp"
@@ -552,6 +553,11 @@ struct Glm5Model::PrefillState {
     bool pin_fail = false;
     std::vector<uint8_t> c_act, c_hq, c_pack;
     std::vector<float> c_ff;
+    // the exact light rows (gf::rows_experts_exact): each expert's blob address (a tail slot's is not base + slot *
+    // stride), uploaded with the light list
+    std::vector<unsigned long long> xl_ptrs_h;
+    unsigned long long* xl_ptrs_d = nullptr;
+    uint64_t x_flushed = 0;   // (the exact prompt's layers whose rows were added as the window filled)
     uint64_t cpu_experts = 0, cpu_rows = 0;
     double ms_cpu = 0, row_ms = 0.05;   // row_ms: the host's cost of a row, learned (the split's estimate)
     // the host experts on the iGPU (abyss_igpu_rows): its own cost of a row (learned) and of an expert; the host
@@ -1625,6 +1631,7 @@ void Glm5Model::prefill_destroy() {
     if (S->gpin) cudaFreeHost(S->gpin);
     if (S->emb_h) cudaFreeHost(S->emb_h);
     if (S->toks_d) cudaFree(S->toks_d);
+    if (S->xl_ptrs_d) cudaFree(S->xl_ptrs_d);
     if (S->img_d) cudaFree(S->img_d);
     if (S->hop_h) cudaFreeHost(S->hop_h);
     if (S->h_counts) cudaFreeHost(S->h_counts);
@@ -3143,8 +3150,30 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }();
         const auto lt_ok = [](int t) { return t == 16 || t == 18 || t == 19; };
         static const int light_layer = getenv("STRATA_GLM_PREFILL_LIGHT_LAYER") ? std::atoi(getenv("STRATA_GLM_PREFILL_LIGHT_LAYER")) : -1;
-        const int light_rows = lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && (light_layer < 0 || il == light_layer)
+        // THE EXACT PROMPT (the CPU lane's exact combine on, STRATA_GLM_LANE_XC): every expert with at most xrows rows
+        // of the chunk - resident, in a tail slot or in the RAM tier - is computed in the decode kernels' arithmetic,
+        // on the GPU (gf::rows_experts_exact) or, from the RAM tier, on the CPU (lane_q81: the same bits), and the
+        // CPU takes no other expert; the rest go through MMQ (whose rows do not depend on where an expert was).  So a
+        // prompt's numbers do not depend on what was resident or on the CPU's timing-learned share.  An expert on disk
+        // still goes through MMQ.  STRATA_GLM_PREFILL_XROWS=<n>: the rows bound (0: off - the timing-learned share)
+        namespace kc = strata::kernels::cpu;
+        static const int xrows_env = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_XROWS");
+            return v ? std::max(0, std::min(kLightRows, std::atoi(v))) : kLightRows;
+        }();
+        // (a chunk whose routed rows do not all fit the output window - over ~2,000 tokens on Qwen3.8 - adds them into
+        // ffn as the window fills, in the order the experts ran: not one order anyway, so it keeps the timed share)
+        const bool xact = F->xc && xrows_env > 0 && (size_t) T * (size_t) K <= (size_t) moe_window_rows((size_t) T, g) &&
+                          gf::rows_exact_type(Ly.gu_type) && gf::rows_exact_type(Ly.d_type) &&
+                          !Ly.mixed() && !Ly.exl3 && Ly.nv_host.empty() && Ly.nv_scale == nullptr &&
+                          (size_t) il < F->cpu_exact.size() && F->cpu_exact[(size_t) il] != 0 &&
+                          kc::lane_q81_dev_order(Ly.gu_type) && kc::lane_q81_dev_order(Ly.d_type) &&
+                          kc::lane_q81_act_bytes(E) <= kc::kNativeActBytes &&
+                          kc::lane_q81_act_bytes(nff) <= kc::kNativeHBytes;
+        const int light_rows = xact ? xrows_env
+                               : lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && (light_layer < 0 || il == light_layer)
                                    ? light_env : 0;
+        if (xact && S->xl_ptrs_h.empty()) S->xl_ptrs_h.resize((size_t) kLightMax);
         int n_light = 0, rows_mmq = 0;
         int b_pre = -1, rows_pre = 0, max_pre = 0;   // the prestaged set: its bounds, rows and largest expert
         const int pre_n = S->pre_layer == il ? (int) S->pre_e.size() : 0;
@@ -3159,6 +3188,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     cnt = S->h_counts[e];
                     if (cnt > 0 && cnt <= light_rows && n_light < kLightMax) {
                         S->h_counts[e] = -cnt;   // claimed (rows assigned below)
+                        if (xact) S->xl_ptrs_h[(size_t) n_light] = (unsigned long long) P.slot_ptr(sl);
                         h_light[3 * n_light] = sl;
                         h_light[3 * n_light + 1] = e;   // (the expert until its rows are known)
                         h_light[3 * n_light + 2] = cnt;
@@ -3173,6 +3203,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 max_res = std::max(max_res, cnt);
                 S->h_bounds[nb++] = rows_res;
             }
+            // (the exact prompt: the tail slots' lightly routed experts too, by address)
+            for (int e = 0; xact && e < NE && n_light < kLightMax; ++e) {
+                const int cnt = S->h_counts[e];
+                if (cnt <= 0 || cnt > light_rows) continue;
+                const int vs = F->slot_of[(size_t) (il * NE + e)];
+                if (vs >= P.n_main && vs < P.n && P.st[(size_t) vs] == FastState::kResident && P.key[(size_t) vs] == e) {
+                    S->h_counts[e] = -cnt;
+                    S->xl_ptrs_h[(size_t) n_light] = (unsigned long long) P.slot_ptr(vs);
+                    h_light[3 * n_light] = vs;
+                    h_light[3 * n_light + 1] = e;
+                    h_light[3 * n_light + 2] = cnt;
+                    ++n_light;
+                }
+            }
             rows_mmq = rows_res;
             for (int i = 0; i < n_light; ++i) {
                 const int e = h_light[3 * i + 1];
@@ -3186,7 +3230,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->h_bounds[nb++] = 0;
                 for (int e : S->pre_e) {
                     const int cnt = std::max(0, S->h_counts[e]);
-                    if (cnt > 0) {
+                    if (cnt > 0 && !(xact && cnt <= light_rows)) {   // (the exact prompt's light ones: to the CPU)
                         S->h_base[e] = rows_res + rows_pre;
                         S->h_counts[e] = -cnt;   // claimed
                         rows_pre += cnt;
@@ -3278,7 +3322,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 std::vector<char> take(staged.size(), 0);
                 const int cpu_cap = moe_window_rows((size_t) T, g);   // (the device rows their outputs go up into)
                 int cpu_rows_taken = 0;
+                // the exact prompt: every RAM-tier expert of at most light_rows rows, whatever the times say, no other
                 for (size_t i : ram_i) {
+                    if (!xact) break;
+                    const int cnt = S->h_counts[staged[i].e];
+                    if (cnt > light_rows || cpu_rows_taken + cnt > cpu_cap) break;
+                    cpu_rows_taken += cnt;
+                    take[i] = 1;
+                }
+                for (size_t i : ram_i) {
+                    if (xact) break;
                     // (an expert's fixed cost is about twice the lane's one-token expert: its weights, and the
                     // multi-row kernel's unpacking of every row)
                     const double c = S->kappa * (fix_ms + row_ms * S->h_counts[staged[i].e]);
@@ -3332,6 +3385,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         cudaMemcpyAsync(M.bounds, S->h_bounds, (size_t) nb * sizeof(int), cudaMemcpyHostToDevice, s);
         if (n_light > 0)
             cudaMemcpyAsync(M.bounds + kLightOff, h_light, (size_t) 3 * n_light * sizeof(int), cudaMemcpyHostToDevice, s);
+        if (n_light > 0 && xact) {
+            if (S->xl_ptrs_d == nullptr &&
+                !glmfast::cuda_ok(cudaMalloc((void**) &S->xl_ptrs_d, (size_t) kLightMax * sizeof(unsigned long long)),
+                                  "glm prompt exact light rows", err))
+                return false;
+            // (pageable: the call returns once the bytes are staged - the host list is rewritten by the next layer)
+            cudaMemcpyAsync(S->xl_ptrs_d, S->xl_ptrs_h.data(), (size_t) n_light * sizeof(unsigned long long),
+                            cudaMemcpyHostToDevice, s);
+        }
         gb::expert_scatter(M.ids, M.rank, M.base, T * K, K, M.row_tok, M.pos, s);
         const bool nvl = Ly.nv_scale != nullptr;   // (NVFP4: the down scales into the route weights, once)
         if (nvl) gb::nv_fold_down(M.rw, M.ids, T * K, Ly.nv_scale, s);
@@ -3361,12 +3423,22 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         //      A set's rows go in contiguous with what it holds, else the window is added into ffn first (moe_combine_add)
         //      and starts at the set; a set larger than the window runs in parts at expert boundaries
         const int W = moe_window_rows((size_t) T, g);
-        int wb = 0, w_lo = 0, w_hi = 0;
+        int wb = 0, w_lo = 0, w_hi = 0, n_flush = 0;
+        // (the exact prompt, a chunk whose routed rows all fit the window: every row at its own place, one combine at
+        // the end - the sets run in an order of their own, light before MMQ, and a window that moved with them added
+        // them in groups)
+        const bool xone = xact && (size_t) T * (size_t) K <= (size_t) W;
         const auto flush = [&]() {
+            if (xone) return;
             if (w_hi > w_lo) gb::moe_combine_add(M.OUTP, wb, w_lo, w_hi, M.pos, M.rw, T, K, E, S->ffn, s);
+            if (w_hi > w_lo) ++n_flush;
             w_lo = w_hi = 0;
         };
         const auto place = [&](int a, int n) {   // -> the OUTP row of sorted row a
+            if (xone) {
+                w_hi = std::max(w_hi, a + n);
+                return a;
+            }
             if (!(w_hi > w_lo && a == w_hi && a + n <= wb + W)) {
                 flush();
                 wb = a;
@@ -3693,9 +3765,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the layer's whole pool partition (the light ones empty there), while the copy stream stages
         if (n_light > 0) {
             const int o = place(rows_mmq, rows_res - rows_mmq);   // (light rows: at most kLightMax * kLightRows <= W)
-            if (!gf::rows_experts(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off, M.bounds + kLightOff, n_light,
-                                  M.row_tok, S->x, T, E, nff, g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
-                                  M.OUTP + (size_t) (o - rows_mmq) * E, E, s)) {
+            const bool lk = xact ? gf::rows_experts_exact(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off,
+                                                          M.bounds + kLightOff, n_light, M.row_tok, S->x, T, E, nff,
+                                                          g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
+                                                          M.OUTP + (size_t) (o - rows_mmq) * E, E, s, S->xl_ptrs_d)
+                                 : gf::rows_experts(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off,
+                                                    M.bounds + kLightOff, n_light, M.row_tok, S->x, T, E, nff,
+                                                    g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
+                                                    M.OUTP + (size_t) (o - rows_mmq) * E, E, s);
+            if (!lk) {
                 err = "glm prefill: the light expert kernels refused the layer's types";
                 return false;
             }
@@ -3844,7 +3922,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             };
             // the iGPU first: the whole set in one call, the outputs straight into out_h
             bool on_igpu = false;
-            if (igpu_lane(il)) {
+            if (igpu_lane(il) && !xact) {
                 std::vector<const void*> bl((size_t) ncx);
                 std::vector<int> nr((size_t) ncx);
                 for (int j = 0; j < ncx; ++j) {
@@ -3867,7 +3945,46 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     F->igpu_rows = nullptr;
                 }
             }
-            if (!on_igpu) {
+            if (!on_igpu && xact) {
+                // the exact prompt's CPU share: the decode lane's rows (lane_q81), an expert's rows as columns
+                F->cpu_pool->run(cpu_nrows, [&](int r) {
+                    const float* xr = S->x_gathered ? S->out_h + (size_t) r * E : S->x_h + (size_t) S->rt_h[r] * E;
+                    kc::lane_q81_quant(xr, E, S->c_act.data() + (size_t) r * kA);
+                });
+                F->cpu_pool->run(ncx * (nff / kGu), [&](int job) {
+                    const int j = job % ncx, r0 = (job / ncx) * kGu, b = r_of[(size_t) j];
+                    const int cnt = S->h_counts[cpu_set[(size_t) j].e];
+                    const uint8_t* blob = cpu_set[(size_t) j].ram;
+                    thread_local std::vector<const void*> a;
+                    thread_local std::vector<float*> o;
+                    a.resize((size_t) cnt);
+                    o.resize((size_t) cnt);
+                    for (int t = 0; t < cnt; ++t) {
+                        a[(size_t) t] = S->c_act.data() + (size_t) (b + t) * kA;
+                        o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
+                    }
+                    kc::lane_q81_gu_rows(nf.gu_type, nf.gu_type, blob, nf.gu_row, blob + Ly.gu_bytes, nf.gu_row, E,
+                                         a.data(), cnt, o.data(), r0, r0 + kGu, g.swiglu_exp, 1.0f);
+                });
+                F->cpu_pool->run(cpu_nrows, [&](int r) {
+                    kc::lane_q81_quant(S->c_ff.data() + (size_t) r * nff, nff, S->c_hq.data() + (size_t) r * kH);
+                });
+                F->cpu_pool->run(ncx * (E / kDn), [&](int job) {
+                    const int j = job % ncx, r0 = (job / ncx) * kDn, b = r_of[(size_t) j];
+                    const int cnt = S->h_counts[cpu_set[(size_t) j].e];
+                    thread_local std::vector<const void*> h;
+                    thread_local std::vector<float*> o;
+                    h.resize((size_t) cnt);
+                    o.resize((size_t) cnt);
+                    for (int t = 0; t < cnt; ++t) {
+                        h[(size_t) t] = S->c_hq.data() + (size_t) (b + t) * kH;
+                        o[(size_t) t] = S->out_h + (size_t) (b + t) * E;
+                    }
+                    kc::lane_q81_rows(nf.d_type, cpu_set[(size_t) j].ram + Ly.down_off, nf.d_row, nff, h.data(), cnt,
+                                      o.data(), r0, r0 + kDn);
+                });
+                up(0, cpu_nrows);
+            } else if (!on_igpu) {
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
                     const float* xr = S->x_gathered ? S->out_h + (size_t) r * E : S->x_h + (size_t) S->rt_h[r] * E;
                     kc::native_quant_act(nf, xr, S->c_act.data() + (size_t) r * kA);
@@ -4093,8 +4210,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         S->mark("moe_staged", s);
         dump_row("pf_shexp-" + std::to_string(il), S->ffn, E);
-        flush();
-        if (cpu_nrows > 0) gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, rows, M.pos, M.rw, T, K, E, S->ffn, s);
+        if (xact && n_flush == 0) {
+            // the exact prompt: the window and the CPU's rows in one combine, each token's routes in plan order (two
+            // adds - the window's, then the CPU's - grouped them by where the experts ran).  A chunk whose rows did
+            // not fit one window was added as it filled: in the order the experts were placed (STRATA_GLM_PREFILL_WINDOW=0
+            // keeps one window)
+            gb::moe_combine_add2(M.OUTP, wb, w_lo, xone ? std::min(w_hi, cpu_r0) : w_hi, M.OUTPc, cpu_r0, cpu_r0,
+                                 cpu_nrows > 0 ? rows : cpu_r0, M.pos, M.rw, T, K, E, S->ffn, s);
+            w_lo = w_hi = 0;
+        } else {
+            if (xact) ++S->x_flushed;
+            flush();
+            if (cpu_nrows > 0) gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, rows, M.pos, M.rw, T, K, E, S->ffn, s);
+        }
         abl_out(il, 1, S->ffn, T, E, s);   // (the whole FFN: shared + routed + the CPU lane's rows)
         S->mark("combine", s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
@@ -4712,6 +4840,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                      (unsigned long long) ige, (unsigned long long) igr, pf_->row_ms_ig, pf_->kappa,
                      pf_->row_ms, (unsigned long long) pi, (unsigned long long) ph, (unsigned long long) pr,
                      100.0 * (double) rr / (double) std::max<uint64_t>(1, rr + rs), plan);
+        if (pf_->x_flushed > 0)
+            std::fprintf(stderr, "glm prefill: the exact prompt's combine ran as the window filled in %llu layers (not one "
+                                 "order: STRATA_GLM_PREFILL_WINDOW=0 keeps one window)\n",
+                         (unsigned long long) pf_->x_flushed);
     }
     return true;
 }

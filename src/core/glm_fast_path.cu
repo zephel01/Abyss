@@ -2411,8 +2411,25 @@ static void lane_down_rows(bool exact, const strata::kernels::cpu::NativeFmt& nf
         kc::native_down_rows_split(nf, down, h, nt, out, r0, r1);
 }
 
-void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
-                                 const void* xq, const float* gs) {
+// the CPU lane's EXACT COMBINE (MoeDev::xpart): its experts' weighted rows summed in fixed point - each term
+// w_i * row_i[r] to int64 units of 2^-kFxShift (glm_fast.cu's fx_term, the same steps), the sum in any order the same
+static inline long long lane_fx_term(float v) {
+    const float sv = v * (float) (1ll << gf::kFxShift);
+    return std::fabs(sv) < 0x1p58f ? std::llrint(sv) : gf::kFxBad;
+}
+static void lane_fx_sum(int ne, const float* w, const float* const* rows, int r0, int r1, long long* fx) {
+    for (int r = r0; r < r1; ++r) {
+        long long m = 0;
+        for (int i = 0; i < ne && m != gf::kFxBad; ++i) {
+            const long long t = lane_fx_term(w[i] * rows[i][r]);
+            m = t == gf::kFxBad ? gf::kFxBad : m + t;
+        }
+        fx[r] = m;
+    }
+}
+
+bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out,
+                                 const void* xq, const float* gs, long long* fx) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
@@ -2474,7 +2491,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
                 F->igpu_calls.fetch_add(1, std::memory_order_relaxed);
             }
             for (int r = 0; r < n_embd; ++r) out[r] += go[r];
-            return;
+            return false;
         }
     }
     // the iGPU lane: the same sum from the registered RAM tier (an EXL3 layer through abyss_igpu_experts_x3, when the
@@ -2507,7 +2524,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         }
         if (rc == 0) {
             F->igpu_calls.fetch_add(1, std::memory_order_relaxed);
-            return;
+            return false;
         }
         if (rc < 0) {
             std::fprintf(stderr, "glm fast: CUDA%d iGPU lane failed - the CPU lane takes over\n", dev_);
@@ -2530,7 +2547,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     }();
     if (Ly.exl3) {
         x3_cpu(ne, blob, w, out);
-        return;
+        return false;
     }
     const int threads = F->cpu_pool->active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
@@ -2550,18 +2567,33 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     });
     for (int i = 0; i < ne; ++i)
         lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
+    const bool slot_out = fx != nullptr && exact;   // (the exact combine: the fixed-point sum into fx, no part)
+    float* const dn = F->cpu_dn.data();
     const int dn_tot = ne * n_embd;
+    if (slot_out)   // (each job a run of rows of every expert, then their fixed-point sums)
+        F->cpu_pool->run(T, [&](int job) {
+            const int r0 = (int) ((int64_t) n_embd * job / T), r1 = (int) ((int64_t) n_embd * (job + 1) / T);
+            const float* rows[gf::kMaxK];
+            for (int i = 0; i < ne; ++i) {
+                const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
+                float* o[1] = {dn + (size_t) i * n_embd};
+                lane_down_rows(exact, nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+                rows[i] = o[0];
+            }
+            lane_fx_sum(ne, w, rows, r0, r1, fx);
+        });
+    else
     F->cpu_pool->run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
             const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
-            float* o[1] = {F->cpu_dn.data() + (size_t) i * n_embd};
+            float* o[1] = {dn + (size_t) i * n_embd};
             lane_down_rows(exact, nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
             q += r1 - r0;
         }
     });
-    for (int r = 0; r < n_embd; ++r) {
+    for (int r = 0; r < n_embd && !slot_out; ++r) {
         float m = 0.0f;
         for (int i = 0; i < ne; ++i) m += w[i] * F->cpu_dn[(size_t) i * n_embd + r];
         out[r] = m;
@@ -2569,7 +2601,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     // STRATA_GLM_CPU_LANE_VERIFY=1 (debug, slow): the same experts in double precision from ggml's dequantised rows;
     // the relative L2 distance of the lane's sum, accumulated and printed every 16 calls
     static const bool verify = getenv("STRATA_GLM_CPU_LANE_VERIFY") != nullptr;
-    if (verify && !Ly.exl3) {
+    if (verify && !Ly.exl3 && !slot_out) {
         static double e2 = 0, n2 = 0, worst = 0;
         static int calls = 0;
         const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
@@ -2608,6 +2640,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             std::fprintf(stderr, "cpu lane verify (%d calls, layer %d): relative L2 error %.5f, worst call %.5f\n", calls, il,
                          std::sqrt(e2 / n2), worst);
     }
+    return slot_out;
 }
 
 // A batched verify window's columns of a layer on the CPU threads at once (the service thread queues them,
@@ -2615,9 +2648,9 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
 // route it - its weights read from RAM once - then every column's weighted sum in its own order.  Each (expert,
 // column) product is the one-column call's bit for bit (the multi-token rows are ggml's dot per token, like the
 // one-token rows), and so is each sum.  An EXL3 layer or the iGPU lane: one call a column
-void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
+bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
                                        const float* const* x, float* const* out, const void* const* xq,
-                                       const float* gs) {
+                                       const float* gs, long long* const* fx) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
@@ -2649,7 +2682,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             F->igpu_cols_calls.fetch_add(1, std::memory_order_relaxed);
             F->igpu_cols_cols.fetch_add((uint64_t) n, std::memory_order_relaxed);
             if (check) check_cols("igpu");
-            return;
+            return false;
         }
         if (rc < 0) {
             std::fprintf(stderr, "glm fast: CUDA%d iGPU lane failed (columns call) - the CPU lane takes over\n", dev_);
@@ -2658,10 +2691,11 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
         F->igpu_cols_falls.fetch_add(1, std::memory_order_relaxed);
     }
     if (n <= 1 || Ly.exl3 || (F->igpu_experts != nullptr && !Ly.mixed())) {
+        bool all = fx != nullptr;
         for (int t = 0; t < n; ++t)
-            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t], xq ? xq[t] : nullptr,
-                             gs ? gs + gf::kMaxK * t : nullptr);
-        return;
+            all = fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t], xq ? xq[t] : nullptr,
+                                   gs ? gs + gf::kMaxK * t : nullptr, fx != nullptr ? fx[t] : nullptr) && all;
+        return all;
     }
     namespace kc = strata::kernels::cpu;
     const auto& nf = F->cpu_fmt[(size_t) il];
@@ -2718,7 +2752,27 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     });
     for (int p = 0; p < np; ++p)
         lane_quant_h(exact, nf, F->cpu_ff_m.data() + (size_t) p * n_ff, F->cpu_hq_m.data() + (size_t) p * kc::kNativeHBytes);
+    const bool slot_out = fx != nullptr && exact;   // (the exact combine: as fast_cpu_experts)
     const int dn_tot = nu * n_embd;
+    if (slot_out)   // (each job a run of rows of every expert, then each column's fixed-point sums of them)
+        F->cpu_pool->run(T, [&](int job) {
+            const int r0 = (int) ((int64_t) n_embd * job / T), r1 = (int) ((int64_t) n_embd * (job + 1) / T);
+            for (int u = 0; u < nu; ++u) {
+                const void* h[kCols];
+                float* o[kCols];
+                for (int k = 0; k < ucnt[u]; ++k) {
+                    h[k] = F->cpu_hq_m.data() + (size_t) upair[u][k] * kc::kNativeHBytes;
+                    o[k] = F->cpu_dn_m.data() + (size_t) upair[u][k] * n_embd;
+                }
+                lane_down_rows(exact, nf, ub[u] + Ly.down_off, h, ucnt[u], o, r0, r1);
+            }
+            for (int t = 0; t < n; ++t) {
+                const float* rows[gf::kMaxK];
+                for (int i = 0; i < ne[t]; ++i) rows[i] = F->cpu_dn_m.data() + (size_t) pair_of[t][i] * n_embd;
+                lane_fx_sum(ne[t], w + gf::kMaxK * t, rows, r0, r1, fx[t]);
+            }
+        });
+    else
     F->cpu_pool->run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
@@ -2733,17 +2787,18 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             q += r1 - r0;
         }
     });
-    for (int t = 0; t < n; ++t)
+    for (int t = 0; t < n && !slot_out; ++t)
         for (int r = 0; r < n_embd; ++r) {
             float m = 0.0f;
             for (int i = 0; i < ne[t]; ++i) m += w[gf::kMaxK * t + i] * F->cpu_dn_m[(size_t) pair_of[t][i] * n_embd + r];
             out[t][r] = m;
         }
-    if (check) check_cols("cpu");
+    if (check && !slot_out) check_cols("cpu");
     F->cpu_multi_calls.fetch_add(1, std::memory_order_relaxed);
     F->cpu_multi_cols.fetch_add((uint64_t) n, std::memory_order_relaxed);
     F->cpu_multi_uses.fetch_add((uint64_t) np, std::memory_order_relaxed);
     F->cpu_multi_experts.fetch_add((uint64_t) nu, std::memory_order_relaxed);
+    return slot_out;
 }
 
 // The CPU lane's pool a split's parts share (fast_cpu_lane_setup): made by the first part, found by the later ones -
@@ -3337,6 +3392,37 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
+    // STRATA_GLM_LANE_XC (default on with CUDA for qwen4exp; 0 off, 1 on): the EXACT COMBINE.  The lane's share
+    // follows wall-clock timing, so which of a route's experts the CPU computes changes from run to run; lane_q81
+    // gives each expert the device's bits, and with this the layer's sum is the same whoever computed what - in
+    // fixed point (kFxShift: moe_down leaves the device's int64 sum, moe_cpu_wait adds the CPU's and rounds once) -
+    // so greedy answers no longer change between runs (the prompt follows: glm_prefill's exact prompt).  RTX 5090,
+    // Qwen3.8 16G64G pack: decode within noise with 32 GB of VRAM, ~4% slower with STRATA_GLM_VRAM_GB=16 (the CPU
+    // lane's larger share; 2026-11-10).  Not with expert deferral or the hc-fused answer (they add a CPU sum
+    // elsewhere); on by default for qwen4exp only (measured); HIP: off by default (its RDNA expert kernels sum in
+    // another order than lane_q81)
+    {
+        const char* v = getenv("STRATA_GLM_LANE_XC");
+#if defined(STRATA_USE_HIP)
+        const bool want = v != nullptr && std::atoi(v) != 0;
+#else
+        // (default: qwen4exp on x86, where it was measured - the AVX2 / AVX-512 lane rows keep the device's order, the
+        // portable ones (ARM) do not; set 1 for the others)
+#if defined(__x86_64__) || defined(_M_X64)
+        const bool want = v == nullptr ? g.q4x : std::atoi(v) != 0;
+#else
+        const bool want = v != nullptr && std::atoi(v) != 0;
+#endif
+#endif
+        F->xc = want && !F->defer && !exl3_ &&
+                cudaMalloc((void**) &F->xpart_d, gf::xpart_floats(g.n_embd) * sizeof(float)) == cudaSuccess;
+        if (F->xc) {
+            cudaMemset(F->xpart_d, 0, gf::xpart_floats(g.n_embd) * sizeof(float));
+            F->md.xpart = F->xpart_d;
+        } else {
+            cudaGetLastError();
+        }
+    }
     // the route counts that pick the coldest RAM-tier experts for the host, seeded with the tiers' LFU counts
     // (STRATA_GLM_CPU_COLD=0: the last ones in route order instead)
     const char* cv = getenv("STRATA_GLM_CPU_COLD");
@@ -3857,6 +3943,7 @@ void Glm5Model::fast_destroy() {
     F->cpu_pool.reset();
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
+    if (F->xpart_d) cudaFree(F->xpart_d);
     if (F->dcnt_d) cudaFree(F->dcnt_d);
     if (F->timing && F->ah_routes > 0) {
         std::string ov;
@@ -4366,8 +4453,14 @@ void Glm5Model::fast_service() {
                 }
             }
         }
-        if (!done) fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr,
-                                          nv != nullptr ? gsv : nullptr);
+        bool xs = false;   // (the exact combine: each column's experts' rows in its answer's slots)
+        if (!done) {
+            long long* sl[kVerifyMax];
+            for (int t = 0; t < wq_n; ++t) sl[t] = (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->fx;
+            xs = fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr,
+                                        nv != nullptr ? gsv : nullptr, F->xc ? sl : nullptr);
+        }
+        for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->xmask = xs ? 1u : 0u;
         const auto t1 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
         for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->seq = wq[t].seq;
@@ -4874,6 +4967,7 @@ void Glm5Model::fast_service() {
                     w[ne++] = rq->w[i] * (nvh.empty() ? 1.0f : nvh[(size_t) 2 * rq->ids[i] + 1]);
                 }
             gf::CpuAnswer* ans = F->cpu_ans_h + (next % gf::kCpuAnswers);
+            unsigned int xmask = 0u;   // (the exact combine: != 0: ans->fx holds the CPU's fixed-point sum)
             int rc = 1;
             if (lane_started) {
                 rc = F->igpu_finish(ans->part, g.n_embd);
@@ -4891,8 +4985,9 @@ void Glm5Model::fast_service() {
             if (rc != 0) {
                 auto* H = F->expert_helper.get();
                 if (!H || !H->active || H->failed || gs1 != nullptr) {   // (NVFP4: not on the helper yet)
-                    fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr,
-                                     gs1);
+                    if (fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part,
+                                         rq->xq_ok ? (const void*) rq->xq : nullptr, gs1, F->xc ? ans->fx : nullptr))
+                        xmask = 1u;
                 } else {
                     int hn = 0, cn = 0, hi[gf::kMaxK];
                     float hw[gf::kMaxK], cw[gf::kMaxK];
@@ -4930,6 +5025,7 @@ void Glm5Model::fast_service() {
                 }
             }
             const auto t1 = std::chrono::steady_clock::now();
+            ans->xmask = xmask;
             std::atomic_thread_fence(std::memory_order_release);
             ans->seq = next;
             F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
@@ -6296,7 +6392,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     }();
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     // (deepseek41: not before an Engram layer - its separate hc_post writes the FFN's output before the next read)
-    const bool hc_cpu = lane && hc_cpu_env && g.dsv4() && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on && !abl_full() &&
+    const bool hc_cpu = lane && hc_cpu_env && !F->xc && g.dsv4() && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on && !abl_full() &&
                         !dumps && il + 1 < l1_ && !(g.v41 && F->L[(size_t) il + 1].eng >= 0) && !(pf && pf_at == 2) &&
                         !F->kda_graph_on && gf::hc_fuses_cpu(g.n_embd);
     if (F->defer && !Ly.mtp) {
@@ -6311,7 +6407,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         F->hc_cpu_seq = md.cpu_seq;
         F->hc_cpu_ans = md.cpu_ans;
     } else if (lane) {
-        gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
+        gf::moe_cpu_wait(md, g.n_embd, F->ffn, s, 1, g.n_exp_used);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
     if (pf && pf_at == 2) issue_prefetch();

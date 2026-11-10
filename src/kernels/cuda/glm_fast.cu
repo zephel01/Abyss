@@ -87,6 +87,37 @@ __device__ __forceinline__ void q8_1_store_warp(float v, block_q8_1* dst, int la
     if (lane == 0) dst->ds = make_half2(d, fmaxf(-65504.0f, fminf(65504.0f, sum)));
 }
 __device__ __forceinline__ float dsigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
+// e^x for the decode experts' SiLU (moe_gate_up_kernel's epilogue): the CPU lane's q81::lane_expf (lane_q81_impl.hpp)
+// step for step - Cody-Waite by ln 2, a degree-7 polynomial in FMAs, 2^k from bits, every product rounded on its own
+// (__fmul_rn: no contraction) - so an expert's activation has the same bits on either side.  ~1 ulp (CUDA's expf: 2)
+__device__ __forceinline__ float lane_expf(float x) {
+    if (!(x > -87.0f)) return x != x ? x : 0.0f;
+    if (x > 88.72f) return __int_as_float(0x7f800000);
+    const float kf = rintf(__fmul_rn(x, 1.44269504f));
+    float r = __fmaf_rn(kf, -0.693359375f, x);
+    r = __fmaf_rn(kf, 2.12194440e-4f, r);
+    float p = 1.0f / 5040.0f;
+    p = __fmaf_rn(p, r, 1.0f / 720.0f);
+    p = __fmaf_rn(p, r, 1.0f / 120.0f);
+    p = __fmaf_rn(p, r, 1.0f / 24.0f);
+    p = __fmaf_rn(p, r, 1.0f / 6.0f);
+    p = __fmaf_rn(p, r, 0.5f);
+    p = __fmaf_rn(p, r, 1.0f);
+    p = __fmaf_rn(p, r, 1.0f);
+    const int k = (int) kf;
+    if (k > 127) return __fmul_rn(__fmul_rn(p, __int_as_float(254 << 23)), 2.0f);
+    return __fmul_rn(p, __int_as_float((k + 127) << 23));
+}
+// the exact combine's fixed point (glm_fast.hpp kFxShift; the CPU lane's q81::fx_term): a term to int64 units of
+// 2^-kFxShift, rounded to nearest even; kFxBad when it is not finite or |v| >= 2^24.  fx_float: a sum back, rounded once
+__device__ __forceinline__ long long fx_term(float v) {
+    const float sv = __fmul_rn(v, (float) (1ll << kFxShift));
+    return fabsf(sv) < 0x1p58f ? __float2ll_rn(sv) : kFxBad;
+}
+__device__ __forceinline__ long long fx_add(long long a, long long b) { return a == kFxBad || b == kFxBad ? kFxBad : a + b; }
+__device__ __forceinline__ float fx_float(long long a) {
+    return a == kFxBad ? __int_as_float(0x7fc00000) : __fmul_rn(__ll2float_rn(a), 1.0f / (float) (1ll << kFxShift));
+}
 __device__ __forceinline__ float bf(uint16_t v) { return __uint_as_float((uint32_t) v << 16); }
 
 // ---------------------------------------------------------------- llama.cpp vecdotq helpers
@@ -3644,8 +3675,8 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
 // which: 0 the last route's (cpu_seq[0]), 1 the route before it (cpu_seq[1]: EXPERT DEFERRAL - the host's part of
 // layer l is added one layer late, into layer l + 1's FFN output, so the lane is never waited for)
 __device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const void* cpu_ans, int n_embd, float* out,
-                                             int which, int blk, int nblk) {
-    __shared__ unsigned int s_need;
+                                             int which, int blk, int nblk, const float* xp = nullptr, int k = 0) {
+    __shared__ unsigned int s_need, s_xm;
     const int tid = threadIdx.x;
     if (tid == 0) s_need = cpu_seq[which];
     __syncthreads();
@@ -3670,15 +3701,55 @@ __device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const 
             }
             __threadfence_system();
         }
+        s_xm = ((volatile const CpuAnswer*) r)->xmask;
 #else
+        // seq and xmask in one 16-byte read (the host writes xmask, then its release fence, then seq: a read that
+        // sees the new seq sees the new xmask) - a PCIe round trip less than reading xmask after
         const long long t0 = clock64();   // bounded like moe_wait (~60 s)
-        while (r->seq != s_need) {
+        uint4 h = __ldcv((const uint4*) r);
+        while (h.x != s_need) {
             if (clock64() - t0 > (1ll << 36)) break;
+            h = __ldcv((const uint4*) r);
         }
         __threadfence_system();
+        s_xm = h.y;
 #endif
     }
     __syncthreads();
+    if (xp != nullptr && k > 0) {
+        // the EXACT COMBINE (moe_down left this route's fixed-point sum of the device's slots, the disk lane's part
+        // and the shared expert's rows in xp): plus the CPU's fixed-point sum (fx), rounded to a float once - moe_down's
+        // bits whichever experts the CPU took.  xmask 0 (the CPU's experts went through the iGPU or the expert helper:
+        // a float sum only): the device's sum, then the answer's part added
+        const unsigned int xm = s_xm;
+        const long long* dv = (const long long*) xp;
+        for (int e2 = blk * blockDim.x + tid; 2 * e2 < n_embd; e2 += nblk * blockDim.x) {
+            const int e = 2 * e2;   // (two rows a thread: one 16-byte load across PCIe)
+            const longlong2 a = ((const longlong2*) dv)[e2];
+            float o0, o1;
+            if (xm != 0u) {
+#if defined(__HIPCC__)
+                const volatile long long* vp = (const volatile long long*) r->fx + e;
+                const longlong2 c = make_longlong2(vp[0], vp[1]);
+#else
+                const longlong2 c = __ldcv((const longlong2*) r->fx + e2);
+#endif
+                o0 = fx_float(fx_add(a.x, c.x));
+                o1 = fx_float(fx_add(a.y, c.y));
+            } else {
+#if defined(__HIPCC__)
+                const volatile float* vp = (const volatile float*) r->part + e;
+                const float2 v = make_float2(vp[0], vp[1]);
+#else
+                const float2 v = __ldcv((const float2*) r->part + e2);
+#endif
+                o0 = fx_float(a.x) + v.x;
+                o1 = fx_float(a.y) + v.y;
+            }
+            ((float2*) out)[e2] = make_float2(o0, o1);
+        }
+        return;
+    }
     // the host's part: 16-byte uncached loads spread over the grid's blocks (each block waits for the answer
     // itself) - one block reading 4096 floats a value at a time took ~30 us a layer over PCIe Gen4 x4, 8 blocks ~9
     if ((n_embd & 3) == 0) {
@@ -3702,9 +3773,9 @@ __device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const 
     }
 }
 
-__global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which) {
+__global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out, int which, int k) {
     STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
-    cpu_wait_add(d.cpu_seq, d.cpu_ans, n_embd, out, which, blockIdx.x, gridDim.x);
+    cpu_wait_add(d.cpu_seq, d.cpu_ans, n_embd, out, which, blockIdx.x, gridDim.x, which == 0 ? d.xpart : nullptr, k);
 }
 
 // a verify window's columns in one launch (blockIdx.y the column): each column's answer is waited for and added as
@@ -3713,7 +3784,7 @@ __global__ void moe_cpu_wait_cols_kernel(CpuWaitCols c, const void* cpu_ans, int
     STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int t = blockIdx.y;
     if (c.seq[t] == nullptr) return;
-    cpu_wait_add(c.seq[t], cpu_ans, n_embd, c.out[t], 0, blockIdx.x, gridDim.x);
+    cpu_wait_add(c.seq[t], cpu_ans, n_embd, c.out[t], 0, blockIdx.x, gridDim.x, c.xpart[t], c.k);
 }
 
 // EXPERT DEFERRAL, the half-layer form: the CPU lane's part of layer l's MoE, waited for after layer l + 1's
@@ -4047,7 +4118,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
             if (d.nv_scale != nullptr && plan_id != nullptr && plan_id[ei] >= 0) sc = d.nv_scale[2 * plan_id[ei]];
         const float g = fminf(sc * sg[lane], limit);
         const float u = fminf(fmaxf(sc * su[lane], -limit), limit);
-        q8_1_store_warp((g / (1.0f + expf(-g))) * u, hq + (size_t) ei * (n_ff / 32) + chunk, lane);
+        q8_1_store_warp(__fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, lane_expf(-g))), u), hq + (size_t) ei * (n_ff / 32) + chunk, lane);
     }
 }
 
@@ -4146,10 +4217,28 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             for (int j = 0; j < NR; ++j) s_part[warp][j] = s[j];
     }
     __syncthreads();
+    // the CPU lane's EXACT COMBINE (MoeDev::xpart): the sum in fixed point (fx_term) - the CPU's slots are empty here
+    // (s_part 0: its experts add their own fixed-point sum in moe_cpu_wait); a route the CPU shares leaves the device's
+    // sum in xpart for moe_cpu_wait, the others' rows are done here - the same bits either way
+    float* xp = ca != nullptr ? ca[col].xpart : d.xpart;
+    if (xp != nullptr) {
+        if (threadIdx.x < NR) {
+            const unsigned int* cseq = ca != nullptr ? ca[col].cpu_seq : d.cpu_seq;
+            const int j = threadIdx.x, r = r0 + j;
+            long long m = 0;
+            for (int i = 0; i < k; ++i)
+                if (s_ptr[i] != 0ull) m = fx_add(m, fx_term(__fmul_rn(s_w[i], s_part[i][j])));
+            if (*cpu_flag) m = fx_add(m, fx_term(cpu_part[r]));
+            if (sh_out != nullptr) m = fx_add(m, fx_term(sh_out[r]));
+            if (cseq != nullptr && cseq[0] != 0u) ((long long*) xp)[r] = m;
+            else out[r] = fx_float(m);
+        }
+        return;
+    }
     if (threadIdx.x < NR) {
         const int j = threadIdx.x, r = r0 + j;
         float m = 0.0f;
-        for (int i = 0; i < k; ++i) m += s_w[i] * s_part[i][j];
+        for (int i = 0; i < k; ++i) m = __fmaf_rn(s_w[i], s_part[i][j], m);   // (moe_cpu_wait's exact combine: the same)
         if (*cpu_flag) m += cpu_part[r];
         out[r] = m + (sh_out != nullptr ? sh_out[r] : 0.0f);
     }
@@ -5555,19 +5644,22 @@ void copy_floats(float* dst, const float* src, int n, cudaStream_t s) {
     launch_check("copy_floats");
 }
 
-void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int mode) {
+void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int mode, int k) {
     if (d.cpu_seq == nullptr) return;
     static const int cwb = [] { const char* v = getenv("STRATA_GLM_CPU_WAIT_BLOCKS"); return v ? std::max(1, std::atoi(v)) : 8; }();
     // mode bit 2: the route before the last one's answer (deferred from the layer before), bit 1: the last route's
-    if (mode & 2) pdl_launch(moe_cpu_wait_kernel, cwb, 128, 0, s, d, n_embd, out, 1);
-    if (mode & 1) pdl_launch(moe_cpu_wait_kernel, cwb, 128, 0, s, d, n_embd, out, 0);   // STRATA_GLM_CPU_WAIT_BLOCKS: the blocks (A/B)
+    if (mode & 2) pdl_launch(moe_cpu_wait_kernel, cwb, 128, 0, s, d, n_embd, out, 1, 0);
+    // (the exact combine: a thread a 16-byte read of the answer - two rows - so every read is in flight at once)
+    const int xb = d.xpart != nullptr ? std::max(cwb, (n_embd / 2 + 127) / 128) : cwb;
+    if (mode & 1) pdl_launch(moe_cpu_wait_kernel, xb, 128, 0, s, d, n_embd, out, 0, d.xpart != nullptr ? k : 0);   // STRATA_GLM_CPU_WAIT_BLOCKS: the blocks (A/B)
     launch_check("moe_cpu_wait");
 }
 
 void moe_cpu_wait_cols(const CpuWaitCols& c, const void* cpu_ans, int n_embd, cudaStream_t s) {
     if (c.n <= 0) return;
     static const int cwb = [] { const char* v = getenv("STRATA_GLM_CPU_WAIT_BLOCKS"); return v ? std::max(1, std::atoi(v)) : 8; }();
-    pdl_launch(moe_cpu_wait_cols_kernel, dim3((unsigned) cwb, (unsigned) c.n), 128, 0, s, c, cpu_ans, n_embd);
+    const int xb = c.xpart[0] != nullptr && c.k > 0 ? std::max(cwb, (n_embd / 2 + 127) / 128) : cwb;   // (as moe_cpu_wait)
+    pdl_launch(moe_cpu_wait_cols_kernel, dim3((unsigned) xb, (unsigned) c.n), 128, 0, s, c, cpu_ans, n_embd);
     launch_check("moe_cpu_wait_cols");
 }
 
@@ -5957,6 +6049,157 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
         default: rows_down_kernel<18><<<gdn, GU_WARPS * 32, 0, s>>>(base, stride, ptrs, down_off, light, hq, rlo, n_ff, n_embd, out, ld); break;
     }
     launch_check("rows_experts");
+    return true;
+}
+
+// ---------------------------------------------------------------- the prompt path's EXACT light rows
+namespace {
+// rows_experts_exact (STRATA_GLM_LANE_XC): each (expert, token) pair in the decode kernels' arithmetic - every row's
+// dot rows_dot's (call k to lane k % 32, dw<T> accumulated, warp_sum), moe_gate_up_kernel's epilogue, the q8_1 of
+// q8_1_store_warp - so an expert's rows have the CPU lane's bits (lane_q81: the prompt's CPU share computes them the
+// same way) and a prompt's numbers do not depend on which experts the CPU took.  XT tokens a pass, each its own sums.
+constexpr int XT = 4;
+template<int T>
+__device__ __forceinline__ void xrows_dot(const uint8_t* const* rows, int nr, const block_q8_1* const* x, int nt,
+                                          int n_in, int lane, const uint32_t* tab, float (&acc)[4][XT]) {
+    using Fm = F<T>;
+    const int nb = n_in / Fm::qk;
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int t = 0; t < XT; ++t) acc[r][t] = 0.0f;
+    for (int k = lane; k < nb * Fm::ipb; k += 32) {
+        const int kbx = k / Fm::ipb, ki = k % Fm::ipb, iqs = Fm::step * ki;
+#pragma unroll
+        for (int t = 0; t < XT; ++t) {
+            if (t >= nt) break;
+            const XV xv = load_xv(x[t] + kbx * (Fm::qk / 32) + ki);
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+                if (r < nr) acc[r][t] += dw<T>(rows[r], kbx, iqs, xv, tab);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int t = 0; t < XT; ++t) acc[r][t] = warp_sum(acc[r][t]);
+}
+// grid (n_ff / GU_ROWS, n): 16 warps x (2 gate + 2 up rows); h -> hq rows (r - rlo)
+template<int TG>
+__global__ void __launch_bounds__(GU_WARPS * 32) xrows_gate_up_kernel(const uint8_t* __restrict__ base, size_t stride,
+                                                                      const unsigned long long* __restrict__ ptrs,
+                                                                      const int* __restrict__ light,
+                                                                      const int* __restrict__ row_tok,
+                                                                      const block_q8_1* __restrict__ xq, int n_embd,
+                                                                      int n_ff, float limit, block_q8_1* __restrict__ hq,
+                                                                      int rlo) {
+    const int i = blockIdx.y, chunk = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+    __shared__ float sg[XT][GU_ROWS], su[XT][GU_ROWS];
+    load_tab<TG>(s_tab);
+    __syncthreads();
+    const int slot = light[3 * i], R0 = light[3 * i + 1], NR = light[3 * i + 2];
+    const uint8_t* blob = ptrs != nullptr ? (const uint8_t*) ptrs[i] : base + (size_t) slot * stride;
+    const size_t rb = rbytes<TG>(n_embd);
+    constexpr int RPW = GU_ROWS / GU_WARPS;
+    static_assert(2 * RPW <= 4, "xrows_dot takes 4 rows");
+    const uint8_t* rows[4];
+#pragma unroll
+    for (int j = 0; j < RPW; ++j) {
+        const int r = chunk * GU_ROWS + warp * RPW + j;
+        rows[j] = blob + (size_t) r * rb;
+        rows[RPW + j] = blob + (size_t) (n_ff + r) * rb;
+    }
+    const int nblk = n_embd / 32;
+    for (int t0 = 0; t0 < NR; t0 += XT) {
+        const int nt = min(XT, NR - t0);
+        const block_q8_1* xs[XT];
+#pragma unroll
+        for (int t = 0; t < XT; ++t) xs[t] = xq + (size_t) row_tok[R0 + t0 + min(t, nt - 1)] * nblk;
+        float acc[4][XT];
+        xrows_dot<TG>(rows, 2 * RPW, xs, nt, n_embd, lane, s_tab, acc);
+        if (lane == 0)
+#pragma unroll
+            for (int j = 0; j < RPW; ++j)
+#pragma unroll
+                for (int t = 0; t < XT; ++t) {
+                    sg[t][warp * RPW + j] = acc[j][t];
+                    su[t][warp * RPW + j] = acc[RPW + j][t];
+                }
+        __syncthreads();
+        if (warp < nt) {   // (moe_gate_up_kernel's epilogue: sc = 1)
+            const float sc = 1.0f;
+            const float g = fminf(sc * sg[warp][lane], limit);
+            const float u = fminf(fmaxf(sc * su[warp][lane], -limit), limit);
+            q8_1_store_warp(__fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, lane_expf(-g))), u),
+                            hq + (size_t) (R0 + t0 + warp - rlo) * (n_ff / 32) + chunk, lane);
+        }
+        __syncthreads();
+    }
+}
+// grid (n_embd / (GU_WARPS * 2), n): 16 warps x 2 rows; out row r (ld floats) cols [0, n_embd)
+template<int TD>
+__global__ void __launch_bounds__(GU_WARPS * 32) xrows_down_kernel(const uint8_t* __restrict__ base, size_t stride,
+                                                                   const unsigned long long* __restrict__ ptrs,
+                                                                   size_t down_off, const int* __restrict__ light,
+                                                                   const block_q8_1* __restrict__ hq, int rlo, int n_ff,
+                                                                   int n_embd, float* __restrict__ out, int ld) {
+    const int i = blockIdx.y, chunk = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+    load_tab<TD>(s_tab);
+    __syncthreads();
+    const int slot = light[3 * i], R0 = light[3 * i + 1], NR = light[3 * i + 2];
+    const uint8_t* blob = (ptrs != nullptr ? (const uint8_t*) ptrs[i] : base + (size_t) slot * stride) + down_off;
+    const size_t rb = rbytes<TD>(n_ff);
+    constexpr int RPW = 2;
+    const uint8_t* rows[4];
+    int col[RPW];
+#pragma unroll
+    for (int j = 0; j < RPW; ++j) {
+        col[j] = chunk * (GU_WARPS * RPW) + warp * RPW + j;
+        rows[j] = blob + (size_t) col[j] * rb;
+    }
+    rows[2] = rows[3] = rows[0];
+    const int per = n_ff / 32;
+    for (int t0 = 0; t0 < NR; t0 += XT) {
+        const int nt = min(XT, NR - t0);
+        const block_q8_1* xs[XT];
+#pragma unroll
+        for (int t = 0; t < XT; ++t) xs[t] = hq + (size_t) (R0 + t0 + min(t, nt - 1) - rlo) * per;
+        float acc[4][XT];
+        xrows_dot<TD>(rows, RPW, xs, nt, n_ff, lane, s_tab, acc);
+        if (lane == 0)
+#pragma unroll
+            for (int j = 0; j < RPW; ++j)
+#pragma unroll
+                for (int t = 0; t < XT; ++t)
+                    if (t < nt) out[(size_t) (R0 + t0 + t) * ld + col[j]] = acc[j][t];
+    }
+}
+}  // namespace
+
+bool rows_exact_type(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23; }
+
+bool rows_experts_exact(int gu_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light,
+                        int n, const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo,
+                        int rhi, void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s,
+                        const unsigned long long* ptrs) {
+    if (!rows_exact_type(gu_type) || !rows_exact_type(d_type) || n_embd % 256 || n_ff % GU_ROWS ||
+        n_embd % (GU_WARPS * 2))
+        return false;
+    if (n <= 0 || rhi <= rlo) return true;
+    auto* xq = (block_q8_1*) xq_scratch;
+    auto* hq = (block_q8_1*) hq_scratch;
+    rows_q8_kernel<<<(unsigned) (((int64_t) n_tok * (n_embd / 32) * 32 + 255) / 256), 256, 0, s>>>(x, n_embd, n_tok,
+                                                                                                 n_embd, xq);
+    const dim3 ggu((unsigned) (n_ff / GU_ROWS), (unsigned) n), gdn((unsigned) (n_embd / (GU_WARPS * 2)), (unsigned) n);
+#define XGU(T) case T: xrows_gate_up_kernel<T><<<ggu, GU_WARPS * 32, 0, s>>>(base, stride, ptrs, light, row_tok, xq, n_embd, n_ff, limit, hq, rlo); break;
+#define XDN(T) case T: xrows_down_kernel<T><<<gdn, GU_WARPS * 32, 0, s>>>(base, stride, ptrs, down_off, light, hq, rlo, n_ff, n_embd, out, ld); break;
+    switch (gu_type) { XGU(16) XGU(17) XGU(18) XGU(20) XGU(21) XGU(22) XGU(23) }
+    switch (d_type) { XDN(16) XDN(17) XDN(18) XDN(20) XDN(21) XDN(22) XDN(23) }
+#undef XGU
+#undef XDN
+    launch_check("rows_experts_exact");
     return true;
 }
 

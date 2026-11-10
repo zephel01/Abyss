@@ -1774,6 +1774,38 @@ __global__ void moe_combine_add_kernel(const float* __restrict__ out, int base, 
     }
 }
 
+__global__ void moe_combine_add2_kernel(const float* __restrict__ out, int base, int lo, int hi,
+                                        const float* __restrict__ out2, int base2, int lo2, int hi2,
+                                        const int* __restrict__ pos, const float* __restrict__ w, int k, int E,
+                                        float* __restrict__ ffn) {
+    const int t = blockIdx.x;
+    __shared__ const float* s_row[strata::kernels::glmf::kMaxK];
+    __shared__ float s_w[strata::kernels::glmf::kMaxK];
+    __shared__ int s_n;
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int j = 0; j < k; ++j) {
+            const int p = pos[t * k + j];
+            const float* r = p >= lo && p < hi ? out + (size_t) (p - base) * E
+                             : p >= lo2 && p < hi2 ? out2 + (size_t) (p - base2) * E : nullptr;
+            if (r != nullptr) {
+                s_row[n] = r;
+                s_w[n] = w[t * k + j];
+                ++n;
+            }
+        }
+        s_n = n;
+    }
+    __syncthreads();
+    const int n = s_n;
+    if (n == 0) return;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        float m = 0.0f;
+        for (int j = 0; j < n; ++j) m += s_w[j] * s_row[j][e];
+        ffn[(size_t) t * E + e] += m;
+    }
+}
+
 __global__ void moe_combine_kernel(const float* __restrict__ out, const int* __restrict__ pos, const float* __restrict__ w,
                                    const float* __restrict__ sh, int k, int E, float* __restrict__ ffn) {
     const int t = blockIdx.x;
@@ -2195,6 +2227,12 @@ void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float 
     check("swiglu_f16");
 }
 
+void moe_combine_add2(const float* out, int base, int lo, int hi, const float* out2, int base2, int lo2, int hi2,
+                      const int* pos, const float* w, int T, int k, int n_embd, float* ffn, cudaStream_t s) {
+    if (T <= 0 || (hi <= lo && hi2 <= lo2)) return;
+    moe_combine_add2_kernel<<<T, 256, 0, s>>>(out, base, lo, hi, out2, base2, lo2, hi2, pos, w, k, n_embd, ffn);
+    check("moe_combine_add2");
+}
 void moe_combine_add(const float* out, int base, int lo, int hi, const int* pos, const float* w, int T, int k, int n_embd,
                      float* ffn, cudaStream_t s) {
     if (T <= 0 || hi <= lo) return;

@@ -137,6 +137,10 @@ struct T16 {   // IQ2_XXS
         const __m256i t = tdiv<3>(mul(add(A, B), p.ls));
         return fmul(fmul(bc(p.d), g.d8), i2f(t));
     }
+    static void fin2(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        a = fmul(bc(p.d), g.d8);
+        b = i2f(tdiv<3>(mul(add(A, B), p.ls)));
+    }
 };
 struct T17 {   // IQ2_XS
     static constexpr int qk = 256, bytes = 74, form = GRID, needs_u = 0;
@@ -158,6 +162,10 @@ struct T17 {   // IQ2_XS
     static __m256 fin(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g) {
         const __m256i t = tdiv<2>(add(add(mul(A, p.l0), mul(B, p.l1)), tdiv<1>(add(A, B))));
         return fmul(fmul(bc(p.d), g.d8), i2f(t));
+    }
+    static void fin2(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        a = fmul(bc(p.d), g.d8);
+        b = i2f(tdiv<2>(add(add(mul(A, p.l0), mul(B, p.l1)), tdiv<1>(add(A, B)))));
     }
 };
 struct T22 {   // IQ2_S
@@ -184,6 +192,9 @@ struct T22 {   // IQ2_S
         p.l1 = _mm256_load_si256((const __m256i*) l1);
     }
     static __m256 fin(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g) { return T17::fin(p, v, A, B, g); }
+    static void fin2(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        T17::fin2(p, v, A, B, g, a, b);
+    }
 };
 struct T18 {   // IQ3_XXS
     static constexpr int qk = 256, bytes = 98, form = GRID, needs_u = 0;
@@ -207,6 +218,11 @@ struct T18 {   // IQ3_XXS
         const __m256i t = tdiv<1>(add(mul(p.ls, s), tdiv<1>(s)));
         return fmul(fmul(bc(p.d), g.d8), i2f(t));
     }
+    static void fin2(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        const __m256i s = add(A, B);
+        a = fmul(bc(p.d), g.d8);
+        b = i2f(tdiv<1>(add(mul(p.ls, s), tdiv<1>(s))));
+    }
 };
 struct T21 {   // IQ3_S
     static constexpr int qk = 256, bytes = 110, form = GRID, needs_u = 0;
@@ -229,6 +245,10 @@ struct T21 {   // IQ3_S
     }
     static __m256 fin(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g) {
         return fmul(fmul(bc(p.d), g.d8), i2f(mul(add(A, B), p.ls)));
+    }
+    static void fin2(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        a = fmul(bc(p.d), g.d8);
+        b = i2f(mul(add(A, B), p.ls));
     }
 };
 struct T19 {   // IQ1_S: the grid's values + 1 (0..2), as the device's iq1s_grid_gpu
@@ -314,6 +334,10 @@ struct T23 {   // IQ4_XS
     static __m256 fin(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g) {
         return fmul(fmul(bc(p.d), g.d8), i2f(mul(add(A, B), p.ls)));
     }
+    static void fin2(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        a = fmul(bc(p.d), g.d8);
+        b = i2f(mul(add(A, B), p.ls));
+    }
 };
 // the 32-value formats: a group is 8 blocks; P.dw the blocks' scale factor (0 past the row's end)
 struct T20 {   // IQ4_NL
@@ -331,6 +355,10 @@ struct T20 {   // IQ4_NL
     static __m256 fin(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g) {
         return fmul(fmul(p.dw, g.d8), i2f(add(A, B)));
     }
+    static void fin2(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        a = fmul(p.dw, g.d8);
+        b = i2f(add(A, B));
+    }
 };
 struct T39 {   // MXFP4
     static constexpr int qk = 32, bytes = 17, form = SIGNED, needs_u = 0;
@@ -345,6 +373,9 @@ struct T39 {   // MXFP4
         p.dw = _mm256_load_ps(dw);
     }
     static __m256 fin(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g) { return T20::fin(p, v, A, B, g); }
+    static void fin2(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        T20::fin2(p, v, A, B, g, a, b);
+    }
 };
 struct T8 {   // Q8_0
     static constexpr int qk = 32, bytes = 34, form = SIGNED, needs_u = 0;
@@ -373,6 +404,9 @@ struct T6 {   // Q5_0: the codes - 16 (the device's signed form)
         p.dw = _mm256_load_ps(dw);
     }
     static __m256 fin(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g) { return T20::fin(p, v, A, B, g); }
+    static void fin2(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        T20::fin2(p, v, A, B, g, a, b);
+    }
 };
 struct T7 {   // Q5_1
     static constexpr int qk = 32, bytes = 24, form = PLAIN, needs_u = 0;
@@ -409,6 +443,9 @@ struct T42 {   // Q2_0: 64 values a block (two sub-blocks), codes - 1
         p.dw = _mm256_load_ps(dw);
     }
     static __m256 fin(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g) { return T20::fin(p, v, A, B, g); }
+    static void fin2(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        T20::fin2(p, v, A, B, g, a, b);
+    }
 };
 struct T40 {   // NVFP4: 64 values a block, a UE4M3 scale a 16
     static constexpr int qk = 64, bytes = 36, form = SIGNED, needs_u = 0;
@@ -619,10 +656,17 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TokG* const* tg, co
             int r0, int r1) {
     const int nsub = n / 32, ng = (nsub + 7) / 8;
     const __m256i ones = _mm256_set1_epi16(1);
+    // (a type whose device call is one 32-value block's d_w * d_x times its integer sum: the device's float order -
+    // group k's 8 blocks are the device's lanes 8 (k % 4) .. +7, FMA-accumulated in dv[t][k % 4], q81::dev_sum after -
+    // so the CPU lane's expert has the GPU's bits)
+    constexpr bool dev = requires { &Ty::fin2; };
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         __m256 acc[NT];
+        __m256 dv[dev ? NT : 1][4];
         for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        if constexpr (dev)
+            for (int t = 0; t < NT; ++t) dv[t][0] = dv[t][1] = dv[t][2] = dv[t][3] = _mm256_setzero_ps();
         for (int k = 0; k < ng; ++k) {
             const int ns = nsub - 8 * k < 8 ? nsub - 8 * k : 8;
             __m256i wv[8], mv[8];
@@ -653,10 +697,18 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TokG* const* tg, co
                 const __m256i e = _mm256_hadd_epi32(_mm256_hadd_epi32(v[0], v[1]), _mm256_hadd_epi32(v[2], v[3]));
                 const __m256i f = _mm256_hadd_epi32(_mm256_hadd_epi32(v[4], v[5]), _mm256_hadd_epi32(v[6], v[7]));
                 const __m256i A = _mm256_permute2x128_si256(e, f, 0x20), B = _mm256_permute2x128_si256(e, f, 0x31);
-                acc[t] = fadd(acc[t], Ty::fin(p, v, A, B, tg[t][k]));
+                if constexpr (dev) {
+                    __m256 fa, fb;
+                    Ty::fin2(p, v, A, B, tg[t][k], fa, fb);
+                    dv[t][k & 3] = _mm256_fmadd_ps(fa, fb, dv[t][k & 3]);
+                } else {
+                    acc[t] = fadd(acc[t], Ty::fin(p, v, A, B, tg[t][k]));
+                }
             }
         }
-        for (int t = 0; t < NT; ++t) out[t][r] = hsum(acc[t]);
+        for (int t = 0; t < NT; ++t)
+            if constexpr (dev) out[t][r] = q81::dev_sum(dv[t]);
+            else out[t][r] = hsum(acc[t]);
     }
 }
 
