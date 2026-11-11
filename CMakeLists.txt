@@ -134,6 +134,8 @@ target_compile_options(strata_warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>
+  # CUDA 13's CCCL (pulled in by <cooperative_groups.h>) stops with #error under MSVC's traditional preprocessor.
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:preprocessor>
   $<$<COMPILE_LANGUAGE:HIP>:-Wall>
   $<$<COMPILE_LANGUAGE:HIP>:-Wextra>)
 if(STRATA_WERROR)
