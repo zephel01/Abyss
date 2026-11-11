@@ -6265,16 +6265,25 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
             return v != nullptr ? std::atoi(v) != 0 : small_x;
         }();
         const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all;
-        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, off elsewhere):
+        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, GLM-5.3 and V4 / V4.1 on CUDA, off elsewhere):
         // the moves rank experts by counts that decay smoothly (bgc) instead of the route counts halved every ~32K
         // route events, swap when the hottest RAM-only expert's count passes the layer's coldest resident's by
         // STRATA_GLM_BG_DECAY_MARGIN (2), and make at most STRATA_GLM_BG_DECAY_N (8) swaps a boundary.  Replayed on
         // UD 3.1 UD-IQ3_XXS route logs (32 GB, 4K + 3 x 512, bench/parity/tiersim.py): VRAM hits 93.1 -> 95.5%
         // without a drafter, 91.3 -> 93.2% with MTP (97.5% in the last quarter of both) - the halved integer counts
         // swapped often (13 copies a token) and kept less of what the text was using
-        static const float bg_decay = [small_x] {
+        // GLM-5.3 and DeepSeek V4 / V4.1 too (CUDA; RTX 5090 + Gen4 x4, 4K + 512, iGPU off, 2026-11-12,
+        // bench/parity/results-port.md): their ~7-8 MB experts left VRAM hits at 56-67% and the CPU lane took 85-150
+        // experts a token; the decayed counts keep more of what the text uses (GLM-5.3 Maya-S-v2 IQ2_XXS 43.4 -> 46.8
+        // tok/s, V4 0731 UD-Q2_K_XL 54.0 -> 57.5).  HIP keeps the old moves (not measured there)
+#if defined(STRATA_USE_HIP)
+        const bool decay_dflt = small_x;
+#else
+        const bool decay_dflt = small_x || g.arch == 0 || g.dsv4();
+#endif
+        static const float bg_decay = [decay_dflt] {
             const char* v = getenv("STRATA_GLM_BG_DECAY");
-            const float d = v != nullptr ? (float) std::atof(v) : small_x ? 0.995f : 0.0f;
+            const float d = v != nullptr ? (float) std::atof(v) : decay_dflt ? 0.995f : 0.0f;
             return d > 0.0f && d < 1.0f ? d : 0.0f;
         }();
         static const float bg_dmargin = [] {
