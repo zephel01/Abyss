@@ -627,7 +627,18 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("STRATA_GLM_PROF")));
     if (const char* pn = getenv("STRATA_GLM_PREFETCH_N")) F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
     if (const char* bp = getenv("STRATA_GLM_BG_PACE_KB")) F->bg_pace = (size_t) std::max(0, std::atoi(bp)) << 10;
-    else F->bg_pace = (size_t) 1024 << 10;   // (FastState::bg_drain)
+    else {   // (FastState::bg_drain)
+        // Qwen3.8 on CUDA: 512 KiB a MoE layer.  A 1 MiB piece (~150 us over Gen4 x4) still crossed when the next
+        // layer's route wrote its request: the route's host-mapped stores and system fence waited behind it (route
+        // prof on an RTX 5090, UD-IQ3_XXS after a 4K prompt: request + fence 33.5k -> 4.6k cycles, the seq publish
+        // 6.5k -> 1.1k; decode 110 -> 118 tok/s).  256 KiB fenced as fast but promoted too slowly (VRAM hit 91.9%
+        // against 93.4%).  Other models keep 1 MiB until measured
+#if defined(STRATA_USE_HIP)
+        F->bg_pace = (size_t) 1024 << 10;
+#else
+        F->bg_pace = (size_t) (g.q4x ? 512 : 1024) << 10;
+#endif
+    }
     // RAM-resident mode (--glm-ram-resident / STRATA_GLM_RAM_RESIDENT=1): the RAM tier's per-class cap grows by
     // ram_slack slots per MoE layer so it holds EVERY expert VRAM does not; nothing is ever dropped to disk and the
     // start fails when the tier cannot hold them all - the disk is the pack's home, never a read source at runtime
