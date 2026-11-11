@@ -712,7 +712,8 @@ prompt は ubatch 512 で 78 tok/s、ubatch 8192 で 660 tok/s。）各リリー
 で読める（CPU のスレッドは約 75 GB/s）。ROCm が入っていて `libabyss_igpu.so` がビルドされていれば、エンジンは
 起動時に RAM 層を内蔵 GPU に登録し、RAM 層のエキスパートを CPU の代わりに内蔵 GPU で計算する（コピーはしない）。
 どちらで計算するかは起動時に両方を測って決め、ログに出す（`iGPU lane: an expert 0.046 ms vs 0.107 on the CPU's
-16 threads`）。CPU のほうが速い場合や、ライブラリか HIP のデバイスがない場合は CPU で計算する。
+16 threads`）。内蔵 GPU がはっきり速くない場合（1.5 倍、`STRATA_GLM_IGPU_MARGIN`）、正確な合算が有効な場合（Qwen3.8）、
+ライブラリか HIP のデバイスがない場合は CPU で計算する。
 prompt のまとめ処理でもこのレーンを使う。prompt のチャンクが必要とする RAM 層のエキスパートを、CPU のスレッドではなく
 内蔵 GPU で計算する（8K の prompt で +40%）。レーンの呼び出しには期限がある（`STRATA_GLM_IGPU_TIMEOUT_MS`、20 ms）。
 カーネルドライバが内蔵 GPU のキューを止めているとき（起動後の数分間、読み込みのあとにカーネルがメモリを回収する間に
@@ -847,7 +848,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_HTTP_BACKLOG` | 256 | （サーバー）listen のバックログ（accept 待ちのリクエスト数） |
 | `STRATA_MAX_BODY_MIB` | 256 | （サーバー）リクエスト本文の上限。超えると読まずに 413 |
 | `GPU_MAX_HW_QUEUES` | 2（HIP） | ROCm がデバイスごとに作る HW キューの数。シェルにも設定ファイルにもないとき、サーバーが 2 を渡す（v1.3.40）。AI PRO R9700 の DeepSeek V4 の 8K / 16K の prompt は、1 で 586〜650 / 676〜684 tok/s（R9700 向けの手順でアイドル電力の回避策として広まっている値。この PC ではどちらでもアイドル 12 W）、ROCm の既定の 4 で 653〜737 / 748〜756、2 で 866〜995 / 999〜1,011 |
-| `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU より速ければ使う。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |
+| `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU よりはっきり速ければ使う（`STRATA_GLM_IGPU_MARGIN`）。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |
+| `STRATA_GLM_IGPU_MARGIN` | 1.5 | 自動のとき、起動時の計測でエキスパート 1 個の時間が CPU のこの倍以上速いときだけ iGPU がレーンを受け持つ（計測には実際のトークンでの iGPU 呼び出しの費用が入らない。Ryzen AI Max+ 395 + RTX 5090 の Qwen3.8 16G64G は 0.022 ms 対 0.019〜0.025 ms のほぼ同着で、iGPU を選んだ回はどれも decode が遅かった: MTP 141 → 132 tok/s、既定 94 → 89。GLM-5.3 / V4 / V4.1 は iGPU が 1.9〜2.7 倍速く、iGPU のまま）。正確な合算（`STRATA_GLM_LANE_XC`、Qwen3.8 の既定）が有効なときは CPU がレーンを持つ（iGPU の和は GPU と同じビットにならず、答えがまたレーンに左右されるため）。`1` = 単純に速い方（以前の選び方） |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | これより遅れたレーンの呼び出しは CPU のスレッドが引き継ぐ（0: 待つ） |
 | `STRATA_GLM_IGPU_POKE_MS` | 500 | ルーティングのあと、iGPU を空のカーネルで起こしておく時間（50 µs ごと。v1.3.40 で 20 から変更）。DeepSeek V4.1 はルーティングの間に SSD を 20 ms 以上待つことがあり、その間に寝た iGPU は次の呼び出しに 21〜27 ms かかっていた（AI PRO R9700 + 8060S の最も遅い系列: 遅延 123 回、1 token 80.4 ms → 500 で 3 回、65.6 ms） |
 | `STRATA_GLM_IGPU_COLS` | オン | 検証窓（DSpark / 繰り返しのドラフト）の iGPU レーンのエキスパートを、窓の全列で 1 回のレーン呼び出しにまとめ、同じエキスパートを使う列が何本あっても 1 回だけ読む（v1.3.89。結果は同じビット。RTX 5090 + Radeon 8060S、DeepSeek V4.1 UD-IQ2_XXS + DSpark: レーン 60〜62 → 54〜57 us/エキスパート、decode −3〜5%/トークン、swe-bench 48.6 → 51.0 tok/s）。`ABYSS_IGPU_COLS_UNION=0`: 1 回の呼び出しの中で列ごとのグリッド（読みの共有なし）。`0`: 列ごとにレーンを呼ぶ |

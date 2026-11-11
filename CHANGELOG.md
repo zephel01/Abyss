@@ -23,6 +23,15 @@ Four findings from LarsDrakblod's RTX 4090 field report (#39) - thank you:
   combine (`STRATA_GLM_LANE_XC`). The DFlash 2 note adds the 4090's tie with the MTP layer (55.6 vs 56.4 tok/s at
   86-89% vs 78% acceptance): on a PCIe-bound card a better drafter does not change each window's expert fetches.
 
+- **Qwen3.8 with the iGPU lane no longer decodes slower than without it** (Ryzen AI Max+ 395 + RTX 5090, Qwen3.8
+  16G64G, v1.3.129: iGPU on MTP 132 / default 89 tok/s, iGPU off 141 / 94; with this the iGPU-on box takes the
+  CPU lane, as iGPU off). The start-up timing that picks the iGPU or
+  the CPU for the RAM-tier lane saw a near tie on Qwen3.8 (an expert 0.022 ms vs 0.019-0.025 on the CPU) and flipped
+  run to run, and every run that picked the iGPU was slower. The iGPU now takes the lane only when it times at least
+  1.5x faster (`STRATA_GLM_IGPU_MARGIN`; GLM-5.3, V4 and V4.1 time it 1.9-2.7x faster and keep it), and never with
+  the exact combine (`STRATA_GLM_LANE_XC`, Qwen3.8's default): the iGPU's sums are not the GPU's bits, so the
+  same-answers-every-run combine needs the CPU lane. `STRATA_GLM_IGPU=1` still forces the iGPU.
+
 ## v1.3.129 - 2026-11-10
 
 - **GLM-5.3 and DeepSeek V4.1 decode back to v1.3.123's speed.** `STRATA_GLM_CPU_EXACT` (v1.3.124: the CPU lane in

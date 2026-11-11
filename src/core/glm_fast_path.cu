@@ -2826,6 +2826,25 @@ static int physical_cores() {
 #endif
 }
 
+// STRATA_GLM_LANE_XC asked for (the exact combine, set up at the end of fast_cpu_lane_setup; the iGPU lane's pick
+// reads it too)
+static bool lane_xc_wanted(bool q4x) {
+    const char* v = getenv("STRATA_GLM_LANE_XC");
+#if defined(STRATA_USE_HIP)
+    (void) q4x;
+    return v != nullptr && std::atoi(v) != 0;
+#else
+    // (default: qwen4exp on x86, where it was measured - the AVX2 / AVX-512 lane rows keep the device's order, the
+    // portable ones (ARM) do not; set 1 for the others)
+#if defined(__x86_64__) || defined(_M_X64)
+    return v == nullptr ? q4x : std::atoi(v) != 0;
+#else
+    (void) q4x;
+    return v != nullptr && std::atoi(v) != 0;
+#endif
+#endif
+}
+
 // The CPU LANE, on by default: one thread per physical core (split evenly across the parts of a layer split);
 // STRATA_GLM_CPU_LANE=<threads> sets the count, 0 turns it off; STRATA_GLM_CPU_LANE<n>=<threads> sets one GPU's own
 // (CUDA<n>: a slow link wants more threads than a fast one).  Measures this machine once - one expert on the CPU
@@ -3175,12 +3194,34 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                 }
             }
         }
+        // The pick (STRATA_GLM_IGPU unset): the iGPU keeps the lane only when its expert is at least
+        // STRATA_GLM_IGPU_MARGIN (1.5) times as fast as the CPU's - the timing is one call of n_cal experts in a quiet
+        // loop and leaves out what the iGPU costs a real token (its call's launch and wait inside the layer, the
+        // package's power shared with the CPU threads that still prepare the call).  Ryzen AI Max+ 395 + RTX 5090,
+        // weekly real-use runs: Qwen3.8 16G64G timed an expert 0.022 ms on the iGPU vs 0.019-0.025 on the CPU, so the
+        // pick flipped run to run (v1.3.128/129 mostly iGPU, the CPU_EXACT rows timing ~0.023), and the iGPU runs
+        // decoded slower every time - MTP 141 -> 132 tok/s, default 94 -> 89 (v1.3.99, its CPU at 0.021: 88-90 vs
+        // 91-93).  GLM-5.3, V4 0731 and V4.1 time the iGPU 1.9-2.7x faster than the CPU and keep it (GLM 45 -> 69).
+        // With the exact combine (STRATA_GLM_LANE_XC, Qwen3.8 by default) the CPU keeps the lane whatever the timing:
+        // the iGPU's kernels do not give the device's bits and its sum is added apart, so the answers would depend on
+        // the lane again.  STRATA_GLM_IGPU=1: the iGPU always
+        static const double margin = [] {
+            const char* v = getenv("STRATA_GLM_IGPU_MARGIN");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 1.5;
+        }();
         const char* on = getenv("STRATA_GLM_IGPU");
+        const bool forced = on != nullptr && std::atoi(on) == 1;
+        const bool exact = lane_xc_wanted(g.q4x) && !F->defer && !exl3_;
         const bool failed = F->igpu_experts == nullptr;
-        const bool keep = !failed && (!clean || ig_ms < cpu_ms || (on != nullptr && std::atoi(on) == 1));
-        if (clean || failed)
+        const bool keep = !failed && (forced || (!exact && (!clean || ig_ms * margin < cpu_ms)));
+        if (clean || failed || exact)
             std::fprintf(stderr, "glm fast: CUDA%d iGPU lane: an expert %.3f ms vs %.3f on the CPU's %d threads -> %s\n",
-                         dev_, ig_ms, cpu_ms, threads, keep ? "the iGPU computes the lane" : "the CPU (faster here)");
+                         dev_, ig_ms, cpu_ms, threads,
+                         keep ? "the iGPU computes the lane"
+                         : failed ? "the CPU (the iGPU lane failed)"
+                         : exact ? "the CPU (the exact combine, STRATA_GLM_LANE_XC: the iGPU would change the answers)"
+                         : ig_ms < cpu_ms ? "the CPU (the iGPU not clearly faster, STRATA_GLM_IGPU_MARGIN)"
+                                          : "the CPU (faster here)");
         else
             std::fprintf(stderr, "glm fast: CUDA%d iGPU lane: no clean timing in %.0f s (the kernel driver stalling it) "
                                  "- the iGPU computes the lane, a stalled call goes to the CPU's %d threads\n",
@@ -3376,19 +3417,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // deferral or the hc-fused answer (they add a CPU sum elsewhere); on by default for qwen4exp only (measured);
     // HIP: off by default (its RDNA expert kernels sum in another order than lane_q81)
     {
-        const char* v = getenv("STRATA_GLM_LANE_XC");
-#if defined(STRATA_USE_HIP)
-        const bool want = v != nullptr && std::atoi(v) != 0;
-#else
-        // (default: qwen4exp on x86, where it was measured - the AVX2 / AVX-512 lane rows keep the device's order, the
-        // portable ones (ARM) do not; set 1 for the others)
-#if defined(__x86_64__) || defined(_M_X64)
-        const bool want = v == nullptr ? g.q4x : std::atoi(v) != 0;
-#else
-        const bool want = v != nullptr && std::atoi(v) != 0;
-#endif
-#endif
-        F->xc = want && !F->defer && !exl3_ &&
+        F->xc = lane_xc_wanted(g.q4x) && !F->defer && !exl3_ &&
                 cudaMalloc((void**) &F->xpart_d, gf::xpart_floats(g.n_embd) * sizeof(float)) == cudaSuccess;
         if (F->xc) {
             cudaMemset(F->xpart_d, 0, gf::xpart_floats(g.n_embd) * sizeof(float));
