@@ -71,7 +71,51 @@ __global__ void rope_neox_kernel(const float* __restrict__ x, float* __restrict_
     }
 }
 
+// rope_neox_kernel's arithmetic with a thread a PAIR (and a thread a tail element) instead of a thread a row: a
+// token's few rows (the QSA indexer's query heads) as one thread each walked 64+ pairs serially (~4.5 us).  Each
+// output element is written by exactly one thread, which read its own inputs only: safe in place, the same bits
+__global__ void rope_neox_pairs_kernel(const float* __restrict__ x, float* __restrict__ out, long long rows,
+                                       int head_dim, int n_rot, const float* __restrict__ cos_tab,
+                                       const float* __restrict__ sin_tab, const int* __restrict__ pos,
+                                       const int32_t* __restrict__ mtab) {
+    const int half = n_rot / 2, per = half + (head_dim - n_rot);
+    const long long g = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    const long long r = g / per;
+    if (r >= rows) return;
+    const int j = (int) (g - r * per);
+    const float* xr = x + r * head_dim;
+    float* orow = out + r * head_dim;
+    if (j >= half) {
+        const int d = n_rot + (j - half);
+        orow[d] = xr[d];
+        return;
+    }
+    const int i = j;
+    const size_t toff = (size_t) mrope_pos(mtab, pos[r], i) * half;
+    rope_neox_pair(xr[i], xr[half + i], cos_tab[toff + i], sin_tab[toff + i], orow[i], orow[half + i]);
+}
+
 }  // namespace
+
+void rope_neox_apply_pairs(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
+                           const float* sin_tab, const int* pos, void* stream) {
+    if (rows <= 0 || n_rot <= 0) return;
+    if (n_rot % 2 != 0 || n_rot > head_dim) {
+        std::fprintf(stderr, "rope_neox_apply_pairs: n_rot %d must be even and <= head_dim %d\n", n_rot, head_dim);
+        std::exit(1);
+    }
+    const long long total = rows * (long long) (n_rot / 2 + (head_dim - n_rot));
+    const int threads = 256;
+    const unsigned grid = (unsigned) ((total + threads - 1) / threads);
+    rope_neox_pairs_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, out, rows, head_dim, n_rot, cos_tab,
+                                                                       sin_tab, pos, mrope_table());
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "rope_neox_apply_pairs launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (stream == nullptr) cudaDeviceSynchronize();
+}
 
 void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
                      const float* sin_tab, const int* pos, void* stream) {

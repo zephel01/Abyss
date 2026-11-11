@@ -6470,4 +6470,89 @@ void argmax(const float* x, int n, int* out, cudaStream_t s) {
     launch_check("argmax");
 }
 
+// argmax_kernel's selection (the largest value, the lowest index among equal ones, NaN never taken) split over
+// blocks: each block's best of its contiguous range, the last block to finish (a ticket) picks among the blocks'.
+// The rule is a total order on (value, -index) over the non-NaN entries, so the pick does not depend on how the
+// entries were grouped: the same index as argmax_kernel.  One block read the ~1 MB vocabulary at ~60 GB/s (17 us).
+constexpr int kAmBlocks = 128;
+__global__ void __launch_bounds__(256) argmax_mb_kernel(const float* __restrict__ x, int n, int* __restrict__ out,
+                                                        float* __restrict__ pv, int* __restrict__ pi,
+                                                        unsigned int* __restrict__ ticket) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    __shared__ bool last;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    const auto take = [&](float v, int i) {
+        if (v > best || (v == best && i < bi)) {
+            best = v;
+            bi = i;
+        }
+    };
+    const int n4 = n >> 2;   // (x is 16-byte aligned: the caller checks)
+    const int per = (n4 + gridDim.x - 1) / gridDim.x;
+    const int a0 = blockIdx.x * per, a1 = min(n4, a0 + per);
+    const float4* x4 = (const float4*) x;
+    for (int i = a0 + threadIdx.x; i < a1; i += blockDim.x) {
+        const float4 a = x4[i];
+        take(a.x, 4 * i);
+        take(a.y, 4 * i + 1);
+        take(a.z, 4 * i + 2);
+        take(a.w, 4 * i + 3);
+    }
+    if (blockIdx.x == gridDim.x - 1)
+        for (int i = 4 * n4 + threadIdx.x; i < n; i += blockDim.x) take(x[i], i);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
+            if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
+        pv[blockIdx.x] = best;
+        pi[blockIdx.x] = bi;
+        __threadfence();
+        last = atomicAdd(ticket, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    best = -INFINITY;
+    bi = 0x7fffffff;
+    for (int b = threadIdx.x; b < (int) gridDim.x; b += blockDim.x) take(((const volatile float*) pv)[b], ((const volatile int*) pi)[b]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    __syncthreads();
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
+            if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
+        *out = bi;
+        *ticket = 0u;   // (the next launch on this stream starts from zero)
+    }
+}
+
+void argmax_mb(const float* x, int n, int* out, void* scratch, cudaStream_t s) {
+    if (scratch == nullptr || (((uintptr_t) x) & 15u) != 0 || n < 4 * kAmBlocks * 256) {
+        argmax(x, n, out, s);
+        return;
+    }
+    float* pv = (float*) scratch;
+    int* pi = (int*) (pv + kAmBlocks);
+    unsigned int* ticket = (unsigned int*) (pi + kAmBlocks);
+    argmax_mb_kernel<<<kAmBlocks, 256, 0, s>>>(x, n, out, pv, pi, ticket);
+    launch_check("argmax_mb");
+}
+size_t argmax_mb_scratch_bytes() { return (size_t) kAmBlocks * 8 + 16; }
+
 }  // namespace strata::kernels::glmf

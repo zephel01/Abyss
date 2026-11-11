@@ -479,6 +479,18 @@ struct Glm5Model::FastState {
     std::unique_ptr<strata::kernels::PleTable> ple;
     std::vector<int32_t> ple_toks;
     bool ple_issued = false;
+    // STRATA_Q4X_PLE_SPEC: the next token's rows prefetched as soon as this token is known (the greedy guess = it);
+    // a token that matches the guess issues its rows only before layer 1, after the prefetch landed (cache hits)
+    int32_t ple_spec_tok = -1;
+    int64_t ple_spec_p = -1;
+    bool ple_deferred = false, ple_spec_live = false;
+    uint32_t ple_rows[16] = {};
+    // STRATA_Q4X_EARLY_BOUNDARY: the next token's boundary scan run while this token's head computes (ev_body: the
+    // layers done); early_b_pos: the position whose boundary already ran (-1: none)
+    cudaEvent_t ev_body = nullptr;
+    int64_t early_b_pos = -1;
+    void* am_scratch = nullptr;    // gf::argmax_mb's (qwen4exp's token head, STRATA_Q4X_ARGMAX_MB)
+    float* ple_emb_hd = nullptr;   // ple_emb_h as the device sees it (mapped): a kernel reads it, no copy engine
     int ple_il = -1;                                             // the PLE layer (-1: none on this part)
     float *ple_emb_h = nullptr, *ple_emb = nullptr, *ple_kp = nullptr, *ple_val = nullptr, *ple_hist = nullptr;
     float *ple_key = nullptr, *ple_norm = nullptr, *ple_gated = nullptr, *ple_conv = nullptr, *ple_gate = nullptr;
@@ -757,6 +769,7 @@ struct Glm5Model::FastState {
     cudaEvent_t ev_gs = nullptr, ev_ge[2] = {nullptr, nullptr}, ev_g0 = nullptr;
     int gap_par = 0;
     std::chrono::steady_clock::time_point t_ready{};
+    double gap_ph[7] = {};
     double gap_host = 0, gap_bsync = 0, gap_bwait = 0, gap_bscan = 0, gap_emb = 0, gap_spin = 0, gap_gpu = 0,
            gap_sample = 0, gap_busy = 0, gap_notice = 0;
     bool token_spin = false;   // STRATA_GLM_TOKEN_SPIN=1: the wait for the token polls without yielding (an experiment)
