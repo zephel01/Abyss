@@ -1407,7 +1407,8 @@ static int glm_pack_generate(const Options& o) {
         // (2026-11-10) and the prompt path's sums in one order whatever the pool holds: MMQ a tile a block over the
         // whole K (no stream-k split, which follows the launch's tile count) and every routed row in one output window
         // (the window's flushes follow which experts are resident: a token's experts added in another order)
-        static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"}};
+        static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"},
+                                             {"STRATA_Q4X_VERIFY_EXACT", "1"}};   // (Qwen3.8's verify GEMVs, #42)
         std::string kept;
         for (const char* k : kOff) {
             if (std::getenv(k) == nullptr) set_env(k, "0");

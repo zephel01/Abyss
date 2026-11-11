@@ -3701,7 +3701,9 @@ __device__ __forceinline__ void cpu_wait_add(const unsigned int* cpu_seq, const 
             }
             __threadfence_system();
         }
-        s_xm = ((volatile const CpuAnswer*) r)->xmask;
+        // xmask only for the exact combine (another PCIe read a block, after the wait - issue #42: it ran on every
+        // wait from v1.3.127 on, the exact combine being off on HIP by default)
+        s_xm = xp != nullptr && k > 0 ? ((volatile const CpuAnswer*) r)->xmask : 0u;
 #else
         // seq and xmask in one 16-byte read (the host writes xmask, then its release fence, then seq: a read that
         // sees the new seq sees the new xmask) - a PCIe round trip less than reading xmask after

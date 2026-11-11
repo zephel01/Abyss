@@ -592,6 +592,10 @@ public:
     bool verify_part_glm(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
     void verify_rewind_glm(int64_t pos);
     bool glm_mvn(const void* jobs, int n, int T, cudaStream_t s);   // gf::MvJob[n] (STRATA_GLM_MVN_CHECK)
+    // qwen4exp's verify-window GEMVs: glm_mvn (each column mv()'s sums: the drafts' tokens equal the token path's)
+    // or gf::mvn (the weights read once for all columns) - STRATA_Q4X_VERIFY_EXACT, on by default on CUDA, off on HIP
+    // (HIP's glm_mvn is a mv() a column: the dense weights read once per column, issue #42)
+    bool q4x_mvn(const void* jobs, int n, int T, cudaStream_t s);
     bool glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // STRATA_GLM_WINDOW_CHECK
     void kda_copy_layer(int il, int li, bool restore, float* bak = nullptr);   // one KDA layer's S + conv <-> kda_bak_
     // the NextN block (blk.<n_layers>) as the drafter on one GPU (qwen35_fast_path.cu, behind the q35_mtp_* hooks)
