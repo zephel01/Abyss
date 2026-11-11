@@ -630,21 +630,45 @@ struct Glm5Model::FastState {
         cudaEvent_t ev;   // the move's: recorded after its last piece
         cudaMemcpyKind kind;   // a promotion (H2D) or a swap's demotion (D2H: posted writes, which the GPU's zero-copy
                                // read requests may not pass - they held the token's reads up the same way)
+        cudaStream_t own = nullptr;   // the stream its first bytes went on: the rest follow there (its event then
+                                      // follows every piece; STRATA_GLM_BG_LANE drains on two streams)
     };
     std::vector<BgPiece> bg_q;   // in issue order
     size_t bg_q_at = 0;          // the first piece not fully issued
     size_t bg_pace = 0;
     cudaEvent_t ev_bgq = nullptr;
-    // up to `budget` bytes of the queued copies onto the copy stream, after the work queued on `s` so far (s null:
-    // at once)
-    void bg_drain(cudaStream_t s, size_t budget) {
+    // STRATA_GLM_BG_IDLE (off by default): the link's idle time inside a MoE layer is used too.  The drain after the
+    // CPU-lane answer (bg_pace, above) runs beside the next layer's attention; an RTX 5090 + Gen4 x4 nsys trace of V4
+    // 0731 (4K + 256) showed that window ~160 us long and the link 96% idle from the route to the answer (~215 us),
+    // where the CPU lane computes from RAM.  bg_moe more bytes go right after the route (its request and fence done),
+    // of the kinds in bg_moe_mask (1 H2D, 2 D2H); bg_attn_mask the kinds of the drain after the answer
+    size_t bg_moe = 0;
+    int bg_moe_mask = 3, bg_attn_mask = 3;
+    // STRATA_GLM_BG_LANE (off by default): the service thread itself lets queued copies go (on copy2, at once) when a
+    // route hands the CPU lane ne experts: bg_lane_per x ne - bg_lane_off bytes (at most bg_lane_max) of the kinds in
+    // bg_lane_mask - about what crosses the link while the CPU computes them, so the copy ends before the answer
+    size_t bg_lane_per = 0, bg_lane_off = 0, bg_lane_max = 0;
+    int bg_lane_mask = 1;
+    cudaStream_t copy2 = nullptr;
+    std::mutex bg_mu;   // bg_q and the moves' queued flags: the main thread's drains vs the service thread's
+    // up to `budget` bytes of the queued copies (of the kinds in `mask`: 1 promotions H2D, 2 demotions D2H) onto the
+    // copy stream, in issue order, after the work queued on `s` so far (s null: at once)
+    void bg_drain(cudaStream_t s, size_t budget, int mask = 3, cudaStream_t on = nullptr) {
+        std::lock_guard<std::mutex> lk(bg_mu);
         if (bg_q_at == bg_q.size()) return;
-        if (s != nullptr) {
-            cudaEventRecord(ev_bgq, s);
-            cudaStreamWaitEvent(copy, ev_bgq, 0);
-        }
-        while (bg_q_at < bg_q.size() && budget > 0) {
-            BgPiece& p = bg_q[bg_q_at];
+        cudaStream_t copy = on != nullptr ? on : this->copy;
+        bool waited = false;
+        for (size_t i = bg_q_at; i < bg_q.size() && budget > 0; ++i) {
+            BgPiece& p = bg_q[i];
+            if (p.done == p.n || !(mask & (p.kind == cudaMemcpyHostToDevice ? 1 : 2)) ||
+                (p.own != nullptr && p.own != copy))
+                continue;
+            p.own = copy;
+            if (!waited && s != nullptr) {
+                cudaEventRecord(ev_bgq, s);
+                cudaStreamWaitEvent(copy, ev_bgq, 0);
+            }
+            waited = true;
             const size_t n = p.n - p.done < budget ? p.n - p.done : budget;
             cudaMemcpyAsync(p.dst + p.done, p.src + p.done, n, p.kind, copy);
             p.done += n;
@@ -653,8 +677,8 @@ struct Glm5Model::FastState {
             cudaEventRecord(p.ev, copy);
             for (auto& m : bg)
                 if (m.ev == p.ev) m.queued = false;
-            ++bg_q_at;
         }
+        while (bg_q_at < bg_q.size() && bg_q[bg_q_at].done == bg_q[bg_q_at].n) ++bg_q_at;
         if (bg_q_at == bg_q.size()) {
             bg_q.clear();
             bg_q_at = 0;

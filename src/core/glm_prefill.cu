@@ -1389,8 +1389,11 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
     // way would otherwise be lent under it
     F->bg_hold = true;
     F->bg_drain(nullptr, SIZE_MAX);   // the paced promotions' remaining pieces go now
+    if (F->copy2 != nullptr) F->bg_drain(nullptr, SIZE_MAX, 3, F->copy2);   // (those begun there: STRATA_GLM_BG_LANE)
     // Retire metadata as well as DMA. With the hold set, the boundary cannot start replacement moves.
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lending copies", err) || !fast_boundary(err))
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lending copies", err) ||
+        (F->copy2 != nullptr && !glmfast::cuda_ok(cudaStreamSynchronize(F->copy2), "glm lending copies", err)) ||
+        !fast_boundary(err))
         return false;
     if (!F->bg.empty() || !F->draining.empty()) {
         err = "glm lending: tier moves were not retired";

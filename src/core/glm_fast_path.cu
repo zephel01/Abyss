@@ -650,6 +650,31 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->bg_pace = (size_t) (g.q4x ? 512 : 1024) << 10;
 #endif
     }
+    // STRATA_GLM_BG_IDLE=<KiB after the route>[:<moe kinds>[:<attention kinds>]] (kinds: 1 H2D, 2 D2H, 3 both; off by
+    // default): FastState::bg_moe
+    if (const char* bi = getenv("STRATA_GLM_BG_IDLE")) {
+        int kb = 0, mm = 3, am = 3;
+        std::sscanf(bi, "%d:%d:%d", &kb, &mm, &am);
+        F->bg_moe = (size_t) std::max(0, kb) << 10;
+        F->bg_moe_mask = mm & 3;
+        F->bg_attn_mask = am & 3;
+        std::fprintf(stderr, "glm fast: background copies also after the route: %d KiB (kinds %d), after the answer %zu KiB (kinds %d)\n",
+                     kb, mm & 3, F->bg_pace >> 10, am & 3);
+    }
+    // STRATA_GLM_BG_LANE=<KiB per lane expert>:<KiB off>[:<kinds>[:<max KiB>]] (off by default): FastState::bg_lane_per.
+    // The drain after the answer then takes the other kinds only (unless STRATA_GLM_BG_IDLE says)
+    if (const char* bl = getenv("STRATA_GLM_BG_LANE")) {
+        int per = 0, off = 0, mk = 1, mx = 4096;
+        std::sscanf(bl, "%d:%d:%d:%d", &per, &off, &mk, &mx);
+        F->bg_lane_per = (size_t) std::max(0, per) << 10;
+        F->bg_lane_off = (size_t) std::max(0, off) << 10;
+        F->bg_lane_mask = mk & 3;
+        F->bg_lane_max = (size_t) std::max(0, mx) << 10;
+        if (getenv("STRATA_GLM_BG_IDLE") == nullptr) F->bg_attn_mask = 3 & ~F->bg_lane_mask;
+        std::fprintf(stderr, "glm fast: background copies from the CPU lane: %d KiB a lane expert - %d KiB (kinds %d, at "
+                             "most %d KiB); after the answer %zu KiB (kinds %d)\n", per, off, mk & 3, mx, F->bg_pace >> 10,
+                     F->bg_attn_mask);
+    }
     // RAM-resident mode (--glm-ram-resident / STRATA_GLM_RAM_RESIDENT=1): the RAM tier's per-class cap grows by
     // ram_slack slots per MoE layer so it holds EVERY expert VRAM does not; nothing is ever dropped to disk and the
     // start fails when the tier cannot hold them all - the disk is the pack's home, never a read source at runtime
@@ -659,6 +684,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
+        (F->bg_lane_per > 0 && cudaStreamCreateWithFlags(&F->copy2, cudaStreamNonBlocking) != cudaSuccess) ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pred, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf, cudaEventDisableTiming) != cudaSuccess ||
@@ -4364,6 +4390,7 @@ void Glm5Model::fast_destroy() {
                      100.0 * (double) spec_hits_ / (double) spec_steps_);
     if (F->cs) cudaStreamSynchronize(F->cs);
     if (F->copy) cudaStreamSynchronize(F->copy);
+    if (F->copy2) cudaStreamSynchronize(F->copy2);
     if (F->kda_graphs.captures || F->kda_graphs.replays)
         std::fprintf(stderr, "glm KDA graphs: %llu captures, %llu replays, %llu invalidations\n",
                      (unsigned long long) F->kda_graphs.captures,
@@ -4436,6 +4463,7 @@ void Glm5Model::fast_destroy() {
     if (F->ev_pf_prev) cudaEventDestroy(F->ev_pf_prev);
     if (F->cs) cudaStreamDestroy(F->cs);
     if (F->copy) cudaStreamDestroy(F->copy);
+    if (F->copy2) cudaStreamDestroy(F->copy2);
     if (F->ps) cudaStreamDestroy(F->ps);
     delete F;
     fast_ = nullptr;
@@ -5330,6 +5358,10 @@ void Glm5Model::fast_service() {
                     F->igpu_falls.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            // STRATA_GLM_BG_LANE: queued copies across the link while the CPU computes these ne experts
+            if (F->bg_lane_per > 0 && !F->bg_hold && F->bg_lane_per * (size_t) ne > F->bg_lane_off)
+                F->bg_drain(nullptr, std::min(F->bg_lane_per * (size_t) ne - F->bg_lane_off, F->bg_lane_max),
+                            F->bg_lane_mask, F->copy2);
             if (rc != 0) {
                 auto* H = F->expert_helper.get();
                 if (!H || !H->active || H->failed || gs1 != nullptr) {   // (NVFP4: not on the helper yet)
@@ -6148,6 +6180,7 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
     //     takes the promotion at a later boundary).  Either way the expert stays live where it was until its copy
     //     landed - no window in which a route would go to disk.  STRATA_GLM_PROMOTE=<moves a boundary>, 0: off.
     {
+        std::lock_guard<std::mutex> bgl(F->bg_mu);   // (the service thread's drains: STRATA_GLM_BG_LANE)
         const int NE = g.n_expert;
         std::vector<FastState::BgMove> keep;
         for (auto& m : F->bg) {
@@ -6715,6 +6748,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         cudaEventRecord(F->ev_pf, F->ps);
     };
     if (pf && pf_at == 0) issue_prefetch();
+    // STRATA_GLM_BG_IDLE: queued tier copies across the link while the CPU lane computes (FastState::bg_moe)
+    if (F->bg_moe > 0 && !F->kda_graph_on) F->bg_drain(s, F->bg_moe, F->bg_moe_mask);
     if (late) {
         gf::MvJob sj[2];
         sj[0] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
@@ -6827,7 +6862,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     }
     // the paced promotions' next bytes: across the link while the next layer's mixer runs (no zero-copy reads there)
     if (hc_cpu) F->bg_after_hc = true;
-    else if (!F->kda_graph_on) F->bg_drain(s, F->bg_pace);
+    else if (!F->kda_graph_on) F->bg_drain(s, F->bg_pace, F->bg_attn_mask);
     return true;
 }
 
@@ -6876,6 +6911,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                         getenv("GLM_DUMP_H") == nullptr;
     F->kda_graph_on = graphs;
     if (graphs) F->bg_drain(nullptr, SIZE_MAX);   // (paced copies are not issued from inside a capture)
+    if (graphs && F->copy2 != nullptr) F->bg_drain(nullptr, SIZE_MAX, 3, F->copy2);
     F->hc_cpu_on = F->bg_after_hc = false;
     if (g.qwen35()) return fast_qwen35_layers(p, err);   // (plain residuals: qwen35_fast_path.cu)
     if (F->prof_on) F->mark("start");
@@ -6931,7 +6967,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         h.cpu_ans = nullptr;
         if (F->bg_after_hc) {
             F->bg_after_hc = false;
-            F->bg_drain(s, F->bg_pace);
+            F->bg_drain(s, F->bg_pace, F->bg_attn_mask);
         }
         if (F->prof_on) F->mark("hc_attn");
         if (wrote) std::swap(Rc, Ro);
@@ -7072,7 +7108,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     }
     if (F->bg_after_hc) {
         F->bg_after_hc = false;
-        F->bg_drain(s, F->bg_pace);
+        F->bg_drain(s, F->bg_pace, F->bg_attn_mask);
     }
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
     if (l1_ == g.n_layers) abl_cap(g.n_layers, Ro, g.hc, s);
