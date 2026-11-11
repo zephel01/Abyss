@@ -800,5 +800,51 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertNotIn("STRATA_GLM_POOL_GB", env)
 
 
+class HipCmathOrderTests(unittest.TestCase):
+    """Issue #43: MSVC 14.51's constexpr <cmath> vs TheRock 7.14.1's HIP headers - setup applies LLVM 01d3932."""
+    HEAD = ("#if !defined(__HIPCC_RTC__)\r\n#include <cmath>\r\n#include <cstdlib>\r\n#endif\r\n"
+            "#if defined(__HIPCC_RTC__)\r\n#include <__clang_hip_cmath.h>\r\n#else\r\n"
+            "#include <__clang_cuda_math_forward_declares.h>\r\n#include <__clang_hip_cmath.h>\r\n#endif\r\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.vcvars = root / "VS/VC/Auxiliary/Build/vcvars64.bat"
+        self.vcvars.parent.mkdir(parents=True)
+        self.vcvars.touch()
+        (self.vcvars.parent / "Microsoft.VCToolsVersion.default.txt").write_text("14.51.36231\n")
+        self.clang = root / "_rocm_sdk_devel/lib/llvm/bin/clang++.exe"
+        self.clang.parent.mkdir(parents=True)
+        self.clang.touch()
+        inc = root / "_rocm_sdk_devel/lib/llvm/lib/clang/23/include"
+        inc.mkdir(parents=True)
+        self.h = inc / "__clang_hip_runtime_wrapper.h"
+        self.h.write_bytes(self.HEAD.encode())
+        ctx = patch.object(maya.S, "find_vcvars", return_value=self.vcvars)
+        ctx.start()
+        self.addCleanup(ctx.stop)
+
+    def test_moves_the_declarations_once_with_a_backup(self):
+        maya.hip_cmath_order(self.clang)
+        text = self.h.read_bytes().decode()
+        self.assertLess(text.index("forward_declares.h>"), text.index("#include <cmath>"))
+        self.assertEqual(text.count("forward_declares.h>"), 1)
+        self.assertNotRegex(text, "[^\r]\n")                            # CRLF kept
+        self.assertEqual((self.h.parent / (self.h.name + ".abyss-orig")).read_bytes(), self.HEAD.encode())
+        maya.hip_cmath_order(self.clang)                                    # idempotent
+        self.assertEqual(self.h.read_bytes().decode(), text)
+
+    def test_older_msvc_check_and_opt_out_leave_it(self):
+        for vc, env, check in (("14.44.35207", {}, False), ("14.51.36231", {"ABYSS_NO_ROCM_HEADER_FIX": "1"}, False),
+                               ("14.51.36231", {}, True)):
+            (self.vcvars.parent / "Microsoft.VCToolsVersion.default.txt").write_text(vc)
+            with patch.dict(os.environ, env):
+                maya.hip_cmath_order(self.clang, check=check)
+            self.assertEqual(self.h.read_bytes(), self.HEAD.encode())
+            self.assertFalse((self.h.parent / (self.h.name + ".abyss-orig")).exists())
+        self.assertEqual(maya.msvc_version(self.vcvars), (14, 51))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -610,6 +610,64 @@ def hip_new_enough(hipcc: str) -> None:
          f"found {have}. {why}", fix + " - ABYSS_OLD_ROCM=1 builds with it anyway")
 
 
+def msvc_version(vcvars) -> tuple:
+    """The MSVC toolset Visual Studio's vcvars64.bat sets up (its Microsoft.VCToolsVersion*.default.txt, else the newest
+    VC/Tools/MSVC folder), as (major, minor); (0, 0) when unknown."""
+    if not vcvars:
+        return (0, 0)
+    build = Path(vcvars).parent                      # <VS>/VC/Auxiliary/Build
+    names = [f.read_text(errors="replace").strip() for f in sorted(build.glob("Microsoft.VCToolsVersion*.default.txt"))]
+    names = names or [p.name for p in (build.parents[1] / "Tools" / "MSVC").glob("14.*")]
+    found = [tuple(int(x) for x in m.groups()) for m in (re.match(r"(\d+)\.(\d+)", n) for n in names) if m]
+    return max(found, default=(0, 0))
+
+
+HIP_CMATH_FWD = re.compile(r"^[ \t]*#include <__clang_cuda_math_forward_declares\.h>[ \t]*\r?\n", re.M)
+HIP_CMATH_MARK = "// Abyss (issue #43): LLVM 01d3932 - the __device__ declarations come before <cmath>"
+
+
+def hip_cmath_order(clang, check=False) -> None:
+    """Windows: MSVC 14.51's <cmath> (STL update 202604) makes isgreater .. isunordered, isnormal and signbit constexpr,
+    which HIP takes as __host__ __device__, and the HIP headers of TheRock's ROCm 7.14.1 then fail to declare their
+    __device__ versions ("'isgreater' cannot overload", issues #2, #3, #43).  LLVM fixed it by including
+    __clang_cuda_math_forward_declares.h before <cmath> in __clang_hip_runtime_wrapper.h (llvm-project 01d3932,
+    2026-06-09; in ROCm 10.1, not 7.14.1): setup makes the same one-line move in the compiler's own copy, once, with
+    a backup (<name>.abyss-orig); --check only says so.  ABYSS_NO_ROCM_HEADER_FIX=1 leaves the SDK as it is."""
+    v = msvc_version(S.find_vcvars(cuda=False))
+    if (0, 0) < v < (14, 50) or clang is None:
+        return
+    for h in sorted(Path(clang).parent.parent.glob("lib/clang/*/include/__clang_hip_runtime_wrapper.h")):
+        try:
+            text = h.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        fwd, cmath = HIP_CMATH_FWD.search(text), text.find("#include <cmath>")
+        if fwd is None or cmath < 0 or fwd.start() < cmath:          # LLVM's fixed order (or an unknown header)
+            continue
+        msvc = f"MSVC {v[0]}.{v[1]}" if v != (0, 0) else "Visual Studio's MSVC"
+        if check or os.environ.get("ABYSS_NO_ROCM_HEADER_FIX") == "1":
+            warn(f"{h} includes <cmath> before the __device__ math declarations: with {msvc} the HIP build can stop "
+                 "at \"'isgreater' cannot overload\" (issue #43) - " + ("setup moves them (LLVM's fix)" if check else
+                 "left as it is (ABYSS_NO_ROCM_HEADER_FIX=1)"))
+            continue
+        nl = "\r\n" if "\r\n" in text else "\n"
+        moved = HIP_CMATH_FWD.sub("", text, count=1)
+        at = moved.find("#include <cmath>")
+        moved = moved[:at] + HIP_CMATH_MARK + nl + fwd.group(0).strip() + nl + moved[at:]
+        backup = h.with_name(h.name + ".abyss-orig")
+        try:
+            if not backup.exists():
+                shutil.copy2(h, backup)
+            h.write_bytes(moved.encode("utf-8"))
+        except OSError as e:
+            fail(f"cannot update {h} ({e}): with {msvc} ROCm's HIP headers stop the build at \"'isgreater' cannot "
+                 "overload\" (issue #43)", "move the line '#include <__clang_cuda_math_forward_declares.h>' to just "
+                 "above the first '#include <cmath>' in that file (LLVM's fix, llvm-project 01d3932), or set "
+                 "ABYSS_NO_ROCM_HEADER_FIX=1 to try without it")
+        ok(f"ROCm's HIP headers: the __device__ math declarations now come before {msvc}'s <cmath> (LLVM's fix for "
+           f"\"'isgreater' cannot overload\", issue #43); the original is {backup.name}")
+
+
 def rocm_pip(archs) -> list:
     """pip's command that puts AMD's ROCm SDK for these GPUs into this Python (.venv): the compiler, the libraries and
     their kernels for each architecture."""
@@ -704,6 +762,7 @@ def check_hip_pc(a, installed=False) -> dict:
         hipcc = next((p for p in (bindir / "hipcc.exe", root / "bin" / "hipcc.exe") if p.exists()), None)
         if hipcc is not None:
             hip_new_enough(str(hipcc))
+        hip_cmath_order(hip_clang(root), check=getattr(a, "check", False))
     else:
         root, found = linux_rocm_root()
         if not found:

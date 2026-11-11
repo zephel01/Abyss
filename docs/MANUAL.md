@@ -526,7 +526,10 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
   in `/opt/rocm` (or `/opt/rocm/core-10.0`). It needs HIP 7.14 or newer and stops on ROCm 7.0-7.2, which fail with
   current drivers (issues #1 and #8; `ABYSS_OLD_ROCM=1` builds with one anyway). The engine is built in
   `build-hip/strata`, and the config gets `"backend": "hip"`. After switching to another ROCm, run it again (with
-  `ROCM_PATH`): it builds the engine from scratch for that ROCm (v1.3.44).
+  `ROCM_PATH`): it builds the engine from scratch for that ROCm (v1.3.44). On Windows with Visual Studio's MSVC 14.50
+  or newer, setup moves one include line in the ROCm SDK's `__clang_hip_runtime_wrapper.h` (LLVM's fix for
+  "'isgreater' cannot overload", issue #43; the original is kept as `.abyss-orig`); `ABYSS_NO_ROCM_HEADER_FIX=1`
+  leaves the SDK as it is.
 - **Driver and ROCm:** [docs/amd/README.md](amd/README.md) has the install steps (amdgpu, ROCm 10's per-architecture
   packages - an R9700 needs `amdrocm10.0-gfx1201` - and why `HSA_OVERRIDE_GFX_VERSION` must not be set), a check
   list, and troubleshooting.

@@ -508,7 +508,10 @@ Radeon 8060S（gfx1151）。
   `/opt/rocm`（または `/opt/rocm/core-10.0`）の ROCm 10 を使う。HIP 7.14 以降が要り、ROCm 7.0〜7.2 では止まる。この
   2 つはいまのドライバと組み合わせると失敗するため（issue #1、#8。`ABYSS_OLD_ROCM=1` でそれでもビルドできる）。
   エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。別の ROCm に切り替えたら、
-  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。
+  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。Windows で
+  Visual Studio の MSVC が 14.50 以降なら、セットアップが ROCm SDK の `__clang_hip_runtime_wrapper.h` の include を
+  1 行移す（「'isgreater' cannot overload」への LLVM の修正。issue #43。元は `.abyss-orig` として残る）。
+  `ABYSS_NO_ROCM_HEADER_FIX=1` で SDK に手を付けない。
 - **ドライバと ROCm:** 入れ方は [docs/amd/README.ja.md](amd/README.ja.md) にまとめた（amdgpu、ROCm 10 の
   アーキテクチャ別のパッケージ、`HSA_OVERRIDE_GFX_VERSION` を設定してはいけない理由）。動作確認とトラブル対応も
   そこにある。R9700 では `amdrocm10.0-gfx1201` が要る。
