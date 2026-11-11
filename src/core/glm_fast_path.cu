@@ -1635,9 +1635,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                     // to 0.95; a unified-memory APU has no cap unless one is set)
                     const double frac = strata::core::env_num("STRATA_GLM_RAM_FRAC", F->unified_memory ? 1.0 : 0.73,
                                                               0.05, F->unified_memory ? 1.0 : 0.95);
-                    // a discrete card: the larger of that share and MemTotal less STRATA_GLM_RAM_KEEP_GB (24) - the
-                    // room the page cache, the server and the desktop need does not grow with the RAM
-                    // (glm_memory.hpp ram_tier_cap).  An explicit STRATA_GLM_RAM_FRAC alone keeps the share alone.
+                    // a discrete card with 100 GiB of RAM or more: the larger of that share and MemTotal less
+                    // STRATA_GLM_RAM_KEEP_GB (24) - the room the page cache, the server and the desktop need does not
+                    // grow with the RAM (glm_memory.hpp ram_tier_cap); smaller machines keep the share alone unless
+                    // STRATA_GLM_RAM_KEEP_GB is set.  An explicit STRATA_GLM_RAM_FRAC alone keeps the share alone.
                     // The keep is fixed, not grown per model: what this process pins or allocates before the tier
                     // (dense weights, KV for --max-context, prompt buffers) is already out of MemAvailable, the
                     // bound above; what pins after it (the disk staging, a later part's prompt path) is subtracted
@@ -1648,7 +1649,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                     const double keep_gb = strata::core::env_num("STRATA_GLM_RAM_KEEP_GB", 24.0, 0.0, 4096.0);
                     const int64_t mt = mem_total();
                     bool by_keep = false;
-                    const int64_t cap = frac < 1.0 ? glmfast::ram_tier_cap(mt, frac, keep_gb, use_keep, &by_keep) : 0;
+                    const int64_t keep_min = getenv("STRATA_GLM_RAM_KEEP_GB") != nullptr ? 0 : glmfast::kRamKeepMinTotal;
+                    const int64_t cap = frac < 1.0 ? glmfast::ram_tier_cap(mt, frac, keep_gb, use_keep, &by_keep, keep_min) : 0;
                     const int64_t before = total;
                     if (cap > 0) total = std::min<int64_t>(total, std::max<int64_t>(0, cap - stage_b));
                     const double G = 1073741824.0;
@@ -1660,7 +1662,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                         else
                             std::snprintf(tier_why, sizeof tier_why, "capped at %.0f%% of %.1f GB RAM (STRATA_GLM_RAM_FRAC%s)",
                                           frac * 100.0, (double) mt / G,
-                                          use_keep ? "; the RAM less STRATA_GLM_RAM_KEEP_GB is smaller" : "");
+                                          !use_keep ? "" : mt < keep_min ? "; the keep applies from 100 GiB of RAM"
+                                                               : "; the RAM less STRATA_GLM_RAM_KEEP_GB is smaller");
                     } else if (cap > 0) {
                         std::snprintf(tier_why, sizeof tier_why, "MemAvailable %.1f GB less %.1f GB headroom "
                                       "(STRATA_GLM_RAM_HEADROOM_GB) and %.1f GB staging, below the cap of %.1f GB",

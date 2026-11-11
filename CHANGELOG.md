@@ -42,15 +42,16 @@ Four findings from LarsDrakblod's RTX 4090 field report (#39) - thank you:
   names the CUDA error with a hint (Xid in the kernel log, reboot, reseat an external link), instead of "the warmed
   expert tables did not upload" (an RTX 5090 on OCuLink fell off the bus there on 2026-11-10).
 
-- **A bigger automatic RAM tier on machines with more than ~89 GB of RAM** (Linux, a discrete GPU, no
+- **A bigger automatic RAM tier on machines with 100 GiB of RAM or more** (Linux, a discrete GPU, no
   `STRATA_GLM_RAM_GB`). The cap was 73% of the RAM (`STRATA_GLM_RAM_FRAC`), set on a 94 GB machine where pinning
-  more thrashed; the room the page cache, the server and the desktop need does not grow with the RAM, so a 123 GB
-  machine left 34 GB unpinned (88.7 GB tier). The cap is now the larger of 73% and the RAM less 24 GB
-  (`STRATA_GLM_RAM_KEEP_GB`): about 98 GB there, still below the free RAM less `STRATA_GLM_RAM_HEADROOM_GB`. DeepSeek
-  V4.1 UD-IQ2_XXS on an RTX 5090 decoded 30.2 tok/s at 88.7 GB and 35.8 at 100 GB (`STRATA_GLM_RAM_GB=100`; the new
-  default still to be measured). 64 and 96 GB machines: unchanged or within ~1 GB. `STRATA_GLM_RAM_FRAC` set on its
-  own keeps the old cap; unified memory (DGX Spark, APUs) and Windows are unchanged. The `RAM tier ... pinned` log
-  line now says how its budget was set.
+  more thrashed; the room the page cache, the server and the desktop need does not grow with the RAM, so a 123.5 GiB
+  machine left 34 GB unpinned (88.7 GB tier). From 100 GiB of RAM the cap is now the larger of 73% and the RAM less
+  24 GB (`STRATA_GLM_RAM_KEEP_GB`): 99.5 GB there (227 GB on a 251 GiB machine), still below the free RAM less
+  `STRATA_GLM_RAM_HEADROOM_GB`. DeepSeek V4.1 UD-IQ2_XXS on an RTX 5090 (iGPU off): 30.2 -> 34.5 tok/s. 64 and 96 GB
+  machines keep the 73% cap byte for byte (45.6 / 68.6 GB on 62.5 / 94 GiB); setting `STRATA_GLM_RAM_KEEP_GB` uses the
+  keep there too. If other programs grow by more than ~8 GB after the engine starts, set `STRATA_GLM_RAM_KEEP_GB=32`.
+  `STRATA_GLM_RAM_FRAC` set on its own keeps the old cap; unified memory (DGX Spark, APUs) and Windows are unchanged.
+  The `RAM tier ... pinned` log line now says how its budget was set.
 
 ## v1.3.129 - 2026-11-10
 

@@ -3,6 +3,7 @@
 
 #undef NDEBUG   // the checks are asserts: keep them in Release builds
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 
 int main() {
@@ -84,23 +85,35 @@ int main() {
         assert(!uma_others_block(second, false));    // a second engine but the experts still fit: runs
         assert(uma_others_gb(0, 0, 0) == 0.0 && uma_others_gb(T, 0, 0) == 0.0);   // MemAvailable unknown: never stops
     }
-    // The discrete-card RAM tier cap: the larger of MemTotal x STRATA_GLM_RAM_FRAC and MemTotal less the keep.
+    // The discrete-card RAM tier cap: the larger of MemTotal x STRATA_GLM_RAM_FRAC and MemTotal less the keep, the
+    // keep only from 100 GiB of RAM (unless STRATA_GLM_RAM_KEEP_GB is set: keep_min_total 0).
     {
         using strata::core::glmfast::ram_tier_cap;
         const int64_t g = int64_t{1} << 30;
+        const auto gib = [&](double x) { return (int64_t) (x * (double) g); };
+        const auto near = [&](int64_t v, double want) { return std::fabs((double) v / (double) g - want) < 0.051; };
         bool k = true;
-        // 123.5 GiB box: 0.73 -> 90.2 GiB; less 24 GiB -> 99.5 GiB wins
+        // the four RAM sizes: 64 / 96 GB boxes keep 73% byte for byte, 128 / 256 GB boxes keep 24 GB
+        assert(ram_tier_cap(gib(62.5), 0.73, 24.0, true, &k) == (int64_t) ((double) gib(62.5) * 0.73) && !k);
+        assert(near(ram_tier_cap(gib(62.5), 0.73, 24.0, true, &k), 45.6));
+        assert(ram_tier_cap(gib(94), 0.73, 24.0, true, &k) == (int64_t) ((double) gib(94) * 0.73) && !k);
+        assert(near(ram_tier_cap(gib(94), 0.73, 24.0, true, &k), 68.6));
+        assert(ram_tier_cap(gib(123.5), 0.73, 24.0, true, &k) == gib(123.5) - 24 * g && k);
+        assert(near(ram_tier_cap(gib(123.5), 0.73, 24.0, true, &k), 99.5));
+        assert(ram_tier_cap(gib(251), 0.73, 24.0, true, &k) == 227 * g && k);
+        // this box's MemTotal (123.5 GiB)
         const int64_t box = 129458420LL * 1024;
         assert(ram_tier_cap(box, 0.73, 24.0, true, &k) == box - 24 * g && k);
         // an explicit STRATA_GLM_RAM_FRAC alone: the share, as before
         assert(ram_tier_cap(box, 0.73, 24.0, false, &k) == (int64_t) ((double) box * 0.73) && !k);
-        // 64 GiB: the share (46.7) is larger than 64 - 24
-        assert(ram_tier_cap(64 * g, 0.73, 24.0, true, &k) == (int64_t) (64.0 * 0.73 * (double) g) && !k);
-        // the crossover sits at 24 / 0.27 = 88.9 GiB
-        assert(!(ram_tier_cap(88 * g, 0.73, 24.0, true, &k) > 0 && k));
-        assert(ram_tier_cap(90 * g, 0.73, 24.0, true, &k) == 66 * g && k);
+        // the threshold: just below 100 GiB the share, at 100 GiB the keep (76 > 73)
+        assert(ram_tier_cap(100 * g - 1, 0.73, 24.0, true, &k) == (int64_t) ((double) (100 * g - 1) * 0.73) && !k);
+        assert(ram_tier_cap(100 * g, 0.73, 24.0, true, &k) == 76 * g && k);
+        // STRATA_GLM_RAM_KEEP_GB set: the keep at any size (94 GiB less 24 = 70 > 68.6)
+        assert(ram_tier_cap(gib(94), 0.73, 24.0, true, &k, 0) == 70 * g && k);
+        assert(!(ram_tier_cap(88 * g, 0.73, 24.0, true, &k, 0) > 0 && k));   // the crossover sits at 24 / 0.27 = 88.9 GiB
         // a keep larger than the RAM leaves the share; MemTotal unknown: no cap
-        assert(ram_tier_cap(32 * g, 0.73, 64.0, true, &k) == (int64_t) (32.0 * 0.73 * (double) g) && !k);
+        assert(ram_tier_cap(32 * g, 0.73, 64.0, true, &k, 0) == (int64_t) (32.0 * 0.73 * (double) g) && !k);
         assert(ram_tier_cap(0, 0.73, 24.0, true, &k) == 0 && !k);
     }
     std::puts("GLM memory policy checks passed (CPU only)");
