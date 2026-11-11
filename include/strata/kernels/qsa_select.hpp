@@ -36,6 +36,10 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream);
+/// The register kernel with the digit search chosen: par = 256 threads (a suffix scan), false = thread 0's walk (the
+/// v1.3.130 kernel). The same ids (qsa_topk_parity).
+void qsa_block_topk_variant(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                            const QsaShapes& s, int32_t* ids, void* stream, bool par);
 /// The original kernel (keys read from memory on every radix pass), for tests: the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);

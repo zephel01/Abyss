@@ -1776,6 +1776,29 @@ bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, co
     check("attn_decode_rows");
     return true;
 }
+__global__ void copy_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+void copy_f32(float* dst, const float* src, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    copy_f32_kernel<<<(n + 255) / 256, 256, 0, s>>>(dst, src, n);
+    check("copy_f32");
+}
+__global__ void q4_step_set_kernel(int32_t* step, int32_t* pos, int s0, int s1, int s2, int s3, int p) {
+    const int t = threadIdx.x;
+    pos[t] = p;
+    if (t == 0) {
+        step[0] = s0;
+        step[1] = s1;
+        step[2] = s2;
+        step[3] = s3;
+    }
+}
+void q4_step_set(int32_t* step, int32_t* pos, int s0, int s1, int s2, int s3, int p, cudaStream_t s) {
+    q4_step_set_kernel<<<1, 64, 0, s>>>(step, pos, s0, s1, s2, s3, p);
+    check("q4_step_set");
+}
 void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s) {
     if (head_dim != kD) return;
     pdl_launch(attn_gate_kernel, n_head, kD, 0, s, o, q_full, n_head);

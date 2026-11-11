@@ -46,5 +46,8 @@ void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, floa
 // first token's value forever.  See the same note on `indexer_key_append` in `qsa.hpp`.
 void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
                      const float* sin_tab, const int* pos, void* stream);
+/// rope_neox_apply with a thread a pair (and a tail element) instead of a thread a row: the same bits; in place OK.
+void rope_neox_apply_pairs(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
+                           const float* sin_tab, const int* pos, void* stream);
 
 }  // namespace strata::kernels

@@ -945,8 +945,21 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         if (F->q4_step_at != p64) {   // the step record and the rows' positions, once a token
             k::qsa_step_fill(F->q4_step_h, p64, sh);
             for (int h = 0; h < 64; ++h) F->q4_pos_h[h] = p;
-            cudaMemcpyAsync(F->q4_step, F->q4_step_h, k::qsa_step_bytes(), cudaMemcpyHostToDevice, s);
-            cudaMemcpyAsync(F->q4_pos, F->q4_pos_h, 256, cudaMemcpyHostToDevice, s);
+            // STRATA_Q4X_STEP_KERNEL (CUDA default on, HIP off): a tiny kernel writes them (the values by argument) -
+            // the two copies waited ~20 us a token behind the background expert copies on the copy engine
+#if defined(STRATA_USE_HIP)
+            static const bool sk = [] { const char* v = getenv("STRATA_Q4X_STEP_KERNEL"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+            static const bool sk = [] { const char* v = getenv("STRATA_Q4X_STEP_KERNEL"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+            static_assert(k::kStepCount == 4, "q4_step_set writes 4 ints");
+            if (sk) {
+                const int32_t* hs = F->q4_step_h;
+                q35::q4_step_set(F->q4_step, F->q4_pos, hs[0], hs[1], hs[2], hs[3], p, s);
+            } else {
+                cudaMemcpyAsync(F->q4_step, F->q4_step_h, k::qsa_step_bytes(), cudaMemcpyHostToDevice, s);
+                cudaMemcpyAsync(F->q4_pos, F->q4_pos_h, 256, cudaMemcpyHostToDevice, s);
+            }
             F->q4_step_at = p64;
         }
         const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
@@ -956,8 +969,14 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         width = dense ? p + 1 : (int) k::qsa_selection_width(p64 + 1, sh);
         if (width < p + 1) {   // past 2,051 cells: the indexer's selection, gathered
             k::rms_norm_weighted(F->q4_iq, Ly.q4_iqn, g.idx_heads, g.idx_key, g.norm_eps, (void*) s);
-            k::rope_neox_apply(F->q4_iq, F->q4_iq, g.idx_heads, g.idx_key, g.n_rot, F->q4_cos, F->q4_sin, F->q4_pos,
-                               (void*) s);
+            // STRATA_Q4X_ROPE_PAIRS (CUDA default on): a thread a pair, not a thread a row (the same bits, ~4.5 us a layer)
+#if defined(STRATA_USE_HIP)
+            static const bool rp = [] { const char* v = getenv("STRATA_Q4X_ROPE_PAIRS"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+            static const bool rp = [] { const char* v = getenv("STRATA_Q4X_ROPE_PAIRS"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+            (rp ? k::rope_neox_apply_pairs : k::rope_neox_apply)(F->q4_iq, F->q4_iq, g.idx_heads, g.idx_key, g.n_rot,
+                                                                 F->q4_cos, F->q4_sin, F->q4_pos, (void*) s);
             k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, F->q4_iq, F->q4_step, 1, F->q4_max_blocks, sh, F->q4_scores,
                                 (void*) s);
             k::qsa_block_topk(F->q4_scores, F->q4_step, 1, F->q4_max_blocks, F->q4_cap, sh, F->q4_ids, (void*) s);

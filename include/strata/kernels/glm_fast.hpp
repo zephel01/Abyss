@@ -478,5 +478,10 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 
 /// argmax over n floats -> *out (device int).  Ties: lowest index.
 void argmax(const float* x, int n, int* out, cudaStream_t s);
+/// argmax's index from 128 blocks (the last one to finish picks): the same index (a total order: the largest value, the
+/// lowest index among equal ones). scratch: argmax_mb_scratch_bytes() of device memory, zeroed once, one stream at a
+/// time; null, a misaligned x or a short n: argmax.
+void argmax_mb(const float* x, int n, int* out, void* scratch, cudaStream_t s);
+size_t argmax_mb_scratch_bytes();
 
 }  // namespace strata::kernels::glmf

@@ -42,6 +42,11 @@ size_t attn_rows_part_floats(int rows, int n_head, int head_dim, int max_ids);
 bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* ids, int ld_ids,
                       const int32_t* steps, int rows, int max_ids, int n_head, int n_head_kv, int head_dim, float scale,
                       float* part, float* out, cudaStream_t s, int hpw = 0);
+/// dst[i] = src[i] by a kernel (src may be mapped host memory: no copy engine).
+void copy_f32(float* dst, const float* src, int n, cudaStream_t s);
+/// The token's QSA step record (4 ints) and the 64 rope positions written by a kernel (the values by argument), not
+/// two H2D copies that queue behind the background expert copies on the copy engine; the same values.
+void q4_step_set(int32_t* step, int32_t* pos, int s0, int s1, int s2, int s3, int p, cudaStream_t s);
 /// o[h][d] *= sigmoid(q_full[h][head_dim + d]) (the q projection's gate half), in place.
 void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s);
 /// x[i] *= sigmoid(g[0]), i < n (the shared expert's gate).
