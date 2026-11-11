@@ -616,14 +616,16 @@ __device__ __forceinline__ float mid_row_dot_bf16(const uint16_t* row, const flo
     }
     return warp_sum(s);
 }
-__device__ __forceinline__ float mid_conv(const float* st, const float* w, float x, int dc) {   // (conv_silu_step's)
+__device__ __forceinline__ float mid_conv4(float s0, float s1, float s2, float x, float4 w) {   // (conv_silu_step's, d_conv 4)
     float acc = 0.0f;
-    for (int i = 0; i < dc - 1; ++i) acc += st[i] * w[i];
-    acc += x * w[dc - 1];
+    acc += s0 * w.x;
+    acc += s1 * w.y;
+    acc += s2 * w.z;
+    acc += x * w.w;
     return acc * sigmoid_f(acc);
 }
 template <int S>
-__global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, float* __restrict__ cs,
+__global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, float* cs,
                                                     const float* __restrict__ qkv, const float* __restrict__ kW, int dc,
                                                     const float* __restrict__ xf, const void* __restrict__ wa,
                                                     const void* __restrict__ wb, bool ab_bf16, int n_in, int h_k, int h_v,
@@ -672,6 +674,36 @@ __global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, f
         }
         __pipeline_commit();
     }
+    // meanwhile the small inputs into registers (one round trip): this thread's q, k (the k head's) and v (the v
+    // head's) channels - the input, the old conv state, the taps (d_conv 4) - and the gates' and the norm's numbers
+    const int cq = src * S + j, ck = (h_k + src) * S + j, cv = (2 * h_k + hv) * S + j;
+    float* sq = cs + (size_t) cq * 3;
+    float* sk = cs + (size_t) ck * 3;
+    float* sv = cs + (size_t) cv * 3;
+    const float xq = qkv[cq], xk = qkv[ck], xv = qkv[cv];
+    // (the k head's q / k state through volatile loads: rank 0 overwrites it after the cluster barrier, so these reads
+    // must not be moved past it)
+    const volatile float* vq = sq;
+    const volatile float* vk = sk;
+    const float q0 = vq[0], q1 = vq[1], q2 = vq[2], k0 = vk[0], k1 = vk[1], k2 = vk[2], v0 = sv[0], v1 = sv[1], v2 = sv[2];
+    const float4 wq = *(const float4*) (kW + (size_t) cq * 4), wk = *(const float4*) (kW + (size_t) ck * 4),
+                 wv = *(const float4*) (kW + (size_t) cv * 4);
+    const size_t at = (size_t) hv * S + j;
+    const float zt = z[at], nrm = ssm_norm[j], dth = dt[hv], Ah = A[hv];
+    // the conv + SiLU (conv_silu_step_kernel's sum: kernel[0] on the oldest state row, the input on the last tap)
+    float qv = mid_conv4(q0, q1, q2, xq, wq);
+    float kv = mid_conv4(k0, k1, k2, xk, wk);
+    const float v = mid_conv4(v0, v1, v2, xv, wv);
+    if (h_out != nullptr) {
+        h_out[cv] = v;
+        if (rank == 0) {
+            h_out[cq] = qv;
+            h_out[ck] = kv;
+        }
+    }
+    sv[0] = v1;   // (slide: drop the oldest, append the newest - the v channels are this block's alone)
+    sv[1] = v2;
+    sv[2] = xv;
     __pipeline_wait_prior(0);
     __syncthreads();
     if (warp < 2) {
@@ -684,32 +716,14 @@ __global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, f
             if (ab_out != nullptr) ab_out[warp * h_v + hv] = yv;
         }
     }
-    // the conv + SiLU of this thread's q, k (the k head's) and v (the v head's) channels, from the old state
-    const int cq = src * S + j, ck = (h_k + src) * S + j, cv = (2 * h_k + hv) * S + j;
-    float* sq = cs + (size_t) cq * (dc - 1);
-    float* sk = cs + (size_t) ck * (dc - 1);
-    float* sv = cs + (size_t) cv * (dc - 1);
-    const float xq = qkv[cq], xk = qkv[ck], xv = qkv[cv];
-    float qv = mid_conv(sq, kW + (size_t) cq * dc, xq, dc);
-    float kv = mid_conv(sk, kW + (size_t) ck * dc, xk, dc);
-    const float v = mid_conv(sv, kW + (size_t) cv * dc, xv, dc);
-    if (h_out != nullptr) {
-        h_out[cv] = v;
-        if (rank == 0) {
-            h_out[cq] = qv;
-            h_out[ck] = kv;
-        }
-    }
-    for (int i = 0; i < dc - 2; ++i) sv[i] = sv[i + 1];
-    sv[dc - 2] = xv;
     cl.sync();   // (every block of the cluster has read the k head's old q / k state - and s_ab is visible)
     if (rank == 0) {
-        for (int i = 0; i < dc - 2; ++i) {
-            sq[i] = sq[i + 1];
-            sk[i] = sk[i + 1];
-        }
-        sq[dc - 2] = xq;
-        sk[dc - 2] = xk;
+        sq[0] = q1;
+        sq[1] = q2;
+        sq[2] = xq;
+        sk[0] = k1;
+        sk[1] = k2;
+        sk[2] = xk;
     }
     float g = s_ab[0], b = s_ab[1];
     {   // (gdn_core_kernel's prep)
@@ -728,7 +742,7 @@ __global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, f
         const double sk2 = sh[1][0] + sh[1][1] + sh[1][2] + sh[1][3];
         qv = qv * ((float) (1.0 / sqrt(sq2 + (double) eps)) * qscale);
         kv = kv * ((float) (1.0 / sqrt(sk2 + (double) eps)) * 1.0f);
-        g = softplus_f(g + dt[hv]) * A[hv];
+        g = softplus_f(g + dth) * Ah;
         b = sigmoid_f(b);
     }
     qs[j] = qv;
@@ -760,8 +774,7 @@ __global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, f
         if (j == 0) s_inv = (float) (1.0 / sqrt(acc / (double) S + (double) out_eps));
     }
     __syncthreads();
-    const size_t at = (size_t) hv * S + j;
-    const float yv = os[j] * s_inv * ssm_norm[j] * sigmoid_f(z[at]);
+    const float yv = os[j] * s_inv * nrm * sigmoid_f(zt);
     y[at] = yv;
     if (yq != nullptr) q81_store_warp(yv, yq + at / 32, j & 31);
 #endif
@@ -2061,7 +2074,7 @@ bool gdn_mid_ok(int S, int h_k, int h_v, int d_conv, int n_in) {
     (void) S; (void) h_k; (void) h_v; (void) d_conv; (void) n_in;
     return false;
 #else
-    if (S != 128 || h_k <= 0 || h_v % h_k != 0 || h_v / h_k > 8 || d_conv < 2 || d_conv > 9 || n_in % 8 != 0) return false;
+    if (S != 128 || h_k <= 0 || h_v % h_k != 0 || h_v / h_k > 8 || d_conv != 4 || n_in % 8 != 0) return false;
     static int cc = -1, smem_max = 0;
     if (cc < 0) {
         int dev = 0, major = 0;
