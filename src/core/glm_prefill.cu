@@ -868,7 +868,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // (unified memory: fast_setup prices the pool from MemAvailable - CUDA's free leaves out the page cache, which a
     // GB10's cudaMalloc reclaims; the same figure here)
     if (F->unified_memory) dev_free = std::max(dev_free, glmfast::uma_room_now());
-    size_t avail = pool_avail(dev_free, dev_total);
+    size_t avail = pool_avail(dev_free, dev_total, g_.q4x);
     // (unified memory with STRATA_GLM_VRAM_GB: the cap counts what this process holds, as fast_setup does - the
     // device's total - free counts the page cache and every other process, and left a GB10 at 16 GB no pool here:
     // its prompts then ran token by token, 3.8K tokens in 129 s)

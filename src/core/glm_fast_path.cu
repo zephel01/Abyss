@@ -452,13 +452,18 @@ namespace glmfast {
 // objects and take ~0.7 GB more (an R9700 at --max-context 131072 had 0.6 GB left: every prompt GEMM failed to load
 // and fell back, an 8K prompt 1,300 s).  CUDA too from v1.3.82 on cards over 12 GB: an RTX 5090 running DeepSeek V4.1
 // at --max-context 65536 ran out in the attention's and the DSpark drafter's MMQ buffers with 700 kept.  A card of
-// 12 GB or less (or STRATA_GLM_VRAM_GB of that) keeps ~700 MB: its pool is a few slots a layer (issue #23)
+// 12 GB or less (or STRATA_GLM_VRAM_GB of that) keeps ~700 MB: its pool is a few slots a layer (issue #23).
+// Qwen3.8 (q4x) on CUDA keeps 700 MB on every card: no DSpark, and its prompt borrows from the pool; an RTX 5090 at
+// --max-context 40960 ran a 32K prompt + MTP decode with 700 kept, and the 432 more slots (12,667 -> 13,099) took a
+// 4K + 512 decode 113.9 -> 121.1 tok/s without the drafter, 167.7 -> 175.7 with MTP (2026-11-11, bench/parity)
 constexpr int kVramReserveMb = 1536;
-inline int default_reserve_mb(size_t total_b) {
+inline int default_reserve_mb(size_t total_b, bool q4x = false) {
 #if defined(STRATA_USE_HIP)
     (void) total_b;
+    (void) q4x;
     return kVramReserveMb;
 #else
+    if (q4x) return 700;
     const double cap = strata::core::env_num("STRATA_GLM_VRAM_GB", 0.0, 0.0, 65536.0) * 1073741824.0;
     const double card = cap > 0.0 && cap < (double) total_b ? cap : (double) total_b;
     return card > 12.5 * 1073741824.0 ? kVramReserveMb : 700;
@@ -1142,7 +1147,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
         // headroom: the context's own growth is already allocated (state arena); see default_reserve_mb
-        const size_t reserve = glmfast::vram_reserve_bytes(F->unified_memory ? 1024 : glmfast::default_reserve_mb(total_b));
+        const size_t reserve = glmfast::vram_reserve_bytes(F->unified_memory ? 1024 : glmfast::default_reserve_mb(total_b, g_.q4x));
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
         // what a pool holding every expert AND the prompt's lendable tail on top may take (below): a discrete card's
         // budget; unified memory's is capped at the experts' bytes, so its room is kept here
@@ -7112,8 +7117,8 @@ void Glm5Model::gap_report() {
 // counts everything this process already holds on the device, so the pool gets what such a card would have).  The
 // prompt path and the layer split search size from the same number, before the pool is carved (a discrete card's:
 // fast_setup prices a unified-memory APU's pool itself).
-size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
-    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b));
+size_t Glm5Model::pool_avail(size_t free_b, size_t total_b, bool q4x) {
+    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b, q4x));
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
     if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
     if (getenv("STRATA_GLM_VRAM_GB")) {   // (the split search's estimate, before the parts exist: the one cap)
@@ -7131,7 +7136,7 @@ size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
 size_t Glm5Model::pool_avail_uma(size_t free_b, size_t total_b) const {
     const FastState* F = fast_;
     const size_t cap = vram_cap();
-    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b));
+    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b, g_.q4x));
     const size_t used = (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_ + (F != nullptr ? F->arena_bytes : 0)) +
                         ((size_t) 1 << 30);
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);

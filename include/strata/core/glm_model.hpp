@@ -833,7 +833,7 @@ public:
         size_t staging = 0, hop = 0;
     };
     PinnedPrompt prefill_pinned() const;
-    static size_t pool_avail(size_t free_b, size_t total_b);   // the expert pool's bytes from the free VRAM
+    static size_t pool_avail(size_t free_b, size_t total_b, bool q4x = false);   // the expert pool's bytes from the free VRAM
     size_t pool_avail_uma(size_t free_b, size_t total_b) const;   // (unified memory + STRATA_GLM_VRAM_GB: as fast_setup)
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
