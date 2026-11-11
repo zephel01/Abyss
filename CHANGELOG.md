@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.130 - 2026-11-11
 
 Four findings from LarsDrakblod's RTX 4090 field report (#39) - thank you:
 
