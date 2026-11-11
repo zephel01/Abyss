@@ -661,19 +661,32 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::fprintf(stderr, "glm fast: background copies also after the route: %d KiB (kinds %d), after the answer %zu KiB (kinds %d)\n",
                      kb, mm & 3, F->bg_pace >> 10, am & 3);
     }
-    // STRATA_GLM_BG_LANE=<KiB per lane expert>:<KiB off>[:<kinds>[:<max KiB>]] (off by default): FastState::bg_lane_per.
-    // The drain after the answer then takes the other kinds only (unless STRATA_GLM_BG_IDLE says)
-    if (const char* bl = getenv("STRATA_GLM_BG_LANE")) {
+    // STRATA_GLM_BG_LANE=<KiB per lane expert>:<KiB off>[:<kinds>[:<max KiB>]] (FastState::bg_lane_per; 0 off).
+    // Default 512:128:1 (promotions only) for GLM-5.3 and DeepSeek V4 / V4.1 on CUDA, off elsewhere: an nsys trace
+    // of V4 0731 (RTX 5090, Gen4 x4, 4K + 256) had the link 96% idle from the route to the CPU lane's answer (~215 us
+    // a layer) while the paced 1 MiB after the answer filled its ~160 us window and spilled into the next route
+    // (+12 us).  The promotions crossing during the lane's own work: V4 0731 UD-Q2_K_XL 58.1 -> 61.4 tok/s (VRAM hits
+    // 72.5 -> 77%), GLM-5.3 Maya-S-v2 IQ2_XXS 46.0 -> 49.9 (62 -> 67%), bench/parity/results-idle.md.  More bytes
+    // (768 a lane expert, or 1 MiB after the route) raised the hits to 78% but were slower: the copy still crossed
+    // when the device read the answer; demotions there were worse (they hold up the route's fence and the answer)
+    {
+#if defined(STRATA_USE_HIP)
+        const char* bl_dflt = nullptr;
+#else
+        const char* bl_dflt = (g.arch == 0 || g.dsv4()) && !g.q4x ? "512:128:1" : nullptr;
+#endif
+        const char* bl = getenv("STRATA_GLM_BG_LANE");
+        if (bl == nullptr) bl = bl_dflt;
         int per = 0, off = 0, mk = 1, mx = 4096;
-        std::sscanf(bl, "%d:%d:%d:%d", &per, &off, &mk, &mx);
+        if (bl != nullptr) std::sscanf(bl, "%d:%d:%d:%d", &per, &off, &mk, &mx);
         F->bg_lane_per = (size_t) std::max(0, per) << 10;
         F->bg_lane_off = (size_t) std::max(0, off) << 10;
         F->bg_lane_mask = mk & 3;
         F->bg_lane_max = (size_t) std::max(0, mx) << 10;
-        if (getenv("STRATA_GLM_BG_IDLE") == nullptr) F->bg_attn_mask = 3 & ~F->bg_lane_mask;
-        std::fprintf(stderr, "glm fast: background copies from the CPU lane: %d KiB a lane expert - %d KiB (kinds %d, at "
-                             "most %d KiB); after the answer %zu KiB (kinds %d)\n", per, off, mk & 3, mx, F->bg_pace >> 10,
-                     F->bg_attn_mask);
+        if (F->bg_lane_per > 0)
+            std::fprintf(stderr, "glm fast: background copies from the CPU lane: %d KiB a lane expert - %d KiB (kinds %d, "
+                                 "at most %d KiB); after the answer %zu KiB (kinds %d)\n", per, off, mk & 3, mx,
+                         F->bg_pace >> 10, F->bg_attn_mask);
     }
     // RAM-resident mode (--glm-ram-resident / STRATA_GLM_RAM_RESIDENT=1): the RAM tier's per-class cap grows by
     // ram_slack slots per MoE layer so it holds EVERY expert VRAM does not; nothing is ever dropped to disk and the
