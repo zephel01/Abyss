@@ -830,10 +830,10 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     // qwen4exp on CUDA (sm_90+): alpha / beta, the conv + SiLU and gdn_core in ONE launch after the qkv / z GEMV
     // (q35::gdn_mid: the same arithmetic in the same order, the same bits - gdn_core_parity), which also pulls ssm_out's
-    // weights toward L2 while the recurrence runs.  STRATA_Q4X_GDN_MID=0: the launches below.  STRATA_Q4X_GDN_MID_PF=0:
-    // without the L2 pull.  HIP: never (the launches below)
+    // weights toward L2 while the recurrence runs if STRATA_Q4X_GDN_MID_PF=1 (off: UD 3.1 decode 120.5 with it, 122.7
+    // without - it competes with the state's reads).  STRATA_Q4X_GDN_MID=0: the launches below.  HIP: never
     static const bool mid_env = [] { const char* v = getenv("STRATA_Q4X_GDN_MID"); return v == nullptr || std::atoi(v) != 0; }();
-    static const bool mid_pf = [] { const char* v = getenv("STRATA_Q4X_GDN_MID_PF"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool mid_pf = [] { const char* v = getenv("STRATA_Q4X_GDN_MID_PF"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool gdn_fuse0 = [] { const char* v = getenv("STRATA_Q4X_GDN_FUSE"); return v == nullptr || std::atoi(v) != 0; }();
     const bool ab_typed = (Ly.alpha_w.type == gf::kTypeF32 || Ly.alpha_w.type == gf::kTypeBF16) &&
                           Ly.beta_w.type == Ly.alpha_w.type;
