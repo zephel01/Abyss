@@ -68,11 +68,15 @@ inline int hsum_i32(__m256i v) {
 // MSVC does not (as Q5_K's min term, iq_avx512.cpp); native_expert.cpp's check picks the form this build's ggml-cpu
 // took (this file is built without contraction)
 std::atomic<bool> iq1s_fused{true};
+// the lane's newer decodes (iq512v_set_lane_kernels; each env, when set, wins): IQ2_S by gathering grid qwords,
+// IQ3_XXS by byte planes, IQ4_NL in 512-bit lanes (else AVX2 / VNNI) - all the same bits as the older forms
+std::atomic<bool> iq2s_gather{false}, iq3xxs_planes{false}, iq4nl_512{false};
 
 alignas(64) uint16_t code2xxs[256];  // iq2xxs_grid as 2-bit codes, value v at bits 2v: 0 = 8, 1 = 25, 2 = 43
 alignas(64) uint16_t code2xs[512];   // iq2xs_grid, the same
 alignas(64) uint16_t code2s[1024];   // iq2s_grid, the same
 alignas(64) uint16_t code3xxs[256];  // iq3xxs_grid as 3-bit codes, value v at bits 3v: 4, 12, ..., 52, 62
+alignas(64) uint8_t plane3xxs[4][256];   // iq3xxs_grid's byte v of each entry (rows_iq3xxs_q81)
 alignas(64) uint8_t ksigns[128];     // ksigns_iq2xs: a 7-bit sign index with its parity as bit 7
 
 // an IQ2 grid's entries as codes (false: a byte that is not 8 / 25 / 43 - never in ggml's grids)
@@ -105,6 +109,7 @@ bool build_codes() {
             c = (uint16_t) (c | (k << (3 * v)));
         }
         code3xxs[e] = c;
+        for (int v = 0; v < 4; ++v) plane3xxs[v][e] = (uint8_t) (iq3xxs_grid[e] >> (8 * v));
     }
     std::memcpy(ksigns, ksigns_iq2xs, sizeof ksigns);
     return true;
@@ -267,8 +272,25 @@ template <> struct Dec<22> {   // IQ2_S: d, 32 grid index bytes, 32 sign bytes, 
         const __m512i hi = _mm512_and_si512(_mm512_multishift_epi64_epi8(hsh, _mm512_set1_epi64((long long) qh)), h3);
         const __m512i idx = _mm512_or_si512(_mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*) (b + 2))),
                                             _mm512_slli_epi16(hi, 8));
-        const __m512i codes = look1024(idx, T);
         std::memcpy(m, b + 34, 32);   // the sign bytes: chunk j's 64-bit mask at 8j
+        if (iq2s_gather.load(std::memory_order_relaxed)) {
+            // the grid's qwords themselves, 8 entries (a 64-value chunk) a gather from iq2s_grid (8 KB, L1): the
+            // same bytes look1024's codes turn into, without its 16 two-table permutes and 15 blends a block
+            // (STRATA_IQ2S_GATHER=0: the permutes).  The scales below are not read by the q8_1 rows
+            const __m512i i0 = _mm512_cvtepu16_epi32(_mm512_castsi512_si256(idx));
+            const __m512i i1 = _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(idx, 1));
+            const long long* G = (const long long*) iq2s_grid;
+            g[0] = _mm512_i32gather_epi64(_mm512_castsi512_si256(i0), G, 8);
+            g[1] = _mm512_i32gather_epi64(_mm512_extracti64x4_epi64(i0, 1), G, 8);
+            g[2] = _mm512_i32gather_epi64(_mm512_castsi512_si256(i1), G, 8);
+            g[3] = _mm512_i32gather_epi64(_mm512_extracti64x4_epi64(i1, 1), G, 8);
+            const __m128i s8 = _mm_loadl_epi64((const __m128i*) (b + 74));
+            const __m128i nib = _mm_unpacklo_epi8(_mm_and_si128(s8, m4), _mm_and_si128(_mm_srli_epi16(s8, 4), m4));
+            const __m512i s16 = _mm512_zextsi256_si512(_mm256_cvtepu8_epi16(_mm_add_epi8(_mm_add_epi8(nib, nib), one8)));
+            for (int j = 0; j < 4; ++j) sc[j] = _mm512_permutexvar_epi16(sp[j], s16);
+            return;
+        }
+        const __m512i codes = look1024(idx, T);
         const __m128i s8 = _mm_loadl_epi64((const __m128i*) (b + 74));
         const __m128i nib = _mm_unpacklo_epi8(_mm_and_si128(s8, m4), _mm_and_si128(_mm_srli_epi16(s8, 4), m4));
         const __m512i s16 = _mm512_zextsi256_si512(_mm256_cvtepu8_epi16(_mm_add_epi8(_mm_add_epi8(nib, nib), one8)));
@@ -578,10 +600,232 @@ void rows_q81_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
+// IQ3_XXS against a Q81 activation, the grid by byte planes (STRATA_IQ3XXS_PLANES=0: rows_q81's codes): iq3xxs_grid's
+// byte v of all 256 entries is a 256-byte table, and vpermt2b looks 64 entries up at once (two tables of 128 and a
+// blend on the index's bit 7) - 13 instructions for a block's 64 entries, where look256 and the codes' unpacking took
+// ~38.  The planes interleave to dwords within 128-bit lanes: vector k's lane L holds entries 16 L + 4 k .. + 3, values
+// 64 L + 16 k .. + 15, so the activation is read in that order (a copy of each token's codes, permuted once a call)
+// and the signs likewise (one vpermb of the sign bytes).  Vector k's lane L lies in block 2 L + k / 2, so each 32
+// values' integer sum is exact as before, and the float steps are rows_q81's for IQ3_XXS: the same bits.
+
+template <int NT>
+void rows_iq3xxs_q81(const uint8_t* w, size_t row_bytes, int nb, const Q81Tok* tk, float* const* out, int r0, int r1,
+                     int ahead) {
+    constexpr int kB = 98;
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i* P = (const __m512i*) plane3xxs;   // plane v: P[4 v .. 4 v + 3]
+    const __m512i ks0 = _mm512_load_si512(ksigns), ks1 = _mm512_load_si512(ksigns + 64);
+    const __m256i shs = _mm256_set1_epi64x(0x352e2720150e0700ll), m7f = _mm256_set1_epi8(0x7f);
+    const __m256i one32 = _mm256_set1_epi32(1);
+    // the sign bytes (byte q: values 8 q .. 8 q + 7) in the vectors' order: vector k's lanes L take bytes 8 L + 2 k, + 1
+    alignas(64) uint8_t sp[64] = {};
+    for (int k = 0; k < 4; ++k)
+        for (int L = 0; L < 4; ++L) {
+            sp[8 * k + 2 * L] = (uint8_t) (8 * L + 2 * k);
+            sp[8 * k + 2 * L + 1] = (uint8_t) (8 * L + 2 * k + 1);
+        }
+    const __m512i sperm = _mm512_load_si512(sp);
+    const __m512i pick = _mm512_setr_epi32(0, 1, 4, 5, 8, 9, 12, 13, 0, 0, 0, 0, 0, 0, 0, 0);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * row_bytes;
+        __m256 dv[NT][4];
+        for (int t = 0; t < NT; ++t) dv[t][0] = dv[t][1] = dv[t][2] = dv[t][3] = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* b = row + (size_t) i * kB;
+            if (ahead > 0) {
+                _mm_prefetch((const char*) b + ahead, _MM_HINT_T0);
+                _mm_prefetch((const char*) b + ahead + 64, _MM_HINT_T0);
+            }
+            const __m512i X = _mm512_loadu_si512(b + 2);   // the 64 grid indices
+            const __mmask64 hi = _mm512_movepi8_mask(X);
+            __m512i pl[4];
+#pragma unroll
+            for (int v = 0; v < 4; ++v)
+                pl[v] = _mm512_mask_blend_epi8(hi, _mm512_permutex2var_epi8(P[4 * v], X, P[4 * v + 1]),
+                                               _mm512_permutex2var_epi8(P[4 * v + 2], X, P[4 * v + 3]));
+            const __m512i a01l = _mm512_unpacklo_epi8(pl[0], pl[1]), a01h = _mm512_unpackhi_epi8(pl[0], pl[1]);
+            const __m512i a23l = _mm512_unpacklo_epi8(pl[2], pl[3]), a23h = _mm512_unpackhi_epi8(pl[2], pl[3]);
+            __m512i g[4];
+            g[0] = _mm512_unpacklo_epi16(a01l, a23l);
+            g[1] = _mm512_unpackhi_epi16(a01l, a23l);
+            g[2] = _mm512_unpacklo_epi16(a01h, a23h);
+            g[3] = _mm512_unpackhi_epi16(a01h, a23h);
+            const __m256i aux = _mm256_loadu_si256((const __m256i*) (b + 66));
+            const __m512i s7 = _mm512_zextsi256_si512(_mm256_and_si256(_mm256_multishift_epi64_epi8(shs, aux), m7f));
+            alignas(64) uint64_t m[8];
+            _mm512_store_si512(m, _mm512_permutexvar_epi8(sperm, _mm512_permutex2var_epi8(ks0, s7, ks1)));
+            const float dx = h2f(u16(b));
+            const __m256i l0 = _mm256_srli_epi32(aux, 28);
+            for (int t = 0; t < NT; ++t) {
+                const int8_t* yq = tk[t].q + 256 * i;   // (the permuted copy)
+                __m512i Q[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const __m512i yv = _mm512_loadu_si512(yq + 64 * k);
+                    const __m512i ys = _mm512_mask_sub_epi8(yv, _cvtu64_mask64(m[k]), zero, yv);
+                    Q[k] = _mm512_dpbusd_epi32(zero, g[k], ys);
+                }
+                // lane L of Q0 + Q1: block 2 L's values, of Q2 + Q3: block 2 L + 1's
+                const __m512i P0 = _mm512_add_epi32(Q[0], Q[1]), P1 = _mm512_add_epi32(Q[2], Q[3]);
+                const __m512i c = _mm512_add_epi32(_mm512_unpacklo_epi32(P0, P1), _mm512_unpackhi_epi32(P0, P1));
+                const __m512i d = _mm512_add_epi32(c, _mm512_shuffle_epi32(c, (_MM_PERM_ENUM) 0x4e));
+                const __m256i S = _mm512_castsi512_si256(_mm512_permutexvar_epi32(pick, d));
+                const __m256i sv = tdiv<1>(_mm256_add_epi32(_mm256_mullo_epi32(l0, S), tdiv<1>(S)));
+                const __m256 d8 = _mm256_loadu_ps(tk[t].d + 8 * i);
+                dv[t][i & 3] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(dx), d8), _mm256_cvtepi32_ps(sv), dv[t][i & 3]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = q81::dev_sum(dv[t]);
+    }
+}
+
+void rows_iq3xxs_q81_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out,
+                        int r0, int r1, int ahead) {
+    const int nb = n / QK_K;
+    thread_local std::vector<int8_t> perm;
+    if (perm.size() < (size_t) 4 * n) perm.resize((size_t) 4 * n);
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        Q81Tok tk[4];
+        for (int t = 0; t < k; ++t) {
+            const q81::View v = q81::view(act[t0 + t], n);
+            int8_t* pq = perm.data() + (size_t) t * n;
+            for (int i = 0; i < nb; ++i) {   // vector k' of block i: [Y0, Y1, Y2, Y3]'s 128-bit lanes k'
+                const int8_t* y = v.q + 256 * i;
+                const __m512i Y0 = _mm512_loadu_si512(y), Y1 = _mm512_loadu_si512(y + 64);
+                const __m512i Y2 = _mm512_loadu_si512(y + 128), Y3 = _mm512_loadu_si512(y + 192);
+                const __m512i t0v = _mm512_shuffle_i64x2(Y0, Y1, 0x44), t1v = _mm512_shuffle_i64x2(Y0, Y1, 0xEE);
+                const __m512i t2v = _mm512_shuffle_i64x2(Y2, Y3, 0x44), t3v = _mm512_shuffle_i64x2(Y2, Y3, 0xEE);
+                int8_t* o = pq + 256 * i;
+                _mm512_storeu_si512(o, _mm512_shuffle_i64x2(t0v, t2v, 0x88));
+                _mm512_storeu_si512(o + 64, _mm512_shuffle_i64x2(t0v, t2v, 0xDD));
+                _mm512_storeu_si512(o + 128, _mm512_shuffle_i64x2(t1v, t3v, 0x88));
+                _mm512_storeu_si512(o + 192, _mm512_shuffle_i64x2(t1v, t3v, 0xDD));
+            }
+            tk[t] = Q81Tok{pq, v.d, v.s, v.b8};
+        }
+        switch (k) {
+            case 1: rows_iq3xxs_q81<1>(w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+            case 2: rows_iq3xxs_q81<2>(w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+            case 3: rows_iq3xxs_q81<3>(w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+            default: rows_iq3xxs_q81<4>(w, row_bytes, nb, tk, out + t0, r0, r1, ahead); break;
+        }
+    }
+}
+
+bool iq3xxs_planes_on() { return iq3xxs_planes.load(std::memory_order_relaxed); }
+
+// IQ4_NL (the CPU lane's down rows on Qwen3.8's packs) against a Q81 activation in 512-bit lanes: two 32-value blocks a
+// vector (the nibbles through kvalues_iq4nl by vpshufb, |w| and w's sign mask once for every token), dpbusd for the
+// products, and each block's integer sum (exact in any order).  The float steps are lane_q81_avx2.cpp's T20, group by
+// group (8 blocks, 256 values): d_w * d_x (fmul) times the sum, FMA-accumulated in dv[k % 4] - the device's order, so
+// the rows give that file's bits.  STRATA_IQ4NL_512=0: the AVX2 rows
+template <int NT>
+void rows_iq4nl_q81(const uint8_t* w, size_t row_bytes, int n, const Q81Tok* tk, float* const* out, int r0, int r1,
+                    int ahead) {
+    constexpr int kB = 18;
+    const int nsub = n / 32, ng = (nsub + 7) / 8;
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*) kvalues_iq4nl));
+    const __m512i m4 = _mm512_set1_epi8(15), zero = _mm512_setzero_si512();
+    const __m512i p01 = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11), p23 = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+    alignas(64) uint8_t xa[64], xb[64];
+    alignas(64) uint16_t xw[32] = {};
+    for (int b = 0; b < 4; ++b)
+        for (int i = 0; i < 16; ++i) {
+            xa[16 * b + i] = (uint8_t) (kB * b + 2 + i);              // from z0 | z1 (offsets 0..127)
+            xb[16 * b + i] = (uint8_t) (kB * (b + 4) + 2 + i - 64);   // from z1 | z2 (offsets 64..191)
+        }
+    for (int b = 0; b < 8; ++b) xw[b] = (uint16_t) (kB * b / 2);
+    const __m512i ia = _mm512_load_si512(xa), ib = _mm512_load_si512(xb), iw = _mm512_load_si512(xw);
+    const __m256i pick = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);  // [s0 s2 s4 s6 | s1 s3 s5 s7] -> s0..s7
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * row_bytes;
+        __m256 dv[NT][4];
+        for (int t = 0; t < NT; ++t) dv[t][0] = dv[t][1] = dv[t][2] = dv[t][3] = _mm256_setzero_ps();
+        for (int k = 0; k < ng; ++k) {
+            const int ns = nsub - 8 * k < 8 ? nsub - 8 * k : 8;
+            const uint8_t* g = row + (size_t) (8 * k) * kB;
+            if (ahead > 0) {
+                _mm_prefetch((const char*) g + ahead, _MM_HINT_T0);
+                _mm_prefetch((const char*) g + ahead + 64, _MM_HINT_T0);
+                _mm_prefetch((const char*) g + ahead + 128, _MM_HINT_T0);
+            }
+            // the group's 8 blocks (144 bytes, 18 * ns of them in the row): their nibbles gathered by vpermb into
+            // [q0 q1 q2 q3] and [q4 q5 q6 q7], their scales by vpermw (offsets 18 j: whole words)
+            const int len = kB * ns;
+            const __m512i z0 = _mm512_maskz_loadu_epi8(len >= 64 ? ~0ull : (1ull << len) - 1ull, g);
+            const __m512i z1 = len <= 64 ? zero : _mm512_maskz_loadu_epi8(len >= 128 ? ~0ull : (1ull << (len - 64)) - 1ull, g + 64);
+            const __m512i z2 = len <= 128 ? zero : _mm512_maskz_loadu_epi8((1ull << (len - 128)) - 1ull, g + 128);
+            const __m512i qa = _mm512_permutex2var_epi8(z0, ia, z1), qb = _mm512_permutex2var_epi8(z1, ib, z2);
+            const __m512i la = _mm512_and_si512(qa, m4), ha = _mm512_and_si512(_mm512_srli_epi16(qa, 4), m4);
+            const __m512i lb = _mm512_and_si512(qb, m4), hb = _mm512_and_si512(_mm512_srli_epi16(qb, 4), m4);
+            // block 2j's values in 128-bit lanes 0, 1 of vector j, block 2j + 1's in lanes 2, 3
+            __m512i v[4];
+            v[0] = _mm512_shuffle_epi8(tab, _mm512_permutex2var_epi64(la, p01, ha));
+            v[1] = _mm512_shuffle_epi8(tab, _mm512_permutex2var_epi64(la, p23, ha));
+            v[2] = _mm512_shuffle_epi8(tab, _mm512_permutex2var_epi64(lb, p01, hb));
+            v[3] = _mm512_shuffle_epi8(tab, _mm512_permutex2var_epi64(lb, p23, hb));
+            __m512i mag[4];
+            __mmask64 neg[4], ld[4];
+            for (int j = 0; j < 4; ++j) {
+                // (blocks past the row's end: out - kvalues_iq4nl[0] is not 0)
+                ld[j] = 2 * j >= ns ? 0ull : 2 * j + 1 < ns ? ~0ull : 0xFFFFFFFFull;
+                neg[j] = _mm512_movepi8_mask(v[j]) & ld[j];
+                mag[j] = _mm512_maskz_abs_epi8(ld[j], v[j]);
+            }
+            const __m256 dw = _mm256_maskz_mov_ps((__mmask8) ((1u << ns) - 1u),
+                                                  _mm256_cvtph_ps(_mm512_castsi512_si128(_mm512_permutex2var_epi16(z0, iw, z1))));
+            const __mmask8 lm = (__mmask8) ((1u << ns) - 1u);
+            for (int t = 0; t < NT; ++t) {
+                const int8_t* y = tk[t].q + 256 * k;
+                __m512i Q[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const __m512i yv = _mm512_maskz_loadu_epi8(ld[j], y + 64 * j);   // (nothing past the row)
+                    Q[j] = _mm512_dpbusd_epi32(zero, mag[j], _mm512_mask_sub_epi8(yv, neg[j], zero, yv));
+                }
+                // each 128-bit lane's 4 sums: u's lane L holds [Q0, Q1, Q2, Q3]'s lane-L totals; block 2j = lanes 0 + 1
+                // of Q[j], block 2j + 1 = lanes 2 + 3
+                const __m512i T0 = _mm512_add_epi32(_mm512_unpacklo_epi32(Q[0], Q[1]), _mm512_unpackhi_epi32(Q[0], Q[1]));
+                const __m512i T1 = _mm512_add_epi32(_mm512_unpacklo_epi32(Q[2], Q[3]), _mm512_unpackhi_epi32(Q[2], Q[3]));
+                const __m512i U = _mm512_add_epi32(_mm512_unpacklo_epi64(T0, T1), _mm512_unpackhi_epi64(T0, T1));
+                const __m128i e = _mm_add_epi32(_mm512_extracti32x4_epi32(U, 0), _mm512_extracti32x4_epi32(U, 1));
+                const __m128i o = _mm_add_epi32(_mm512_extracti32x4_epi32(U, 2), _mm512_extracti32x4_epi32(U, 3));
+                const __m256i S = _mm256_permutevar8x32_epi32(_mm256_set_m128i(o, e), pick);
+                const __m256 d8 = _mm256_maskz_loadu_ps(lm, tk[t].d + 8 * k);
+                const __m256 fa = _mm256_mul_ps(dw, d8), fb = _mm256_cvtepi32_ps(S);
+                dv[t][k & 3] = _mm256_fmadd_ps(fa, fb, dv[t][k & 3]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = q81::dev_sum(dv[t]);
+    }
+}
+
+void rows_iq4nl_q81_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out,
+                       int r0, int r1, int ahead) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        Q81Tok tk[4];
+        for (int t = 0; t < k; ++t) {
+            const q81::View v = q81::view(act[t0 + t], n);
+            tk[t] = Q81Tok{v.q, v.d, v.s, v.b8};
+        }
+        switch (k) {
+            case 1: rows_iq4nl_q81<1>(w, row_bytes, n, tk, out + t0, r0, r1, ahead); break;
+            case 2: rows_iq4nl_q81<2>(w, row_bytes, n, tk, out + t0, r0, r1, ahead); break;
+            case 3: rows_iq4nl_q81<3>(w, row_bytes, n, tk, out + t0, r0, r1, ahead); break;
+            default: rows_iq4nl_q81<4>(w, row_bytes, n, tk, out + t0, r0, r1, ahead); break;
+        }
+    }
+}
+
+bool iq4nl_512_on() { return iq4nl_512.load(std::memory_order_relaxed); }
+
 }  // namespace
 
 bool lane_q81_vbmi_type(int type) noexcept {
-    return (type == 16 || type == 17 || type == 18 || type == 19 || type == 22) && iq512v_ready();
+    return (type == 16 || type == 17 || type == 18 || type == 19 || type == 22 || (type == 20 && iq4nl_512_on())) &&
+           iq512v_ready();
 }
 
 void lane_q81_vbmi_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
@@ -593,9 +837,13 @@ void lane_q81_vbmi_rows(int type, const uint8_t* w, size_t row_bytes, int n, con
     switch (type) {
         case 16: rows_q81_nt<16>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
         case 17: rows_q81_nt<17>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
-        case 18: rows_q81_nt<18>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        case 18:
+            if (iq3xxs_planes_on()) rows_iq3xxs_q81_nt(nt, w, row_bytes, n, act, out, r0, r1, ahead);
+            else rows_q81_nt<18>(nt, w, row_bytes, n, act, out, r0, r1, ahead);
+            break;
         case 19: rows_q81_nt<19>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
         case 22: rows_q81_nt<22>(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
+        case 20: rows_iq4nl_q81_nt(nt, w, row_bytes, n, act, out, r0, r1, ahead); break;
         default: break;
     }
 }
@@ -603,6 +851,15 @@ void lane_q81_vbmi_rows(int type, const uint8_t* w, size_t row_bytes, int n, con
 bool iq512v_supported(int type) noexcept { return type == 16 || type == 17 || type == 18 || type == 19 || type == 22; }
 
 void iq512v_set_iq1s_fused(bool fused) noexcept { iq1s_fused.store(fused); }
+void iq512v_set_lane_kernels(bool on) noexcept {
+    const auto pick = [on](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr ? std::atoi(v) != 0 : on;
+    };
+    iq2s_gather.store(pick("STRATA_IQ2S_GATHER"));
+    iq3xxs_planes.store(pick("STRATA_IQ3XXS_PLANES"));
+    iq4nl_512.store(pick("STRATA_IQ4NL_512"));
+}
 
 bool iq512v_ready() noexcept {
     static const bool ok = build_codes();

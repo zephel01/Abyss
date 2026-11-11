@@ -6,6 +6,7 @@
 //   3. a window's tokens through one call bit for bit the same as each token alone;
 //   4. for the record: ggml-cpu's dots (the lane's old arithmetic: Q8_K activations) against the same reference.
 #include "strata/kernels/cpu/lane_q81.hpp"
+#include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "lane_q81_impl.hpp"
@@ -300,6 +301,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     ggml_cpu_init();
+    if (kc::cpu_avx512_ok()) kc::iq512v_set_lane_kernels(true);   // (Qwen3.8's lane decodes; the STRATA_* envs pick the older)
     bool ok = check_quant();
     std::printf("avx2 %d  avx512 (VNNI+VBMI) %d\n", (int) kc::cpu_avx2_ok(), (int) kc::cpu_avx512_ok());
     for (const Ty& T : kTypes) {
@@ -344,10 +346,22 @@ int main(int argc, char** argv) {
                 {"vbmi", kc::lane_q81_vbmi_rows, kc::cpu_avx512_ok() && kc::lane_q81_vbmi_type(T.t)},
             };
             std::string line;
+            // the device-order forms (AVX2 / VNNI / VBMI where both keep the device's float order) must give the
+            // same bits: the CPU lane's exact combine takes either
+            const bool dev_both = T.t == 16 || T.t == 17 || T.t == 18 || T.t == 20 || T.t == 22;
+            std::vector<float> first_dev;
             for (const Form& F : forms) {
                 if (!F.have) continue;
                 std::vector<float> multi((size_t) nt * rows), single((size_t) nt * rows);
                 run(F.fn, nt, 0, multi);
+                if (dev_both && std::strcmp(F.name, "rows") != 0 && std::strcmp(F.name, "scalar") != 0) {
+                    if (first_dev.empty()) {
+                        first_dev = multi;
+                    } else if (std::memcmp(first_dev.data(), multi.data(), multi.size() * sizeof(float)) != 0) {
+                        line += std::string(" (") + F.name + " != the first device-order form: FAIL)";
+                        ok = false;
+                    }
+                }
                 for (int k = 0; k < nt; ++k) run(F.fn, 1, k, single);
                 const double e = rel_l2(multi, ref);
                 const bool same = std::memcmp(multi.data(), single.data(), multi.size() * sizeof(float)) == 0;
