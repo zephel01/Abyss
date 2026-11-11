@@ -7,6 +7,39 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.133 - 2026-11-12
+
+GLM-5.3 and DeepSeek V4 / V4.1 decode faster on NVIDIA, the same answers; and v1.3.132 builds on Windows again.
+RTX 5090 (OCuLink Gen4 x4) + Ryzen AI Max+ 395, 123 GB RAM, iGPU off, 4K prompt + 512 tokens, greedy, median of 3
+runs alternating with v1.3.132:
+
+| model | v1.3.132 | v1.3.133 |
+|---|---:|---:|
+| DeepSeek V4 0731 UD-Q2_K_XL | 58.3 tok/s | **60.7** (+4.2%) |
+| GLM-5.3-Flash Maya-S-v2 IQ2_XXS | 46.8 | **49.1** (+5.0%) |
+| DeepSeek V4.1 Compact JA256 (32G96G) | 50.0 | **52.2** (+4.4%) |
+| DeepSeek V4.1 1017 UD-IQ2_XXS (SSD-bound) | 21.4 | 21.6 (+1.1%) |
+| Qwen3.8-Flash-Next 16G64G | 128.0 | 127.0 (unchanged path) |
+
+- **Tier promotions cross the link while the CPU lane computes (GLM-5.3, DeepSeek V4 / V4.1, CUDA).** An nsys trace
+  of V4 0731 showed the PCIe link ~96% idle for the ~215 us a layer between the route and the CPU lane's answer,
+  while the background moves queued after the answer ran into the next layer's route (12 -> 25 us; 2 MiB pieces
+  added ~60 us a layer, which is why more moves had been slower). Now, when the lane takes a route's ne RAM-tier
+  experts, its service thread lets ne x 512 KiB - 128 KiB of the queued promotions go at once on a second copy stream
+  (`STRATA_GLM_BG_LANE=<KiB a lane expert>:<KiB off>[:<kinds>[:<max KiB>]]`, default `512:128:1` there, `0` off).
+  VRAM hits V4 72.7 -> 77.0%, GLM-5.3 61.6 -> 66.6%; CPU lane V4 7.0 -> 6.2 ms a token, GLM-5.3 11.8 -> 10.7. With a
+  24 GB pool V4 +8.1%, GLM-5.3 +4.0%; 16 GB +0.5% / +2.8%; 32K prompts GLM-5.3 +4.6%, V4 +0.6%; V4 + DSpark
+  unchanged. Not for Qwen3.8 (its ~30 us lane experts leave no gap: -7.5%) or HIP (not measured on AMD).
+  `STRATA_GLM_BG_IDLE=<KiB>:<kinds>:<kinds>` (experimental) sends a fixed amount after the route instead.
+- **Windows: the CUDA build passes again.** v1.3.132's `qwen35_fast.cu` includes `<cooperative_groups.h>`, whose CUDA 13
+  CCCL stops with `#error` under MSVC's traditional preprocessor; CUDA files are now compiled with
+  `-Xcompiler=/Zc:preprocessor` under MSVC.
+- Manual (EN/JA): `STRATA_GLM_BG_LANE`, `STRATA_GLM_BG_IDLE`.
+
+Answers: `STRATA_DETERMINISTIC=1` greedy md5 equal to v1.3.132 on V4 0731, GLM-5.3 and V4.1; with the exact lane and
+moves on (`STRATA_GLM_CPU_EXACT=1 STRATA_GLM_LANE_XC=1`) V4 and GLM-5.3 give v1.3.132's tokens with 4-10 points
+different hits. AMD: the changed HIP files compile for gfx1201 / gfx1151; not run on an AMD card.
+
 ## v1.3.132 - 2026-11-12
 
 Decode speed on NVIDIA for all four models, the same answers. RTX 5090 (OCuLink Gen4 x4) + Ryzen AI Max+ 395, 123 GB
