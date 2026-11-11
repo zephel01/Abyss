@@ -41,6 +41,7 @@ STRATA_GLM_AHEAD  # src/core/glm_fast_path.cu
 STRATA_GLM_AHEAD_MERGE  # src/core/glm_fast_path.cu
 STRATA_GLM_AHEAD_READ  # src/core/glm_fast_path.cu
 STRATA_GLM_AHEAD_TOP  # src/core/glm_fast_path.cu
+STRATA_GLM_BG_IDLE  # src/core/glm_fast_path.cu
 STRATA_GLM_BOUNCE  # src/core/glm_model.cu
 STRATA_GLM_BOUNDARY_SYNC  # src/core/glm_fast_path.cu
 STRATA_GLM_CPU_CAL_VERBOSE  # src/core/glm_fast_path.cu
