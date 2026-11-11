@@ -137,6 +137,21 @@ ROCm 7 と 10 はライブラリの名前が同じ（`libamdhip64.so.7` など�
 
 Windows では手順が別になります（試験的。RX 7900 XT での報告があり、R9700 は未確認です）。
 
+> **Visual Studio 2026（MSVC 14.51）+ ROCm SDK 7.14.1 で `'isgreater' cannot overload` が出る場合。** MSVC 14.51 の
+> `<cmath>` は `isgreater` 〜 `isunordered`、`isnormal`、`signbit` を `constexpr` にしました。そのため TheRock の
+> 7.14.1（Clang 23）の HIP ヘッダと衝突し、CMake の HIP コンパイラのテストが「`__device__` function 'isgreater'
+> cannot overload `__host__ __device__` function 'isgreater'」で止まります（[#2](https://github.com/zephel01/Abyss/issues/2)、
+> [#43](https://github.com/zephel01/Abyss/issues/43)）。LLVM では修正済みです（llvm-project
+> [01d3932](https://github.com/llvm/llvm-project/pull/201563)、2026 年 6 月）。`__clang_hip_runtime_wrapper.h` が
+> `<cmath>` より先に `__clang_cuda_math_forward_declares.h` を読むようになりました。ただし repo.amd.com の Windows 用
+> ROCm SDK には、この修正を含むものがまだありません（最新は 7.14.1。修正は ROCm 10.1 から）。v1.3.131 からは、
+> Visual Studio の MSVC が 14.50 以降なら、セットアップが `.venv` 内の SDK のこのファイルで同じ 1 行の移動を 1 回だけ
+> 行います。元のファイルは `__clang_hip_runtime_wrapper.h.abyss-orig` として残します。`--check` は知らせるだけで、
+> `ABYSS_NO_ROCM_HEADER_FIX=1` を付けると SDK に手を付けません。古いセットアップを使う場合は、
+> `.venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\lib\clang\23\include\__clang_hip_runtime_wrapper.h` の
+> `#include <__clang_cuda_math_forward_declares.h>` の行を、最初の `#include <cmath>` のすぐ上に移してから、
+> セットアップをもう一度実行してください。
+
 1. **ドライバ:** AMD Software: Adrenalin Edition を入れます（https://www.amd.com/en/support）。
 2. **Visual Studio Build Tools**（2022 または 2026、「C++ によるデスクトップ開発」）を入れます。ROCm のコンパイラが、
    Visual Studio のヘッダとライブラリを使います。

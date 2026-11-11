@@ -508,7 +508,10 @@ Radeon 8060S（gfx1151）。
   `/opt/rocm`（または `/opt/rocm/core-10.0`）の ROCm 10 を使う。HIP 7.14 以降が要り、ROCm 7.0〜7.2 では止まる。この
   2 つはいまのドライバと組み合わせると失敗するため（issue #1、#8。`ABYSS_OLD_ROCM=1` でそれでもビルドできる）。
   エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。別の ROCm に切り替えたら、
-  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。
+  `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。Windows で
+  Visual Studio の MSVC が 14.50 以降なら、セットアップが ROCm SDK の `__clang_hip_runtime_wrapper.h` の include を
+  1 行移す（「'isgreater' cannot overload」への LLVM の修正。issue #43。元は `.abyss-orig` として残る）。
+  `ABYSS_NO_ROCM_HEADER_FIX=1` で SDK に手を付けない。
 - **ドライバと ROCm:** 入れ方は [docs/amd/README.ja.md](amd/README.ja.md) にまとめた（amdgpu、ROCm 10 の
   アーキテクチャ別のパッケージ、`HSA_OVERRIDE_GFX_VERSION` を設定してはいけない理由）。動作確認とトラブル対応も
   そこにある。R9700 では `amdrocm10.0-gfx1201` が要る。
@@ -816,6 +819,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド（NVIDIA の内蔵 GPU、DGX Spark では無効） | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
 | `STRATA_GLM_CPU_EXACT` | `1`（x86 の CPU で Qwen3.8）、`0`（ほかのモデル。RTX 5090 で GLM-5.3 の生成が 14%、V4.1 が 5% 遅くなったため） | CPU レーンのエキスパートを、GPU のカーネルと同じ計算（GPU と同じ 8 ビットの活性、同じ整数の和）で求めます。どちらで計算しても同じ値になります。`0` で従来の ggml-cpu の計算。ARM の CPU は従来の計算のまま |
 | `STRATA_GLM_LANE_XC` | `1`（x86 の CUDA で Qwen3.8）、`0`（ほかのモデル、HIP、ARM） | `STRATA_GLM_CPU_EXACT` と合わせて、CPU レーンのエキスパートが GPU とビット単位で同じ値になり（GPU と同じ足し算の順と、SiLU の exp）、層のエキスパートの和を固定小数点で取ります（重みを掛けた各エキスパートの行を 2^-34 単位の 64 ビット整数にして足し、最後に 1 回だけ float に丸める。どの順に足しても同じビットで、float の足し算と同じかそれ以上に正確）。どのエキスパートを CPU が計算したかで和が変わりません。prompt の CPU の分担もこれに合わせます（`STRATA_GLM_PREFILL_XROWS`）。これで `STRATA_DETERMINISTIC` なしでも、温度 0 の答えが毎回同じになります（Qwen3.8 で 1 チャンク約 2,000 トークンまでの prompt。それより長いチャンクは、出力の窓が埋まるたびに、エキスパートを走らせた順に足します）。`0` で従来の動き（CPU の分を別に足して最後に加え、prompt の分担は時間で決める）。エキスパートの先送り（`STRATA_GLM_DEFER`）と EXL3 のエキスパートでは使いません。ほかのモデル（GLM、Ornith、DeepSeek V4）は `1` で使えます（まだ測っていません） |
+| `STRATA_Q4X_VERIFY_EXACT` | `1`（CUDA）、`0`（HIP） | Qwen3.8 の下書き（MTP、DFlash 2）あり: 検証窓の dense の GEMV を列ごとにトークン経路と同じ和にして、温度 0 の答えが下書きなしと同じになります（v1.3.125）。HIP では 1 列ずつの GEMV になり、dense の重みと出力ヘッドを列の数だけ読むため、AI PRO R9700 + MTP で 87 -> 67 tok/s に落ちました（#42）。そのため HIP は重みを 1 回だけ読む GEMV のままです（v1.3.125 より前と同じ。下書きありの答えが、長い答えの後半で下書きなしと分かれることがあります）。`1` / `0` でどちらかに固定。`STRATA_DETERMINISTIC` は `1` にします |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | 起動時の CPU レーンの計測が乱れていそうなとき（CPU の 4 分の 1 以上でほかの仕事が動いている、または一番遅い回が中央値の 3 倍を超える）、1 秒おきに最大この回数まで測り直し、一番小さい値を使います。それでも CPU が混んでいればログに出します。`0`: 1 回だけ |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | VRAM に全エキスパート・予備・プロンプト処理が借りる分がすべて入るとき、借りる分をエキスパートの置き場とは別に確保し、プロンプトでエキスパートを追い出さないようにします。v1.3.119 から共有メモリ（DGX Spark）でも、メモリに余裕があればそうします（Qwen3.8 ISTA IQ3_XXS：32K のプロンプトのあとのデコードで SSD からエキスパートを読み直さなくなった）。`0`：借りる分をエキスパートの置き場から削ります（v1.3.104 より前の動き。共有メモリでは v1.3.119 より前の動き） |
 | `STRATA_GLM_X3_SPLIT` | オフ | EXL3 の pack で、各ルートの RAM 層エキスパートのうちこの割合を CPU スレッドが、残りを iGPU が同時に計算する（`auto`: 起動時の計測から）。Ryzen AI Max+ 395 では電力と熱を共有するため遅くなる（[EXL3](exl3/README.md#settings)） |

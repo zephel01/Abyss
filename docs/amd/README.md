@@ -132,6 +132,21 @@ options when the compiler changes. With those versions, delete `build-hip/` firs
 
 Windows has its own steps (experimental: reported on an RX 7900 XT, not yet run on an R9700).
 
+> **Visual Studio 2026 (MSVC 14.51) + ROCm SDK 7.14.1: `'isgreater' cannot overload`.** MSVC 14.51's `<cmath>` makes
+> `isgreater` .. `isunordered`, `isnormal` and `signbit` `constexpr`, and the HIP headers of TheRock's 7.14.1 (Clang
+> 23) then stop CMake's HIP compiler test with "`__device__` function 'isgreater' cannot overload `__host__
+> __device__` function 'isgreater'" ([#2](https://github.com/zephel01/Abyss/issues/2),
+> [#43](https://github.com/zephel01/Abyss/issues/43)). LLVM fixed it (llvm-project
+> [01d3932](https://github.com/llvm/llvm-project/pull/201563), June 2026): `__clang_hip_runtime_wrapper.h` includes
+> `__clang_cuda_math_forward_declares.h` before `<cmath>`. No ROCm SDK for Windows on repo.amd.com has that fix yet
+> (7.14.1 is the newest; it comes with ROCm 10.1). From v1.3.131 setup makes the same one-line move in the SDK's copy
+> in `.venv` when Visual Studio's MSVC is 14.50 or newer, once, keeping the original as
+> `__clang_hip_runtime_wrapper.h.abyss-orig`; `--check` only reports it, and `ABYSS_NO_ROCM_HEADER_FIX=1` leaves the
+> SDK as it is. With an older setup: in
+> `.venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\lib\clang\23\include\__clang_hip_runtime_wrapper.h`, move the
+> line `#include <__clang_cuda_math_forward_declares.h>` to just above the first `#include <cmath>`, then run setup
+> again.
+
 1. **Driver:** AMD Software: Adrenalin Edition (https://www.amd.com/en/support).
 2. **Visual Studio Build Tools** (2022 or 2026, "Desktop development with C++"). ROCm's compiler uses Visual
    Studio's headers and libraries.

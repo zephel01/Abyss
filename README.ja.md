@@ -111,7 +111,7 @@ RTX 4090 で +12%、[#39](https://github.com/zephel01/Abyss/issues/39)）。正�
 | GPU | NVIDIA: RTX 5090 32 GB と RTX 3090 で測定、DGX Spark（GB10）はベータ。V100 は CUDA 12 でビルドできる（実機は未確認）。AMD Radeon は HIP で試験的に対応: Radeon 8060S と AI PRO R9700（8060S をレーンに）で動作。[docs/amd](docs/amd/README.ja.md) |
 | メモリ | VRAM + RAM がファイルの大きさくらいあれば、全エキスパートがメモリに載る（少なくても SSD から読んで動く） |
 | ディスク | 下の容量が空いた NVMe SSD（モデルがメモリに入りきらないときは、速いほどよい） |
-| ツール | CUDA 13.x（`nvcc`。V100 は 12.9）、g++、Python 3.10 以上。AMD APU の iGPU レーンと AMD ビルドには、Linux は ROCm 10、Windows は AMD の ROCm SDK 7.14（`hipcc`。HIP 7.14 以降。ROCm 7.0〜7.2 はいまのドライバと組み合わせると失敗する: [docs/amd](docs/amd/README.ja.md)） |
+| ツール | CUDA 13.x（`nvcc`。V100 は 12.9）、g++、Python 3.10 以上。AMD APU の iGPU レーンと AMD ビルドには、Linux は ROCm 10、Windows は AMD の ROCm SDK 7.14（`hipcc`。HIP 7.14 以降。ROCm 7.0〜7.2 はいまのドライバと組み合わせると失敗する。Visual Studio 2026（MSVC 14.51）では `'isgreater' cannot overload` 対策として、セットアップが SDK のヘッダを 1 行直す: [docs/amd](docs/amd/README.ja.md#windows)） |
 | ARM / DGX Spark | aarch64 + sm_121（GB10）、CUDA 12.9 以降（DGX OS には CUDA 13 が入っている）。x86 のカーネルは無いので、Q2_0 のエキスパートの pack（DeepSeek V4 の標準の pack）は AVX が要って動かない。ネイティブの pack（`--native`、`iq_pack.py --fast`）は動く（[DGX Spark](docs/DGX-SPARK.ja.md)） |
 
 ### ディスク容量

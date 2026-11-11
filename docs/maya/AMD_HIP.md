@@ -76,7 +76,8 @@ A native Windows build with Visual Studio 18 (MSVC 14.51) and AMD's TheRock ROCm
   changes, guard those declarations with `#if !defined(_MSC_VER)` in the SDK's
   `lib/llvm/lib/clang/23/include/__clang_hip_cmath.h` and `__clang_cuda_math_forward_declares.h` - only `isgreater`
   through `isunordered` (up to `modf`), `isnormal` and `signbit`; keep `isfinite`, `isinf` and `isnan`, which the
-  kernels need. #2 has a script that applies the guard.
+  kernels need. #2 has a script that applies the guard. From v1.3.131 setup applies LLVM's own fix instead (one
+  include line moved in `__clang_hip_runtime_wrapper.h`, issue #43; [docs/amd](../amd/README.md#windows)).
 - Windows counts the pinned RAM tier against the commit limit (RAM + pagefile). With a small pagefile the default
   `STRATA_GLM_RAM_HEADROOM_GB=16` sends experts to the SSD while RAM is free; a larger pagefile (e.g. 64 GB) with
   `STRATA_GLM_RAM_HEADROOM_GB=4`, `STRATA_GLM_RESERVE_MB=512` (no display on the card) and `--prefill 8192` kept
