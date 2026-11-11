@@ -81,6 +81,16 @@ void gdn_scan(float* state, const float* h, int T, int C, const float* gate, con
 void gdn_core(float* state, const float* h, int T, int C, const float* gate, const float* beta, int S, int h_k, int h_v,
               bool prep, float eps, const float* dt_bias, const float* ssm_a, const float* z, const float* ssm_norm,
               float out_eps, float* y, void* yq, cudaStream_t s);
+/// The token path's delta-net middle after the qkv / z projection in one launch (CUDA sm_90+, a cluster of h_v / h_k
+/// blocks a k head): alpha / beta (F32 or BF16 (ab_bf16) rows w_alpha / w_beta [h_v][n_in] against x: mv's sums), conv_silu_step, then
+/// gdn_core with prep (T 1) - the same bits as those launches (gdn_core_parity).  h_out (the conv rows, may be null)
+/// and ab_out (raw alpha then beta, may be null) as the old launches leave them.  pf / pf_bytes (may be null): the next
+/// GEMV's weights, pulled toward L2 while the recurrence runs.  False (nothing launched): not supported here.
+bool gdn_mid_ok(int S, int h_k, int h_v, int d_conv, int n_in);
+bool gdn_mid(float* state, float* conv_state, const float* qkv, const float* conv_w, int d_conv, const float* x,
+             const void* w_alpha, const void* w_beta, bool ab_bf16, int n_in, int S, int h_k, int h_v, float eps,
+             const float* dt_bias, const float* ssm_a, const float* z, const float* ssm_norm, float out_eps, float* h_out,
+             float* ab_out, float* y, void* yq, const void* pf, size_t pf_bytes, cudaStream_t s);
 /// attn_prep over T rows at positions p0 + t: q_full [T][n_head][2 * head_dim], k / v [T][n_head_kv][head_dim] ->
 /// q [T][n_head][head_dim] and the caches' rows p0 .. p0 + T - 1.
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
