@@ -89,31 +89,52 @@ inline bool pdl_enabled() {
 #endif
 }
 
+// Stream capture: pdl_launch keeps the attribute while a stream is being captured only inside a PdlCapture scope on
+// this thread - the graph then carries programmatic edges (CUDA 12.3+), the same rule as the plain launches.  Outside
+// a scope a captured launch is plain, as before.  The scope is opened by the q4x verify window's per-layer graphs
+inline int& pdl_capture_depth() {
+    static thread_local int d = 0;
+    return d;
+}
+struct PdlCapture {
+    bool on;
+    explicit PdlCapture(bool want) : on(want) { if (on) ++pdl_capture_depth(); }
+    ~PdlCapture() { if (on) --pdl_capture_depth(); }
+    PdlCapture(const PdlCapture&) = delete;
+    PdlCapture& operator=(const PdlCapture&) = delete;
+};
+
 #if !defined(STRATA_USE_HIP)
-// a kernel launch with the PDL attribute when pdl_enabled() (and the stream is not being captured), else <<<>>>.
-// The kernel MUST begin with STRATA_PDL_ENTRY().
+// a launch on s may carry the PDL attribute: PDL on and the stream not captured, or captured inside a PdlCapture
+inline bool pdl_attr_ok(cudaStream_t s) {
+    if (!pdl_enabled()) return false;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &cs) != cudaSuccess) return false;
+    return cs == cudaStreamCaptureStatusNone || (cs == cudaStreamCaptureStatusActive && pdl_capture_depth() > 0);
+}
+
+// a kernel launch with the PDL attribute when pdl_attr_ok(s), else <<<>>>.  The kernel MUST begin with
+// STRATA_PDL_ENTRY()
 template <typename... KArgs, typename... Args>
 inline void pdl_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s, Args&&... args) {
-    if (pdl_enabled()) {
-        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(s, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) {
-            cudaLaunchConfig_t cfg = {};
-            cfg.gridDim = grid;
-            cfg.blockDim = block;
-            cfg.dynamicSmemBytes = smem;
-            cfg.stream = s;
-            cudaLaunchAttribute at[1];
-            at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            at[0].val.programmaticStreamSerializationAllowed = 1;
-            cfg.attrs = at;
-            cfg.numAttrs = 1;
-            if (cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...) == cudaSuccess) return;
-            (void) cudaGetLastError();   // (refused: launched the plain way below)
-        }
+    if (pdl_attr_ok(s)) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid;
+        cfg.blockDim = block;
+        cfg.dynamicSmemBytes = smem;
+        cfg.stream = s;
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = at;
+        cfg.numAttrs = 1;
+        if (cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...) == cudaSuccess) return;
+        (void) cudaGetLastError();   // (refused: launched the plain way below)
     }
     kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
 }
 #else
+inline bool pdl_attr_ok(cudaStream_t) { return false; }
 template <typename... KArgs, typename... Args>
 inline void pdl_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s, Args&&... args) {
     kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);

@@ -2137,8 +2137,7 @@ bool gdn_mid(float* state, float* conv_state, const float* qkv, const float* con
     at[0].val.clusterDim.y = 1;
     at[0].val.clusterDim.z = 1;
     int na = 1;
-    cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
-    if (pdl_enabled() && cudaStreamIsCapturing(s, &cst) == cudaSuccess && cst == cudaStreamCaptureStatusNone) {
+    if (pdl_attr_ok(s)) {
         at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         at[1].val.programmaticStreamSerializationAllowed = 1;
         na = 2;

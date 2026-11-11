@@ -38,6 +38,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -107,6 +108,7 @@ struct VerifyBuf {
     std::vector<unsigned char> q4g_n;         // ... the windows seen before its capture (255: it did not capture)
     std::vector<uint64_t> q4g_sig;            // ... the route arguments it was captured with
     unsigned long long q4g_rep = 0, q4g_eager = 0, q4g_recap = 0;   // layers replayed / launched, re-captures
+    unsigned long long q4g_pdl_ok = 0, q4g_pdl_no = 0;   // captures with PDL edges taken / refused (STRATA_Q4X_GRAPH_PDL)
     float* ffn_chk = nullptr;                 // STRATA_DS4_WIN_COLS_CHECK: the batched launch's FFN rows, then compared
     uint64_t chk_calls = 0, chk_cols = 0, chk_diff = 0;
     // per column, for the pipelined window's concurrent tokens: the mHC partials, the routed experts' h, the
@@ -750,8 +752,9 @@ void Glm5Model::verify_report() const {
     size_t n = 0;
     for (auto e : V->q4g) n += e != nullptr;
     std::fprintf(stderr, "qwen4exp verify graphs CUDA%d: %llu layer segments replayed, %llu launched (%.1f%% replayed), %zu "
-                         "graphs, %llu re-captured for new route arguments\n", dev_, V->q4g_rep, V->q4g_eager,
-                 100.0 * (double) V->q4g_rep / (double) (V->q4g_rep + V->q4g_eager), n, V->q4g_recap);
+                         "graphs, %llu re-captured for new route arguments; captures with PDL edges %llu, refused %llu\n",
+                 dev_, V->q4g_rep, V->q4g_eager, 100.0 * (double) V->q4g_rep / (double) (V->q4g_rep + V->q4g_eager), n,
+                 V->q4g_recap, V->q4g_pdl_ok, V->q4g_pdl_no);
 }
 
 bool Glm5Model::verify_sh_late() {
@@ -1715,6 +1718,21 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
         const char* v = getenv("STRATA_GLM_GRAPH_MOE");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // STRATA_Q4X_GRAPH_PDL=0/1: the graphs below captured with PDL's programmatic edges (pdl.hpp's PdlCapture: the
+    // launches that carry the attribute outside a capture carry it inside); default on where PDL is on, except an
+    // integrated GPU (not measured there).  A refused capture is taken again without the edges
+    static const bool q4g_pdl = [] {
+        const char* v = getenv("STRATA_Q4X_GRAPH_PDL");
+        if (v != nullptr) return std::atoi(v) != 0;
+#if defined(STRATA_USE_HIP)
+        return false;
+#else
+        int dev = 0, integ = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, dev);
+        return integ == 0;
+#endif
+    }();
     static const bool q4g_on = [] {
         const char* v = getenv("STRATA_GLM_GRAPH");
 #if defined(STRATA_USE_HIP)
@@ -2014,17 +2032,27 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             const uint64_t exp0 = F->expected;
             if (ex == nullptr && V->q4g_n[gk] < 255 && ++V->q4g_n[gk] >= 2) {
                 const int li0 = li, la0 = la;
-                cudaGraph_t gr = nullptr;
-                bool cok = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
-                if (cok) {
-                    cok = q4g_moe ? seg_moe() : seg(true);
-                    const cudaError_t e = cudaStreamEndCapture(s, &gr);
-                    cok = cok && e == cudaSuccess && gr != nullptr;
+                // with PDL edges first (q4g_pdl), then once more without them if that capture or its instantiation
+                // was refused
+                for (int pass = q4g_pdl ? 0 : 1; pass < 2 && ex == nullptr; ++pass) {
+                    li = li0;
+                    la = la0;
+                    F->expected = exp0;
+                    err.clear();
+                    cudaGraph_t gr = nullptr;
+                    bool cok = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+                    if (cok) {
+                        const k::PdlCapture pc(pass == 0);
+                        cok = q4g_moe ? seg_moe() : seg(true);
+                        const cudaError_t e = cudaStreamEndCapture(s, &gr);
+                        cok = cok && e == cudaSuccess && gr != nullptr;
+                    }
+                    if (cok && cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) ex = nullptr;
+                    if (!cok) ex = nullptr;
+                    if (gr != nullptr) cudaGraphDestroy(gr);
+                    cudaGetLastError();
+                    if (pass == 0) ++(ex != nullptr ? V->q4g_pdl_ok : V->q4g_pdl_no);
                 }
-                if (cok && cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) ex = nullptr;
-                if (!cok) ex = nullptr;
-                if (gr != nullptr) cudaGraphDestroy(gr);
-                cudaGetLastError();
                 li = li0;
                 la = la0;
                 F->expected = exp0;   // (the capture ran no route: counted again below)
