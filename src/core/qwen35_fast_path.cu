@@ -5,6 +5,8 @@
 // MoE (fast_moe: a softmax top-k router, the routed experts through the tiers and the lanes, the shared expert behind
 // its sigmoid gate) -> R += ffn.  No hyper-connections: the residual R is state_ (n_embd floats).  The math follows
 // llama.cpp's src/models/qwen35moe.cpp and delta-net-base.cpp.
+#include <cstring>
+#include <vector>
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/knobs.hpp"
@@ -824,6 +826,96 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, C = g.ssm_conv_dim(), V = g.ssm_inner, S = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
+    static const bool old_step = getenv("STRATA_Q35_GDN_STEP") != nullptr;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    // qwen4exp on CUDA (sm_90+): alpha / beta, the conv + SiLU and gdn_core in ONE launch after the qkv / z GEMV
+    // (q35::gdn_mid: the same arithmetic in the same order, the same bits - gdn_core_parity), which also pulls ssm_out's
+    // weights toward L2 while the recurrence runs.  STRATA_Q4X_GDN_MID=0: the launches below.  STRATA_Q4X_GDN_MID_PF=0:
+    // without the L2 pull.  HIP: never (the launches below)
+    static const bool mid_env = [] { const char* v = getenv("STRATA_Q4X_GDN_MID"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool mid_pf = [] { const char* v = getenv("STRATA_Q4X_GDN_MID_PF"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool gdn_fuse0 = [] { const char* v = getenv("STRATA_Q4X_GDN_FUSE"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool ab_typed = (Ly.alpha_w.type == gf::kTypeF32 || Ly.alpha_w.type == gf::kTypeBF16) &&
+                          Ly.beta_w.type == Ly.alpha_w.type;
+    if (g.q4x && mid_env && gdn_fuse0 && !old_step && !dumps && ab_typed && q35::gdn_mid_ok(S, HK, HV, g.d_conv, E)) {
+        gf::MvJob j2[2];
+        j2[0] = {Ly.qkv.q, F->xq, F->x, F->q35_qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
+        j2[1] = {Ly.zg.q, F->xq, F->x, F->q35_z, nullptr, 1.0f, Ly.zg.type, E, V};
+        if (!gf::mv(j2, 2, s)) { err = "qwen35moe: the delta-net projections"; return false; }
+        if (F->prof_on) F->mark("q35_gdn_mv");
+        const size_t orb = mid_pf ? gf::row_bytes(Ly.ssm_o.type, V) : 0;
+        // STRATA_Q4X_GDN_MID_CHECK=<n> (debug): the first n calls also run the old launches from the same state and
+        // compare the bytes (state, conv state, y, y's q8_1); the old launches' results are kept
+        static const int mid_check = [] { const char* v = getenv("STRATA_Q4X_GDN_MID_CHECK"); return v ? std::atoi(v) : 0; }();
+        static int mid_checked = 0;
+        if (mid_checked < mid_check) {
+            ++mid_checked;
+            const size_t nst = (size_t) S * HV * S, ncs = (size_t) C * (g.d_conv - 1), nyq = (size_t) V / 32 * 36;
+            static float *st0 = nullptr, *cs0 = nullptr;
+            if (st0 == nullptr) { cudaMalloc(&st0, nst * 4); cudaMalloc(&cs0, ncs * 4); }
+            cudaMemcpyAsync(st0, Ly.gdn_state, nst * 4, cudaMemcpyDeviceToDevice, s);
+            cudaMemcpyAsync(cs0, Ly.gdn_conv, ncs * 4, cudaMemcpyDeviceToDevice, s);
+            q35::gdn_mid(Ly.gdn_state, Ly.gdn_conv, F->q35_qkv, Ly.conv1d, g.d_conv, F->x, Ly.alpha_w.q, Ly.beta_w.q,
+                         Ly.alpha_w.type == gf::kTypeBF16, E, S, HK, HV, g.norm_eps, Ly.dt_bias, Ly.ssm_a, F->q35_z,
+                         Ly.ssm_norm, g.norm_eps, F->q35_h, F->q35_ab, F->q35_y, F->q35_yq, nullptr, 0, s);
+            std::vector<float> a_st(nst), a_cs(ncs), a_y(V), a_h(C), a_ab(2 * HV);
+            std::vector<uint8_t> a_yq(nyq);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(a_st.data(), Ly.gdn_state, nst * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_cs.data(), Ly.gdn_conv, ncs * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_y.data(), F->q35_y, V * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_yq.data(), F->q35_yq, nyq, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_h.data(), F->q35_h, C * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(a_ab.data(), F->q35_ab, 2 * HV * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(Ly.gdn_state, st0, nst * 4, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(Ly.gdn_conv, cs0, ncs * 4, cudaMemcpyDeviceToDevice);
+            gf::MvJob ab[2];
+            ab[0] = {Ly.alpha_w.q, F->xq, F->x, F->q35_ab, nullptr, 1.0f, Ly.alpha_w.type, E, HV};
+            ab[1] = {Ly.beta_w.q, F->xq, F->x, F->q35_ab + HV, nullptr, 1.0f, Ly.beta_w.type, E, HV};
+            gf::mv(ab, 2, s);
+            q35::conv_silu_step(Ly.gdn_conv, F->q35_qkv, Ly.conv1d, C, g.d_conv, F->q35_h, s);
+            std::vector<float> b_ab(2 * HV), b_h(C);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(b_ab.data(), F->q35_ab, 2 * HV * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_h.data(), F->q35_h, C * 4, cudaMemcpyDeviceToHost);
+            q35::gdn_core(Ly.gdn_state, F->q35_h, 1, C, F->q35_ab, F->q35_ab + HV, S, HK, HV, true, g.norm_eps, Ly.dt_bias,
+                          Ly.ssm_a, F->q35_z, Ly.ssm_norm, g.norm_eps, F->q35_y, F->q35_yq, s);
+            std::vector<float> b_st(nst), b_cs(ncs), b_y(V);
+            std::vector<uint8_t> b_yq(nyq);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(b_st.data(), Ly.gdn_state, nst * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_cs.data(), Ly.gdn_conv, ncs * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_y.data(), F->q35_y, V * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b_yq.data(), F->q35_yq, nyq, cudaMemcpyDeviceToHost);
+            const auto cmpf = [&](const char* nm, const std::vector<float>& a, const std::vector<float>& b) {
+                size_t n = 0, first = 0;
+                for (size_t i = 0; i < a.size(); ++i)
+                    if (std::memcmp(&a[i], &b[i], 4) != 0) { if (n++ == 0) first = i; }
+                if (n) std::fprintf(stderr, "gdn_mid check L%d %s: %zu differ, first %zu: %.9g vs %.9g\n", il, nm, n, first,
+                                    a[first], b[first]);
+                return n;
+            };
+            size_t bad = cmpf("ab", a_ab, b_ab) + cmpf("h", a_h, b_h) + cmpf("state", a_st, b_st) + cmpf("conv", a_cs, b_cs) +
+                         cmpf("y", a_y, b_y) + (a_yq != b_yq ? 1 : 0);
+            std::fprintf(stderr, "gdn_mid check L%d (HK %d HV %d C %d E %d dc %d ab type %d): %s\n", il, HK, HV, C, E,
+                         g.d_conv, Ly.alpha_w.type, bad ? "DIFF" : "same");
+            gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
+            if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
+            return true;
+        }
+        if (q35::gdn_mid(Ly.gdn_state, Ly.gdn_conv, F->q35_qkv, Ly.conv1d, g.d_conv, F->x, Ly.alpha_w.q, Ly.beta_w.q,
+                         Ly.alpha_w.type == gf::kTypeBF16, E, S, HK, HV, g.norm_eps, Ly.dt_bias, Ly.ssm_a, F->q35_z,
+                         Ly.ssm_norm, g.norm_eps, nullptr, nullptr, F->q35_y, F->q35_yq, orb ? Ly.ssm_o.q : nullptr,
+                         orb * (size_t) E, s)) {
+            if (F->prof_on) F->mark("q35_gdn");
+            gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
+            if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
+            if (F->prof_on) F->mark("q35_gdn_out");
+            return true;
+        }
+        err = "qwen35moe: gdn_mid";
+        return false;
+    }
     // 1. the projections: qkv (C), z (V), alpha and beta (h_v each) in one launch
     gf::MvJob j[4];
     j[0] = {Ly.qkv.q, F->xq, F->x, F->q35_qkv, nullptr, 1.0f, Ly.qkv.type, E, C};
@@ -832,7 +924,6 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
     j[3] = {Ly.beta_w.q, F->xq, F->x, F->q35_ab + HV, nullptr, 1.0f, Ly.beta_w.type, E, HV};
     if (!gf::mv(j, 4, s)) { err = "qwen35moe: the delta-net projections"; return false; }
     if (F->prof_on) F->mark("q35_gdn_mv");
-    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     if (dumps) {
         q35_dump(s, "linear_attn_qkv_mixed", il, F->q35_qkv, C);
         q35_dump(s, "z", il, F->q35_z, V);
@@ -847,7 +938,6 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
         q35_dump(s, "k_conv", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
         q35_dump(s, "v_conv", il, F->q35_h + (size_t) 2 * HK * S, (int64_t) HV * S);
     }
-    static const bool old_step = getenv("STRATA_Q35_GDN_STEP") != nullptr;
     // qwen4exp: the heads' L2 norm, the gates, the recurrence, the output norm and y's q8_1 in one launch
     // (q35::gdn_core, the same bits as the launches below - gdn_core_parity).  STRATA_Q4X_GDN_FUSE=0: those launches.
     // Off by default with HIP (unmeasured there): STRATA_Q4X_GDN_FUSE=1 there

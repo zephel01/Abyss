@@ -23,6 +23,8 @@
 #include <cuda_runtime.h>
 #if !defined(STRATA_USE_HIP)
 #include <mma.h>
+#include <cooperative_groups.h>
+#include <cuda_pipeline.h>
 #endif
 
 #include <cmath>
@@ -582,6 +584,202 @@ __global__ void __launch_bounds__(S) gdn_core_kernel(float* __restrict__ state, 
 #pragma unroll
     for (int i = 0; i < S; ++i) col[(size_t) i * stride] = st[i];
 }
+#if !defined(STRATA_USE_HIP)
+// The token path's delta-net middle after the qkv / z projection in ONE launch (gdn_mid): alpha and beta (F32 rows:
+// glm_fast's row_dot_f32 - a lane's float4 chain, then the xor tree - and mv_kernel's 1 * s + 0), the conv + SiLU
+// (conv_silu_step_kernel's), then gdn_core_kernel's prep, recurrence, output norm and y's q8_1 - the same arithmetic
+// in the same order, so the same bits (gdn_core_parity).  A cluster of R = h_v / h_k blocks per k head: block (src,
+// rank) takes v head src + h_k * rank (the MODULO pairing); every block of the cluster computes the k head's q / k conv
+// from the old state, and after the cluster barrier rank 0 alone slides that state (each block its own v channels).
+// The block also pulls its state column and its slice of the next GEMV's weights (pf, pf_bytes) toward L2 at the start.
+__device__ __forceinline__ float mid_row_dot_f32(const float* row, const float* x, int n_in, int lane) {
+    float s = 0.0f;
+    const float4* r4 = (const float4*) row;
+    const float4* x4 = (const float4*) x;
+    for (int k = lane; k < n_in / 4; k += 32) {
+        const float4 a = r4[k], b = x4[k];
+        s += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    return warp_sum(s);
+}
+__device__ __forceinline__ float mid_row_dot_bf16(const uint16_t* row, const float* x, int n_in, int lane) {   // (row_dot_bf16)
+    float s = 0.0f;
+    const uint4* r8 = (const uint4*) row;
+    const float4* x4 = (const float4*) x;
+    for (int k = lane; k < n_in / 8; k += 32) {
+        const uint4 w = r8[k];
+        const float4 a = x4[2 * k], b = x4[2 * k + 1];
+        s += __uint_as_float(w.x << 16) * a.x + __uint_as_float(w.x & 0xffff0000u) * a.y +
+             __uint_as_float(w.y << 16) * a.z + __uint_as_float(w.y & 0xffff0000u) * a.w +
+             __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
+             __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
+    }
+    return warp_sum(s);
+}
+__device__ __forceinline__ float mid_conv4(float s0, float s1, float s2, float x, float4 w) {   // (conv_silu_step's, d_conv 4)
+    float acc = 0.0f;
+    acc += s0 * w.x;
+    acc += s1 * w.y;
+    acc += s2 * w.z;
+    acc += x * w.w;
+    return acc * sigmoid_f(acc);
+}
+template <int S>
+__global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, float* cs,
+                                                    const float* __restrict__ qkv, const float* __restrict__ kW, int dc,
+                                                    const float* __restrict__ xf, const void* __restrict__ wa,
+                                                    const void* __restrict__ wb, bool ab_bf16, int n_in, int h_k, int h_v,
+                                                    float eps, float qscale, const float* __restrict__ dt,
+                                                    const float* __restrict__ A, const float* __restrict__ z,
+                                                    const float* __restrict__ ssm_norm, float out_eps,
+                                                    float* __restrict__ h_out, float* __restrict__ ab_out,
+                                                    float* __restrict__ y, Q81* __restrict__ yq,
+                                                    const uint8_t* __restrict__ pf, size_t pf_bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
+    namespace cg = cooperative_groups;
+    cg::cluster_group cl = cg::this_cluster();
+    __shared__ float ks[S], qs[S], os[S];
+    __shared__ double sh[2][4];
+    __shared__ float s_inv, s_ab[2];
+    const int R = h_v / h_k, rank = (int) cl.block_rank(), src = blockIdx.x / R, hv = src + h_k * rank;
+    const int j = threadIdx.x, lane = j & 31, warp = j >> 5;
+    const size_t stride = (size_t) h_v * S;
+    float* col = state + (size_t) hv * S + j;
+    // the next GEMV's weights toward L2 (this block's slice)
+    if (pf != nullptr) {
+        const size_t per = (pf_bytes / gridDim.x + 127) & ~(size_t) 127, b0 = per * blockIdx.x;
+        const size_t b1 = b0 + per < pf_bytes ? b0 + per : pf_bytes;
+        for (size_t o = b0 + (size_t) j * 128; o < b1; o += (size_t) S * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(pf + o));
+    }
+    // into shared memory with cp.async (one round trip, no registers held): this v head's state slice [S][S], x and
+    // its alpha / beta rows.  Then alpha (warp 0) and beta (warp 1): mv_kernel's row (alpha 1, no bias)
+    extern __shared__ __align__(16) unsigned char mid_sm[];
+    float* sst = (float*) mid_sm;                                   // [i][j]: state row i of this head
+    float* sx = sst + S * S;
+    const int rb = ab_bf16 ? n_in * 2 : n_in * 4;   // (a row's bytes)
+    unsigned char* sw = (unsigned char*) (sx + n_in);
+    {
+        for (int c = j; c < S * S / 4; c += S) {   // (16-byte pieces: row c / 32, piece c % 32)
+            const int i = c / (S / 4), p = c % (S / 4);
+            __pipeline_memcpy_async(sst + i * S + p * 4, state + (size_t) i * stride + (size_t) hv * S + p * 4, 16);
+        }
+        const char* gx = (const char*) xf;
+        const char* ga = (const char*) wa + (size_t) hv * rb;
+        const char* gb = (const char*) wb + (size_t) hv * rb;
+        for (int o = j * 16; o < n_in * 4; o += S * 16) __pipeline_memcpy_async((unsigned char*) sx + o, gx + o, 16);
+        for (int o = j * 16; o < rb; o += S * 16) {
+            __pipeline_memcpy_async(sw + o, ga + o, 16);
+            __pipeline_memcpy_async(sw + rb + o, gb + o, 16);
+        }
+        __pipeline_commit();
+    }
+    // meanwhile the small inputs into registers (one round trip): this thread's q, k (the k head's) and v (the v
+    // head's) channels - the input, the old conv state, the taps (d_conv 4) - and the gates' and the norm's numbers
+    const int cq = src * S + j, ck = (h_k + src) * S + j, cv = (2 * h_k + hv) * S + j;
+    float* sq = cs + (size_t) cq * 3;
+    float* sk = cs + (size_t) ck * 3;
+    float* sv = cs + (size_t) cv * 3;
+    const float xq = qkv[cq], xk = qkv[ck], xv = qkv[cv];
+    // (the k head's q / k state through volatile loads: rank 0 overwrites it after the cluster barrier, so these reads
+    // must not be moved past it)
+    const volatile float* vq = sq;
+    const volatile float* vk = sk;
+    const float q0 = vq[0], q1 = vq[1], q2 = vq[2], k0 = vk[0], k1 = vk[1], k2 = vk[2], v0 = sv[0], v1 = sv[1], v2 = sv[2];
+    const float4 wq = *(const float4*) (kW + (size_t) cq * 4), wk = *(const float4*) (kW + (size_t) ck * 4),
+                 wv = *(const float4*) (kW + (size_t) cv * 4);
+    const size_t at = (size_t) hv * S + j;
+    const float zt = z[at], nrm = ssm_norm[j], dth = dt[hv], Ah = A[hv];
+    // the conv + SiLU (conv_silu_step_kernel's sum: kernel[0] on the oldest state row, the input on the last tap)
+    float qv = mid_conv4(q0, q1, q2, xq, wq);
+    float kv = mid_conv4(k0, k1, k2, xk, wk);
+    const float v = mid_conv4(v0, v1, v2, xv, wv);
+    if (h_out != nullptr) {
+        h_out[cv] = v;
+        if (rank == 0) {
+            h_out[cq] = qv;
+            h_out[ck] = kv;
+        }
+    }
+    sv[0] = v1;   // (slide: drop the oldest, append the newest - the v channels are this block's alone)
+    sv[1] = v2;
+    sv[2] = xv;
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    if (warp < 2) {
+        const unsigned char* w = sw + (size_t) warp * rb;
+        const float s = ab_bf16 ? mid_row_dot_bf16((const uint16_t*) w, sx, n_in, lane)
+                                : mid_row_dot_f32((const float*) w, sx, n_in, lane);
+        if (lane == 0) {
+            const float yv = 1.0f * s + 0.0f;
+            s_ab[warp] = yv;
+            if (ab_out != nullptr) ab_out[warp * h_v + hv] = yv;
+        }
+    }
+    cl.sync();   // (every block of the cluster has read the k head's old q / k state - and s_ab is visible)
+    if (rank == 0) {
+        sq[0] = q1;
+        sq[1] = q2;
+        sq[2] = xq;
+        sk[0] = k1;
+        sk[1] = k2;
+        sk[2] = xk;
+    }
+    float g = s_ab[0], b = s_ab[1];
+    {   // (gdn_core_kernel's prep)
+        double aq = (double) qv * (double) qv, ak = (double) kv * (double) kv;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            aq += __shfl_xor_sync(0xffffffffu, aq, o);
+            ak += __shfl_xor_sync(0xffffffffu, ak, o);
+        }
+        if ((j & 31) == 0) {
+            sh[0][j >> 5] = aq;
+            sh[1][j >> 5] = ak;
+        }
+        __syncthreads();
+        const double sq2 = sh[0][0] + sh[0][1] + sh[0][2] + sh[0][3];
+        const double sk2 = sh[1][0] + sh[1][1] + sh[1][2] + sh[1][3];
+        qv = qv * ((float) (1.0 / sqrt(sq2 + (double) eps)) * qscale);
+        kv = kv * ((float) (1.0 / sqrt(sk2 + (double) eps)) * 1.0f);
+        g = softplus_f(g + dth) * Ah;
+        b = sigmoid_f(b);
+    }
+    qs[j] = qv;
+    ks[j] = kv;
+    __syncthreads();
+    // gdn_core_kernel's recurrence, the state column read from shared memory twice (s *= dec recomputed: one
+    // multiply, the same float) instead of held in registers - written back as it goes
+    const float dec = expf(g);
+    float skd = 0.0f;
+#pragma unroll 16
+    for (int i = 0; i < S; ++i) {
+        const float sd = __fmul_rn(sst[i * S + j], dec);
+        skd = __fmaf_rn(sd, ks[i], skd);
+    }
+    const float d = (v - skd) * b;
+    float dot = 0.0f;
+#pragma unroll 16
+    for (int i = 0; i < S; ++i) {
+        const float sn = __fmaf_rn(ks[i], d, __fmul_rn(sst[i * S + j], dec));   // (the products the register
+        dot = __fmaf_rn(sn, qs[i], dot);                                        //  version's FMAs take, spelled out)
+        col[(size_t) i * stride] = sn;
+    }
+    os[j] = dot;
+    __syncthreads();
+    if (j < 32) {
+        double acc = 0.0;
+        for (int i = j; i < S; i += 32) acc += (double) os[i] * (double) os[i];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        if (j == 0) s_inv = (float) (1.0 / sqrt(acc / (double) S + (double) out_eps));
+    }
+    __syncthreads();
+    const float yv = os[j] * s_inv * nrm * sigmoid_f(zt);
+    y[at] = yv;
+    if (yq != nullptr) q81_store_warp(yv, yq + at / 32, j & 31);
+#endif
+}
+#endif
 // attn_prep_kernel over rows: grid (n_head + n_head_kv, T), row t at position p0 + t
 __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restrict__ qf, const float* __restrict__ k,
                                                             const float* __restrict__ v, const float* __restrict__ q_norm,
@@ -1869,6 +2067,71 @@ void gdn_core(float* state, const float* h, int T, int C, const float* gate, con
     pdl_launch(gdn_core_kernel<128>, h_v, 128, 0, s, state, h, T, C, gate, beta, h_k, h_v, prep, eps, 1.0f / std::sqrt((float) S),
                                              dt_bias, ssm_a, z, ssm_norm, out_eps, y, (Q81*) yq);
     check("gdn_core");
+}
+static size_t gdn_mid_smem(int n_in, bool bf16) { return (size_t) 128 * 128 * 4 + (size_t) n_in * 4 + (size_t) 2 * n_in * (bf16 ? 2 : 4); }
+bool gdn_mid_ok(int S, int h_k, int h_v, int d_conv, int n_in) {
+#if defined(STRATA_USE_HIP)
+    (void) S; (void) h_k; (void) h_v; (void) d_conv; (void) n_in;
+    return false;
+#else
+    if (S != 128 || h_k <= 0 || h_v % h_k != 0 || h_v / h_k > 8 || d_conv != 4 || n_in % 8 != 0) return false;
+    static int cc = -1, smem_max = 0;
+    if (cc < 0) {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        int optin = 0;
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cc = major;
+        smem_max = optin;
+        if (cc >= 9 && cudaFuncSetAttribute(gdn_mid_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, optin - 4096) != cudaSuccess) {
+            (void) cudaGetLastError();
+            cc = 0;
+        }
+    }
+    return cc >= 9 && gdn_mid_smem(n_in, false) + 4096 <= (size_t) smem_max;
+#endif
+}
+bool gdn_mid(float* state, float* conv_state, const float* qkv, const float* conv_w, int d_conv, const float* x,
+             const void* w_alpha, const void* w_beta, bool ab_bf16, int n_in, int S, int h_k, int h_v, float eps,
+             const float* dt_bias, const float* ssm_a, const float* z, const float* ssm_norm, float out_eps, float* h_out,
+             float* ab_out, float* y, void* yq, const void* pf, size_t pf_bytes, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+    (void) state; (void) conv_state; (void) qkv; (void) conv_w; (void) d_conv; (void) x; (void) w_alpha; (void) w_beta; (void) ab_bf16;
+    (void) n_in; (void) S; (void) h_k; (void) h_v; (void) eps; (void) dt_bias; (void) ssm_a; (void) z; (void) ssm_norm;
+    (void) out_eps; (void) h_out; (void) ab_out; (void) y; (void) yq; (void) pf; (void) pf_bytes; (void) s;
+    return false;
+#else
+    if (!gdn_mid_ok(S, h_k, h_v, d_conv, n_in)) return false;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(h_v);
+    cfg.blockDim = dim3(128);
+    cfg.dynamicSmemBytes = gdn_mid_smem(n_in, ab_bf16);
+    cfg.stream = s;
+    cudaLaunchAttribute at[2];
+    at[0].id = cudaLaunchAttributeClusterDimension;
+    at[0].val.clusterDim.x = h_v / h_k;
+    at[0].val.clusterDim.y = 1;
+    at[0].val.clusterDim.z = 1;
+    int na = 1;
+    cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+    if (pdl_enabled() && cudaStreamIsCapturing(s, &cst) == cudaSuccess && cst == cudaStreamCaptureStatusNone) {
+        at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at[1].val.programmaticStreamSerializationAllowed = 1;
+        na = 2;
+    }
+    cfg.attrs = at;
+    cfg.numAttrs = na;
+    const cudaError_t e = cudaLaunchKernelEx(&cfg, gdn_mid_kernel<128>, state, conv_state, qkv, conv_w, d_conv, x,
+                                             w_alpha, w_beta, ab_bf16, n_in, h_k, h_v, eps, 1.0f / std::sqrt((float) S), dt_bias,
+                                             ssm_a, z, ssm_norm, out_eps, h_out, ab_out, y, (Q81*) yq,
+                                             (const uint8_t*) pf, pf_bytes);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qwen35 gdn_mid: %s\n", cudaGetErrorString(e));
+        return false;
+    }
+    return true;
+#endif
 }
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int64_t p0, int T,
