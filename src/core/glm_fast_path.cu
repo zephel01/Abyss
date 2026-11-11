@@ -3754,6 +3754,110 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaFree(dxq);
         cudaFree(dhq);
     }
+    // STRATA_GLM_CPU_LANE_BITS=<inputs> (debug): the exact combine's premise, bit for bit - for every MoE layer whose
+    // lane runs in the device's arithmetic (cpu_exact), one RAM-tier expert on <inputs> normalised inputs through the
+    // device's decode kernels and through the CPU lane (the device's q8_1 activation, as a decode passes it): the
+    // activation's q8_1 the CPU makes itself, the down input's q8_1 blocks and the expert's rows compared as bits
+    if (const char* bv = getenv("STRATA_GLM_CPU_LANE_BITS"); bv != nullptr && std::atoi(bv) > 0 && !exl3_) {
+        const int reps = std::atoi(bv);
+        const int E = g.n_embd, FFE = g.n_ff_exp;
+        float *dh = nullptr, *dw = nullptr, *dx = nullptr, *dout = nullptr;
+        void *dxq = nullptr, *dhq = nullptr;
+        cudaMalloc(&dh, (size_t) E * 4);
+        cudaMalloc(&dw, (size_t) E * 4);
+        cudaMalloc(&dx, (size_t) E * 4);
+        cudaMalloc(&dout, (size_t) E * 4);
+        cudaMalloc(&dxq, (size_t) E / 32 * 36);
+        cudaMalloc(&dhq, (size_t) 8 * FFE / 32 * 36);
+        std::vector<float> h((size_t) E), ones((size_t) E, 1.0f), xc((size_t) E), og((size_t) E), oc((size_t) E);
+        std::vector<uint8_t> xqh((size_t) E / 32 * 36), hqh((size_t) FFE / 32 * 36), a1(kc::kNativeActBytes),
+            a2(kc::kNativeActBytes), h1(kc::kNativeHBytes);
+        uint64_t rs = 0x9E3779B97F4A7C15ull;
+        const auto rnd = [&]() {
+            rs ^= rs << 13;
+            rs ^= rs >> 7;
+            rs ^= rs << 17;
+            return (double) (rs >> 11) / 9007199254740992.0;
+        };
+        long long tot_rows = 0, bad_rows = 0, bad_h = 0, bad_x = 0;
+        for (int il = l0_; il < lt_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (!Ly.moe || Ly.mtp || Ly.exl3 || F->cpu_fmt[(size_t) il].n_ff == 0 || F->cpu_exact[(size_t) il] == 0 ||
+                !Ly.nv_host.empty())
+                continue;
+            const auto& Rl = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            const uint8_t* ex = nullptr;
+            int ex_id = -1;
+            for (int s = 0; s < Rl.n && ex == nullptr; ++s)
+                if (Rl.st[(size_t) s] == FastState::kRHold && Rl.key[(size_t) s] / g.n_expert == il) {
+                    ex = Rl.base + (size_t) s * Rl.stride;
+                    ex_id = Rl.key[(size_t) s] % g.n_expert;
+                }
+            if (ex == nullptr) continue;
+            cudaMemcpyAsync(F->scratch, ex, Ly.blob, cudaMemcpyHostToDevice, F->cs);
+            const unsigned long long sp = (unsigned long long) F->scratch;
+            const float one = 1.0f;
+            cudaMemcpyAsync(F->md.plan_ptr, &sp, 8, cudaMemcpyHostToDevice, F->cs);
+            cudaMemcpyAsync(F->md.plan_w, &one, 4, cudaMemcpyHostToDevice, F->cs);
+            cudaMemcpyAsync(F->md.plan_id, &ex_id, 4, cudaMemcpyHostToDevice, F->cs);
+            int lr = 0, lh = 0, lx = 0;
+            unsigned int worst = 0;
+            for (int rep = 0; rep < reps; ++rep) {
+                const double amp = rep % 3 == 0 ? 1.0 : rep % 3 == 1 ? 0.05 : 20.0;
+                for (int i = 0; i < E; ++i) {
+                    const double u = rnd() + rnd() + rnd() - 1.5;
+                    h[(size_t) i] = (float) (amp * u * (rnd() < 0.01 ? 30.0 : 1.0));
+                }
+                cudaMemcpyAsync(dh, h.data(), (size_t) E * 4, cudaMemcpyHostToDevice, F->cs);
+                cudaMemcpyAsync(dw, ones.data(), (size_t) E * 4, cudaMemcpyHostToDevice, F->cs);
+                cudaMemsetAsync(F->md.cpu_flag, 0, 4, F->cs);
+                gf::rms_q8(dh, nullptr, dw, g.norm_eps, E, dx, dxq, F->cs);
+                gf::MoeDev mdc = F->md;
+                mdc.nv_scale = Ly.nv_scale;
+                mdc.xpart = nullptr;   // (the float form: out = 1 * the expert's row + 0, its bits as they are)
+                gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr,
+                                F->cs, Ly.up_type);
+                gf::moe_down(Ly.d_type, mdc, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
+                cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
+                cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
+                cudaMemcpyAsync(xqh.data(), dxq, xqh.size(), cudaMemcpyDeviceToHost, F->cs);
+                cudaMemcpyAsync(hqh.data(), dhq, hqh.size(), cudaMemcpyDeviceToHost, F->cs);
+                cudaStreamSynchronize(F->cs);
+                // the activation: the CPU's own q8_1 of the device's float x against the device's blocks
+                kc::lane_q81_from_blocks(xqh.data(), E, a1.data());
+                kc::lane_q81_quant(xc.data(), E, a2.data());
+                if (std::memcmp(a1.data(), a2.data(), kc::lane_q81_act_bytes(E)) != 0) ++lx;
+                fast_cpu_experts(il, 1, &ex, &one, xc.data(), oc.data(), xqh.data());
+                kc::lane_q81_from_blocks(hqh.data(), FFE, h1.data());
+                if (std::memcmp(h1.data(), F->cpu_hq.data(), kc::lane_q81_act_bytes(FFE)) != 0) ++lh;
+                for (int r = 0; r < E; ++r) {
+                    uint32_t ua, ub;
+                    std::memcpy(&ua, &og[(size_t) r], 4);
+                    std::memcpy(&ub, &oc[(size_t) r], 4);
+                    if (ua != ub && !(og[(size_t) r] == 0.0f && oc[(size_t) r] == 0.0f)) {
+                        ++lr;
+                        worst = std::max(worst, ua > ub ? ua - ub : ub - ua);
+                    }
+                }
+            }
+            tot_rows += (long long) reps * E;
+            bad_rows += lr;
+            bad_h += lh;
+            bad_x += lx;
+            std::fprintf(stderr, "glm fast: CPU lane bits (layer %d, types %d/%d/%d, expert %d, %d inputs): rows "
+                                 "differing %d of %lld (worst %u ulp), down-input q8_1 differing %d, own activation "
+                                 "q8_1 differing %d\n",
+                         il, Ly.gu_type, Ly.up_type, Ly.d_type, ex_id, reps, lr, (long long) reps * E, worst, lh, lx);
+        }
+        std::fprintf(stderr, "glm fast: CPU lane bits: %lld of %lld rows differ, %lld down inputs, %lld activations\n",
+                     bad_rows, tot_rows, bad_h, bad_x);
+        cudaFree(dh);
+        cudaFree(dw);
+        cudaFree(dx);
+        cudaFree(dout);
+        cudaFree(dxq);
+        cudaFree(dhq);
+    }
     return true;
 }
 
@@ -4782,6 +4886,19 @@ void Glm5Model::fast_service() {
             static const char* rlog = getenv("STRATA_GLM_ROUTE_LOG");
             if (rlog != nullptr) {
                 static thread_local FILE* rf = std::fopen((std::string(rlog) + "." + std::to_string(dev_)).c_str(), "w");
+                // (the first route: "R layer e..." lines, the VRAM residents the decode starts from, and "S layer n"
+                // the layer's slots - a cache simulator's starting point)
+                static thread_local bool rf_res = false;
+                if (rf != nullptr && !rf_res) {
+                    rf_res = true;
+                    for (int l2 = l0_; l2 < lt_; ++l2) {
+                        if (!F->L[(size_t) l2].moe) continue;
+                        std::fprintf(rf, "S %d %d\nR %d", l2, F->lp[(size_t) l2].n, l2);
+                        for (int e = 0; e < g.n_expert; ++e)
+                            if (F->slot_of[(size_t) l2 * g.n_expert + e] >= 0) std::fprintf(rf, " %d", e);
+                        std::fprintf(rf, "\n");
+                    }
+                }
                 if (rf != nullptr) {
                     std::fprintf(rf, "%d", il);
                     for (int i = 0; i < K; ++i) std::fprintf(rf, " %d", ids[i]);
