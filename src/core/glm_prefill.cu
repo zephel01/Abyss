@@ -2834,15 +2834,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
                     S->mark("q35_proj", s);
                     q35::attn_prep_rows(B.qf, B.k, B.v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
-                                        g.n_rot, g.rope_base, pt0, tn, Ly.kc, Ly.vc, B.q, s);
+                                        g.n_rot, g.rope_base, pt0, tn, Ly.kc, Ly.vc, B.q, s, q35_kv4_);
                     if (g.q4x) {
                         Q4xBufs Q = carve_q4x(c, (size_t) tn, g);
                         if (!q4_attn(il, pt0, tn, xs, B.q, B.ao, Q, err)) return false;
                     } else {
                         q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, tn,
-                                         1.0f / std::sqrt((float) D), B.ao, s);
+                                         1.0f / std::sqrt((float) D), B.ao, s, q35_kv4_);
                     }
-                    q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s);
+                    q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s, q35_kv4_);
                     S->mark("q35_attn", s);
                     if (t0 + tn == T) dump_row("attn_gated-" + Ls, B.ao, HDq, tn - 1);
                     if (!skip_output) {
@@ -4325,7 +4325,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.ak, KVq, E, S->x16, E, kq, KVq, Tv, 0.0f);
             hgemm_q(Ly.av, KVq, E, S->x16, E, vq, KVq, Tv, 0.0f);
             q35::attn_kv_rows(kq, vq, Ly.k_norm, g.norm_eps, g.attn_head_kv, g.head_dim, g.n_rot, g.rope_base, p0, Tv,
-                              Ly.kc, Ly.vc, s);
+                              Ly.kc, Ly.vc, s, q35_kv4_);
             q35_row_done_ = std::max(q35_row_done_, p0 + Tv - 1);
             S->mark("mtp_rows", s);
         } else if (Tv > 0) {

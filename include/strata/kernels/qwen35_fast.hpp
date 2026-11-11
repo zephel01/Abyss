@@ -20,19 +20,23 @@ void scale(float* x, int n, float a, cudaStream_t s);
 /// decay exp(gate) lies in (0, 1]); beta[h] = sigmoid(beta[h]) in place.
 void gdn_gates(const float* alpha, const float* dt_bias, const float* ssm_a, float* beta, float* gate, int h_v,
                cudaStream_t s);
+/// `q4` (--kv q4_0 on the qwen35moe path): the caches hold Hadamard-rotated q4_0 rows of kv_q4_row_bytes() each (the
+/// layout in qwen35_fast.cu), not FP16; q is rotated the same way by the prologue, the attention reads the rows in
+/// place, and attn_gate / attn_gate_rows rotate the output back.  Every function below that takes a cache takes q4.
+inline size_t kv_q4_row_bytes() { return 144; }
 /// The attention layer's prologue at position p: q_full ([n_head][2 * head_dim], a head's q then its gate) -> q
 /// ([n_head][head_dim]: rms-normed by q_norm, NEOX RoPE on the first n_rot dims); k ([n_head_kv][head_dim]: k_norm,
 /// RoPE) and v into row p of the FP16 caches kc / vc ([ctx][n_head_kv][head_dim]).  head_dim 256.
 void attn_prep(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm, float eps,
                int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int p, uint16_t* kc, uint16_t* vc,
-               float* q, cudaStream_t s);
+               float* q, cudaStream_t s, bool q4 = false);
 /// The scratch (floats) attn_decode needs for n_head heads over a cache of max_ctx positions.
 size_t attn_part_floats(int n_head, int head_dim, int max_ctx);
 /// One token's attention: out[h] = softmax(scale * q[h] . K[g][t]) V[g][t] over t < n_pos, g = h / (n_head /
 /// n_head_kv), from the FP16 caches; the positions in chunks (a block each: a partial max / sum / accumulator into
 /// part), then merged.  head_dim 256.
 void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
-                 int n_pos, float scale, float* part, float* out, cudaStream_t s);
+                 int n_pos, float scale, float* part, float* out, cudaStream_t s, bool q4 = false);
 /// attn_decode for `rows` rows at once, each over its own cells: row r's query q[r] ([n_head][head_dim]) attends to the
 /// cache rows ids[r * ld_ids + j], j < steps[r * 4 + 3] (<= max_ids; a QSA step record a row, device), read in place,
 /// into out[r]; bit-identical to gather_rows + attn_decode per row.  ids null: row r attends to cells 0 .. its width - 1
@@ -48,7 +52,7 @@ void copy_f32(float* dst, const float* src, int n, cudaStream_t s);
 /// two H2D copies that queue behind the background expert copies on the copy engine; the same values.
 void q4_step_set(int32_t* step, int32_t* pos, int s0, int s1, int s2, int s3, int p, cudaStream_t s);
 /// o[h][d] *= sigmoid(q_full[h][head_dim + d]) (the q projection's gate half), in place.
-void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s);
+void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s, bool q4 = false);
 /// x[i] *= sigmoid(g[0]), i < n (the shared expert's gate).
 void scale_sigmoid(float* x, int n, const float* g, cudaStream_t s);
 /// x[t][i] *= sigmoid(g[t]) over T rows of n (the window's columns).
@@ -100,25 +104,25 @@ bool gdn_mid(float* state, float* conv_state, const float* qkv, const float* con
 /// q [T][n_head][head_dim] and the caches' rows p0 .. p0 + T - 1.
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int64_t p0, int T,
-                    uint16_t* kc, uint16_t* vc, float* q, cudaStream_t s);
+                    uint16_t* kc, uint16_t* vc, float* q, cudaStream_t s, bool q4 = false);
 /// The causal attention of T queries (row t at position p0 + t, over the cache's positions <= p0 + t):
 /// out [T][n_head][head_dim].  A block takes 4 queries and one KV head's group of n_head / n_head_kv heads (8, 16 or
 /// 32 of them), a warp 1, 2 or 4 heads, a lane 8 dims; the keys stream past once a block.  head_dim 256.
 void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
-                 int64_t p0, int T, float scale, float* out, cudaStream_t s);
+                 int64_t p0, int T, float scale, float* out, cudaStream_t s, bool q4 = false);
 /// The scratch (floats) attn_window needs for max_rows rows of n_head heads over a cache of max_ctx positions.
 size_t attn_window_floats(int n_head, int head_dim, int max_ctx, int max_rows);
 /// attn_prompt for a verify window's few rows (row t at position p0 + t): the keys split into chunks of 128 positions,
 /// a block each per 4 rows and KV group, the partials into part, then merged - the same sums as attn_prompt up to
 /// their order.  head_dim 256.
 void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
-                 int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s);
+                 int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s, bool q4 = false);
 /// attn_gate over T rows.
-void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s);
+void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s, bool q4 = false);
 /// attn_prep_rows' K / V half alone: k / v rows [T][n_head_kv][head_dim] (k_norm, RoPE) into the caches' rows p0 ..
 /// p0 + T - 1 (the drafter's cache rows, whose queries are never needed).
 void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps, int n_head_kv, int head_dim, int n_rot,
-                  float rope_base, int64_t p0, int T, uint16_t* kc, uint16_t* vc, cudaStream_t s);
+                  float rope_base, int64_t p0, int T, uint16_t* kc, uint16_t* vc, cudaStream_t s, bool q4 = false);
 /// out[0] = softmax(logits)[tok[0]] over n logits (a draft's confidence).
 void top_prob(const float* logits, int n, const int* tok, float* out, cudaStream_t s);
 /// ffn[t] *= sigmoid(x[t] . w) over T rows of n (the shared expert's gate from its input rows).

@@ -525,6 +525,7 @@ public:
     // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (the prompt path, the verify windows and the
     // conversation snapshot are elsewhere; no layer splits yet)
     void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations
+    bool q35_kv4_ = false;   // --kv q4_0 (STRATA_GLM_KV_Q4): the attention layers' caches as rotated q4_0 (qwen35_fast.hpp)
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)

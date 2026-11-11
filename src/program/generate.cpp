@@ -3494,6 +3494,8 @@ int main(int argc, char** argv) {
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        // --kv q4_0 (or q4) on the qwen35moe path (Ornith): the attention layers' caches as rotated q4_0 (qwen35_fast.hpp)
+        if ((o.kv == "q4_0" || o.kv == "q4") && std::getenv("STRATA_GLM_KV_Q4") == nullptr) set_env("STRATA_GLM_KV_Q4", "1");
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

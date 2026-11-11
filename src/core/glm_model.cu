@@ -1631,8 +1631,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // layer's BF16 K / V caches at the context, and qwen4exp's QSA block keys (one pooled key per 4 cells)
     const double gdn_state = 4.0 * ((double) g.ssm_state * g.ssm_v_heads * g.ssm_state +
                                     (double) g.ssm_conv_dim() * (g.d_conv - 1));
+    const bool q35_kv4 = !g.q4x && getenv("STRATA_GLM_KV_Q4") != nullptr && std::atoi(getenv("STRATA_GLM_KV_Q4")) != 0;
     const double q35_attn_state =
-        2.0 * 2.0 * (double) max_ctx * g.attn_head_kv * g.head_dim +
+        2.0 * (double) max_ctx * g.attn_head_kv * (q35_kv4 ? 144.0 : 2.0 * g.head_dim) +
         (g.q4x ? 4.0 * 128.0 * ((double) max_ctx / 4.0 + 2.0 + 3.0) : 0.0);
     const auto layer_state = [&](int l) {
         if (g.qwen35()) return g.is_recr(l) ? gdn_state : q35_attn_state;
