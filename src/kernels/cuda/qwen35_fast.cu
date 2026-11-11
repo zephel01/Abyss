@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <type_traits>
 
 namespace strata::kernels::q35 {
 namespace {
@@ -136,6 +137,53 @@ __device__ __forceinline__ void q4_put(uint8_t* b, int d, float x) {
     if ((d & 7) == 0) reinterpret_cast<uint32_t*>(b + 16)[d >> 3] = (uint32_t) w;
     if ((d & 31) == 0) reinterpret_cast<uint16_t*>(b)[d >> 5] = f2h(sc);
 }
+// --kv int8 (and k8v4's K): unrotated, 8 groups of 32 dims, scale = max |x| / 127, code = round(x / scale) - the 8 FP16
+// scales, then the 256 int8 codes in dim order (a lane's 8 dims one aligned 64-bit load).  272 B a row
+constexpr int kQ8Row = 272;
+__device__ __forceinline__ void q8_ld8(const uint16_t* c, size_t ch, int col, float* f) {
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(c) + ch * kQ8Row;
+    const float d = h2f(reinterpret_cast<const uint16_t*>(b)[col >> 2]);
+    const uint2 w = reinterpret_cast<const uint2*>(b + 16)[col];
+    const int8_t* q = reinterpret_cast<const int8_t*>(&w);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) f[i] = (float) q[i] * d;
+}
+__device__ __forceinline__ void q8_put(uint8_t* b, int d, float x) {
+    const float amax = warp_max(fabsf(x));
+    const float sc = amax / 127.0f, id = sc != 0.0f ? 1.0f / sc : 0.0f;
+    reinterpret_cast<int8_t*>(b + 16)[d] = (int8_t) max(-127, min(127, __float2int_rn(x * id)));
+    if ((d & 31) == 0) reinterpret_cast<uint16_t*>(b)[d >> 5] = f2h(sc);
+}
+// The cache formats (the host's `kv` argument): 0 FP16, 1 q4_0 (K and V rotated), 2 int8, 3 k8v4 (K int8, V rotated
+// q4_0).  A half's format: 0 FP16, 1 q4_0, 2 int8
+__host__ __device__ constexpr int kv_kf(int kv) { return kv == 1 ? 1 : kv >= 2 ? 2 : 0; }
+__host__ __device__ constexpr int kv_vf(int kv) { return kv == 1 || kv == 3 ? 1 : kv == 2 ? 2 : 0; }
+__host__ __device__ constexpr int kv_row(int f) { return f == 1 ? kQ4Row : f == 2 ? kQ8Row : 2 * kD; }
+template <int F>
+__device__ __forceinline__ void kv_ld8(const uint16_t* c, size_t ch, int col, float* f) {
+    if constexpr (F == 1) q4_ld8(c, ch, col, f);
+    else if constexpr (F == 2) q8_ld8(c, ch, col, f);
+    else {
+        const __half2* h = reinterpret_cast<const __half2*>(c + ch * kD + col * 8);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 x = __half22float2(h[i]);
+            f[2 * i] = x.x;
+            f[2 * i + 1] = x.y;
+        }
+    }
+}
+template <int F>
+__device__ __forceinline__ uint4 kv_ld8h(const uint16_t* c, size_t ch, int col) {
+    if constexpr (F == 0) return *reinterpret_cast<const uint4*>(c + ch * kD + col * 8);
+    float f[8];
+    kv_ld8<F>(c, ch, col, f);
+    uint4 u;
+    uint32_t* p = reinterpret_cast<uint32_t*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) p[i] = (uint32_t) f2h(f[2 * i]) | ((uint32_t) f2h(f[2 * i + 1]) << 16);
+    return u;
+}
 
 __global__ void silu_kernel(float* __restrict__ x, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -206,7 +254,7 @@ __global__ void __launch_bounds__(kD) attn_prep_kernel(const float* __restrict__
 
 // grid (n_head, chunks), 128 threads: warp w takes positions t0 + w, t0 + w + 4, ..; a lane holds 8 dims of q (scaled)
 // and of the V accumulator; the online softmax per warp, the 4 warps merged into the chunk's partial (max, sum, acc)
-template <bool Q4>
+template <int KV>
 __global__ void __launch_bounds__(kWarps * 32) attn_part_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                                                                 const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
                                                                 int n_pos, float scale, float* __restrict__ part,
@@ -223,10 +271,10 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_kernel(const float* __r
 #pragma unroll
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
     for (int t = t0 + warp; t < t1; t += kWarps) {
-        if constexpr (Q4) {
+        if constexpr (KV != 0) {
             float kf[8], vf[8];
-            q4_ld8(kc, (size_t) t * n_head_kv + g, lane, kf);
-            q4_ld8(vc, (size_t) t * n_head_kv + g, lane, vf);
+            kv_ld8<kv_kf(KV)>(kc, (size_t) t * n_head_kv + g, lane, kf);
+            kv_ld8<kv_vf(KV)>(vc, (size_t) t * n_head_kv + g, lane, vf);
             float dot = 0.0f;
 #pragma unroll
             for (int i = 0; i < 8; ++i) dot += qv[i] * kf[i];
@@ -895,6 +943,7 @@ __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restr
 }
 // attn_prep_rows_kernel for a q4_0 cache: the same norms and RoPE, then q, k and v rotated by H; k and v go to the
 // cache rows as q4_0 (kQ4Row bytes a row).  T 1 at p0 = p is attn_prep's token.  n_head 0: the K / V blocks alone
+template <int KV>
 __global__ void __launch_bounds__(kD) attn_prep_q4_kernel(const float* __restrict__ qf, const float* __restrict__ k,
                                                           const float* __restrict__ v, const float* __restrict__ q_norm,
                                                           const float* __restrict__ k_norm, float eps, int n_head,
@@ -925,16 +974,30 @@ __global__ void __launch_bounds__(kD) attn_prep_q4_kernel(const float* __restric
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * sn : x0 * sn + x1 * c;
     }
+    constexpr int KF = kv_kf(KV), VF = kv_vf(KV);   // (q4_0 halves rotated; q is rotated with K)
     sk[d] = y;
     sw[d] = is_q ? 0.0f : vrow[(size_t) g * kD + d];
-    fwht256_sh(sk, d);
-    if (!is_q) fwht256_sh(sw, d);   // (block-uniform)
+    if constexpr (KF == 1) {
+        fwht256_sh(sk, d);
+        y = sk[d] * (1.0f / 16.0f);
+    }
+    float vv = sw[d];
+    if constexpr (VF == 1) {
+        if (!is_q) {   // (block-uniform)
+            fwht256_sh(sw, d);
+            vv = sw[d] * (1.0f / 16.0f);
+        }
+    }
     if (is_q) {
-        q[((size_t) t * n_head + b) * kD + d] = sk[d] * (1.0f / 16.0f);
+        q[((size_t) t * n_head + b) * kD + d] = y;
     } else {
-        const size_t row = ((size_t) p * n_head_kv + g) * kQ4Row;
-        q4_put(reinterpret_cast<uint8_t*>(kc) + row, d, sk[d] * (1.0f / 16.0f));
-        q4_put(reinterpret_cast<uint8_t*>(vc) + row, d, sw[d] * (1.0f / 16.0f));
+        const size_t ch = (size_t) p * n_head_kv + g;
+        uint8_t* kb = reinterpret_cast<uint8_t*>(kc) + ch * kv_row(KF);
+        uint8_t* vb = reinterpret_cast<uint8_t*>(vc) + ch * kv_row(VF);
+        if constexpr (KF == 1) q4_put(kb, d, y);
+        else q8_put(kb, d, y);
+        if constexpr (VF == 1) q4_put(vb, d, vv);
+        else q8_put(vb, d, vv);
     }
 }
 // attn_gate_rows_kernel after rotating the q4_0 cache's attention output back: o[t][h] = H o[t][h], then the gate
@@ -957,7 +1020,7 @@ __device__ __forceinline__ void unpack8(const uint4& u, float* f) {
 }
 // the causal attention of 4 queries a block over one KV head's group: 8 warps x HW heads, a lane 8 dims; the keys
 // stream past once, each (query, head) pair an online softmax in registers.  grid (ceil(T / 4), n_head_kv)
-template <int HW, bool Q4>
+template <int HW, int KV>
 __global__ void __launch_bounds__(256) attn_prompt_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                                                           const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
                                                           int64_t p0, int T, float scale, float* __restrict__ out) {
@@ -983,9 +1046,9 @@ __global__ void __launch_bounds__(256) attn_prompt_kernel(const float* __restric
     const int64_t pend = p0 + t0 + nq;   // the keys: positions < pend, each query's own and before
     for (int64_t kp = 0; kp < pend; ++kp) {
         float kf[8], vf[8];
-        if constexpr (Q4) {
-            q4_ld8(kc, (size_t) kp * n_head_kv + g, lane, kf);
-            q4_ld8(vc, (size_t) kp * n_head_kv + g, lane, vf);
+        if constexpr (KV != 0) {
+            kv_ld8<kv_kf(KV)>(kc, (size_t) kp * n_head_kv + g, lane, kf);
+            kv_ld8<kv_vf(KV)>(vc, (size_t) kp * n_head_kv + g, lane, vf);
         } else {
             const size_t row = ((size_t) kp * n_head_kv + g) * kD + lane * 8;
             unpack8(*reinterpret_cast<const uint4*>(kc + row), kf);
@@ -1047,7 +1110,7 @@ __global__ void q16_scale_kernel(const float* __restrict__ q, size_t n, float sc
     if (i < n) q16[i] = to_wh16(q[i] * scale);
 }
 
-template <bool Q4>
+template <int KV>
 __global__ void __launch_bounds__(256) attn_prompt_tc_kernel(const wh16* __restrict__ q16, const uint16_t* __restrict__ kc,
                                                              const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
                                                              int64_t p0, int T, float* __restrict__ out) {
@@ -1077,10 +1140,10 @@ __global__ void __launch_bounds__(256) attn_prompt_tc_kernel(const wh16* __restr
             const int idx = it * 256 + tid, row = idx / (kD / 8), col = idx % (kD / 8);
             const int64_t kp = kt + row;
             const uint4 z = make_uint4(0, 0, 0, 0);
-            if constexpr (Q4) {
+            if constexpr (KV != 0) {
                 const size_t ch = (size_t) kp * n_head_kv + g;
-                *reinterpret_cast<uint4*>(sK + row * kKP + col * 8) = kp < kend ? q4_ld8h(kc, ch, col) : z;
-                if (with_v) *reinterpret_cast<uint4*>(sV + row * kD + col * 8) = kp < kend ? q4_ld8h(vc, ch, col) : z;
+                *reinterpret_cast<uint4*>(sK + row * kKP + col * 8) = kp < kend ? kv_ld8h<kv_kf(KV)>(kc, ch, col) : z;
+                if (with_v) *reinterpret_cast<uint4*>(sV + row * kD + col * 8) = kp < kend ? kv_ld8h<kv_vf(KV)>(vc, ch, col) : z;
             } else {
             const size_t off = ((size_t) kp * n_head_kv + g) * kD + col * 8;
             *reinterpret_cast<uint4*>(sK + row * kKP + col * 8) = kp < kend ? *reinterpret_cast<const uint4*>(kc + off) : z;
@@ -1178,7 +1241,7 @@ __global__ void __launch_bounds__(256) attn_prompt_tc_kernel(const wh16* __restr
 // [row][head][chunk] for attn_merge_kernel - the window's few rows alone gave attn_prompt 1-4 blocks, each walking
 // every cached position.  grid (ceil(T / 4), n_head_kv, n_chunks)
 constexpr int kWinChunk = 128;
-template <int HW, bool Q4>
+template <int HW, int KV>
 __global__ void __launch_bounds__(256) attn_window_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                                                           const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
                                                           int64_t p0, int T, float scale, float* __restrict__ part,
@@ -1204,9 +1267,9 @@ __global__ void __launch_bounds__(256) attn_window_kernel(const float* __restric
     const int64_t k0 = (int64_t) c * kWinChunk, k1 = min(k0 + kWinChunk, p0 + t0 + nq);
     for (int64_t kp = k0; kp < k1; ++kp) {
         float kf[8], vf[8];
-        if constexpr (Q4) {
-            q4_ld8(kc, (size_t) kp * n_head_kv + g, lane, kf);
-            q4_ld8(vc, (size_t) kp * n_head_kv + g, lane, vf);
+        if constexpr (KV != 0) {
+            kv_ld8<kv_kf(KV)>(kc, (size_t) kp * n_head_kv + g, lane, kf);
+            kv_ld8<kv_vf(KV)>(vc, (size_t) kp * n_head_kv + g, lane, vf);
         } else {
             const size_t row = ((size_t) kp * n_head_kv + g) * kD + lane * 8;
             unpack8(*reinterpret_cast<const uint4*>(kc + row), kf);
@@ -1251,7 +1314,7 @@ __global__ void __launch_bounds__(256) attn_window_kernel(const float* __restric
 // in one transposed butterfly (9 shuffles for 8 keys, not 5 a key), and the softmax runs per tile of 32 keys (one max
 // and one rescale a tile, not one a key); the tile's probabilities pass through shared memory to the P.V sums.
 // grid (ceil(T / RB), n_head_kv, n_chunks)
-template <int PW, bool Q4>
+template <int PW, int KV>
 __global__ void __launch_bounds__(256) attn_split_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                                                          const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
                                                          int64_t p0, int T, float scale, float* __restrict__ part,
@@ -1285,10 +1348,10 @@ __global__ void __launch_bounds__(256) attn_split_kernel(const float* __restrict
         for (int it = 0; it < 4; ++it) {   // 32 rows x 32 uint4 each for K and V, 256 threads
             const int idx = it * 256 + threadIdx.x, row = idx >> 5, col = idx & 31;
             const uint4 z = make_uint4(0, 0, 0, 0);
-            if constexpr (Q4) {
+            if constexpr (KV != 0) {
                 const size_t ch = (size_t) (kt + row) * n_head_kv + g;
-                sk[row][col] = row < nk ? q4_ld8h(kc, ch, col) : z;
-                sv[row][col] = row < nk ? q4_ld8h(vc, ch, col) : z;
+                sk[row][col] = row < nk ? kv_ld8h<kv_kf(KV)>(kc, ch, col) : z;
+                sv[row][col] = row < nk ? kv_ld8h<kv_vf(KV)>(vc, ch, col) : z;
             } else {
             const size_t off = ((size_t) (kt + row) * n_head_kv + g) * kD + col * 8;
             sk[row][col] = row < nk ? *reinterpret_cast<const uint4*>(kc + off) : z;
@@ -2028,16 +2091,27 @@ void gdn_gates(const float* alpha, const float* dt_bias, const float* ssm_a, flo
     gdn_gates_kernel<<<(h_v + 127) / 128, 128, 0, s>>>(alpha, dt_bias, ssm_a, beta, gate, h_v);
     check("gdn_gates");
 }
+// fn(std::integral_constant<int, kv>) for a quantized cache format kv (1..3; the FP16 calls stay as they were)
+template <class Fn>
+static void kv_switch(int kv, Fn&& fn) {
+    switch (kv) {
+        case 1: fn(std::integral_constant<int, 1>{}); break;
+        case 2: fn(std::integral_constant<int, 2>{}); break;
+        default: fn(std::integral_constant<int, 3>{}); break;
+    }
+}
 void attn_prep(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm, float eps,
                int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int p, uint16_t* kc, uint16_t* vc,
-               float* q, cudaStream_t s, bool q4) {
+               float* q, cudaStream_t s, int kv) {
     if (head_dim != kD) {
         std::fprintf(stderr, "qwen35 attn_prep: head_dim %d (the kernels take %d)\n", head_dim, kD);
         return;
     }
-    if (q4) {
-        attn_prep_q4_kernel<<<dim3((unsigned) (n_head + n_head_kv), 1), kD, 0, s>>>(
-            q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, (int64_t) p, kc, vc, q);
+    if (kv != 0) {
+        kv_switch(kv, [&](auto K) {
+            attn_prep_q4_kernel<K()><<<dim3((unsigned) (n_head + n_head_kv), 1), kD, 0, s>>>(
+                q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, (int64_t) p, kc, vc, q);
+        });
         check("attn_prep");
         return;
     }
@@ -2048,7 +2122,7 @@ void attn_prep(const float* q_full, const float* k, const float* v, const float*
 // attn_split_kernel over the keys < p0 + T for T rows; part holds at least kMinChunks chunks a row and head.
 // false: a shape it does not take (the caller runs its old kernel)
 static bool attn_split(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int64_t p0,
-                       int T, float scale, float* part, float* out, cudaStream_t s, bool q4 = false) {
+                       int T, float scale, float* part, float* out, cudaStream_t s, int kv = 0) {
     static const int mode = [] { const char* v = getenv("STRATA_Q35_ATTN"); return v ? std::atoi(v) : 0; }();
     static const int chunk_env = [] { const char* v = getenv("STRATA_Q35_ATTN_CHUNK"); return v ? std::atoi(v) : 0; }();
     const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
@@ -2065,8 +2139,8 @@ static bool attn_split(const float* q, const uint16_t* kc, const uint16_t* vc, i
     const int n_chunks = (int) ((n_keys + chunk - 1) / chunk);
     const dim3 grid((unsigned) ((T + RB - 1) / RB), (unsigned) n_head_kv, (unsigned) n_chunks);
     switch (PW) {
-#define Q35_SPLIT(n) case n: if (q4) attn_split_kernel<n, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks, chunk); \
-                              else attn_split_kernel<n, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks, chunk); break;
+#define Q35_SPLIT(n) case n: if (kv != 0) kv_switch(kv, [&](auto K) { attn_split_kernel<n, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks, chunk); }); \
+                              else attn_split_kernel<n, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks, chunk); break;
         Q35_SPLIT(1) Q35_SPLIT(2) Q35_SPLIT(3) Q35_SPLIT(4) Q35_SPLIT(5) Q35_SPLIT(6) Q35_SPLIT(7) Q35_SPLIT(8)
 #undef Q35_SPLIT
         default: return false;
@@ -2079,21 +2153,23 @@ size_t attn_part_floats(int n_head, int head_dim, int max_ctx) {
     return (size_t) n_head * chunks * ((size_t) head_dim + 2);
 }
 void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
-                 int n_pos, float scale, float* part, float* out, cudaStream_t s, bool q4) {
+                 int n_pos, float scale, float* part, float* out, cudaStream_t s, int kv) {
     if (head_dim != kD || n_pos <= 0 || n_head % n_head_kv != 0) {
         std::fprintf(stderr, "qwen35 attn_decode: head_dim %d, n_pos %d, heads %d / %d\n", head_dim, n_pos, n_head, n_head_kv);
         return;
     }
-    if (attn_split(q, kc, vc, n_head, n_head_kv, n_pos - 1, 1, scale, part, out, s, q4)) {
+    if (attn_split(q, kc, vc, n_head, n_head_kv, n_pos - 1, 1, scale, part, out, s, kv)) {
         check("attn_decode");
         return;
     }
     const int n_chunks = (n_pos + kChunk - 1) / kChunk;
-    if (q4)
-        attn_part_kernel<true><<<dim3((unsigned) n_head, (unsigned) n_chunks), kWarps * 32, 0, s>>>(
-            q, kc, vc, n_head, n_head_kv, n_pos, scale, part, n_chunks);
+    if (kv != 0)
+        kv_switch(kv, [&](auto K) {
+            attn_part_kernel<K()><<<dim3((unsigned) n_head, (unsigned) n_chunks), kWarps * 32, 0, s>>>(
+                q, kc, vc, n_head, n_head_kv, n_pos, scale, part, n_chunks);
+        });
     else
-    attn_part_kernel<false><<<dim3((unsigned) n_head, (unsigned) n_chunks), kWarps * 32, 0, s>>>(q, kc, vc, n_head, n_head_kv,
+    attn_part_kernel<0><<<dim3((unsigned) n_head, (unsigned) n_chunks), kWarps * 32, 0, s>>>(q, kc, vc, n_head, n_head_kv,
                                                                                             n_pos, scale, part, n_chunks);
     pdl_launch(attn_merge_kernel, n_head, kD, 0, s, part, n_chunks, out);
     check("attn_decode");
@@ -2158,9 +2234,9 @@ void q4_step_set(int32_t* step, int32_t* pos, int s0, int s1, int s2, int s3, in
     q4_step_set_kernel<<<1, 64, 0, s>>>(step, pos, s0, s1, s2, s3, p);
     check("q4_step_set");
 }
-void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s, bool q4) {
+void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s, int kv) {
     if (head_dim != kD) return;
-    if (q4) {
+    if (kv == 1 || kv == 3) {   // (a rotated V: the output back)
         attn_gate_q4_kernel<<<dim3((unsigned) n_head, 1), kD, 0, s>>>(o, q_full, n_head);
         check("attn_gate");
         return;
@@ -2323,15 +2399,17 @@ bool gdn_mid(float* state, float* conv_state, const float* qkv, const float* con
 }
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int64_t p0, int T,
-                    uint16_t* kc, uint16_t* vc, float* q, cudaStream_t s, bool q4) {
+                    uint16_t* kc, uint16_t* vc, float* q, cudaStream_t s, int kv) {
     if (T <= 0) return;
     if (head_dim != kD) {
         std::fprintf(stderr, "qwen35 attn_prep_rows: head_dim %d (the kernels take %d)\n", head_dim, kD);
         return;
     }
-    if (q4) {
-        attn_prep_q4_kernel<<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
-            q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q);
+    if (kv != 0) {
+        kv_switch(kv, [&](auto K) {
+            attn_prep_q4_kernel<K()><<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
+                q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q);
+        });
         check("attn_prep_rows");
         return;
     }
@@ -2340,7 +2418,7 @@ void attn_prep_rows(const float* q_full, const float* k, const float* v, const f
     check("attn_prep_rows");
 }
 void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
-                 int64_t p0, int T, float scale, float* out, cudaStream_t s, bool q4) {
+                 int64_t p0, int T, float scale, float* out, cudaStream_t s, int kv) {
     if (T <= 0) return;
     const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
     if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 12 && G != 16 && G != 32)) {
@@ -2353,7 +2431,7 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
         // the scaled q in FP16 for the tensor-core kernel (a scratch kept between calls; qwen35moe runs on one GPU)
         static wh16* q16 = nullptr;
         static size_t cap = 0;
-        static bool smem_ok = false, smem_ok4 = false;
+        static bool smem_ok = false, smem_okq[4] = {false, false, false, false};
         const size_t n = (size_t) T * n_head * kD;
         if (n > cap) {
             if (q16 != nullptr) cudaFree(q16);
@@ -2362,18 +2440,23 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
             if (cudaMalloc(&q16, n * sizeof(wh16)) == cudaSuccess) cap = n;
             else cudaGetLastError();
         }
-        if (!q4 && !smem_ok)
-            smem_ok = cudaFuncSetAttribute(attn_prompt_tc_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        if (kv == 0 && !smem_ok)
+            smem_ok = cudaFuncSetAttribute(attn_prompt_tc_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            (int) kPromptTcSmem) == cudaSuccess;
-        if (q4 && !smem_ok4)
-            smem_ok4 = cudaFuncSetAttribute(attn_prompt_tc_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            (int) kPromptTcSmem) == cudaSuccess;
-        if (q16 != nullptr && (q4 ? smem_ok4 : smem_ok)) {
+        if (kv != 0 && !smem_okq[kv & 3])
+            kv_switch(kv, [&](auto K) {
+                smem_okq[K()] = cudaFuncSetAttribute(attn_prompt_tc_kernel<K()>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                     (int) kPromptTcSmem) == cudaSuccess;
+            });
+        if (q16 != nullptr && (kv != 0 ? smem_okq[kv & 3] : smem_ok)) {
             q16_scale_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(q, n, scale, q16);
             const dim3 tg((unsigned) ((T + kPT - 1) / kPT), (unsigned) n_head_kv);
-            if (q4) attn_prompt_tc_kernel<true><<<tg, 256, kPromptTcSmem, s>>>(q16, kc, vc, n_head, n_head_kv, p0, T, out);
+            if (kv != 0)
+                kv_switch(kv, [&](auto K) {
+                    attn_prompt_tc_kernel<K()><<<tg, 256, kPromptTcSmem, s>>>(q16, kc, vc, n_head, n_head_kv, p0, T, out);
+                });
             else
-            attn_prompt_tc_kernel<false><<<tg, 256, kPromptTcSmem, s>>>(
+            attn_prompt_tc_kernel<0><<<tg, 256, kPromptTcSmem, s>>>(
                 q16, kc, vc, n_head, n_head_kv, p0, T, out);
             check("attn_prompt");
             return;
@@ -2381,13 +2464,15 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
         cudaGetLastError();
     }
     const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv);
-    if (q4) {
-        if (G == 8) attn_prompt_kernel<1, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-        else if (G == 16 || G == 12) attn_prompt_kernel<2, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-        else attn_prompt_kernel<4, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-    } else if (G == 8) attn_prompt_kernel<1, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-    else if (G == 16 || G == 12) attn_prompt_kernel<2, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-    else attn_prompt_kernel<4, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    if (kv != 0) {
+        kv_switch(kv, [&](auto K) {
+            if (G == 8) attn_prompt_kernel<1, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+            else if (G == 16 || G == 12) attn_prompt_kernel<2, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+            else attn_prompt_kernel<4, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+        });
+    } else if (G == 8) attn_prompt_kernel<1, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    else if (G == 16 || G == 12) attn_prompt_kernel<2, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    else attn_prompt_kernel<4, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     check("attn_prompt");
 }
 size_t attn_window_floats(int n_head, int head_dim, int max_ctx, int max_rows) {
@@ -2395,7 +2480,7 @@ size_t attn_window_floats(int n_head, int head_dim, int max_ctx, int max_rows) {
     return (size_t) max_rows * n_head * chunks * ((size_t) head_dim + 2);
 }
 void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
-                 int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s, bool q4) {
+                 int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s, int kv) {
     if (T <= 0) return;
     const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
     if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 16 && G != 32)) {
@@ -2403,25 +2488,27 @@ void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
                      n_head, n_head_kv);
         return;
     }
-    if (attn_split(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, out, s, q4)) {
+    if (attn_split(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, out, s, kv)) {
         check("attn_window");
         return;
     }
     const int n_chunks = (int) ((p0 + T + kWinChunk - 1) / kWinChunk);
     const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv, (unsigned) n_chunks);
-    if (q4) {
-        if (G == 8) attn_window_kernel<1, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-        else if (G == 16) attn_window_kernel<2, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-        else attn_window_kernel<4, true><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-    } else if (G == 8) attn_window_kernel<1, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-    else if (G == 16) attn_window_kernel<2, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-    else attn_window_kernel<4, false><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    if (kv != 0) {
+        kv_switch(kv, [&](auto K) {
+            if (G == 8) attn_window_kernel<1, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+            else if (G == 16) attn_window_kernel<2, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+            else attn_window_kernel<4, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+        });
+    } else if (G == 8) attn_window_kernel<1, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    else if (G == 16) attn_window_kernel<2, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    else attn_window_kernel<4, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
     pdl_launch(attn_merge_kernel, dim3((unsigned) n_head, (unsigned) T), kD, 0, s, part, n_chunks, out);
     check("attn_window");
 }
-void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s, bool q4) {
+void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_dim, cudaStream_t s, int kv) {
     if (T <= 0 || head_dim != kD) return;
-    if (q4) {
+    if (kv == 1 || kv == 3) {   // (a rotated V: the output back)
         attn_gate_q4_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(o, q_full, n_head);
         check("attn_gate_rows");
         return;
@@ -2430,12 +2517,13 @@ void attn_gate_rows(float* o, const float* q_full, int T, int n_head, int head_d
     check("attn_gate_rows");
 }
 void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps, int n_head_kv, int head_dim, int n_rot,
-                  float rope_base, int64_t p0, int T, uint16_t* kc, uint16_t* vc, cudaStream_t s, bool q4) {
+                  float rope_base, int64_t p0, int T, uint16_t* kc, uint16_t* vc, cudaStream_t s, int kv) {
     if (T <= 0 || head_dim != kD) return;
-    if (q4) {
-        attn_prep_q4_kernel<<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(k, k, v, k_norm, k_norm, eps, 0,
-                                                                                 n_head_kv, n_rot, rope_base, p0, kc, vc,
-                                                                                 nullptr);
+    if (kv != 0) {
+        kv_switch(kv, [&](auto K) {
+            attn_prep_q4_kernel<K()><<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(
+                k, k, v, k_norm, k_norm, eps, 0, n_head_kv, n_rot, rope_base, p0, kc, vc, nullptr);
+        });
         check("attn_kv_rows");
         return;
     }

@@ -1604,10 +1604,10 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, (int) E, KV};
             if (!gf::mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
             q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
-                                g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s, q35_kv4_);
+                                g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s, q35_kv_);
             q35::attn_window(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
-                             V->q35_part, V->q35_ao, s, q35_kv4_);
-            q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s, q35_kv4_);
+                             V->q35_part, V->q35_ao, s, q35_kv_);
+            q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s, q35_kv_);
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, (int) E};
             if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: attn_output"; return false; }

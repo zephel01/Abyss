@@ -3494,8 +3494,17 @@ int main(int argc, char** argv) {
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
-        // --kv q4_0 (or q4) on the qwen35moe path (Ornith): the attention layers' caches as rotated q4_0 (qwen35_fast.hpp)
-        if ((o.kv == "q4_0" || o.kv == "q4") && std::getenv("STRATA_GLM_KV_Q4") == nullptr) set_env("STRATA_GLM_KV_Q4", "1");
+        // --kv q4_0 / int8 / k8v4 on the qwen35moe path (Ornith): the attention layers' cache format (qwen35_fast.hpp)
+        if (std::getenv("STRATA_GLM_KV_Q35") == nullptr) {
+            const std::string kv = o.kv == "q4" ? "q4_0" : o.kv;
+            if (kv == "q4_0") set_env("STRATA_GLM_KV_Q35", "1");
+            else if (kv == "int8") set_env("STRATA_GLM_KV_Q35", "2");
+            else if (kv == "k8v4") set_env("STRATA_GLM_KV_Q35", "3");
+            else if (kv != "fp16") {
+                std::fprintf(stderr, "maya generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+                return 2;
+            }
+        }
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

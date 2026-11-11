@@ -142,21 +142,23 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim(), V = (size_t) g.ssm_inner;
     const size_t D = (size_t) g.head_dim, HD = (size_t) g.n_head * D, KV = (size_t) g.attn_head_kv * D;
     const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
-    // --kv q4_0 (STRATA_GLM_KV_Q4=1, set by --kv q4_0): the caches as rotated q4_0 rows, 144 B a KV head and position
-    // (FP16: 512).  qwen4exp's fast path (its QSA gathers and the rows kernels read FP16) keeps FP16
+    // --kv (STRATA_GLM_KV_Q35, set by --kv on --glm-pack): 1 q4_0, 2 int8, 3 k8v4 - the caches' rows 144 / 272 / 272 + 144
+    // B a KV head and position against FP16's 512 (qwen35_fast.hpp).  qwen4exp's fast path (its QSA gathers and rows
+    // kernels read FP16) keeps FP16
     {
-        const char* kv4 = getenv("STRATA_GLM_KV_Q4");
-        const bool want = kv4 != nullptr && std::atoi(kv4) != 0;
-        q35_kv4_ = want && !g.q4x && D == 256;
-        if (want && !q35_kv4_ && l0_ == 0)
-            std::fprintf(stderr, "qwen35moe: --kv q4_0 is not supported on this model's fast path - the KV cache stays FP16\n");
+        const char* kv = getenv("STRATA_GLM_KV_Q35");
+        const int want = kv != nullptr ? std::max(0, std::min(3, std::atoi(kv))) : 0;
+        q35_kv_ = !g.q4x && D == 256 ? want : 0;
+        if (want != 0 && q35_kv_ == 0 && l0_ == 0)
+            std::fprintf(stderr, "qwen35moe: --kv is not supported on this model's fast path - the KV cache stays FP16\n");
     }
-    const size_t row_b = q35_kv4_ ? (size_t) g.attn_head_kv * q35::kv_q4_row_bytes() : KV * 2;
-    const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * row_b);
+    const size_t row_k = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, false) : KV * 2;
+    const size_t row_v = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, true) : KV * 2;
+    const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * row_k) + al(ctx * row_v);
     int n_rec = 0, n_attn = 0;
     for (int il = l0_; il < lt_; ++il) (F->L[(size_t) il].recr ? n_rec : n_attn) += 1;   // (lt_: the NextN block too)
     const size_t part = q35::attn_part_floats(g.n_head, g.head_dim, (int) ctx);
-    size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * 2 * cache_b;
+    size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * cache_b;
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
@@ -186,8 +188,8 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
             Ly.gdn_state = (float*) take(S * HV * S * 4);
             Ly.gdn_conv = (float*) take(C * (size_t) (g.d_conv - 1) * 4);
         } else {
-            Ly.kc = (uint16_t*) take(ctx * row_b);
-            Ly.vc = (uint16_t*) take(ctx * row_b);
+            Ly.kc = (uint16_t*) take(ctx * row_k);
+            Ly.vc = (uint16_t*) take(ctx * row_v);
         }
     }
     F->q35_qkv = (float*) take(C * 4);
@@ -235,7 +237,8 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     }
     std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
                          "for %lld tokens%s)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
-                 (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx, q35_kv4_ ? ", q4_0" : "");
+                 (double) n_attn * cache_b / 1073741824.0, (long long) ctx,
+                 q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
     // (STRATA_Q4X_DFLASH: DFlash 2 replaces the MTP layer - the two drafters never run together)
@@ -647,7 +650,7 @@ bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_st
     j[1] = {Ly.av.q, F->q35_mt_xq, F->q35_mt_x, F->q35_mt_v, nullptr, 1.0f, Ly.av.type, E, KV};
     if (!gf::mvn(j, 2, n, s)) { err = "qwen35 mtp: k / v rows"; return false; }
     q35::attn_kv_rows(F->q35_mt_k, F->q35_mt_v, Ly.k_norm, g.norm_eps, g.attn_head_kv, D, g.n_rot, g.rope_base, p0, n,
-                      Ly.kc, Ly.vc, s, q35_kv4_);
+                      Ly.kc, Ly.vc, s, q35_kv_);
     q35_row_done_ = std::max(q35_row_done_, p0 + n - 1);
     return true;
 }
@@ -1091,7 +1094,7 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         q35_dump(s, "Vcur", il, F->q35_v, KV);
     }
     q35::attn_prep(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D, g.n_rot,
-                   g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s, q35_kv4_);
+                   g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s, q35_kv_);
     namespace k = strata::kernels;
     int width = p + 1;
     // STRATA_Q4X_QSA_DECODE (on for CUDA, off on HIP): the QSA layer's attention reads its cells in place, a few query
@@ -1159,12 +1162,12 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
                          F->q35_part, F->q35_ao, s);
     else if (!done)
         q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D),
-                         F->q35_part, F->q35_ao, s, q35_kv4_);
+                         F->q35_part, F->q35_ao, s, q35_kv_);
     if (dumps) {
         q35_dump(s, "Qcur", il, F->q35_q, HD);
         q35_dump(s, "attn_pregate", il, F->q35_ao, HD);
     }
-    q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s, q35_kv4_);
+    q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s, q35_kv_);
     if (F->prof_on) F->mark("q35_attend");
     if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
     gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
