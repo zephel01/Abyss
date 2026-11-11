@@ -47,6 +47,8 @@ int mv_split_rule(int type, int n_out);
 /// (test) the route's 8-warp top-k against warp_topk: n blocks of 512 scores (sel_d), E_d[b] of them live, k = 1..16;
 /// *bad_d counts the differing ids
 int route_topk_check(const float* sel_d, const int* E_d, int n, int* bad_d, cudaStream_t s);
+/// (test) cycles of one selection: cyc_d[0] warp_topk, cyc_d[1] block_topk512 (512 scores at sel_d)
+void route_topk_time(const float* sel_d, int E, int k, int reps, unsigned long long* cyc_d, cudaStream_t s);
 void mv_force_q6k_split(int split4);
 void mv_force_split(int split);   // gpu_tune: every typed GEMV launch at 1 / 2 / 4 warps a row (other: the engine's rule)
 /// mv() for nc activation columns at once (1..8 a launch, wider calls in runs) - a verify window's tokens, the DSpark

@@ -43,6 +43,14 @@ int main(int argc, char** argv) {
     if (gf::route_topk_check(sd, ed, n, bad, nullptr) != 0) { std::fprintf(stderr, "launch failed\n"); return 2; }
     int h = -1;
     if (cudaMemcpy(&h, bad, 4, cudaMemcpyDeviceToHost) != cudaSuccess) { std::fprintf(stderr, "run failed\n"); return 2; }
+    unsigned long long* cy;
+    cudaMalloc(&cy, 16);
+    for (int k : {8, 10}) {
+        gf::route_topk_time(sd, 512, k, 2000, cy, nullptr);
+        unsigned long long c[2] = {0, 0};
+        cudaMemcpy(c, cy, 16, cudaMemcpyDeviceToHost);
+        std::printf("k %d of 512: warp_topk %llu cycles, block_topk512 %llu\n", k, c[0], c[1]);
+    }
     std::printf(h == 0 ? "topk parity: OK (%d patterns x k 1..16, the same ids)\n" : "topk parity: %d ids differ\n", h == 0 ? n : h);
     return h == 0 ? 0 : 1;
 }

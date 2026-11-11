@@ -2955,7 +2955,7 @@ struct RouteArgs {
                                 // only); a VRAM one gets the larger of the two.  LOSSY (0: off)
     int prof;                   // STRATA_GLM_ROUTE_PROF: per-phase cycle sums (diagnostics)
     int win_more;               // MoeRequest::win_more (a batched verify window's column: more routes of the layer follow)
-    int topk_par;               // 1: the top-k over 8 warps (block_topk512, the same ids); STRATA_GLM_TOPK_PAR=0: warp 0's
+    int topk_par;               // 1: the top-k by ranks over the block (block_topk512, the same ids); STRATA_GLM_TOPK_PAR=0: warp 0's
 };
 // the request's xq (x's q8_1 as the device computed it: 36-byte blocks, copied as words) and its flag; the system
 // fence before the request's seq covers it as it does x
@@ -3059,70 +3059,60 @@ __device__ void warp_topk(const float* sel, int E, int k, int* out) {
 #endif
 }
 
-// ... the same selection over 8 warps (the route block's, E <= 512): warp w takes experts 64 w .. 64 w + 63 (2 a lane)
-// and picks its slice's k best by warp_topk's rounds - the highest key, the lowest index on a tie - into shared memory;
-// then warp 0 picks the k best of those 8 k candidates the same way.  The k best of all are among their slices' k best
-// and the order is one total order (key, then index), so the ids are warp_topk's, -1 for -inf / none as there (a key
-// at or below -inf's ends the valid ones in both).  RTX 5090, Qwen3.8 k = 10 of 512: ~9k cycles a route (the phase
-// with its barrier, STRATA_GLM_ROUTE_PROF) on warp 0 alone.  Every thread of the block calls it (it syncs)
-__device__ void block_topk512(const float* sel, int E, int k, int* out, unsigned* ck, unsigned* ci) {
+// ... the same selection by ranks, the whole route block (E <= 512): warp_topk's order is one total order - the higher
+// key first, the lower index on a tie - so its r-th pick is the entry exactly r others beat.  A: each entry's rank
+// within its 64-entry slice (64 compares); the k best of a slice go to candidate slot (slice, rank).  B: each
+// candidate's rank among the candidates - the k best of all are among their slices' k best, and every entry that
+// beats one of them is too, so that rank is its rank of all - and a rank r < k with a key above -inf's writes out[r];
+// the rest stay -1 (warp_topk's -1 for -inf / none).  No serial rounds: warp_topk's k rounds of two warp reductions
+// were ~9k cycles a route on an RTX 5090 (Qwen3.8 k = 10 of 512, STRATA_GLM_ROUTE_PROF); alone (topk_parity) 7.2k ->
+// 4.0k cycles (k 8: 5.9k -> 3.7k).  Every thread calls it (it syncs); cand: 8 kMaxK words of shared memory
+// (an entry as one 64-bit word: its key above, ~index below - "beats" is then one unsigned compare)
+__device__ __forceinline__ void block_topk512(const float* sel, int E, int k, int* out, unsigned long long* cand) {
 #if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    if (w < 8) {
-        unsigned key[2];
+    __shared__ __align__(16) unsigned long long s_c[512];
+    const int tid = threadIdx.x;
+    for (int e = tid; e < 512; e += blockDim.x)
+        s_c[e] = e < E ? ((unsigned long long) topk_key(sel[e]) << 32) | (0xffffffffu - (unsigned) e) : 0ull;
+    for (int c = tid; c < 8 * kMaxK; c += blockDim.x) cand[c] = 0ull;
+    if (tid < k) out[tid] = -1;
+    __syncthreads();
+    for (int e = tid; e < E; e += blockDim.x) {
+        const unsigned long long ce = s_c[e];
+        const int s0 = e & ~63, s1 = min(s0 + 64, E);
+        int r = 0;
+        if (s1 - s0 == 64) {
+            const ulonglong2* c2 = (const ulonglong2*) (s_c + s0);
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const int e = 64 * w + lane + 32 * j;
-            key[j] = e < E ? topk_key(sel[e]) : 0u;
-        }
-        for (int r = 0; r < k; ++r) {
-            const bool t = key[1] > key[0];
-            const unsigned bk = t ? key[1] : key[0];
-            const unsigned mi = (unsigned) (64 * w + lane + (t ? 32 : 0));
-            const unsigned m = __reduce_max_sync(0xffffffffu, bk);
-            const unsigned bi = __reduce_min_sync(0xffffffffu, bk == m ? mi : 0xffffffffu);
-            if (mi == bi) key[t ? 1 : 0] = 0u;
-            if (lane == 0) {
-                ck[w * kMaxK + r] = m;
-                ci[w * kMaxK + r] = bi;
+            for (int q = 0; q < 32; ++q) {
+                const ulonglong2 v = c2[q];
+                r += (v.x > ce ? 1 : 0) + (v.y > ce ? 1 : 0);
             }
+        } else {
+            for (int j = s0; j < s1; ++j) r += s_c[j] > ce ? 1 : 0;
         }
+        if (r < k) cand[(e >> 6) * k + r] = ce;   // (slot (slice, rank), k a slice)
     }
     __syncthreads();
-    if (w == 0) {
-        unsigned key[4], idx[4];   // (candidate c = lane + 32 j: warp c / 16's rank c % 16)
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int c = lane + 32 * j, cw = c / kMaxK, cr = c % kMaxK;
-            const bool on = cr < k;
-            key[j] = on ? ck[cw * kMaxK + cr] : 0u;
-            idx[j] = on ? ci[cw * kMaxK + cr] : 0xffffffffu;
+    const int nc = 8 * k;   // (an empty slot is 0: below every entry, and skipped)
+    for (int c = tid; c < nc; c += blockDim.x) {
+        const unsigned long long cc = cand[c];
+        if (cc == 0ull) continue;
+        int r = 0;
+        const ulonglong2* c2 = (const ulonglong2*) cand;
+#pragma unroll 8
+        for (int q = 0; q < nc / 2; ++q) {
+            const ulonglong2 v = c2[q];
+            r += (v.x > cc ? 1 : 0) + (v.y > cc ? 1 : 0);
         }
-        for (int r = 0; r < k; ++r) {
-            unsigned bk = key[0], bx = idx[0];
-            int bj = 0;
-#pragma unroll
-            for (int j = 1; j < 4; ++j)
-                if (key[j] > bk || (key[j] == bk && idx[j] < bx)) {
-                    bk = key[j];
-                    bx = idx[j];
-                    bj = j;
-                }
-            const unsigned m = __reduce_max_sync(0xffffffffu, bk);
-            const unsigned bi = __reduce_min_sync(0xffffffffu, bk == m ? bx : 0xffffffffu);
-            if (bx == bi) {
-#pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    if (j == bj) key[j] = 0u;
-            }
-            if (lane == 0) out[r] = bi < (unsigned) E && m > 0x007fffffu ? (int) bi : -1;
-        }
+        if (nc & 1) r += cand[nc - 1] > cc ? 1 : 0;
+        if (r < k && (unsigned) (cc >> 32) > 0x007fffffu) out[r] = (int) (0xffffffffu - (unsigned) cc);
     }
     __syncthreads();
 #else
     if (threadIdx.x < 32) warp_topk(sel, E, k, out);
     __syncthreads();
-    (void) ck; (void) ci;
+    (void) cand;
 #endif
 }
 
@@ -3130,19 +3120,44 @@ __device__ void block_topk512(const float* sel, int E, int k, int* out, unsigned
 __global__ void __launch_bounds__(ROUTE_THREADS) topk_check_kernel(const float* sel, const int* Es, int* bad) {
     __shared__ float s[512];
     __shared__ int o1[kMaxK], o2[kMaxK];
-    __shared__ unsigned ck[8 * kMaxK], ci[8 * kMaxK];
+    __shared__ __align__(16) unsigned long long cand[8 * kMaxK];
     const int E = Es[blockIdx.x];
     for (int e = threadIdx.x; e < 512; e += ROUTE_THREADS) s[e] = sel[(size_t) blockIdx.x * 512 + e];
     __syncthreads();
     for (int k = 1; k <= kMaxK; ++k) {
         if (threadIdx.x < 32) warp_topk(s, E, k, o1);
         __syncthreads();
-        block_topk512(s, E, k, o2, ck, ci);
+        block_topk512(s, E, k, o2, cand);
         if (threadIdx.x == 0)
             for (int i = 0; i < k; ++i)
                 if (o1[i] != o2[i]) atomicAdd(bad, 1);
         __syncthreads();
     }
+}
+
+// (route_topk_time: SM cycles of one k-of-E selection each way, the mean over reps, block 0's thread 0)
+template <int MODE>
+__global__ void __launch_bounds__(ROUTE_THREADS) topk_time_kernel(const float* sel, int E, int k, int reps,
+                                                                 unsigned long long* cyc) {
+    __shared__ float s[512];
+    __shared__ int o[kMaxK];
+    __shared__ __align__(16) unsigned long long cand[8 * kMaxK];
+    for (int e = threadIdx.x; e < 512; e += ROUTE_THREADS) s[e] = sel[e];
+    __syncthreads();
+    unsigned long long t = 0;
+    for (int r = 0; r < reps; ++r) {
+        __syncthreads();
+        const unsigned long long t0 = clock64();
+        if (MODE == 0) {
+            if (threadIdx.x < 32) warp_topk(s, E, k, o);
+            __syncthreads();
+        } else {
+            block_topk512(s, E, k, o, cand);
+        }
+        t += clock64() - t0;
+        if (threadIdx.x == 0) s[r & 511] += o[0] < 0 ? 1e-30f : 0.0f;   // (keep the work)
+    }
+    if (threadIdx.x == 0) *cyc = t / (unsigned long long) reps;
 }
 
 // STRATA_GLM_ROUTE_PROF=1 (diagnostics, CUDA): thread 0 of the route block sums SM cycles per phase (0 start, 1 x / prev
@@ -3268,8 +3283,8 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
         __syncthreads();
     } else if (E <= 512) {
         if (a.topk_par) {
-            __shared__ unsigned s_ck[8 * kMaxK], s_ci[8 * kMaxK];
-            block_topk512(s_sel, E, a.k, s_ids, s_ck, s_ci);
+            __shared__ __align__(16) unsigned long long s_cand[8 * kMaxK];
+            block_topk512(s_sel, E, a.k, s_ids, s_cand);
         } else {
             if (tid < 32) warp_topk(s_sel, E, a.k, s_ids);
             __syncthreads();
@@ -5683,7 +5698,11 @@ int route_topk_check(const float* sel_d, const int* E_d, int n, int* bad_d, cuda
     topk_check_kernel<<<n, ROUTE_THREADS, 0, s>>>(sel_d, E_d, bad_d);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
-// STRATA_GLM_TOPK_PAR (default 1): the route's top-k over 8 warps (block_topk512: the same ids); 0: warp 0 alone
+void route_topk_time(const float* sel_d, int E, int k, int reps, unsigned long long* cyc_d, cudaStream_t s) {
+    topk_time_kernel<0><<<1, ROUTE_THREADS, 0, s>>>(sel_d, E, k, reps, cyc_d);
+    topk_time_kernel<1><<<1, ROUTE_THREADS, 0, s>>>(sel_d, E, k, reps, cyc_d + 1);
+}
+// STRATA_GLM_TOPK_PAR (default 1): the route's top-k by ranks over the block (block_topk512: the same ids); 0: warp 0 alone
 static int route_topk_par() {
     static const int v = [] { const char* e = getenv("STRATA_GLM_TOPK_PAR"); return e == nullptr || std::atoi(e) != 0 ? 1 : 0; }();
     return v;
