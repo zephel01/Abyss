@@ -7,6 +7,31 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.134 - 2026-11-12
+
+Ornith-1.5 (122B / 397B) takes a smaller K/V cache, so a 16 GB card runs Ornith-1.5-397B at a 128K context (#44).
+
+- **`--kv q4_0` / `k8v4` / `int8` on the qwen35moe path (Ornith-1.5).** The 4-bit and 8-bit caches were only on
+  Qwen3.8's older attention path; on Ornith `--kv` was read for GLM-5.3's `int8` alone and `q4_0` / `k8v4` were
+  silently ignored, so its attention layers always kept fp16 K/V - while the pool-shortage error suggested
+  `--kv q4_0`. Now `q4_0` (K and V Hadamard-rotated, then ggml's q4_0: 144 B a row against 512), `k8v4` (int8 K +
+  rotated q4_0 V) and `int8` (272 B) are written by the token, prompt, verify-window and NextN paths and read
+  directly by the split decode kernel, the WMMA prompt kernel and the verify window; the freed VRAM goes to the
+  expert pool, and the split cost model counts the smaller cache. At `--max-context 131072` Ornith-1.5-397B's cache
+  is 4.00 GB in fp16, 2.12 / 1.62 / 1.12 GB in int8 / k8v4 / q4_0: capped at 16 GB (`STRATA_GLM_VRAM_GB=16`, 46 GB
+  RAM tier) fp16 stops with `not enough VRAM for the expert pool ... (81 MB short)` while all three start and answer.
+  Ornith-1.5-122B 24G64G capped at 16 GB with a 128K context: experts get 7.05 GB instead of 4.71 (1,470 slots
+  instead of 980), decode 26.3 -> 34.9 tok/s, a 32K prompt 746 -> 1,654 tok/s. At 32 GB decode is unchanged
+  (4K-64K) and prompts are 5-9% slower at 32K-64K (the WMMA tiles turn the codes back into FP16).
+  KL against fp16 (122B 24G64G, 511 scored tokens): after an 8K English context q4_0 0.019 (same top token 93.9%),
+  k8v4 0.013, int8 0.008; after 32K of code 0.007 / 0.005 / 0.003; after an 8K Japanese context 0.031 (91.6%) /
+  0.021 / 0.014; nll within 0.013 of fp16 everywhere. A wrong `--kv` value with `--glm-pack` now stops with an error
+  instead of being ignored. Default stays fp16 (the same tokens as v1.3.133); Qwen3.8's fast path keeps fp16.
+- `setup --quant` help lists Ornith's `32G128G` (Ornith-1.5-397B).
+- Manual (EN/JA): `--kv` row in Settings and "when VRAM is short" in the Ornith section.
+
+Not run on an AMD card: the HIP build (gfx1201 / gfx1151) compiles and links.
+
 ## v1.3.133 - 2026-11-12
 
 GLM-5.3 and DeepSeek V4 / V4.1 decode faster on NVIDIA, the same answers; and v1.3.132 builds on Windows again.

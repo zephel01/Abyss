@@ -462,7 +462,7 @@ def main() -> int:
                     "ornith: Ornith-1.5-122B, qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default) or 24G64G; qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default), 24G64G or 32G128G (Ornith-1.5-397B); qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")

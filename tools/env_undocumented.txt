@@ -86,6 +86,7 @@ STRATA_GLM_KDA_GRAPH  # src/core/glm_fast_path.cu
 STRATA_GLM_KEEP_MAP  # src/core/glm_model.cu
 STRATA_GLM_KQ  # src/core/glm_prefill.cu
 STRATA_GLM_KV_INT8  # src/core/glm_model.cu
+STRATA_GLM_KV_Q35  # src/core/glm_model.cu (set by --kv on qwen35moe)
 STRATA_GLM_LEND_DROP  # src/core/glm_prefill.cu
 STRATA_GLM_LOOP_ANSWER  # src/program/generate.cpp
 STRATA_GLM_LOOP_THINK  # src/program/generate.cpp
