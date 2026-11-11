@@ -7,6 +7,34 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.131 - 2026-11-11
+
+A fix release for two AMD reports - thank you, hondaru (#42) and tim6300243 (#43):
+
+- **Qwen3.8 with drafts (MTP, DFlash 2) on AMD GPUs (HIP) decodes at its pre-v1.3.125 speed again.** v1.3.125 gave
+  every dense GEMV of Qwen3.8's verify window (the hyper-connection mixes, delta-net / attention projections,
+  `ssm_out` / `attn_output`, the router and shared expert, the output head) the token path's sums, so greedy answers
+  with drafts equal the ones without. On CUDA that GEMV reads the weights once for all columns; on HIP it ran one GEMV
+  a column, so each verify window read the ~4 GB of dense weights and the head once per column. An AI PRO R9700 on
+  Qwen3.8 IQ3_XXS + MTP went 87.0 -> 67.2 tok/s. HIP now keeps the shared-read GEMVs of v1.3.124
+  (`STRATA_Q4X_VERIFY_EXACT`: `1` on CUDA as before, `0` on HIP; `STRATA_DETERMINISTIC` sets `1`). On HIP, greedy
+  answers with drafts can again part from the ones without late in a long answer, as up to v1.3.124. CUDA is
+  unchanged.
+- **HIP: one host read less per CPU-lane wait.** The wait read the exact-combine mask even with the exact combine off
+  (HIP's default); it now reads it only with the combine on.
+- **Windows + AMD: the HIP build passes with Visual Studio's MSVC 14.51** (#43, RX 9060 XT; also #2 / #3). MSVC
+  14.51's `<cmath>` makes `isgreater` .. `isunordered`, `isnormal` and `signbit` `constexpr` (under HIP implicitly
+  `__host__ __device__`), and TheRock 7.14.1's Clang 23 then fails CMake's HIP compiler test ("`__device__` function
+  'isgreater' cannot overload `__host__ __device__` function"). LLVM fixed it by including
+  `__clang_cuda_math_forward_declares.h` before `<cmath>` in `__clang_hip_runtime_wrapper.h` (01d3932); no Windows ROCm
+  SDK has that yet (it comes with ROCm 10.1). Setup on Windows now makes the same one-line move in the SDK's own copy
+  of that header when MSVC is 14.50 or newer, once, keeping the original as `.abyss-orig`; `--check` only warns,
+  `ABYSS_NO_ROCM_HEADER_FIX=1` leaves the SDK alone. README, the manual and [docs/amd](docs/amd/README.md) (EN/JA) give
+  the manual step for an SDK setup cannot write to.
+- Manual (EN/JA): `STRATA_Q4X_VERIFY_EXACT`.
+
+Not run on an AMD card or on Windows here (none attached today): the HIP files compile, the header move was checked against the reported error with ROCm's Clang 23 on Linux, and the CUDA answers are unchanged.
+
 ## v1.3.130 - 2026-11-11
 
 Four findings from LarsDrakblod's RTX 4090 field report (#39) - thank you:
