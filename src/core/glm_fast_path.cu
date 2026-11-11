@@ -1573,6 +1573,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // here (estimated from this part's own sizes), and each later part measures again and leaves at least half
         // the headroom free.
         static int64_t total = -1, remaining = -1;
+        static char tier_why[256] = "";   // how the automatic budget was set, for the "RAM tier ... pinned" line
         static int remaining_layers = 0;
         const auto pinned_pf = prefill_pinned();
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
@@ -1588,6 +1589,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (total < 0) {
                 if (const char* rg = getenv("STRATA_GLM_RAM_GB")) {
                     total = (int64_t) (std::atof(rg) * 1073741824.0);
+                    std::snprintf(tier_why, sizeof tier_why, "STRATA_GLM_RAM_GB=%s", rg);
                 } else {
                     int64_t avail_kb = 0;
 #ifdef _WIN32
@@ -1633,8 +1635,38 @@ bool Glm5Model::fast_setup(std::string& err) {
                     // to 0.95; a unified-memory APU has no cap unless one is set)
                     const double frac = strata::core::env_num("STRATA_GLM_RAM_FRAC", F->unified_memory ? 1.0 : 0.73,
                                                               0.05, F->unified_memory ? 1.0 : 0.95);
-                    if (const int64_t mt = mem_total(); mt > 0 && frac < 1.0)
-                        total = std::min<int64_t>(total, std::max<int64_t>(0, (int64_t) ((double) mt * frac) - stage_b));
+                    // a discrete card: the larger of that share and MemTotal less STRATA_GLM_RAM_KEEP_GB (24) - the
+                    // room the page cache, the server and the desktop need does not grow with the RAM
+                    // (glm_memory.hpp ram_tier_cap).  An explicit STRATA_GLM_RAM_FRAC alone keeps the share alone.
+                    // The keep is fixed, not grown per model: what this process pins or allocates before the tier
+                    // (dense weights, KV for --max-context, prompt buffers) is already out of MemAvailable, the
+                    // bound above; what pins after it (the disk staging, a later part's prompt path) is subtracted
+                    // there; the DSpark drafter lives in VRAM (its tier is capped below); and V4.1's Engram rows go
+                    // through their own 256 MB row cache first, the page cache serving only its misses
+                    const bool use_keep = !F->unified_memory &&
+                                          (getenv("STRATA_GLM_RAM_FRAC") == nullptr || getenv("STRATA_GLM_RAM_KEEP_GB") != nullptr);
+                    const double keep_gb = strata::core::env_num("STRATA_GLM_RAM_KEEP_GB", 24.0, 0.0, 4096.0);
+                    const int64_t mt = mem_total();
+                    bool by_keep = false;
+                    const int64_t cap = frac < 1.0 ? glmfast::ram_tier_cap(mt, frac, keep_gb, use_keep, &by_keep) : 0;
+                    const int64_t before = total;
+                    if (cap > 0) total = std::min<int64_t>(total, std::max<int64_t>(0, cap - stage_b));
+                    const double G = 1073741824.0;
+                    if (cap > 0 && total < before) {
+                        if (by_keep)
+                            std::snprintf(tier_why, sizeof tier_why, "capped at %.1f GB RAM less %.0f GB kept "
+                                          "(STRATA_GLM_RAM_KEEP_GB; %.0f%% would be %.1f GB)", (double) mt / G, keep_gb,
+                                          frac * 100.0, (double) mt * frac / G);
+                        else
+                            std::snprintf(tier_why, sizeof tier_why, "capped at %.0f%% of %.1f GB RAM (STRATA_GLM_RAM_FRAC%s)",
+                                          frac * 100.0, (double) mt / G,
+                                          use_keep ? "; the RAM less STRATA_GLM_RAM_KEEP_GB is smaller" : "");
+                    } else if (cap > 0) {
+                        std::snprintf(tier_why, sizeof tier_why, "MemAvailable %.1f GB less %.1f GB headroom "
+                                      "(STRATA_GLM_RAM_HEADROOM_GB) and %.1f GB staging, below the cap of %.1f GB",
+                                      (double) avail_kb / 1048576.0, head_gb, (double) (stage_b + unseen_pf) / G,
+                                      (double) cap / G);
+                    }
 #endif
                 }
                 remaining = total;
@@ -1740,8 +1772,13 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         int64_t ram_slots = 0;
         for (auto& R : F->rc) ram_slots += R.n;
-        std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
-                     (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
+        if (tier_why[0] != '\0' && ram_budget_ < 0 && !staging_only)
+            std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots (budget %.2f GB: %s)\n", dev_,
+                         (double) F->ram_bytes / 1073741824.0, (long long) ram_slots, (double) total / 1073741824.0,
+                         tier_why);
+        else
+            std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
+                         (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
         if (F->unified_memory)
             std::fprintf(stderr, "glm fast: CUDA%d unified memory: MemAvailable %.1f GB, headroom %.1f GB -> pool %.1f GB, "
                                  "RAM tier %.1f GB (STRATA_GLM_UMA_HEADROOM_GB; STRATA_GLM_VRAM_GB / STRATA_GLM_RAM_GB "

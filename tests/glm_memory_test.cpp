@@ -84,5 +84,24 @@ int main() {
         assert(!uma_others_block(second, false));    // a second engine but the experts still fit: runs
         assert(uma_others_gb(0, 0, 0) == 0.0 && uma_others_gb(T, 0, 0) == 0.0);   // MemAvailable unknown: never stops
     }
+    // The discrete-card RAM tier cap: the larger of MemTotal x STRATA_GLM_RAM_FRAC and MemTotal less the keep.
+    {
+        using strata::core::glmfast::ram_tier_cap;
+        const int64_t g = int64_t{1} << 30;
+        bool k = true;
+        // 123.5 GiB box: 0.73 -> 90.2 GiB; less 24 GiB -> 99.5 GiB wins
+        const int64_t box = 129458420LL * 1024;
+        assert(ram_tier_cap(box, 0.73, 24.0, true, &k) == box - 24 * g && k);
+        // an explicit STRATA_GLM_RAM_FRAC alone: the share, as before
+        assert(ram_tier_cap(box, 0.73, 24.0, false, &k) == (int64_t) ((double) box * 0.73) && !k);
+        // 64 GiB: the share (46.7) is larger than 64 - 24
+        assert(ram_tier_cap(64 * g, 0.73, 24.0, true, &k) == (int64_t) (64.0 * 0.73 * (double) g) && !k);
+        // the crossover sits at 24 / 0.27 = 88.9 GiB
+        assert(!(ram_tier_cap(88 * g, 0.73, 24.0, true, &k) > 0 && k));
+        assert(ram_tier_cap(90 * g, 0.73, 24.0, true, &k) == 66 * g && k);
+        // a keep larger than the RAM leaves the share; MemTotal unknown: no cap
+        assert(ram_tier_cap(32 * g, 0.73, 64.0, true, &k) == (int64_t) (32.0 * 0.73 * (double) g) && !k);
+        assert(ram_tier_cap(0, 0.73, 24.0, true, &k) == 0 && !k);
+    }
     std::puts("GLM memory policy checks passed (CPU only)");
 }
