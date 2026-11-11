@@ -546,6 +546,10 @@ struct Glm5Model::FastState {
     std::vector<LayerPool> lp;   // indexed by absolute layer
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
+    // the background moves' DECAYED counts (STRATA_GLM_BG_DECAY): a route adds bg_inc, which grows by 1 / decay at
+    // each boundary (so every count decays by `decay` a boundary without touching them); rescaled when it gets large
+    std::vector<float> bgc;
+    std::atomic<float> bg_inc{1.0f};
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
     std::vector<uint32_t> usage;

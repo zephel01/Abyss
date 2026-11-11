@@ -1509,6 +1509,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d the vision encoder borrows the pool's tail (%.2f GB) while it "
                                  "encodes\n", dev_, (double) xtot / 1073741824.0);
         F->cnt.assign((size_t) NL * g.n_expert, 0);
+        F->bgc.assign((size_t) NL * g.n_expert, 0.0f);
         F->usage.assign((size_t) NL * g.n_expert, 0);
         { std::array<int, gf::kMaxK> none; none.fill(-1); F->pred_of.assign((size_t) NL, none); }
         std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
@@ -3758,6 +3759,110 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaFree(dxq);
         cudaFree(dhq);
     }
+    // STRATA_GLM_CPU_LANE_BITS=<inputs> (debug): the exact combine's premise, bit for bit - for every MoE layer whose
+    // lane runs in the device's arithmetic (cpu_exact), one RAM-tier expert on <inputs> normalised inputs through the
+    // device's decode kernels and through the CPU lane (the device's q8_1 activation, as a decode passes it): the
+    // activation's q8_1 the CPU makes itself, the down input's q8_1 blocks and the expert's rows compared as bits
+    if (const char* bv = getenv("STRATA_GLM_CPU_LANE_BITS"); bv != nullptr && std::atoi(bv) > 0 && !exl3_) {
+        const int reps = std::atoi(bv);
+        const int E = g.n_embd, FFE = g.n_ff_exp;
+        float *dh = nullptr, *dw = nullptr, *dx = nullptr, *dout = nullptr;
+        void *dxq = nullptr, *dhq = nullptr;
+        cudaMalloc(&dh, (size_t) E * 4);
+        cudaMalloc(&dw, (size_t) E * 4);
+        cudaMalloc(&dx, (size_t) E * 4);
+        cudaMalloc(&dout, (size_t) E * 4);
+        cudaMalloc(&dxq, (size_t) E / 32 * 36);
+        cudaMalloc(&dhq, (size_t) 8 * FFE / 32 * 36);
+        std::vector<float> h((size_t) E), ones((size_t) E, 1.0f), xc((size_t) E), og((size_t) E), oc((size_t) E);
+        std::vector<uint8_t> xqh((size_t) E / 32 * 36), hqh((size_t) FFE / 32 * 36), a1(kc::kNativeActBytes),
+            a2(kc::kNativeActBytes), h1(kc::kNativeHBytes);
+        uint64_t rs = 0x9E3779B97F4A7C15ull;
+        const auto rnd = [&]() {
+            rs ^= rs << 13;
+            rs ^= rs >> 7;
+            rs ^= rs << 17;
+            return (double) (rs >> 11) / 9007199254740992.0;
+        };
+        long long tot_rows = 0, bad_rows = 0, bad_h = 0, bad_x = 0;
+        for (int il = l0_; il < lt_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (!Ly.moe || Ly.mtp || Ly.exl3 || F->cpu_fmt[(size_t) il].n_ff == 0 || F->cpu_exact[(size_t) il] == 0 ||
+                !Ly.nv_host.empty())
+                continue;
+            const auto& Rl = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            const uint8_t* ex = nullptr;
+            int ex_id = -1;
+            for (int s = 0; s < Rl.n && ex == nullptr; ++s)
+                if (Rl.st[(size_t) s] == FastState::kRHold && Rl.key[(size_t) s] / g.n_expert == il) {
+                    ex = Rl.base + (size_t) s * Rl.stride;
+                    ex_id = Rl.key[(size_t) s] % g.n_expert;
+                }
+            if (ex == nullptr) continue;
+            cudaMemcpyAsync(F->scratch, ex, Ly.blob, cudaMemcpyHostToDevice, F->cs);
+            const unsigned long long sp = (unsigned long long) F->scratch;
+            const float one = 1.0f;
+            cudaMemcpyAsync(F->md.plan_ptr, &sp, 8, cudaMemcpyHostToDevice, F->cs);
+            cudaMemcpyAsync(F->md.plan_w, &one, 4, cudaMemcpyHostToDevice, F->cs);
+            cudaMemcpyAsync(F->md.plan_id, &ex_id, 4, cudaMemcpyHostToDevice, F->cs);
+            int lr = 0, lh = 0, lx = 0;
+            unsigned int worst = 0;
+            for (int rep = 0; rep < reps; ++rep) {
+                const double amp = rep % 3 == 0 ? 1.0 : rep % 3 == 1 ? 0.05 : 20.0;
+                for (int i = 0; i < E; ++i) {
+                    const double u = rnd() + rnd() + rnd() - 1.5;
+                    h[(size_t) i] = (float) (amp * u * (rnd() < 0.01 ? 30.0 : 1.0));
+                }
+                cudaMemcpyAsync(dh, h.data(), (size_t) E * 4, cudaMemcpyHostToDevice, F->cs);
+                cudaMemcpyAsync(dw, ones.data(), (size_t) E * 4, cudaMemcpyHostToDevice, F->cs);
+                cudaMemsetAsync(F->md.cpu_flag, 0, 4, F->cs);
+                gf::rms_q8(dh, nullptr, dw, g.norm_eps, E, dx, dxq, F->cs);
+                gf::MoeDev mdc = F->md;
+                mdc.nv_scale = Ly.nv_scale;
+                mdc.xpart = nullptr;   // (the float form: out = 1 * the expert's row + 0, its bits as they are)
+                gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr,
+                                F->cs, Ly.up_type);
+                gf::moe_down(Ly.d_type, mdc, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
+                cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
+                cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
+                cudaMemcpyAsync(xqh.data(), dxq, xqh.size(), cudaMemcpyDeviceToHost, F->cs);
+                cudaMemcpyAsync(hqh.data(), dhq, hqh.size(), cudaMemcpyDeviceToHost, F->cs);
+                cudaStreamSynchronize(F->cs);
+                // the activation: the CPU's own q8_1 of the device's float x against the device's blocks
+                kc::lane_q81_from_blocks(xqh.data(), E, a1.data());
+                kc::lane_q81_quant(xc.data(), E, a2.data());
+                if (std::memcmp(a1.data(), a2.data(), kc::lane_q81_act_bytes(E)) != 0) ++lx;
+                fast_cpu_experts(il, 1, &ex, &one, xc.data(), oc.data(), xqh.data());
+                kc::lane_q81_from_blocks(hqh.data(), FFE, h1.data());
+                if (std::memcmp(h1.data(), F->cpu_hq.data(), kc::lane_q81_act_bytes(FFE)) != 0) ++lh;
+                for (int r = 0; r < E; ++r) {
+                    uint32_t ua, ub;
+                    std::memcpy(&ua, &og[(size_t) r], 4);
+                    std::memcpy(&ub, &oc[(size_t) r], 4);
+                    if (ua != ub && !(og[(size_t) r] == 0.0f && oc[(size_t) r] == 0.0f)) {
+                        ++lr;
+                        worst = std::max(worst, ua > ub ? ua - ub : ub - ua);
+                    }
+                }
+            }
+            tot_rows += (long long) reps * E;
+            bad_rows += lr;
+            bad_h += lh;
+            bad_x += lx;
+            std::fprintf(stderr, "glm fast: CPU lane bits (layer %d, types %d/%d/%d, expert %d, %d inputs): rows "
+                                 "differing %d of %lld (worst %u ulp), down-input q8_1 differing %d, own activation "
+                                 "q8_1 differing %d\n",
+                         il, Ly.gu_type, Ly.up_type, Ly.d_type, ex_id, reps, lr, (long long) reps * E, worst, lh, lx);
+        }
+        std::fprintf(stderr, "glm fast: CPU lane bits: %lld of %lld rows differ, %lld down inputs, %lld activations\n",
+                     bad_rows, tot_rows, bad_h, bad_x);
+        cudaFree(dh);
+        cudaFree(dw);
+        cudaFree(dx);
+        cudaFree(dout);
+        cudaFree(dxq);
+        cudaFree(dhq);
+    }
     return true;
 }
 
@@ -4786,6 +4891,19 @@ void Glm5Model::fast_service() {
             static const char* rlog = getenv("STRATA_GLM_ROUTE_LOG");
             if (rlog != nullptr) {
                 static thread_local FILE* rf = std::fopen((std::string(rlog) + "." + std::to_string(dev_)).c_str(), "w");
+                // (the first route: "R layer e..." lines, the VRAM residents the decode starts from, and "S layer n"
+                // the layer's slots - a cache simulator's starting point)
+                static thread_local bool rf_res = false;
+                if (rf != nullptr && !rf_res) {
+                    rf_res = true;
+                    for (int l2 = l0_; l2 < lt_; ++l2) {
+                        if (!F->L[(size_t) l2].moe) continue;
+                        std::fprintf(rf, "S %d %d\nR %d", l2, F->lp[(size_t) l2].n, l2);
+                        for (int e = 0; e < g.n_expert; ++e)
+                            if (F->slot_of[(size_t) l2 * g.n_expert + e] >= 0) std::fprintf(rf, " %d", e);
+                        std::fprintf(rf, "\n");
+                    }
+                }
                 if (rf != nullptr) {
                     std::fprintf(rf, "%d", il);
                     for (int i = 0; i < K; ++i) std::fprintf(rf, " %d", ids[i]);
@@ -4796,6 +4914,7 @@ void Glm5Model::fast_service() {
             for (int i = 0; i < K; ++i) {
                 const int key = il * g.n_expert + ids[i];
                 if (F->cnt[(size_t) key] < (1u << 24)) ++F->cnt[(size_t) key];
+                F->bgc[(size_t) key] += F->bg_inc.load(std::memory_order_relaxed);
                 if (++F->usage[(size_t) key] >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
                 if ((skip >> i) & 1u) continue;   // not computed: neither a hit nor a miss (its count above stays)
@@ -6146,9 +6265,45 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
             return v != nullptr ? std::atoi(v) != 0 : small_x;
         }();
         const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all;
+        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, off elsewhere):
+        // the moves rank experts by counts that decay smoothly (bgc) instead of the route counts halved every ~32K
+        // route events, swap when the hottest RAM-only expert's count passes the layer's coldest resident's by
+        // STRATA_GLM_BG_DECAY_MARGIN (2), and make at most STRATA_GLM_BG_DECAY_N (8) swaps a boundary.  Replayed on
+        // UD 3.1 UD-IQ3_XXS route logs (32 GB, 4K + 3 x 512, bench/parity/tiersim.py): VRAM hits 93.1 -> 95.5%
+        // without a drafter, 91.3 -> 93.2% with MTP (97.5% in the last quarter of both) - the halved integer counts
+        // swapped often (13 copies a token) and kept less of what the text was using
+        static const float bg_decay = [small_x] {
+            const char* v = getenv("STRATA_GLM_BG_DECAY");
+            const float d = v != nullptr ? (float) std::atof(v) : small_x ? 0.995f : 0.0f;
+            return d > 0.0f && d < 1.0f ? d : 0.0f;
+        }();
+        static const float bg_dmargin = [] {
+            const char* v = getenv("STRATA_GLM_BG_DECAY_MARGIN");
+            return v != nullptr ? (float) std::atof(v) : 2.0f;
+        }();
+        static const int bg_dn = [] {
+            const char* v = getenv("STRATA_GLM_BG_DECAY_N");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 8;
+        }();
+        const bool decayed = bg_decay > 0.0f && !F->bgc.empty();
+        float inc = 1.0f;
+        if (decayed) {
+            inc = F->bg_inc.load(std::memory_order_relaxed) / bg_decay;
+            if (inc > 1e18f) {   // (rescale: the counts back to units of 1; a route racing this adds a slightly off amount)
+                const float r = 1.0f / inc;
+                for (auto& c : F->bgc) c *= r;
+                inc = 1.0f;
+            }
+            F->bg_inc.store(inc, std::memory_order_relaxed);
+        }
+        const float inv_inc = 1.0f / inc;
+        const auto score = [&](size_t key) {
+            return decayed ? F->bgc[key] * inv_inc : (float) F->cnt[key];
+        };
+        const int swaps_max = decayed ? bg_dn : bg_n;
         if (bg_n > 0 && bg_on && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
             struct Cand {
-                uint32_t hot, cold;
+                float hot, cold;
                 int il, e, rs, free_slot, cold_slot;
             };
             std::vector<Cand> cands;
@@ -6157,13 +6312,13 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                 const auto& P = F->lp[(size_t) il];
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
                 int cs = -1;
-                uint32_t cold = UINT32_MAX;
+                float cold = 3e38f;
                 int frees[8], nfree = 0;   // (refill: up to 8 a layer a boundary)
                 for (int s2 = 0; s2 < P.n; ++s2) {
                     if (P.st[(size_t) s2] == FastState::kFree) {
                         if (nfree < (bg_fill > 0 ? 8 : 1)) frees[nfree++] = s2;
                     } else if (P.st[(size_t) s2] == FastState::kResident && P.key[(size_t) s2] >= 0) {
-                        const uint32_t c = F->cnt[(size_t) il * NE + P.key[(size_t) s2]];
+                        const float c = score((size_t) il * NE + P.key[(size_t) s2]);
                         if (c < cold) {
                             cold = c;
                             cs = s2;
@@ -6179,7 +6334,7 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                     if (F->slot_of[key] >= 0) continue;
                     const int rs = F->ram_of[key];
                     if (rs < 0 || R.st[(size_t) rs] != FastState::kRHold) continue;
-                    const uint32_t h = F->cnt[key];
+                    const float h = score(key);
                     if (ntop == want && h <= top[(size_t) ntop - 1].hot) continue;
                     int at = ntop < want ? ntop++ : ntop - 1;
                     while (at > 0 && top[(size_t) at - 1].hot < h) {
@@ -6196,10 +6351,10 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                 }
             }
             std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.hot > b.hot; });
-            int issued = 0, filled = 0;   // demotion moves (at most bg_n), promotions into free slots (bg_up_max)
+            int issued = 0, filled = 0;   // demotion moves (at most swaps_max), promotions into free slots (bg_up_max)
             for (const auto& c : cands) {
-                if (issued >= bg_n && filled >= bg_up_max) break;
-                if (c.free_slot >= 0 ? filled >= bg_up_max : issued >= bg_n) continue;
+                if (issued >= swaps_max && filled >= bg_up_max) break;
+                if (c.free_slot >= 0 ? filled >= bg_up_max : issued >= swaps_max) continue;
                 auto& P = F->lp[(size_t) c.il];
                 const int rc = F->layer_rc[(size_t) c.il];
                 auto& R = F->rc[(size_t) rc];
@@ -6220,7 +6375,8 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                     }
                     F->bg.push_back(FastState::BgMove{c.il, c.free_slot, c.il * NE + c.e, rc, c.rs, true, ev, paced});
                     ++filled;
-                } else if (c.cold_slot >= 0 && c.hot >= bg_ratio * std::max<uint32_t>(c.cold, 1u) + bg_margin) {
+                } else if (c.cold_slot >= 0 && (decayed ? c.hot > c.cold + bg_dmargin
+                                                        : (uint64_t) c.hot >= (uint64_t) bg_ratio * std::max<uint32_t>((uint32_t) c.cold, 1u) + bg_margin)) {
                     int rs = -1;
                     for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                         if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;

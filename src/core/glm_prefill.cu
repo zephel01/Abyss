@@ -2597,15 +2597,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // the CPU lane can compute layer il's experts in a prompt at all (cpu_lane: and its plan may take them)
+    const auto cpu_lane_ok = [&](int il) {
+        return !S->pin_fail && F->cpu_pool && F->cpu_c_ms > 0.0 &&
+               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
+               !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
+               F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
+    };
     const auto cpu_lane = [&](int il) {
         // (no gate on the CPU's speed against the link: the plan below takes an expert only while the host's time
         // stays under the copy stream's, and kappa corrects it as it goes.  The old gate - one copy slower than two
         // CPU experts - was a cliff: issue #24's Gen5 x8 host timed 0.155 ms an expert in some processes and 0.159-0.169
         // in others, and those gave the CPU no prompt work at all, 2,050 vs 2,700 tok/s on 16K prompts)
-        return pf_cpu && !S->pin_fail && F->cpu_pool && F->cpu_c_ms > 0.0 &&
-               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
-               !F->L[(size_t) il].exl3 &&   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
-               F->L[(size_t) il].nv_host.empty();   // (NVFP4: neither the expert scales yet)
+        return pf_cpu && cpu_lane_ok(il);
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
     // A failed allocation frees what it had and leaves every pointer null and size 0 (it used to keep the new size
@@ -3294,7 +3298,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const double fix_ms = ig ? S->fix_ms_ig : 2.0 * F->cpu_c_ms;
             // (the host buffers for the most rows the CPU may take, before it takes any: when they do not allocate,
             // every expert stays on PCIe - the prompt goes on instead of failing)
-            if (cpu_lane(il) && cpu_bufs(moe_window_rows((size_t) T, g))) {
+            // (the exact prompt's light RAM-tier experts go to the CPU even under STRATA_GLM_PREFILL_CPU=0, which
+            // STRATA_DETERMINISTIC sets: that take follows no timing, and through MMQ instead they summed in another
+            // arithmetic than the resident ones beside them - a prompt's numbers then followed what was resident.
+            // Measured: the second request of a deterministic run gave other tokens under two CPU plans, whose tier
+            // moves had left other experts resident)
+            // (and a layer the exact prompt cannot take - a type without exact rows, as UD 3.1's Q2_0 down layers -
+            // in a chunk it would otherwise cover gives the CPU nothing: its timed share made such a short prompt's
+            // numbers follow the run's timings and pool - two runs of the same prompt gave other tokens)
+            const bool x_skip = F->xc && !xact && (size_t) T * (size_t) K <= (size_t) moe_window_rows((size_t) T, g);
+            if ((xact ? cpu_lane_ok(il) : cpu_lane(il) && !x_skip) && cpu_bufs(moe_window_rows((size_t) T, g))) {
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;
                 for (size_t i = 0; i < staged.size(); ++i) {
