@@ -665,8 +665,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     // Default 512:128:1 (promotions only) for GLM-5.3 and DeepSeek V4 / V4.1 on CUDA, off elsewhere: an nsys trace
     // of V4 0731 (RTX 5090, Gen4 x4, 4K + 256) had the link 96% idle from the route to the CPU lane's answer (~215 us
     // a layer) while the paced 1 MiB after the answer filled its ~160 us window and spilled into the next route
-    // (+12 us).  The promotions crossing during the lane's own work: V4 0731 UD-Q2_K_XL 58.1 -> 61.4 tok/s (VRAM hits
-    // 72.5 -> 77%), GLM-5.3 Maya-S-v2 IQ2_XXS 46.0 -> 49.9 (62 -> 67%), bench/parity/results-idle.md.  More bytes
+    // (+12 us).  The promotions crossing during the lane's own work: V4 0731 UD-Q2_K_XL 58.3 -> 60.7 tok/s (VRAM hits
+    // 72.7 -> 77%), GLM-5.3 Maya-S-v2 IQ2_XXS 46.8 -> 49.1 (62 -> 67%), +4-8% over five sets, bench/parity/results-idle.md.  More bytes
     // (768 a lane expert, or 1 MiB after the route) raised the hits to 78% but were slower: the copy still crossed
     // when the device read the answer; demotions there were worse (they hold up the route's fence and the answer)
     {
