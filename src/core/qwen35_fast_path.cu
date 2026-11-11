@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace strata::core {
@@ -374,6 +375,17 @@ bool Glm5Model::q4x_ple_setup(std::string& err) {
         cudaMemcpy(F->ple_conv16, c16.data(), n_conv * 2, cudaMemcpyHostToDevice);
     }
     F->ple_w.conv1d_f16 = F->ple_conv16;
+    if (cudaMalloc(&F->am_scratch, gf::argmax_mb_scratch_bytes()) == cudaSuccess)
+        cudaMemset(F->am_scratch, 0, gf::argmax_mb_scratch_bytes());
+    else {
+        cudaGetLastError();
+        F->am_scratch = nullptr;
+    }
+    {   // the row's device view (pinned memory is mapped under unified addressing); none: the copy as before
+        void* d = nullptr;
+        if (cudaHostGetDevicePointer(&d, F->ple_emb_h, 0) == cudaSuccess) F->ple_emb_hd = (float*) d;
+        else cudaGetLastError();
+    }
     F->ple.reset(new k::PleTable());
     k::PleIoOptions io;
     if (!F->ple->open(ple_gguf_, err, io)) {
@@ -388,21 +400,54 @@ bool Glm5Model::q4x_ple_setup(std::string& err) {
     return true;
 }
 
+static bool ple_spec_on() {
+    static const bool on = [] { const char* v = getenv("STRATA_Q4X_PLE_SPEC"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
+// STRATA_Q4X_PLE_SPEC (default on): the token just produced is the next one's input whenever the caller samples
+// greedily - its 16 table rows are prefetched now, while the host finishes the token and the next one's boundary runs
+// (~0.2 ms that the SSD read used to start after).  Only the row cache changes: a different next token reads its own
+// rows as before, so the outputs are the same either way.  Not with a drafter (its steps prefetch their own rows).
+void Glm5Model::q4x_ple_spec(int32_t token, int64_t p) {
+    FastState* F = fast_;
+    namespace k = strata::kernels;
+    F->ple_spec_p = -1;
+    if (!ple_spec_on() || F->ple == nullptr || q35_mtp_on() || dfl_ != nullptr || dsp_ != nullptr) return;
+    if (F->ple_issued || p < 1 || (size_t) p >= F->ple_toks.size()) return;
+    const int32_t prev[2] = {p >= 2 ? F->ple_toks[(size_t) p - 2] : -1, F->ple_toks[(size_t) p - 1]};
+    static const k::PleConsts consts = k::ple_artifact_consts();
+    uint32_t rows[k::PLE_N_HEADS];
+    k::ngram_rows(&token, prev, 1, consts, rows);
+    F->ple->prefetch(rows, k::PLE_N_HEADS);
+    F->ple_spec_live = true;
+    F->ple_spec_tok = token;
+    F->ple_spec_p = p;
+}
+
 bool Glm5Model::q4x_ple_issue(int32_t token, int64_t p, std::string& err) {
     FastState* F = fast_;
     namespace k = strata::kernels;
     if (F->ple == nullptr) return true;
     if (F->ple_issued) {   // (a token whose layers never ran: its rows are dropped)
-        if (!F->ple->collect(F->ple_emb_h, err)) return false;
-        F->ple_issued = false;
+        if (!F->ple_deferred && !F->ple->collect(F->ple_emb_h, err)) return false;
+        F->ple_issued = F->ple_deferred = false;
     }
     const size_t n = F->ple_toks.size();
+    // (the guess's history: the same two earlier tokens - ple_toks below p is not rewritten in between)
+    const bool spec_hit = F->ple_spec_p >= 0 && F->ple_spec_p == p && F->ple_spec_tok == token;
+    F->ple_spec_p = -1;
     if (p >= 0 && (size_t) p < n) F->ple_toks[(size_t) p] = token;
     const int32_t prev[2] = {p >= 2 && (size_t) p - 2 < n ? F->ple_toks[(size_t) p - 2] : -1,
                              p >= 1 && (size_t) p - 1 < n ? F->ple_toks[(size_t) p - 1] : -1};
     static const k::PleConsts consts = k::ple_artifact_consts();
     uint32_t rows[k::PLE_N_HEADS];
     k::ngram_rows(&token, prev, 1, consts, rows);
+    if (spec_hit) {   // (the prefetch is in flight: the rows are issued before layer 1, from the cache)
+        std::memcpy(F->ple_rows, rows, sizeof rows);
+        F->ple_issued = F->ple_deferred = true;
+        return true;
+    }
     if (!F->ple->issue(rows)) {
         err = "qwen4exp: the PLE rows could not be issued";
         return false;
@@ -421,10 +466,27 @@ bool Glm5Model::q4x_ple_apply(std::string& err) {
         err = "qwen4exp: layer 1 ran without its PLE rows";
         return false;
     }
+    if (F->ple_deferred) {   // (STRATA_Q4X_PLE_SPEC's guess was right: wait for its reads, then the cache answers)
+        F->ple->reap_prefetches();
+        F->ple_spec_live = false;
+        if (!F->ple->issue(F->ple_rows)) { err = "qwen4exp: the PLE rows could not be issued"; return false; }
+        F->ple_deferred = false;
+    }
     if (!F->ple->collect(F->ple_emb_h, err)) { err = "qwen4exp: PLE: " + err; return false; }
     F->ple_issued = false;
+    if (F->ple_spec_live) {   // (a wrong guess: its reads were issued a token ago - drop the tickets)
+        F->ple->reap_prefetches();
+        F->ple_spec_live = false;
+    }
     const int E = g.n_embd, HE = g.hc * E;
-    cudaMemcpyAsync(F->ple_emb, F->ple_emb_h, (size_t) E * 4, cudaMemcpyHostToDevice, s);
+    // STRATA_Q4X_PLE_MAPPED=1 (default off): a kernel reads the row from the mapped pinned buffer instead of the 10 KB
+    // copy (which can queue behind the background expert copies); the same bytes.  RTX 5090 nsys: the kernel took
+    // 11.0 us over PCIe against the copy's 6.4, so the copy stays the default
+    static const bool mapped = [] { const char* v = getenv("STRATA_Q4X_PLE_MAPPED"); return v != nullptr && std::atoi(v) != 0; }();
+    if (mapped && F->ple_emb_hd != nullptr)
+        q35::copy_f32(F->ple_emb, F->ple_emb_hd, E, s);
+    else
+        cudaMemcpyAsync(F->ple_emb, F->ple_emb_h, (size_t) E * 4, cudaMemcpyHostToDevice, s);
     gf::quantize_q8_1(F->ple_emb, F->ple_embq, E, s);
     gf::MvJob j[2];
     j[0] = {F->ple_key_w.q, F->ple_embq, F->ple_emb, F->ple_kp, nullptr, 1.0f, F->ple_key_w.type, E, HE};

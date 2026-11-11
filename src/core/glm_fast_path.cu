@@ -4217,6 +4217,7 @@ void Glm5Model::fast_destroy() {
     if (F->ps) cudaStreamSynchronize(F->ps);
     if (F->ev_hop) cudaEventDestroy(F->ev_hop);
     if (F->ev_done) cudaEventDestroy(F->ev_done);
+    if (F->ev_body) cudaEventDestroy(F->ev_body);
     if (F->ev_bgq) cudaEventDestroy(F->ev_bgq);
     if (F->ev_gs) cudaEventDestroy(F->ev_gs);
     if (F->ev_g0) cudaEventDestroy(F->ev_g0);
@@ -5384,13 +5385,15 @@ void Glm5Model::fast_ahead_reader() {
 // (3) every layer's spares are refilled - from free slots, else by evicting the layer's least-used resident
 // (demoted into the RAM tier when it beats the RAM tier's least-used, dropped otherwise); (4) the RAM tier keeps
 // a few free slots for disk reads.  The table edits ride one small update kernel at the head of the next token.
-bool Glm5Model::fast_boundary(std::string& err) {
+bool Glm5Model::fast_boundary(std::string& err, bool early) {
     FastState* F = fast_;
     if (F == nullptr || F->lp.empty() || F->rc.empty()) return true;
     const auto tb0 = std::chrono::steady_clock::now();
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
-        return false;
+    // (early: the caller saw the token's layers finish - every route and expert read done - while the head still runs
+    // on the stream; the table edits below queue after it, before the next token, as they do from the next token)
+    if (!early && !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err)) return false;
+    if (!F->route_ok(err)) return false;
     const Glm5Geometry& g = g_;
     const auto tb1 = std::chrono::steady_clock::now();
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
@@ -5538,6 +5541,13 @@ bool Glm5Model::fast_boundary(std::string& err) {
         const char* v = getenv("STRATA_GLM_TIER_GC");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    auto tph = std::chrono::steady_clock::now();
+    const auto ph = [&](int k) {   // (STRATA_GLM_GAP_PROF: the scan by phase)
+        if (!F->gap_on) return;
+        const auto t = std::chrono::steady_clock::now();
+        F->gap_ph[k] += std::chrono::duration<double, std::milli>(t - tph).count();
+        tph = t;
+    };
     // (1)
     for (size_t c = 0; c < F->rc.size(); ++c) {
         auto& R = F->rc[c];
@@ -5583,6 +5593,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
         }
     }
+    ph(0);
     // (2)
     std::vector<FastState::Drain> still;
     for (auto& d : F->draining) {
@@ -5607,6 +5618,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         F->ev_free.push_back(d.ev);
     }
     F->draining.swap(still);
+    ph(1);
     // (3)
     for (int il = l0_; il < lt_; ++il) {
         if (F->bg_hold) break;   // lending retires moves without starting spare-refill demotions
@@ -5718,6 +5730,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
         }
     }
+    ph(2);
     // (3b) the RESYNC after a helper decode (#24): the helper keeps its experts out of VRAM while it decodes, so the VRAM
     //      tier stops following the text (0.3 promotions a token against 2.4) and the next prompt runs ~10% slower.
     //      Here - between requests, no route in flight - each layer's hottest RAM-held experts go into its fresh spares
@@ -5786,6 +5799,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         if (made > 0 && !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm resync copies", err)) return false;
         F->resync_n += (uint64_t) made;
     }
+    ph(3);
     // (4) a few free RAM slots per class for the next token's disk reads (and its reads ahead); RAM-resident
     // mode plans no disk reads, so no residents are evicted to keep landing room either
     static const char* kf = getenv("STRATA_GLM_RAM_FREE");
@@ -5887,6 +5901,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
         if (queued) F->ah_cv.notify_all();
     }
+    ph(4);
     // (5) background moves between the tiers, over the copy stream.  Where the CPU lane takes every RAM-tier expert
     //     (two sockets beside an x8 link: 0.18 ms an expert on the CPU, 2.1 over PCIe) no route fetches one into VRAM
     //     any more, so the pool kept what the warm-up loaded - minus what each prompt's lending moved out (one 3090:
@@ -6113,7 +6128,9 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
         }
     }
+    ph(5);
     flush();
+    ph(6);
     static const bool diag = getenv("STRATA_GLM_TIER_DIAG") != nullptr;
     if (diag && ++F->diag_b % 64 == 0)
         std::fprintf(stderr, "glm tier diag CUDA%d (%llu boundaries): VRAM drops %llu, RAM evictions %llu, lend drops %llu (to RAM %llu), background promotions %llu / demotions %llu, resident skips %llu | "
@@ -6799,7 +6816,9 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
             F->gap_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - F->t_ready).count();
     }
     // between tokens (every device idle): finished promotions go live in the device tables
-    if (next_port_ != nullptr) {   // (qwen4exp's split: the later parts through their port)
+    if (F->early_b_pos >= 0 && F->early_b_pos == p && next_port_ == nullptr && split_next_ == nullptr) {
+        F->early_b_pos = -1;   // (STRATA_Q4X_EARLY_BOUNDARY: it ran during the previous token's head)
+    } else if (next_port_ != nullptr) {   // (qwen4exp's split: the later parts through their port)
         cudaSetDevice(dev_);
         if (!fast_boundary(err) || !next_port_->boundary(err)) return false;
     } else {
@@ -6934,6 +6953,26 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
             std::fclose(f);
         }
     }
+    // STRATA_Q4X_EARLY_BOUNDARY (qwen4exp, one device, no drafter; CUDA default on, HIP off): the next token's boundary
+    // (fast_boundary: the tier bookkeeping, ~0.16 ms of host time with the GPU idle) runs while the head computes -
+    // once the layers are done no route or expert read of this token is left; its table edits and copies queue after
+    // the head, before the next token, as before.  The same tokens (the tiers' timing only; qwen4exp's XC sums do not
+    // depend on where an expert lives)
+#if defined(STRATA_USE_HIP)
+    static const bool early_env = [] { const char* v = getenv("STRATA_Q4X_EARLY_BOUNDARY"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+    static const bool early_env = [] { const char* v = getenv("STRATA_Q4X_EARLY_BOUNDARY"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+    const bool early_b = early_env && g.q4x && tail == this && next_port_ == nullptr && !q35_mtp_on() &&
+                         dfl_ == nullptr && dsp_ == nullptr;
+    F->early_b_pos = -1;
+    if (early_b) {
+        if (F->ev_body == nullptr && cudaEventCreateWithFlags(&F->ev_body, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            F->ev_body = nullptr;
+        }
+        if (F->ev_body != nullptr) cudaEventRecord(F->ev_body, F->cs);
+    }
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};
@@ -6942,14 +6981,35 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    // STRATA_Q4X_ARGMAX_MB (qwen4exp on CUDA, default on): the argmax over 128 blocks - the same index
+#if defined(STRATA_USE_HIP)
+    static const bool am_mb = [] { const char* v = getenv("STRATA_Q4X_ARGMAX_MB"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+    static const bool am_mb = [] { const char* v = getenv("STRATA_Q4X_ARGMAX_MB"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+    const auto argmax_tok = [&](int* o) {
+        if (g.q4x && am_mb && FT->am_scratch != nullptr)
+            gf::argmax_mb(tail->sc_ + tail->sc_logits, g.n_vocab, o, FT->am_scratch, FT->cs);
+        else
+            gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, o, FT->cs);
+    };
     if (FT->zero_copy) {
-        gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok_hd, FT->cs);   // straight into the host-mapped word
+        argmax_tok(FT->tok_hd);   // straight into the host-mapped word
     } else {
-        gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
+        argmax_tok(FT->tok);
         cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     }
     if (gp) cudaEventRecord(F->ev_ge[F->gap_par], F->cs);
     cudaEventRecord(FT->ev_done, FT->cs);
+    if (early_b && F->ev_body != nullptr) {
+        cudaError_t be;
+        while ((be = cudaEventQuery(F->ev_body)) == cudaErrorNotReady) {
+            if (F->token_spin) cpu_relax(); else std::this_thread::yield();
+        }
+        if (!glmfast::cuda_ok(be, "glm token layers", err)) return false;
+        if (!fast_boundary(err, true)) return false;
+        F->early_b_pos = pos_;
+    }
     // wait for the token (the service threads answer misses meanwhile)
     const auto tw = std::chrono::steady_clock::now();
     bool warned = false;
@@ -6980,6 +7040,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     last_tok_ = FT->tok_h[0];
+    if (g.q4x && split_next_ == nullptr) q4x_ple_spec(last_tok_, pos_);   // (the next token's rows, if greedy)
     if (gp) fast_gap_mark(tw);
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ && m->fast_->prof_on) {
@@ -7100,6 +7161,10 @@ void Glm5Model::gap_report() {
                  F->gap_bsync / n, F->gap_bwait / n, F->gap_bscan / n, F->gap_emb / n, F->gap_spin / n, F->gap_busy / n,
                  F->gap_gpu / (double) std::max<uint64_t>(1, F->gap_gpu_n), (unsigned long long) F->gap_gpu_n,
                  F->gap_notice / (double) std::max<uint64_t>(1, F->gap_gpu_n));
+    std::fprintf(stderr, "glm gap prof boundary scan by step (ms/call): 1 %.3f | 2 %.3f | 3 %.3f | 3b %.3f | 4 %.3f | 5 %.3f "
+                         "| flush %.3f\n", F->gap_ph[0] / n, F->gap_ph[1] / n, F->gap_ph[2] / n, F->gap_ph[3] / n,
+                 F->gap_ph[4] / n, F->gap_ph[5] / n, F->gap_ph[6] / n);
+    for (double& v : F->gap_ph) v = 0;
     F->gap_host = F->gap_bsync = F->gap_bwait = F->gap_bscan = F->gap_emb = F->gap_spin = F->gap_gpu = F->gap_sample = 0;
     F->gap_busy = F->gap_notice = 0;
     F->gap_n = F->gap_gpu_n = F->gap_sample_n = 0;

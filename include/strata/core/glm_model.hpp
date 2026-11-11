@@ -632,6 +632,7 @@ public:
     std::string ple_gguf_;                                 // qwen4exp: the shard holding per_layer_token_embd
     bool q4x_ple_setup(std::string& err);
     bool q4x_ple_issue(int32_t token, int64_t p, std::string& err);
+    void q4x_ple_spec(int32_t token, int64_t p);
     bool q4x_ple_apply(std::string& err);
     bool q4x_qsa_setup(std::string& err);
     int64_t q35_snap_pend_ = -1, q35_snap_done_ = -1;
@@ -673,7 +674,7 @@ public:
     void fast_read_expert_x3(int il, int e, uint8_t* blob);   // a whole EXL3 expert in as few reads as it allows
     void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[16]);   // [glmf::kMaxK]   // LOOKAHEAD
     void fast_ahead_reader();
-    bool fast_boundary(std::string& err);                  // between tokens: apply finished promotions
+    bool fast_boundary(std::string& err, bool early = false);   // between tokens: apply finished promotions
     int fast_sample(strata::kernels::SamplerParams& sp, std::string& err);   // this half's logits, sampled on its stream
     int64_t ram_budget_ = -1;                              // bytes of pinned RAM tier for this half (-1: derive)
     float* snap_ = nullptr;                                // the saved KDA states + conv histories (this half)
