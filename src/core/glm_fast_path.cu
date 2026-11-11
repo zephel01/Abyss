@@ -22,6 +22,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/lane_q81.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
@@ -604,6 +605,9 @@ bool Glm5Model::fast_setup(std::string& err) {
     // so an expert's rows summed apart with what else was resident: the same prompt came out ~1e-6 apart with another
     // VRAM budget (a drafter loaded) or pool, and greedy answers parted later.  RTX 5090, Qwen3.8 16G64G: 8K / 32K
     // prompts 2,025 / 2,945 tok/s either way.  Set as 0: stream-k as before
+    // qwen4exp: PDL on by default on a discrete sm_120+ card too (pdl.hpp; STRATA_GLM_PDL=0: off).  Set before any
+    // launch of this model; other models leave the discrete-card default off
+    if (g_.q4x) strata::kernels::pdl_model_default_on();
     if (g_.q4x && getenv("STRATA_MMQ_WHOLE_K") == nullptr) {
 #if defined(_WIN32)
         _putenv_s("STRATA_MMQ_WHOLE_K", "1");
