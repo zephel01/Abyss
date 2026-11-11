@@ -140,6 +140,7 @@ void iq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float
 bool iq512v_supported(int) noexcept { return false; }
 bool iq512v_ready() noexcept { return false; }
 void iq512v_set_iq1s_fused(bool) noexcept {}
+void iq512v_set_lane_kernels(bool) noexcept {}
 void iq512v_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     x86_only("iq512v_rows");
 }

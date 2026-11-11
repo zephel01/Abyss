@@ -27,6 +27,11 @@ bool iq512v_ready() noexcept;
 /// IQ1_S's per-block delta term as one fmadd (GCC / Clang's contraction of ggml's line, the default) or a multiply then
 /// an add (MSVC's) - set from native_expert.cpp's check against this build's ggml-cpu.
 void iq512v_set_iq1s_fused(bool fused) noexcept;
+/// The CPU lane's newer AVX-512 decodes, the same bits as the older ones (lane_q81_test): IQ2_S by gathering
+/// iq2s_grid's qwords (~1.5x a block on Zen 5), IQ3_XXS by the grid's byte planes (~1.2x), IQ4_NL in 512-bit lanes
+/// (~1.9x over AVX2).  Off unless set: Qwen3.8's CPU lane turns them on (glm_fast_path.cu); STRATA_IQ2S_GATHER,
+/// STRATA_IQ3XXS_PLANES, STRATA_IQ4NL_512 = 0 / 1 override each.
+void iq512v_set_lane_kernels(bool on) noexcept;
 void iq512v_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
 

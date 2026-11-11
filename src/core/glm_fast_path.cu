@@ -24,6 +24,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/lane_q81.hpp"
+#include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 
@@ -2696,6 +2698,19 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     return slot_out;
 }
 
+// STRATA_GLM_CPU_PAR (default on for Qwen3.8 (qwen4exp); 0 off, 1 on): a verify window's call (fast_cpu_experts_multi)
+// runs its serial steps on the pool too - the columns' activations, the (expert, column) pairs' h quantization and
+// each column's weighted sum, in bands of rows.  Each piece is the serial step's own arithmetic on its own rows (a
+// row's sum never crosses a band), so the bits are the same; the call ran them on the service thread alone (a
+// 5-expert window ~17 of its ~175 us, RTX 5090 + 16 Zen 5 cores, 2026-11-11)
+static bool cpu_par_wanted(bool q4x) {
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_CPU_PAR");
+        return e == nullptr ? -1 : std::atoi(e);
+    }();
+    return v < 0 ? q4x : v != 0;
+}
+
 // A batched verify window's columns of a layer on the CPU threads at once (the service thread queues them,
 // MoeRequest::win_more): the union of the columns' experts, each through the multi-token rows for the columns that
 // route it - its weights read from RAM once - then every column's weighted sum in its own order.  Each (expert,
@@ -2751,6 +2766,11 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
         return all;
     }
     namespace kc = strata::kernels::cpu;
+    // STRATA_GLM_CPU_MULTI_STAT=1 (debug): the call's phases timed, by its union size, printed every 4096 calls
+    static const bool mstat = getenv("STRATA_GLM_CPU_MULTI_STAT") != nullptr;
+    using mclk = std::chrono::steady_clock;
+    mclk::time_point mt[6];
+    if (mstat) mt[0] = mclk::now();
     const auto& nf = F->cpu_fmt[(size_t) il];
     constexpr int kCols = kVerifyMax, kPairs = gf::kMaxK * kVerifyMax;   // (a column's entries at stride kMaxK)
     // the union: expert u's blob, its columns, the (expert, column) pair each of them is; pair p's buffers at p
@@ -2780,16 +2800,24 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     }
     uint8_t* act = F->cpu_act_m.data();
     const bool exact = F->cpu_exact[(size_t) il] != 0;
-    for (int t = 0; t < n; ++t) lane_quant_x(exact, nf, x[t], xq ? xq[t] : nullptr, act + (size_t) t * kc::kNativeActBytes);
+    const bool par = cpu_par_wanted(g.q4x);
+    const auto quant_x = [&](int t) {
+        lane_quant_x(exact, nf, x[t], xq ? xq[t] : nullptr, act + (size_t) t * kc::kNativeActBytes);
+    };
+    if (par && n >= 2)
+        F->cpu_pool->run(n, quant_x);
+    else
+        for (int t = 0; t < n; ++t) quant_x(t);
     static const int kSplit = [] {
         const char* v = getenv("STRATA_GLM_CPU_SPLIT");
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
     const int threads = F->cpu_pool->active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
+    if (mstat) mt[1] = mclk::now();
     // gate/up: the union's rows end to end, a contiguous run a job (as fast_cpu_experts), every column of an expert
     const int gu_tot = nu * n_ff;
-    F->cpu_pool->run(T, [&](int job) {
+    const auto gu_job = [&](int job) {
         const int q1 = (int) ((int64_t) gu_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int u = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
@@ -2802,12 +2830,20 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             lane_gu_rows(exact, nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp, ugs[u]);
             q += r1 - r0;
         }
-    });
-    for (int p = 0; p < np; ++p)
+    };
+    F->cpu_pool->run(T, gu_job);
+    if (mstat) mt[2] = mclk::now();
+    const auto quant_h = [&](int p) {
         lane_quant_h(exact, nf, F->cpu_ff_m.data() + (size_t) p * n_ff, F->cpu_hq_m.data() + (size_t) p * kc::kNativeHBytes);
+    };
+    if (par && np >= 3)
+        F->cpu_pool->run(np, quant_h);
+    else
+        for (int p = 0; p < np; ++p) quant_h(p);
+    if (mstat) mt[3] = mclk::now();
     const bool slot_out = fx != nullptr && exact;   // (the exact combine: as fast_cpu_experts)
     const int dn_tot = nu * n_embd;
-    F->cpu_pool->run(T, [&](int job) {
+    const auto dn_job = [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
             const int u = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
@@ -2820,18 +2856,73 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             lane_down_rows(exact, nf, ub[u] + Ly.down_off, h, ucnt[u], o, r0, r1);
             q += r1 - r0;
         }
-    });
-    for (int t = 0; t < n && slot_out; ++t) {   // (the exact combine: as fast_cpu_experts)
-        const float* rows[gf::kMaxK];
-        for (int i = 0; i < ne[t]; ++i) rows[i] = F->cpu_dn_m.data() + (size_t) pair_of[t][i] * n_embd;
-        kc::lane_q81_fx_sum(ne[t], w + gf::kMaxK * t, rows, 0, n_embd, fx[t], gf::kFxShift);
-    }
-    for (int t = 0; t < n && !slot_out; ++t)
-        for (int r = 0; r < n_embd; ++r) {
-            float m = 0.0f;
-            for (int i = 0; i < ne[t]; ++i) m += w[gf::kMaxK * t + i] * F->cpu_dn_m[(size_t) pair_of[t][i] * n_embd + r];
-            out[t][r] = m;
+    };
+    F->cpu_pool->run(T, dn_job);
+    if (mstat) mt[4] = mclk::now();
+    // each column's weighted sum over rows [r0, r1) (a band: the same per-row steps as the whole range)
+    const auto col_sum = [&](int r0, int r1) {
+        for (int t = 0; t < n && slot_out; ++t) {   // (the exact combine: as fast_cpu_experts)
+            const float* rows[gf::kMaxK];
+            for (int i = 0; i < ne[t]; ++i) rows[i] = F->cpu_dn_m.data() + (size_t) pair_of[t][i] * n_embd;
+            kc::lane_q81_fx_sum(ne[t], w + gf::kMaxK * t, rows, r0, r1, fx[t], gf::kFxShift);
         }
+        for (int t = 0; t < n && !slot_out; ++t)
+            for (int r = r0; r < r1; ++r) {
+                float m = 0.0f;
+                for (int i = 0; i < ne[t]; ++i) m += w[gf::kMaxK * t + i] * F->cpu_dn_m[(size_t) pair_of[t][i] * n_embd + r];
+                out[t][r] = m;
+            }
+    };
+    if (par && np >= 3) {
+        // bands of a multiple of 4 rows (lane_q81_fx_sum's vector step), one a pair up to a band a thread
+        const int nbands = std::max(1, std::min(threads, np)), quads = (n_embd + 3) / 4;
+        F->cpu_pool->run(nbands, [&](int b) {
+            col_sum(std::min(n_embd, 4 * (quads * b / nbands)), std::min(n_embd, 4 * (quads * (b + 1) / nbands)));
+        });
+    } else {
+        col_sum(0, n_embd);
+    }
+    if (mstat) {
+        mt[5] = mclk::now();
+        static uint64_t calls = 0, by_n[17] = {}, ph[17][5] = {};
+        const int b = std::min(nu, 16);
+        ++by_n[b];
+        for (int k = 0; k < 5; ++k)
+            ph[b][k] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(mt[k + 1] - mt[k]).count();
+        // STRATA_GLM_CPU_MULTI_HOT=1 (debug, delays every answer): gate/up and down again, the experts now in the
+        // caches - what a perfect warm-up would leave of the two (the same values written again)
+        static const bool hot = getenv("STRATA_GLM_CPU_MULTI_HOT") != nullptr;
+        static uint64_t hg[17] = {}, hd[17] = {};
+        if (hot) {
+            const auto h0 = mclk::now();
+            F->cpu_pool->run(T, gu_job);
+            const auto h1 = mclk::now();
+            F->cpu_pool->run(T, dn_job);
+            const auto h2 = mclk::now();
+            hg[b] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(h1 - h0).count();
+            hd[b] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(h2 - h1).count();
+        }
+        if (++calls % 4096 == 0) {
+            std::string s;
+            for (int k = 1; k <= 16; ++k)
+                if (by_n[k] > 0) {
+                    char buf[160];
+                    std::snprintf(buf, sizeof buf, " | %d: %llu x prep %.1f gu %.1f qh %.1f dn %.1f sum %.1f us", k,
+                                  (unsigned long long) by_n[k], ph[k][0] / 1e3 / by_n[k], ph[k][1] / 1e3 / by_n[k],
+                                  ph[k][2] / 1e3 / by_n[k], ph[k][3] / 1e3 / by_n[k], ph[k][4] / 1e3 / by_n[k]);
+                    s += buf;
+                    if (hot) {
+                        std::snprintf(buf, sizeof buf, " (hot gu %.1f dn %.1f)", hg[k] / 1e3 / by_n[k], hd[k] / 1e3 / by_n[k]);
+                        s += buf;
+                    }
+                }
+            std::fprintf(stderr, "cpu multi stat (%llu calls, by union size)%s\n", (unsigned long long) calls, s.c_str());
+            std::fill(by_n, by_n + 17, 0);
+            std::fill(hg, hg + 17, 0);
+            std::fill(hd, hd + 17, 0);
+            for (auto& r : ph) std::fill(r, r + 5, 0);
+        }
+    }
     if (check && !slot_out) check_cols("cpu");
     F->cpu_multi_calls.fetch_add(1, std::memory_order_relaxed);
     F->cpu_multi_cols.fetch_add((uint64_t) n, std::memory_order_relaxed);
@@ -3034,6 +3125,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     F->cpu_fmt.assign(F->L.size(), kc::NativeFmt{});
     F->cpu_exact.assign(F->L.size(), 0);
     int il_cal = -1;
+    // IQ2_S blocks gathered from iq2s_grid (the same bytes, ~1.6x faster a block: Qwen3.8's UD-IQ3_XXS gate/up
+    // layers' lane) - Qwen3.8 first; STRATA_IQ2S_GATHER=0 / 1 decides for any model
+    if (kc::cpu_avx512_ok()) kc::iq512v_set_lane_kernels(g.q4x);
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe || Ly.mtp) continue;
@@ -4383,6 +4477,10 @@ void Glm5Model::fast_service() {
     };
     WinCol wq[kVerifyMax];
     int wq_n = 0, wq_layer = -1;
+    // STRATA_GLM_CPU_MULTI_STAT=1 (debug): the window's first queued column to its flush, and the flush itself
+    static const bool wstat = getenv("STRATA_GLM_CPU_MULTI_STAT") != nullptr;
+    std::chrono::steady_clock::time_point wq_first{};
+    uint64_t ws_n = 0, ws_q = 0, ws_f = 0;
     const auto lane_flush = [&] {
         const auto t0 = std::chrono::steady_clock::now();
         int ne[kVerifyMax];
@@ -4569,6 +4667,15 @@ void Glm5Model::fast_service() {
         F->cpu_routes.fetch_add((uint64_t) wq_n, std::memory_order_relaxed);
         F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
                             std::memory_order_relaxed);
+        if (wstat) {
+            ws_q += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - wq_first).count();
+            ws_f += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            if (++ws_n % 4096 == 0) {
+                std::fprintf(stderr, "cpu window stat: %llu flushes | first column queued -> flush %.1f us | flush %.1f us\n",
+                             (unsigned long long) ws_n, ws_q / 1e3 / 4096, ws_f / 1e3 / 4096);
+                ws_q = ws_f = 0;
+            }
+        }
         wq_n = 0;
         wq_layer = -1;
     };
@@ -5050,6 +5157,7 @@ void Glm5Model::fast_service() {
         if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr && cpu_multi && !lane_started &&
             (F->igpu_experts == nullptr || (F->igpu_cols != nullptr && !F->L[(size_t) rq->layer].exl3)) &&
             (rq->win_more > 0 || wq_n > 0) && wq_n < kVerifyMax) {
+            if (wstat && wq_n == 0) wq_first = std::chrono::steady_clock::now();
             WinCol& c = wq[wq_n++];
             wq_layer = rq->layer;
             c.seq = next;
