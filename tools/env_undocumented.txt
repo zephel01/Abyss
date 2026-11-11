@@ -141,7 +141,6 @@ STRATA_GLM_RAM_FREE  # src/core/glm_fast_path.cu
 STRATA_GLM_RAM_PROTECT  # src/core/glm_fast_path.cu
 STRATA_GLM_RAM_RESIDENT  # src/core/glm_fast_path.cu
 STRATA_GLM_RAM_SLACK  # src/core/glm_fast_path.cu
-STRATA_GLM_READ_CHUNKS  # src/core/glm_fast_path.cu
 STRATA_GLM_ROUTE_EARLY  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_ROUTE_LOG  # src/core/glm_fast_path.cu
 STRATA_GLM_SCORE_DUMP  # src/program/generate.cpp
@@ -170,7 +169,6 @@ STRATA_GLM_TAIL_SKIP_W  # src/core/glm_fast_path.cu
 STRATA_GLM_TEST_PIPE  # src/core/glm_pack_test.cpp
 STRATA_GLM_TIER_DIAG  # src/core/glm_fast_path.cu
 STRATA_GLM_TIER_GC  # src/core/glm_fast_path.cu
-STRATA_GLM_TIMING  # src/core/glm_fast_path.cu
 STRATA_GLM_TOKEN_SPIN  # src/core/glm_fast_path.cu
 STRATA_GLM_TRACE  # src/core/glm_model.cu
 STRATA_GLM_UNIFORM_SLOTS  # src/core/glm_fast_path.cu

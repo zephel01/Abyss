@@ -664,6 +664,12 @@ struct Glm5Model::FastState {
     std::vector<uint8_t*> stage;   // pinned: disk reads when no RAM slot is free
     std::mutex mu;   // the service thread vs the between-token boundary
     std::unique_ptr<glmfast::Workers> workers;   // parallel disk reads
+    // STRATA_GLM_DISK_PAR (off by default): the decode's miss reads get a pool of their own, sized so every chunk of
+    // an expert (3 parts x read_chunks) is read at once, instead of 9 threads taking 24 chunks in ~3 rounds.  Only
+    // the I/O schedule changes (the same bytes land in the same slots); null = the shared pool above
+    std::unique_ptr<glmfast::Workers> disk_pool;
+    int disk_par = 0;                            // the miss reads' threads with the switch on (the caller included)
+    int shared_readers = 0;                      // ... and the shared pool's (off)
     // ---- the CPU LANE (STRATA_GLM_CPU_LANE=<threads>, 0 off): a route's RAM-tier experts split between the device's
     //      PCIe pulls and this pool, which computes its share from the pinned blobs meanwhile; the device adds the
     //      weighted sum (cpu_ans_h) before its down combine.  cpu_plan: how many of f RAM-tier experts go to the host.
@@ -735,6 +741,12 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> hits{0}, misses{0}, miss_layers{0}, ram_hits{0}, disk_reads{0}, promotions{0};
     std::atomic<uint64_t> scratch_uses{0}, demotions{0}, drops{0};
     std::atomic<uint64_t> miss_us{0}, disk_us{0};
+    // the decode's disk waits (STRATA_GLM_TIMING=1 prints them): bytes read, and the wait times of the waits that read
+    // exactly one expert in 50 us buckets (the last one is everything from 12.75 ms up)
+    static constexpr int kDiskHist = 256;
+    static constexpr int kDiskHistUs = 50;
+    std::atomic<uint64_t> disk_bytes{0}, disk_one_waits{0}, disk_one_us{0};
+    std::array<std::atomic<uint32_t>, kDiskHist> disk_one_hist{};
     uint64_t tokens = 0;
     double ms = 0;
     // ---- STRATA_GLM_GAP_PROF=1: where the time between two tokens goes.  Host laps (ms, summed): from a token's
