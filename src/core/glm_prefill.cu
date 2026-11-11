@@ -3303,7 +3303,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // arithmetic than the resident ones beside them - a prompt's numbers then followed what was resident.
             // Measured: the second request of a deterministic run gave other tokens under two CPU plans, whose tier
             // moves had left other experts resident)
-            if ((cpu_lane(il) || (xact && cpu_lane_ok(il))) && cpu_bufs(moe_window_rows((size_t) T, g))) {
+            // (and a layer the exact prompt cannot take - a type without exact rows, as UD 3.1's Q2_0 down layers -
+            // in a chunk it would otherwise cover gives the CPU nothing: its timed share made such a short prompt's
+            // numbers follow the run's timings and pool - two runs of the same prompt gave other tokens)
+            const bool x_skip = F->xc && !xact && (size_t) T * (size_t) K <= (size_t) moe_window_rows((size_t) T, g);
+            if ((xact ? cpu_lane_ok(il) : cpu_lane(il) && !x_skip) && cpu_bufs(moe_window_rows((size_t) T, g))) {
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;
                 for (size_t i = 0; i < staged.size(); ++i) {
