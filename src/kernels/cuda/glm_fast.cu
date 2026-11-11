@@ -2955,6 +2955,7 @@ struct RouteArgs {
                                 // only); a VRAM one gets the larger of the two.  LOSSY (0: off)
     int prof;                   // STRATA_GLM_ROUTE_PROF: per-phase cycle sums (diagnostics)
     int win_more;               // MoeRequest::win_more (a batched verify window's column: more routes of the layer follow)
+    int topk_par;               // 1: the top-k over 8 warps (block_topk512, the same ids); STRATA_GLM_TOPK_PAR=0: warp 0's
 };
 // the request's xq (x's q8_1 as the device computed it: 36-byte blocks, copied as words) and its flag; the system
 // fence before the request's seq covers it as it does x
@@ -3056,6 +3057,92 @@ __device__ void warp_topk(const float* sel, int E, int k, int* out) {
 #else
     warp_topk_scan(sel, E, k, out);
 #endif
+}
+
+// ... the same selection over 8 warps (the route block's, E <= 512): warp w takes experts 64 w .. 64 w + 63 (2 a lane)
+// and picks its slice's k best by warp_topk's rounds - the highest key, the lowest index on a tie - into shared memory;
+// then warp 0 picks the k best of those 8 k candidates the same way.  The k best of all are among their slices' k best
+// and the order is one total order (key, then index), so the ids are warp_topk's, -1 for -inf / none as there (a key
+// at or below -inf's ends the valid ones in both).  RTX 5090, Qwen3.8 k = 10 of 512: ~9k cycles a route (the phase
+// with its barrier, STRATA_GLM_ROUTE_PROF) on warp 0 alone.  Every thread of the block calls it (it syncs)
+__device__ void block_topk512(const float* sel, int E, int k, int* out, unsigned* ck, unsigned* ci) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (w < 8) {
+        unsigned key[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int e = 64 * w + lane + 32 * j;
+            key[j] = e < E ? topk_key(sel[e]) : 0u;
+        }
+        for (int r = 0; r < k; ++r) {
+            const bool t = key[1] > key[0];
+            const unsigned bk = t ? key[1] : key[0];
+            const unsigned mi = (unsigned) (64 * w + lane + (t ? 32 : 0));
+            const unsigned m = __reduce_max_sync(0xffffffffu, bk);
+            const unsigned bi = __reduce_min_sync(0xffffffffu, bk == m ? mi : 0xffffffffu);
+            if (mi == bi) key[t ? 1 : 0] = 0u;
+            if (lane == 0) {
+                ck[w * kMaxK + r] = m;
+                ci[w * kMaxK + r] = bi;
+            }
+        }
+    }
+    __syncthreads();
+    if (w == 0) {
+        unsigned key[4], idx[4];   // (candidate c = lane + 32 j: warp c / 16's rank c % 16)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = lane + 32 * j, cw = c / kMaxK, cr = c % kMaxK;
+            const bool on = cr < k;
+            key[j] = on ? ck[cw * kMaxK + cr] : 0u;
+            idx[j] = on ? ci[cw * kMaxK + cr] : 0xffffffffu;
+        }
+        for (int r = 0; r < k; ++r) {
+            unsigned bk = key[0], bx = idx[0];
+            int bj = 0;
+#pragma unroll
+            for (int j = 1; j < 4; ++j)
+                if (key[j] > bk || (key[j] == bk && idx[j] < bx)) {
+                    bk = key[j];
+                    bx = idx[j];
+                    bj = j;
+                }
+            const unsigned m = __reduce_max_sync(0xffffffffu, bk);
+            const unsigned bi = __reduce_min_sync(0xffffffffu, bk == m ? bx : 0xffffffffu);
+            if (bx == bi) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (j == bj) key[j] = 0u;
+            }
+            if (lane == 0) out[r] = bi < (unsigned) E && m > 0x007fffffu ? (int) bi : -1;
+        }
+    }
+    __syncthreads();
+#else
+    if (threadIdx.x < 32) warp_topk(sel, E, k, out);
+    __syncthreads();
+    (void) ck; (void) ci;
+#endif
+}
+
+// (route_topk_check: block_topk512 against warp_topk on n patterns of E scores a block, k = 1..16)
+__global__ void __launch_bounds__(ROUTE_THREADS) topk_check_kernel(const float* sel, const int* Es, int* bad) {
+    __shared__ float s[512];
+    __shared__ int o1[kMaxK], o2[kMaxK];
+    __shared__ unsigned ck[8 * kMaxK], ci[8 * kMaxK];
+    const int E = Es[blockIdx.x];
+    for (int e = threadIdx.x; e < 512; e += ROUTE_THREADS) s[e] = sel[(size_t) blockIdx.x * 512 + e];
+    __syncthreads();
+    for (int k = 1; k <= kMaxK; ++k) {
+        if (threadIdx.x < 32) warp_topk(s, E, k, o1);
+        __syncthreads();
+        block_topk512(s, E, k, o2, ck, ci);
+        if (threadIdx.x == 0)
+            for (int i = 0; i < k; ++i)
+                if (o1[i] != o2[i]) atomicAdd(bad, 1);
+        __syncthreads();
+    }
 }
 
 // STRATA_GLM_ROUTE_PROF=1 (diagnostics, CUDA): thread 0 of the route block sums SM cycles per phase (0 start, 1 x / prev
@@ -3180,8 +3267,13 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
         if (tid < a.k) s_ids[tid] = a.hash_ids[tid];
         __syncthreads();
     } else if (E <= 512) {
-        if (tid < 32) warp_topk(s_sel, E, a.k, s_ids);
-        __syncthreads();
+        if (a.topk_par) {
+            __shared__ unsigned s_ck[8 * kMaxK], s_ci[8 * kMaxK];
+            block_topk512(s_sel, E, a.k, s_ids, s_ck, s_ci);
+        } else {
+            if (tid < 32) warp_topk(s_sel, E, a.k, s_ids);
+            __syncthreads();
+        }
     } else {
         topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
     }
@@ -4906,6 +4998,24 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
 void mv_force_q6k_split(int split4) { g_q6k_force.store(split4); }
 void mv_force_split(int split) { g_split_force.store(split == 2 || split == 4 || split == 1 ? split : -1); }
 bool mv_q6k_split_choice() { return mv_tune().q6k_split; }
+int mv_split_rule(int type, int n_out) {
+    // (mv()'s rule below, for one type's blocks acc; HIP's mixed-type launch is another order: no rule there)
+#if defined(STRATA_USE_HIP)
+    (void) type; (void) n_out;
+    return 0;
+#else
+    if (getenv("STRATA_GLM_MV_GENERIC") != nullptr) return 0;
+    if (type != 14 && type != 8 && type != 12 && type != 13) return 0;
+    static const int split_env = [] { const char* v = getenv("STRATA_GLM_MV_SPLIT"); return v ? std::atoi(v) : -1; }();
+    const int q6k_force = g_q6k_force.load(std::memory_order_relaxed);
+    const bool q6k_split = q6k_force >= 0 ? q6k_force != 0 : mv_tune().q6k_split;
+    const int acc = (n_out + MV_ROWS - 1) / MV_ROWS;
+    const int sforce = g_split_force.load(std::memory_order_relaxed);
+    return sforce > 0 ? sforce
+         : split_env >= 0 ? (split_env == 2 || split_env == 4 ? split_env : 1)
+         : (acc < 256 || (q6k_split && type == 14 && acc <= 4096)) ? 4 : 1;
+#endif
+}
 
 bool mvn_mv(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     if (nc == 1) return mv(jobs, n, s);
@@ -5569,6 +5679,15 @@ __global__ void sh_swiglu_kernel(const float* __restrict__ sh_gate, const float*
     q8_1_store_warp((g / (1.0f + expf(-g))) * u, sh_hq + i / 32, threadIdx.x & 31);
 }
 
+int route_topk_check(const float* sel_d, const int* E_d, int n, int* bad_d, cudaStream_t s) {
+    topk_check_kernel<<<n, ROUTE_THREADS, 0, s>>>(sel_d, E_d, bad_d);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+// STRATA_GLM_TOPK_PAR (default 1): the route's top-k over 8 warps (block_topk512: the same ids); 0: warp 0 alone
+static int route_topk_par() {
+    static const int v = [] { const char* e = getenv("STRATA_GLM_TOPK_PAR"); return e == nullptr || std::atoi(e) != 0 ? 1 : 0; }();
+    return v;
+}
 void sh_swiglu(const float* sh_gate, const float* sh_up, float sh_limit, int n_ff_sh, void* sh_hq, cudaStream_t s) {
     pdl_launch(sh_swiglu_kernel, (n_ff_sh + ROUTE_THREADS - 1) / ROUTE_THREADS, ROUTE_THREADS, 0, s, sh_gate, sh_up, sh_limit,
                                                                                             n_ff_sh, (block_q8_1*) sh_hq);
@@ -5598,6 +5717,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     static const int prof = [] { const char* v = getenv("STRATA_GLM_ROUTE_PROF"); return v != nullptr && std::atoi(v) != 0; }();
     a.prof = prof;
     a.win_more = win_more;
+    a.topk_par = route_topk_par();
     // STRATA_GLM_ROUTE_EARLY=1: x written at the route kernel's start (float4, beside the scores and the plan);
     // default 0: after the plan, as before - measured the same on an RTX 5090 + iGPU lane (the system fence, not the
     // store, is what the request waits for): 3 x 2 answers, 83.4 / 85.6 against 83.6 / 91.2 tok/s
@@ -5638,6 +5758,7 @@ bool moe_route_cols(const float* logits, size_t logit_stride, const float* bias,
                     pf_rank > 0 ? pf_rank : k, gating, nullptr, skip_w, 0, skip_disk, nullptr, 0.0f, 0.0f};
     c.a.n_embd = (int) x_stride;   // (a column's x: n_embd floats)
     c.a.prof = prof;
+    c.a.topk_par = route_topk_par();
     c.nc = nc;
     c.sync = sync;
     for (int t = 0; t < nc; ++t) {

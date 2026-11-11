@@ -1671,7 +1671,7 @@ bool Glm5Model::q4x_mix_cols(float* R, int T, const float* norm, const WSlot& do
     if (fuse && q35::hc4_fused_cols_ok(E, g.hc, LR, T, down.type, up.type, inject != nullptr ? inject->type : -1)) {
         q35::hc4_fused_cols(R, out, inj_prev, g.hc, norm, g.norm_eps, E, g.hc, LR, T, down.q,
                             inject != nullptr ? inject->q : nullptr, up.q, V->q4_lo, inj_out, V->q4_sc, V->q4_xn,
-                            V->q4_gate, x, xq, s, inject != nullptr && inject->type == gf::kTypeF32);
+                            V->q4_gate, x, xq, s, inject != nullptr && inject->type == gf::kTypeF32, down.type, V->q4_xnq);
         return true;
     }
     q35::hc4_combine_norm(R, out, inj_prev, g.hc, norm, g.norm_eps, E, g.hc, T, V->q4_xn, s, V->q4_xnq);

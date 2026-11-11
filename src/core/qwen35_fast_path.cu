@@ -1020,7 +1020,7 @@ bool Glm5Model::q4x_mix(const float* norm, const WSlot& down, const WSlot& up, c
     if (fused) {
         q35::hc4_fused(state_, out, inj_prev, norm, g.norm_eps, E, g.hc, LR, down.q, inject != nullptr ? inject->q : nullptr,
                        up.q, F->q4_lo, inj_out, F->q4_sc, F->q4_xn, F->q4_gate, x, xq, s,
-                       inject != nullptr && inject->type == gf::kTypeF32);
+                       inject != nullptr && inject->type == gf::kTypeF32, down.type, F->q4_xnq);
         return true;
     }
     return q4x_mix5(norm, down, up, inject, out, inj_prev, inj_out, x, xq, err);

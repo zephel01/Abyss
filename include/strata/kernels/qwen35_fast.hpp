@@ -128,11 +128,13 @@ void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, floa
 /// streams' combine and norm into its own shared copy of xn (R is read, not written), then 8 rows of down / inject;
 /// b - silu(lo / hc), the up rows of 32 embedding columns (all hc streams), R's combine, xn, gate, the mix and its q8_1.
 /// lo: down's output before the silu; sc: hc floats of scratch (a's stream scales for b).  hc4_fused_ok: the shapes
-/// and types the kernels take (hc 4, hc * n_embd <= 10240, lo <= 512 and a multiple of 8, BF16 down / up, BF16 or F32 inject).
+/// and types the kernels take (hc 4, hc * n_embd <= 10240, lo <= 512 and a multiple of 8, BF16 down / up with BF16 or
+/// F32 inject, or Q8_0 down / up - lo a multiple of 32 - with F32 inject: mv()'s sums, xn and lo as q8_1).
 bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int inject_type);
 void hc4_fused(float* R, const float* out, const float* inj_prev, const float* gamma, float eps, int n_embd, int hc,
                int lr, const void* down, const void* inject, const void* up, float* lo, float* inj_out, float* sc,
-               float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32 = false);
+               float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32 = false,
+               int wtype = 30, void* scratch = nullptr);
 /// the same over a window's T columns (1..8; R [T][hc][n_embd], out [T][n_embd], inj_prev / inj_out [T][inj_stride /
 /// hc], lo [T][lr], sc 4 T floats, xn / gate [T][hc][n_embd], x [T][n_embd]): bit-identical to q4x_mix_cols' five
 /// launches (hc4_combine_norm over the columns, mvn down + inject, silu_scale, mvn up, hc4_mix) - a: hc4_fused's a with
@@ -141,6 +143,8 @@ bool hc4_fused_cols_ok(int n_embd, int hc, int lr, int T, int down_type, int up_
 void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_stride, const float* gamma, float eps,
                     int n_embd, int hc, int lr, int T, const void* down, const void* inject, const void* up, float* lo,
                     float* inj_out, float* sc, float* xn, float* gate, float* x, void* xq, cudaStream_t s,
-                    bool inject_f32 = false);
+                    bool inject_f32 = false, int wtype = 30, void* scratch = nullptr);
+/// (wtype: down's and up's type, BF16 30 or Q8_0 8; Q8_0 needs scratch of 4 T lr floats - a's down parts, the five's
+/// xn q8_1 buffer is big enough)
 
 }  // namespace strata::kernels::q35

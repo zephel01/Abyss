@@ -16,6 +16,7 @@
 #pragma pop_macro("__shfl_sync")
 #endif
 #include "strata/kernels/qwen35_fast.hpp"
+#include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -1165,6 +1166,34 @@ __device__ __forceinline__ float hc_bf16_dot8(const uint4 w, const float4 a, con
            __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
            __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
 }
+// Q8_0 (the UD 3.1 packs' hc down / up): glm_fast's dot_q8_0 against a q8_1 activation, expression for expression
+// (row: the weight row, 34-byte blocks; x: the activation's q8_1 blocks; call k = block kbx's ints iqs, iqs + 1)
+__device__ __forceinline__ int hc_int_b2(const uint8_t* x, int i32) {
+    const uint16_t* x16 = (const uint16_t*) x;
+    int x32 = x16[2 * i32 + 0] << 0;
+    x32 |= x16[2 * i32 + 1] << 16;
+    return x32;
+}
+__device__ __forceinline__ float hc_q8_0_dot(const uint8_t* row, const Q81* x, int kbx, int iqs) {
+    const uint8_t* b = row + (size_t) kbx * 34;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = hc_int_b2(b + 2, iqs + i);
+        const int u = ((const int*) x[kbx].qs)[iqs + i];
+        sumi = __dp4a(v, u, sumi);
+    }
+    return __half2float(*(const __half*) b) * __low2float(x[kbx].ds) * float(sumi);
+}
+// a warp's share of [w, w + bytes) into L2 (glm_fast's mv_prefetch_l2): weights only, so before STRATA_PDL_ENTRY
+__device__ __forceinline__ void hc_prefetch_l2(const void* w, size_t bytes, int lane) {
+#if defined(__CUDA_ARCH__) && !defined(STRATA_USE_HIP)
+    const char* c = (const char*) w;
+    for (size_t o = (size_t) lane * 128; o < bytes; o += (size_t) 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(c + o));
+#else
+    (void) w; (void) bytes; (void) lane;
+#endif
+}
 // a: block b - the hc streams' combine (R + out * 2 sigmoid(inj_prev / hc), not written back) and grouped norm into
 // shared memory (each stream as hc4_combine_norm_kernel's block: 256 threads, the same partial sums), then its 8 warps'
 // rows of down (lr rows) and inject (hc rows after them): y = the row's dot + 0 (mv's alpha 1, no bias)
@@ -1269,6 +1298,169 @@ __global__ void __launch_bounds__(256) hc4_fused_a_kernel(const float* __restric
     s = warp_sum(s);
     if (lane == 0) *y = s + 0.0f;
 }
+// a, Q8_0 down (hc4_fused_a_q8_kernel): mv()'s down is mv_kernel_ts<8, DS> - DS warps a row, warp p summing the
+// calls of its k range, the DS sums added 0 -> DS - 1 - and with lo % 32 == 0 range p is streams 4p / DS .. 4(p+1) / DS
+// - 1 of xn exactly.  So block (g, p) needs only those streams: their combine and norm (hc4_combine_norm_kernel's
+// sums, as hc4_fused_a_kernel's), their q8_1 in shared memory (the same bytes), then its 8 warps' range-p sums of rows
+// 8g .. 8g + 7 to part[p][row] (the warp sum, as mv_kernel_ts' s_part); b adds the parts in order.  The inject rows
+// (F32, row_dot_f32's chain over all four streams: not divisible) are the last block's, with the four streams' floats -
+// its weight rows pulled into L2 before the PDL wait and read 8 float4 ahead (the same adds in the same order)
+template<int DS>
+__global__ void __launch_bounds__(256) hc4_fused_a_q8_kernel(const float* __restrict__ R, const float* __restrict__ out,
+                                                             const float* __restrict__ inj_prev,
+                                                             const float* __restrict__ gamma, float eps, int n_embd,
+                                                             int hc, const uint8_t* __restrict__ down, int lr,
+                                                             const float* __restrict__ inject,
+                                                             float* __restrict__ part, float* __restrict__ inj_out,
+                                                             float* __restrict__ sc_out, int inj_stride) {
+    constexpr int NS = 4 / DS;   // (streams a down block)
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, n_in = hc * n_embd;
+    const int ndb = lr / 8 * DS;   // (down blocks; the inject block after them)
+    const bool injb = (int) blockIdx.x >= ndb;
+    const int g = blockIdx.x / DS, p = blockIdx.x % DS;
+    const int c0 = injb ? 0 : p * NS, nc = injb ? 4 : NS;
+    const size_t rb = (size_t) n_in / 32 * 34;
+    // the inject block: warp w takes row w % 4's lane chains, steps j (k = lane + 32 j) of half w / 4 - the first half
+    // summed as it goes, the second's terms kept in registers and added onto the first's chain after it (row_dot_f32's
+    // adds, in order); each warp's first 8 weight float4 loaded before the PDL wait, its half pulled into L2
+    constexpr int kJh = kHcMaxHE / 4 / 32 / 2;   // (a half's steps, at most)
+    const int Jh = n_in / 4 / 32 / 2, ih = warp >> 2, ir = warp & 3;
+    const float4* r4 = injb && inject != nullptr ? (const float4*) (inject + (size_t) ir * n_in) + lane + 32 * ih * Jh : nullptr;
+    float4 pre[8];
+    if (!injb) {
+        hc_prefetch_l2(down + (size_t) (g * 8 + warp) * rb + (size_t) c0 * n_embd / 32 * 34, (size_t) nc * n_embd / 32 * 34,
+                       lane);
+    } else if (r4 != nullptr) {
+        hc_prefetch_l2((const float*) (inject + (size_t) ir * n_in) + (size_t) ih * Jh * 128, (size_t) Jh * 512, lane);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) pre[u] = r4[32 * u];
+    }
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any read of what an earlier kernel writes)
+    if (injb && inject == nullptr) return;
+    __shared__ __align__(16) float xs[kHcMaxHE];
+    {   // column blockIdx.y of a window
+        const int t = blockIdx.y;
+        R += (size_t) t * hc * n_embd;
+        if (out != nullptr) out += (size_t) t * n_embd;
+        inj_prev += (size_t) t * inj_stride;
+        part += (size_t) t * DS * lr;
+        if (inj_out != nullptr) inj_out += (size_t) t * hc;
+        sc_out += (size_t) t * 4;
+    }
+    __shared__ float sh[4][8];
+    __shared__ float scs[4];
+    float ss[4] = {0.0f, 0.0f, 0.0f, 0.0f}, w[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (out != nullptr)
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            if (c < nc) w[c] = 2.0f * sigmoid_f(inj_prev[c0 + c] / (float) hc);
+    constexpr int kNe = kHcMaxHE / 4 / 256;   // (a thread's elements a stream, at most: unrolled, the loads in flight)
+#pragma unroll
+    for (int ie = 0; ie < kNe; ++ie) {
+        const int e = threadIdx.x + 256 * ie;
+        if (e >= n_embd) break;
+        const float o = out != nullptr ? out[e] : 0.0f;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            if (c >= nc) break;
+            const int cs = c0 + c;
+            const float r = R[(size_t) cs * n_embd + e];
+            if (out != nullptr) {
+                const float v = r + o * w[c];
+                xs[c * n_embd + e] = v;
+                ss[c] += v * v;
+            } else {
+                xs[c * n_embd + e] = r;
+                ss[c] += r * r;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        if (c >= nc) break;
+        const float v = warp_sum(ss[c]);
+        if (lane == 0) sh[c][warp] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            if (c >= nc) break;
+            float t = threadIdx.x < 8 ? sh[c][threadIdx.x] : 0.0f;
+            t = warp_sum(t);
+            if (threadIdx.x == 0) {
+                const float sc = rsqrtf(t / (float) n_embd + eps);
+                scs[c] = sc;
+                if (!injb && g == 0) sc_out[c0 + c] = sc;
+            }
+        }
+    }
+    __syncthreads();
+    if (injb) {
+#pragma unroll
+        for (int ie = 0; ie < kNe; ++ie) {
+            const int e = threadIdx.x + 256 * ie;
+            if (e >= n_embd) break;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) xs[c * n_embd + e] = xs[c * n_embd + e] * scs[c] * gamma[(size_t) c * n_embd + e];
+        }
+        __syncthreads();
+        __shared__ float chain[4][32];
+        const float4* x4 = (const float4*) xs + lane + 32 * ih * Jh;
+        float s = 0.0f, tm[kJh];
+#pragma unroll
+        for (int c8 = 0; c8 < kJh / 8; ++c8)
+            if (c8 * 8 < Jh) {   // (Jh % 8 == 0: n_embd % 256 == 0)
+                float4 a[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) a[u] = c8 == 0 ? pre[u] : r4[32 * (c8 * 8 + u)];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const float4 b = x4[32 * (c8 * 8 + u)];
+                    const float term = a[u].x * b.x + a[u].y * b.y + a[u].z * b.z + a[u].w * b.w;
+                    if (ih == 0) s += term;
+                    else tm[c8 * 8 + u] = term;
+                }
+            }
+        if (ih == 0) chain[ir][lane] = s;
+        __syncthreads();
+        if (ih == 0) return;
+        s = chain[ir][lane];
+#pragma unroll
+        for (int j = 0; j < kJh; ++j)
+            if (j < Jh) s += tm[j];
+        s = warp_sum(s);
+        if (lane == 0) inj_out[ir] = s + 0.0f;
+        return;
+    }
+    // the streams' xn, each thread's values first (n_embd <= 2560: 10 a stream), then their q8_1 over the floats
+    constexpr int kNi = kHcMaxHE / 4 / 256;
+    const int ni = n_embd / 256;
+    float v[kNi][NS];
+#pragma unroll
+    for (int i = 0; i < kNi; ++i)
+        if (i < ni) {
+            const int e = threadIdx.x + 256 * i;
+#pragma unroll
+            for (int c = 0; c < NS; ++c) v[i][c] = xs[c * n_embd + e] * scs[c] * gamma[(size_t) (c0 + c) * n_embd + e];
+        }
+    __syncthreads();
+    Q81* xq = (Q81*) xs;   // (block kb of the streams' run: kb = (c * n_embd + e) / 32, the call k's block k / 4 - k0 / 4)
+#pragma unroll
+    for (int i = 0; i < kNi; ++i)
+        if (i < ni) {
+            const int e = threadIdx.x + 256 * i;
+#pragma unroll
+            for (int c = 0; c < NS; ++c) q81_store_warp(v[i][c], xq + (c * n_embd + e) / 32, lane);
+        }
+    __syncthreads();
+    const int row = g * 8 + warp, nk = n_in / 32 * 4, k0 = nk * p / DS, k1 = nk * (p + 1) / DS;
+    const uint8_t* wr = down + (size_t) row * rb;
+    float s = 0.0f;
+    for (int k = k0 + lane; k < k1; k += 32) s += hc_q8_0_dot(wr, xq - k0 / 4, k / 4, 2 * (k % 4));
+    s = warp_sum(s);
+    if (lane == 0) part[(size_t) p * lr + row] = s;
+}
 // ---- the window's hyper-connection mix over T columns in two launches (hc4_fused_cols): q4x_mix_cols' five launches
 // (hc4_combine_norm over the columns, mvn down + inject, silu_scale, mvn up, hc4_mix), each column's sums in
 // mvn_kernel_f's order (the same as mv's: a warp a row, 8 weights a lane a step, then the warp's sum) - the same bits
@@ -1277,32 +1469,67 @@ __global__ void __launch_bounds__(256) hc4_fused_a_kernel(const float* __restric
 // b: block b - embedding columns e0 = 32 b .. e0 + 31 of every window column: silu(lo / hc) of the T columns into
 // shared memory, each warp's 8 up rows loaded once and summed against every column (mv's order), then warp t: column
 // t's R combine written, xn, the mix over the streams and its q8_1
+template<int WT>
 __global__ void __launch_bounds__(512) hc4_fused_cols_b_kernel(float* __restrict__ R, const float* __restrict__ out,
                                                                const float* __restrict__ inj_prev, int inj_stride,
                                                                const float* __restrict__ gamma, int n_embd, int hc,
                                                                int T, const uint16_t* __restrict__ up, int lr,
                                                                const float* __restrict__ lo, float a,
                                                                const float* __restrict__ sc, float* __restrict__ xn,
+                                                               int ds,
                                                                float* __restrict__ gate, float* __restrict__ mixed,
                                                                Q81* __restrict__ xq) {
-    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ __align__(16) float ls[8 * 512];
     __shared__ float gs[8 * 4 * 32];
+    __shared__ Q81 lq[WT == 8 ? 8 * 16 : 1];   // (Q8_0 up: lo's q8_1 a column, silu_scale_kernel's bytes)
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e0 = blockIdx.x * 32, HE = hc * n_embd;
+    const int nk = lr / 8;   // (a row's calls: BF16 8 weights, Q8_0 a quarter block - lr / 8 either way)
+    uint4 w0[8], w1[8];      // (Q8_0: x, y the call's two ints, z its block's scale)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {   // (the weights: nothing an earlier kernel writes - loaded before the PDL wait)
+        const int rl = warp * 8 + j;
+        const bool ok = (rl >> 5) < hc;
+        const size_t ro = (size_t) ((ok ? rl >> 5 : 0) * n_embd + e0 + (rl & 31));
+        if constexpr (WT == 8) {
+            const uint8_t* rb = (const uint8_t*) up + ro * (size_t) (lr / 32 * 34);
+            w0[j] = make_uint4(0, 0, 0, 0);
+            w1[j] = make_uint4(0, 0, 0, 0);
+            if (ok && lane < nk) {
+                const int k = lane, kb = k / 4, iq = 2 * (k % 4);
+                w0[j] = make_uint4((unsigned) hc_int_b2(rb + kb * 34 + 2, iq), (unsigned) hc_int_b2(rb + kb * 34 + 2, iq + 1),
+                                   (unsigned) *(const uint16_t*) (rb + kb * 34), 0);
+            }
+            if (ok && lane + 32 < nk) {
+                const int k = lane + 32, kb = k / 4, iq = 2 * (k % 4);
+                w1[j] = make_uint4((unsigned) hc_int_b2(rb + kb * 34 + 2, iq), (unsigned) hc_int_b2(rb + kb * 34 + 2, iq + 1),
+                                   (unsigned) *(const uint16_t*) (rb + kb * 34), 0);
+            }
+        } else {
+            const uint4* r8 = (const uint4*) (up + ro * lr);
+            w0[j] = ok && lane < nk ? r8[lane] : make_uint4(0, 0, 0, 0);
+            w1[j] = ok && lane + 32 < nk ? r8[lane + 32] : make_uint4(0, 0, 0, 0);
+        }
+    }
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any read of what an earlier kernel writes)
     for (int i = threadIdx.x; i < T * lr; i += 512) {   // (silu_scale_kernel's expression)
-        const float v = lo[i] * a;
+        float l;
+        if constexpr (WT == 8) {   // (lo: a's ds parts a row, [T][ds][lr] - mv_kernel_ts' sum of them, then + 0)
+            const int t = i / lr, r = i % lr;
+            l = 0.0f;
+            for (int q = 0; q < ds; ++q) l += lo[((size_t) t * ds + q) * lr + r];
+            l = l + 0.0f;
+        } else {
+            l = lo[i];
+        }
+        const float v = l * a;
         ls[(i / lr) * 512 + i % lr] = v / (1.0f + expf(-v));
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e0 = blockIdx.x * 32, HE = hc * n_embd;
-    const int nk = lr / 8;
-    uint4 w0[8], w1[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int rl = warp * 8 + j;
-        const bool ok = (rl >> 5) < hc;
-        const uint4* r8 = (const uint4*) (up + (size_t) ((ok ? rl >> 5 : 0) * n_embd + e0 + (rl & 31)) * lr);
-        w0[j] = ok && lane < nk ? r8[lane] : make_uint4(0, 0, 0, 0);
-        w1[j] = ok && lane + 32 < nk ? r8[lane + 32] : make_uint4(0, 0, 0, 0);
+    if constexpr (WT == 8) {   // (lr % 32 == 0: a q8_1 block never spans two columns, as in silu_scale's flat run)
+        const int nqb = lr / 32;
+        for (int pq = warp; pq < T * nqb; pq += 16)
+            q81_store_warp(ls[(pq / nqb) * 512 + (pq % nqb) * 32 + lane], lq + (pq / nqb) * 16 + pq % nqb, lane);
+        __syncthreads();
     }
     // (hc == 4: the 16 warps' 8 rows are the 128 rows of the 32 columns' 4 streams)
     for (int t = 0; t < T; ++t) {
@@ -1311,8 +1538,24 @@ __global__ void __launch_bounds__(512) hc4_fused_cols_b_kernel(float* __restrict
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             float s = 0.0f;
-            if (lane < nk) s += hc_bf16_dot8(w0[j], x4[2 * lane], x4[2 * lane + 1]);
-            if (lane + 32 < nk) s += hc_bf16_dot8(w1[j], x4[2 * (lane + 32)], x4[2 * (lane + 32) + 1]);
+            if constexpr (WT == 8) {   // (dot_q8_0: the two dp4a, then d_w d_x sumi)
+                const Q81* xq = lq + t * 16;
+                if (lane < nk) {
+                    const int kb = lane / 4, iq = 2 * (lane % 4);
+                    int sumi = __dp4a((int) w0[j].x, ((const int*) xq[kb].qs)[iq], 0);
+                    sumi = __dp4a((int) w0[j].y, ((const int*) xq[kb].qs)[iq + 1], sumi);
+                    s += __half2float(__ushort_as_half((unsigned short) w0[j].z)) * __low2float(xq[kb].ds) * float(sumi);
+                }
+                if (lane + 32 < nk) {
+                    const int k = lane + 32, kb = k / 4, iq = 2 * (k % 4);
+                    int sumi = __dp4a((int) w1[j].x, ((const int*) xq[kb].qs)[iq], 0);
+                    sumi = __dp4a((int) w1[j].y, ((const int*) xq[kb].qs)[iq + 1], sumi);
+                    s += __half2float(__ushort_as_half((unsigned short) w1[j].z)) * __low2float(xq[kb].ds) * float(sumi);
+                }
+            } else {
+                if (lane < nk) s += hc_bf16_dot8(w0[j], x4[2 * lane], x4[2 * lane + 1]);
+                if (lane + 32 < nk) s += hc_bf16_dot8(w1[j], x4[2 * (lane + 32)], x4[2 * (lane + 32) + 1]);
+            }
             v[j] = s;
         }
         // the 8 rows' warp sums as a reduce-scatter: each xor step of warp_sum's butterfly (v + the partner's v) on
@@ -1368,15 +1611,23 @@ __global__ void __launch_bounds__(512) hc4_fused_cols_b_kernel(float* __restrict
 }  // namespace
 
 bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int inject_type) {
-    constexpr int kBF16 = 30;   // (ggml's GGML_TYPE_BF16, glm_fast's kTypeBF16)
-    return hc == 4 && n_embd % 256 == 0 && hc * n_embd <= kHcMaxHE && lr % 8 == 0 && lr > 0 && lr <= 512 &&
-           down_type == kBF16 && up_type == kBF16 && (inject_type < 0 || inject_type == kBF16 || inject_type == 0);
+    constexpr int kBF16 = 30, kQ8_0 = 8;   // (ggml's GGML_TYPE_BF16 / Q8_0, glm_fast's kTypeBF16)
+    if (!(hc == 4 && n_embd % 256 == 0 && hc * n_embd <= kHcMaxHE && lr % 8 == 0 && lr > 0 && lr <= 512)) return false;
+    if (down_type == kBF16 && up_type == kBF16) return inject_type < 0 || inject_type == kBF16 || inject_type == 0;
+    // Q8_0 down / up (unsloth UD 3.1): F32 or no inject, and mv()'s own split for these shapes - down 1, 2 or 4 warps a
+    // row, up one warp (mv_kernel_t<8>); anything else (STRATA_GLM_MV_SPLIT, the generic kernel, HIP) keeps the five
+    if (down_type == kQ8_0 && up_type == kQ8_0 && (inject_type < 0 || inject_type == 0) && lr % 32 == 0 &&
+        n_embd % 512 == 0) {   // (the inject block's halves: whole 8-step chunks)
+        const int ds = strata::kernels::glmf::mv_split_rule(kQ8_0, lr);
+        return (ds == 1 || ds == 2 || ds == 4) && strata::kernels::glmf::mv_split_rule(kQ8_0, hc * n_embd) == 1;
+    }
+    return false;
 }
 void hc4_fused(float* R, const float* out, const float* inj_prev, const float* gamma, float eps, int n_embd, int hc,
                int lr, const void* down, const void* inject, const void* up, float* lo, float* inj_out, float* sc,
-               float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32) {
+               float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32, int wtype, void* scratch) {
     hc4_fused_cols(R, out, inj_prev, hc, gamma, eps, n_embd, hc, lr, 1, down, inject, up, lo, inj_out, sc, xn, gate, x,
-                   xq, s, inject_f32);
+                   xq, s, inject_f32, wtype, scratch);
 }
 bool hc4_fused_cols_ok(int n_embd, int hc, int lr, int T, int down_type, int up_type, int inject_type) {
     return T >= 1 && T <= 8 && hc4_fused_ok(n_embd, hc, lr, down_type, up_type, inject_type);
@@ -1384,16 +1635,32 @@ bool hc4_fused_cols_ok(int n_embd, int hc, int lr, int T, int down_type, int up_
 void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_stride, const float* gamma, float eps,
                     int n_embd, int hc, int lr, int T, const void* down, const void* inject, const void* up, float* lo,
                     float* inj_out, float* sc, float* xn, float* gate, float* x, void* xq, cudaStream_t s,
-                    bool inject_f32) {
+                    bool inject_f32, int wtype, void* scratch) {
     if (T <= 0) return;
+    if (wtype == 8) {   // (Q8_0: a's down parts in scratch, [T][ds][lr] floats)
+        const int ds = strata::kernels::glmf::mv_split_rule(8, lr);
+        float* part = (float*) scratch;
+        const dim3 ga((unsigned) (lr / 8 * ds + (inject != nullptr ? 1 : 0)), (unsigned) T);
+#define HC4_AQ(DS)                                                                                                     \
+        pdl_launch(hc4_fused_a_q8_kernel<DS>, ga, 256, 0, s, R, out, inj_prev, gamma, eps, n_embd, hc,                 \
+                   (const uint8_t*) down, lr, (const float*) inject, part, inj_out, sc, inj_stride)
+        if (ds == 4) HC4_AQ(4);
+        else if (ds == 2) HC4_AQ(2);
+        else HC4_AQ(1);
+#undef HC4_AQ
+        check("hc4_fused_cols_a (Q8_0)");
+        pdl_launch(hc4_fused_cols_b_kernel<8>, n_embd / 32, 512, 0, s, R, out, inj_prev, inj_stride, gamma, n_embd, hc,
+                   T, (const uint16_t*) up, lr, (const float*) part, 1.0f / (float) hc, sc, xn, ds, gate, x, (Q81*) xq);
+        check("hc4_fused_cols_b (Q8_0)");
+        return;
+    }
     const int rows = lr + (inject != nullptr ? hc : 0);
-    pdl_launch(hc4_fused_a_kernel, dim3((unsigned) ((rows + 7) / 8), (unsigned) T), 256, 0, s, 
+    pdl_launch(hc4_fused_a_kernel, dim3((unsigned) ((rows + 7) / 8), (unsigned) T), 256, 0, s,
         R, out, inj_prev, gamma, eps, n_embd, hc, (const uint16_t*) down, lr, inject, inject_f32, lo, inj_out, sc,
         inj_stride);
     check("hc4_fused_cols_a");
-    pdl_launch(hc4_fused_cols_b_kernel, n_embd / 32, 512, 0, s, R, out, inj_prev, inj_stride, gamma, n_embd, hc, T,
-                                                        (const uint16_t*) up, lr, lo, 1.0f / (float) hc, sc, xn, gate,
-                                                        x, (Q81*) xq);
+    pdl_launch(hc4_fused_cols_b_kernel<30>, n_embd / 32, 512, 0, s, R, out, inj_prev, inj_stride, gamma, n_embd, hc, T,
+               (const uint16_t*) up, lr, lo, 1.0f / (float) hc, sc, xn, 1, gate, x, (Q81*) xq);
     check("hc4_fused_cols_b");
 }
 
