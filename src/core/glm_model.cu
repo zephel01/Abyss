@@ -1219,6 +1219,7 @@ Glm5Model::~Glm5Model() {
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
     fast_destroy();
+    q35d_destroy();   // (load_pack's record when fast_setup never ran)
     if (!stage_workers_.empty()) {
         // stop the staging pool: without this the workers block in stage_cv_ forever and the
         // process hangs at exit (their std::thread destructors must see joined threads)
@@ -3341,6 +3342,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
+    // the dense qwen35: the trunk's FFN weights stay in the mapping for q35d_place (VRAM as far as the budget goes, the
+    // rest in RAM); role 0 / 1 / 2 = gate / up / down, -1 not one of them
+    const bool q35d_on = q35d_defer_on();
+    const auto q35d_role = [&](const std::string& n) -> int {
+        if (!q35d_on || n.rfind("blk.", 0) != 0) return -1;
+        const int il = std::atoi(n.c_str() + 4);
+        if (il < 0 || il >= g_.n_layers || row_kind_[n] != "0") return -1;   // (natively served rows only)
+        const std::string t = n.substr(n.find('.', 4) + 1);
+        return t == "ffn_gate.weight" ? 0 : t == "ffn_up.weight" ? 1 : t == "ffn_down.weight" ? 2 : -1;
+    };
     const bool glm5_q8 = !g_.dsv4() && !g_.qwen35();   // (dense_q8_row: glm5 only)
     uint64_t bytes = 0;
     std::map<std::string, uint64_t> by_kind;   // STRATA_GLM_TIMING: the dense weights' VRAM by kind and storage
@@ -3378,7 +3389,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             err = "pack: tensor " + r.name + " is in index.txt but in no shard";
             return false;
         }
-        if (skip_upload(r)) continue;
+        if (skip_upload(r) || q35d_role(r.name) >= 0) continue;
         std::string how;
         const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how, glm5_q8);
         bytes += b;
@@ -3449,6 +3460,21 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             continue;
         }
         const strata::TensorInfo* t = find_tensor(r.name);
+        if (const int role = q35d_role(r.name); role >= 0) {
+            const int si = find_shard_of(r.name);
+            const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;
+            if (ti == nullptr) {
+                err = "pack: native tensor " + r.name + " not found in any shard";
+                return false;
+            }
+            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0], native_rows(ti));
+            const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
+            // (q: the mapping until q35d_place puts it in VRAM or RAM - the prompt path's setup checks only the type)
+            ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) src, (int64_t) ti->shape[0],
+                                                  (int64_t) native_rows(ti)};
+            q35d_defer(std::atoi(r.name.c_str() + 4), role, src, nbytes, (int) ti->type);
+            continue;
+        }
         if (skip_upload(r)) {
             const int si = find_shard_of(r.name);
             const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;

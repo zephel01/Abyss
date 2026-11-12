@@ -1976,6 +1976,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the dense qwen35: no experts, so no pool, tiers, lanes or service thread - every weight is in the dense
         // arena; the prompt path gets a region of its own
         if (!prefill_setup_own(err)) return false;
+        if (!q35d_place(err)) return false;   // (the trunk's FFN: VRAM as far as it goes, the rest in RAM)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const double G = 1073741824.0;
@@ -4271,6 +4272,7 @@ void Glm5Model::fast_destroy() {
     dflash_report();
     dflash_destroy();
     prefill_destroy();
+    q35d_destroy();
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
     if (F->expert_helper) {

@@ -846,6 +846,35 @@ public:
                                                            // per_pool > 0: against the pool fast_setup carved
     bool prefill_setup_own(std::string& err);              // ... a dense qwen35: and its own device region (no pool)
     bool fast_dense_ffn(int il, std::string& err);         // a dense SwiGLU FFN (x / xq -> ffn): the dense qwen35
+    // ---- the dense qwen35 on a GPU smaller than its file (src/core/qwen35_dense_ram.cu): load_pack leaves the trunk's
+    // FFN weights in the shard mapping, q35d_place (fast_setup) puts as many layers' FFN in VRAM as the budget leaves
+    // and the rest in pinned RAM, where the CPU computes them (decode, verify windows) and the prompt path streams
+    // them to the GPU
+    struct Q35dRam;
+    Q35dRam* q35d_ = nullptr;
+    bool q35d_place(std::string& err);
+    bool q35d_defer_on() const;                            // load_pack: leave the trunk's FFN for q35d_place
+    void q35d_defer(int il, int role, const uint8_t* src, size_t bytes, int type);   // role 0 gate, 1 up, 2 down
+    bool q35d_ram(int il) const;                           // this layer's FFN lives in RAM
+    size_t q35d_pending() const;                           // FFN bytes load_pack left for q35d_place
+    // nt columns of q8_1 x (xq, contiguous) through layer il's FFN on the CPU into out (nt x n_embd floats), in
+    // stream order on s
+    // a RAM layer's FFN: the CPU's rows posted, gpu(kg) - the caller's launches over the first kg FF rows into out
+    // (a split layer: kg > 0) - then the CPU's answer into out (added to the GPU's)
+    bool q35d_cpu_ffn(int il, const void* xq, int nt, float* out, cudaStream_t s, std::string& err,
+                      const std::function<bool(int)>& gpu = {});
+    int q35d_gpu_rows(int il) const;
+    // the loan (a card the FFN does not fit): whole layers' FFN live in the prompt path's buffers between prompts -
+    // q35d_evict (prefill_lend) gives the buffers back to the prompt, q35d_restore (prefill_return) uploads them again
+    bool q35d_prompt_ram(int il) const;                    // the prompt path stages this layer's FFN
+    void q35d_evict();
+    bool q35d_restore(std::string& err);
+    std::vector<std::pair<uint8_t*, size_t>> prefill_loan_blocks() const;   // the dense prompt path's scratch
+    // the prompt path: layer il's FFN weights in a VRAM staging buffer (gate / up / down into w), in order on s;
+    // q35d_unstage after the layer's products (the buffer may be refilled)
+    bool q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err);
+    void q35d_unstage(int il, cudaStream_t s);
+    void q35d_destroy();
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

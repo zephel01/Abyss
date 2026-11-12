@@ -931,8 +931,19 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             if (mb_env != nullptr) return (size_t) (std::atof(mb_env) * 1048576.0);
             // (a dense qwen35: no pool - the buffers are allocated for the session, so a quarter of the free VRAM,
             // 512 MB to 4 GB)
-            if (stride_sum == 0 && g.q35_dense())
-                return std::clamp<size_t>(avail / 4, (size_t) 512 << 20, (size_t) 4 << 30);
+            // (the trunk's FFN q35d_place has yet to put in VRAM counted as taken: the same share as v1.3.138's, whose
+            // load had uploaded it; a card it does not fit gets the 512 MB)
+            // A card that leaves more than 3 GB of the FFN in RAM (each chunk of a prompt stages it all over PCIe) lends
+            // the region to whole layers' FFN between prompts (q35d_place's loan) and makes it larger: a quarter of the
+            // free VRAM there, to 1.5 GB - ~3K-token chunks on a 12 GB card instead of 1024 (RTX 5090 capped to 12 GB, 4K
+            // prompt: 881 -> 1441 tok/s, decode -3%; at 16 GB, 1.5 GB in RAM, the larger region cost decode 5% for nothing)
+            if (stride_sum == 0 && g.q35_dense()) {
+                const size_t pend = q35d_pending(), av = avail > pend ? avail - pend : 0;
+                if (pend > avail + ((size_t) 3 << 30) && q35d_defer_on() &&
+                    (getenv("STRATA_Q35D_LOAN") == nullptr || std::atoi(getenv("STRATA_Q35D_LOAN")) != 0))
+                    return std::clamp<size_t>(avail / 4, (size_t) 512 << 20, (size_t) 1536 << 20);
+                return std::clamp<size_t>(av / 4, (size_t) 512 << 20, (size_t) 4 << 30);
+            }
             if (stride_sum == 0) return avail;
             int64_t k = std::max<int64_t>(0, per - keep);
             if (is_auto) k = std::min<int64_t>(k, pct * per / 100);
@@ -1210,6 +1221,18 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
 
 size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
 
+// the dense qwen35's prompt scratch q35d_place may lend between prompts: the own region and the MMQ buffers up to
+// their iota (which stays)
+std::vector<std::pair<uint8_t*, size_t>> Glm5Model::prefill_loan_blocks() const {
+    std::vector<std::pair<uint8_t*, size_t>> r;
+    const PrefillState* S = pf_;
+    if (S == nullptr || !S->own) return r;
+    if (S->region != nullptr) r.push_back({(uint8_t*) S->region, S->borrow_bytes});
+    if (S->dq != nullptr && S->dq_iota != nullptr)
+        r.push_back({(uint8_t*) S->dq, (size_t) ((uint8_t*) S->dq_iota - (uint8_t*) S->dq)});
+    return r;
+}
+
 // a dense qwen35 (fast_setup: no expert pool): prefill_setup, then the prompt path's buffers in a region of their own
 // for the session - prefill_lend binds nothing and evicts nothing
 bool Glm5Model::prefill_setup_own(std::string& err) {
@@ -1238,9 +1261,11 @@ bool Glm5Model::prefill_setup_own(std::string& err) {
                    mmq::supported(Ly.ffn_down.type);
     }
     if (mmq_env && types_ok) {
-        const int rows = [] {
+        // (no more than the chunk: a small card's 1024-token chunks left half of 2048 rows' 322 MB unused)
+        const int rows = [&] {
             const char* v = getenv("STRATA_Q35D_MMQ_ROWS");
-            return std::max(256, std::min(8192, v != nullptr ? std::atoi(v) : 2048)) / 256 * 256;
+            const int r = std::max(256, std::min(8192, v != nullptr ? std::atoi(v) : 2048)) / 256 * 256;
+            return std::max(256, std::min(r, (int) (S->T + 255) / 256 * 256));
         }();
         const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
         const size_t b_gu = al((size_t) rows * 2 * FF * sizeof(float)), b_xq = al(mmq::q8_bytes(rows, E)),
@@ -1437,6 +1462,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
+    q35d_evict();   // (the dense qwen35's loaned layers leave the scratch first)
     const uint64_t moved0 = S->moved, dropped0 = S->dropped;
     if (!S->own && !lend_tail(S->need, S->moved, S->dropped, err)) return false;
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
@@ -1714,7 +1740,7 @@ bool Glm5Model::prefill_return(std::string& err) {
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
     S->lent = false;
-    return true;
+    return q35d_restore(err);
 }
 
 void Glm5Model::prefill_destroy() {
@@ -3251,6 +3277,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             x_down = true;
         }
 
+        // the dense qwen35's FFN in RAM (qwen35_dense_ram.cu): its weights copied into a staging buffer - the
+        // products below read them there
+        WSlot dffn[3] = {Ly.ffn_gate, Ly.ffn_up, Ly.ffn_down};
+        const bool dram = !Ly.moe && q35d_prompt_ram(il);
+        if (dram && !q35d_stage(il, s, dffn, err)) return false;
         if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
             // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into
@@ -3271,23 +3302,23 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 p.max_rows = tn;
                 p.ld_dst = 2 * FF;
                 p.w_rows = FF;
-                p.w = Ly.ffn_gate.q;
-                p.type = Ly.ffn_gate.type;
+                p.w = dffn[0].q;
+                p.type = dffn[0].type;
                 p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
                 p.dst = S->dq_gu;
                 mmq::quantize(xt, nullptr, S->dq_xq, p.type, E, E, tn, s);
                 S->mq->run(p, s);
-                if (Ly.ffn_up.type != Ly.ffn_gate.type) mmq::quantize(xt, nullptr, S->dq_xq, Ly.ffn_up.type, E, E, tn, s);
-                p.w = Ly.ffn_up.q;
-                p.type = Ly.ffn_up.type;
+                if (dffn[1].type != dffn[0].type) mmq::quantize(xt, nullptr, S->dq_xq, dffn[1].type, E, E, tn, s);
+                p.w = dffn[1].q;
+                p.type = dffn[1].type;
                 p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
                 p.dst = S->dq_gu + FF;
                 S->mq->run(p, s);
                 gb::swiglu_rows(S->dq_gu, S->dq_gu, tn, (int) FF, g.swiglu_shexp, s, (int) (2 * FF));
-                mmq::quantize(S->dq_gu, nullptr, S->dq_hq, Ly.ffn_down.type, FF, 2 * FF, tn, s);
+                mmq::quantize(S->dq_gu, nullptr, S->dq_hq, dffn[2].type, FF, 2 * FF, tn, s);
                 mmq::Product d = p;
-                d.w = Ly.ffn_down.q;
-                d.type = Ly.ffn_down.type;
+                d.w = dffn[2].q;
+                d.type = dffn[2].type;
                 d.w_rows = E;
                 d.w_cols = FF;
                 d.expert_bytes = mmq::matrix_bytes(d.type, E, FF);
@@ -3296,6 +3327,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.ld_dst = E;
                 S->mq->run(d, s);
             }
+            if (dram) q35d_unstage(il, s);
             S->mark("dense_ffn", s);
             abl_out(il, 1, S->ffn, T, E, s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
@@ -3307,11 +3339,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 Carve c{S->uni};
                 DenseBufs B = carve_dense(c, (size_t) tn, g);
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
-                hgemm_q(Ly.ffn_gate, g.n_ff_dense, E, x16, E, B.dg, g.n_ff_dense, tn, 0.0f);
-                hgemm_q(Ly.ffn_up, g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
+                hgemm_q(dffn[0], g.n_ff_dense, E, x16, E, B.dg, g.n_ff_dense, tn, 0.0f);
+                hgemm_q(dffn[1], g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
                 gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
-                hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+                hgemm_q(dffn[2], E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
+            if (dram) q35d_unstage(il, s);
             S->mark("dense_ffn", s);
             abl_out(il, 1, S->ffn, T, E, s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);

@@ -2020,6 +2020,43 @@ __global__ void __launch_bounds__(512) hc4_fused_cols_b_kernel(float* __restrict
     mixed[(size_t) t * n_embd + e] = m;
     if (xq != nullptr) q81_store_warp(m, xq + ((size_t) t * n_embd + e) / 32, lane);
 }
+
+// ---- the dense qwen35's CPU FFN hand-off (src/core/qwen35_dense_ram.cu): the request and the answer are host-mapped,
+// a 64-byte header (seq, layer, columns) and the payload after it
+__global__ void __launch_bounds__(512) dffn_post_kernel(const uint4* __restrict__ xq, size_t n16, unsigned int* req,
+                                                        unsigned int seq, int layer, int nt) {
+    uint4* dst = (uint4*) (req + 16);
+    for (size_t i = threadIdx.x; i < n16; i += blockDim.x) dst[i] = xq[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ((volatile unsigned int*) req)[1] = (unsigned int) layer;
+        ((volatile unsigned int*) req)[2] = (unsigned int) nt;
+        __threadfence_system();
+        ((volatile unsigned int*) req)[0] = seq;
+        __threadfence_system();
+    }
+}
+__global__ void __launch_bounds__(256) dffn_wait_kernel(const unsigned int* ans, unsigned int seq, float* __restrict__ out,
+                                                        int n, int add) {
+    if (threadIdx.x == 0) {
+        const long long t0 = clock64();
+        while (((volatile const unsigned int*) ans)[0] != seq) {
+            if (clock64() - t0 > (1ll << 36)) break;
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    const float* src = (const float*) (ans + 16);
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) {
+#if defined(__HIPCC__)
+        const float v = ((volatile const float*) src)[e];
+#else
+        const float v = __ldcv(src + e);
+#endif
+        out[e] = add ? out[e] + v : v;   // (add: the GPU's part of a split layer, then the CPU's)
+    }
+}
 }  // namespace
 
 bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int inject_type) {
@@ -2583,6 +2620,16 @@ void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, floa
     pdl_launch(hc4_mix_kernel, dim3((unsigned) ((n_embd + 255) / 256), (unsigned) T), 256, 0, s, xn, gate, n_embd, hc, mixed,
                                                                                        (Q81*) xq);
     check("hc4_mix");
+}
+
+void dffn_post(const void* xq, size_t bytes, void* req, unsigned int seq, int layer, int nt, cudaStream_t s) {
+    dffn_post_kernel<<<1, 512, 0, s>>>((const uint4*) xq, bytes / 16, (unsigned int*) req, seq, layer, nt);
+    check("dffn_post");
+}
+void dffn_wait(const void* ans, unsigned int seq, float* out, int n, cudaStream_t s, bool add) {
+    const int blocks = std::max(1, std::min(32, (n + 1023) / 1024));
+    dffn_wait_kernel<<<blocks, 256, 0, s>>>((const unsigned int*) ans, seq, out, n, add ? 1 : 0);
+    check("dffn_wait");
 }
 
 }  // namespace strata::kernels::q35

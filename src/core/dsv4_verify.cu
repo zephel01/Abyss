@@ -1623,37 +1623,40 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                        (uint8_t*) V->xq + (size_t) t * q8e, s);
         mark(2);
         if (!Ly.moe) {   // the dense qwen35 (Qwen3.8-27B): fast_dense_ffn over the columns
-            const int FF = g.n_ff_dense;
-            const size_t hq = (size_t) FF / 32 * kQ8;
-            // mvn: one launch over the columns where it has the type (Q3_K not: mv a column, as the token path)
-            const auto mvc = [&](const gf::MvJob* j, int n, const char* what) {
-                bool all = true;
-                for (int i = 0; i < n; ++i) all = all && gf::mvn_supported(j[i].type);
-                if (all) {
-                    if (!gf::mvn(j, n, T, s)) { err = std::string("qwen35 verify: ") + what; return false; }
-                    return true;
-                }
-                for (int i = 0; i < n; ++i) {
-                    const size_t xb = (size_t) j[i].n_in / 32 * kQ8;   // (a column's q8_1 row)
-                    for (int t = 0; t < T; ++t) {
-                        gf::MvJob c = j[i];
-                        c.xq = (const uint8_t*) j[i].xq + (size_t) t * xb;
-                        if (j[i].xf != nullptr) c.xf = j[i].xf + (size_t) t * j[i].n_in;
-                        c.y = j[i].y + (size_t) t * j[i].n_out;
-                        if (!gf::mv(&c, 1, s)) { err = std::string("qwen35 verify: ") + what; return false; }
+            // the first FF rows (all of them, or a split layer's GPU part; the CPU's in RAM, qwen35_dense_ram.cu)
+            const auto rows = [&](int FF) {
+                const size_t hq = (size_t) FF / 32 * kQ8;
+                // mvn: one launch over the columns where it has the type (Q3_K not: mv a column, as the token path)
+                const auto mvc = [&](const gf::MvJob* j, int n, const char* what) {
+                    bool all = true;
+                    for (int i = 0; i < n; ++i) all = all && gf::mvn_supported(j[i].type);
+                    if (all) {
+                        if (!gf::mvn(j, n, T, s)) { err = std::string("qwen35 verify: ") + what; return false; }
+                        return true;
                     }
-                }
-                return true;
+                    for (int i = 0; i < n; ++i) {
+                        const size_t xb = (size_t) j[i].n_in / 32 * kQ8;   // (a column's q8_1 row)
+                        for (int t = 0; t < T; ++t) {
+                            gf::MvJob c = j[i];
+                            c.xq = (const uint8_t*) j[i].xq + (size_t) t * xb;
+                            if (j[i].xf != nullptr) c.xf = j[i].xf + (size_t) t * j[i].n_in;
+                            c.y = j[i].y + (size_t) t * j[i].n_out;
+                            if (!gf::mv(&c, 1, s)) { err = std::string("qwen35 verify: ") + what; return false; }
+                        }
+                    }
+                    return true;
+                };
+                gf::MvJob jd[2];
+                jd[0] = {Ly.ffn_gate.q, V->xq, V->x, V->glm_dg, nullptr, 1.0f, Ly.ffn_gate.type, (int) E, FF};
+                jd[1] = {Ly.ffn_up.q, V->xq, V->x, V->glm_du, nullptr, 1.0f, Ly.ffn_up.type, (int) E, FF};
+                if (!mvc(jd, 2, "dense ffn gate / up")) return false;
+                for (int t = 0; t < T; ++t)
+                    gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                                  (uint8_t*) V->glm_dhq + (size_t) t * hq, s);
+                gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, nullptr, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, (int) E};
+                return mvc(&dn, 1, "dense ffn down");
             };
-            gf::MvJob jd[2];
-            jd[0] = {Ly.ffn_gate.q, V->xq, V->x, V->glm_dg, nullptr, 1.0f, Ly.ffn_gate.type, (int) E, FF};
-            jd[1] = {Ly.ffn_up.q, V->xq, V->x, V->glm_du, nullptr, 1.0f, Ly.ffn_up.type, (int) E, FF};
-            if (!mvc(jd, 2, "dense ffn gate / up")) return false;
-            for (int t = 0; t < T; ++t)
-                gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
-                              (uint8_t*) V->glm_dhq + (size_t) t * hq, s);
-            gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, nullptr, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, (int) E};
-            if (!mvc(&dn, 1, "dense ffn down")) return false;
+            if (q35d_ram(il) ? !q35d_cpu_ffn(il, V->xq, T, V->ffn, s, err, rows) : !rows(g.n_ff_dense)) return false;
         } else if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) {
             return false;
         }

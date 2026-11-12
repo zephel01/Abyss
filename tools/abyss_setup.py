@@ -61,6 +61,11 @@ REPO = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
 # NextN drafter, a 4K prompt); short of that it stops at the start, or at the first prompt (20 GB free, 32K).  ~1 GB
 # left for the desktop and the driver: a 24 GB card gets 32K (64K ran with nothing else on it), a 32 GB one 128K
 DENSE27_VRAM = {8192: 21.0, 32768: 23.5, 65536: 26.0, 131072: 30.0, 262144: 40.0}   # (256K: +8.7 GB of caches, estimated)
+# a smaller GPU (2026-11-12, v1.3.139): the engine keeps the FFN rows that do not fit in pinned RAM and computes them on
+# the CPU; the GPU then needs the rest of the file, the caches and two staging buffers - the table less the FFN (9.9 GB)
+# plus 0.4 GB (RTX 5090 capped: 8K started at 9.0 GB with no FFN in VRAM; 12 GB 27 tok/s, 16 GB 65, 20 GB all in VRAM)
+DENSE27_FFN_GB = 9.5
+DENSE27_RAM_GB = 32   # (up to 10 GB of FFN pinned + the 6 GB headroom + the server)
 # the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
 # is a fixed set, the config's model_name, the config name's prefix, the env the model's measurements were made with,
 # the experts' size in GB at the default quant (for the RAM line)
@@ -122,7 +127,7 @@ MODELS = {
                    "folder": "", "prefix_tmpl": "Qwen3.8-27B-{q}.", "model_name": "qwen3.8-27b",
                    "prefix": "qwen38-27b", "title": "Qwen3.8-27B", "env": {}, "gb": 18, "pack_args": [],
                    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-                   "vram_ctx": DENSE27_VRAM},
+                   "vram_ctx": DENSE27_VRAM, "ffn_gb": DENSE27_FFN_GB, "ram_min": DENSE27_RAM_GB},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -565,14 +570,21 @@ def dense_context(key: str, vram: float, ctx: int) -> int | None:
     return max(fits) if fits else None
 
 
-def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool) -> int:
-    """Step 1 for a model that runs all in VRAM: one GPU that holds the file, the KV cache and the prompt path.  Returns
-    the context to write (shorter than --context when this GPU holds only a shorter one); stops on a GPU too small
-    for the shortest, before anything is downloaded or compiled."""
+def dense_split_context(key: str, vram: float, ctx: int) -> int | None:
+    """dense_context for a GPU smaller than the file: the FFN rows that do not fit stay in RAM ("ffn_gb" less VRAM)."""
+    m = MODELS[key]
+    return dense_context(key, vram + m.get("ffn_gb", 0.0), ctx) if m.get("ffn_gb") else None
+
+
+def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | None = None) -> int:
+    """Step 1 for a dense model ("vram_ctx"): one GPU that holds the file, the KV cache and the prompt path - or, on a
+    smaller GPU, all but the FFN rows the engine keeps in RAM (slower).  Returns the context to write (shorter than
+    --context when this GPU holds only a shorter one); stops on a GPU too small for the shortest, or too little RAM
+    for the rows it leaves there, before anything is downloaded or compiled."""
     model = MODELS[key]
     need = model["vram_ctx"]
     if len(gpus) > 1:
-        S.fail(f"{model['title']} runs on one GPU in this version (the whole file in its VRAM; no layer split yet)",
+        S.fail(f"{model['title']} runs on one GPU in this version (no layer split across GPUs yet)",
                "set it up without --gpus (--gpu picks the card)")
     if backend == "hip":
         S.warn(f"{model['title']} is measured on NVIDIA only so far (RTX 5090): on AMD it is untested")
@@ -582,17 +594,35 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool) -> int:
     vram = gpus[0].get("vram_gb") or 0.0
     ctx = dense_context(key, vram, a.context)
     table = ", ".join(f"{c // 1024}K: {g:.0f} GB" for c, g in sorted(need.items()))
+    if ctx == a.context:
+        S.ok(f"{model['title']}: the whole file in VRAM - this {vram:.0f} GB GPU holds a {ctx // 1024}K context "
+             f"(the GPU size a context needs: {table})")
+        return ctx
+    # short of that: the FFN rows that do not fit in RAM, on the CPU (the context asked for, or the longest it holds)
+    sctx = dense_split_context(key, vram, a.context)
+    if sctx is not None and (ctx is None or sctx > ctx):
+        ram = S.ram_gb() if ram is None else ram
+        if ram + 0.5 < model.get("ram_min", 0):
+            S.fail(f"{model['title']} on this {vram:.0f} GB GPU keeps part of its FFN in RAM (up to "
+                   f"~{model['ffn_gb']:.0f} GB, pinned): it needs {model['ram_min']} GB of RAM, and this PC has {ram:.0f} GB",
+                   f"a PC with {model['ram_min']} GB of RAM or more, or a GPU that holds the file (24 GB or more)")
+        S.ok(f"{model['title']}: this {vram:.0f} GB GPU holds a {sctx // 1024}K context with part of the FFN in RAM "
+             f"(the engine computes those rows on the CPU: slower than all in VRAM - RTX 5090 capped to 12 / 16 GB: "
+             f"~27 / ~65 tok/s with the drafter, 20 GB and up all in VRAM ~130)")
+        if sctx < a.context:
+            S.warn(f"--context {a.context} is longer than this GPU holds: the config gets {sctx} (a larger GPU holds more)")
+        return sctx
     if ctx is None:
-        S.fail(f"{model['title']} needs a GPU with 24 GB or more: this version runs the whole {model['quant']} file "
-               f"(~{model['gb']} GB) in VRAM, and this GPU has {vram:.0f} GB (the GPU size a context needs: {table})",
-               "a GPU with 24 GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or Ornith-1.5-35B-A3B "
+        S.fail(f"{model['title']} needs a GPU with 12 GB or more: the {model['quant']} file (~{model['gb']} GB) runs "
+               f"from VRAM, its FFN partly from RAM, and this GPU has {vram:.0f} GB (the GPU size a context needs all "
+               f"in VRAM: {table}; ~{model['ffn_gb']:.0f} GB less with the FFN in RAM)",
+               "a GPU with 12 GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or Ornith-1.5-35B-A3B "
                "(--model ornith35) run from VRAM + RAM")
     S.ok(f"{model['title']}: the whole file in VRAM - this {vram:.0f} GB GPU holds a {ctx // 1024}K context "
          f"(the GPU size a context needs: {table})")
-    if ctx < a.context:
-        n = dense_need(key, a.context)
-        S.warn(f"--context {a.context} " + (f"needs a ~{n:.0f} GB GPU" if n else "is longer than measured") +
-               f": the config gets {ctx} (--context {ctx} says so; a larger GPU holds more)")
+    n = dense_need(key, a.context)
+    S.warn(f"--context {a.context} " + (f"needs a ~{n:.0f} GB GPU" if n else "is longer than measured") +
+           f": the config gets {ctx} (--context {ctx} says so; a larger GPU holds more)")
     return ctx
 
 
