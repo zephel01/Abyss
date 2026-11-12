@@ -63,6 +63,10 @@ RTX 5090 capped at 8 / 12 / 16 GB, 4K prompt + 512 tokens: decode 156 / 209 / 26
 (same VRAM, best `--n-cpu-moe`), prompts 2,202 / 3,118 / 3,685 tok/s against 1,638 / 2,168 / 3,197 (`-ub 4096`). On a GPU that holds the whole file
 (24 GB and up) llama.cpp is faster.
 
+A dense model, the whole file in VRAM (v1.3.138, first version): **Qwen3.8-27B** ([unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), 17.7 GB, `--model qwen38-27b`), for a GPU with 24 GB or more
+(24 GB: a 32K context, 32 GB: 128K; smaller GPUs are not supported yet). RTX 5090, 4K prompt + 512 tokens: decode 131.6 tok/s with its NextN drafter
+against llama.cpp's 72.1 (72.7 without the drafter), prompts 2,538 tok/s against 3,463.
+
 - The sizes are targets, not speed guarantees. A larger PC runs a smaller file faster; a smaller PC runs a larger one
   too, reading the experts that do not fit from the SSD (slower).
 - Not sure? On 16 GB + 64 GB start with Qwen3.8-Flash-Next (the fastest there); on 32 GB + 96 GB with GLM-5.3-Flash or
@@ -295,6 +299,7 @@ run broke at task 35 on the 16K bug fixed in v1.3.32. Details:
 | | our [Ornith-1.5-122B-IQ4_XS-24G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ4_XS-24G64G-GGUF) for a 24-32 GB GPU + 64 GB RAM (BETA, 2026-11-08) | 68.9 GB | measured on an RTX 5090 capped at 24 GB + a 64 GB RAM setup: decode 52.4 tok/s with its NextN drafter (63.8 at 32 GB), 8K prompt 1,594 tok/s, no SSD waits |
 | Qwen3.5-122B-A10B (Qwen3.5-MoE, Ornith's layout) | our [Qwen3.5-122B-A10B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF) for a 16 GB GPU + 64 GB RAM | 51.4 GB | measured: KL 0.035, 41.2 tok/s, swe-bench 53 of 60 resolved |
 | Qwen3.8-35B-A3B Distill (Qwen3.5-MoE, a small Ornith layout) | empero-ai [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF) (v1.3.92) | 21.7 GB | measured on an RTX 5090: swe-bench 3 tasks 399 tok/s with its NextN drafter (85% of drafts accepted); VRAM capped at 16 GB: 297 tok/s |
+| Qwen3.8-27B (dense Qwen3.5, `qwen35`; [MANUAL](docs/MANUAL.md#qwen38-27b-dense)) | unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (v1.3.138) | 17.7 GB | measured on an RTX 5090: KL 0.0025 against llama.cpp, decode 131.6 tok/s with its NextN drafter (82% of drafts accepted), 72.7 without (llama.cpp 72.1); the whole file in VRAM: a 24 GB+ GPU |
 | Qwen3.8-Flash-Next (qwen4exp, [docs/qwen38](docs/qwen38/README.md)) | orcarouter's [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) on the fast path (v1.3.74); beta from v1.3.76: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S, unsloth UD-IQ4_XS / UD-Q4_K_XL (which fits where: [docs/qwen38](docs/qwen38/README.md#other-ggufs-beta)) | 85.2 GB | measured on an AI PRO R9700: prompts 1,037 tok/s at 30K, answers 64-65 tok/s prose / 86 code with its MTP drafter, KL 0.026 against llama.cpp; NVIDIA: RTX 5090 from v1.3.83 (ISTA IQ3_S 128.5-129.5 tok/s with the drafter, v1.3.87), DGX Spark from v1.3.113 ([numbers](docs/qwen38/README.md#measured-on-nvidia-rtx-5090-dgx-spark)) |
 | | our [Qwen3.8-Flash-Next-IQ3_M-16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF) for a 16 GB GPU + 64 GB RAM (beta; reports welcome) | 86.9 GB | measured on an RTX 5090 + 94 GB: KL 0.083, 131.3 tok/s with its MTP drafter at 32 GB, 96.4 at 16 GB (v1.3.112); a rented DGX Spark 47.05 (v1.3.113) |
 | | our [Qwen3.8-Flash-Next-IQ3_M-24G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF) for a 24 GB GPU + 64 GB RAM (beta) | 93.7 GB | measured with VRAM capped at 24 GB ([model card](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF)) |

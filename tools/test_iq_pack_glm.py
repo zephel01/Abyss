@@ -139,7 +139,13 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("deepseek4", iq_pack.ARCHITECTURES)  # Abyss: DeepSeek V4
         self.assertIn("deepseek41", iq_pack.ARCHITECTURES)  # Abyss: DeepSeek V4.1 (v1.3.29)
         self.assertIn("qwen35moe", iq_pack.ARCHITECTURES)   # Abyss: Qwen3.5-MoE / Ornith-1.5-122B (v1.3.46)
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 6)
+        self.assertIn("qwen35", iq_pack.ARCHITECTURES)      # Abyss: the dense Qwen3.5 / Qwen3.8-27B (v1.3.138)
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 7)
+
+    def test_qwen35_dense_as_stored(self):
+        # the dense qwen35: qwen35moe's set with a dense FFN, every tensor served as stored
+        for n in ("ffn_gate", "ffn_up", "ffn_down", "attn_qkv", "attn_q", "ssm_out"):
+            self.assertFalse(iq_pack.needs_bf16(f"blk.0.{n}.weight", "Q4_K", "qwen35"), n)
 
     def test_qwen35moe_dense_as_stored(self):
         # every dense tensor is served as stored (Q8_0 by the quantized GEMV, F32 as F32): nothing goes to BF16

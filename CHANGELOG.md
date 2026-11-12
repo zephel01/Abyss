@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.138 - 2026-11-12
+
+- Qwen3.8-27B, a dense Qwen3.5 (llama.cpp's `qwen35`: 48 delta-net + 16 attention layers, a dense FFN in every layer,
+  a NextN block), runs on the engine: token path, prompt path, NextN drafter and verify window. `setup --model
+  qwen38-27b` installs [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (17.7 GB). This first
+  version keeps the whole file in one GPU's VRAM: a GPU with 24 GB or more. The setup stops on a smaller one before
+  downloading, and writes the context the GPU holds (24 GB: 32K, 32 GB: 128K; the engine takes 20.7 GB at 32K, 22.8 GB
+  at 64K, ~27.7 GB at 128K).
+  Same token ids as llama.cpp; KL against llama.cpp 0.0025 (token path) / 0.0019 (prompt path) over 3,071 positions of
+  English, Japanese and code. RTX 5090, 4K prompt + 512 tokens, median of 3: decode 131.6 tok/s with the NextN
+  drafter, 72.7 without; llama.cpp 72.1. Prompts 2,538 tok/s (llama.cpp 3,463). The dense FFN of prompts goes
+  through MMQ on the quantized weights (`STRATA_Q35D_MMQ`, `0`: FP16 + cuBLAS).
+- Shared kernels widened for it: the RMS-norm / NextN-input kernels took 4,096 values a row at most (Qwen3.8-27B has
+  5,120) and now pick a wider variant above that; the decode / verify / prompt attention kernels take any query-head
+  group up to 8 (the 27B has 6). Every other model takes the same kernels as before: md5-identical greedy output under
+  `STRATA_DETERMINISTIC=1` on Ornith-122B 24G64G, Ornith-35B (8 / 16 GB), Qwen3.8-Flash-Next, GLM-5.3-Flash, V4 0731
+  and V4.1 JA256 (two runs a binary), decode speed within run-to-run noise (-1.2% to +1.8%).
+
 ## v1.3.137 - 2026-11-12
 
 - Prompts on 15-16 GB cards no longer fall back to one token at a time. The prompt chunk was sized against the pool

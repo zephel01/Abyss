@@ -72,6 +72,14 @@ Qwen3.5-MoE の 122B モデル 2 つは、GPU 16 GB + RAM 64 GB 向けの zephel
 ./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B-IQ3_XXS-16G64G
 ```
 
+dense モデルの Qwen3.8-27B は unsloth の UD-Q4_K_XL（17.7 GB、v1.3.138）で入れられる。最初の版はファイル全体を 1 枚の
+GPU の VRAM に載せるので、GPU は 24 GB 以上が必要。それより小さい GPU では何もダウンロードする前に止まり、GPU に入る文脈の
+長さを設定に書く（24 GB: 32K、32 GB: 128K。[Qwen3.8-27B](#qwen38-27bdense)）:
+
+```sh
+./setup-deepseek.sh --model qwen38-27b --download-model   # Qwen3.8-27B-UD-Q4_K_XL（17.7 GB）
+```
+
 zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
 から、モデルカードを測ったときの値にする。Qwen3.8 はシャードにある MTP 層で下書きする。V4 の自作版は単体 GPU では DSpark
 なしのほうが速いので、DSpark は入れない）:
@@ -676,6 +684,26 @@ llama.cpp の `qwen35moe`）も動かします。gated delta-net 層 36 + full a
   残りはエキスパートの置き場に回ります（v1.3.134、#44）。Ornith-1.5-397B を 128K の文脈で 16 GB のカードでも起動できます。設定項目の `--kv` を参照。
 - **まだないもの:** 会話スロット、レイヤー分割、画像。エキスパートカーネルはこの形状にまだ調整していない。
 
+## Qwen3.8-27B（dense）
+
+v1.3.138 から、エンジンは [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)（dense の Qwen3.5、llama.cpp の
+`qwen35`）も動かします。gated delta-net 層 48 + full attention 層 16（query 24 ヘッド、KV 4 ヘッド）、全層が dense の
+SwiGLU FFN（5120 → 17408）でエキスパートはなく、下書きは NextN ブロックがします。`./setup-deepseek.sh --model qwen38-27b`
+が unsloth の UD-Q4_K_XL を入れて pack を作ります（`tools/iq_pack.py --gguf <ファイル> --out <フォルダ>/pack`、テンソルは
+すべて元の形式のまま）。
+
+- **メモリ。** この版はファイル全体を VRAM に置きます（RAM 層なし、GPU 1 枚）。NextN ドラフターあり、F16 の KV、4K の
+  プロンプトで、エンジンが使うのは文脈 8K で 19.0 GB、32K で 20.7 GB、64K で 22.8 GB、128K で約 27.7 GB（RTX 5090 で
+  VRAM を確保して空きを減らして計測）。セットアップは 24 GB のカードには 32K（64K はカードにほかに何もなければ動いた）、
+  32 GB には 128K を書き、約 21 GB 未満の GPU では止まります。空きが少ないとプロンプト経路のバッファが小さくなり（空き
+  24 GB、文脈 32K / 64K でも 4K のプロンプトは約 2,500 tok/s、生成 130 tok/s）、それも入らないときは起動時か最初の
+  プロンプトで止まります（"did not allocate"）。`--kv int8` で attention のキャッシュが半分になります。
+- **品質。** トークン ID は llama.cpp と同じ。llama.cpp との KL は英語・日本語・コード 3,071 位置で 0.0025（1 トークンずつ）、
+  0.0019（プロンプト経路）。4K のチャットの greedy 生成は最初の 212 トークンが llama.cpp と一致。
+- **速度。** RTX 5090、4K プロンプト + 512 トークン、3 回の中央値: デコードは NextN ドラフターありで 131.6 tok/s（下書きの
+  82% が採用）、なしで 72.7。llama.cpp は 72.1。プロンプトは 2,538 tok/s（llama.cpp 3,463）。
+- **まだないもの:** RAM 層（24 GB 未満の GPU 向け）、レイヤー分割、AMD（コンパイルは通る。未検証）、画像。
+
 ## EXL3 量子化（GLM-5.3-Flash）
 
 v1.3.35 から、エンジンは [exllamav3](https://github.com/turboderp-org/exllamav3) の EXL3 量子化の GLM-5.3-Flash も、
@@ -916,6 +944,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: lightning indexer / prompt の attention を tensor core 版ではなく従来の FP32 カーネルで計算する（A/B 確認用） |
 | `STRATA_Q35_ATTN` | 0 | `1`：Ornith（qwen35moe）の生成 / 確認ウィンドウの attention を従来のカーネル（v1.3.64）に戻す。0：分割カーネル（v1.3.65）。8 キー分を 1 回のシャッフルで合計し、softmax は 32 キーのタイルごと、K / V は共有メモリ経由。115K の位置で 1 層 1 トークン 1.09 → 0.57 ms、3 行のウィンドウ 3.29 → 1.39 ms。`STRATA_Q35_ATTN_PW`（warp あたりの query-head の組、2）と `STRATA_Q35_ATTN_CHUNK` / `_CHUNK_MIN`（ブロックあたりのキー数。既定は文脈の約 1/128、最小 64）は調整用 |
 | `STRATA_Q35_PATTN` | 0 | `1`：Ornith（qwen35moe）のプロンプトの attention を従来の FP32 カーネル（v1.3.66）に戻す。0：テンソルコア（rocWMMA / CUDA の WMMA。FP16 の入力、FP32 の合計。v1.3.67）。114K の位置での 1,024 トークンのサブバッチが 1 層 918 → 156 ms、115K のプロンプトが 685 → 154 秒。24K の文脈の後の KL は FP32 カーネルに対して 0.0054（FP32 同士の 2 回で 0.0064） |
+| `STRATA_Q35D_MMQ` | on | Qwen3.8-27B（dense の qwen35）のプロンプト: dense FFN の積を量子化したままの重みで MMQ で計算する（4K プロンプトで FFN 1,187 → 563 ms）。`0`: FP16 に展開して cuBLAS。`STRATA_Q35D_MMQ_ROWS`（1 回に通すトークン数、2048: 約 330 MB）は調整用 |
 | `STRATA_GLM_MMQ_GLU` | オン | prompt の expert の gate/up の積で SwiGLU まで済ませる（NVIDIA Turing 以降）。`0` で別カーネル（以前のビルドとビット一致） |
 | `STRATA_GLM_CPU_MT` | オン | 複数トークンが同じ expert を使うとき（prompt、検証窓）、CPU は重みの行を 1 回だけ展開する。ggml の内積とビット一致（IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS は `STRATA_GLM_CPU_1T` の CPU で格子をレジスタの中で引く。v1.3.41）。`0` で無効 |
 | `STRATA_GLM_CPU_1T` | オン | CPU レーンの 1 トークン用の行を軽くする（ggml の内積とビット一致）。VNNI と VBMI のある AVX-512 の CPU（Zen 4 / Ice Lake 以降）では、IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS の格子をレジスタの中で引く（v1.3.41。Ryzen AI Max+ 395 の 16 スレッドで DeepSeek V4 のエキスパート 1 個が 109 → 90 µs、内蔵 GPU なしの生成が +3〜9%。`STRATA_NO_IQ512_VBMI=1` でこれだけ無効）。それ以外の CPU では AVX2 の IQ3_S / IQ3_XXS。`0` で無効 |

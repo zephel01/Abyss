@@ -95,7 +95,7 @@ class PickQuant(unittest.TestCase):
         self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
 
     def test_models_without_pc_sizes(self):
-        for key in ("v41", "ornith35", "qwen35"):
+        for key in ("v41", "ornith35", "qwen35", "qwen38-27b"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
     def test_no_gpu(self):
@@ -334,6 +334,80 @@ class ToolkitSwitch(unittest.TestCase):
             cfg, _ = A.write_config("ornith-iq3_xxs-b", self.root / "pack", 65536, 8082, False, None, None, m)
         self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["sampling"]["top_k"], 20)
 
+
+
+class DenseAllInVram(unittest.TestCase):
+    """--model qwen38-27b (Qwen3.8-27B, the whole file in one GPU's VRAM): the context a GPU holds, a stop on a GPU too
+    small (before any download or build), one GPU only, unsloth's file picked by its prefix."""
+    KEY = "qwen38-27b"
+
+    def check(self, vram, context=65536, gpus=1, backend="cuda", shared=False):
+        a = Namespace(context=context)
+        said = []
+        cards = [{"index": i, "name": "GPU", "vram_gb": vram} for i in range(gpus)]
+        with mock.patch.object(A.S, "say", side_effect=lambda *x: said.append(" ".join(map(str, x)))):
+            try:
+                got = A.dense_gpu_check(a, self.KEY, cards, backend, shared)
+            except SystemExit:
+                got = "stopped"
+        return got, "\n".join(said)
+
+    def test_the_context_a_gpu_holds(self):
+        f = A.dense_context
+        self.assertIsNone(f(self.KEY, 15.92, 8192))
+        self.assertIsNone(f(self.KEY, 19.99, 8192))   # (8K ran with 19.1 GB free: no room for the desktop)
+        self.assertEqual(f(self.KEY, 23.99, 65536), 32768)
+        self.assertEqual(f(self.KEY, 23.99, 16384), 16384)
+        self.assertEqual(f(self.KEY, 31.84, 65536), 65536)
+        self.assertEqual(f(self.KEY, 31.84, 131072), 131072)
+        self.assertEqual(f(self.KEY, 31.84, 262144), 131072)
+        self.assertEqual(f(self.KEY, 47.99, 262144), 262144)
+        self.assertEqual(f(self.KEY, 95.0, 1 << 20), 262144)   # (longer than measured: the longest)
+
+    def test_a_small_gpu_stops_with_the_reason(self):
+        got, said = self.check(15.92)
+        self.assertEqual(got, "stopped")
+        self.assertIn("needs a GPU with 24 GB or more", said)
+        self.assertIn("--model qwen38", said)
+
+    def test_a_24_gb_gpu_gets_32k(self):
+        got, said = self.check(23.99)
+        self.assertEqual(got, 32768)
+        self.assertIn("--context 65536 needs a ~26 GB GPU: the config gets 32768", said)
+        self.assertEqual(self.check(31.84), (65536, self.check(31.84)[1]))
+
+    def test_one_gpu_only(self):
+        self.assertEqual(self.check(23.99, gpus=2)[0], "stopped")
+
+    def test_shared_memory_and_amd_go_on_with_a_note(self):
+        got, said = self.check(0.0, shared=True)
+        self.assertEqual(got, 65536)
+        self.assertIn("untested", said)
+        got, said = self.check(31.84, backend="hip")
+        self.assertEqual(got, 65536)
+        self.assertIn("on AMD it is untested", said)
+
+    def test_the_file_and_the_config(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual((m["repo"], m["quant"]), ("unsloth/Qwen3.8-27B-GGUF", "UD-Q4_K_XL"))
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "Qwen3.8-27B-UD-Q4_K_XL.gguf", "Qwen3.8-27B-UD-Q4_K_M.gguf", "Qwen3.8-27B-Q4_0.gguf", "mmproj-F16.gguf",
+            "imatrix_unsloth.gguf", "README.md")]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+            got = A.quant_files(m["quant"], m["repo"], m["folder"], m["prefix_tmpl"].format(q=m["quant"]))
+        self.assertEqual([g[0] for g in got], ["Qwen3.8-27B-UD-Q4_K_XL.gguf"])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("qwen38-27b-q4_k_xl", Path(d) / "pack", 32768, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("Qwen3.8-27B", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "qwen3.8-27b")
+        self.assertEqual(got["args"][got["args"].index("--max-context") + 1], "32768")
+        self.assertEqual(got["sampling"]["top_k"], 20)
+        self.assertNotIn("env", got)   # (no RAM tier: nothing of it is in RAM)
 
 
 class TestVariants(unittest.TestCase):

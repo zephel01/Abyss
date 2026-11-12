@@ -74,6 +74,14 @@ NextN block in its second shard):
 ./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B-IQ3_XXS-16G64G
 ```
 
+Qwen3.8-27B, a dense model, from unsloth's UD-Q4_K_XL (17.7 GB, v1.3.138): this first version runs the whole file in one
+GPU's VRAM, so it needs a GPU with 24 GB or more. The setup stops on a smaller one before downloading anything, and writes
+the context the GPU holds (24 GB: 32K, 32 GB: 128K; [Qwen3.8-27B](#qwen38-27b-dense)):
+
+```sh
+./setup-deepseek.sh --model qwen38-27b --download-model   # Qwen3.8-27B-UD-Q4_K_XL (17.7 GB)
+```
+
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
 card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
 off for the V4 sizes, which run faster without it on a discrete GPU):
@@ -717,6 +725,27 @@ layer with 8 routed and a gated shared expert, a plain residual. `./setup-deepse
   rest to the expert pool (v1.3.134, #44): Ornith-1.5-397B at a 128K context starts on a 16 GB card. See `--kv` in Settings.
 - **Not yet:** conversation slots, a layer split, images; the expert kernels are not yet tuned for its shapes.
 
+## Qwen3.8-27B (dense)
+
+From v1.3.138 the engine runs [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), a dense Qwen3.5
+(llama.cpp's `qwen35`): 48 gated delta-net layers and 16 full-attention layers (24 query heads, 4 KV heads), a dense
+SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that drafts.
+`./setup-deepseek.sh --model qwen38-27b` installs unsloth's UD-Q4_K_XL and makes the pack (`tools/iq_pack.py --gguf
+<file> --out <dir>/pack`, every tensor as stored).
+
+- **Memory.** This version keeps the whole file in VRAM (no RAM tier, one GPU). With the NextN drafter, F16 KV and a 4K
+  prompt the engine takes 19.0 GB at an 8K context, 20.7 GB at 32K, 22.8 GB at 64K and ~27.7 GB at 128K (RTX 5090
+  with VRAM held back). The setup writes 32K on a 24 GB card (64K ran with nothing else on the card), 128K on a 32 GB
+  one, and stops on a GPU under ~21 GB. With less VRAM free the prompt path takes a smaller buffer (24 GB free, 32K
+  and 64K: a 4K prompt still at ~2,500 tok/s, decode 130 tok/s); when even that does not fit, the engine stops at the
+  start or at the first prompt ("did not allocate"). `--kv int8` halves the attention cache.
+- **Quality.** The same token ids as llama.cpp; KL against llama.cpp 0.0025 (one token at a time) and 0.0019 (the
+  prompt path) over 3,071 positions of English, Japanese and code; the first 212 greedy tokens of a 4K chat equal
+  llama.cpp's.
+- **Speed.** RTX 5090, 4K prompt + 512 tokens, median of 3: decode 131.6 tok/s with the NextN drafter (82% of drafts
+  accepted), 72.7 without; llama.cpp 72.1. Prompts 2,538 tok/s (llama.cpp 3,463).
+- **Not yet:** the RAM tier (for GPUs under 24 GB), a layer split, AMD (it compiles; untested), images.
+
 ## EXL3 quants (GLM-5.3-Flash)
 
 From v1.3.35 the engine also reads [exllamav3](https://github.com/turboderp-org/exllamav3)'s EXL3 quants of
@@ -963,6 +992,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_DS4_IDX`, `STRATA_DS4_ATTN` | 0 | `1`: the older FP32 kernels for the lightning indexer / the prompt attention instead of the tensor-core ones (A/B checks) |
 | `STRATA_Q35_ATTN` | 0 | `1`: Ornith (qwen35moe) decode / verify-window attention on the older kernels (v1.3.64). 0: the split kernel (v1.3.65) - 8 keys summed in one shuffle tree, a softmax a 32-key tile, K / V through shared memory: 115K positions 1.09 -> 0.57 ms a layer a token, a 3-row window 3.29 -> 1.39. `STRATA_Q35_ATTN_PW` (query-head pairs a warp, 2) and `STRATA_Q35_ATTN_CHUNK` / `_CHUNK_MIN` (keys a block; default ~1/128 of the context, at least 64) are for tuning |
 | `STRATA_Q35_PATTN` | 0 | `1`: Ornith (qwen35moe) prompts' attention on the older FP32 kernel (v1.3.66). 0: tensor cores (rocWMMA / CUDA WMMA, FP16 operands, FP32 sums; v1.3.67) - a 1,024-token sub-batch at 114K positions 918 -> 156 ms a layer; a 115K prompt 685 -> 154 s; KL 0.0054 against the FP32 kernel after a 24K context (two FP32 runs: 0.0064) |
+| `STRATA_Q35D_MMQ` | on | Qwen3.8-27B (dense qwen35) prompts: the dense FFN's products through MMQ on the quantized weights (FFN 1,187 -> 563 ms for a 4K prompt). `0`: dequantize to FP16 + cuBLAS. `STRATA_Q35D_MMQ_ROWS` (tokens a pass, 2048: ~330 MB) is for tuning |
 | `STRATA_GLM_MMQ_GLU` | on | the prompt path's expert gate/up product writes the SwiGLU itself (NVIDIA Turing and newer); `0`: the separate SwiGLU kernel, bit-identical to older builds |
 | `STRATA_GLM_CPU_MT` | on | CPU experts shared by several tokens (prompts, verify windows) decode each weight row once for all of them, bit-identical to ggml's dot (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers where `STRATA_GLM_CPU_1T` says, v1.3.41); `0` off |
 | `STRATA_GLM_CPU_1T` | on | cheaper one-token rows on the CPU lane, bit-identical to ggml's dot: on an AVX-512 CPU with VNNI and VBMI (Zen 4 / Ice Lake and later) IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers (v1.3.41; a Ryzen AI Max+ 395's 16 threads, a DeepSeek V4 expert 109 -> 90 us, decode without the iGPU lane +3-9%; `STRATA_NO_IQ512_VBMI=1` only these off), else IQ3_S / IQ3_XXS in AVX2; `0` off |
