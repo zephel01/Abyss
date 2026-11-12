@@ -341,13 +341,13 @@ class DenseAllInVram(unittest.TestCase):
     small (before any download or build), one GPU only, unsloth's file picked by its prefix."""
     KEY = "qwen38-27b"
 
-    def check(self, vram, context=65536, gpus=1, backend="cuda", shared=False):
+    def check(self, vram, context=65536, gpus=1, backend="cuda", shared=False, ram=96.0):
         a = Namespace(context=context)
         said = []
         cards = [{"index": i, "name": "GPU", "vram_gb": vram} for i in range(gpus)]
         with mock.patch.object(A.S, "say", side_effect=lambda *x: said.append(" ".join(map(str, x)))):
             try:
-                got = A.dense_gpu_check(a, self.KEY, cards, backend, shared)
+                got = A.dense_gpu_check(a, self.KEY, cards, backend, shared, ram)
             except SystemExit:
                 got = "stopped"
         return got, "\n".join(said)
@@ -364,16 +364,36 @@ class DenseAllInVram(unittest.TestCase):
         self.assertEqual(f(self.KEY, 47.99, 262144), 262144)
         self.assertEqual(f(self.KEY, 95.0, 1 << 20), 262144)   # (longer than measured: the longest)
 
+    def test_the_context_a_smaller_gpu_holds_with_the_ffn_in_ram(self):
+        f = A.dense_split_context
+        self.assertIsNone(f(self.KEY, 7.99, 8192))
+        self.assertEqual(f(self.KEY, 11.99, 65536), 8192)
+        self.assertEqual(f(self.KEY, 15.92, 65536), 32768)
+        self.assertEqual(f(self.KEY, 23.99, 65536), 65536)
+
     def test_a_small_gpu_stops_with_the_reason(self):
-        got, said = self.check(15.92)
+        got, said = self.check(7.99)
         self.assertEqual(got, "stopped")
-        self.assertIn("needs a GPU with 24 GB or more", said)
+        self.assertIn("needs a GPU with 12 GB or more", said)
         self.assertIn("--model qwen38", said)
 
-    def test_a_24_gb_gpu_gets_32k(self):
-        got, said = self.check(23.99)
+    def test_a_12_16_gb_gpu_runs_with_the_ffn_partly_in_ram(self):
+        got, said = self.check(11.99)
+        self.assertEqual(got, 8192)
+        self.assertIn("part of the FFN in RAM", said)
+        got, said = self.check(15.92, context=32768)
         self.assertEqual(got, 32768)
-        self.assertIn("--context 65536 needs a ~26 GB GPU: the config gets 32768", said)
+        got, said = self.check(15.92, ram=16.0)
+        self.assertEqual(got, "stopped")
+        self.assertIn("needs 32 GB of RAM", said)
+
+    def test_a_24_gb_gpu_gets_32k_all_in_vram_or_64k_with_the_ffn_in_ram(self):
+        got, said = self.check(23.99, context=32768)
+        self.assertEqual(got, 32768)
+        self.assertIn("the whole file in VRAM", said)
+        got, said = self.check(23.99)   # (64K: all in VRAM needs ~26 GB, so the FFN partly in RAM)
+        self.assertEqual(got, 65536)
+        self.assertIn("part of the FFN in RAM", said)
         self.assertEqual(self.check(31.84), (65536, self.check(31.84)[1]))
 
     def test_one_gpu_only(self):
