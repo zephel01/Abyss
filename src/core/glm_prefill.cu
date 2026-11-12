@@ -472,6 +472,9 @@ struct Glm5Model::PrefillState {
     float* dq_gu = nullptr;
     uint8_t *dq_xq = nullptr, *dq_hq = nullptr;
     int32_t *dq_iota = nullptr, *dq_bounds = nullptr;
+    // (qwen35moe with STRATA_Q35_PROJ_MMQ=1: the same buffers, without dq_gu / dq_xq, for the mixers' projections only;
+    // dq_kmax: their widest input, the bound mmq_gemm checks instead of the dense n_ff)
+    int64_t dq_kmax = 0;
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
     bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
@@ -1163,6 +1166,36 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         S->tr.resize((size_t) g.n_layers);
         for (auto& t : S->tr)
             for (cudaEvent_t* e : {&t.start, &t.plan, &t.pre, &t.c1, &t.end}) cudaEventCreate(e);
+    }
+    // STRATA_GLM_Q35_PROJ_MMQ=1 (opt-in, qwen35moe): the mixers' projections through MMQ (int8, the weights as stored)
+    // instead of dequantize + the BLAS library's FP16 GEMM, as the dense qwen35's prompt path does (STRATA_Q35D_MMQ).
+    // Other arithmetic than the default (a q8_1 activation), so other prompt numbers: an A/B for a GPU whose BLAS GEMM is
+    // slow (issue #43: an RX 9060 XT, gfx1200 on Windows, read an 8K Ornith-1.5-122B prompt at 14 tok/s), not a default
+    if (has_moe && g.qwen35() && !g.q4x && mmq::built() && S->dq == nullptr) {
+        static const bool proj_mmq = [] { const char* v = getenv("STRATA_GLM_Q35_PROJ_MMQ"); return v != nullptr && std::atoi(v) != 0; }();
+        const int64_t kmax = std::max<int64_t>({(int64_t) g.n_embd, (int64_t) g.ssm_inner,
+                                                (int64_t) g.n_head * g.head_dim});
+        if (proj_mmq && g.n_embd % 512 == 0) {
+            const int rows = 2048;
+            const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+            const size_t b_hq = al(mmq::q8_bytes(rows, kmax)), b_io = al(((size_t) rows + kIdsPad) * sizeof(int32_t));
+            void* d = nullptr;
+            if (cudaMalloc(&d, b_hq + b_io + 256) != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "glm prefill: CUDA%d STRATA_GLM_Q35_PROJ_MMQ: no room for its buffers - FP16 GEMMs\n", dev_);
+            } else {
+                uint8_t* b = (uint8_t*) d;
+                S->dq = d;
+                S->dq_rows = rows;
+                S->dq_kmax = kmax;
+                S->dq_hq = b; b += b_hq;
+                S->dq_iota = (int32_t*) b; b += b_io;
+                S->dq_bounds = (int32_t*) b;
+                mmq::iota(S->dq_iota, (int64_t) rows + kIdsPad, fast_->cs);
+                std::fprintf(stderr, "glm prefill: CUDA%d the mixers' projections through MMQ (STRATA_GLM_Q35_PROJ_MMQ), %d "
+                                     "tokens a pass (%.0f MB)\n", dev_, rows, (double) (b_hq + b_io + 256) / 1048576.0);
+            }
+        }
     }
     std::fprintf(stderr, "glm prefill: CUDA%d chunks of %d tokens (--prefill %s; mixer sub-batches of %d), borrowing "
                          "%.0f MB of the expert pool while a prompt runs (activations %.0f, weight scratch %.0f, expert "
@@ -2264,7 +2297,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // Y[t][N] = X[t][Kd] (F32 rows, contiguous) . W[N][Kd]^T through MMQ (the weights as stored, X as q8_1) - the dense
     // qwen35's projections, where its FFN buffers exist (prefill_setup_own); false: not taken (the caller's FP16 GEMM)
     const auto mmq_gemm = [&](const WSlot& w, int N, int Kd, const float* X, float* Y, int Tn) -> bool {
-        if (S->dq == nullptr || !mmq::supported(w.type) || Kd % 512 != 0 || N % 128 != 0 || Kd > g.n_ff_dense ||
+        if (S->dq == nullptr || !mmq::supported(w.type) || Kd % 512 != 0 || N % 128 != 0 ||
+            Kd > (S->dq_kmax > 0 ? S->dq_kmax : (int64_t) g.n_ff_dense) ||
             w.q == nullptr)
             return false;
         for (int t0 = 0; t0 < Tn; t0 += S->dq_rows) {
@@ -3217,7 +3251,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             x_down = true;
         }
 
-        if (!Ly.moe && S->dq != nullptr) {
+        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
             // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into
             // S->ffn - the experts' MMQ path with one "expert" whose rows are the tokens
@@ -5081,6 +5115,27 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             std::fprintf(stderr, "glm prefill: the exact prompt's combine ran as the window filled in %llu layers (not one "
                                  "order: STRATA_GLM_PREFILL_WINDOW=0 keeps one window)\n",
                          (unsigned long long) pf_->x_flushed);
+    }
+    // STRATA_GLM_PREFILL_PROF=1: the stages' GPU time so far, after every prompt, on one line --bench's report keeps
+    // (the table at exit never reached a server's log: issue #43's 14 tok/s prompts on an RX 9060 XT had no breakdown)
+    if (pf_->prof && !pf_->pacc.empty()) {
+        std::vector<std::pair<double, std::string>> v;
+        double tot = 0.0;
+        for (auto& kv : pf_->pacc) {
+            v.push_back({kv.second, kv.first});
+            tot += kv.second;
+        }
+        std::sort(v.rbegin(), v.rend());
+        const double nt = (double) std::max<int64_t>(1, pf_->tokens);
+        std::string line;
+        char buf[96];
+        for (size_t i = 0; i < v.size() && i < 8; ++i) {
+            std::snprintf(buf, sizeof buf, "%s%s %.3f", i ? ", " : "", v[i].second.c_str(), v[i].first / nt);
+            line += buf;
+        }
+        std::fprintf(stderr, "glm prefill: %lld tokens so far, GPU stages %.3f ms a token (STRATA_GLM_PREFILL_PROF): %s | "
+                             "host waits on disk %.3f, plan %.3f ms a token\n", (long long) pf_->tokens, tot / nt,
+                     line.c_str(), pf_->ms_disk / nt, pf_->ms_plan / nt);
     }
     return true;
 }
