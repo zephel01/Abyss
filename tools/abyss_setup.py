@@ -62,7 +62,7 @@ REPO = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
 DENSE27_VRAM = {8192: 21.0, 32768: 23.5, 65536: 26.0, 131072: 30.0, 262144: 40.0}   # (256K: +8.7 GB of caches, estimated)
 # a smaller GPU (2026-11-12, v1.3.139): the engine keeps the FFN rows that do not fit in pinned RAM and computes them on
 # the CPU; the GPU then needs the rest of the file, the caches and two staging buffers - the table less the FFN (9.9 GB)
-# plus 0.4 GB (RTX 5090 capped: 8K started at 9.0 GB with no FFN in VRAM; 12 GB 22 tok/s, 16 GB 42, 20 GB all in VRAM)
+# plus 0.4 GB (RTX 5090 capped: 8K started at 9.0 GB with no FFN in VRAM; 12 GB 27 tok/s, 16 GB 65, 20 GB all in VRAM)
 DENSE27_FFN_GB = 9.5
 DENSE27_RAM_GB = 32   # (up to 10 GB of FFN pinned + the 6 GB headroom + the server)
 # the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
@@ -601,7 +601,7 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
                    f"a PC with {model['ram_min']} GB of RAM or more, or a GPU that holds the file (24 GB or more)")
         S.ok(f"{model['title']}: this {vram:.0f} GB GPU holds a {sctx // 1024}K context with part of the FFN in RAM "
              f"(the engine computes those rows on the CPU: slower than all in VRAM - RTX 5090 capped to 12 / 16 GB: "
-             f"~22 / ~42 tok/s, 20 GB and up all in VRAM ~130)")
+             f"~27 / ~65 tok/s with the drafter, 20 GB and up all in VRAM ~130)")
         if sctx < a.context:
             S.warn(f"--context {a.context} is longer than this GPU holds: the config gets {sctx} (a larger GPU holds more)")
         return sctx

@@ -928,8 +928,15 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             // 512 MB to 4 GB)
             // (the trunk's FFN q35d_place has yet to put in VRAM counted as taken: the same share as v1.3.138's, whose
             // load had uploaded it; a card it does not fit gets the 512 MB)
+            // A card that leaves more than 3 GB of the FFN in RAM (each chunk of a prompt stages it all over PCIe) lends
+            // the region to whole layers' FFN between prompts (q35d_place's loan) and makes it larger: a quarter of the
+            // free VRAM there, to 1.5 GB - ~3K-token chunks on a 12 GB card instead of 1024 (RTX 5090 capped to 12 GB, 4K
+            // prompt: 881 -> 1441 tok/s, decode -3%; at 16 GB, 1.5 GB in RAM, the larger region cost decode 5% for nothing)
             if (stride_sum == 0 && g.q35_dense()) {
                 const size_t pend = q35d_pending(), av = avail > pend ? avail - pend : 0;
+                if (pend > avail + ((size_t) 3 << 30) && q35d_defer_on() &&
+                    (getenv("STRATA_Q35D_LOAN") == nullptr || std::atoi(getenv("STRATA_Q35D_LOAN")) != 0))
+                    return std::clamp<size_t>(avail / 4, (size_t) 512 << 20, (size_t) 1536 << 20);
                 return std::clamp<size_t>(av / 4, (size_t) 512 << 20, (size_t) 4 << 30);
             }
             if (stride_sum == 0) return avail;
