@@ -591,33 +591,51 @@ template <int S>
 __global__ void __launch_bounds__(S) gdn_scan_kernel(float* __restrict__ state, const float* __restrict__ h, int T, int C,
                                                      const float* __restrict__ gate, const float* __restrict__ beta,
                                                      int h_k, int h_v, float* __restrict__ o) {
-    __shared__ float ks[S], qs[S];
+    // (the next row's q / k / v / gate / beta load while this row computes, into the other half of a double buffer:
+    // one barrier a row instead of two and no load latency on the chain - the same arithmetic, the same bits)
+    __shared__ float ks[2][S], qs[2][S];
     const int hv = blockIdx.x, j = threadIdx.x, src = hv % h_k;   // (MODULO head pairing, as gdn_step)
     const size_t stride = (size_t) h_v * S;
     float* col = state + (size_t) hv * S + j;
     float st[S];
 #pragma unroll
     for (int i = 0; i < S; ++i) st[i] = col[(size_t) i * stride];
+    float nq = 0.0f, nk = 0.0f, nv = 0.0f, ng = 0.0f, nb = 0.0f;
+    if (T > 0) {
+        nq = h[src * S + j];
+        nk = h[(h_k + src) * S + j];
+        nv = h[(2 * h_k + hv) * S + j];
+        ng = gate[hv];
+        nb = beta[hv];
+    }
     for (int t = 0; t < T; ++t) {
-        const float* row = h + (size_t) t * C;
+        const int bf = t & 1;
+        qs[bf][j] = nq;
+        ks[bf][j] = nk;
+        const float v = nv, dec = expf(ng), b = nb;
         __syncthreads();
-        qs[j] = row[src * S + j];
-        ks[j] = row[(h_k + src) * S + j];
-        __syncthreads();
-        const float dec = expf(gate[(size_t) t * h_v + hv]), b = beta[(size_t) t * h_v + hv];
-        const float v = row[(2 * h_k + hv) * S + j];
+        if (t + 1 < T) {
+            const float* row = h + (size_t) (t + 1) * C;
+            nq = row[src * S + j];
+            nk = row[(h_k + src) * S + j];
+            nv = row[(2 * h_k + hv) * S + j];
+            ng = gate[(size_t) (t + 1) * h_v + hv];
+            nb = beta[(size_t) (t + 1) * h_v + hv];
+        }
+        const float* kk = ks[bf];
+        const float* qq = qs[bf];
         float sk = 0.0f;
 #pragma unroll
         for (int i = 0; i < S; ++i) {
             st[i] *= dec;
-            sk += st[i] * ks[i];
+            sk += st[i] * kk[i];
         }
         const float d = (v - sk) * b;
         float dot = 0.0f;
 #pragma unroll
         for (int i = 0; i < S; ++i) {
-            st[i] += ks[i] * d;
-            dot += st[i] * qs[i];
+            st[i] += kk[i] * d;
+            dot += st[i] * qq[i];
         }
         o[((size_t) t * h_v + hv) * S + j] = dot;
     }
