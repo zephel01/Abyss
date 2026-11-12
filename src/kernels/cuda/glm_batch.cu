@@ -1529,18 +1529,20 @@ __global__ void __launch_bounds__(256) head_rows_kernel(const float* __restrict_
         h[(size_t) t * E + e] = v[i] * inv * w[e];
     }
 }
-// out16[t] = [rms(emb[t]) * enorm, rms(h[t]) * hnorm] (FP16, 2E per row)
+// out16[t] = [rms(emb[t]) * enorm, rms(h[t]) * hnorm] (FP16, 2E per row); E <= K x 256 (K 16: 4096,
+// as before; K 32: 8192 - the dense Qwen3.8-27B's 5120)
+template <int K>
 __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                           const float* __restrict__ enorm,
                                                           const float* __restrict__ hnorm, float eps, int E,
                                                           __half* __restrict__ out) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float a[16], b[16];
+    float a[K], b[K];
     float sa = 0.0f, sb = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < K; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         a[i] = emb[(size_t) t * E + e];
@@ -1552,23 +1554,24 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) E + eps), ib = rsqrtf(sb / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < K; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         out[(size_t) t * 2 * E + e] = __float2half(a[i] * ia * enorm[e]);
         out[(size_t) t * 2 * E + E + e] = __float2half(b[i] * ib * hnorm[e]);
     }
 }
-// x[t] = rms(in[t]) * w, F32 and FP16
+// x[t] = rms(in[t]) * w, F32 and FP16; E <= K x 256, as mtp_in_rows_kernel
+template <int K>
 __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__ in, const float* __restrict__ w, float eps,
                                                        int E, float* __restrict__ x, __half* __restrict__ x16) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float v[16];
+    float v[K];
     float ss = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < K; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         v[i] = in[(size_t) t * E + e];
@@ -1577,7 +1580,7 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < K; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         const float xv = v[i] * inv * w[e];
@@ -2091,7 +2094,8 @@ void head_rows(const float* R, const float* w, float eps, int T, int n_embd, flo
 void mtp_in_rows(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int T, int n_embd,
                  void* out16, cudaStream_t s) {
     if (T <= 0) return;
-    mtp_in_rows_kernel<<<T, 256, 0, s>>>(emb, h, enorm, hnorm, eps, n_embd, (__half*) out16);
+    if (n_embd <= 4096) mtp_in_rows_kernel<16><<<T, 256, 0, s>>>(emb, h, enorm, hnorm, eps, n_embd, (__half*) out16);
+    else mtp_in_rows_kernel<32><<<T, 256, 0, s>>>(emb, h, enorm, hnorm, eps, n_embd, (__half*) out16);
     check("mtp_in_rows");
 }
 
@@ -2153,7 +2157,8 @@ void router_f32(const float* w, int NE, const float* x, int T, int n_embd, float
 }
 void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s) {
     if (T <= 0) return;
-    rms_rows_kernel<<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);
+    if (n_embd <= 4096) rms_rows_kernel<16><<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);
+    else rms_rows_kernel<32><<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);
     check("rms_rows");
 }
 

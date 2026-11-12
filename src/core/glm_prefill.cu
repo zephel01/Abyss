@@ -464,6 +464,13 @@ struct Glm5Model::PrefillState {
     size_t borrow_bytes = 0, ws_bytes = 0, gbuf_bytes = 0;
     bool lent = false;
     bool own = false;                // a dense qwen35: the region is the prompt path's own (no expert pool to borrow)
+    // the dense qwen35's FFN through MMQ (int8 tensor cores, the weights as stored): dq_rows tokens a pass - their
+    // gate|up rows (2 n_ff floats each, h in the first n_ff after the SwiGLU), x and h as q8_1, the row map, bounds
+    void* dq = nullptr;
+    int dq_rows = 0;
+    float* dq_gu = nullptr;
+    uint8_t *dq_xq = nullptr, *dq_hq = nullptr;
+    int32_t *dq_iota = nullptr, *dq_bounds = nullptr;
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
     bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
@@ -1183,7 +1190,46 @@ bool Glm5Model::prefill_setup_own(std::string& err) {
         return true;
     }
     S->own = true;
-    return prefill_bind((uint8_t*) r, S->borrow_bytes, err);
+    if (!prefill_bind((uint8_t*) r, S->borrow_bytes, err)) return false;
+    // the FFN's MMQ buffers (STRATA_Q35D_MMQ=0: the dequantize + cuBLAS FP16 products; STRATA_Q35D_MMQ_ROWS: tokens a
+    // pass, default 2048 - ~330 MB with Qwen3.8-27B's n_ff 17408).  MMQ reads K in tiles of 512 values: n_embd and
+    // n_ff multiples of 512 (no over-read past a matrix), every FFN type MMQ's
+    static const bool mmq_env = [] { const char* v = getenv("STRATA_Q35D_MMQ"); return v == nullptr || std::atoi(v) != 0; }();
+    const int64_t E = g_.n_embd, FF = g_.n_ff_dense;
+    bool types_ok = mmq::built() && E % 512 == 0 && FF % 512 == 0;
+    for (int il = l0_; il < l1_ && types_ok; ++il) {
+        const auto& Ly = fast_->L[(size_t) il];
+        types_ok = !Ly.moe && mmq::supported(Ly.ffn_gate.type) && mmq::supported(Ly.ffn_up.type) &&
+                   mmq::supported(Ly.ffn_down.type);
+    }
+    if (mmq_env && types_ok) {
+        const int rows = [] {
+            const char* v = getenv("STRATA_Q35D_MMQ_ROWS");
+            return std::max(256, std::min(8192, v != nullptr ? std::atoi(v) : 2048)) / 256 * 256;
+        }();
+        const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+        const size_t b_gu = al((size_t) rows * 2 * FF * sizeof(float)), b_xq = al(mmq::q8_bytes(rows, E)),
+                     b_hq = al(mmq::q8_bytes(rows, FF)), b_io = al(((size_t) rows + kIdsPad) * sizeof(int32_t)),
+                     b_bd = 256;
+        void* d = nullptr;
+        if (cudaMalloc(&d, b_gu + b_xq + b_hq + b_io + b_bd) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "glm prefill: CUDA%d no room for the dense FFN's MMQ buffers - FP16 products\n", dev_);
+        } else {
+            uint8_t* b = (uint8_t*) d;
+            S->dq = d;
+            S->dq_rows = rows;
+            S->dq_gu = (float*) b; b += b_gu;
+            S->dq_xq = b; b += b_xq;
+            S->dq_hq = b; b += b_hq;
+            S->dq_iota = (int32_t*) b; b += b_io;
+            S->dq_bounds = (int32_t*) b;
+            mmq::iota(S->dq_iota, (int64_t) rows + kIdsPad, fast_->cs);
+            std::fprintf(stderr, "glm prefill: CUDA%d the dense FFN through MMQ, %d tokens a pass (%.0f MB)\n", dev_, rows,
+                         (double) (b_gu + b_xq + b_hq + b_io + b_bd) / 1048576.0);
+        }
+    }
+    return true;
 }
 
 // the slots a layer the pool keeps while a prompt runs (prefill_setup: the full keep, or the small one on a pool that
@@ -1697,6 +1743,7 @@ void Glm5Model::prefill_destroy() {
     if (S->h_base) cudaFreeHost(S->h_base);
     if (S->h_bounds) cudaFreeHost(S->h_bounds);
     if (S->own && S->region) cudaFree(S->region);
+    if (S->dq) cudaFree(S->dq);
     delete S;
     pf_ = nullptr;
 }
@@ -2211,6 +2258,35 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                     "gemm f16");
         }
+    };
+    // Y[t][N] = X[t][Kd] (F32 rows, contiguous) . W[N][Kd]^T through MMQ (the weights as stored, X as q8_1) - the dense
+    // qwen35's projections, where its FFN buffers exist (prefill_setup_own); false: not taken (the caller's FP16 GEMM)
+    const auto mmq_gemm = [&](const WSlot& w, int N, int Kd, const float* X, float* Y, int Tn) -> bool {
+        if (S->dq == nullptr || !mmq::supported(w.type) || Kd % 512 != 0 || N % 128 != 0 || Kd > g.n_ff_dense ||
+            w.q == nullptr)
+            return false;
+        for (int t0 = 0; t0 < Tn; t0 += S->dq_rows) {
+            const int tn = std::min(S->dq_rows, Tn - t0);
+            const int32_t hb[2] = {0, tn};
+            cudaMemcpyAsync(S->dq_bounds, hb, sizeof hb, cudaMemcpyHostToDevice, s);
+            mmq::quantize(X + (size_t) t0 * Kd, nullptr, S->dq_hq, w.type, Kd, Kd, tn, s);
+            mmq::Product p;
+            p.w = w.q;
+            p.type = w.type;
+            p.w_rows = N;
+            p.w_cols = Kd;
+            p.expert_bytes = mmq::matrix_bytes(w.type, N, Kd);
+            p.n = 1;
+            p.xq = S->dq_hq;
+            p.bounds = S->dq_bounds;
+            p.ids = S->dq_iota;
+            p.total_rows = tn;
+            p.max_rows = tn;
+            p.dst = Y + (size_t) t0 * N;
+            p.ld_dst = N;
+            S->mq->run(p, s);
+        }
+        return true;
     };
     // qwen4exp's hyper-connection over the chunk, in sub-batches (fast_q4x_layers' q4x_mix): R += out . 2 sigmoid(the
     // writer's inject / hc) (out: null = none), the streams normed, inject = inject_w . xn (inj_out: null = none), the
@@ -2864,8 +2940,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const std::string Ls = std::to_string(il);
                 if (Ly.recr) {
                     const int C = g.ssm_conv_dim(), V = g.ssm_inner, Sd = g.ssm_state, HK = g.ssm_k_heads, HV = g.ssm_v_heads;
-                    hgemm_q(Ly.qkv, C, E, x16, E, B.qkv, C, tn, 0.0f);
-                    hgemm_q(Ly.zg, V, E, x16, E, B.z, V, tn, 0.0f);
+                    if (!mmq_gemm(Ly.qkv, C, E, xs, B.qkv, tn)) hgemm_q(Ly.qkv, C, E, x16, E, B.qkv, C, tn, 0.0f);
+                    if (!mmq_gemm(Ly.zg, V, E, xs, B.z, tn)) hgemm_q(Ly.zg, V, E, x16, E, B.z, V, tn, 0.0f);
                     hgemm_q(Ly.alpha_w, HV, E, x16, E, B.alpha, HV, tn, 0.0f);
                     hgemm_q(Ly.beta_w, HV, E, x16, E, B.beta, HV, tn, 0.0f);
                     S->mark("q35_proj", s);
@@ -2881,14 +2957,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->mark("q35_gdn", s);
                     if (t0 + tn == T) dump_row("final_output-" + Ls, B.y, V, tn - 1);
                     if (!skip_output) {
-                        gb::f32_to_f16(B.y, B.y16, (int64_t) tn * V, s);
-                        hgemm_q(Ly.ssm_o, E, V, B.y16, V, mixer, E, tn, 0.0f);
+                        if (!mmq_gemm(Ly.ssm_o, E, V, B.y, mixer, tn)) {
+                            gb::f32_to_f16(B.y, B.y16, (int64_t) tn * V, s);
+                            hgemm_q(Ly.ssm_o, E, V, B.y16, V, mixer, E, tn, 0.0f);
+                        }
                     }
                 } else {
                     const int D = g.head_dim, HDq = g.n_head * D, KV = g.attn_head_kv * D;
-                    hgemm_q(Ly.aq, 2 * HDq, E, x16, E, B.qf, 2 * HDq, tn, 0.0f);
-                    hgemm_q(Ly.ak, KV, E, x16, E, B.k, KV, tn, 0.0f);
-                    hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
+                    if (!mmq_gemm(Ly.aq, 2 * HDq, E, xs, B.qf, tn)) hgemm_q(Ly.aq, 2 * HDq, E, x16, E, B.qf, 2 * HDq, tn, 0.0f);
+                    if (!mmq_gemm(Ly.ak, KV, E, xs, B.k, tn)) hgemm_q(Ly.ak, KV, E, x16, E, B.k, KV, tn, 0.0f);
+                    if (!mmq_gemm(Ly.av, KV, E, xs, B.v, tn)) hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
                     S->mark("q35_proj", s);
                     q35::attn_prep_rows(B.qf, B.k, B.v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                         g.n_rot, g.rope_base, pt0, tn, Ly.kc, Ly.vc, B.q, s, q35_kv_);
@@ -2903,8 +2981,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->mark("q35_attn", s);
                     if (t0 + tn == T) dump_row("attn_gated-" + Ls, B.ao, HDq, tn - 1);
                     if (!skip_output) {
-                        gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
-                        hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
+                        if (!mmq_gemm(Ly.out, E, HDq, B.ao, mixer, tn)) {
+                            gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
+                            hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
+                        }
                     }
                 }
             } else if (Ly.recr) {
@@ -3103,6 +3183,56 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             x_down = true;
         }
 
+        if (!Ly.moe && S->dq != nullptr) {
+            // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
+            // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into
+            // S->ffn - the experts' MMQ path with one "expert" whose rows are the tokens
+            const int64_t FF = g.n_ff_dense;
+            for (int t0 = 0; t0 < T; t0 += S->dq_rows) {
+                const int tn = std::min(S->dq_rows, T - t0);
+                const int32_t hb[2] = {0, tn};
+                cudaMemcpyAsync(S->dq_bounds, hb, sizeof hb, cudaMemcpyHostToDevice, s);
+                const float* xt = S->x + (size_t) t0 * E;
+                mmq::Product p;
+                p.w_cols = E;
+                p.n = 1;
+                p.xq = S->dq_xq;
+                p.bounds = S->dq_bounds;
+                p.ids = S->dq_iota;
+                p.total_rows = tn;
+                p.max_rows = tn;
+                p.ld_dst = 2 * FF;
+                p.w_rows = FF;
+                p.w = Ly.ffn_gate.q;
+                p.type = Ly.ffn_gate.type;
+                p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
+                p.dst = S->dq_gu;
+                mmq::quantize(xt, nullptr, S->dq_xq, p.type, E, E, tn, s);
+                S->mq->run(p, s);
+                if (Ly.ffn_up.type != Ly.ffn_gate.type) mmq::quantize(xt, nullptr, S->dq_xq, Ly.ffn_up.type, E, E, tn, s);
+                p.w = Ly.ffn_up.q;
+                p.type = Ly.ffn_up.type;
+                p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
+                p.dst = S->dq_gu + FF;
+                S->mq->run(p, s);
+                gb::swiglu_rows(S->dq_gu, S->dq_gu, tn, (int) FF, g.swiglu_shexp, s, (int) (2 * FF));
+                mmq::quantize(S->dq_gu, nullptr, S->dq_hq, Ly.ffn_down.type, FF, 2 * FF, tn, s);
+                mmq::Product d = p;
+                d.w = Ly.ffn_down.q;
+                d.type = Ly.ffn_down.type;
+                d.w_rows = E;
+                d.w_cols = FF;
+                d.expert_bytes = mmq::matrix_bytes(d.type, E, FF);
+                d.xq = S->dq_hq;
+                d.dst = S->ffn + (size_t) t0 * E;
+                d.ld_dst = E;
+                S->mq->run(d, s);
+            }
+            S->mark("dense_ffn", s);
+            abl_out(il, 1, S->ffn, T, E, s);
+            dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
+            continue;
+        }
         if (!Ly.moe) {
             for (int t0 = 0; t0 < T; t0 += S->sub) {
                 const int tn = std::min(S->sub, T - t0);

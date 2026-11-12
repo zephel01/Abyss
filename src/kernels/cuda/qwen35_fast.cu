@@ -1249,6 +1249,7 @@ __global__ void __launch_bounds__(256) attn_window_kernel(const float* __restric
     constexpr int QB = 4;
     const int g = blockIdx.y, t0 = blockIdx.x * QB, c = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int G = n_head / n_head_kv, h0 = g * G + warp * HW;
+    if (warp * HW >= G) return;   // (a group of fewer than 8 HW heads: Qwen3.8-27B's 6 on HW 1; no block sync)
     const int nq = min(QB, T - t0);
     float qr[QB][HW][8], acc[QB][HW][8], m[QB][HW], l[QB][HW];
 #pragma unroll
@@ -2417,12 +2418,15 @@ void attn_prep_rows(const float* q_full, const float* k, const float* v, const f
         q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q);
     check("attn_prep_rows");
 }
+// the prompt / window kernels' query-head groups: 8 warps x HW heads (HW 1, 2, 4), whole warps - up to 8 heads, an even
+// count up to 16, a multiple of 4 up to 32 (the dense Qwen3.8-27B's 6, qwen4exp's 12, Ornith's 8 / 16 / 32)
+static bool attn_group_ok(int G) { return G >= 1 && (G <= 8 || (G <= 16 && G % 2 == 0) || (G <= 32 && G % 4 == 0)); }
 void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
                  int64_t p0, int T, float scale, float* out, cudaStream_t s, int kv) {
     if (T <= 0) return;
     const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
-    if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 12 && G != 16 && G != 32)) {
-        std::fprintf(stderr, "qwen35 attn_prompt: head_dim %d, heads %d / %d (a group of 8, 12, 16 or 32)\n", head_dim,
+    if (head_dim != kD || G * n_head_kv != n_head || !attn_group_ok(G)) {
+        std::fprintf(stderr, "qwen35 attn_prompt: head_dim %d, heads %d / %d (a group of up to 8, 16 even or 32 by 4)\n", head_dim,
                      n_head, n_head_kv);
         return;
     }
@@ -2466,12 +2470,12 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv);
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
-            if (G == 8) attn_prompt_kernel<1, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-            else if (G == 16 || G == 12) attn_prompt_kernel<2, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+            if (G <= 8) attn_prompt_kernel<1, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+            else if (G <= 16) attn_prompt_kernel<2, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
             else attn_prompt_kernel<4, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
         });
-    } else if (G == 8) attn_prompt_kernel<1, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-    else if (G == 16 || G == 12) attn_prompt_kernel<2, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    } else if (G <= 8) attn_prompt_kernel<1, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    else if (G <= 16) attn_prompt_kernel<2, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     else attn_prompt_kernel<4, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     check("attn_prompt");
 }
@@ -2483,8 +2487,8 @@ void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
                  int64_t p0, int T, float scale, float* part, float* out, cudaStream_t s, int kv) {
     if (T <= 0) return;
     const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
-    if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 16 && G != 32)) {
-        std::fprintf(stderr, "qwen35 attn_window: head_dim %d, heads %d / %d (a group of 8, 16 or 32)\n", head_dim,
+    if (head_dim != kD || G * n_head_kv != n_head || !attn_group_ok(G)) {
+        std::fprintf(stderr, "qwen35 attn_window: head_dim %d, heads %d / %d (a group of up to 8, 16 even or 32 by 4)\n", head_dim,
                      n_head, n_head_kv);
         return;
     }
@@ -2496,12 +2500,12 @@ void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv, (unsigned) n_chunks);
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
-            if (G == 8) attn_window_kernel<1, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-            else if (G == 16) attn_window_kernel<2, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+            if (G <= 8) attn_window_kernel<1, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+            else if (G <= 16) attn_window_kernel<2, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
             else attn_window_kernel<4, K()><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
         });
-    } else if (G == 8) attn_window_kernel<1, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
-    else if (G == 16) attn_window_kernel<2, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    } else if (G <= 8) attn_window_kernel<1, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
+    else if (G <= 16) attn_window_kernel<2, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
     else attn_window_kernel<4, 0><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks);
     pdl_launch(attn_merge_kernel, dim3((unsigned) n_head, (unsigned) T), kD, 0, s, part, n_chunks, out);
     check("attn_window");

@@ -4715,16 +4715,18 @@ __global__ void rows_q8_kernel(const float* __restrict__ x, int ld, int rows, in
 }
 
 // ---------------------------------------------------------------- the NextN block's glue
-// cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 4096, one block of 1024
+// cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 1024 K (K 4: 4096, as before; K 8: 8192 - the dense
+// qwen35's 5120), one block of 1024
+template <int K>
 __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                       const float* __restrict__ enorm, const float* __restrict__ hnorm,
                                                       float eps, int n, block_q8_1* __restrict__ catq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float a[4], b[4];
+    float a[K], b[K];
     float sa = 0.0f, sb = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < K; ++i) {
         const int e = tid + 1024 * i;
         a[i] = e < n ? emb[e] : 0.0f;
         b[i] = e < n ? h[e] : 0.0f;
@@ -4735,23 +4737,25 @@ __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ 
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) n + eps), ib = rsqrtf(sb / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < K; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         q8_1_store_warp(a[i] * ia * enorm[e], catq + e / 32, lane);
         q8_1_store_warp(b[i] * ib * hnorm[e], catq + (n + e) / 32, lane);
     }
 }
-// h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 4096, one block of 1024
+// h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 1024 K (K 4: 4096, as before; K 8: 8192 - the dense
+// qwen35's 5120), one block of 1024
+template <int K>
 __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, const float* __restrict__ add,
                                                       const float* __restrict__ w, float eps, int n,
                                                       float* __restrict__ x, block_q8_1* __restrict__ xq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float v[4];
+    float v[K];
     float ss = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < K; ++i) {
         const int e = tid + 1024 * i;
         float t = e < n ? h[e] : 0.0f;
         if (add != nullptr && e < n) {
@@ -4764,7 +4768,7 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < K; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         const float xv = v[i] * inv * w[e];
@@ -6458,12 +6462,14 @@ void tab_update(unsigned long long* tab, const int* keys, const unsigned long lo
 
 void mtp_in(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int n, void* cat_q8_1,
             cudaStream_t s) {
-    mtp_in_kernel<<<1, 1024, 0, s>>>(emb, h, enorm, hnorm, eps, n, (block_q8_1*) cat_q8_1);
+    if (n <= 4096) mtp_in_kernel<4><<<1, 1024, 0, s>>>(emb, h, enorm, hnorm, eps, n, (block_q8_1*) cat_q8_1);
+    else mtp_in_kernel<8><<<1, 1024, 0, s>>>(emb, h, enorm, hnorm, eps, n, (block_q8_1*) cat_q8_1);
     launch_check("mtp_in");
 }
 
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s) {
-    rms_q8_kernel<<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
+    if (n <= 4096) rms_q8_kernel<4><<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
+    else rms_q8_kernel<8><<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
     launch_check("rms_q8");
 }
 
