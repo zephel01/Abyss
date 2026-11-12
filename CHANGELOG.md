@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.136 - 2026-11-12
+
+- `setup --model ornith35`: Ornith-1.5-35B-A3B from the official
+  [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (`--quant` Q4_K_M, the
+  default, Q5_K_M, Q6_K or Q8_0). It is the same qwen35moe path as the 122B / 397B, NextN drafter from the file.
+  RTX 5090 capped at 8 / 12 / 16 GB (`STRATA_GLM_VRAM_GB`), Q4_K_M, 32K context, 4K prompt + 512 tokens, greedy, median
+  of 3: decode 155.9 / 208.7 / 262.1 tok/s against llama.cpp's 106.4 / 132.8 / 173.4 (same VRAM, the best `--n-cpu-moe`,
+  +47-57%), prompts 2,202 / 3,118 / 3,685 against 1,638 / 2,168 / 3,197 tok/s (llama.cpp `-ub 4096`; 282 / 393 / 630 at
+  its default). With the whole file in VRAM (24 GB) llama.cpp is faster: 357.5 vs 322.4 tok/s decode (both drafting).
+  The setup sets a RAM tier for 32-64 GB PCs as for Qwen3.8.
+- README (EN/JA): the file and the comparison under the PC-size table.
+
 ## v1.3.135 - 2026-11-12
 
 - `setup --model ornith --quant 16G64G`: Ornith-1.5-397B for a 16 GB GPU + 64 GB RAM

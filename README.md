@@ -58,6 +58,11 @@ on the PC size it is named for. Every one is set up with one command (below).
 | 32 GB | 128 GB | [Ornith-1.5-397B-IQ2_XXS-32G128G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF) | 114.2 GB | `--model ornith --quant 32G128G` |
 | DGX Spark | 128 GB unified | [Qwen3.8](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-DGX-Spark-GGUF) · [GLM-5.3-Flash](https://huggingface.co/zephel01/GLM-5.3-Flash-DGX-Spark-GGUF) · [V4 0731](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-DGX-Spark-GGUF) (DGX-Spark) | 86.9-96.8 GB | [docs/DGX-SPARK](docs/DGX-SPARK.md) |
 
+An official file that Abyss runs well on a small GPU: **Ornith-1.5-35B-A3B** ([ornith-ai's Q4_K_M](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), 21.7 GB, `--model ornith35`), for an 8-16 GB GPU + 32 GB RAM.
+RTX 5090 capped at 8 / 12 / 16 GB, 4K prompt + 512 tokens: decode 156 / 209 / 262 tok/s against llama.cpp's 106 / 133 / 173
+(same VRAM, best `--n-cpu-moe`), prompts 2,202 / 3,118 / 3,685 tok/s against 1,638 / 2,168 / 3,197 (`-ub 4096`). On a GPU that holds the whole file
+(24 GB and up) llama.cpp is faster.
+
 - The sizes are targets, not speed guarantees. A larger PC runs a smaller file faster; a smaller PC runs a larger one
   too, reading the experts that do not fit from the SSD (slower).
 - Not sure? On 16 GB + 64 GB start with Qwen3.8-Flash-Next (the fastest there); on 32 GB + 96 GB with GLM-5.3-Flash or
