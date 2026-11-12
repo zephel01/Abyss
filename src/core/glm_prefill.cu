@@ -2250,6 +2250,17 @@ bool Glm5Model::prefill_v41_engram_block(int il, int bn, int kd, const float* ro
 // ---------------------------------------------------------------- one half's layers over a chunk
 bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t* next_ids) {
     FastState* F = fast_;
+    // the prompt's CPU share on every core the pool has (the decode leaves two to the threads that feed the GPU);
+    // a width set_cpu_lane_threads chose stays as it is
+    struct LaneWide {
+        FastState* F;
+        bool on;
+        explicit LaneWide(FastState* f)
+            : F(f), on(f && f->cpu_pool && f->lane_wide > 0 && f->cpu_pool->active() == f->lane_narrow) {
+            if (on) F->cpu_pool->set_active(F->lane_wide);
+        }
+        ~LaneWide() { if (on) F->cpu_pool->set_active(F->lane_narrow); }
+    } lane_wide_guard(F);
     PrefillState* S = pf_;
     const Glm5Geometry& g = g_;
     const cudaStream_t s = F->cs;

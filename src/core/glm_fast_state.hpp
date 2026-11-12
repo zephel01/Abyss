@@ -725,6 +725,9 @@ struct Glm5Model::FastState {
     //      A split of 3+ GPUs shares one pool across its parts (fast_cpu_lane_setup).
     std::unique_ptr<GlmExpertHelper> expert_helper;
     std::shared_ptr<glmfast::Workers> cpu_pool;
+    // the CPU lane's decode width and the pool's whole size (> 0: the spare-core rule left lane_wide - lane_narrow
+    // cores to the service, main and disk threads in a decode; a prompt's CPU share takes them all - LaneWide)
+    int lane_narrow = 0, lane_wide = 0;
     int cpu_node = -1;                         // the NUMA node the pool is pinned to (-1: unpinned) ...
     std::vector<int> cpu_pin;                  // ... and its CPUs (the service thread runs there too)
     double cpu_c_ms = 0.0, cpu_p_ms = 0.0;   // the lane's calibration: an expert on the CPU, one over PCIe

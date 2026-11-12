@@ -3097,6 +3097,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const bool shared = n_parts_ >= 2 && !own_count &&
                         (shv != nullptr && shv[0] != '\0' ? std::atoi(shv) != 0 : n_parts_ >= 3);
     int threads = 0;
+    int lane_spare = 0;   // (the decode's spare cores: the pool keeps them for the prompt path - FastState::lane_wide)
     if (lv != nullptr) {
         threads = std::max(0, std::min(64, std::atoi(lv)));
     } else if (F->integrated && !glmfast::kHipBuild) {   // (an AMD APU keeps its lane: not measured there)
@@ -3117,12 +3118,27 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         // 5.7 tok/s, 16 7.6)
         if (const int logical = (int) std::thread::hardware_concurrency(); logical > 0 && cores >= logical)
             threads = logical * 2 / 3;
+        // SMT parts with 8+ cores, one GPU: a decode leaves two cores to the service thread (which computes a pool
+        // share itself), the main thread's launches and waits and the disk readers - a pool on every core had its last
+        // workers share a core with them (one GLM-5.3 expert from DRAM: 16 threads 86-107 us, 14 89-98).  The pool
+        // keeps those cores for a prompt's CPU share (prefill_half widens it: 14 for prompts too cost GLM ~5%).
+        // Ryzen AI Max+ 395 (16 cores) + RTX 5090, iGPU lane off, 4K + 512, interleaved: GLM-5.3 50.5 -> 51.4,
+        // V4 0731 67.8 -> 69.8, V4.1 JA256 56.8 -> 58.5, V4.1 UD-IQ2_XXS 35.4 -> 36.3, Qwen3.8 128.8 -> 130.8 tok/s
+        // (bench/glmspeed/results.md).  STRATA_GLM_CPU_LANE_SPARE=<n> (default 2; 0 = a thread a core, as before)
+        else if (n_parts_ == 1 && cores >= 8) {
+            static const int spare = (int) strata::core::env_num("STRATA_GLM_CPU_LANE_SPARE", 2.0, 0.0, 8.0);
+            lane_spare = threads - std::max(4, cores - spare);
+            threads -= lane_spare;
+        }
         // one GPU: at most one NUMA node's worth, less 4 - a spinning pool on both sockets syncs across them, and the
         // CPUs left free keep the main thread's event wait, the service and warm-up threads off the spinning ones
         // (2-socket Xeon, 88 vCPUs, Q3_K experts: 88 threads 531 us an expert, 44 216 us, 44 with the RAM tier
         // interleaved 152 us - ~85 of the ~105 GB/s this host reads; a pool per socket, tried, did not add to that)
         if (n_parts_ == 1 || shared)
-            if (const int node = numa_node_cpus(); node > 0 && threads > node - 4) threads = node - 4;
+            if (const int node = numa_node_cpus(); node > 0 && threads + lane_spare > node - 4) {
+                lane_spare = std::max(0, node - 4 - threads);
+                threads = std::min(threads, node - 4);
+            }
         if (shared)
             threads = std::min(threads, cores - (n_parts_ - 1));   // a core for each other part's service thread
         else
@@ -3288,7 +3304,14 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
-        F->cpu_pool.reset(new glmfast::Workers(threads - 1, 20000, pin_cpus));
+        // (a node / pin clamp below the spare rule's count: no spare left to keep)
+        if (lane_spare > 0 && !pin_cpus.empty()) lane_spare = 0;
+        F->cpu_pool.reset(new glmfast::Workers(threads - 1 + lane_spare, 20000, pin_cpus));
+        if (lane_spare > 0) {
+            F->cpu_pool->set_active(threads);
+            F->lane_wide = threads + lane_spare;
+            F->lane_narrow = threads;
+        }
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
