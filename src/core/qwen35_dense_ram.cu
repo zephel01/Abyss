@@ -331,7 +331,11 @@ bool Glm5Model::q35d_place(std::string& err) {
     const size_t cap = vram_cap();
     const size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
     size_t room = cap > 0 ? (cap > used ? std::min(cap - used, free_b) : 0) : free_b;
-    const size_t reserve = (size_t) std::max(0.0, std::atof(getenv("STRATA_Q35D_RESERVE_MB") ? getenv("STRATA_Q35D_RESERVE_MB") : "128")) << 20;
+    // (the reserve: 128 MB; 320 with the kernels loaded lazily - a dense pack, generate.cpp - for those a run loads
+    // after this, ~90 MB on an sm_120 build)
+    const char* mlv = getenv("CUDA_MODULE_LOADING");
+    const bool lazy = mlv == nullptr || std::strcmp(mlv, "EAGER") != 0;
+    const size_t reserve = (size_t) std::max(0.0, std::atof(getenv("STRATA_Q35D_RESERVE_MB") ? getenv("STRATA_Q35D_RESERVE_MB") : lazy ? "320" : "128")) << 20;
     room = room > reserve ? room - reserve : 0;
     size_t all = 0, max_layer = 0;
     for (const auto& f : Q->L) {

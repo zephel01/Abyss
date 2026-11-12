@@ -3224,7 +3224,23 @@ int main(int argc, char** argv) {
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
-    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+    // A pack without experts (the dense qwen35: no expert cache; q35d_place leaves STRATA_Q35D_RESERVE_MB for the
+    // kernels a run loads later) keeps the default lazy loading: the eager load of every kernel takes ~350 MB on an
+    // sm_120 build - ~2 more layers' FFN in VRAM on a 12 GB card.
+    bool dense_pack = false;
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--glm-pack") {
+            std::ifstream ix(std::string(argv[i + 1]) + "/index.txt");
+            std::string line;
+            bool any = false, exps = false;
+            while (std::getline(ix, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                any = true;
+                if (line.find("_exps.") != std::string::npos) { exps = true; break; }
+            }
+            dense_pack = any && !exps;
+        }
+    if (std::getenv("CUDA_MODULE_LOADING") == nullptr && !dense_pack) {
 #if defined(_WIN32)
         _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #else
