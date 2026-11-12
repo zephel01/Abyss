@@ -833,6 +833,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_LANE_LEAN` | 4 | CPU レーンがエキスパート 1 個を PCIe のこの倍数速くこなすなら、置き場が落ち着いた時点（上の `:settle` の切り替えを自動で）で RAM 層のエキスパートを全部 CPU に回し、それまでと VRAM のヒット率が落ちたときは測った分担に戻します。`0`: 測った分担だけ。手で書いた分担や plan が優先（[VRAM の小さいカード](SMALL-VRAM.ja.md)） |
 | `STRATA_GLM_POOL_FLOOR` | 4 | エキスパート置き場の最小（層あたりの枠数。予備 + 常駐 1）。これ未満ではエンジンは起動を拒否し、VRAM が何 MB 足りないかを言います。v1.3.82 より前は route 1 本分（8）が床でした。その間の置き場では、route の残りを scratch 枠と CPU レーンでこなします（[VRAM の小さいカード](SMALL-VRAM.ja.md)） |
 | `STRATA_GLM_PREFILL_KEEP` | 4 | 本来の残し（route + 予備 + 2）では prompt の chunk を貸せない置き場で、prompt の間に各層が残す枠数。残りは prompt 経路に貸し、終わった後に埋め直します（[VRAM の小さいカード](SMALL-VRAM.ja.md)） |
+| `STRATA_GLM_PREFILL_SMALL_BELOW` | 4096 | 本来の残しで貸せる prompt の chunk がこのトークン数より短く、小さい残し（`STRATA_GLM_PREFILL_KEEP`）でその 2 倍以上を貸せるときも、小さい残しにします（16 GB の Ornith-1.5-397B 16G64G: chunk 1,024 -> 12,288、4K の prompt が約 3 倍速）。`0` で、本来の残しで chunk を貸せないときだけ（v1.3.136 の動き） |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | prompt のまとめ処理の大きさ: `auto`、トークン数、`0`（1 トークンずつ） |
 | `STRATA_WATCHDOG_S` | 180 | serve の見張り役：この秒数のあいだ進みのないリクエストはエンジンを終了させ、サーバーが起動し直す（`0` でオフ）。長いプロンプトの最中に大きなファイルをコピーすると（メモリの逼迫。ここではネットワーク共有へ 200 GB）、エンジンが 1 か所で数分待たされ、見張り役が止まったと判断することがある。値を上げる（`600`）か、コピーを別の時間にする |
 | `STRATA_GLM_PREFILL_SUB` | auto（NVIDIA）、1024（HIP） | prompt の mixer と dense FFN のサブバッチ（16〜8192）。HIP の既定は v1.3.40 から 1024（以前は 256。AI PRO R9700 で DeepSeek V4 の 8K / 16K の prompt が +8% / +10%、GLM-5.3-Flash が +13% / +15%） |

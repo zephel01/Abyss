@@ -821,7 +821,8 @@ public:
     int* pf_sel_ = nullptr;
     unsigned char* pf_keep_ = nullptr;
     size_t prefill_v41_row() const;   // those two per row, in bytes (0: not deepseek41)
-    bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
+    bool prefill_setup(std::string& err, int per_pool = 0);   // in fast_setup: sizes, host buffers (no device memory);
+                                                           // per_pool > 0: against the pool fast_setup carved
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

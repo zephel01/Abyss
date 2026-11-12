@@ -1320,15 +1320,27 @@ bool Glm5Model::fast_setup(std::string& err) {
         const auto tail_slots = [&](size_t bytes) {
             return (int) ((bytes + stride_sum - 1) / std::max<size_t>(1, stride_sum));
         };
-        if (pf_ != nullptr) {
+        // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main slots
+        // need little more than one route's experts and the spares)
+        const auto fit_tail = [&]() -> bool {
             k_extra = tail_slots(prefill_borrow_bytes());
             // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
             const int keep = prefill_keep();   // (prefill_setup: a route, the spares and 2 - or the small keep, #23)
             const int k_max = per - keep;
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
-            // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
-            // slots need little more than one route's experts and the spares)
-            if (per - k_extra < keep) {
+            return per - k_extra >= keep;
+        };
+        if (pf_ != nullptr && !fit_tail()) {
+            // prefill_setup sized the chunk against its estimate of the pool; the pool came out smaller (a 16 GB card:
+            // Ornith-1.5-397B 16G64G q5all, 15 slots against a keep of 15 - no slot to lend, a 4K prompt 400 s token
+            // by token).  Size it again against the real pool, where the small keep (#23) lends a chunk
+            prefill_destroy();
+            if (!prefill_setup(err, per)) return false;
+            if (pf_ != nullptr && fit_tail())
+                std::fprintf(stderr, "glm prefill: CUDA%d chunk sized again for the pool's %d slots/layer\n", dev_, per);
+        }
+        if (pf_ != nullptr) {
+            if (per - k_extra < prefill_keep()) {
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
                 prefill_destroy();

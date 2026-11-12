@@ -689,7 +689,7 @@ static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool ha
 static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 
 // ---------------------------------------------------------------- setup
-bool Glm5Model::prefill_setup(std::string& err) {
+bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
@@ -882,6 +882,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
+    // (fast_setup's second call: the pool it carved - smaller than this estimate when VRAM went to a drafter, a cap or
+    // the context after the first - so the chunk and the keep are chosen against the slots that are really there)
+    if (per_pool > 0) per = per_pool;
     // what every layer keeps from the prompt: a route's experts, the spares and 2 (fast_setup's floor).  A pool that
     // can lend no chunk at that keeps only the spares and 1 instead (issue #23: an 8 GB RTX A2000 ran Ornith-1.5-122B
     // IQ3_XXS with 9 slots a layer - no chunk against a keep of 13, 16 tok/s token by token.  A prompt runs alone and
@@ -892,6 +895,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->keep = keep_full;
     S->keep_small = std::min<int64_t>(keep_full, gf::kSpares + 1);
     if (const char* v = getenv("STRATA_GLM_PREFILL_KEEP")) S->keep_small = std::max<int64_t>(1, std::atoll(v));
+    // the full keep's chunk below which the small keep is tried too (when it lends one at least twice as long);
+    // STRATA_GLM_PREFILL_SMALL_BELOW=<tokens>, 0: the small keep only when the full one lends no chunk (v1.3.136)
+    int64_t small_below = 4096;
+    if (const char* v = getenv("STRATA_GLM_PREFILL_SMALL_BELOW")) small_below = std::max<int64_t>(0, std::atoll(v));
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;
@@ -976,6 +983,28 @@ bool Glm5Model::prefill_setup(std::string& err) {
                                          "(small VRAM; STRATA_GLM_PREFILL_KEEP)\n", dev_, (long long) per,
                                  (long long) keep_full, (long long) keep);
                 S->small = true;
+            }
+        } else if (is_auto && T > 0 && T < small_below && S->keep_small < keep_full && mb_env == nullptr &&
+                   stride_sum > 0) {
+            // a pool whose full keep lends only a short chunk (Ornith-1.5-397B 16G64G on a 16 GB card: 19 slots a
+            // layer, 4 of them lent - chunks of 1024, 4K prompts 85 tok/s) lends a chunk at least twice as long with
+            // the small keep, for the same reason as above (5632 tokens at 15 GB: 256 tok/s, the decode after it as
+            // fast); a chunk of small_below tokens or more keeps the full keep
+            const size_t lend_full = lendable;
+            lendable = lendable_at(S->keep_small);
+            const int64_t T_small = pick_T();
+            if (T_small >= 2 * T) {
+                if (!S->small)
+                    std::fprintf(stderr, "glm prefill: CUDA%d the expert pool (%lld slots a layer) lends chunks of %lld "
+                                         "tokens while every layer keeps %lld slots - it keeps %lld while a prompt runs, "
+                                         "for chunks of %lld (STRATA_GLM_PREFILL_SMALL_BELOW, STRATA_GLM_PREFILL_KEEP)\n",
+                                 dev_, (long long) per, (long long) T, (long long) keep_full,
+                                 (long long) S->keep_small, (long long) T_small);
+                S->small = true;
+                T = T_small;
+                keep = S->keep_small;
+            } else {
+                lendable = lend_full;
             }
         }
         S->keep = keep;

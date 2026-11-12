@@ -54,6 +54,12 @@ Three things changed in v1.3.82 for a pool of a few slots a layer:
    residents cost it little, and the decode's misses refill the tail after it (1.5 GB, a fraction of a second).
    Estimate for the 2,048-token prompt of issue #23: the experts stream once per chunk per layer (42 GB over PCIe
    Gen4 x8, ~3 s) plus the GPU's own matrix work - about 150-400 tokens/s against 16.
+   Since v1.3.137 the small keep is also taken when the full keep lends only a short chunk (under 4,096 tokens) and
+   the small keep lends one at least twice as long (`STRATA_GLM_PREFILL_SMALL_BELOW`), and the chunk is sized again
+   against the pool the engine really carved when that came out smaller than the first estimate (a drafter or the
+   context took VRAM in between). Ornith-1.5-397B 16G64G on a 16 GB card: 19 slots a layer lent 4 (chunks of 1,024,
+   4K prompts ~70 tokens/s) and now lend 15 (chunks of 12,288, ~210 tokens/s; 8K prompts 65 -> 390); a pool of 15
+   slots that lent nothing (a 4K prompt ~400 s token by token) now prompts at ~250 tokens/s.
 3. **The CPU lane takes every RAM-tier expert when it is much faster than the link.** The split between the CPU lane
    and PCIe is measured at start (`an expert 0.055 ms on the CPU vs 0.282 ms over PCIe` in issue #23) and used to keep
    one expert of 8 on the link. On that box every expert on the CPU was 10% faster (the `--deep` sweep: share 0 at
@@ -178,6 +184,7 @@ be set by hand. The config: `--max-context 8192` (the KV cache is small on this 
 |---|---|---|
 | `STRATA_GLM_POOL_FLOOR` | 4 | the expert pool's smallest size in slots a layer (the spares and one resident); below it the engine refuses to start and says how much VRAM is short. A route's experts (8) were the floor before v1.3.82 |
 | `STRATA_GLM_PREFILL_KEEP` | 4 | slots a layer the pool keeps while a prompt runs on a pool that could lend no chunk at the full keep (a route, the spares and 2). Larger keeps more experts resident through the prompt and gives the prompt a smaller chunk |
+| `STRATA_GLM_PREFILL_SMALL_BELOW` | 4096 | the small keep is also used when the full keep lends a chunk shorter than this many tokens and the small keep lends one at least twice as long. `0`: the small keep only when the full keep lends no chunk (v1.3.136) |
 | `STRATA_GLM_LANE_LEAN` | 4 | when the CPU lane does an expert this many times faster than the PCIe link, every RAM-tier expert goes to the CPU once the pool has settled. `0`: the measured split only, as before v1.3.82. `STRATA_GLM_PCIE_SHARE` / `_LATE` / `STRATA_GLM_CPU_PLAN` set by hand win |
 | `STRATA_GLM_VRAM_GB` | off | behave like a card with this many GB: the expert pool gets what such a card would have (the context, dense weights and state already held count). For trying this page's rules on a bigger card |
 | `STRATA_GLM_RESERVE_MB` | 700 (CUDA, 12 GB or less), 1536 (bigger CUDA cards, HIP) | VRAM left free beside the pool; issue #23 ran with 64 on CUDA, which gained ~0.6 GB of pool |
