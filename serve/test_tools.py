@@ -204,6 +204,21 @@ class DsmlCalls(unittest.TestCase):
         self.assertIn(quoted, out41)                    # a message's own text is never respelled
 
 
+class GenerationTag(unittest.TestCase):
+    def test_laguna_generation_block_renders_its_body(self):
+        # Laguna-S-2.1's template wraps the assistant's turn in transformers' {% generation %} marker
+        src = ("{%- for m in messages -%}{%- if m.role == 'assistant' -%}<assistant>{%- generation -%}{{ m.content }}"
+               "</assistant>{%- endgeneration -%}{%- else -%}<user>{{ m.content }}</user>{%- endif -%}{%- endfor -%}"
+               "{%- if add_generation_prompt -%}<assistant>{%- endif -%}")
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(src, encoding="utf-8")
+            out = ChatTemplate(p).render([{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+                                          {"role": "user", "content": "c"}])
+        self.assertEqual(out, "<user>a</user><assistant>b</assistant><user>c</user><assistant>")
+
+
 class ThinkToken(unittest.TestCase):
     """think_token: the reasoning ends at the special token only - DeepSeek V4.1 wrote `</think>` while explaining a
     chat template, and its reasoning's second half went out as the answer."""

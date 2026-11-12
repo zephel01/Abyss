@@ -23,10 +23,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+import jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 
 # ------------------------------------------------------------------------------------------------ template
+class _GenerationTag(jinja2.ext.Extension):
+    """{% generation %} ... {% endgeneration %} (transformers' marker of the assistant's tokens for training masks, in
+    Laguna-S-2.1's template): rendered as its body, as apply_chat_template does without return_assistant_tokens_mask."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.Scope(body, lineno=lineno)
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
@@ -37,7 +49,7 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationTag])
         env.filters["tojson"] = tojson
         env.filters["from_json"] = json.loads           # DeepSeek V4's template parses tool-call arguments
         env.globals["raise_exception"] = raise_exception
