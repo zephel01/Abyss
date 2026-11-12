@@ -7334,7 +7334,9 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, FT->cs)) {
+    if (tail->q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
+        if (!tail->q35d_head(FT->head_xq, 1, tail->sc_ + tail->sc_logits, FT->cs, err)) return false;
+    } else if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
@@ -8433,7 +8435,9 @@ bool Glm5Model::part_token_head(int64_t p, std::string& err) {
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, FT->cs)) {
+    if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
+        if (!q35d_head(FT->head_xq, 1, sc_ + sc_logits, FT->cs, err)) return false;
+    } else if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }

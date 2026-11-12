@@ -18,6 +18,7 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/cpu/lane_q81.hpp"
+#include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "ggml.h"
@@ -41,6 +42,7 @@ namespace strata::core {
 
 namespace kc = strata::kernels::cpu;
 namespace q35 = strata::kernels::q35;
+namespace gf = strata::kernels::glmf;
 
 namespace {
 size_t al256(size_t b) { return (b + 255u) & ~(size_t) 255u; }
@@ -116,6 +118,15 @@ struct Glm5Model::Q35dRam {
         }
     };
     std::vector<Ffn> L;
+    // the head: its own allocation from load_pack; vg < n_vocab: rows [vg, n_vocab) on the CPU (host)
+    struct Head {
+        const uint8_t* src = nullptr;
+        size_t bytes = 0, row = 0;
+        int type = 0, vg = -1;
+        void* dev = nullptr;
+        std::vector<uint8_t> host;
+    } head;
+    int n_vocab = 0;
     bool placed = false;
     void* dev = nullptr;          // the VRAM layers' FFN
     void* pinned = nullptr;       // the RAM layers' FFN
@@ -150,6 +161,8 @@ struct Glm5Model::Q35dRam {
     static constexpr int kCols = 8;   // the widest window the service takes (kVerifyMax)
     void serve();
     void compute(int il, int nt);
+    void compute_head(int nt);
+    static constexpr int kHeadReq = -2;   // (a request's layer: the head's CPU rows)
 };
 
 bool Glm5Model::q35d_defer_on() const {
@@ -171,6 +184,49 @@ void Glm5Model::q35d_defer(int il, int role, const uint8_t* src, size_t bytes, i
     f.bytes[role] = bytes;
     f.type[role] = type;
     f.row[role] = role == 2 ? bytes / (size_t) g_.n_embd : bytes / (size_t) g_.n_ff_dense;
+}
+
+void Glm5Model::q35d_head_set(const uint8_t* src, size_t bytes, int type, void* dev) {
+    if (q35d_ == nullptr) {
+        q35d_ = new Q35dRam();
+        q35d_->L.resize((size_t) g_.n_layers);
+        q35d_->n_embd = g_.n_embd;
+        q35d_->n_ff = g_.n_ff_dense;
+    }
+    auto& H = q35d_->head;
+    H.src = src;
+    H.bytes = bytes;
+    H.type = type;
+    H.dev = dev;
+    H.row = bytes / (size_t) g_.n_vocab;
+    H.vg = g_.n_vocab;
+    q35d_->n_vocab = g_.n_vocab;
+}
+
+bool Glm5Model::q35d_head_split() const {
+    return q35d_ != nullptr && q35d_->head.vg >= 0 && q35d_->head.vg < g_.n_vocab;
+}
+
+bool Glm5Model::q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err) {
+    if (!q35d_head_split()) return false;
+    Q35dRam* Q = q35d_;
+    const auto& H = Q->head;
+    const int E = g_.n_embd, V = g_.n_vocab;
+    if (Q->req_d == nullptr || T < 1 || T > Q35dRam::kCols) {
+        err = "qwen35 dense: the head's CPU rows without the CPU service";
+        return false;
+    }
+    const size_t q8e = (size_t) E / 32 * 36;
+    ++Q->seq;
+    if (Q->seq == 0) ++Q->seq;
+    q35::dffn_post(xq, (size_t) T * q8e, Q->req_d, Q->seq, Q35dRam::kHeadReq, T, s);
+    for (int t = 0; H.vg > 0 && t < T; ++t) {   // (the GPU's rows while the CPU computes its own)
+        gf::MvJob o = {H.dev, (const uint8_t*) xq + (size_t) t * q8e, nullptr, logits + (size_t) t * V, nullptr, 1.0f,
+                       H.type, E, H.vg};
+        if (!gf::mv(&o, 1, s)) { err = "qwen35 dense: the head's VRAM rows"; return false; }
+    }
+    q35::dffn_wait_cols(Q->ans_d, Q->seq, logits + H.vg, V - H.vg, T, (size_t) V, s);
+    return true;
 }
 
 int Glm5Model::q35d_gpu_rows(int il) const {
@@ -225,7 +281,7 @@ size_t Glm5Model::q35d_pending() const {
     if (q35d_ == nullptr || q35d_->placed) return 0;
     size_t b = 0;
     for (const auto& f : q35d_->L) b += f.total();
-    return b;
+    return b;   // (the head is in VRAM already: q35d_place may only give some of it back)
 }
 
 // the CPU side of a request: the columns' x (the device's q8_1 blocks) -> gate / up rows and the SwiGLU (the pool,
@@ -273,6 +329,26 @@ void Glm5Model::Q35dRam::compute(int il, int nt) {
     ms_dn += std::chrono::duration<double, std::milli>(t3 - t2).count();
 }
 
+// the head's CPU rows [vg, n_vocab) for nt columns into the answer (nt rows of n_vocab - vg floats)
+void Glm5Model::Q35dRam::compute_head(int nt) {
+    const int E = n_embd, VC = n_vocab - head.vg;
+    const size_t q8e = (size_t) E / 32 * 36, ab = kc::lane_q81_act_bytes(E);
+    const uint8_t* xq = (const uint8_t*) req_h + 64;
+    for (int t = 0; t < nt; ++t) kc::lane_q81_from_blocks(xq + (size_t) t * q8e, E, act.data() + (size_t) t * ab);
+    const void* a[kCols];
+    float* o[kCols];
+    float* ans = (float*) ((uint8_t*) ans_h + 64);
+    for (int t = 0; t < nt; ++t) {
+        a[t] = act.data() + (size_t) t * ab;
+        o[t] = ans + (size_t) t * VC;
+    }
+    const int jobs = std::max(1, pool->active() * 4);
+    pool->run(jobs, [&](int j) {
+        const int r0 = (int) ((int64_t) VC * j / jobs), r1 = (int) ((int64_t) VC * (j + 1) / jobs);
+        kc::lane_q81_rows(head.type, head.host.data(), head.row, E, a, nt, o, r0, r1);
+    });
+}
+
 void Glm5Model::Q35dRam::serve() {
     volatile unsigned int* rq = (volatile unsigned int*) req_h;
     std::atomic<unsigned int>* aseq = (std::atomic<unsigned int>*) ans_h;
@@ -292,6 +368,7 @@ void Glm5Model::Q35dRam::serve() {
         const int il = (int) rq[1], nt = (int) rq[2];
         const auto t0 = std::chrono::steady_clock::now();
         if (il >= 0 && il < (int) L.size() && L[(size_t) il].ram && nt >= 1 && nt <= kCols) compute(il, nt);
+        else if (il == kHeadReq && head.vg >= 0 && head.vg < n_vocab && nt >= 1 && nt <= kCols) compute_head(nt);
         std::atomic_thread_fence(std::memory_order_release);
         aseq->store(s, std::memory_order_release);
         last = s;
@@ -347,6 +424,48 @@ bool Glm5Model::q35d_place(std::string& err) {
     if (const char* v = getenv("STRATA_Q35D_GPU_LAYERS")) gpu_cap = std::max(0, std::min(NL, std::atoi(v)));
     const char* rv = getenv("STRATA_Q35D_RAM");
     const bool ram_ok = rv == nullptr || std::atoi(rv) != 0;
+    // the head: a card that leaves less room than the prompt path's staging buffers with every FFN in RAM keeps only
+    // the head's first rows in VRAM (multiples of 256; STRATA_Q35D_HEAD_ROWS=<n>: n, tests) and the CPU computes the
+    // rest - its bytes the prompt path's staging needs (an 8 GB card: 8K context)
+    auto& H = Q->head;
+    if (H.dev != nullptr && H.vg == g.n_vocab) {
+        const size_t stage_need = pf_ != nullptr ? 2 * al256(max_layer) : 0;
+        int vg = g.n_vocab;
+        // (left: the room before the reserve's clamp - negative on a card this process is past already)
+        const int64_t left = (cap > 0 ? std::min<int64_t>((int64_t) cap - (int64_t) used, (int64_t) free_b) : (int64_t) free_b) -
+                             (int64_t) reserve;
+        if (const char* v = getenv("STRATA_Q35D_HEAD_ROWS")) {
+            vg = std::max(0, std::min(g.n_vocab, std::atoi(v) / 256 * 256));
+        } else if (ram_ok && left < (int64_t) stage_need) {
+            const size_t give = (size_t) ((int64_t) stage_need - left);   // (left: the room before the reserve's clamp)
+            const int64_t rows = ((int64_t) ((give + H.row - 1) / H.row) + 255) / 256 * 256;
+            vg = (int) std::max<int64_t>(0, (int64_t) g.n_vocab - rows);
+        }
+        if (vg < g.n_vocab) {
+            if (!kc::lane_q81_type(H.type)) {
+                err = "qwen35 dense: the head's type " + std::to_string(H.type) + " has no CPU rows (it does not fit in VRAM)";
+                return false;
+            }
+            cudaFree(H.dev);
+            H.dev = nullptr;
+            if (vg > 0) {
+                if (cudaMalloc(&H.dev, (size_t) vg * H.row) != cudaSuccess) {
+                    cudaGetLastError();
+                    err = "qwen35 dense: the head's VRAM rows did not allocate";
+                    return false;
+                }
+                if (!glmfast::cuda_ok(cudaMemcpy(H.dev, H.src, (size_t) vg * H.row, cudaMemcpyHostToDevice),
+                                      "qwen35 dense: the head's upload", err))
+                    return false;
+            }
+            const size_t VC = (size_t) (g.n_vocab - vg);
+            H.host.resize(VC * H.row);
+            std::memcpy(H.host.data(), H.src + (size_t) vg * H.row, VC * H.row);
+            H.vg = vg;
+            ws_map_["output.weight"].q = H.dev;   // (the callers go through q35d_head)
+            room = (size_t) std::max<int64_t>(0, left + (int64_t) ((size_t) (g.n_vocab - vg) * H.row));
+        }
+    }
     // STRATA_Q35D_SPLIT=0: whole layers' FFN on the CPU (the A/B); else the CPU takes the last rows of n layers' FFN
     const char* sv = getenv("STRATA_Q35D_SPLIT");
     const bool split = sv == nullptr || std::atoi(sv) != 0;
@@ -473,6 +592,7 @@ bool Glm5Model::q35d_place(std::string& err) {
     }
     const int m = (int) Q->ram_layers.size();
     // RAM: what the pinned copy takes must leave the host its headroom (STRATA_GLM_RAM_HEADROOM_GB, 6)
+    if (q35d_head_split()) ram_b += H.host.size();   // (the RAM check: the head's CPU rows)
     if (ram_b > 0) {
         const double head = std::atof(getenv("STRATA_GLM_RAM_HEADROOM_GB") ? getenv("STRATA_GLM_RAM_HEADROOM_GB") : "6");
         const int64_t av = ram_available();
@@ -530,8 +650,9 @@ bool Glm5Model::q35d_place(std::string& err) {
             }
         }
     }
-    if (ram_b > 0) {
-        if (cudaHostAlloc(&Q->pinned, ram_b, cudaHostAllocPortable) != cudaSuccess) {
+    if (q35d_head_split()) ram_b -= H.host.size();
+    if (ram_b > 0 || q35d_head_split()) {
+        if (ram_b > 0 && cudaHostAlloc(&Q->pinned, ram_b, cudaHostAllocPortable) != cudaSuccess) {
             cudaGetLastError();
             err = "qwen35 dense: " + std::to_string(ram_b >> 20) + " MB of pinned RAM for the FFN did not allocate";
             return false;
@@ -590,7 +711,8 @@ bool Glm5Model::q35d_place(std::string& err) {
         // the service: request / answer mapped, the pool, its thread
         const size_t q8e = (size_t) g.n_embd / 32 * 36;
         if (cudaHostAlloc(&Q->req_h, 64 + Q35dRam::kCols * q8e, cudaHostAllocMapped) != cudaSuccess ||
-            cudaHostAlloc(&Q->ans_h, 64 + (size_t) Q35dRam::kCols * g.n_embd * sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostAlloc(&Q->ans_h, 64 + (size_t) Q35dRam::kCols * std::max(g.n_embd, g.n_vocab - std::max(0, H.vg)) * sizeof(float),
+                          cudaHostAllocMapped) != cudaSuccess ||
             cudaHostGetDevicePointer(&Q->req_d, Q->req_h, 0) != cudaSuccess ||
             cudaHostGetDevicePointer(&Q->ans_d, Q->ans_h, 0) != cudaSuccess) {
             err = "qwen35 dense: the CPU FFN's mapped buffers did not allocate";
@@ -639,6 +761,9 @@ bool Glm5Model::q35d_place(std::string& err) {
         }
     }
     Q->placed = true;
+    if (q35d_head_split())
+        std::fprintf(stderr, "glm fast: CUDA%d dense qwen35: the head's first %d of %d rows in VRAM, the other %d (%.2f GB) on "
+                             "the CPU\n", dev_, H.vg, g.n_vocab, g.n_vocab - H.vg, (double) H.host.size() / G);
     cudaMemGetInfo(&free_b, &total_b);
     if (getenv("STRATA_GLM_TIMING") != nullptr)
         std::fprintf(stderr, "glm fast: CUDA%d dense qwen35 placement: %.2f GB in use before it (the verify window %.2f "
@@ -777,6 +902,7 @@ void Glm5Model::q35d_destroy() {
     if (Q->ans_h) cudaFreeHost(Q->ans_h);
     if (Q->pinned) cudaFreeHost(Q->pinned);
     if (Q->dev) cudaFree(Q->dev);
+    if (Q->head.dev) cudaFree(Q->head.dev);
     delete Q;
     q35d_ = nullptr;
 }

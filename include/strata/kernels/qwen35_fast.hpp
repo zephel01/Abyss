@@ -179,5 +179,7 @@ void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_s
 /// seq is `seq`, then its first n floats into out.
 void dffn_post(const void* xq, size_t bytes, void* req, unsigned int seq, int layer, int nt, cudaStream_t s);
 void dffn_wait(const void* ans, unsigned int seq, float* out, int n, cudaStream_t s, bool add = false);
+// ... the answer as cols rows of n floats into out's rows ld floats apart (the split head's CPU rows)
+void dffn_wait_cols(const void* ans, unsigned int seq, float* out, int n, int cols, size_t ld, cudaStream_t s);
 
 }  // namespace strata::kernels::q35

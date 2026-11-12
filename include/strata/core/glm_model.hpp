@@ -875,6 +875,13 @@ public:
     bool q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err);
     void q35d_unstage(int il, cudaStream_t s);
     void q35d_destroy();
+    // the head: load_pack gives it its own allocation (q35d_head_set); a card that even every FFN in RAM leaves too
+    // little room keeps only its first rows in VRAM and the CPU computes the rest (q35d_place) - q35d_head then runs
+    // T columns of q8_1 x (xq, contiguous) into logits (T x n_vocab floats) on s; false with err empty: not split (the
+    // caller's own launches)
+    void q35d_head_set(const uint8_t* src, size_t bytes, int type, void* dev);
+    bool q35d_head_split() const;
+    bool q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err);
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

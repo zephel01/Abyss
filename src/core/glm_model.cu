@@ -3352,6 +3352,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         const std::string t = n.substr(n.find('.', 4) + 1);
         return t == "ffn_gate.weight" ? 0 : t == "ffn_up.weight" ? 1 : t == "ffn_down.weight" ? 2 : -1;
     };
+    // ... and its head in an allocation of its own (q35d_place may keep only its first rows in VRAM)
+    const auto q35d_head_row = [&](const std::string& n) {
+        return q35d_on && n == "output.weight" && row_kind_[n] == "0";
+    };
     const bool glm5_q8 = !g_.dsv4() && !g_.qwen35();   // (dense_q8_row: glm5 only)
     uint64_t bytes = 0;
     std::map<std::string, uint64_t> by_kind;   // STRATA_GLM_TIMING: the dense weights' VRAM by kind and storage
@@ -3389,7 +3393,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             err = "pack: tensor " + r.name + " is in index.txt but in no shard";
             return false;
         }
-        if (skip_upload(r) || q35d_role(r.name) >= 0) continue;
+        if (skip_upload(r) || q35d_role(r.name) >= 0 || q35d_head_row(r.name)) continue;
         std::string how;
         const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how, glm5_q8);
         bytes += b;
@@ -3473,6 +3477,23 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) src, (int64_t) ti->shape[0],
                                                   (int64_t) native_rows(ti)};
             q35d_defer(std::atoi(r.name.c_str() + 4), role, src, nbytes, (int) ti->type);
+            continue;
+        }
+        if (q35d_head_row(r.name)) {
+            const int si = find_shard_of(r.name);
+            const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;
+            if (ti == nullptr) {
+                err = "pack: native tensor " + r.name + " not found in any shard";
+                return false;
+            }
+            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0], native_rows(ti));
+            const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
+            void* d = nullptr;
+            { cudaError_t e_ = cudaMalloc(&d, nbytes); if (e_ != cudaSuccess) { err = std::string("pack: the head: ") + cudaGetErrorString(e_); return false; } }
+            { cudaError_t e_ = cudaMemcpy(d, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) d, (int64_t) ti->shape[0],
+                                                  (int64_t) native_rows(ti)};
+            q35d_head_set(src, nbytes, (int) ti->type, d);
             continue;
         }
         if (skip_upload(r)) {

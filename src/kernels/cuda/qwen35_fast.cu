@@ -2234,6 +2234,27 @@ __global__ void __launch_bounds__(256) dffn_wait_kernel(const unsigned int* ans,
         out[e] = add ? out[e] + v : v;   // (add: the GPU's part of a split layer, then the CPU's)
     }
 }
+__global__ void __launch_bounds__(256) dffn_wait_cols_kernel(const unsigned int* ans, unsigned int seq,
+                                                             float* __restrict__ out, int n, int cols, size_t ld) {
+    if (threadIdx.x == 0) {
+        const long long t0 = clock64();
+        while (((volatile const unsigned int*) ans)[0] != seq) {
+            if (clock64() - t0 > (1ll << 36)) break;
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    const float* src = (const float*) (ans + 16);
+    const size_t all = (size_t) n * cols;
+    for (size_t e = (size_t) blockIdx.x * blockDim.x + threadIdx.x; e < all; e += (size_t) gridDim.x * blockDim.x) {
+#if defined(__HIPCC__)
+        const float v = ((volatile const float*) src)[e];
+#else
+        const float v = __ldcv(src + e);
+#endif
+        out[(e / (size_t) n) * ld + e % (size_t) n] = v;
+    }
+}
 }  // namespace
 
 bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int inject_type) {
@@ -2848,6 +2869,11 @@ void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, floa
 void dffn_post(const void* xq, size_t bytes, void* req, unsigned int seq, int layer, int nt, cudaStream_t s) {
     dffn_post_kernel<<<1, 512, 0, s>>>((const uint4*) xq, bytes / 16, (unsigned int*) req, seq, layer, nt);
     check("dffn_post");
+}
+void dffn_wait_cols(const void* ans, unsigned int seq, float* out, int n, int cols, size_t ld, cudaStream_t s) {
+    const int blocks = std::max(1, std::min(64, (int) (((size_t) n * cols + 1023) / 1024)));
+    dffn_wait_cols_kernel<<<blocks, 256, 0, s>>>((const unsigned int*) ans, seq, out, n, cols, ld);
+    check("dffn_wait_cols");
 }
 void dffn_wait(const void* ans, unsigned int seq, float* out, int n, cudaStream_t s, bool add) {
     const int blocks = std::max(1, std::min(32, (n + 1023) / 1024));
