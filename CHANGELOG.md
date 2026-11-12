@@ -7,6 +7,11 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.141 - 2026-11-13
+
+- Windows: v1.3.140 did not compile (Laguna's YaRN used `M_PI`, which MSVC's `<cmath>` lacks without
+  `_USE_MATH_DEFINES`); pi is spelled out as in the V4 kernels. The same value: outputs unchanged.
+
 ## v1.3.140 - 2026-11-13
 
 - Laguna-S-2.1 (poolside, llama.cpp's `laguna`: 118B parameters, ~8B active a token, 48 attention layers with a

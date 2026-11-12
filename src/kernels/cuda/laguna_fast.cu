@@ -179,7 +179,7 @@ void rope_freqs(int n_rot, double base, double freq_scale, int orig_ctx, double 
     const bool yarn = freq_scale != 1.0;
     // ggml_rope_yarn_corr_dims, in float as there (the floor / ceil decide which pairs ramp)
     const auto corr = [&](float beta) {
-        return (float) n_rot * logf((float) orig_ctx / (beta * 2.0f * (float) M_PI)) / (2.0f * logf((float) base));
+        return (float) n_rot * logf((float) orig_ctx / (beta * 2.0f * 3.14159265358979323846f)) / (2.0f * logf((float) base));
     };
     const float low = std::max(0.0f, floorf(corr((float) beta_fast)));
     const float high = std::min((float) (n_rot - 1), ceilf(corr((float) beta_slow)));
