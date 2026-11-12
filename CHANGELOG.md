@@ -7,6 +7,32 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.140 - 2026-11-13
+
+- Laguna-S-2.1 (poolside, llama.cpp's `laguna`: 118B parameters, ~8B active a token, 48 attention layers with a
+  512-token sliding window on three of four, 256 experts / 10 routed plus a shared expert, layer 0 dense) runs on the
+  engine: token path, prompt path, RAM tier and CPU lane as for the other qwen35moe models. `setup --model laguna`
+  installs [unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Laguna-S-2.1-GGUF) (58 GB). KL against llama.cpp
+  0.0238 (token path) / 0.0192 (prompt path) over 3,071 positions of English, Japanese and code - llama.cpp's own CPU
+  backend differs from its CUDA one by 0.0243 on the same tokens, so both sit at the router's near-tie floor. RTX 5090
+  capped at 16 / 24 / 32 GB, no iGPU, 4K prompt + 512 tokens: decode 36.3 / 41.4 / 47.4 tok/s against llama.cpp's
+  32.0 / 38.1 / 43.2, prompts 842 / 975 / 1,144 tok/s against 318 / 391 / 470. No drafter (the GGUF has no NextN
+  block). The server renders transformers' `{% generation %}` tag of the chat template. [docs/laguna](docs/laguna/README.md).
+- Qwen3.8-27B on 12 and 16 GB GPUs (v1.3.138 needed 24 GB): the FFN rows that do not fit stay in pinned RAM and the
+  CPU computes them while the GPU computes its rows (attention, DeltaNet and their state stay on the GPU; only the
+  hidden state crosses PCIe), and between prompts the prompt path's idle buffers hold whole layers' FFN, which are
+  given back when a prompt starts. RTX 5090 capped, 4K prompt + 512 tokens, median of 3: 16 GB decode 65-68 tok/s with
+  the NextN drafter, 42.2 without (llama.cpp 38.4), prompt 1,710 tok/s; 12 GB 26.9 / 13.6 (llama.cpp 13.9), prompt
+  1,440. KL against llama.cpp unchanged (0.0024 token path, 0.0020 prompt path). `setup --model qwen38-27b` now writes
+  the context the GPU holds with the FFN partly in RAM, needs 32 GB of RAM for it, and stops under 12 GB of VRAM; 8 GB
+  does not fit. `STRATA_Q35D_SPLIT=0` keeps whole layers on the CPU instead of rows (an A/B).
+- Prompts (#43): `STRATA_GLM_PREFILL_PROF=1` prints a line of stage timings (a token's GPU stages, the host's waits on
+  the disk) after every prompt; `--bench` picks it up in its report. Opt-in `STRATA_GLM_Q35_PROJ_MMQ=1` runs
+  qwen35moe's mixer projections through MMQ on the quantized weights instead of hipBLAS / cuBLAS; the outputs differ
+  from the default from a few tokens on (another summation order), so it is not the default.
+- Every other model's output is unchanged: md5-identical greedy output under `STRATA_DETERMINISTIC=1` on Ornith-122B
+  24G64G, Ornith-35B 16 GB, Qwen3.8-Flash-Next, GLM-5.3-Flash and V4 0731; Qwen3.8-27B in VRAM as in v1.3.138.
+
 ## v1.3.139 - 2026-11-12
 
 - Windows + AMD (#43): `--bench`, `--check` and the setup screen named the GPU from Windows' display-adapter

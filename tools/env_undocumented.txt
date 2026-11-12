@@ -128,7 +128,6 @@ STRATA_GLM_PREFILL_LIGHT_LAYER  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_MB  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_MIN  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_PRED_T  # src/core/glm_prefill.cu
-STRATA_GLM_PREFILL_PROF  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_SERIAL  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_SH_LATE  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_TAIL_SKIP  # src/core/glm_prefill.cu
@@ -255,13 +254,11 @@ STRATA_VERIFY_DEBUG  # src/core/verify.cpp
 STRATA_VERIFY_DEVICE_PLAN  # src/core/verify.cpp
 STRATA_VERIFY_NODES  # src/core/verify.cpp
 STRATA_VERIFY_PROFILE  # src/core/verify.cpp
-STRATA_GLM_Q35_PROJ_MMQ  # src/core/glm_prefill.cu (opt-in A/B: mixer projections by MMQ)
 STRATA_Q35D_GPU_LAYERS  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_LOAN  # src/core/glm_prefill.cu
 STRATA_Q35D_PIN  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_RAM  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_RESERVE_MB  # src/core/qwen35_dense_ram.cu
-STRATA_Q35D_SPLIT  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_SPLIT_MIN  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_SPLIT_N  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_THREADS  # src/core/qwen35_dense_ram.cu

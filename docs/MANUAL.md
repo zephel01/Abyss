@@ -74,9 +74,10 @@ NextN block in its second shard):
 ./setup-deepseek.sh --model qwen35 --download-model     # Qwen3.5-122B-A10B-IQ3_XXS-16G64G
 ```
 
-Qwen3.8-27B, a dense model, from unsloth's UD-Q4_K_XL (17.7 GB, v1.3.138): this first version runs the whole file in one
-GPU's VRAM, so it needs a GPU with 24 GB or more. The setup stops on a smaller one before downloading anything, and writes
-the context the GPU holds (24 GB: 32K, 32 GB: 128K; [Qwen3.8-27B](#qwen38-27b-dense)):
+Qwen3.8-27B, a dense model, from unsloth's UD-Q4_K_XL (17.7 GB, v1.3.138): a GPU with 24 GB or more holds the whole file;
+from v1.3.140 a 12-20 GB GPU runs it too, with the FFN rows that do not fit in pinned RAM (32 GB of RAM needed). The setup
+stops on a GPU under 12 GB before downloading anything, and writes the context the GPU holds (24 GB: 32K, 32 GB: 128K;
+[Qwen3.8-27B](#qwen38-27b-dense)):
 
 ```sh
 ./setup-deepseek.sh --model qwen38-27b --download-model   # Qwen3.8-27B-UD-Q4_K_XL (17.7 GB)
@@ -733,18 +734,34 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
 `./setup-deepseek.sh --model qwen38-27b` installs unsloth's UD-Q4_K_XL and makes the pack (`tools/iq_pack.py --gguf
 <file> --out <dir>/pack`, every tensor as stored).
 
-- **Memory.** This version keeps the whole file in VRAM (no RAM tier, one GPU). With the NextN drafter, F16 KV and a 4K
+- **Memory.** On a 24 GB+ GPU the whole file is in VRAM (one GPU). With the NextN drafter, F16 KV and a 4K
   prompt the engine takes 19.0 GB at an 8K context, 20.7 GB at 32K, 22.8 GB at 64K and ~27.7 GB at 128K (RTX 5090
   with VRAM held back). The setup writes 32K on a 24 GB card (64K ran with nothing else on the card), 128K on a 32 GB
   one, and stops on a GPU under ~21 GB. With less VRAM free the prompt path takes a smaller buffer (24 GB free, 32K
   and 64K: a 4K prompt still at ~2,500 tok/s, decode 130 tok/s); when even that does not fit, the engine stops at the
   start or at the first prompt ("did not allocate"). `--kv int8` halves the attention cache.
+- **12-20 GB GPUs (v1.3.140).** Every layer keeps its first FFN rows in VRAM and the rest in pinned RAM; in decode and the
+  verify window the GPU computes its rows while the CPU computes the others (the hidden state is the only thing that
+  crosses PCIe), and the CPU's answer is added. Between prompts the prompt path's idle buffers hold whole layers' FFN
+  (1-1.6 GB), given back at the start of a prompt. The setup needs 32 GB of RAM for it, writes the context the GPU holds,
+  and stops under 12 GB of VRAM; 8 GB does not fit (the non-FFN part alone is ~8.3 GB with caches). RTX 5090 capped,
+  4K prompt + 512 tokens, median of 3: 16 GB decode 65-68 tok/s with the NextN drafter, 42.2 without (llama.cpp 38.4),
+  prompt 1,710 tok/s; 12 GB 26.9 / 13.6 (llama.cpp 13.9), prompt 1,440; KL against llama.cpp unchanged (0.0024 / 0.0020).
+  `STRATA_Q35D_SPLIT=0`: whole layers on the CPU instead of rows (the A/B; 16 GB no drafter 22.2 against 42.2).
 - **Quality.** The same token ids as llama.cpp; KL against llama.cpp 0.0025 (one token at a time) and 0.0019 (the
   prompt path) over 3,071 positions of English, Japanese and code; the first 212 greedy tokens of a 4K chat equal
   llama.cpp's.
 - **Speed.** RTX 5090, 4K prompt + 512 tokens, median of 3: decode 131.6 tok/s with the NextN drafter (82% of drafts
   accepted), 72.7 without; llama.cpp 72.1. Prompts 2,538 tok/s (llama.cpp 3,463).
-- **Not yet:** the RAM tier (for GPUs under 24 GB), a layer split, AMD (it compiles; untested), images.
+- **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images.
+
+## Laguna-S-2.1
+
+From v1.3.140 the engine runs poolside's [Laguna-S-2.1](https://huggingface.co/unsloth/Laguna-S-2.1-GGUF) (`laguna`, a
+118B MoE, ~8B active a token) on the qwen35moe layer path: `./setup-deepseek.sh --model laguna --download-model` installs
+unsloth's UD-IQ4_XS (58 GB). RTX 5090 capped at 16 / 24 / 32 GB: decode 36.3 / 41.4 / 47.4 tok/s (llama.cpp 32.0 / 38.1 /
+43.2), prompts 842 / 975 / 1,144 (318 / 391 / 470); KL against llama.cpp 0.024, the same as its own CPU against CUDA. No
+drafter. Details: [docs/laguna](laguna/README.md).
 
 ## EXL3 quants (GLM-5.3-Flash)
 
@@ -993,6 +1010,9 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_Q35_ATTN` | 0 | `1`: Ornith (qwen35moe) decode / verify-window attention on the older kernels (v1.3.64). 0: the split kernel (v1.3.65) - 8 keys summed in one shuffle tree, a softmax a 32-key tile, K / V through shared memory: 115K positions 1.09 -> 0.57 ms a layer a token, a 3-row window 3.29 -> 1.39. `STRATA_Q35_ATTN_PW` (query-head pairs a warp, 2) and `STRATA_Q35_ATTN_CHUNK` / `_CHUNK_MIN` (keys a block; default ~1/128 of the context, at least 64) are for tuning |
 | `STRATA_Q35_PATTN` | 0 | `1`: Ornith (qwen35moe) prompts' attention on the older FP32 kernel (v1.3.66). 0: tensor cores (rocWMMA / CUDA WMMA, FP16 operands, FP32 sums; v1.3.67) - a 1,024-token sub-batch at 114K positions 918 -> 156 ms a layer; a 115K prompt 685 -> 154 s; KL 0.0054 against the FP32 kernel after a 24K context (two FP32 runs: 0.0064) |
 | `STRATA_Q35D_MMQ` | on | Qwen3.8-27B (dense qwen35) prompts: the dense FFN's products through MMQ on the quantized weights (FFN 1,187 -> 563 ms for a 4K prompt). `0`: dequantize to FP16 + cuBLAS. `STRATA_Q35D_MMQ_ROWS` (tokens a pass, 2048: ~330 MB) is for tuning |
+| `STRATA_Q35D_SPLIT` | on | Qwen3.8-27B on a GPU under ~24 GB (v1.3.140): every layer keeps its first FFN rows in VRAM and the GPU and the CPU compute their rows in parallel. `0`: whole layers on the CPU instead (an A/B: 16 GB without the drafter 22.2 against 42.2 tok/s) |
+| `STRATA_GLM_PREFILL_PROF` | off | `1`: after every prompt a `glm prefill: N tokens so far, GPU stages X ms a token ... | host waits on disk .., plan .. ms a token` line goes to the log (stage timings of the prompt path); `--bench` puts it in its report (#43) |
+| `STRATA_GLM_Q35_PROJ_MMQ` | off | `1`: qwen35moe (Ornith, Qwen3.5-122B, Ornith-35B, Laguna) prompts' mixer projections (GDN qkv / z / ssm_out, attention q / k / v / out) go through MMQ on the quantized weights instead of dequantize + hipBLAS / cuBLAS (18 MB buffer; on an RTX 5090 0.076 -> 0.057 ms a token). Another summation order: the output differs from the default from a few tokens on, so it is not on by default |
 | `STRATA_GLM_MMQ_GLU` | on | the prompt path's expert gate/up product writes the SwiGLU itself (NVIDIA Turing and newer); `0`: the separate SwiGLU kernel, bit-identical to older builds |
 | `STRATA_GLM_CPU_MT` | on | CPU experts shared by several tokens (prompts, verify windows) decode each weight row once for all of them, bit-identical to ggml's dot (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers where `STRATA_GLM_CPU_1T` says, v1.3.41); `0` off |
 | `STRATA_GLM_CPU_1T` | on | cheaper one-token rows on the CPU lane, bit-identical to ggml's dot: on an AVX-512 CPU with VNNI and VBMI (Zen 4 / Ice Lake and later) IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers (v1.3.41; a Ryzen AI Max+ 395's 16 threads, a DeepSeek V4 expert 109 -> 90 us, decode without the iGPU lane +3-9%; `STRATA_NO_IQ512_VBMI=1` only these off), else IQ3_S / IQ3_XXS in AVX2; `0` off |

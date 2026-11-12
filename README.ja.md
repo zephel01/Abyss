@@ -61,9 +61,13 @@ Hugging Face で公開している自作の GGUF です。PC の大きさごと�
 RTX 5090 を 8 / 12 / 16 GB に制限し、4K のプロンプト + 512 トークンで、生成 156 / 209 / 262 tok/s（llama.cpp は同じ VRAM で `--n-cpu-moe` を一番よくして 106 / 133 / 173）、
 プロンプト 2,202 / 3,118 / 3,685 tok/s（llama.cpp は `-ub 4096` で 1,638 / 2,168 / 3,197）。ファイル全体が入る GPU（24 GB 以上）では llama.cpp のほうが速いです。
 
-dense モデルをファイルごと VRAM に載せて動かす（v1.3.138、最初の版）：**Qwen3.8-27B**（[unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)、17.7 GB、`--model qwen38-27b`）。GPU 24 GB 以上向けです
-（24 GB で文脈 32K、32 GB で 128K。それより小さい GPU にはまだ対応していません）。RTX 5090、4K のプロンプト + 512 トークンで、生成は NextN 下書きありで 131.6 tok/s
-（llama.cpp 72.1、下書きなしの Abyss 72.7）、プロンプト 2,538 tok/s（llama.cpp 3,463）。
+dense モデル：**Qwen3.8-27B**（[unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)、17.7 GB、`--model qwen38-27b`）。GPU 12〜32 GB + RAM 32 GB 向けです
+（v1.3.138 はファイルごと VRAM に載せる版。v1.3.140 から、約 24 GB 未満の GPU では入らない FFN の行を CPU が並行して計算します）。RTX 5090、4K のプロンプト + 512 トークンで、
+全部 VRAM に載せた場合の生成は NextN 下書きありで 131.6 tok/s（llama.cpp 72.1、下書きなしの Abyss 72.7）、プロンプト 2,538 tok/s（llama.cpp 3,463）。
+16 GB に制限すると下書きありで 65〜68 tok/s、なしで 42.2（llama.cpp 38.4）、12 GB では 26.9 / 13.6（llama.cpp 13.9）。8 GB には入りません。
+
+**Laguna-S-2.1**（poolside の 118B MoE、[docs/laguna](docs/laguna/README.ja.md)、unsloth の UD-IQ4_XS、58 GB、`--model laguna`、v1.3.140）：RTX 5090 を 16 / 24 / 32 GB に制限、
+4K のプロンプト + 512 トークンで、生成は 36.3 / 41.4 / 47.4 tok/s（llama.cpp 32.0 / 38.1 / 43.2）、プロンプトは 842 / 975 / 1,144 tok/s（llama.cpp 318 / 391 / 470）。
 
 - 大きさは目安で、速さの保証ではありません。大きい PC なら小さいファイルがもっと速く動きます。小さい PC でも大きい
   ファイルは動きます（入りきらないエキスパートを SSD から読むので遅くなります）。
@@ -285,7 +289,8 @@ RAM 層 60 GB、モデルは NVMe（3.4 GB/s）、Abyss v1.3.31:
 | | 自作の [Ornith-1.5-122B-IQ4_XS-24G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ4_XS-24G64G-GGUF)（GPU 24〜32 GB + RAM 64 GB 向け、BETA、2026-11-08） | 68.9 GB | RTX 5090 を 24 GB に制限、RAM 64 GB の設定で計測: NextN ドラフトありで生成 52.4 tok/s（32 GB では 63.8）、8K の入力 1,594 tok/s、SSD 待ちなし |
 | Qwen3.5-122B-A10B（Qwen3.5-MoE、Ornith と同じ形式） | 自作の [Qwen3.5-122B-A10B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け） | 51.4 GB | 計測済み: KL 0.035、41.2 tok/s、swe-bench 60 問中 53 問解決 |
 | Qwen3.8-35B-A3B Distill（Qwen3.5-MoE、Ornith を小さくした形式） | empero-ai の [Q4_K_M](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF)（v1.3.92） | 21.7 GB | RTX 5090 で計測: swe-bench 3 問で 399 tok/s（NextN 下書きあり、採用率 85%）、VRAM を 16 GB に制限して 297 tok/s |
-| Qwen3.8-27B（dense の Qwen3.5、`qwen35`。[MANUAL](docs/MANUAL.ja.md#qwen38-27bdense)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)（v1.3.138） | 17.7 GB | RTX 5090 で計測: llama.cpp との KL 0.0025、生成は NextN 下書きありで 131.6 tok/s（採用率 82%）、なしで 72.7（llama.cpp 72.1）。ファイル全体を VRAM に置くので GPU 24 GB 以上 |
+| Qwen3.8-27B（dense の Qwen3.5、`qwen35`。[MANUAL](docs/MANUAL.ja.md#qwen38-27bdense)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)（v1.3.138） | 17.7 GB | RTX 5090 で計測: llama.cpp との KL 0.0025、生成は NextN 下書きありで 131.6 tok/s（採用率 82%）、なしで 72.7（llama.cpp 72.1）。ファイル全体を VRAM に置く場合（24 GB 以上）。v1.3.140 から 12〜20 GB の GPU + RAM 32 GB でも動く（FFN の行を RAM に置いて CPU で計算）: 16 GB で下書きあり 65〜68 tok/s、なし 42.2（llama.cpp 38.4）、12 GB で 26.9 / 13.6（llama.cpp 13.9） |
+| Laguna-S-2.1（poolside、`laguna`。[docs/laguna](docs/laguna/README.ja.md)） | unsloth の [UD-IQ4_XS](https://huggingface.co/unsloth/Laguna-S-2.1-GGUF)（v1.3.140） | 58 GB | RTX 5090（iGPU なし）で計測: llama.cpp との KL 0.024（llama.cpp 自身の CPU と CUDA の差も 0.024）、生成は 16 / 24 / 32 GB で 36.3 / 41.4 / 47.4 tok/s（llama.cpp 32.0 / 38.1 / 43.2）、プロンプト 842 / 975 / 1,144（llama.cpp 318 / 391 / 470）。下書きなし |
 | Qwen3.8-Flash-Next（qwen4exp、[docs/qwen38](docs/qwen38/README.ja.md)） | orcarouter の [Uncensored IQ3_XXS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) を速い経路で（v1.3.74）。v1.3.76 からベータ: ISTA-DASLab GSQ-RCO IQ3_XXS / IQ3_S、unsloth UD-IQ4_XS / UD-Q4_K_XL（どの PC にどれか: [docs/qwen38](docs/qwen38/README.ja.md#ほかの-ggufベータ)） | 85.2 GB | AI PRO R9700 で計測: プロンプト 30K で 1,037 tok/s、答えは MTP ドラフターありで文章 64〜65 tok/s / コード 86、llama.cpp 比 KL 0.026。NVIDIA: RTX 5090 は v1.3.83 から（ISTA IQ3_S でドラフターあり 128.5〜129.5 tok/s、v1.3.87）、DGX Spark は v1.3.113 から（[数字](docs/qwen38/README.ja.md#nvidia-での計測rtx-5090dgx-spark)） |
 | | 自作の [Qwen3.8-Flash-Next-IQ3_M-16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF)（GPU 16 GB + RAM 64 GB 向け、ベータ。報告歓迎） | 86.9 GB | RTX 5090 + 94 GB で計測: KL 0.083、MTP ドラフターありで 32 GB 131.3 tok/s、16 GB 96.4（v1.3.112）。レンタルの DGX Spark で 47.05（v1.3.113） |
 | | 自作の [Qwen3.8-Flash-Next-IQ3_M-24G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF)（GPU 24 GB + RAM 64 GB 向け、ベータ） | 93.7 GB | VRAM を 24 GB に制限して計測（[モデルカード](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF)） |
