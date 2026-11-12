@@ -867,7 +867,7 @@ public:
     // the loan (a card the FFN does not fit): whole layers' FFN live in the prompt path's buffers between prompts -
     // q35d_evict (prefill_lend) gives the buffers back to the prompt, q35d_restore (prefill_return) uploads them again
     bool q35d_prompt_ram(int il) const;                    // the prompt path stages this layer's FFN
-    void q35d_evict();
+    void q35d_evict(size_t region_used);   // (the region's first bytes the prompt takes: the layers past them stay)
     bool q35d_restore(std::string& err);
     std::vector<std::pair<uint8_t*, size_t>> prefill_loan_blocks() const;   // the dense prompt path's scratch
     // the prompt path: layer il's FFN weights in a VRAM staging buffer (gate / up / down into w), in order on s;

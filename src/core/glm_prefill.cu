@@ -592,6 +592,7 @@ struct Glm5Model::PrefillState {
     // the CPU and PCIe as before; copies still in flight at the plan count against the PCIe side.
     int NP = 0;                           // slots (of the largest MoE layer stride)
     size_t pbuf_bytes = 0;
+    size_t carved = 0;                    // the region's bytes the last prefill_carve laid out (q35d_evict)
     size_t pbuf_carved = 0;               // ... of which this chunk's carve took (prefill_carve; the prestage's cap)
     uint8_t* pbuf = nullptr;              // carved for chunks of kPreMinT tokens and more
     int pre_layer = -1;                   // the layer whose experts pbuf holds (or is receiving)
@@ -1452,6 +1453,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
     S->T_bound = Tn;
     S->need = c.off;
+    S->carved = c.off;
     return c.off;
 }
 
@@ -1462,7 +1464,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
-    q35d_evict();   // (the dense qwen35's loaned layers leave the scratch first)
+    q35d_evict(S->carved);   // (the dense qwen35's loaned layers in the scratch this prompt takes leave first)
     const uint64_t moved0 = S->moved, dropped0 = S->dropped;
     if (!S->own && !lend_tail(S->need, S->moved, S->dropped, err)) return false;
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
