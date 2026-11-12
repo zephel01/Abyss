@@ -106,7 +106,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "layer %d not found (or a straddle row)\n", layer);
         return 1;
     }
-    const int n_embd = 4096, n_ff = 2048, n_exp = 64;
+    // GLM_BENCH_EMBD / GLM_BENCH_FF: another geometry (default DeepSeek V4's 4096 / 2048); GLM_BENCH_NEXP: how many
+    // experts are cycled (64 = from DRAM; 1-2 = from the CPU's caches, what a warmed expert would cost)
+    const int n_embd = getenv("GLM_BENCH_EMBD") ? std::atoi(getenv("GLM_BENCH_EMBD")) : 4096;
+    const int n_ff = getenv("GLM_BENCH_FF") ? std::atoi(getenv("GLM_BENCH_FF")) : 2048;
+    const int n_exp = getenv("GLM_BENCH_NEXP") ? std::max(1, std::atoi(getenv("GLM_BENCH_NEXP"))) : 64;
     strata::kernels::cpu::NativeFmt f;
     std::string err;
     if (!strata::kernels::cpu::native_fmt(gu, dt, n_embd, n_ff, f, err)) {
@@ -141,12 +145,27 @@ int main(int argc, char** argv) {
     if (counts.empty()) counts = {1, 6, 12};
     std::printf("layer %d gu_type %d d_type %d: expert %.2f MB (gate/up %.2f, down %.2f), %d experts cycled from DRAM\n",
                 layer, gu, dt, (double) eb / 1e6, 2.0 * gub / 1e6, dnb / 1e6, n_exp);
+    const int warm = getenv("GLM_BENCH_WARM") ? std::atoi(getenv("GLM_BENCH_WARM")) : 0;
+    std::atomic<uint64_t> sink{0};
     for (int nt : counts) {
         Spin pool(nt);
         const int reps = 4 * n_exp;
         double t_gu = 0, t_dn = 0, best = 1e9;
         for (int rep = 0; rep < reps; ++rep) {
             const uint8_t* b = blobs.data() + eb * (size_t) (rep % n_exp);
+            // GLM_BENCH_WARM=1: before the timed call, each thread reads (into its caches) the rows it will compute;
+            // 2: the rows of the thread n/2 away (another CCX on a 2-CCX part) - what a warm by the wrong thread gives
+            if (warm != 0) {
+                pool.run([&](int t, int n) {
+                    const int tw = warm == 2 ? (t + n / 2) % n : warm == 3 ? (t * 5 + 3) % n : t;
+                    const size_t g0 = f.gu_row * (size_t) (n_ff * tw / n), g1 = f.gu_row * (size_t) (n_ff * (tw + 1) / n);
+                    const size_t d0 = f.d_row * (size_t) (n_embd * tw / n), d1 = f.d_row * (size_t) (n_embd * (tw + 1) / n);
+                    uint64_t acc = 0;
+                    for (size_t o = g0; o < g1; o += 64) acc += *(const volatile uint8_t*) (b + o) + *(const volatile uint8_t*) (b + gub + o);
+                    for (size_t o = d0; o < d1; o += 64) acc += *(const volatile uint8_t*) (b + 2 * gub + o);
+                    sink.fetch_add(acc, std::memory_order_relaxed);
+                });
+            }
             const auto t0 = std::chrono::steady_clock::now();
             pool.run([&](int t, int n) {
                 const int r0 = n_ff * t / n, r1 = n_ff * (t + 1) / n;
