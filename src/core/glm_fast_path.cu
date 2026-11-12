@@ -3118,16 +3118,19 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         // 5.7 tok/s, 16 7.6)
         if (const int logical = (int) std::thread::hardware_concurrency(); logical > 0 && cores >= logical)
             threads = logical * 2 / 3;
-        // SMT parts with 8+ cores, one GPU: a decode leaves two cores to the service thread (which computes a pool
-        // share itself), the main thread's launches and waits and the disk readers - a pool on every core had its last
-        // workers share a core with them (one GLM-5.3 expert from DRAM: 16 threads 86-107 us, 14 89-98).  The pool
-        // keeps those cores for a prompt's CPU share (prefill_half widens it: 14 for prompts too cost GLM ~5%).
-        // Ryzen AI Max+ 395 (16 cores) + RTX 5090, iGPU lane off, 4K + 512, interleaved: GLM-5.3 50.5 -> 51.4,
-        // V4 0731 67.8 -> 69.8, V4.1 JA256 56.8 -> 58.5, V4.1 UD-IQ2_XXS 35.4 -> 36.3, Qwen3.8 128.8 -> 130.8 tok/s
-        // (bench/glmspeed/results.md).  STRATA_GLM_CPU_LANE_SPARE=<n> (default 2; 0 = a thread a core, as before)
+        // SMT parts with 16+ cores, one GPU: a decode leaves two cores to the service thread (which computes a pool
+        // share itself), the main thread's launches and waits and the disk readers - the lane reads DRAM, and past
+        // ~12-14 threads it has the bandwidth it can use (one GLM-5.3 expert: 16 threads 86-107 us, 14 89-98), while
+        // its last workers shared a core with those threads.  The pool keeps the cores for a prompt's CPU share
+        // (prefill_half widens it: 14 for prompts too cost GLM ~5%).  Ryzen AI Max+ 395 + RTX 5090, iGPU lane off,
+        // 4K + 512, interleaved, tok/s: 16 cores GLM-5.3 50.5 -> 51.4, V4 0731 67.8 -> 69.8, V4.1 JA256 56.8 -> 58.5,
+        // V4.1 UD-IQ2_XXS 35.4 -> 36.3, Qwen3.8 128.8 -> 130.8; the same box cut to 12 cores (taskset) LOST with two
+        // spare - GLM-5.3 49.2 -> 48.0, V4 68.8 -> 66.4 - and 8 cores no better, so fewer cores keep a thread a core
+        // (bench/glmspeed/results.md).  STRATA_GLM_CPU_LANE_SPARE=<n> (8+ cores; default 2 from 16 cores, else 0)
         else if (n_parts_ == 1 && cores >= 8) {
-            static const int spare = (int) strata::core::env_num("STRATA_GLM_CPU_LANE_SPARE", 2.0, 0.0, 8.0);
-            lane_spare = threads - std::max(4, cores - spare);
+            const char* sv2 = getenv("STRATA_GLM_CPU_LANE_SPARE");
+            const int spare = sv2 != nullptr && sv2[0] ? std::max(0, std::min(8, std::atoi(sv2))) : cores >= 16 ? 2 : 0;
+            lane_spare = std::max(0, threads - std::max(4, cores - spare));
             threads -= lane_spare;
         }
         // one GPU: at most one NUMA node's worth, less 4 - a spinning pool on both sockets syncs across them, and the
