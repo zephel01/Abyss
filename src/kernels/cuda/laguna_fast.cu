@@ -165,6 +165,103 @@ __global__ void __launch_bounds__(kWarps * 32) attn_kernel(const float* __restri
     }
 }
 
+// The same attention as attn_kernel for few rows (a token, a verify window), a block a (row, head, split) instead of a
+// warp: the split's key scores first, every warp at once (each key's dot as attn_kernel's lane computes it: the same
+// bits), into shared memory; then warp 0 runs attn_kernel's online softmax and V sums over them in key order.  The
+// scores of a key no longer wait for the previous step's softmax - the dot was the step's long serial part.
+// grid (T * n_head, splits), 128 threads, dynamic shared memory: the split's scores (len floats).
+__global__ void __launch_bounds__(kWarps * 32) attn_few_kernel(const float* __restrict__ q,
+                                                               const uint16_t* __restrict__ kc,
+                                                               const uint16_t* __restrict__ vc, int ring, int n_head,
+                                                               int n_head_kv, int64_t p0, int T, int window, float scale,
+                                                               float* __restrict__ part, float* __restrict__ out) {
+    extern __shared__ float ssc[];
+    __shared__ float sq[kD];
+    const int idx = blockIdx.x, tid = threadIdx.x, lane = tid & 31;
+    const int t = idx / n_head, h = idx % n_head;
+    const int grp = h / (n_head / n_head_kv);
+    const int64_t p = p0 + t;
+    const int64_t lo = window > 0 && p - window + 1 > 0 ? p - window + 1 : 0;
+    const int64_t n = p - lo + 1;
+    const int splits = gridDim.y, sp = blockIdx.y;
+    const int64_t len = ((n + splits - 1) / splits + 31) / 32 * 32;
+    const int64_t a = lo + (int64_t) sp * len, e = a + len < p + 1 ? a + len : p + 1;
+    const float* qr = q + ((size_t) t * n_head + h) * kD;
+    sq[tid] = qr[tid] * scale;
+    __syncthreads();
+    const size_t kstride = (size_t) n_head_kv * kD;
+    const int ra = (int) (a % ring);
+    for (int64_t j = a + tid; j < e; j += kWarps * 32) {
+        const int rj = ra + (int) (j - a);   // (j % ring: a split is shorter than the ring)
+        const uint4* kp = reinterpret_cast<const uint4*>(kc + (size_t) (rj < ring ? rj : rj - ring) * kstride +
+                                                         (size_t) grp * kD);
+        float dot = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kD / 8; ++c) {
+            const uint4 u = kp[c];
+            const __half2* hp = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f = __half22float2(hp[i]);
+                dot += f.x * sq[c * 8 + 2 * i] + f.y * sq[c * 8 + 2 * i + 1];
+            }
+        }
+        ssc[j - a] = dot;
+    }
+    __syncthreads();
+    if (tid >= 32) return;
+    float m = -INFINITY, l = 0.0f, acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint16_t* vg = vc + (size_t) grp * kD + lane * 4;
+    for (int64_t base = a; base < e; base += 32) {
+        const int64_t j = base + lane;
+        const float sc = j < e ? ssc[j - a] : -INFINITY;
+        const float mn = fmaxf(m, warp_max(sc));
+        const float corr = expf(m - mn);
+        const float pj = j < e ? expf(sc - mn) : 0.0f;
+        l = l * corr + warp_sum(pj);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[i] *= corr;
+        const int nk = e - base < 32 ? (int) (e - base) : 32;
+        const int rb = (int) (base % ring);
+        const auto vrow = [&](int jj) {
+            const int r = rb + jj < ring ? rb + jj : rb + jj - ring;
+            return *reinterpret_cast<const uint2*>(vg + (size_t) r * kstride);
+        };
+        const auto add = [&](float pp, uint2 u) {
+            const __half2* hp = reinterpret_cast<const __half2*>(&u);
+            const float2 f0 = __half22float2(hp[0]), f1 = __half22float2(hp[1]);
+            acc[0] += pp * f0.x;
+            acc[1] += pp * f0.y;
+            acc[2] += pp * f1.x;
+            acc[3] += pp * f1.y;
+        };
+        int jj = 0;
+        for (; jj + 8 <= nk; jj += 8) {
+            uint2 u[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) u[i] = vrow(jj + i);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) add(__shfl_sync(0xffffffffu, pj, jj + i), u[i]);
+        }
+        for (; jj < nk; ++jj) add(__shfl_sync(0xffffffffu, pj, jj), vrow(jj));
+        m = mn;
+    }
+    if (splits == 1) {
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        float* o = out + ((size_t) t * n_head + h) * kD + lane * 4;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = acc[i] * inv;
+    } else {
+        float* pr = part + ((size_t) sp * T * n_head + idx) * (kD + 2);
+        if (lane == 0) {
+            pr[0] = m;
+            pr[1] = l;
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) pr[2 + lane * 4 + i] = acc[i];
+    }
+}
+
 // block a (row, head), 128 threads: the splits' partials merged
 __global__ void __launch_bounds__(kD) merge_kernel(const float* __restrict__ part, int rows, int splits,
                                                    float* __restrict__ out) {
@@ -234,8 +331,16 @@ void attn(const float* q, const uint16_t* kc, const uint16_t* vc, int ring, int 
         splits = (int) std::min<int64_t>((keys + kSplitKeys - 1) / kSplitKeys, max_splits);
         splits = std::max(splits, 1);
     }
-    const dim3 grid((unsigned) ((pairs + kWarps - 1) / kWarps), (unsigned) splits);
-    attn_kernel<<<grid, kWarps * 32, 0, s>>>(q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, part, out);
+    // few rows (a token, a verify window): a block a (row, head, split), its scores at once (attn_few_kernel: the
+    // same bits) while a split's scores fit in shared memory; many rows (the prompt): a warp a (row, head)
+    const int64_t len = ((keys + splits - 1) / splits + 31) / 32 * 32;   // (a split's keys at the most)
+    if (pairs < 1024 && len <= 11776) {   // (46 KB of scores + q: under the 48 KB a block has without opting in)
+        attn_few_kernel<<<dim3((unsigned) pairs, (unsigned) splits), kWarps * 32, (size_t) len * sizeof(float), s>>>(
+            q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, part, out);
+    } else {
+        const dim3 grid((unsigned) ((pairs + kWarps - 1) / kWarps), (unsigned) splits);
+        attn_kernel<<<grid, kWarps * 32, 0, s>>>(q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, part, out);
+    }
     if (splits > 1) merge_kernel<<<pairs, kD, 0, s>>>(part, pairs, splits, out);
 }
 
