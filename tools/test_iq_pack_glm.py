@@ -140,7 +140,8 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("deepseek41", iq_pack.ARCHITECTURES)  # Abyss: DeepSeek V4.1 (v1.3.29)
         self.assertIn("qwen35moe", iq_pack.ARCHITECTURES)   # Abyss: Qwen3.5-MoE / Ornith-1.5-122B (v1.3.46)
         self.assertIn("qwen35", iq_pack.ARCHITECTURES)      # Abyss: the dense Qwen3.5 / Qwen3.8-27B (v1.3.138)
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 7)
+        self.assertIn("laguna", iq_pack.ARCHITECTURES)      # Abyss: poolside Laguna-S-2.1
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 8)
 
     def test_qwen35_dense_as_stored(self):
         # the dense qwen35: qwen35moe's set with a dense FFN, every tensor served as stored
