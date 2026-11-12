@@ -7,6 +7,16 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.139 - 2026-11-12
+
+- Windows + AMD (#43): `--bench`, `--check` and the setup screen named the GPU from Windows' display-adapter
+  registry, which keeps every card ever installed - an RX 9060 XT 16 GB was reported as a removed RX 6600 XT 8 GB.
+  They now ask ROCm's hipInfo (the config's ROCm, as the setup does), and the registry fallback lists the present
+  adapters only. Display only: the engine measures its VRAM itself. The RX 9060 XT (gfx1200) is in the device table.
+- `START-ABYSS.bat` (and `abyss.py`) without `--config` starts the installed setup-deepseek configs too
+  (abyss-*.json); a PC set up only with `setup-deepseek.bat --model ornith` went into Maya's GLM-5.3 setup instead (#43).
+- `--bench` compiles a changed engine first, as a start does; after an update it measured the engine compiled before.
+
 ## v1.3.138 - 2026-11-12
 
 - Qwen3.8-27B, a dense Qwen3.5 (llama.cpp's `qwen35`: 48 delta-net + 16 attention layers, a dense FFN in every layer,
