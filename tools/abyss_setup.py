@@ -14,6 +14,8 @@
                                              16G64G (the default) or 24G64G
     ./setup-deepseek.sh --model glm          GLM-5.3-Flash, zephel01's GGUFs: --quant 32G96G (the default) or 32G128G
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
+    (no --quant: the PC-size file that suits this PC's VRAM + RAM is proposed - qwen38, glm, ornith; v4 keeps
+     UD-Q2_K_XL and names zephel01's file for this size)
     ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
     ./setup-deepseek.sh --model qwen38 --dflash   also the DFlash 2 drafter (0.65 GB): faster code (--no-dflash: off)
 
@@ -40,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import urllib.request
@@ -468,6 +471,112 @@ def make_tools(tools: Path) -> None:
     S.ok(f"tools: {tools}  ({tools / 'abyss.sh'} start | stop | status | update | log | models)")
 
 
+def _shared_memory(g) -> bool:
+    """A GPU without memory of its own: an APU (Ryzen AI Max's Radeon 8060S, gfx1151) or DGX Spark's GB10 - its VRAM
+    is the system RAM (as abyss.py's hip_unified_memory, plus setup.py's "integrated")."""
+    return g.get("arch") == "gfx1151" or bool(g.get("integrated")) or bool(
+        re.search(r"Ryzen AI Max|Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", g.get("name", ""), re.I))
+
+
+def pc_memory(gpus, ram: float) -> tuple[float, float, bool]:
+    """(VRAM, RAM, shared) in GB for picking a PC-size file: the chosen GPUs' VRAM (a layer split's cards add up), the
+    RAM.  An APU's memory is counted once, as RAM (shared=True when there is no GPU memory of its own): an AMD APU's
+    BIOS carve-out (sysfs / the registry's "VRAM") is not in the OS's RAM, so it is added to it; DGX Spark's "VRAM" is
+    the RAM itself."""
+    vram, shared = 0.0, False
+    for g in gpus or []:
+        if _shared_memory(g):
+            shared = True
+            if g.get("vendor") == "amd" and (g.get("driver") == "amdgpu" or g.get("source") == "registry"):
+                ram += g.get("vram_gb") or 0.0
+        else:
+            vram += g.get("vram_gb") or 0.0
+    return vram, ram, shared and vram == 0
+
+
+def fit_quant(key: str, vram: float, ram: float, shared: bool = False) -> dict | None:
+    """The PC-size file ("variants") that suits a PC best: the largest one whose GPU size is at most this VRAM (+1 GB:
+    a 16 GB card reports 15.9) and whose RAM size at most this RAM (+2 GB, or 4% - a 128 GB PC with an iGPU shows ~123),
+    among the default model's files (Ornith: the 122B; the 397B ones are "extra", the largest that fits).  An APU
+    (shared) holds both parts in one memory: GPU + RAM size at most its RAM.  When none fits, the smallest
+    (fits=False).  None for a model without PC-size files."""
+    model = MODELS[key]
+    variants = model.get("variants") or {}
+    if not variants:
+        return None
+
+    def size(q):
+        v = variants[q]
+        return (v.get("gb", model.get("gb", 0)), v["vram"] + v["ram"])
+
+    def fits(q):
+        v = variants[q]
+        slack = max(2.0, 0.04 * v["ram"])
+        if shared:
+            return v["vram"] + v["ram"] <= ram + slack + 1
+        return v["vram"] <= vram + 1 and v["ram"] <= ram + slack
+
+    base = model["model_name"]
+    family = sorted((q for q in variants if variants[q].get("model_name", base) == base), key=size)
+    ok = [q for q in family if fits(q)]
+    pick = ok[-1] if ok else family[0]
+    extra = [q for q in sorted(variants, key=size) if q not in family and fits(q)]
+    return {"quant": pick, "fits": bool(ok), "others": [q for q in family if q != pick],
+            "extra": extra[-1] if extra else None}
+
+
+def pc_line(vram: float, ram: float, shared: bool) -> str:
+    if shared:
+        return f"this PC: {ram:.0f} GB shared memory (an APU: GPU and RAM in one)"
+    return f"this PC: {vram:.0f} GB GPU + {ram:.0f} GB RAM" if vram else f"this PC: no GPU memory + {ram:.0f} GB RAM"
+
+
+def choose_quant(a, key: str, gpus) -> str:
+    """--quant when given; else the PC-size file for this PC (fit_quant), asked with it as the default (--yes takes it).
+    DeepSeek V4 keeps unsloth's UD-Q2_K_XL (the default since v1.3.0) and only names zephel01's file that suits the PC;
+    a file of this model already set up (its config there, --name not given) is kept and the better one named."""
+    model = MODELS[key]
+    if a.quant:
+        return a.quant
+    vram, ram, shared = pc_memory(gpus, S.ram_gb())
+    rec = fit_quant(key, vram, ram, shared)
+    if rec is None:
+        return model["quant"]
+    variants = model["variants"]
+    v = variants[rec["quant"]]
+    why = "" if rec["fits"] else (f"  (less than every file here is made for: {rec['quant']}, the smallest, is for a "
+                                  f"{v['vram']} GB GPU + {v['ram']} GB RAM - it runs, with more of it read from the SSD: "
+                                  "slower)")
+    note = ""
+    if rec["extra"]:
+        x = variants[rec["extra"]]
+        note = (f"  ({x.get('title', model['title'])} fits this PC too: --quant {rec['extra']} - a bigger model, "
+                "slower: more of it is read from the SSD)")
+    others = f" (the others: {', '.join(rec['others'])})" if rec["others"] else ""
+    if key == "v4":
+        # (the default stays: a setup run again after `git pull` must not start another ~60-100 GB download)
+        S.say(f"  {pc_line(vram, ram, shared)} -> zephel01's --quant {rec['quant']} is the file made for this size"
+              f"{others}; the default stays {model['quant']} (unsloth's, the tested one)")
+        if why:
+            S.say(why)
+        return S.ask(f"  Quant ({model['quant']} or {', '.join(variants)})", [model["quant"], *variants],
+                     model["quant"], a.yes)
+    have = [] if a.name else [q for q in variants if (ROOT / f"abyss-{model['prefix']}-{q.lower()}.json").exists()]
+    default = rec["quant"]
+    if have and default not in have:
+        # (set up before: kept, so a setup run again after `git pull` does not start another download)
+        default = model["quant"] if model["quant"] in have else have[-1]
+        S.say(f"  {pc_line(vram, ram, shared)} -> --quant {rec['quant']}{others}; already set up here: {default} "
+              f"(kept; --quant {rec['quant']} sets up the other)")
+    else:
+        S.say(f"  {pc_line(vram, ram, shared)} -> --quant {rec['quant']}{others}")
+        if why:
+            S.say(why)
+    if note:
+        S.say(note)
+    return S.ask(f"  Quant ({', '.join(variants)})", list(variants), default, a.yes)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
@@ -475,7 +584,8 @@ def main() -> int:
                     "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default), 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")
@@ -512,22 +622,13 @@ def main() -> int:
         make_tools(tools)
         return 0
     model = MODELS[a.model]
-    quant = a.quant or model["quant"]
-    if model["quants"] and quant not in model["quants"]:
+    if a.quant and model["quants"] and a.quant not in model["quants"]:
         ap.error(f"--model {a.model} has the quants {', '.join(model['quants'])}")
-    own = quant in model.get("variants", {})   # (the quant is a PC size and picks zephel01's repo for it)
-    if own:
-        model = {**model, **model["variants"][quant]}
-    if "prefix_tmpl" in model:
-        model = {**model, "prefix_file": model["prefix_tmpl"].format(q=quant)}
-    repo = model["repo"]
     if a.dspark and a.model != "v4":
         ap.error("--dspark: the DSpark drafter is set up for DeepSeek V4 only (V4.1: docs/deepseek41/README.md)")
     if (a.dflash or a.no_dflash) and a.model != "qwen38":
         ap.error("--dflash: the DFlash 2 drafter is Qwen3.8-Flash-Next's (--model qwen38)")
-    name = a.name or model["prefix"] + "-" + quant.lower().removeprefix("ud-")
     data = Path(a.data_dir).expanduser().resolve()
-    mdir = data / "models" / repo / quant
 
     S.step(1, "the PC")
     gpu = S.gpu_info(a.gpu) if a.backend != "hip" else None
@@ -552,6 +653,16 @@ def main() -> int:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
+    # the quant: --quant, else the PC-size file that suits this PC's VRAM + RAM (choose_quant)
+    quant = choose_quant(a, a.model, gpus)
+    own = quant in model.get("variants", {})   # (the quant is a PC size and picks zephel01's repo for it)
+    if own:
+        model = {**model, **model["variants"][quant]}
+    if "prefix_tmpl" in model:
+        model = {**model, "prefix_file": model["prefix_tmpl"].format(q=quant)}
+    repo = model["repo"]
+    name = a.name or model["prefix"] + "-" + quant.lower().removeprefix("ud-")
+    mdir = data / "models" / repo / quant
     if own and a.model != "ornith" or quant in ("24G64G", "32G128G", "16G64G"):
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is made for a {model['vram']} GB GPU + {model['ram']} GB RAM: with "
              f"VRAM, ~{model['gb']} GB holds every expert; less reads from the SSD)")

@@ -73,7 +73,7 @@ RTX 5090 を 8 / 12 / 16 GB に制限し、4K のプロンプト + 512 トーク
 ```sh
 git clone https://github.com/zephel01/Abyss.git ~/llm/apps/Abyss
 cd ~/llm/apps/Abyss
-./setup-deepseek.sh --model qwen38 --download-model   # エンジン、モデル、pack、設定、../Abyss-tools（表から選ぶ）
+./setup-deepseek.sh --model qwen38 --download-model   # エンジン、モデル、pack、設定、../Abyss-tools（この PC に合う大きさ。表から --quant でも選べる）
 ../Abyss-tools/abyss.sh start                         # → http://127.0.0.1:8082/
 ```
 
@@ -104,7 +104,9 @@ RTX 4090 で +12%、[#39](https://github.com/zephel01/Abyss/issues/39)）。正�
 
 済んだ手順は飛ばすので、何度実行してもよい。オプション（`--quant`、`--context`、`--port`、`--gpus 0,1`（層の分割）、
 `--backend hip`（AMD）、`--nvcc`（V100 用の CUDA 12）、`--dspark` / `--no-dspark`、`--tools-only` など）は
-[マニュアル](docs/MANUAL.ja.md#まとめてセットアップ)。
+[マニュアル](docs/MANUAL.ja.md#まとめてセットアップ)。`--quant` を付けないと、この PC の VRAM + RAM に合う大きさの
+ファイルを提案する（`this PC: 16 GB GPU + 62 GB RAM -> --quant 16G64G (the others: 12G32G, 24G64G)`。`--yes` ならそれを使い、
+前に入れた大きさはそのまま。DeepSeek V4 は `UD-Q2_K_XL` のままで、合うファイルを知らせるだけ）。
 
 </details>
 

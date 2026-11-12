@@ -75,7 +75,7 @@ RTX 5090 capped at 8 / 12 / 16 GB, 4K prompt + 512 tokens: decode 156 / 209 / 26
 ```sh
 git clone https://github.com/zephel01/Abyss.git ~/llm/apps/Abyss
 cd ~/llm/apps/Abyss
-./setup-deepseek.sh --model qwen38 --download-model   # engine, model, pack, config, ../Abyss-tools (pick from the table)
+./setup-deepseek.sh --model qwen38 --download-model   # engine, model, pack, config, ../Abyss-tools (the size for this PC, or --quant from the table)
 ../Abyss-tools/abyss.sh start                         # → http://127.0.0.1:8082/
 ```
 
@@ -107,7 +107,9 @@ and measure it with `--bench --deep` ([docs/BENCH.md](docs/BENCH.md)).
 
 Every step is skipped when done, so it is safe to run again. Options: `--quant`, `--context`, `--port`, `--gpus 0,1`
 (a layer split), `--backend hip` (AMD), `--nvcc` (a CUDA 12 toolkit for a V100), `--dspark` / `--no-dspark`,
-`--tools-only`, and more in the [manual](docs/MANUAL.md#setup-in-one-command).
+`--tools-only`, and more in the [manual](docs/MANUAL.md#setup-in-one-command). Without `--quant`, the setup proposes
+the PC-size file that fits this PC's VRAM + RAM (`this PC: 16 GB GPU + 62 GB RAM -> --quant 16G64G (the others: 12G32G,
+24G64G)`; `--yes` takes it, a size set up before is kept, DeepSeek V4 keeps `UD-Q2_K_XL` and only names it).
 
 </details>
 
