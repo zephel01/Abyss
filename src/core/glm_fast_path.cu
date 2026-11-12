@@ -3657,6 +3657,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         if (plan != all_cpu) {
             F->cpu_plan_late = all_cpu;
             F->settle = true;
+            F->lean_armed = true;
             std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the CPU does an expert %.1fx faster than the link - every "
                                  "RAM-tier expert goes to the CPU once the pool settles (windows of %d token steps), the "
                                  "split below until then and when the VRAM hits fall (STRATA_GLM_LANE_LEAN=0 keeps the "
@@ -6361,7 +6362,12 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
             const char* v = getenv("STRATA_GLM_BG_SPLIT");
             return v != nullptr ? std::atoi(v) != 0 : small_x;
         }();
-        const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all;
+        // THE LEAN's split (a CPU 4x+ faster than the link, its calibration a little slow - an 8-core Zen 5 beside an
+        // RTX 5090 on Gen4 x4 reads 0.126-0.152 ms an expert against 1.123, right where 8 of 8 turns into 7 of 8):
+        // without the moves the slots the prompt lent stayed empty, the VRAM hits flattened at ~48% and the settle
+        // switch took that for the pool's level - GLM-5.3 29-31 tok/s against 35-39 when the calibration came out
+        // a hair faster (bench/glmspeed/results.md)
+        const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all || (F->lean_armed && F->cpu_plan != 0ull);
         // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, GLM-5.3 and V4 / V4.1 on CUDA, off elsewhere):
         // the moves rank experts by counts that decay smoothly (bgc) instead of the route counts halved every ~32K
         // route events, swap when the hottest RAM-only expert's count passes the layer's coldest resident's by

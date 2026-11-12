@@ -743,6 +743,9 @@ struct Glm5Model::FastState {
     // settle_win boundaries; the late plan starts when a window gains less than settle_eps on the one before (the
     // pool has settled) and the start plan comes back when one falls settle_drop below that level (a new topic)
     bool settle = false, settle_late = false;
+    // THE LEAN armed (fast_cpu_lane_setup): the split plan is a step on the way to every RAM-tier expert on the CPU -
+    // the background moves run as under that plan (fast_boundary's bg_on)
+    bool lean_armed = false;
     int settle_win = 128, settle_n = 0;
     double settle_eps = 0.01, settle_drop = 0.05, settle_prev = -1.0, settle_level = 0.0;
     uint64_t settle_h0 = 0, settle_t0 = 0, settle_moves = 0;
