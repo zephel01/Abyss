@@ -223,7 +223,7 @@ bool Glm5Model::verify_ready() const {
         // (one part; qwen4exp's window crosses a split as its token does: verify_part_q4x's hop)
         if ((m->g_.v41 || (m->g_.qwen35() && !m->g_.q4x)) && (m->split_next_ != nullptr || m != this)) return false;
         for (int il = m->l0_; il < m->l1_; ++il)
-            if (!F->L[(size_t) il].moe) return false;
+            if (!F->L[(size_t) il].moe && !m->g_.q35_dense()) return false;   // (the dense qwen35: every layer dense)
     }
     const Glm5Model* tail = verify_tail();
     const auto it = tail->ws_map_.find("output.weight");
@@ -349,6 +349,10 @@ bool Glm5Model::verify_alloc(std::string& err) {
         std::fprintf(stderr, "glm verify: CUDA%d the window's buffers - %d KDA layers' replay inputs %.0f MB, the state "
                              "after column 0 %.0f MB\n", dev_, nrec,
                      (double) L * TM * V->glm_ki * 4 / 1048576.0, (double) nrec * V->glm_run * 4 / 1048576.0);
+    }
+    if (ok && g.q35_dense()) {   // the dense qwen35's FFN a column: gate / up rows and the q8_1 h for down
+        f(V->glm_dg, (size_t) g.n_ff_dense); f(V->glm_du, (size_t) g.n_ff_dense);
+        b(V->glm_dhq, (size_t) g.n_ff_dense / 32 * kQ8);
     }
     V->st[0] = fast_->cs;
     for (int t = 0; t < TM && ok; ++t) {
@@ -1618,7 +1622,41 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, (int) E, V->x + (size_t) t * E,
                        (uint8_t*) V->xq + (size_t) t * q8e, s);
         mark(2);
-        if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+        if (!Ly.moe) {   // the dense qwen35 (Qwen3.8-27B): fast_dense_ffn over the columns
+            const int FF = g.n_ff_dense;
+            const size_t hq = (size_t) FF / 32 * kQ8;
+            // mvn: one launch over the columns where it has the type (Q3_K not: mv a column, as the token path)
+            const auto mvc = [&](const gf::MvJob* j, int n, const char* what) {
+                bool all = true;
+                for (int i = 0; i < n; ++i) all = all && gf::mvn_supported(j[i].type);
+                if (all) {
+                    if (!gf::mvn(j, n, T, s)) { err = std::string("qwen35 verify: ") + what; return false; }
+                    return true;
+                }
+                for (int i = 0; i < n; ++i) {
+                    const size_t xb = (size_t) j[i].n_in / 32 * kQ8;   // (a column's q8_1 row)
+                    for (int t = 0; t < T; ++t) {
+                        gf::MvJob c = j[i];
+                        c.xq = (const uint8_t*) j[i].xq + (size_t) t * xb;
+                        if (j[i].xf != nullptr) c.xf = j[i].xf + (size_t) t * j[i].n_in;
+                        c.y = j[i].y + (size_t) t * j[i].n_out;
+                        if (!gf::mv(&c, 1, s)) { err = std::string("qwen35 verify: ") + what; return false; }
+                    }
+                }
+                return true;
+            };
+            gf::MvJob jd[2];
+            jd[0] = {Ly.ffn_gate.q, V->xq, V->x, V->glm_dg, nullptr, 1.0f, Ly.ffn_gate.type, (int) E, FF};
+            jd[1] = {Ly.ffn_up.q, V->xq, V->x, V->glm_du, nullptr, 1.0f, Ly.ffn_up.type, (int) E, FF};
+            if (!mvc(jd, 2, "dense ffn gate / up")) return false;
+            for (int t = 0; t < T; ++t)
+                gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                              (uint8_t*) V->glm_dhq + (size_t) t * hq, s);
+            gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, nullptr, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, (int) E};
+            if (!mvc(&dn, 1, "dense ffn down")) return false;
+        } else if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) {
+            return false;
+        }
         mark(3);
     }
     const auto nw = w_.find("output_norm.weight");

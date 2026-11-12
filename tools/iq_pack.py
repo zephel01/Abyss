@@ -146,7 +146,10 @@ QWEN4EXP_FAST_NATIVE_OK = QWEN35MOE_NATIVE_OK + (
     "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
     "output_hc_down.weight", "output_hc_up.weight", "ple_key.weight", "ple_value.weight",
 )
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe")   # unsloth spells glm5-next without the hyphen
+# qwen35 (dense Qwen3.5 / Qwen3.8-27B): qwen35moe's set with the dense FFN in place of the experts - every tensor is
+# served as stored; the pack has no experts (native_experts.txt keeps only its header, which names the shards)
+QWEN35_NATIVE_OK = QWEN35MOE_NATIVE_OK + ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight")
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -160,7 +163,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
-    if arch in ("qwen35moe", "qwen4exp-fast"):
+    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -356,6 +359,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             elif arch == "qwen35moe" and not name.endswith(QWEN35MOE_NATIVE_OK):
                 print("%s is %s: not on the qwen35moe native set (QWEN35MOE_NATIVE_OK); refusing to pack it "
                       "silently" % (t.name, t.type_name))
+                return 1
+            elif arch == "qwen35" and not name.endswith(QWEN35_NATIVE_OK):
+                print("%s is %s: not on the qwen35 native set (QWEN35_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
                 return 1
             elif arch == "qwen4exp-fast" and not name.endswith(QWEN4EXP_FAST_NATIVE_OK):
                 print("%s is %s: not on the qwen4exp fast-path native set (QWEN4EXP_FAST_NATIVE_OK); refusing to "
@@ -632,12 +639,12 @@ def main() -> int:
         prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
         print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
               "gate remains closed until the pack wiring lands - docs/maya/GLM5-FLASH.md §9)" % arch)
-    if arch == "qwen35moe":
-        prefix = "qwen35moe."
-        print("qwen35moe: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)")
+    if arch in ("qwen35moe", "qwen35"):
+        prefix = arch + "."
+        print("%s: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -697,7 +704,14 @@ def main() -> int:
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
-    # ---- the experts
+    # ---- the experts (a dense qwen35 has none: native_experts.txt keeps the header the engine reads the shards from)
+    if arch == "qwen35":
+        with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
+            fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                     "[shard | gate_shard up_shard down_shard] "
+                     "(n_expert 0, total 0; absolute offsets in %s, or in the named shard(s) beside it)\n" % src.name)
+        print("qwen35: a dense model - no experts to pack")
+        return 0
     if trunk is not None:
         # the trunk only: the NextN/MTP layer ships its own experts (a full extra layer) and the
         # runner skips MTP - deriving n_layers from the max expert index would pack the NextN

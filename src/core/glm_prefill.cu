@@ -397,6 +397,10 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
 #else
     size_t room = 0;
     if (moe) { Carve m; carve_moe(m, T, kSub, g); room = m.off; }
+    // a dense qwen35 (no MoE union to fit under): the largest sub-batch up to 4096 - every sub-batch dequantizes all
+    // 27B weights to FP16 once more, so 256-token ones spent more time there than in the GEMMs; the chunk's choice
+    // prices the buffers (prefill_setup)
+    if (!moe && dense && g.q35_dense()) room = SIZE_MAX;
     int ts = kSub;
     for (int t2 = 2 * kSub; t2 <= 4096 && (size_t) t2 <= T; t2 *= 2) {
         size_t need = 0;
@@ -459,6 +463,7 @@ struct Glm5Model::PrefillState {
     // every device buffer lives in the pool's lendable tail (prefill_bind): valid only while lent
     size_t borrow_bytes = 0, ws_bytes = 0, gbuf_bytes = 0;
     bool lent = false;
+    bool own = false;                // a dense qwen35: the region is the prompt path's own (no expert pool to borrow)
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
     bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
@@ -912,6 +917,10 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         // the bytes the pool can lend the prompt path when every layer keeps `keep` slots
         const auto lendable_at = [&](int64_t keep) -> size_t {
             if (mb_env != nullptr) return (size_t) (std::atof(mb_env) * 1048576.0);
+            // (a dense qwen35: no pool - the buffers are allocated for the session, so a quarter of the free VRAM,
+            // 512 MB to 4 GB)
+            if (stride_sum == 0 && g.q35_dense())
+                return std::clamp<size_t>(avail / 4, (size_t) 512 << 20, (size_t) 4 << 30);
             if (stride_sum == 0) return avail;
             int64_t k = std::max<int64_t>(0, per - keep);
             if (is_auto) k = std::min<int64_t>(k, pct * per / 100);
@@ -1159,6 +1168,24 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
 
 size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
 
+// a dense qwen35 (fast_setup: no expert pool): prefill_setup, then the prompt path's buffers in a region of their own
+// for the session - prefill_lend binds nothing and evicts nothing
+bool Glm5Model::prefill_setup_own(std::string& err) {
+    if (!prefill_setup(err)) return false;
+    PrefillState* S = pf_;
+    if (S == nullptr) return true;
+    void* r = nullptr;
+    if (cudaMalloc(&r, S->borrow_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "glm prefill: CUDA%d the prompt path's %zu MB did not allocate - token by token\n", dev_,
+                     S->borrow_bytes >> 20);
+        prefill_destroy();
+        return true;
+    }
+    S->own = true;
+    return prefill_bind((uint8_t*) r, S->borrow_bytes, err);
+}
+
 // the slots a layer the pool keeps while a prompt runs (prefill_setup: the full keep, or the small one on a pool that
 // could lend no chunk at that); without a prompt path, the full keep
 int Glm5Model::prefill_keep() const {
@@ -1330,7 +1357,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
     const uint64_t moved0 = S->moved, dropped0 = S->dropped;
-    if (!lend_tail(S->need, S->moved, S->dropped, err)) return false;
+    if (!S->own && !lend_tail(S->need, S->moved, S->dropped, err)) return false;
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
     if (verbose)
         std::fprintf(stderr, "glm prefill: CUDA%d lends %.0f MB of the expert pool for %d tokens: %llu experts leave "
@@ -1669,6 +1696,7 @@ void Glm5Model::prefill_destroy() {
     if (S->h_counts) cudaFreeHost(S->h_counts);
     if (S->h_base) cudaFreeHost(S->h_base);
     if (S->h_bounds) cudaFreeHost(S->h_bounds);
+    if (S->own && S->region) cudaFree(S->region);
     delete S;
     pf_ = nullptr;
 }

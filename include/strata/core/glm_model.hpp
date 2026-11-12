@@ -112,6 +112,9 @@ struct Glm5Geometry {
     int attn_head_kv = 2, n_ff_shexp = 1024;
     int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_inner; }
     static bool from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+    // ---- qwen35 (dense Qwen3.5 / Qwen3.8-27B): arch 2 as qwen35moe with no experts - every layer (the NextN block
+    // too) a dense SwiGLU FFN of n_ff_dense (dense_lead past the last block, n_expert 0, n_exp_used 0)
+    bool q35_dense() const { return arch == 2 && n_expert == 0; }
     // ---- qwen4exp (Qwen3.8-Flash-Next, llama.cpp src/models/qwen4exp.cpp): arch stays 2 (the qwen35moe path) with
     // hc streams mixed by low-rank hyper-connections in place of the norms (hc_lr wide), the delta-net's output gate a
     // sigmoid, top-k up to glmf::kMaxK, the attention layers' QSA indexer and layer 1's per-layer embedding (PLE)
@@ -823,6 +826,8 @@ public:
     size_t prefill_v41_row() const;   // those two per row, in bytes (0: not deepseek41)
     bool prefill_setup(std::string& err, int per_pool = 0);   // in fast_setup: sizes, host buffers (no device memory);
                                                            // per_pool > 0: against the pool fast_setup carved
+    bool prefill_setup_own(std::string& err);              // ... a dense qwen35: and its own device region (no pool)
+    bool fast_dense_ffn(int il, std::string& err);         // a dense SwiGLU FFN (x / xq -> ffn): the dense qwen35
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

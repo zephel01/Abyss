@@ -673,7 +673,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     if (!fast_qwen35_attn(il, p, err)) return false;
     gf::rms_q8(F->mtp_h, F->mixer, Ly.post_norm, g.norm_eps, E, F->x, F->xq, s);
     bool pf_pending = false;
-    if (!fast_moe(il, pf_pending, err)) return false;
+    if (!(Ly.moe ? fast_moe(il, pf_pending, err) : fast_dense_ffn(il, err))) return false;
     gf::rms_q8(F->mtp_h, F->ffn, w_.at("output_norm.weight"), g.norm_eps, E, F->head_x, F->head_xq, s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
@@ -1229,6 +1229,26 @@ bool Glm5Model::q4x_mix5(const float* norm, const WSlot& down, const WSlot& up, 
     return true;
 }
 
+// the dense qwen35's FFN (llama.cpp build_ffn, LLM_FFN_SILU / LLM_FFN_PAR): ffn = down . (silu(gate . x) * up . x),
+// gate and up in one launch, the SwiGLU into down's q8_1 input (no clamp: swiglu_shexp is +inf on this path)
+bool Glm5Model::fast_dense_ffn(int il, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, FF = g.n_ff_dense;
+    gf::MvJob j[2];
+    j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, E, FF};
+    j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, FF};
+    if (!gf::mv(j, 2, s)) { err = "qwen35: the dense FFN's gate / up"; return false; }
+    if (F->prof_on) F->mark("q35_dense_gu");
+    gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
+    gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
+    if (!gf::mv(&dn, 1, s)) { err = "qwen35: the dense FFN's down"; return false; }
+    if (F->prof_on) F->mark("q35_dense_down");
+    return true;
+}
+
 bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -1261,11 +1281,14 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
             q35_dump(s, "attn_residual", il, state_, g.n_embd);
             q35_dump(s, "attn_post_norm", il, F->x, g.n_embd);
         }
-        if (!Ly.moe) { err = "qwen35moe: a dense FFN layer (not supported)"; return false; }
-        if (!fast_moe(il, pf_pending, err)) return false;
+        if (!Ly.moe) {   // (the dense qwen35: every layer)
+            if (!fast_dense_ffn(il, err)) return false;
+        } else if (!fast_moe(il, pf_pending, err)) {
+            return false;
+        }
         abl_out(il, 1, F->ffn, 1, g.n_embd, s);
         if (dumps) {
-            q35_dump(s, "ffn_shexp_gated", il, F->sh_out, g.n_embd);
+            if (Ly.moe) q35_dump(s, "ffn_shexp_gated", il, F->sh_out, g.n_embd);
             q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
         }
     }

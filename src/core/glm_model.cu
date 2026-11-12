@@ -293,17 +293,35 @@ static const char* const kMtpRawQ35[] = {"attn_q.weight", "attn_k.weight", "attn
 static const char* const kMtpF32Q35[] = {"attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight",
                                          "attn_k_norm.weight", "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
                                          "nextn.enorm.weight", "nextn.hnorm.weight"};
+// the dense qwen35's (Qwen3.8-27B): the same attention layer with a dense FFN - no router, no experts
+static const char* const kMtpRawQ35D[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                                          "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "nextn.eh_proj.weight"};
+static const char* const kMtpF32Q35D[] = {"attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight",
+                                          "attn_k_norm.weight", "nextn.enorm.weight", "nextn.hnorm.weight"};
+// the block's name lists for kind 0 (glm5-next), 1 (qwen35moe), 2 (the dense qwen35)
+static void mtp_names(int kind, std::vector<const char*>& raw, std::vector<const char*>& b16, std::vector<const char*>& f32) {
+    if (kind == 2) {
+        raw.assign(std::begin(kMtpRawQ35D), std::end(kMtpRawQ35D));
+        b16.clear();
+        f32.assign(std::begin(kMtpF32Q35D), std::end(kMtpF32Q35D));
+    } else if (kind == 1) {
+        raw.assign(std::begin(kMtpRawQ35), std::end(kMtpRawQ35));
+        b16.clear();
+        f32.assign(std::begin(kMtpF32Q35), std::end(kMtpF32Q35));
+    } else {
+        raw.assign(std::begin(kMtpRaw), std::end(kMtpRaw));
+        b16.assign(std::begin(kMtpB16), std::end(kMtpB16));
+        f32.assign(std::begin(kMtpF32), std::end(kMtpF32));
+    }
+}
 
 // ... and the VRAM they take
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
-                           bool q35, uint64_t& bytes, std::string& err) {
+                           int kind, uint64_t& bytes, std::string& err) {
     const std::string P = "blk." + std::to_string(il) + ".";
     bytes = 0;
-    const std::vector<const char*> raw(q35 ? std::begin(kMtpRawQ35) : std::begin(kMtpRaw),
-                                       q35 ? std::end(kMtpRawQ35) : std::end(kMtpRaw));
-    const std::vector<const char*> b16(q35 ? std::end(kMtpB16) : std::begin(kMtpB16), std::end(kMtpB16));
-    const std::vector<const char*> f32(q35 ? std::begin(kMtpF32Q35) : std::begin(kMtpF32),
-                                       q35 ? std::end(kMtpF32Q35) : std::end(kMtpF32));
+    std::vector<const char*> raw, b16, f32;
+    mtp_names(kind, raw, b16, f32);
     for (const char* n : raw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
@@ -538,7 +556,7 @@ std::string expert_counts_path(const std::string& pack_dir) {
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     if (g.get("deepseek4.block_count")) return from_gguf_dsv4(g, out, err);
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
-    if (g.get("qwen35moe.block_count")) return from_gguf_qwen35(g, out, err);
+    if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count")) return from_gguf_qwen35(g, out, err);
     if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
@@ -658,7 +676,9 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
 // attention layers' KV heads; n_ff_exp * n_shared = the shared expert's width (n_ff_shexp must equal n_ff_exp);
 // gating 2 = softmax top-k; swiglu clamps off (+inf); hc 1 (plain residuals); dense_lead 0
 bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
-    const std::string p = "qwen35moe.";
+    // (the dense qwen35 - Qwen3.8-27B: the same hparams without the experts, feed_forward_length the FFN's width)
+    const bool dense = g.get("qwen35moe.block_count") == nullptr;
+    const std::string p = dense ? "qwen35." : "qwen35moe.";
     const auto num = [&](const std::string& key, double def) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -677,13 +697,20 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
     out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
     out.n_rot = (int) num("rope.dimension_count", 64);
     out.rope_base = (float) num("rope.freq_base", 10000000.0);
-    out.n_expert = (int) num("expert_count", 256);
-    out.n_exp_used = (int) num("expert_used_count", 8);
-    out.n_ff_exp = (int) num("expert_feed_forward_length", 1024);
-    out.n_ff_shexp = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
-    out.n_shared = out.n_ff_shexp > 0 ? 1 : 0;
-    out.n_ff_dense = 0;
-    out.dense_lead = 0;
+    if (dense) {
+        // every block a dense FFN: dense_lead past the last one (the NextN block included), no experts
+        out.n_expert = out.n_exp_used = out.n_ff_exp = out.n_ff_shexp = out.n_shared = 0;
+        out.n_ff_dense = (int) num("feed_forward_length", 17408);
+        out.dense_lead = block_count + 1;
+    } else {
+        out.n_expert = (int) num("expert_count", 256);
+        out.n_exp_used = (int) num("expert_used_count", 8);
+        out.n_ff_exp = (int) num("expert_feed_forward_length", 1024);
+        out.n_ff_shexp = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
+        out.n_shared = out.n_ff_shexp > 0 ? 1 : 0;
+        out.n_ff_dense = 0;
+        out.dense_lead = 0;
+    }
     out.d_conv = (int) num("ssm.conv_kernel", 4);
     out.ssm_k_heads = (int) num("ssm.group_count", 16);
     out.ssm_inner = (int) num("ssm.inner_size", 8192);
@@ -698,7 +725,12 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
         out.n_vocab = (int) v->count;   // (the reader keeps only the first items of a long array)
     else
         out.n_vocab = 248320;
-    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_expert <= 0 || out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK) {
+    if (dense && (out.n_layers < 1 || out.n_embd <= 0 || out.n_embd % 256 != 0 || out.n_ff_dense <= 0 ||
+                  out.n_ff_dense % 256 != 0)) {
+        err = "qwen35: block_count / embedding_length / feed_forward_length are off (multiples of 256 expected)";
+        return false;
+    }
+    if (!dense && (out.n_layers < 1 || out.n_embd <= 0 || out.n_expert <= 0 || out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK)) {
         err = "qwen35moe: block_count / embedding_length / expert_count / expert_used_count are off";
         return false;
     }
@@ -1687,7 +1719,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
         const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
-            mtp_dense_vram(findm, L, g.qwen35(), b, e2)) {
+            mtp_dense_vram(findm, L, g.qwen35() ? 1 : 0, b, e2)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type, g.n_ff_exp,
                                                                   (int) tu->type);
@@ -3784,12 +3816,9 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;   // a GGUF without the draft block
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
-    const bool q35 = g_.qwen35();
-    const std::vector<const char*> raw_names(q35 ? std::begin(kMtpRawQ35) : std::begin(kMtpRaw),
-                                             q35 ? std::end(kMtpRawQ35) : std::end(kMtpRaw));
-    const std::vector<const char*> b16_names(q35 ? std::end(kMtpB16) : std::begin(kMtpB16), std::end(kMtpB16));
-    const std::vector<const char*> f32_names(q35 ? std::begin(kMtpF32Q35) : std::begin(kMtpF32),
-                                             q35 ? std::end(kMtpF32Q35) : std::end(kMtpF32));
+    const int mkind = g_.q35_dense() ? 2 : g_.qwen35() ? 1 : 0;
+    std::vector<const char*> raw_names, b16_names, f32_names;
+    mtp_names(mkind, raw_names, b16_names, f32_names);
     uint64_t bytes = 0;
     if (exl3_) {
         for (const char* n : raw_names) {
@@ -3814,7 +3843,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
-    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, q35, bytes, err)) {
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, mkind, bytes, err)) {
         return false;
     }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
@@ -3903,6 +3932,19 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         w_[P + n] = (const float*) (base + at);
         ws_map_[P + n] = strata::core::WSlot{(const float*) (base + at), 0, nullptr, 0, 0};
         at += ((uint64_t) host.size() * 4 + 255u) & ~(uint64_t) 255u;
+    }
+    if (mkind == 2) {   // the dense qwen35: no experts - the block's FFN is among the raw names
+        if (pack_emb_src_ == nullptr) {
+            int se = -1;
+            const strata::TensorInfo* te = find("token_embd.weight", se);
+            if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
+            pack_emb_src_ = src_of(te, se);
+            pack_emb_type_ = (int) te->type;
+        }
+        mtp_il_ = il;
+        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB, a dense FFN\n", dev_, il,
+                     (double) bytes / 1048576.0);
+        return true;
     }
     // the routed experts: gate/up/down by absolute offset, like native_experts.txt rows
     NativeLayer nl;

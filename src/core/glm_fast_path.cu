@@ -1972,6 +1972,17 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (!fast_cpu_lane_setup(err)) return false;
         F->svc = std::thread([this] { fast_service(); });
         glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
+    } else if (g.q35_dense()) {
+        // the dense qwen35: no experts, so no pool, tiers, lanes or service thread - every weight is in the dense
+        // arena; the prompt path gets a region of its own
+        if (!prefill_setup_own(err)) return false;
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const double G = 1073741824.0;
+        std::fprintf(stderr, "glm fast: CUDA%d dense qwen35: %.2f of %.2f GB in use - weights %.2f, state/KV (%lld ctx) "
+                             "%.2f, activations %.2f, prompt path %.2f\n", dev_, (double) (total_b - free_b) / G,
+                     (double) total_b / G, (double) w_arena_bytes_ / G, (long long) max_ctx_, (double) state_bytes_ / G,
+                     (double) (sc_bytes_ + F->arena_bytes) / G, (double) prefill_borrow_bytes() / G);
     }
     // Lazily allocate the opt-in tier after Prefill, so it cannot change the primary pool or prompt buffers.
     if (const char* helper = getenv("STRATA_GLM_EXPERT_HELPER"); helper && std::strcmp(helper, "0") != 0) {
