@@ -10,7 +10,7 @@
                                              (--quant 24G64G: the IQ4_XS file for a 24-32 GB GPU + 64 GB RAM)
     ./setup-deepseek.sh --model ornith35     Ornith-1.5-35B-A3B, the official Q4_K_M for an 8-16 GB GPU + 32 GB RAM
     ./setup-deepseek.sh --model laguna       Laguna-S-2.1 (poolside, 118B-A8B), unsloth's UD-IQ4_XS for a 16-32 GB GPU + 64 GB RAM
-    ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL all in VRAM: a GPU with ~24 GB or more
+    ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for a 12 GB+ GPU (FFN partly in RAM under ~20 GB)
     ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
                                              16G64G (the default) or 24G64G
@@ -682,7 +682,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, all in VRAM: a 24 GB+ GPU), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, a 12 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
                     "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: UD-Q4_K_XL; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
