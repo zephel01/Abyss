@@ -93,6 +93,14 @@ JOYAI_PATTERNS = (
     r"|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
 
+# The `laguna` pre-tokenizer (poolside Laguna), transcribed from llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_LAGUNA): two
+# expressions in sequence - the lines and the newline runs apart first, then a GPT-4-like split (single digits).
+LAGUNA_PATTERNS = (
+    r"[^\n]+|[\n]+",
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
 
 def split_sequential(text: str, pats) -> list[str]:
     pieces = [text]
@@ -119,8 +127,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm" % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna"
+                             % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -141,7 +150,8 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
-        self._seq = [regex.compile(x) for x in JOYAI_PATTERNS] if pre == "joyai-llm" else None
+        seq = JOYAI_PATTERNS if pre == "joyai-llm" else LAGUNA_PATTERNS if pre == "laguna" else None
+        self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:

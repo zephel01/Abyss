@@ -121,6 +121,23 @@ struct Glm5Geometry {
     bool q4x = false;
     int hc_lr = 320;
     static bool from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+    // ---- laguna (poolside Laguna-S-2.1, llama.cpp src/models/laguna.cpp; src/core/qwen35_fast_path.cu's laguna
+    // branches, kernels/laguna_fast.hpp): arch stays 2 with laguna set - every layer attention (no delta-net), head_dim
+    // 128, q heads per layer (lag_heads; n_head their maximum), a per-head softplus output gate (attn_gate), q / k
+    // norms, NEOX RoPE: the full layers n_rot dims of rope_base with YaRN (yarn_*), the sliding-window layers (lag_swa,
+    // window n_swa) n_rot_swa dims of rope_base_swa plain; pre-norms attn_norm / ffn_norm; dense_lead dense FFN layers;
+    // a sigmoid router with exp_probs_b (gating 0, normalised, w_scale); an ungated shared expert; no NextN
+    bool laguna = false;
+    std::vector<int> lag_heads;
+    std::vector<char> lag_swa;
+    float rope_base_swa = 10000.0f;
+    int n_rot_swa = 128;
+    static constexpr int kLagSlice = 2048;   // the prompt path's attention rows a pass (a window layer's ring slack)
+    /// a layer's KV cache rows for a context: a window layer a ring of n_swa + kLagSlice rows, else the context
+    int64_t lag_rows(int il, int64_t ctx) const {
+        return lag_swa[(size_t) il] ? std::min<int64_t>(ctx, (int64_t) n_swa + kLagSlice) : ctx;
+    }
+    static bool from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
@@ -535,6 +552,7 @@ public:
     bool fast_qwen35_layers(int64_t p, std::string& err);  // fast_layers for this arch, head_x / head_xq at the end
     bool fast_qwen35_gdn(int il, std::string& err);        // x / xq -> mixer
     bool fast_qwen35_attn(int il, int64_t p, std::string& err);
+    bool fast_laguna_attn(int il, int64_t p, std::string& err);   // laguna's attention layer (x / xq -> mixer)
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);

@@ -30,6 +30,7 @@
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
+#include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -745,6 +746,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                 deq_ok(Ly.aq, "attn_q", il);
                 deq_ok(Ly.ak, "attn_k", il);
                 deq_ok(Ly.av, "attn_v", il);
+                if (g.laguna) deq_ok(Ly.lag_g, "attn_gate", il);
             }
         } else if (g.v41) {
             // deepseek41: the attention's projections batched (prefill_v41_mixer) when every one dequantizes, else
@@ -2931,6 +2933,38 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             } else if (g.dsv4()) {
                 if (!prefill_ds4_mixer(il, p0 + t0, tn, x16, xs, mixer, skip_output, (void*) S->uni, err)) return false;
+            } else if (g.laguna) {
+                // laguna (fast_laguna_attn over the sub-batch's rows): the projections and the gate's logits (in qf's
+                // second half), then prep + attention in slices of kLagSlice rows (a window layer's ring keeps window +
+                // a slice), the per-head softplus gate, attn_output
+                namespace lk = strata::kernels::lag;
+                Carve c{S->uni};
+                Q35Bufs B = carve_q35(c, (size_t) tn, g);
+                const int64_t pt0 = p0 + t0;
+                const int D = lk::kHeadDim, H = Ly.lag_heads, HDq = H * D, KV = g.attn_head_kv * D;
+                float* gl = B.qf + (size_t) tn * HDq;
+                hgemm_q(Ly.aq, HDq, E, x16, E, B.qf, HDq, tn, 0.0f);
+                hgemm_q(Ly.ak, KV, E, x16, E, B.k, KV, tn, 0.0f);
+                hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
+                hgemm_q(Ly.lag_g, H, E, x16, E, gl, H, tn, 0.0f);
+                S->mark("lag_proj", s);
+                const bool swa = Ly.lag_swa;
+                for (int a = 0; a < tn; a += Glm5Geometry::kLagSlice) {
+                    const int an = std::min(Glm5Geometry::kLagSlice, tn - a);
+                    lk::attn_prep_rows(B.qf + (size_t) a * HDq, B.k + (size_t) a * KV, B.v + (size_t) a * KV, Ly.q_norm,
+                                       Ly.k_norm, g.norm_eps, H, g.attn_head_kv, swa ? g.n_rot_swa : g.n_rot,
+                                       swa ? F->lag_freq_swa : F->lag_freq, swa ? F->lag_mscale_swa : F->lag_mscale,
+                                       pt0 + a, an, Ly.lag_ring, Ly.kc, Ly.vc, B.q + (size_t) a * HDq, s);
+                    lk::attn(B.q + (size_t) a * HDq, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, pt0 + a, an,
+                             swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), nullptr, 1, B.ao + (size_t) a * HDq, s);
+                }
+                lk::gate_rows(B.ao, gl, tn, H, s);
+                S->mark("lag_attn", s);
+                if (t0 + tn == T) dump_row("attn_gated-" + std::to_string(il), B.ao, HDq, tn - 1);
+                if (!skip_output) {
+                    gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
+                    hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
+                }
             } else if (g.qwen35()) {
                 // qwen35moe: the token path's layers over the sub-batch's rows (qwen35_fast_path.cu's order), the
                 // recurrence and the conv carrying their state across sub-batches, the caches' rows written in order

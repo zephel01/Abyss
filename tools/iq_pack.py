@@ -149,7 +149,13 @@ QWEN4EXP_FAST_NATIVE_OK = QWEN35MOE_NATIVE_OK + (
 # qwen35 (dense Qwen3.5 / Qwen3.8-27B): qwen35moe's set with the dense FFN in place of the experts - every tensor is
 # served as stored; the pack has no experts (native_experts.txt keeps only its header, which names the shards)
 QWEN35_NATIVE_OK = QWEN35MOE_NATIVE_OK + ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight")
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35")   # unsloth spells glm5-next without the hyphen
+# laguna (poolside Laguna-S-2.1): every non-expert tensor served as stored (Q8_0 projections, the per-head attn_gate,
+# the dense lead FFN, the shared expert; F32 norms / router / exp_probs_b) - nothing converted, no NextN block
+LAGUNA_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_gate.weight",
+                    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                    "token_embd.weight", "output.weight")
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -163,7 +169,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
-    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast"):
+    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -362,6 +368,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             elif arch == "qwen35" and not name.endswith(QWEN35_NATIVE_OK):
                 print("%s is %s: not on the qwen35 native set (QWEN35_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
+            elif arch == "laguna" and not name.endswith(LAGUNA_NATIVE_OK):
+                print("%s is %s: not on the laguna native set (LAGUNA_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
             elif arch == "qwen4exp-fast" and not name.endswith(QWEN4EXP_FAST_NATIVE_OK):
@@ -639,12 +649,16 @@ def main() -> int:
         prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
         print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
               "gate remains closed until the pack wiring lands - docs/maya/GLM5-FLASH.md §9)" % arch)
+    if arch == "laguna":
+        prefix = "laguna."
+        print("laguna: packing for the Glm5Model runner's qwen35moe path, laguna layers (every dense tensor served as "
+              "stored)")
     if arch in ("qwen35moe", "qwen35"):
         prefix = arch + "."
         print("%s: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -729,7 +743,7 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)

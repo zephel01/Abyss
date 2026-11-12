@@ -1335,7 +1335,9 @@ class Service:
         # GLM ends an assistant turn with the next role's token (<|user|> / <|observation|>): the engine stops on it,
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
-                            _special_ids("<|observation|>") + _special_ids("<\uff5cend\u2581of\u2581sentence\uff5c>"))
+                            _special_ids("<|observation|>") + _special_ids("<\uff5cend\u2581of\u2581sentence\uff5c>") +
+                            # (Laguna: an assistant turn ends with </assistant>, a document with its EOS)
+                            _special_ids("</assistant>") + _special_ids("\u3008|EOS|\u3009"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]

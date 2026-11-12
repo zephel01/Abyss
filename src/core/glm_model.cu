@@ -558,6 +558,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
     if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count")) return from_gguf_qwen35(g, out, err);
     if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err);
+    if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -758,6 +759,113 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
         const int every = (int) num("full_attention_interval", 4);
         for (int il = 0; il < out.n_layers; ++il) out.n_head_kv[(size_t) il] = (il + 1) % every == 0 ? out.attn_head_kv : 0;
     }
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
+    return true;
+}
+
+// laguna: the hparams llama.cpp's loader reads (src/models/laguna.cpp load_arch_hparams) with Laguna-S-2.1's values as
+// defaults.  On the qwen35moe path (arch 2) with laguna set: n_head_kv[il] the KV heads of every layer (no delta-net),
+// lag_heads the q heads per layer (attention.head_count may be an array), the window layers by
+// attention.sliding_window_pattern (an array, or a period: a layer is full when il % period == 0), gating 0 (sigmoid
+// with exp_probs_b), the dense lead layers' FFN feed_forward_length wide
+bool Glm5Geometry::from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "laguna.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    out.arch = 2;
+    out.laguna = true;
+    out.hc = 1;
+    out.n_embd = (int) num("embedding_length", 3072);
+    const int block_count = (int) num("block_count", 48);
+    out.nextn = 0;
+    out.n_layers = block_count;
+    out.attn_head_kv = (int) num("attention.head_count_kv", 8);
+    out.head_dim = (int) num("attention.key_length", 128);
+    const int v_len = (int) num("attention.value_length", 128);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+    out.n_rot = (int) num("rope.dimension_count", 64);
+    out.n_rot_swa = (int) num("rope.dimension_count_swa", out.head_dim);
+    out.rope_base = (float) num("rope.freq_base", 500000.0);
+    out.rope_base_swa = (float) num("rope.freq_base_swa", out.rope_base);
+    out.n_swa = (int) num("attention.sliding_window", 0);
+    // YaRN (rope.scaling.type yarn): the full layers only
+    const auto* st = g.get(p + "rope.scaling.type");
+    const bool yarn = st != nullptr && st->type == strata::MetaType::STRING && st->s == "yarn";
+    out.yarn_factor = yarn ? (float) num("rope.scaling.factor", 1.0) : 1.0f;
+    out.yarn_orig_ctx = (int) num("rope.scaling.original_context_length", 8192);
+    out.yarn_beta_fast = (float) num("rope.scaling.yarn_beta_fast", 32.0);
+    out.yarn_beta_slow = (float) num("rope.scaling.yarn_beta_slow", 1.0);
+    out.n_expert = (int) num("expert_count", 256);
+    out.n_exp_used = (int) num("expert_used_count", 10);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 1024);
+    out.n_ff_shexp = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
+    out.n_shared = out.n_ff_shexp > 0 ? 1 : 0;
+    out.n_ff_dense = (int) num("feed_forward_length", 12288);
+    out.dense_lead = (int) num("leading_dense_block_count", 1);
+    out.gating = (int) num("expert_gating_func", 2) == 2 ? 0 : -1;   // (llama.cpp's 2 = sigmoid)
+    out.w_scale = (float) num("expert_weights_scale", 1.0);
+    out.norm_w = (int) num("expert_weights_norm", 1) != 0 ? 1 : 0;
+    out.swiglu_exp = out.swiglu_shexp = INFINITY;
+    // no delta-net layers: the GDN scratch at its smallest (qwen35_alloc sizes a few buffers by it)
+    out.ssm_state = 32;
+    out.ssm_k_heads = out.ssm_v_heads = 1;
+    out.ssm_inner = 32;
+    out.d_conv = 4;
+    out.kda_head_dim = out.head_dim;
+    if (const auto* v = g.get("tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
+        out.n_vocab = (int) v->count;
+    else
+        out.n_vocab = 100352;
+    // the q heads per layer
+    out.lag_heads.assign((size_t) out.n_layers, (int) num("attention.head_count", 48));
+    if (const auto* v = g.get(p + "attention.head_count"); v && v->type == strata::MetaType::ARRAY) {
+        if (v->items.size() < (size_t) out.n_layers) {
+            err = "laguna: attention.head_count lists fewer heads than layers";
+            return false;
+        }
+        for (int il = 0; il < out.n_layers; ++il) out.lag_heads[(size_t) il] = (int) v->items[(size_t) il].num();
+    }
+    out.n_head = *std::max_element(out.lag_heads.begin(), out.lag_heads.end());
+    // the window layers
+    out.lag_swa.assign((size_t) out.n_layers, 0);
+    if (out.n_swa > 0) {
+        const auto* v = g.get(p + "attention.sliding_window_pattern");
+        if (v != nullptr && v->type == strata::MetaType::ARRAY) {
+            if (v->items.size() < (size_t) out.n_layers) {
+                err = "laguna: attention.sliding_window_pattern lists fewer entries than layers";
+                return false;
+            }
+            for (int il = 0; il < out.n_layers; ++il) out.lag_swa[(size_t) il] = v->items[(size_t) il].u != 0;
+        } else {
+            const int period = std::max(1, (int) num("attention.sliding_window_pattern", 4));
+            for (int il = 0; il < out.n_layers; ++il) out.lag_swa[(size_t) il] = il % period != 0;
+        }
+    }
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_embd % 256 != 0 || out.n_expert <= 0 || out.n_expert > 512 ||
+        out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK || out.gating != 0) {
+        err = "laguna: block_count / embedding_length / expert_count / expert_used_count / expert_gating_func are off";
+        return false;
+    }
+    if (out.n_shared != 0 && out.n_ff_shexp != out.n_ff_exp) {
+        err = "laguna: the shared expert's width differs from the experts' (not supported)";
+        return false;
+    }
+    if (out.head_dim != 128 || v_len != 128 || out.n_rot <= 0 || out.n_rot > 128 || out.n_rot % 2 != 0 ||
+        out.n_rot_swa <= 0 || out.n_rot_swa > 128 || out.n_rot_swa % 2 != 0) {
+        err = "laguna: the attention kernels take head_dim 128 and even n_rot <= 128";
+        return false;
+    }
+    for (int il = 0; il < out.n_layers; ++il)
+        if (out.lag_heads[(size_t) il] <= 0 || out.lag_heads[(size_t) il] % out.attn_head_kv != 0) {
+            err = "laguna: a layer's head_count is not a multiple of head_count_kv";
+            return false;
+        }
+    out.n_head_kv.assign((size_t) out.n_layers, out.attn_head_kv);
     out.indexer_full.assign((size_t) out.n_layers, 1);
     out.comp_ratio.assign((size_t) out.n_layers, 0);
     return true;

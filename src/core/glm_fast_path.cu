@@ -839,7 +839,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers) && !g.qwen35()) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
+            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
             Ly.sh_down = q("ffn_down_shexp.weight");

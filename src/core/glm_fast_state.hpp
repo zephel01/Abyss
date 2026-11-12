@@ -420,6 +420,11 @@ struct Glm5Model::FastState {
         const float *q_norm = nullptr, *k_norm = nullptr, *post_norm = nullptr, *sh_gate_w = nullptr;
         float *gdn_state = nullptr, *gdn_conv = nullptr;            // (S x h_v x S), (C x (d_conv - 1))
         uint16_t *kc = nullptr, *vc = nullptr;                      // the KV cache, FP16 [ctx][attn_head_kv][head_dim]
+        // ---- laguna (qwen35_fast_path.cu): the q heads, a window layer, the cache's rows (a ring for a window
+        // layer: position j in row j % lag_ring), attn_gate (n_embd -> heads)
+        int lag_heads = 0, lag_ring = 0;
+        bool lag_swa = false;
+        WSlot lag_g;
         // ---- qwen4exp (q4x, qwen35_fast_path.cu): the hyper-connections' mixers, [0] the attention's, [1] the FFN's
         struct Hc4 {
             const float* norm = nullptr;                            // the grouped norm's gamma [hc][n_embd]
@@ -467,6 +472,10 @@ struct Glm5Model::FastState {
           *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr, *q35_q = nullptr,
           *q35_ao = nullptr, *q35_part = nullptr, *q35_shg = nullptr;
     void *q35_yq = nullptr, *q35_aoq = nullptr;
+    // laguna: the RoPE pair frequencies (float64, full layers then window layers), the gate's logits
+    double *lag_freq = nullptr, *lag_freq_swa = nullptr;
+    float lag_mscale = 1.0f, lag_mscale_swa = 1.0f;
+    float* lag_gl = nullptr;
     // ---- qwen4exp activations: the normed streams, the low rank, the gate, the injections ([0] attention, [1] FFN:
     // each lives until its combine, the FFN's into the next layer)
     float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};

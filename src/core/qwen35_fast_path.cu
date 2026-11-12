@@ -19,6 +19,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
+#include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/rope.hpp"
 
 #include "ggml.h"
@@ -82,7 +83,20 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         }
     } else {
         Ly.attn_norm = f32("attn_norm.weight");
-        Ly.post_norm = f32("post_attention_norm.weight");
+        Ly.post_norm = f32(g.laguna ? "ffn_norm.weight" : "post_attention_norm.weight");   // (laguna: pre-norms only)
+    }
+    if (g.laguna) {   // every layer attention: q (no gate half), k, v, the per-head gate, out; q / k norms
+        const int H = g.lag_heads[(size_t) il];
+        Ly.lag_heads = H;
+        Ly.lag_swa = g.lag_swa[(size_t) il] != 0;
+        Ly.aq = q("attn_q.weight", E, (int64_t) H * D);
+        Ly.ak = q("attn_k.weight", E, (int64_t) g.attn_head_kv * D);
+        Ly.av = q("attn_v.weight", E, (int64_t) g.attn_head_kv * D);
+        Ly.lag_g = q("attn_gate.weight", E, H);
+        Ly.out = q("attn_output.weight", (int64_t) H * D, E);
+        Ly.q_norm = f32("attn_q_norm.weight");
+        Ly.k_norm = f32("attn_k_norm.weight");
+        return;
     }
     if (Ly.recr) {
         Ly.qkv = q("attn_qkv.weight", E, C);
@@ -157,8 +171,20 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     const size_t state_b = al(S * HV * S * 4), conv_b = al(C * (size_t) (g.d_conv - 1) * 4), cache_b = al(ctx * row_k) + al(ctx * row_v);
     int n_rec = 0, n_attn = 0;
     for (int il = l0_; il < lt_; ++il) (F->L[(size_t) il].recr ? n_rec : n_attn) += 1;   // (lt_: the NextN block too)
-    const size_t part = q35::attn_part_floats(g.n_head, g.head_dim, (int) ctx);
+    // laguna: head_dim 128, its own attention scratch (key splits of 256 a token, up to kLagSplits), a window layer's
+    // cache a ring (Glm5Geometry::lag_rows), the RoPE tables and the gate's logits
+    const size_t part = g.laguna ? strata::kernels::lag::attn_part_floats(1, g.n_head, strata::kernels::lag::kMaxSplits)
+                                 : q35::attn_part_floats(g.n_head, g.head_dim, (int) ctx);
     size_t bytes = (size_t) n_rec * (state_b + conv_b) + (size_t) n_attn * cache_b;
+    size_t lag_cache = 0;
+    if (g.laguna) {
+        bytes -= (size_t) n_attn * cache_b;
+        for (int il = l0_; il < l1_; ++il) {
+            const size_t rows = (size_t) g.lag_rows(il, (int64_t) ctx);
+            lag_cache += 2 * al(rows * KV * 2);
+        }
+        bytes += lag_cache + 2 * al(64 * 8) + al((size_t) g.n_head * 4);
+    }
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
@@ -187,6 +213,10 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         if (Ly.recr) {
             Ly.gdn_state = (float*) take(S * HV * S * 4);
             Ly.gdn_conv = (float*) take(C * (size_t) (g.d_conv - 1) * 4);
+        } else if (g.laguna) {
+            Ly.lag_ring = (int) g.lag_rows(il, (int64_t) ctx);
+            Ly.kc = (uint16_t*) take((size_t) Ly.lag_ring * KV * 2);
+            Ly.vc = (uint16_t*) take((size_t) Ly.lag_ring * KV * 2);
         } else {
             Ly.kc = (uint16_t*) take(ctx * row_k);
             Ly.vc = (uint16_t*) take(ctx * row_v);
@@ -208,6 +238,18 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     F->q35_aoq = take(HD / 32 * 36);
     F->q35_part = (float*) take(part * 4);
     F->q35_shg = (float*) take(256);
+    if (g.laguna) {
+        F->lag_freq = (double*) take(64 * 8);
+        F->lag_freq_swa = (double*) take(64 * 8);
+        F->lag_gl = (float*) take((size_t) g.n_head * 4);
+        double fr[64], fs[64];
+        namespace lk = strata::kernels::lag;
+        lk::rope_freqs(g.n_rot, g.rope_base, 1.0 / g.yarn_factor, g.yarn_orig_ctx, g.yarn_beta_fast, g.yarn_beta_slow, fr,
+                       F->lag_mscale);
+        lk::rope_freqs(g.n_rot_swa, g.rope_base_swa, 1.0, g.yarn_orig_ctx, 0.0, 0.0, fs, F->lag_mscale_swa);
+        cudaMemcpy(F->lag_freq, fr, (size_t) g.n_rot / 2 * 8, cudaMemcpyHostToDevice);
+        cudaMemcpy(F->lag_freq_swa, fs, (size_t) g.n_rot_swa / 2 * 8, cudaMemcpyHostToDevice);
+    }
     if (g.q4x) {
         F->q4_xn = (float*) take(HE * 4);
         F->q4_xnq = take(HE / 32 * 36);
@@ -235,6 +277,11 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
             return false;
         }
     }
+    if (g.laguna)
+        std::fprintf(stderr, "laguna: CUDA%d %d attention layers (KV caches %.2f GB for %lld tokens, window layers' rings "
+                             "%lld rows)\n", dev_, n_attn, (double) lag_cache / 1073741824.0, (long long) ctx,
+                     (long long) std::min<int64_t>((int64_t) ctx, (int64_t) g.n_swa + Glm5Geometry::kLagSlice));
+    else
     std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
                          "for %lld tokens%s)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
                  (double) n_attn * cache_b / 1073741824.0, (long long) ctx,
@@ -549,9 +596,15 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     // a block finds its earlier cells' keys there, not the later positions' that overwrote them)
     const size_t tail_b = (size_t) 3 * g.idx_key * sizeof(float);
     size_t total = pend_b + ple_b;
+    // laguna: a window layer's ring (the rows a later position overwrites; the full layers' rows past the snapshot are
+    // written again in order)
+    const auto ring_b = [&](const FastState::Layer& Ly) {
+        return Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * 128 * 2 : (size_t) 0;
+    };
     for (int il = l0_; il < l1_; ++il) {
         if (F->L[(size_t) il].recr) total += state_b + conv_b;
         else if (F->L[(size_t) il].q4_tail != nullptr) total += tail_b;
+        total += 2 * ring_b(F->L[(size_t) il]);
     }
     if (q35_snap_h_ == nullptr) {
         if (restore) return false;
@@ -571,6 +624,10 @@ bool Glm5Model::q35_snap_copy(bool restore) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.recr) {
             if (Ly.q4_tail != nullptr) run(Ly.q4_tail, tail_b);
+            if (ring_b(Ly) > 0) {
+                run(Ly.kc, ring_b(Ly));
+                run(Ly.vc, ring_b(Ly));
+            }
             continue;
         }
         run(Ly.gdn_state, state_b);
@@ -1178,6 +1235,52 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     return true;
 }
 
+// laguna's attention layer (llama.cpp src/models/laguna.cpp): q / k / v and the gate's logits from x (attn_norm'd), q /
+// k normed and rotated (the full layers: n_rot dims, YaRN; the window layers: n_rot_swa dims, plain), K / V into the
+// cache (a window layer's ring), attention over the window (or every position), each head times softplus(its gate
+// logit), attn_output -> mixer
+bool Glm5Model::fast_laguna_attn(int il, int64_t p64, std::string& err) {
+    namespace lk = strata::kernels::lag;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, D = lk::kHeadDim, H = Ly.lag_heads, HD = H * D, KV = g.attn_head_kv * D;
+    gf::MvJob j[4];
+    j[0] = {Ly.aq.q, F->xq, F->x, F->q35_qf, nullptr, 1.0f, Ly.aq.type, E, HD};
+    j[1] = {Ly.ak.q, F->xq, F->x, F->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
+    j[2] = {Ly.av.q, F->xq, F->x, F->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
+    j[3] = {Ly.lag_g.q, F->xq, F->x, F->lag_gl, nullptr, 1.0f, Ly.lag_g.type, E, H};
+    if (!gf::mv(j, 4, s)) { err = "laguna: the attention projections"; return false; }
+    if (F->prof_on) F->mark("lag_attn_mv");
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    if (dumps) {
+        q35_dump(s, "Qcur", il, F->q35_qf, HD);
+        q35_dump(s, "Kcur", il, F->q35_k, KV);
+        q35_dump(s, "Vcur", il, F->q35_v, KV);
+        q35_dump(s, "attn_gate_proj", il, F->lag_gl, H);
+    }
+    const bool swa = Ly.lag_swa;
+    lk::attn_prep_rows(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv,
+                       swa ? g.n_rot_swa : g.n_rot, swa ? F->lag_freq_swa : F->lag_freq,
+                       swa ? F->lag_mscale_swa : F->lag_mscale, p64, 1, Ly.lag_ring, Ly.kc, Ly.vc, F->q35_q, s);
+    lk::attn(F->q35_q, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, p64, 1, swa ? g.n_swa : 0,
+             1.0f / std::sqrt((float) D), F->q35_part, lk::kMaxSplits, F->q35_ao, s);
+    if (dumps) {
+        q35_dump(s, "Qcur_rope", il, F->q35_q, HD);
+        q35_dump(s, "attn_out", il, F->q35_ao, HD);
+    }
+    lk::gate_rows(F->q35_ao, F->lag_gl, 1, H, s);
+    if (F->prof_on) F->mark("lag_attend");
+    if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
+    gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
+    gf::MvJob o = {Ly.out.q, F->q35_aoq, F->q35_ao, F->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
+    if (!gf::mv(&o, 1, s)) { err = "laguna: attn_output"; return false; }
+    if (F->prof_on) F->mark("lag_attn_out");
+    if (dumps) q35_dump(s, "attn_o_proj", il, F->mixer, E);
+    return true;
+}
+
 // qwen4exp: build_hc_mix after the combine - R[c] += out * 2 sigmoid(inj_prev[c] / hc) (out == nullptr: none), xn =
 // the grouped norm, lo = silu(down . xn / hc), gate = up . lo, x = mean_c xn[c] sigmoid(gate[c]) (and its q8_1),
 // inj_out = inject . xn (nullptr: the head's mixer has none)
@@ -1269,7 +1372,9 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
             else q35_dump(s, "inp_embd", il, state_, g.n_embd);
             q35_dump(s, "attn_norm", il, F->x, g.n_embd);
         }
-        if (Ly.recr) {
+        if (g.laguna) {
+            if (!fast_laguna_attn(il, p, err)) return false;
+        } else if (Ly.recr) {
             if (!fast_qwen35_gdn(il, err)) return false;
         } else {
             if (!fast_qwen35_attn(il, p, err)) return false;
