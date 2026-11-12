@@ -10,7 +10,7 @@
                                              (--quant 24G64G: the IQ4_XS file for a 24-32 GB GPU + 64 GB RAM)
     ./setup-deepseek.sh --model ornith35     Ornith-1.5-35B-A3B, the official Q4_K_M for an 8-16 GB GPU + 32 GB RAM
     ./setup-deepseek.sh --model laguna       Laguna-S-2.1 (poolside, 118B-A8B), unsloth's UD-IQ4_XS for a 16-32 GB GPU + 64 GB RAM
-    ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for a 12 GB+ GPU (FFN partly in RAM under ~20 GB)
+    ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for an 8 GB+ GPU (FFN partly in RAM under ~20 GB)
     ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
                                              16G64G (the default) or 24G64G
@@ -65,6 +65,9 @@ DENSE27_VRAM = {8192: 21.0, 32768: 23.5, 65536: 26.0, 131072: 30.0, 262144: 40.0
 # the CPU; the GPU then needs the rest of the file, the caches and two staging buffers - the table less the FFN (9.9 GB)
 # plus 0.4 GB (RTX 5090 capped: 8K started at 9.0 GB with no FFN in VRAM; 12 GB 27 tok/s, 16 GB 65, 20 GB all in VRAM)
 DENSE27_FFN_GB = 9.5
+# an 8 GB card (v1.3.142): the engine also keeps the head's last rows on the CPU and loads its kernels lazily - 8K
+# only (RTX 5090 capped to 8 GB, 8K, the drafter: peak 7.8 GB, 15.7 tok/s; llama.cpp 8.0) with nothing else on the GPU
+DENSE27_SMALL = (7.5, 8192)   # (the GPU size it takes as reported, the context it gets)
 DENSE27_RAM_GB = 32   # (up to 10 GB of FFN pinned + the 6 GB headroom + the server)
 # the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
 # is a fixed set, the config's model_name, the config name's prefix, the env the model's measurements were made with,
@@ -127,7 +130,8 @@ MODELS = {
                    "folder": "", "prefix_tmpl": "Qwen3.8-27B-{q}.", "model_name": "qwen3.8-27b",
                    "prefix": "qwen38-27b", "title": "Qwen3.8-27B", "env": {}, "gb": 18, "pack_args": [],
                    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-                   "vram_ctx": DENSE27_VRAM, "ffn_gb": DENSE27_FFN_GB, "ram_min": DENSE27_RAM_GB},
+                   "vram_ctx": DENSE27_VRAM, "ffn_gb": DENSE27_FFN_GB, "ram_min": DENSE27_RAM_GB,
+                   "small_gpu": DENSE27_SMALL},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -600,6 +604,9 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
         return ctx
     # short of that: the FFN rows that do not fit in RAM, on the CPU (the context asked for, or the longest it holds)
     sctx = dense_split_context(key, vram, a.context)
+    small = model.get("small_gpu")
+    if sctx is None and ctx is None and small and vram >= small[0]:
+        sctx = small[1]   # (an 8 GB card: 8K, the head partly on the CPU too)
     if sctx is not None and (ctx is None or sctx > ctx):
         ram = S.ram_gb() if ram is None else ram
         if ram + 0.5 < model.get("ram_min", 0):
@@ -608,15 +615,18 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
                    f"a PC with {model['ram_min']} GB of RAM or more, or a GPU that holds the file (24 GB or more)")
         S.ok(f"{model['title']}: this {vram:.0f} GB GPU holds a {sctx // 1024}K context with part of the FFN in RAM "
              f"(the engine computes those rows on the CPU: slower than all in VRAM - RTX 5090 capped to 12 / 16 GB: "
-             f"~27 / ~65 tok/s with the drafter, 20 GB and up all in VRAM ~130)")
+             f"~16 / ~27 / ~65 tok/s with the drafter at 8 / 12 / 16 GB, 20 GB and up all in VRAM ~130)")
+        if small and sctx == small[1] and vram < 9.0:
+            S.warn(f"an {vram:.0f} GB GPU runs {model['title']} with ~0.2 GB to spare at 8K: keep other programs "
+                   "(a browser, the desktop on another GPU if you can) off it")
         if sctx < a.context:
             S.warn(f"--context {a.context} is longer than this GPU holds: the config gets {sctx} (a larger GPU holds more)")
         return sctx
     if ctx is None:
-        S.fail(f"{model['title']} needs a GPU with 12 GB or more: the {model['quant']} file (~{model['gb']} GB) runs "
+        S.fail(f"{model['title']} needs a GPU with 8 GB or more: the {model['quant']} file (~{model['gb']} GB) runs "
                f"from VRAM, its FFN partly from RAM, and this GPU has {vram:.0f} GB (the GPU size a context needs all "
                f"in VRAM: {table}; ~{model['ffn_gb']:.0f} GB less with the FFN in RAM)",
-               "a GPU with 12 GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or Ornith-1.5-35B-A3B "
+               "a GPU with 8 GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or Ornith-1.5-35B-A3B "
                "(--model ornith35) run from VRAM + RAM")
     S.ok(f"{model['title']}: the whole file in VRAM - this {vram:.0f} GB GPU holds a {ctx // 1024}K context "
          f"(the GPU size a context needs: {table})")
@@ -682,7 +692,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, a 12 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
                     "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: UD-Q4_K_XL; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
