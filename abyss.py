@@ -2935,6 +2935,9 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
              f"stop it ({ME} stop, or Ctrl+C in its window), then run --bench again")
     except OSError:
         pass
+    # the engine of the current sources, as a start and --check run it (issue #43: an update, then --bench first,
+    # measured the engine compiled before it)
+    refresh_engine(cfg)
     sys.path.insert(0, str(ROOT))
     import serve.server as SV                      # the server's own engine command and environment
     import strata_tokenizer as ST

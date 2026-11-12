@@ -309,6 +309,13 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("GPUs: R9700 32 GB, RX 7900 XT 20 GB", text)
         self.assertIn("GPUs [1, 0]", text)
 
+    def test_bench_compiles_a_changed_engine_first(self):
+        # issue #43: after an update --bench ran the engine compiled before it (a start and --check refresh it)
+        with patch.object(maya, "refresh_engine") as refresh:
+            self.run_bench(self.installed_config())
+        refresh.assert_called_once()
+        self.assertEqual(refresh.call_args.args[0]["exe"], str(self.root / "build-hip/strata"))
+
     def test_bench_cuda_command_and_env_unchanged(self):
         path = self.installed_config(backend="cuda", gpu=[1, 0])
         cfg = json.loads(path.read_text())
