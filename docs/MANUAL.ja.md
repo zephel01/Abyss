@@ -79,14 +79,22 @@ zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリ�
 ```sh
 ./setup-deepseek.sh --model ornith --quant 24G64G --download-model   # Ornith-1.5-122B-IQ4_XS-24G64G（68.9 GB）
 ./setup-deepseek.sh --model qwen38 --quant 12G32G --download-model   # Qwen3.8-Flash-Next-E448-IQ2_M-12G32G（67.5 GB）
-./setup-deepseek.sh --model qwen38 --download-model                  # Qwen3.8-Flash-Next-IQ3_M-16G64G（86.9 GB）
+./setup-deepseek.sh --model qwen38 --quant 16G64G --download-model   # Qwen3.8-Flash-Next-IQ3_M-16G64G（86.9 GB）
 ./setup-deepseek.sh --model qwen38 --quant 24G64G --download-model   # Qwen3.8-Flash-Next-IQ3_M-24G64G（93.7 GB）
-./setup-deepseek.sh --model glm --download-model                     # GLM-5.3-Flash-IQ2_XS-32G96G（94.1 GB）
+./setup-deepseek.sh --model glm --quant 32G96G --download-model      # GLM-5.3-Flash-IQ2_XS-32G96G（94.1 GB）
 ./setup-deepseek.sh --model glm --quant 32G128G --download-model     # GLM-5.3-Flash-IQ3_XXS-32G128G（127.9 GB）
 ./setup-deepseek.sh --quant 16G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ1_S-16G64G（61.7 GB）
 ./setup-deepseek.sh --quant 32G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G（72.0 GB）
 ./setup-deepseek.sh --quant 32G96G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_M-32G96G（96.8 GB）
 ```
+
+`--quant` を付けないと、この PC に合う大きさを選ぶ。GPU の大きさがこの GPU の VRAM に、RAM の大きさがこの PC の RAM に収まる
+いちばん大きいファイルを、ほかの候補と並べて表示し（`this PC: 16 GB GPU + 62 GB RAM -> --quant 16G64G (the others: 12G32G,
+24G64G)`）、それを既定にして確認する（`--yes` ならそのまま）。Ryzen AI Max のような APU は共有メモリを 1 回だけ、RAM として数える。
+どれも収まらないときは最小のファイルにして、その理由（SSD から読む分が増えて遅い）を出す。Ornith は 122B のファイルから選び、
+397B も収まるときは注記で知らせる。前に入れた大きさ（その `abyss-<名前>.json` がある）はそのまま使うので、セットアップを
+もう一度実行しても別のダウンロードは始まらない。DeepSeek V4 は既定の unsloth `UD-Q2_K_XL` のままで、この PC に合う
+zephel01 のファイルを知らせるだけ。`--quant` を付ければいつもそれが優先。
 
 `setup-deepseek.sh` は `.venv` を作ってから `tools/abyss_setup.py` を実行する。済んだ手順は飛ばすので、何度実行してもよい:
 

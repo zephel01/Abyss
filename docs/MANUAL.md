@@ -81,14 +81,22 @@ off for the V4 sizes, which run faster without it on a discrete GPU):
 ```sh
 ./setup-deepseek.sh --model ornith --quant 24G64G --download-model   # Ornith-1.5-122B-IQ4_XS-24G64G (68.9 GB)
 ./setup-deepseek.sh --model qwen38 --quant 12G32G --download-model   # Qwen3.8-Flash-Next-E448-IQ2_M-12G32G (67.5 GB)
-./setup-deepseek.sh --model qwen38 --download-model                  # Qwen3.8-Flash-Next-IQ3_M-16G64G (86.9 GB)
+./setup-deepseek.sh --model qwen38 --quant 16G64G --download-model   # Qwen3.8-Flash-Next-IQ3_M-16G64G (86.9 GB)
 ./setup-deepseek.sh --model qwen38 --quant 24G64G --download-model   # Qwen3.8-Flash-Next-IQ3_M-24G64G (93.7 GB)
-./setup-deepseek.sh --model glm --download-model                     # GLM-5.3-Flash-IQ2_XS-32G96G (94.1 GB)
+./setup-deepseek.sh --model glm --quant 32G96G --download-model      # GLM-5.3-Flash-IQ2_XS-32G96G (94.1 GB)
 ./setup-deepseek.sh --model glm --quant 32G128G --download-model     # GLM-5.3-Flash-IQ3_XXS-32G128G (127.9 GB)
 ./setup-deepseek.sh --quant 16G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ1_S-16G64G (61.7 GB)
 ./setup-deepseek.sh --quant 32G64G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_XXS-32G64G (72.0 GB)
 ./setup-deepseek.sh --quant 32G96G --download-model                  # DeepSeek-V4-Flash-0731-IQ2_M-32G96G (96.8 GB)
 ```
+
+Without `--quant`, the setup picks the size for this PC: the largest file whose GPU size fits this GPU's VRAM and whose
+RAM size fits this PC's RAM (an APU such as Ryzen AI Max counts its shared memory once, as RAM), shows it with the
+others (`this PC: 16 GB GPU + 62 GB RAM -> --quant 16G64G (the others: 12G32G, 24G64G)`) and asks, that one the
+default (`--yes` takes it). When nothing fits, it takes the smallest and says so (more of it read from the SSD: slower).
+Ornith picks among the 122B files and names the 397B one in a note when it fits too. A size set up before (its
+`abyss-<name>.json` there) is kept, so running the setup again does not start another download. DeepSeek V4 keeps
+unsloth's `UD-Q2_K_XL` as the default and only names the zephel01 file that suits this PC. `--quant` always wins.
 
 `setup-deepseek.sh` makes the `.venv`, then runs `tools/abyss_setup.py`. Each step is skipped when it is already done,
 so it can be run again at any time:

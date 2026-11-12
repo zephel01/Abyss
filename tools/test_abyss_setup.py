@@ -52,6 +52,120 @@ class AbyssTools(unittest.TestCase):
 
 
 
+class PickQuant(unittest.TestCase):
+    """fit_quant / pc_memory / choose_quant: the PC-size file for this PC's VRAM + RAM, with the sizes GPUs and RAM
+    report (a 16 GB card 15.9, a 64 GB PC ~62)."""
+    PCS = {"12/32": (11.99, 31.1), "16/64": (15.92, 62.5), "24/64": (23.99, 62.5), "32/96": (31.84, 93.9),
+           "32/128": (31.84, 125.6), "32/123": (31.84, 123.0)}
+
+    def pick(self, key, pc):
+        vram, ram = self.PCS[pc]
+        return A.fit_quant(key, vram, ram)
+
+    def test_qwen38(self):
+        self.assertEqual(self.pick("qwen38", "12/32")["quant"], "12G32G")
+        self.assertEqual(self.pick("qwen38", "16/64")["quant"], "16G64G")
+        self.assertEqual(self.pick("qwen38", "16/64")["others"], ["12G32G", "24G64G"])
+        self.assertEqual(self.pick("qwen38", "24/64")["quant"], "24G64G")
+        self.assertEqual(self.pick("qwen38", "32/128")["quant"], "24G64G")
+
+    def test_v4(self):
+        r = self.pick("v4", "12/32")
+        self.assertEqual((r["quant"], r["fits"]), ("16G64G", False))   # the smallest, and why
+        self.assertEqual(self.pick("v4", "16/64")["quant"], "16G64G")
+        self.assertEqual(self.pick("v4", "24/64")["quant"], "16G64G")
+        self.assertEqual(self.pick("v4", "32/96")["quant"], "32G96G")
+        self.assertEqual(self.pick("v4", "32/128")["quant"], "32G96G")
+
+    def test_glm(self):
+        self.assertEqual(self.pick("glm", "16/64"), {"quant": "32G96G", "fits": False, "others": ["32G128G"],
+                                                     "extra": None})
+        self.assertEqual(self.pick("glm", "32/96")["quant"], "32G96G")
+        self.assertEqual(self.pick("glm", "32/128")["quant"], "32G128G")
+        self.assertEqual(self.pick("glm", "32/123")["quant"], "32G128G")   # 128 GB with an iGPU's carve-out
+
+    def test_ornith_keeps_the_122b_and_names_the_397b(self):
+        r = self.pick("ornith", "12/32")
+        self.assertEqual((r["quant"], r["fits"], r["extra"]), ("IQ3_XXS-B", False, None))
+        r = self.pick("ornith", "16/64")
+        self.assertEqual((r["quant"], r["fits"], r["extra"]), ("IQ3_XXS-B", True, "16G64G"))
+        self.assertEqual(r["others"], ["24G64G"])                         # the 397B ones are not among them
+        self.assertEqual(self.pick("ornith", "24/64")["quant"], "24G64G")
+        r = self.pick("ornith", "32/128")
+        self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
+
+    def test_models_without_pc_sizes(self):
+        for key in ("v41", "ornith35", "qwen35"):
+            self.assertIsNone(A.fit_quant(key, 32, 96))
+
+    def test_no_gpu(self):
+        vram, ram, shared = A.pc_memory([], 62.5)
+        self.assertEqual((vram, shared), (0.0, False))
+        r = A.fit_quant("qwen38", vram, ram, shared)
+        self.assertEqual((r["quant"], r["fits"]), ("12G32G", False))
+
+    def test_apu_counts_the_memory_once(self):
+        # a Ryzen AI Max+ 395 with 128 GB: a 512 MB carve-out (~125 GB to the OS) or 96 GB of it (~31 GB to the OS)
+        for vram_gb, ram in ((0.5, 125.0), (96.0, 31.0)):
+            g = {"index": 0, "name": "AMD Radeon 8060S Graphics", "arch": "gfx1151", "vram_gb": vram_gb,
+                 "vendor": "amd", "driver": "amdgpu"}
+            vram, total, shared = A.pc_memory([g], ram)
+            self.assertEqual((vram, shared), (0.0, True))
+            self.assertAlmostEqual(total, ram + vram_gb)
+            self.assertEqual(A.fit_quant("qwen38", vram, total, shared)["quant"], "24G64G")
+            self.assertEqual(A.fit_quant("v4", vram, total, shared)["quant"], "32G96G")
+            self.assertEqual(A.fit_quant("glm", vram, total, shared)["quant"], "32G96G")
+            r = A.fit_quant("ornith", vram, total, shared)
+            self.assertEqual((r["quant"], r["extra"]), ("24G64G", "16G64G"))
+        # DGX Spark: its "VRAM" is the RAM itself
+        spark = {"index": 0, "name": "NVIDIA GB10", "arch": "121", "vram_gb": 119.7, "integrated": True}
+        self.assertEqual(A.pc_memory([spark], 119.7), (0.0, 119.7, True))
+
+    def test_split_cards_add_up(self):
+        cards = [{"index": 0, "name": "RTX 3090", "vram_gb": 23.99}, {"index": 1, "name": "RTX 3090", "vram_gb": 23.99}]
+        vram, _, shared = A.pc_memory(cards, 62.5)
+        self.assertEqual((round(vram), shared), (48, False))
+
+    def choose(self, key, quant=None, yes=True, name=None, have=(), ram=62.5, vram=15.92):
+        a = Namespace(quant=quant, yes=yes, name=name)
+        said = []
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)), \
+                mock.patch.object(A.S, "ram_gb", return_value=ram), \
+                mock.patch.object(A.S, "say", side_effect=lambda *x: said.append(" ".join(map(str, x)))):
+            for q in have:
+                (Path(d) / f"abyss-{A.MODELS[key]['prefix']}-{q.lower()}.json").write_text("{}", encoding="utf-8")
+            got = A.choose_quant(a, key, [{"index": 0, "name": "GPU", "vram_gb": vram}])
+        return got, "\n".join(said)
+
+    def test_choose_takes_the_fit_with_yes(self):
+        got, said = self.choose("qwen38")
+        self.assertEqual(got, "16G64G")
+        self.assertIn("this PC: 16 GB GPU + 62 GB RAM -> --quant 16G64G (the others: 12G32G, 24G64G)", said)
+        got, said = self.choose("ornith")
+        self.assertEqual(got, "IQ3_XXS-B")
+        self.assertIn("Ornith-1.5-397B fits this PC too: --quant 16G64G", said)
+
+    def test_explicit_quant_wins(self):
+        self.assertEqual(self.choose("qwen38", quant="12G32G"), ("12G32G", ""))
+
+    def test_v4_keeps_its_default_and_names_the_fit(self):
+        got, said = self.choose("v4", ram=93.9, vram=31.84)
+        self.assertEqual(got, "UD-Q2_K_XL")
+        self.assertIn("--quant 32G96G is the file made for this size", said)
+
+    def test_a_file_set_up_before_is_kept(self):
+        got, said = self.choose("qwen38", have=("16G64G",), vram=23.99)
+        self.assertEqual(got, "16G64G")
+        self.assertIn("already set up here: 16G64G", said)
+        self.assertEqual(self.choose("qwen38", have=("16G64G",), vram=23.99, name="mine")[0], "24G64G")
+
+    def test_asks_with_the_fit_as_default(self):
+        with mock.patch("builtins.input", return_value=""):
+            self.assertEqual(self.choose("qwen38", yes=False, vram=23.99)[0], "24G64G")
+        with mock.patch("builtins.input", return_value="12g32g"):
+            self.assertEqual(self.choose("qwen38", yes=False)[0], "12G32G")
+
+
 class DSparkStep(unittest.TestCase):
     """dspark_step against a config in a temporary folder, the drafter 'downloaded' from a local file."""
 
