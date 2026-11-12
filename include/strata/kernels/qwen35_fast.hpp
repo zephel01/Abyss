@@ -171,4 +171,11 @@ void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_s
 /// (wtype: down's and up's type, BF16 30 or Q8_0 8; Q8_0 needs scratch of 4 T lr floats - a's down parts, the five's
 /// xn q8_1 buffer is big enough)
 
+/// The dense qwen35's CPU FFN hand-off (src/core/qwen35_dense_ram.cu).  req / ans: host-mapped (device pointers), a
+/// 64-byte header - [0] seq, [1] layer, [2] columns - then the payload.  dffn_post: `bytes` (a multiple of 16) of the
+/// columns' q8_1 x into req's payload, then the header (seq last, after a system fence); dffn_wait: waits until ans's
+/// seq is `seq`, then its first n floats into out.
+void dffn_post(const void* xq, size_t bytes, void* req, unsigned int seq, int layer, int nt, cudaStream_t s);
+void dffn_wait(const void* ans, unsigned int seq, float* out, int n, cudaStream_t s, bool add = false);
+
 }  // namespace strata::kernels::q35

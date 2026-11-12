@@ -1236,17 +1236,26 @@ bool Glm5Model::fast_dense_ffn(int il, std::string& err) {
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
-    const int E = g.n_embd, FF = g.n_ff_dense;
-    gf::MvJob j[2];
-    j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, E, FF};
-    j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, FF};
-    if (!gf::mv(j, 2, s)) { err = "qwen35: the dense FFN's gate / up"; return false; }
-    if (F->prof_on) F->mark("q35_dense_gu");
-    gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
-    gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
-    if (!gf::mv(&dn, 1, s)) { err = "qwen35: the dense FFN's down"; return false; }
-    if (F->prof_on) F->mark("q35_dense_down");
-    return true;
+    const int E = g.n_embd;
+    // the first FF rows (all of them, or a split layer's GPU part)
+    const auto rows = [&](int FF) {
+        gf::MvJob j[2];
+        j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, E, FF};
+        j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, FF};
+        if (!gf::mv(j, 2, s)) { err = "qwen35: the dense FFN's gate / up"; return false; }
+        if (F->prof_on) F->mark("q35_dense_gu");
+        gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
+        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
+        if (!gf::mv(&dn, 1, s)) { err = "qwen35: the dense FFN's down"; return false; }
+        if (F->prof_on) F->mark("q35_dense_down");
+        return true;
+    };
+    if (q35d_ram(il)) {   // (its FFN, or its last rows, in RAM: the CPU's, qwen35_dense_ram.cu)
+        if (!q35d_cpu_ffn(il, F->xq, 1, F->ffn, s, err, rows)) return false;
+        if (F->prof_on) F->mark("q35_dense_cpu");
+        return true;
+    }
+    return rows(g.n_ff_dense);
 }
 
 bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
