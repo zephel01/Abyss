@@ -110,6 +110,8 @@ bool gdn_mid(float* state, float* conv_state, const float* qkv, const float* con
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int64_t p0, int T,
                     uint16_t* kc, uint16_t* vc, float* q, cudaStream_t s, int kv = 0);
+/// the prompt attention of a head group under 16 on tensor cores (attn_prompt_tcg_kernel) - the dense qwen35 turns it on
+void attn_prompt_groups_tc(bool on);
 /// The causal attention of T queries (row t at position p0 + t, over the cache's positions <= p0 + t):
 /// out [T][n_head][head_dim].  A block takes 4 queries and one KV head's group of n_head / n_head_kv heads (8, 16 or
 /// 32 of them), a warp 1, 2 or 4 heads, a lane 8 dims; the keys stream past once a block.  head_dim 256.

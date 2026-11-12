@@ -1254,6 +1254,165 @@ __global__ void __launch_bounds__(256) attn_prompt_tc_kernel(const wh16* __restr
     }
 }
 
+// The tensor-core prompt attention for a group of G < 16 heads (Qwen3.8-27B: 6): a warp's 16 rows are 16 consecutive
+// (token, head) rows of one KV head's group - q16 laid out group-major ([n_head_kv][T][G][kD], q16_scale_grp_kernel) so
+// they sit kD apart - a block 8 warps = floor(128 / G) tokens.  The math is attn_prompt_tc_kernel's (two passes, FP16
+// operands, F32 sums), each row with its own last key; the output through the warp's score tile (rows of different
+// tokens are not kD apart in out).  grid (ceil(T / tokens a block), n_head_kv)
+__global__ void q16_scale_grp_kernel(const float* __restrict__ q, int T, int n_head, int G, float scale,
+                                     wh16* __restrict__ q16) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x, n = (size_t) T * n_head * kD;
+    if (i >= n) return;
+    const int d = (int) (i % kD), hh = (int) ((i / kD) % n_head);
+    const size_t t = i / ((size_t) kD * n_head);
+    const int g = hh / G, h = hh % G;
+    q16[(((size_t) g * T + t) * G + h) * kD + d] = to_wh16(q[i] * scale);
+}
+
+template <int KV>
+__global__ void __launch_bounds__(256) attn_prompt_tcg_kernel(const wh16* __restrict__ q16, const uint16_t* __restrict__ kc,
+                                                              const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
+                                                              int G, int64_t p0, int T, float* __restrict__ out) {
+    namespace wm = q35wm;
+    extern __shared__ __align__(128) unsigned char q35_tc_sm[];
+    wh16* sK = (wh16*) q35_tc_sm;                     // [kPB][kKP]
+    wh16* sV = sK + kPB * kKP;                         // [kPB][kD]
+    float* sS = (float*) (sV + kPB * kD);              // [warp][16][kPB]
+    wh16* sP = (wh16*) (sS + kPT * 16 * kPB);          // [warp][16][kPB]
+    const int TB = (kPT * 16) / G;                     // tokens a block
+    const int g = blockIdx.y, t0 = blockIdx.x * TB, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int nt = min(TB, T - t0), rows = nt * G, w0 = warp * 16;   // the block's valid rows, the warp's first
+    const bool active = w0 < rows;
+    const int64_t kend = p0 + t0 + nt;                 // the block's keys: [0, kend)
+    const int r = lane >> 1, hf = lane & 1;            // the softmax: a row a lane pair, 16 keys a lane
+    const int myrow = w0 + r;
+    const int64_t lim = p0 + t0 + (myrow < rows ? myrow / G : 0);   // this row's last key (a padding row: the first)
+    const int64_t wlim = p0 + t0 + (min(w0 + 15, rows - 1)) / G;    // the warp's last key over its rows
+    float* wS = sS + warp * 16 * kPB;
+    wh16* wP = sP + warp * 16 * kPB;
+    wm::fragment<wm::matrix_a, 16, 16, 16, wh16, wm::row_major> qf[kD / 16];
+    if (active) {
+        // (rows past the block's read the next block's or the pad after the buffer: discarded)
+        const wh16* qa = q16 + (((size_t) g * T + t0) * G + w0) * kD;
+#pragma unroll
+        for (int k = 0; k < kD / 16; ++k) wm::load_matrix_sync(qf[k], qa + k * 16, kD);
+    }
+    const auto load_tile = [&](int64_t kt, bool with_v) {
+#pragma unroll
+        for (int it = 0; it < kPB * (kD / 8) / 256; ++it) {
+            const int idx = it * 256 + tid, row = idx / (kD / 8), col = idx % (kD / 8);
+            const int64_t kp = kt + row;
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            if constexpr (KV != 0) {
+                const size_t ch = (size_t) kp * n_head_kv + g;
+                *reinterpret_cast<uint4*>(sK + row * kKP + col * 8) = kp < kend ? kv_ld8h<kv_kf(KV)>(kc, ch, col) : z;
+                if (with_v) *reinterpret_cast<uint4*>(sV + row * kD + col * 8) = kp < kend ? kv_ld8h<kv_vf(KV)>(vc, ch, col) : z;
+            } else {
+                const size_t off = ((size_t) kp * n_head_kv + g) * kD + col * 8;
+                *reinterpret_cast<uint4*>(sK + row * kKP + col * 8) = kp < kend ? *reinterpret_cast<const uint4*>(kc + off) : z;
+                if (with_v)
+                    *reinterpret_cast<uint4*>(sV + row * kD + col * 8) =
+                        kp < kend ? *reinterpret_cast<const uint4*>(vc + off) : z;
+            }
+        }
+    };
+    const auto scores = [&] {
+#pragma unroll
+        for (int n = 0; n < kPB / 16; ++n) {
+            wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+            wm::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int k = 0; k < kD / 16; ++k) {
+                wm::fragment<wm::matrix_b, 16, 16, 16, wh16, wm::col_major> b;
+                wm::load_matrix_sync(b, sK + n * 16 * kKP + k * 16, kKP);
+                wm::mma_sync(acc, qf[k], b, acc);
+            }
+            wm::store_matrix_sync(wS + n * 16, acc, kPB, wm::mem_row_major);
+        }
+    };
+    float m = -INFINITY, l = 0.0f;
+    for (int64_t kt = 0; kt < kend; kt += kPB) {
+        __syncthreads();
+        load_tile(kt, false);
+        __syncthreads();
+        const bool on = active && kt <= wlim;
+        if (on) scores();
+        __syncthreads();
+        if (on) {   // (every lane of the warp: the shuffles; a row past its last key keeps its m / l)
+            const bool row_on = kt <= lim;
+            float sv[16], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int64_t kp = kt + hf * 16 + j;
+                sv[j] = kp <= lim ? wS[r * kPB + hf * 16 + j] : -INFINITY;
+                mx = fmaxf(mx, sv[j]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            const float mn = fmaxf(m, mx);
+            float sum = 0.0f;
+            if (row_on) {
+#pragma unroll
+                for (int j = 0; j < 16; ++j) sum += expf(sv[j] - mn);
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            if (row_on) {
+                l = (m == -INFINITY ? 0.0f : l * expf(m - mn)) + sum;
+                m = mn;
+            }
+        }
+    }
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    wm::fragment<wm::accumulator, 16, 16, 16, float> of[kD / 16];
+#pragma unroll
+    for (int n = 0; n < kD / 16; ++n) wm::fill_fragment(of[n], 0.0f);
+    for (int64_t kt = 0; kt < kend; kt += kPB) {
+        __syncthreads();
+        load_tile(kt, true);
+        __syncthreads();
+        const bool on = active && kt <= wlim;
+        if (on) scores();
+        __syncthreads();
+        if (on) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int64_t kp = kt + hf * 16 + j;
+                const float pv = kp <= lim ? expf(wS[r * kPB + hf * 16 + j] - m) * inv : 0.0f;
+                wP[r * kPB + hf * 16 + j] = to_wh16(pv);
+            }
+        }
+        __syncthreads();
+        if (on) {
+            wm::fragment<wm::matrix_a, 16, 16, 16, wh16, wm::row_major> pa[kPB / 16];
+#pragma unroll
+            for (int kk = 0; kk < kPB / 16; ++kk) wm::load_matrix_sync(pa[kk], wP + kk * 16, kPB);
+#pragma unroll
+            for (int n = 0; n < kD / 16; ++n)
+#pragma unroll
+                for (int kk = 0; kk < kPB / 16; ++kk) {
+                    wm::fragment<wm::matrix_b, 16, 16, 16, wh16, wm::row_major> vb;
+                    wm::load_matrix_sync(vb, sV + kk * 16 * kD + n * 16, kD);
+                    wm::mma_sync(of[n], pa[kk], vb, of[n]);
+                }
+        }
+    }
+    if (active) {
+        // a 16 x 16 tile at a time through the warp's score tile, then each valid row to its (token, head)
+#pragma unroll 1
+        for (int n = 0; n < kD / 16; ++n) {
+            __syncwarp();
+            wm::store_matrix_sync(wS, of[n], 16, wm::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int rr = w0 + e / 16;
+                if (rr < rows) {
+                    const int tt = t0 + rr / G, h = rr % G;
+                    out[((size_t) tt * n_head + (size_t) g * G + h) * kD + n * 16 + (e % 16)] = wS[e];
+                }
+            }
+        }
+    }
+}
+
 // a verify window's attention (T <= 8 rows): attn_prompt_kernel's block (4 queries x one KV head's group) over one
 // chunk of kWinChunk key positions, its partials (max, sum, the unnormalized accumulator) into part
 // [row][head][chunk] for attn_merge_kernel - the window's few rows alone gave attn_prompt 1-4 blocks, each walking
@@ -2476,6 +2635,8 @@ void attn_prep_rows(const float* q_full, const float* k, const float* v, const f
 // the prompt / window kernels' query-head groups: 8 warps x HW heads (HW 1, 2, 4), whole warps - up to 8 heads, an even
 // count up to 16, a multiple of 4 up to 32 (the dense Qwen3.8-27B's 6, qwen4exp's 12, Ornith's 8 / 16 / 32)
 static bool attn_group_ok(int G) { return G >= 1 && (G <= 8 || (G <= 16 && G % 2 == 0) || (G <= 32 && G % 4 == 0)); }
+static bool g_groups_tc = false;
+void attn_prompt_groups_tc(bool on) { g_groups_tc = on; }
 void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
                  int64_t p0, int T, float scale, float* out, cudaStream_t s, int kv) {
     if (T <= 0) return;
@@ -2486,6 +2647,50 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
         return;
     }
     static const int pmode = [] { const char* v = getenv("STRATA_Q35_PATTN"); return v ? std::atoi(v) : 0; }();
+    // a group under 16 where the engine asked for it (attn_prompt_groups_tc: the dense qwen35, Qwen3.8-27B's 6 - the
+    // MoE models keep their kernels, STRATA_Q35_PATTN=2 gives them this one): attn_prompt_tcg_kernel (STRATA_Q35_PATTN=1:
+    // the F32 kernel below)
+    if (pmode != 1 && (g_groups_tc || pmode == 2) && G < 16 && G >= 2) {
+        static wh16* q16g = nullptr;
+        static size_t capg = 0;
+        static bool okg[4] = {false, false, false, false};
+        const size_t n = (size_t) T * n_head * kD, need = n + (size_t) 16 * kD;   // (+ a warp's rows past the end)
+        if (need > capg) {
+            if (q16g != nullptr) cudaFree(q16g);
+            q16g = nullptr;
+            capg = 0;
+            if (cudaMalloc(&q16g, need * sizeof(wh16)) == cudaSuccess) {
+                capg = need;
+                cudaMemset(q16g, 0, need * sizeof(wh16));
+            } else {
+                cudaGetLastError();
+            }
+        }
+        if (!okg[kv & 3]) {
+            if (kv != 0)
+                kv_switch(kv, [&](auto K) {
+                    okg[K()] = cudaFuncSetAttribute(attn_prompt_tcg_kernel<K()>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    (int) kPromptTcSmem) == cudaSuccess;
+                });
+            else
+                okg[0] = cudaFuncSetAttribute(attn_prompt_tcg_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              (int) kPromptTcSmem) == cudaSuccess;
+        }
+        if (q16g != nullptr && okg[kv & 3]) {
+            q16_scale_grp_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(q, T, n_head, G, scale, q16g);
+            const int TB = (kPT * 16) / G;
+            const dim3 tg((unsigned) ((T + TB - 1) / TB), (unsigned) n_head_kv);
+            if (kv != 0)
+                kv_switch(kv, [&](auto K) {
+                    attn_prompt_tcg_kernel<K()><<<tg, 256, kPromptTcSmem, s>>>(q16g, kc, vc, n_head, n_head_kv, G, p0, T, out);
+                });
+            else
+                attn_prompt_tcg_kernel<0><<<tg, 256, kPromptTcSmem, s>>>(q16g, kc, vc, n_head, n_head_kv, G, p0, T, out);
+            check("attn_prompt");
+            return;
+        }
+        cudaGetLastError();
+    }
     if (pmode != 1 && G == 16) {
         // the scaled q in FP16 for the tensor-core kernel (a scratch kept between calls; qwen35moe runs on one GPU)
         static wh16* q16 = nullptr;

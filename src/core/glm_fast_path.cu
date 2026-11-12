@@ -1977,6 +1977,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // arena; the prompt path gets a region of its own
         if (!prefill_setup_own(err)) return false;
         if (!q35d_place(err)) return false;   // (the trunk's FFN: VRAM as far as it goes, the rest in RAM)
+        strata::kernels::q35::attn_prompt_groups_tc(true);   // (its 6-head groups' prompt attention on tensor cores)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const double G = 1073741824.0;
