@@ -3039,10 +3039,23 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
                 gap = abs(lps[0] - lps[1])
                 spec_bad = gap >= SPEC_TIE
                 tie = f", the two tokens {gap:.2f} nats apart"
+        # the route tail skip / expert deferral leave out experts by where they sit right now (VRAM, RAM tier, disk),
+        # so two runs of one prompt differ even token by token, and LOGP scores in a third state: an early part says
+        # nothing about the drafter then (issue #44: Ornith-1.5-397B on 16 GB, ~150 of 600 experts a token skipped -
+        # spec=0 against spec=0 parted at token 77, the first cold answer at 29 with 2.1 nats; tail skip off: 159
+        # and 119, 0.2 nats)
+        spec_lossy = sorted(k for k in ("STRATA_GLM_TAIL_SKIP", "STRATA_GLM_TAIL_SKIP_W", "STRATA_GLM_DEFER")
+                            if (env.get(k) or "0").strip() not in ("", "0", "0.0"))
+        spec_unjudged = spec_bad and bool(spec_lossy)
+        if spec_unjudged:
+            spec_bad = False
         spec_txt = ("not checked" if f[0] != "DONE" or first is None else
                     f"same {len(first)} tokens with and without speculative decoding" if spec_diff is None else
                     f"the same first {spec_diff} of {len(first)} tokens with and without speculative decoding" + tie +
-                    (" - TOO EARLY" if spec_bad else
+                    (f" - not judged: {', '.join(spec_lossy)} is on (it leaves out experts by what the GPU and RAM "
+                     "hold at that moment, so two runs of one prompt part early too); --bench without it checks the "
+                     "drafter" if spec_unjudged else
+                     " - TOO EARLY" if spec_bad else
                      " (an early near-tie: fine)" if spec_diff < SPEC_EARLY else " (a late near-tie: fine)"))
         say(f"  drafter check: {spec_txt}")
         if lens:                                            # warm-up: the first prompt after a start is slower
