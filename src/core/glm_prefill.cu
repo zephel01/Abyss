@@ -1179,6 +1179,18 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
 
 size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
 
+// the dense qwen35's prompt scratch q35d_place may lend between prompts: the own region and the MMQ buffers up to
+// their iota (which stays)
+std::vector<std::pair<uint8_t*, size_t>> Glm5Model::prefill_loan_blocks() const {
+    std::vector<std::pair<uint8_t*, size_t>> r;
+    const PrefillState* S = pf_;
+    if (S == nullptr || !S->own) return r;
+    if (S->region != nullptr) r.push_back({(uint8_t*) S->region, S->borrow_bytes});
+    if (S->dq != nullptr && S->dq_iota != nullptr)
+        r.push_back({(uint8_t*) S->dq, (size_t) ((uint8_t*) S->dq_iota - (uint8_t*) S->dq)});
+    return r;
+}
+
 // a dense qwen35 (fast_setup: no expert pool): prefill_setup, then the prompt path's buffers in a region of their own
 // for the session - prefill_lend binds nothing and evicts nothing
 bool Glm5Model::prefill_setup_own(std::string& err) {
@@ -1408,6 +1420,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
+    q35d_evict();   // (the dense qwen35's loaned layers leave the scratch first)
     const uint64_t moved0 = S->moved, dropped0 = S->dropped;
     if (!S->own && !lend_tail(S->need, S->moved, S->dropped, err)) return false;
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
@@ -1685,7 +1698,7 @@ bool Glm5Model::prefill_return(std::string& err) {
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
     S->lent = false;
-    return true;
+    return q35d_restore(err);
 }
 
 void Glm5Model::prefill_destroy() {
@@ -3192,7 +3205,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the dense qwen35's FFN in RAM (qwen35_dense_ram.cu): its weights copied into a staging buffer - the
         // products below read them there
         WSlot dffn[3] = {Ly.ffn_gate, Ly.ffn_up, Ly.ffn_down};
-        const bool dram = !Ly.moe && q35d_ram(il);
+        const bool dram = !Ly.moe && q35d_prompt_ram(il);
         if (dram && !q35d_stage(il, s, dffn, err)) return false;
         if (!Ly.moe && S->dq != nullptr) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the

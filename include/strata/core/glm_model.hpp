@@ -846,6 +846,12 @@ public:
     bool q35d_cpu_ffn(int il, const void* xq, int nt, float* out, cudaStream_t s, std::string& err,
                       const std::function<bool(int)>& gpu = {});
     int q35d_gpu_rows(int il) const;
+    // the loan (a card the FFN does not fit): whole layers' FFN live in the prompt path's buffers between prompts -
+    // q35d_evict (prefill_lend) gives the buffers back to the prompt, q35d_restore (prefill_return) uploads them again
+    bool q35d_prompt_ram(int il) const;                    // the prompt path stages this layer's FFN
+    void q35d_evict();
+    bool q35d_restore(std::string& err);
+    std::vector<std::pair<uint8_t*, size_t>> prefill_loan_blocks() const;   // the dense prompt path's scratch
     // the prompt path: layer il's FFN weights in a VRAM staging buffer (gate / up / down into w), in order on s;
     // q35d_unstage after the layer's products (the buffer may be refilled)
     bool q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err);

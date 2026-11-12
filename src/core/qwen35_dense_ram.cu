@@ -103,6 +103,7 @@ struct Glm5Model::Q35dRam {
         uint8_t* host[3] = {nullptr, nullptr, nullptr};
         size_t drow_g = 0, drow_c = 0;   // down's row bytes in the two parts
         bool ram = false;                // a CPU part (kg < n_ff)
+        bool lent = false;               // all in VRAM in the prompt path's scratch between prompts (the loan)
         size_t total() const { return al256(bytes[0]) + al256(bytes[1]) + al256(bytes[2]); }
         // the bytes of a part of k FF rows (gate / up rows, down columns), as laid out
         size_t part(int k, int n_embd) const {
@@ -117,6 +118,10 @@ struct Glm5Model::Q35dRam {
     void* pinned = nullptr;       // the RAM layers' FFN
     size_t dev_bytes = 0, pinned_bytes = 0;
     std::vector<int> ram_layers;  // ascending
+    std::vector<int> prompt_layers;   // the RAM and the loaned layers, ascending (the prompt path stages them)
+    bool evicted = false;         // the loaned layers out of VRAM (a prompt runs)
+    void* stage_block = nullptr;  // the two staging buffers in one allocation
+    size_t loan_bytes = 0;
     // ---- the CPU service: the request / answer host-mapped, a thread answering on a pool
     void* req_h = nullptr;        // [16 uint32 header | the columns' q8_1 x]
     void* ans_h = nullptr;        // [16 uint32 header | the columns' FFN output]
@@ -138,7 +143,7 @@ struct Glm5Model::Q35dRam {
     int cur = 0;                  // the buffer the last staged layer used
     cudaEvent_t ready[2] = {nullptr, nullptr}, freed[2] = {nullptr, nullptr};
     cudaStream_t cs = nullptr;
-    uint64_t staged = 0, stage_hits = 0;
+    uint64_t staged = 0, stage_hits = 0, restores = 0;
     static constexpr int kCols = 8;   // the widest window the service takes (kVerifyMax)
     void serve();
     void compute(int il, int nt);
@@ -173,6 +178,38 @@ int Glm5Model::q35d_gpu_rows(int il) const {
 
 bool Glm5Model::q35d_ram(int il) const {
     return q35d_ != nullptr && il >= 0 && il < (int) q35d_->L.size() && q35d_->L[(size_t) il].ram;
+}
+
+bool Glm5Model::q35d_prompt_ram(int il) const {
+    return q35d_ != nullptr && il >= 0 && il < (int) q35d_->L.size() &&
+           (q35d_->L[(size_t) il].ram || q35d_->L[(size_t) il].lent);
+}
+
+void Glm5Model::q35d_evict() {
+    Q35dRam* Q = q35d_;
+    if (Q == nullptr || Q->loan_bytes == 0 || Q->evicted) return;
+    cudaStreamSynchronize(fast_->cs);   // (the last token's reads of the loaned layers)
+    Q->evicted = true;
+    Q->holds[0] = Q->holds[1] = -1;
+}
+
+bool Glm5Model::q35d_restore(std::string& err) {
+    Q35dRam* Q = q35d_;
+    if (Q == nullptr || !Q->evicted) return true;
+    // the staging copies first (the last layer's prefetch of the next chunk's first may still run), then the loaned
+    // layers whole from their pinned copies - on the token stream, so the next token reads them after
+    if (Q->cs != nullptr && !glmfast::cuda_ok(cudaStreamSynchronize(Q->cs), "qwen35 dense: staging copies", err)) return false;
+    for (auto& f : Q->L) {
+        if (!f.lent) continue;
+        for (int r = 0; r < 3; ++r)
+            if (!glmfast::cuda_ok(cudaMemcpyAsync(f.dev[r], f.host[r], f.bytes[r], cudaMemcpyHostToDevice, fast_->cs),
+                                  "qwen35 dense: the loaned layers back", err))
+                return false;
+    }
+    Q->evicted = false;
+    Q->holds[0] = Q->holds[1] = -1;
+    ++Q->restores;
+    return true;
 }
 
 size_t Glm5Model::q35d_pending() const {
@@ -285,7 +322,7 @@ bool Glm5Model::q35d_place(std::string& err) {
     const size_t cap = vram_cap();
     const size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
     size_t room = cap > 0 ? (cap > used ? std::min(cap - used, free_b) : 0) : free_b;
-    const size_t reserve = (size_t) std::max(0.0, std::atof(getenv("STRATA_Q35D_RESERVE_MB") ? getenv("STRATA_Q35D_RESERVE_MB") : "512")) << 20;
+    const size_t reserve = (size_t) std::max(0.0, std::atof(getenv("STRATA_Q35D_RESERVE_MB") ? getenv("STRATA_Q35D_RESERVE_MB") : "128")) << 20;
     room = room > reserve ? room - reserve : 0;
     size_t all = 0, max_layer = 0;
     for (const auto& f : Q->L) {
@@ -300,16 +337,20 @@ bool Glm5Model::q35d_place(std::string& err) {
     // STRATA_Q35D_SPLIT=0: whole layers' FFN on the CPU (the A/B); else the CPU takes the last rows of n layers' FFN
     const char* sv = getenv("STRATA_Q35D_SPLIT");
     const bool split = sv == nullptr || std::atoi(sv) != 0;
-    // n layers spread evenly (layer floor((i + 0.5) * NL / n))
+    // the candidates for CPU rows (all but the loaned layers), n of them spread evenly (floor((i + 0.5) * nc / n))
+    std::vector<int> cand;
     const auto spread = [&](int n) {
         std::vector<char> r((size_t) NL, 0);
-        for (int i = 0; i < n; ++i) r[(size_t) std::min(NL - 1, (int) (((double) i + 0.5) * NL / n))] = 1;
+        const int nc = (int) cand.size();
+        n = std::min(n, nc);
+        for (int i = 0; i < n; ++i) r[(size_t) cand[(size_t) std::min(nc - 1, (int) (((double) i + 0.5) * nc / n))]] = 1;
         return r;
     };
-    // the VRAM n spread layers leave with c of their FF rows on the CPU
+    // the VRAM n spread layers leave with c of their FF rows on the CPU (the loaned layers' VRAM is the prompt's)
     const auto gpu_need = [&](const std::vector<char>& set, int c) {
         size_t b = 0;
-        for (int il = 0; il < NL; ++il) b += set[(size_t) il] ? Q->L[(size_t) il].part(FF - c, E) : Q->L[(size_t) il].total();
+        for (int il = 0; il < NL; ++il)
+            if (!Q->L[(size_t) il].lent) b += set[(size_t) il] ? Q->L[(size_t) il].part(FF - c, E) : Q->L[(size_t) il].total();
         return b;
     };
     std::vector<int> kg((size_t) NL, FF);
@@ -322,8 +363,43 @@ bool Glm5Model::q35d_place(std::string& err) {
             err = b;
             return false;
         }
-        const size_t stage = pf_ != nullptr ? 2 * max_layer : 0;
+        const size_t stage = pf_ != nullptr ? 2 * al256(max_layer) : 0;
         const size_t room2 = room > stage ? room - stage : 0;
+        // the staging buffers now (one allocation), then the loan: whole layers' FFN in the prompt path's scratch and
+        // the staging buffers between prompts (STRATA_Q35D_LOAN=0: none) - first fit, the layers spread over the depth
+        if (pf_ != nullptr) {
+            if (cudaMalloc(&Q->stage_block, stage) != cudaSuccess) {
+                cudaGetLastError();
+                err = "qwen35 dense: the prompt path's FFN staging buffers (" + std::to_string(stage >> 20) + " MB) did not allocate";
+                return false;
+            }
+            Q->stage_bytes = al256(max_layer);
+            const char* lv = getenv("STRATA_Q35D_LOAN");
+            if (lv == nullptr || std::atoi(lv) != 0) {
+                auto blocks = prefill_loan_blocks();
+                blocks.push_back({(uint8_t*) Q->stage_block, stage});
+                std::vector<size_t> used(blocks.size(), 0);
+                const int step = 7;   // (a stride coprime to 64: spread over the depth)
+                for (int i = 0; i < NL; ++i) {
+                    const int il = (int) (((int64_t) i * step + 3) % NL);
+                    auto& f = Q->L[(size_t) il];
+                    for (size_t b = 0; b < blocks.size(); ++b) {
+                        if (used[b] + f.total() > blocks[b].second) continue;
+                        uint8_t* d = blocks[b].first + used[b];
+                        for (int r = 0; r < 3; ++r) {
+                            f.dev[r] = d;
+                            d += al256(f.bytes[r]);
+                        }
+                        used[b] += f.total();
+                        f.lent = true;
+                        Q->loan_bytes += f.total();
+                        break;
+                    }
+                }
+            }
+        }
+        for (int il = 0; il < NL; ++il)
+            if (!Q->L[(size_t) il].lent) cand.push_back(il);
         // the fewest CPU rows (a multiple of 256) on n layers that leave the rest within room2; FF + 256 when even all of
         // them on the CPU does not
         const auto rows_for = [&](int n) {
@@ -338,7 +414,7 @@ bool Glm5Model::q35d_place(std::string& err) {
         int c_min = 2048;
         if (const char* v = getenv("STRATA_Q35D_SPLIT_MIN")) c_min = std::max(256, std::min(FF, std::atoi(v) / 256 * 256));
         if (split && gpu_cap == NL) {
-            int n = NL, c = rows_for(NL);
+            int n = std::max(1, (int) cand.size()), c = rows_for(n);
             if (const char* v = getenv("STRATA_Q35D_SPLIT_N")) {   // (tests: n layers, their fewest rows)
                 n = std::max(1, std::min(NL, std::atoi(v)));
                 c = rows_for(n);
@@ -367,13 +443,18 @@ bool Glm5Model::q35d_place(std::string& err) {
     size_t dev_b = 0, ram_b = 0;
     for (int il = 0; il < NL; ++il) {
         auto& f = Q->L[(size_t) il];
-        f.kg = kg[(size_t) il];
+        f.kg = f.lent ? FF : kg[(size_t) il];
         f.ram = f.kg < FF;
         f.drow_g = ggml_row_size((ggml_type) f.type[2], f.kg);
         f.drow_c = f.row[2] - f.drow_g;
-        dev_b += f.part(f.kg, E);
-        ram_b += f.part(FF - f.kg, E);
+        if (f.lent) {
+            ram_b += f.total();   // (its whole pinned copy: the prompt stages it, a restore uploads it)
+        } else {
+            dev_b += f.part(f.kg, E);
+            ram_b += f.part(FF - f.kg, E);
+        }
         if (f.ram) Q->ram_layers.push_back(il);
+        if (f.ram || f.lent) Q->prompt_layers.push_back(il);
     }
     const int m = (int) Q->ram_layers.size();
     // RAM: what the pinned copy takes must leave the host its headroom (STRATA_GLM_RAM_HEADROOM_GB, 6)
@@ -416,7 +497,7 @@ bool Glm5Model::q35d_place(std::string& err) {
         size_t at = 0;
         for (int il = 0; il < NL; ++il) {
             auto& f = Q->L[(size_t) il];
-            if (f.kg <= 0) continue;
+            if (f.kg <= 0 || f.lent) continue;
             for (int r = 0; r < 3; ++r) {
                 uint8_t* d = (uint8_t*) Q->dev + at;
                 cudaError_t e;
@@ -446,8 +527,20 @@ bool Glm5Model::q35d_place(std::string& err) {
         struct Job { uint8_t* dst; const uint8_t* src; size_t len, rows, dpitch, spitch; };
         std::vector<Job> jobs;
         size_t at = 0;
-        for (int il : Q->ram_layers) {
+        for (int il : Q->prompt_layers) {
             auto& f = Q->L[(size_t) il];
+            if (f.lent) {   // (whole, and in VRAM from the mapping)
+                for (int r = 0; r < 3; ++r) {
+                    f.host[r] = (uint8_t*) Q->pinned + at;
+                    jobs.push_back({f.host[r], f.src[r], f.bytes[r], 1, 0, 0});
+                    at += al256(f.bytes[r]);
+                    if (!glmfast::cuda_ok(cudaMemcpy(f.dev[r], f.src[r], f.bytes[r], cudaMemcpyHostToDevice),
+                                          "qwen35 dense: a loaned layer's upload", err))
+                        return false;
+                    set_slot(il, r, f.dev[r]);
+                }
+                continue;
+            }
             const size_t fc = (size_t) (FF - f.kg);
             for (int r = 0; r < 3; ++r) {
                 f.host[r] = (uint8_t*) Q->pinned + at;
@@ -515,18 +608,17 @@ bool Glm5Model::q35d_place(std::string& err) {
         Q->pool.reset(new glmfast::Workers(threads - 1, 20000, pin));
         Q->svc = std::thread([Q] { Q->serve(); });
         // the prompt path's staging buffers
-        if (pf_ != nullptr) {
-            size_t sb = 0;
-            for (int il : Q->ram_layers) sb = std::max(sb, Q->L[(size_t) il].total());   // (a layer assembled whole)
-            Q->stage_bytes = sb;
+        if (Q->stage_block != nullptr) {
+            const size_t sb = Q->stage_bytes;
+            Q->stage[0] = (uint8_t*) Q->stage_block;
+            Q->stage[1] = (uint8_t*) Q->stage_block + sb;
             bool ok = cudaStreamCreateWithFlags(&Q->cs, cudaStreamNonBlocking) == cudaSuccess;
             for (int b = 0; b < 2 && ok; ++b)
-                ok = cudaMalloc((void**) &Q->stage[b], sb) == cudaSuccess &&
-                     cudaEventCreateWithFlags(&Q->ready[b], cudaEventDisableTiming) == cudaSuccess &&
+                ok = cudaEventCreateWithFlags(&Q->ready[b], cudaEventDisableTiming) == cudaSuccess &&
                      cudaEventCreateWithFlags(&Q->freed[b], cudaEventDisableTiming) == cudaSuccess;
             if (!ok) {
                 cudaGetLastError();
-                err = "qwen35 dense: the prompt path's FFN staging buffers (2 x " + std::to_string(sb >> 20) + " MB) did not allocate";
+                err = "qwen35 dense: the prompt path's staging events did not create";
                 return false;
             }
         }
@@ -538,7 +630,10 @@ bool Glm5Model::q35d_place(std::string& err) {
                              "GB of it), room %.2f GB after a %zu MB reserve, FFN %.2f GB in all\n", dev_,
                      (double) in_use0 / G, (double) verify_b / G, (double) room / G, reserve >> 20, (double) all / G);
     char extra[160] = "";
-    if (Q->stage_bytes > 0) std::snprintf(extra, sizeof extra, ", prompt staging 2 x %zu MB", Q->stage_bytes >> 20);
+    if (Q->stage_bytes > 0)
+        std::snprintf(extra, sizeof extra, ", prompt staging 2 x %zu MB; %d layers' FFN (%.2f GB) in the prompt path's "
+                                           "scratch between prompts", Q->stage_bytes >> 20,
+                      (int) (Q->prompt_layers.size() - Q->ram_layers.size()), (double) Q->loan_bytes / G);
     char capb[64] = "";
     if (cap > 0) std::snprintf(capb, sizeof capb, " (cap %.1f GB)", (double) cap / G);
     if (m == 0)
@@ -582,9 +677,9 @@ bool Glm5Model::q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err) {
         err = "qwen35 dense: a RAM layer's FFN in the prompt path without the staging buffers";
         return false;
     }
-    const int n = (int) Q->ram_layers.size();
-    const int k = (int) (std::lower_bound(Q->ram_layers.begin(), Q->ram_layers.end(), il) - Q->ram_layers.begin());
-    if (k >= n || Q->ram_layers[(size_t) k] != il) {
+    const int n = (int) Q->prompt_layers.size();
+    const int k = (int) (std::lower_bound(Q->prompt_layers.begin(), Q->prompt_layers.end(), il) - Q->prompt_layers.begin());
+    if (k >= n || Q->prompt_layers[(size_t) k] != il) {
         err = "qwen35 dense: blk." + std::to_string(il) + " is not a RAM layer";
         return false;
     }
@@ -600,7 +695,7 @@ bool Glm5Model::q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err) {
         // the whole layer as it was in the file: gate / up rows [0, kg) from VRAM, [kg, n_ff) from RAM; down's
         // columns the same way, row by row (2D copies)
         const auto& f = Q->L[(size_t) l];
-        const int kg = std::max(0, f.kg), E = Q->n_embd;
+        const int kg = f.lent ? 0 : std::max(0, f.kg), E = Q->n_embd;   // (a loaned layer: its whole pinned copy)
         uint8_t* d = Q->stage[b];
         for (int r = 0; r < 2; ++r) {
             const size_t g0 = (size_t) kg * f.row[r];
@@ -620,7 +715,7 @@ bool Glm5Model::q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err) {
     };
     int b = Q->holds[Q->cur ^ 1] == il ? Q->cur ^ 1 : Q->holds[Q->cur] == il ? Q->cur : Q->cur ^ 1;
     issue(b, il);
-    if (n >= 2) issue(b ^ 1, Q->ram_layers[(size_t) ((k + 1) % n)]);
+    if (n >= 2) issue(b ^ 1, Q->prompt_layers[(size_t) ((k + 1) % n)]);
     Q->cur = b;
     cudaStreamWaitEvent(s, Q->ready[b], 0);
     const auto& f = Q->L[(size_t) il];
@@ -647,20 +742,21 @@ void Glm5Model::q35d_destroy() {
     if (Q->svc.joinable()) Q->svc.join();
     if (const uint64_t c = Q->calls.load(); c > 0)
         std::fprintf(stderr, "glm fast: CUDA%d dense qwen35 CPU FFN: %llu calls of %.2f columns, %.3f ms each; prompt "
-                             "staging %llu copies (%llu reused)\n", dev_, (unsigned long long) c,
+                             "staging %llu copies (%llu reused), %llu loan restores\n", dev_, (unsigned long long) c,
                      (double) Q->cols.load() / (double) c, (double) Q->us.load() / 1000.0 / (double) c,
-                     (unsigned long long) Q->staged, (unsigned long long) Q->stage_hits);
+                     (unsigned long long) Q->staged, (unsigned long long) Q->stage_hits, (unsigned long long) Q->restores);
     if (const uint64_t c = Q->calls.load(); c > 0 && getenv("STRATA_GLM_TIMING") != nullptr)
         std::fprintf(stderr, "glm fast: CUDA%d dense qwen35 CPU FFN phases a call: gate/up %.3f ms, h %.3f, down %.3f\n",
                      dev_, Q->ms_gu / (double) c, Q->ms_q / (double) c, Q->ms_dn / (double) c);
     Q->pool.reset();
     if (Q->cs) cudaStreamSynchronize(Q->cs);
     for (int b = 0; b < 2; ++b) {
-        if (Q->stage[b]) cudaFree(Q->stage[b]);
+        Q->stage[b] = nullptr;
         if (Q->ready[b]) cudaEventDestroy(Q->ready[b]);
         if (Q->freed[b]) cudaEventDestroy(Q->freed[b]);
     }
     if (Q->cs) cudaStreamDestroy(Q->cs);
+    if (Q->stage_block) cudaFree(Q->stage_block);
     if (Q->req_h) cudaFreeHost(Q->req_h);
     if (Q->ans_h) cudaFreeHost(Q->ans_h);
     if (Q->pinned) cudaFreeHost(Q->pinned);
