@@ -487,6 +487,32 @@ class HipSetupTests(unittest.TestCase):
                 self.assertEqual(maya.main(), 0)
                 self.assertIn(path, run.call_args.args)
 
+    def setup_deepseek_config(self, name="abyss-ornith-iq3_xxs-b.json"):
+        """A config setup-deepseek.bat writes (abyss-*.json): no maya-*.json beside it."""
+        path = self.root / name
+        path.write_text(json.dumps({"exe": str(self.root / "build-hip/strata.exe"), "backend": "hip", "gpu": [0],
+                                    "args": ["--glm-pack", str(self.root / "pack"), "--max-context", "32768"]}))
+        return path
+
+    def test_plain_start_runs_a_setup_deepseek_config(self):
+        # issue #43: START-ABYSS.bat (with or without --backend hip) on a PC set up by setup-deepseek.bat --model ornith
+        # listed only maya-*.json and began Maya's GLM setup; the Ornith config needed --config
+        path = self.setup_deepseek_config()
+        for argv in (["abyss.py"], ["abyss.py", "--backend", "hip"]):
+            with self.subTest(argv=argv), patch.object(sys, "argv", argv), \
+                    patch.object(maya, "set_up", side_effect=AssertionError("must not set Maya up")), \
+                    patch.object(maya, "start", return_value=0) as start:
+                self.assertEqual(maya.main(), 0)
+                self.assertEqual(start.call_args.args[0], path)
+
+    def test_maya_setup_reads_its_own_config_not_a_setup_deepseek_one(self):
+        self.setup_deepseek_config()
+        with patch.object(sys, "argv", ["abyss.py", "--setup", "--no-start"]), \
+                patch.object(maya, "setup_screen", return_value=False), \
+                patch.object(maya, "set_up", return_value=None) as set_up:
+            self.assertEqual(maya.main(), 0)
+        self.assertEqual(set_up.call_args.args[1], {})
+
     def test_cli_backend_never_benchmarks_cuda_config_as_hip(self):
         self.installed_config(backend="cuda")
         with patch.object(sys, "argv", ["abyss.py", "--backend", "hip", "--bench"]), \
@@ -546,6 +572,35 @@ class WindowsDetectionTests(unittest.TestCase):
         self.assertEqual([g["arch"] for g in maya.S.parse_display_adapters(rows)], ["gfx1151", "gfx1201", "unknown"])
         self.assertEqual(maya.S.parse_display_adapters(""), [])
         self.assertEqual(maya.S.parse_display_adapters("not json"), [])
+
+    def test_registry_keeps_only_present_adapters(self):
+        # issue #43: the display class kept a removed RX 6600 XT 8 GB (0000) before the RX 9060 XT 16 GB (0001)
+        rows = json.dumps([{"DriverDesc": "AMD Radeon RX 6600 XT", "MatchingDeviceId": "pci\\ven_1002&dev_73ff",
+                            "HardwareInformation.qwMemorySize": 8 * 2**30, "Present": False},
+                           {"DriverDesc": "AMD Radeon RX 9060 XT", "MatchingDeviceId": "pci\\ven_1002&dev_7590",
+                            "HardwareInformation.qwMemorySize": 16 * 2**30, "Present": True}])
+        g, = maya.S.parse_display_adapters(rows)
+        self.assertEqual((g["index"], g["name"], g["arch"]), (0, "AMD Radeon RX 9060 XT", "gfx1200"))
+        self.assertAlmostEqual(g["vram_gb"], 16.0)
+        # Plug and Play's query failed (no row says Present): every adapter, as before
+        rows = json.dumps([{"DriverDesc": "AMD Radeon RX 6600 XT", "Present": False},
+                           {"DriverDesc": "AMD Radeon RX 9060 XT", "Present": False}])
+        self.assertEqual(len(maya.S.parse_display_adapters(rows)), 2)
+
+    def test_windows_hip_gpus_ask_hipinfo_of_the_configs_rocm(self):
+        # issue #43: --bench listed the GPUs without hipInfo (Windows' registry: a removed card first)
+        with tempfile.TemporaryDirectory() as d:
+            bindir = Path(d) / "rocm-bin"
+            bindir.mkdir()
+            (bindir / "hipInfo.exe").touch()
+            seen = [{"index": 0, "name": "AMD Radeon RX 9060 XT", "vram_gb": 15.9, "arch": "gfx1200"}]
+            with patch.object(maya, "WIN", True), patch.object(maya, "STAMP", Path(d) / "none.json"), \
+                    patch.object(maya.S, "amd_gpus", return_value=seen) as amd:
+                self.assertEqual(maya.hip_gpus({"lib_dirs": [str(bindir)]}), seen)
+                amd.assert_called_once_with(str(bindir / "hipInfo.exe"))
+                with patch.object(maya.shutil, "which", return_value=None):
+                    maya.hip_gpus({})
+                amd.assert_called_with(None)   # (no hipInfo anywhere: Windows' present display adapters)
 
     def test_windows_apu_names_are_unified_memory(self):
         for name in ("AMD Radeon(TM) 8060S Graphics", "AMD Radeon(TM) 8065S Graphics", "Radeon 8050S"):

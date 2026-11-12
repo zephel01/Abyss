@@ -584,6 +584,18 @@ def hip_info(bindir) -> str | None:
     return str(p) if p and p.exists() else shutil.which("hipInfo")
 
 
+def hip_gpus(cfg: dict | None = None) -> list:
+    """The AMD GPUs as HIP numbers them (S.amd_gpus).  On Windows through ROCm's hipInfo - in the config's lib_dirs (the
+    ROCm the engine was compiled with), else the build stamp's, else on PATH - as the setup lists them; Windows' display
+    adapters only without one (issue #43: the registry still had a removed RX 6600 XT 8 GB first, and --bench named it
+    for the RX 9060 XT 16 GB the engine ran on)."""
+    if not WIN:
+        return S.amd_gpus()
+    dirs = [*((cfg or {}).get("lib_dirs") or []), *(read_json(STAMP).get("lib_dirs") or [])]
+    exe = next((p for p in (Path(d) / "hipInfo.exe" for d in dirs) if p.exists()), None)
+    return S.amd_gpus(str(exe) if exe else shutil.which("hipInfo"))
+
+
 THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
 THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
 # The oldest HIP setup builds with: ROCm 10 (HIP 7.15) on Linux, TheRock's 7.14 on Windows.  The ROCm 7.0-7.2 releases
@@ -1098,7 +1110,7 @@ def exl3_advice(cards: list, size_gb: float) -> tuple:
     except Exception:  # noqa: BLE001
         avx512 = False
     try:
-        apu = any(g.get("arch") in ("gfx1150", "gfx1151") for g in S.amd_gpus())
+        apu = any(g.get("arch") in ("gfx1150", "gfx1151") for g in hip_gpus())
     except Exception:  # noqa: BLE001
         apu = False
     try:
@@ -2345,7 +2357,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     env = dict(os.environ, MAYA_RESTART_ON_UPDATE="1")  # (the dashboard may update Maya)
     if S.UI is not None:                               # (the setup's screen shows the same in its card, and reads
         env["PYTHONUNBUFFERED"] = "1"                  # the server's output from a pipe)
-        found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
+        found = hip_gpus(cfg) if cfg.get("backend") == "hip" else S.gpus()
         info["vram"] = {g["index"]: g["vram_gb"] for g in found}   # (its load: a GPU not started yet, by its VRAM)
         return cmd, env, info
     say()
@@ -3102,7 +3114,7 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         say("  quality check: scoring a known text against a known-good run of this model ...")
         quality = bench_quality(cfg, pack, SV)
     dec = [r[2] for r in results if r[0] == "decode"]
-    found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
+    found = hip_gpus(cfg) if cfg.get("backend") == "hip" else S.gpus()
     if cfg.get("backend") == "hip" and SV.gpu_list(cfg):
         by_index = {g["index"]: g for g in found}
         found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
@@ -3203,7 +3215,7 @@ def os_name() -> str:
 
 def check_gpus(cfg: dict) -> list:
     """The config's GPUs: [{name, vram_gb, ...}] in its order."""
-    found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
+    found = hip_gpus(cfg) if cfg.get("backend") == "hip" else S.gpus()
     import serve.server as SV
     want = SV.gpu_list(cfg)
     if want:
@@ -3560,12 +3572,16 @@ def main() -> int:
             fail("Abyss is not set up here yet", f"run {ME} first")
         return bench(have[0], version, deep=a.deep, full=a.full)
 
-    have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
+    setting_up = a.setup or a.check or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model
+    # a start offers every installed config - setup-deepseek's abyss-*.json too (issue #43: a PC set up with
+    # setup-deepseek.bat --model ornith had only those, and START-ABYSS.bat without --config began Maya's GLM setup);
+    # Maya's own setup reads its previous answers from its maya-*.json only
+    have = (configs() if setting_up else all_configs()) if a.config is None else [a.config.resolve()]
+    backend_given = a.backend
     if a.backend:
         have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
     else:
         a.backend = "hip" if have and read_json(have[0]).get("backend") == "hip" else "cuda"
-    setting_up = a.setup or a.check or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model
     if have and not setting_up and (a.calibrate or not a.no_start):
         pick = have[0]
         if len(have) > 1:
@@ -3584,6 +3600,12 @@ def main() -> int:
         return start(pick, a)
     if not have and a.calibrate:
         say("Nothing is set up yet: the setup runs first, then the tuning.")
+    if a.config is None and not setting_up:          # (Maya's setup: its own configs' answers, not an abyss-*.json)
+        have = configs()
+        if backend_given:
+            have = [p for p in have if read_json(p).get("backend", "cuda") == backend_given]
+        else:
+            a.backend = "hip" if have and read_json(have[0]).get("backend") == "hip" else "cuda"
     prev = read_json(have[0]) if have else {}
     if a.check:
         pc = check_pc(a)

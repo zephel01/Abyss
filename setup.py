@@ -506,9 +506,9 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",
              "gfx1201": "AMD Radeon RX 9070 / AI PRO R9700 (gfx1201)"}   # when sysfs has no product name
 # Windows without ROCm's hipInfo yet: the architecture from the adapter's PCI device ID (Navi 31, Navi 48, the
 # Strix Halo / Gorgon Halo APU), else from its name ("AMD Radeon(TM) 8060S Graphics", 8050S, 8065S, ...)
-AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7550": "gfx1201", "7551": "gfx1201", "1586": "gfx1151"}
+AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7550": "gfx1201", "7551": "gfx1201", "7590": "gfx1200", "1586": "gfx1151"}
 AMD_NAME_ARCHS = ((r"Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", "gfx1151"), (r"RX\s*7900", "gfx1100"),
-                  (r"RX\s*9070|R9700", "gfx1201"))
+                  (r"RX\s*9070|R9700", "gfx1201"), (r"RX\s*9060", "gfx1200"))
 
 
 def parse_hipinfo(text: str) -> list:
@@ -544,15 +544,18 @@ def parse_hipinfo(text: str) -> list:
 
 def parse_display_adapters(text: str) -> list:
     """Windows' AMD display adapters (the registry's display class as JSON, from windows_amd_adapters), numbered in
-    its order - HIP's own with one AMD GPU."""
+    its order - HIP's own with one AMD GPU.  The display class keeps the entry of every card that was ever installed:
+    when some rows say "Present" (Plug and Play's present display devices), only those are listed (issue #43: a
+    removed RX 6600 XT 8 GB came first, before the RX 9060 XT in the slot); none saying so (that query failed): all."""
     try:
         rows = json.loads(text) if text.strip() else []
     except ValueError:
         return []
+    rows = [r for r in (rows if isinstance(rows, list) else [rows]) if isinstance(r, dict)]
+    if any(r.get("Present") is True for r in rows):
+        rows = [r for r in rows if r.get("Present") is True]
     found = []
-    for r in rows if isinstance(rows, list) else [rows]:
-        if not isinstance(r, dict):
-            continue
+    for r in rows:
         name = str(r.get("DriverDesc") or "AMD Radeon")
         dev = re.search(r"dev_([0-9a-f]{4})", str(r.get("MatchingDeviceId") or ""), re.I)
         arch = AMD_DEVICE_ARCHS.get(dev.group(1).lower(), "") if dev else ""
@@ -566,11 +569,20 @@ def parse_display_adapters(text: str) -> list:
     return found
 
 
+DISPLAY_CLASS = "{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+
 def windows_amd_adapters() -> list:
-    # the registry's display class has each adapter's full memory size (WMI's AdapterRAM stops at 4 GB)
-    ps = ("Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    # the registry's display class has each adapter's full memory size (WMI's AdapterRAM stops at 4 GB) - and keeps
+    # the entries of cards no longer installed: each row says whether a present display device uses it (its driver
+    # key, DEVPKEY_Device_Driver = "<class>\\0001"), and parse_display_adapters keeps those
+    ps = ("$p = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | ForEach-Object { "
+          "(Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_Driver "
+          "-ErrorAction SilentlyContinue).Data }); "
+          f"Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{DISPLAY_CLASS}"
           "\\0*' -ErrorAction SilentlyContinue | Where-Object { $_.MatchingDeviceId -match 'ven_1002' } | "
-          "Select-Object DriverDesc, MatchingDeviceId, DriverVersion, 'HardwareInformation.qwMemorySize' | "
+          "Select-Object DriverDesc, MatchingDeviceId, DriverVersion, 'HardwareInformation.qwMemorySize', "
+          f"@{{n='Present';e={{$p -contains ('{DISPLAY_CLASS}\\' + $_.PSChildName)}}}} | "
           "ConvertTo-Json -Compress")
     return parse_display_adapters(out(["powershell", "-NoProfile", "-Command", ps]))
 

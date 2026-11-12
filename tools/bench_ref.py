@@ -93,7 +93,7 @@ def main() -> int:
             top[i].tofile(f)
             val[i].tofile(f)
     m = re.search(r"nll ([\d.]+) .*?top1 ([\d.]+)%", line)
-    gpu = ", ".join(g["name"] for g in (A.S.amd_gpus() if cfg.get("backend") == "hip" else A.S.gpus())) or "?"
+    gpu = ", ".join(g["name"] for g in (A.hip_gpus(cfg) if cfg.get("backend") == "hip" else A.S.gpus())) or "?"
     dense = pack / "dense.bin"
     ref = {"model": name, "gguf_bytes": size, "dense_bytes": dense.stat().st_size if dense.exists() else 0, "skip": 0, "k": a.k, "topk": topk.name, "ids": ids,
            "nll": float(m.group(1)), "top1": float(m.group(2)),
