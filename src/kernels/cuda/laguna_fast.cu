@@ -34,7 +34,7 @@ __global__ void __launch_bounds__(kD) prep_kernel(const float* __restrict__ q, c
                                                   const float* __restrict__ k_norm, float eps, int n_head, int n_head_kv,
                                                   int n_rot, const double* __restrict__ freq, float mscale, int64_t p0,
                                                   int ring, uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
-                                                  float* __restrict__ q_out) {
+                                                  float* __restrict__ q_out, const float2* __restrict__ cs_tab) {
     __shared__ float sv[kD];
     __shared__ float sred[kD / 32];
     const int b = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
@@ -55,9 +55,17 @@ __global__ void __launch_bounds__(kD) prep_kernel(const float* __restrict__ q, c
     if (d < n_rot) {   // NEOX pairs (i, i + n_rot / 2)
         const int half = n_rot / 2;
         const int i = d < half ? d : d - half;
-        double sn, cs;
-        sincos((double) p * freq[i], &sn, &cs);
-        const float c = (float) cs * mscale, s = (float) sn * mscale;
+        float c, s;
+        if (cs_tab != nullptr) {   // (rope_table's: the same values, computed once a row)
+            const float2 v = cs_tab[(size_t) t * half + i];
+            c = v.x;
+            s = v.y;
+        } else {
+            double sn, cs;
+            sincos((double) p * freq[i], &sn, &cs);
+            c = (float) cs * mscale;
+            s = (float) sn * mscale;
+        }
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * s : x0 * s + x1 * c;
     }
@@ -279,6 +287,16 @@ __global__ void __launch_bounds__(kD) merge_kernel(const float* __restrict__ par
     out[(size_t) idx * kD + d] = l > 0.0f ? acc / l : 0.0f;
 }
 
+// block t, a thread a pair: prep_kernel's (cos, sin) x mscale of row t
+__global__ void rope_table_kernel(const double* __restrict__ freq, int half, float mscale, int64_t p0,
+                                  float2* __restrict__ cs) {
+    const int t = blockIdx.x, i = threadIdx.x;
+    if (i >= half) return;
+    double sn, c;
+    sincos((double) (p0 + t) * freq[i], &sn, &c);
+    cs[(size_t) t * half + i] = make_float2((float) c * mscale, (float) sn * mscale);
+}
+
 __global__ void gate_kernel(float* __restrict__ o, const float* __restrict__ g, int n_head) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     o[((size_t) t * n_head + h) * kD + d] *= softplus_f(g[(size_t) t * n_head + h]);
@@ -311,10 +329,15 @@ void rope_freqs(int n_rot, double base, double freq_scale, int orig_ctx, double 
 
 void attn_prep_rows(const float* q, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int n_rot, const double* freq, float mscale, int64_t p0,
-                    int T, int ring, uint16_t* kc, uint16_t* vc, float* q_out, cudaStream_t s) {
+                    int T, int ring, uint16_t* kc, uint16_t* vc, float* q_out, cudaStream_t s, const float2* cs) {
     if (T <= 0) return;
     prep_kernel<<<dim3(n_head + n_head_kv, T), kD, 0, s>>>(q, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, freq,
-                                                          mscale, p0, ring, kc, vc, q_out);
+                                                          mscale, p0, ring, kc, vc, q_out, cs);
+}
+
+void rope_table(const double* freq, int n_rot, float mscale, int64_t p0, int T, float2* cs, cudaStream_t s) {
+    if (T <= 0 || n_rot <= 0) return;
+    rope_table_kernel<<<T, kD, 0, s>>>(freq, n_rot / 2, mscale, p0, cs);
 }
 
 size_t attn_part_floats(int rows, int n_head, int max_splits) {

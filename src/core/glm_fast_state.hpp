@@ -476,6 +476,8 @@ struct Glm5Model::FastState {
     double *lag_freq = nullptr, *lag_freq_swa = nullptr;
     float lag_mscale = 1.0f, lag_mscale_swa = 1.0f;
     float* lag_gl = nullptr;
+    float2 *lag_cs = nullptr, *lag_cs_swa = nullptr;   // a token's RoPE (cos, sin) for the full / window layers
+    int lag_first = -1, lag_first_swa = -1;            // ... written at the token's first layer of each kind
     // ---- qwen4exp activations: the normed streams, the low rank, the gate, the injections ([0] attention, [1] FFN:
     // each lives until its combine, the FFN's into the next layer)
     float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};
