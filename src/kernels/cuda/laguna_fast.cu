@@ -99,7 +99,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_kernel(const float* __restri
         const int64_t j = base + lane;
         float sc = -INFINITY;
         if (j < e) {
-            const uint4* kp = reinterpret_cast<const uint4*>(kc + (size_t) (j % ring) * kstride + (size_t) grp * kD);
+            const int rj = (int) (base % ring) + lane;   // (j % ring, the step's row once)
+            const uint4* kp = reinterpret_cast<const uint4*>(kc + (size_t) (rj < ring ? rj : rj - ring) * kstride +
+                                                             (size_t) grp * kD);
             float dot = 0.0f;
 #pragma unroll
             for (int c = 0; c < kD / 8; ++c) {
@@ -120,17 +122,31 @@ __global__ void __launch_bounds__(kWarps * 32) attn_kernel(const float* __restri
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc[i] *= corr;
         const int nk = e - base < 32 ? (int) (e - base) : 32;
-        for (int jj = 0; jj < nk; ++jj) {
-            const float pp = __shfl_sync(0xffffffffu, pj, jj);
-            const uint2 u = *reinterpret_cast<const uint2*>(vc + (size_t) ((base + jj) % ring) * kstride +
-                                                          (size_t) grp * kD + lane * 4);
+        // the step's V rows: the ring row once a step, the loads of 8 keys issued before their sums (the sums in key
+        // order, as one at a time: the same bits, without a dependent load a key)
+        const int rb = (int) (base % ring);
+        const uint16_t* vg = vc + (size_t) grp * kD + lane * 4;
+        const auto vrow = [&](int jj) {
+            const int r = rb + jj < ring ? rb + jj : rb + jj - ring;
+            return *reinterpret_cast<const uint2*>(vg + (size_t) r * kstride);
+        };
+        const auto add = [&](float pp, uint2 u) {
             const __half2* hp = reinterpret_cast<const __half2*>(&u);
             const float2 f0 = __half22float2(hp[0]), f1 = __half22float2(hp[1]);
             acc[0] += pp * f0.x;
             acc[1] += pp * f0.y;
             acc[2] += pp * f1.x;
             acc[3] += pp * f1.y;
+        };
+        int jj = 0;
+        for (; jj + 8 <= nk; jj += 8) {
+            uint2 u[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) u[i] = vrow(jj + i);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) add(__shfl_sync(0xffffffffu, pj, jj + i), u[i]);
         }
+        for (; jj < nk; ++jj) add(__shfl_sync(0xffffffffu, pj, jj), vrow(jj));
         m = mn;
     }
     if (splits == 1) {
