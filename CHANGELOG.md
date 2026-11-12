@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.137 - 2026-11-12
+
+- Prompts on 15-16 GB cards no longer fall back to one token at a time. The prompt chunk was sized against the pool
+  the setup expects; NextN and the context then take 1-2 slots a layer, and when the chunk no longer fitted the engine
+  went token by token without trying the small keep. Now it sizes the chunk again against the real pool, and in
+  `--prefill auto` takes the small keep when the full keep would lend a chunk under 4,096 tokens and the small keep
+  lends at least twice as much (`STRATA_GLM_PREFILL_SMALL_BELOW`, default 4096; 0 = the v1.3.136 choice).
+  RTX 5090, Ornith-1.5-397B 16G64G, 128K, 4K prompt: 16 GB 70.9 -> 213.0 tok/s (8K: 65 -> 392), a q5all build at
+  16 GB 8.1 -> 226.7, 15 GB 8.8 -> 227.0; Ornith-35B at 8 GB, 16K prompt ~120 s -> 6.9 s. Decode unchanged.
+  Configurations whose chunk is 4,096 tokens or more take the same path as before (md5-identical under
+  `STRATA_DETERMINISTIC=1`: Ornith-122B, Ornith-35B 8 / 16 GB, Qwen3.8, GLM-5.3-Flash, V4 0731; V4.1 JA256 differs
+  run to run on v1.3.136 too). Where the chunk length changes, the answer is the normal chunked one for that length.
+- `setup` without `--quant` proposes the PC-size file that fits this PC's VRAM + RAM (APUs count the memory once);
+  an installed quant is kept. DeepSeek V4 keeps UD-Q2_K_XL as the default.
+- `--bench`: the drafter check no longer says TOO EARLY while `STRATA_GLM_TAIL_SKIP` / `_TAIL_SKIP_W` /
+  `STRATA_GLM_DEFER` is on - they leave out experts by what the GPU and RAM hold at that moment, so two runs of one
+  prompt part early even without a drafter (#44). It says "not judged" and names the setting.
+
 ## v1.3.136 - 2026-11-12
 
 - `setup --model ornith35`: Ornith-1.5-35B-A3B from the official
