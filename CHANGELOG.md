@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.135 - 2026-11-12
+
+- `setup --model ornith --quant 16G64G`: Ornith-1.5-397B for a 16 GB GPU + 64 GB RAM
+  ([zephel01/Ornith-1.5-397B-IQ2_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-16G64G-GGUF),
+  BETA, 110.6 GB, #44). The experts stay IQ2_XXS; the dense part is Q5_K (attn_qkv, shared experts) and IQ4_XS with an
+  imatrix (the rest), so a 128K context starts in 16 GB (19 expert slots a layer). RTX 5090 capped at 16 GB, 44 GB RAM
+  tier: decode 9.1 tok/s (15 GB: 9.3), SSD-bound; llama.cpp KL vs the Q8_0 source 0.182 (the 32G128G files 0.166).
+  Against the 122B 16G64G on the same box: hard graded tasks 8/8 vs 6/8, 20 everyday tasks 20/20 both, ~6x slower -
+  the 122B stays the pick for speed. The setup sets the card's RAM tier (RAM - 20 GB on a 64 GB PC); the RAM line now
+  names the right PC size for the 397B files.
+- README (EN/JA): the file in the PC-size table.
+
 ## v1.3.134 - 2026-11-12
 
 Ornith-1.5 (122B / 397B) takes a smaller K/V cache, so a 16 GB card runs Ornith-1.5-397B at a 128K context (#44).

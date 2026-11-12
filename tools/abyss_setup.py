@@ -73,7 +73,7 @@ MODELS = {
                     "STRATA_GLM_ROUTE_AFFINITY_RAM": "0.08"}, "gb": 140},
     # zephel01's 16 GB GPU + 64 GB RAM quants of the two Qwen3.5-MoE 122B models (the files at the repo's top level;
     # the quant names the local folder).  Ornith's NextN drafter is in its second shard: the engine reads it there
-    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B", "24G64G", "32G128G"),
+    "ornith": {"repo": "zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B", "quants": ("IQ3_XXS-B", "24G64G", "32G128G", "16G64G"),
                "folder": "", "prefix_file": "Ornith-1.5-122B-IQ3_XXS-B-", "model_name": "ornith-1.5-122b",
                "prefix": "ornith", "title": "Ornith-1.5-122B", "env": {}, "gb": 52, "pack_args": [],
                "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
@@ -84,7 +84,12 @@ MODELS = {
                             # (--quant 32G128G: Ornith-1.5-397B, 10 experts a token, for a 32 GB GPU + 128 GB RAM, 2026-11-09)
                             "32G128G": {"repo": "zephel01/Ornith-1.5-397B-IQ2_XXS-32G128G-GGUF",
                                         "prefix_file": "Ornith-1.5-397B-32G128G-", "model_name": "ornith-1.5-397b",
-                                        "title": "Ornith-1.5-397B", "gb": 114, "vram": 32, "ram": 128}}},
+                                        "title": "Ornith-1.5-397B", "gb": 114, "vram": 32, "ram": 128},
+                            # (--quant 16G64G: Ornith-1.5-397B with a lighter dense part (Q5_K / IQ4_XS) so 128K starts on a
+                            # 16 GB GPU + 64 GB RAM, 2026-11-12, #44; ~9 tok/s, SSD-bound - the 122B is ~5x faster)
+                            "16G64G": {"repo": "zephel01/Ornith-1.5-397B-IQ2_XXS-16G64G-GGUF",
+                                       "prefix_file": "Ornith-1.5-397B-16G64G-", "model_name": "ornith-1.5-397b",
+                                       "title": "Ornith-1.5-397B", "gb": 111, "vram": 16, "ram": 64}}},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -462,7 +467,7 @@ def main() -> int:
                     "ornith: Ornith-1.5-122B, qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default), 24G64G or 32G128G (Ornith-1.5-397B); qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B (default), 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); qwen38: 12G32G, 16G64G (default) or 24G64G; glm: 32G96G (default) or 32G128G")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")
@@ -537,7 +542,7 @@ def main() -> int:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
-    if own and a.model != "ornith" or quant == "24G64G":
+    if own and a.model != "ornith" or quant in ("24G64G", "32G128G", "16G64G"):
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is made for a {model['vram']} GB GPU + {model['ram']} GB RAM: with "
              f"VRAM, ~{model['gb']} GB holds every expert; less reads from the SSD)")
         if S.ram_gb() + (gpus[0].get("vram_gb") or 0 if gpus else 0) < model["gb"] * 0.8:
@@ -604,6 +609,10 @@ def main() -> int:
         # the page cache - Qwen3.8's PLE table is read from the SSD through it - and the server)
         ram = S.ram_gb()
         extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(12, round(ram) - (12 if ram < 48 else 18 if ram < 80 else 34)))
+    if a.model == "ornith" and quant == "16G64G" and S.ram_gb() < 160:
+        # Ornith-1.5-397B 16G64G: the model card's RAM tier (44 GB on a 64 GB PC: the rest for the OS and the page cache
+        # the SSD experts go through)
+        extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 20))
     if a.model == "v41" and S.ram_gb() < 160:
         # a RAM tier that leaves ~34 GB to the page cache and the rest of the PC: V4.1's Engram rows and SSD experts keep
         # the page cache full, and without a cap systemd-oomd stops the server or the session that started it (the

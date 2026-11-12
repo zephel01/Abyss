@@ -43,6 +43,7 @@ Hugging Face で公開している自作の GGUF です。PC の大きさごと�
 | 12 GB | 32 GB | [Qwen3.8-Flash-Next-E448-IQ2_M-12G32G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-E448-IQ2_M-12G32G-GGUF) | 67.5 GB | `--model qwen38 --quant 12G32G` |
 | 16 GB | 64 GB | [Qwen3.8-Flash-Next-IQ3_M-16G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-16G64G-GGUF) | 86.9 GB | `--model qwen38` |
 | 16 GB | 64 GB | [Ornith-1.5-122B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF) | 51.7 GB | `--model ornith` |
+| 16 GB | 64 GB | [Ornith-1.5-397B-IQ2_XXS-16G64G](https://huggingface.co/zephel01/Ornith-1.5-397B-IQ2_XXS-16G64G-GGUF) | 110.6 GB | `--model ornith --quant 16G64G`（約 9 tok/s。上の 122B のほうが約 5 倍速い） |
 | 16 GB | 64 GB | [Qwen3.5-122B-A10B-IQ3_XXS-16G64G](https://huggingface.co/zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF) | 51.4 GB | `--model qwen35` |
 | 16 GB | 64 GB | [DeepSeek-V4-Flash-0731-IQ1_S-16G64G](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ1_S-16G64G-GGUF) | 61.7 GB | `--quant 16G64G` |
 | 24 GB | 64 GB | [Qwen3.8-Flash-Next-IQ3_M-24G64G](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-IQ3_M-24G64G-GGUF) | 93.7 GB | `--model qwen38 --quant 24G64G` |
