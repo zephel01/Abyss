@@ -5990,8 +5990,17 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
     }
     ph(0);
     // (2)
+    // STRATA_GLM_DRAIN_WAIT=1 (STRATA_DETERMINISTIC sets it): every demotion's copy is waited for here, so whether its
+    // VRAM slot is free again and its RAM copy live follows the tokens, not the link's speed (a slow link left drains
+    // in flight at the next boundary, the spares were refilled by evicting other residents, and the tiers changed
+    // from run to run - the answers do not depend on the tiers, but an equality test also compares their stats)
+    static const bool drain_wait = [] {
+        const char* v = getenv("STRATA_GLM_DRAIN_WAIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     std::vector<FastState::Drain> still;
     for (auto& d : F->draining) {
+        if (drain_wait) cudaEventSynchronize(d.ev);
         const cudaError_t de = cudaEventQuery(d.ev);
         if (de != cudaSuccess && de != cudaErrorNotReady)
             return glmfast::cuda_ok(de, "glm demotion event", err);
