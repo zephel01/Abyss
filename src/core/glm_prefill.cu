@@ -4254,7 +4254,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return need < 0 || dq.landed.load(std::memory_order_acquire) > need;
         };
         // the groups from g0 on; may_defer: stop at the first whose disk experts have not all landed (returned)
-        const auto run_groups = [&](size_t g0, bool may_defer) {
+        const auto run_groups = [&](size_t g0, bool may_defer, bool deferred) {
             for (size_t gi = g0; gi < groups.size(); ++gi) {
                 if (may_defer && !group_landed(gi)) return gi;
                 const Group& gr = groups[gi];
@@ -4271,7 +4271,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         if (dq.copied.load() < gi2) dq.copied.store(gi2, std::memory_order_release);
                         if (dq.landed.load(std::memory_order_acquire) <= gi2) {
                             const auto td = std::chrono::steady_clock::now();
-                            while (dq.landed.load(std::memory_order_acquire) <= gi2) glmfast::cpu_relax();
+                            // (the feeder thread - the host's experts run meanwhile: it sleeps between looks
+                            // instead of spinning a core away from them, which slowed the CPU lane's rows ~30%)
+                            while (dq.landed.load(std::memory_order_acquire) <= gi2) {
+                                if (may_defer || !deferred) glmfast::cpu_relax();
+                                else std::this_thread::sleep_for(std::chrono::microseconds(20));
+                            }
                             S->ms_disk += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
                         }
                         src = S->gpin + (size_t) (gi2 % KL) * S->gstride;
@@ -4307,7 +4312,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 t.dl = t.dcpu = 0.0;
             }
         };
-        const size_t g_def = run_groups(0, disk_defer && cpu_nrows > 0 && !dlist.empty());
+        const size_t g_def = run_groups(0, disk_defer && cpu_nrows > 0 && !dlist.empty(), false);
         if (g_def == groups.size()) groups_end();
         // the next MoE layer's prestage: its copies run once this layer's are done - during the next mixer.  With
         // CPU experts it is queued after their outputs' upload, on the same stream: an upload on a stream of its own
@@ -4339,7 +4344,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             feeder = std::thread([&, nx, feed, g_def] {
                 cudaSetDevice(dev_);
                 if (g_def < groups.size()) {   // the disk groups first, whatever fstop says (the combine needs them)
-                    run_groups(g_def, false);
+                    run_groups(g_def, false, true);
                     groups_end();
                 }
                 if (!feed) return;
