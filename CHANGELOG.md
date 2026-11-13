@@ -41,6 +41,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   `STRATA_DS4_DSPARK=0`'s.
 - When the verify window's buffers do not fit the VRAM left, the decode goes a token at a time (said once) instead
   of the request failing at its first window.
+- GLM-5.3-Flash / V4 0731 / V4.1 prompts: in layers where the CPU computes experts, the activations go down to the
+  CPU already quantized to Q8_K on the GPU (the CPU quantizer's arithmetic, byte-equal), 28.5% of the bytes; the CPU
+  copies instead of quantizing. Prompt tok/s vs v1.3.144: GLM-5.3-Flash +0.4..+1.8%, V4 0731 +1.8..+3.5%, V4.1
+  JA256 +1.7..+5% (4K/16K, 32/16 GB); decode unchanged. `STRATA_GLM_PREFILL_XQ8K=0` sends floats as before.
 - Outputs: identical to v1.3.144 with drafts off and on (md5 under `STRATA_DETERMINISTIC=1`).
 
 ## v1.3.144 - 2026-11-13
