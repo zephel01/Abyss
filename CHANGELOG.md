@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.143 - 2026-11-13
+
+- Fix (GLM-5.3-Flash, V4, V4.1, Qwen3.8, Ornith and the other fast-path models): when a VRAM -> RAM demotion copy was
+  still crossing the link a token later, the RAM table could be left pointing at a slot that had been freed and
+  reused for another expert's demotion; a route could then fetch the first expert from that slot while the other
+  expert's bytes were landing, so one expert of one layer was computed with wrong weights for that token. No crash,
+  but slightly different (worse) answers. Only slow copies hit it: PCIe Gen3 x4 or slower, x1 risers, USB4 /
+  Thunderbolt eGPUs, or a busy copy queue (small VRAM with many swaps). On an emulated half-speed link GLM-5.3-Flash's
+  `STRATA_DETERMINISTIC=1` answer changed from run to run; it is now the same every run. A late copy is now freed
+  without going live, and the clean-up re-points the table before freeing a duplicate. `STRATA_GLM_TIER_DIAG` counts
+  the stale copies freed.
+- `STRATA_GLM_DRAIN_WAIT=1` waits at each token boundary for the demotion copies still crossing; the deterministic
+  mode sets it, so its tiers (VRAM hits) no longer depend on the link speed.
+- Outputs on a Gen4 x4 link: unchanged (md5 under `STRATA_DETERMINISTIC=1` identical to v1.3.142).
+
 ## v1.3.142 - 2026-11-13
 
 - Qwen3.8-27B on an 8 GB GPU (8K context): when even every FFN row in RAM leaves too little VRAM for the prompt path,
