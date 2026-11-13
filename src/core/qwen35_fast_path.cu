@@ -183,7 +183,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
             const size_t rows = (size_t) g.lag_rows(il, (int64_t) ctx);
             lag_cache += 2 * al(rows * KV * 2);
         }
-        bytes += lag_cache + 2 * al(64 * 8) + al((size_t) g.n_head * 4);
+        bytes += lag_cache + 2 * al(64 * 8) + al((size_t) g.n_head * 4) + 2 * al(64 * 8);
     }
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
@@ -242,6 +242,9 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         F->lag_freq = (double*) take(64 * 8);
         F->lag_freq_swa = (double*) take(64 * 8);
         F->lag_gl = (float*) take((size_t) g.n_head * 4);
+        F->lag_cs = (float2*) take(64 * 8);       // (a token's RoPE (cos, sin) a kind: rope_table)
+        F->lag_cs_swa = (float2*) take(64 * 8);
+        for (int il = l1_ - 1; il >= l0_; --il) (F->L[(size_t) il].lag_swa ? F->lag_first_swa : F->lag_first) = il;
         double fr[64], fs[64];
         namespace lk = strata::kernels::lag;
         lk::rope_freqs(g.n_rot, g.rope_base, 1.0 / g.yarn_factor, g.yarn_orig_ctx, g.yarn_beta_fast, g.yarn_beta_slow, fr,
@@ -1261,9 +1264,13 @@ bool Glm5Model::fast_laguna_attn(int il, int64_t p64, std::string& err) {
         q35_dump(s, "attn_gate_proj", il, F->lag_gl, H);
     }
     const bool swa = Ly.lag_swa;
-    lk::attn_prep_rows(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv,
-                       swa ? g.n_rot_swa : g.n_rot, swa ? F->lag_freq_swa : F->lag_freq,
-                       swa ? F->lag_mscale_swa : F->lag_mscale, p64, 1, Ly.lag_ring, Ly.kc, Ly.vc, F->q35_q, s);
+    const int nr = swa ? g.n_rot_swa : g.n_rot;
+    const double* fq = swa ? F->lag_freq_swa : F->lag_freq;
+    const float ms = swa ? F->lag_mscale_swa : F->lag_mscale;
+    float2* cs = swa ? F->lag_cs_swa : F->lag_cs;
+    if (il == (swa ? F->lag_first_swa : F->lag_first)) lk::rope_table(fq, nr, ms, p64, 1, cs, s);   // (a token's first layer of its kind)
+    lk::attn_prep_rows(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv, nr, fq, ms,
+                       p64, 1, Ly.lag_ring, Ly.kc, Ly.vc, F->q35_q, s, cs);
     lk::attn(F->q35_q, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, p64, 1, swa ? g.n_swa : 0,
              1.0f / std::sqrt((float) D), F->q35_part, lk::kMaxSplits, F->q35_ao, s);
     if (dumps) {

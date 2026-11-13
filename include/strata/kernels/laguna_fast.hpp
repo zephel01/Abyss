@@ -23,10 +23,16 @@ void rope_freqs(int n_rot, double base, double freq_scale, int orig_ctx, double 
 
 /// T rows at positions p0 + t: q [T][n_head][128] -> rms(q) * q_norm, RoPE -> q_out; k [T][n_head_kv][128] ->
 /// rms(k) * k_norm, RoPE, and v as they are, into the FP16 caches' rows (p0 + t) % ring ([ring][n_head_kv][128]).
-/// freq: device, n_rot / 2 doubles (rope_freqs).
+/// freq: device, n_rot / 2 doubles (rope_freqs).  cs: rope_table's rows for these positions and this freq / mscale
+/// (null: computed here - the same values).
 void attn_prep_rows(const float* q, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int n_rot, const double* freq, float mscale, int64_t p0,
-                    int T, int ring, uint16_t* kc, uint16_t* vc, float* q_out, cudaStream_t s);
+                    int T, int ring, uint16_t* kc, uint16_t* vc, float* q_out, cudaStream_t s,
+                    const float2* cs = nullptr);
+
+/// The (cos, sin) x mscale attn_prep_rows uses for rows p0 .. p0 + T - 1: cs [T][n_rot / 2] (a token's layers of one
+/// kind share them: one table a token instead of a sincos a layer)
+void rope_table(const double* freq, int n_rot, float mscale, int64_t p0, int T, float2* cs, cudaStream_t s);
 
 /// The scratch (floats) attn needs for `rows` query rows of n_head heads split into up to max_splits key ranges.
 size_t attn_part_floats(int rows, int n_head, int max_splits);

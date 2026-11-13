@@ -34,6 +34,7 @@
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -160,6 +161,7 @@ struct VerifyBuf {
     float *q35_snap = nullptr, *q35_csnap = nullptr;
     float *q35_z = nullptr, *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr,
           *q35_q = nullptr, *q35_ao = nullptr, *q35_shg = nullptr, *q35_part = nullptr;
+    float* lag_part = nullptr;                // laguna: the attention's key-split scratch over the columns
     void *q35_yq = nullptr, *q35_aoq = nullptr;
     // qwen4exp, a column each: the hyper-connection's normed streams (and q8_1), low rank, gates and the two injects;
     // the PLE's embedding rows, keys, values, postops scratch (q4_ple_qn ends as the rows the conv history takes - the
@@ -223,7 +225,8 @@ bool Glm5Model::verify_ready() const {
         // (one part; qwen4exp's window crosses a split as its token does: verify_part_q4x's hop)
         if ((m->g_.v41 || (m->g_.qwen35() && !m->g_.q4x)) && (m->split_next_ != nullptr || m != this)) return false;
         for (int il = m->l0_; il < m->l1_; ++il)
-            if (!F->L[(size_t) il].moe && !m->g_.q35_dense()) return false;   // (the dense qwen35: every layer dense)
+            if (!F->L[(size_t) il].moe && !m->g_.q35_dense() && !m->g_.laguna)   // (the dense qwen35: every layer
+                return false;                                                    // dense; laguna: layer 0)
     }
     const Glm5Model* tail = verify_tail();
     const auto it = tail->ws_map_.find("output.weight");
@@ -350,7 +353,11 @@ bool Glm5Model::verify_alloc(std::string& err) {
                              "after column 0 %.0f MB\n", dev_, nrec,
                      (double) L * TM * V->glm_ki * 4 / 1048576.0, (double) nrec * V->glm_run * 4 / 1048576.0);
     }
-    if (ok && g.q35_dense()) {   // the dense qwen35's FFN a column: gate / up rows and the q8_1 h for down
+    if (ok && g.laguna)
+        ok = cudaMalloc((void**) &V->lag_part, strata::kernels::lag::attn_part_floats(TM, g.n_head,
+                                                                                    strata::kernels::lag::kMaxSplits) *
+                                                   sizeof(float)) == cudaSuccess;
+    if (ok && (g.q35_dense() || g.laguna)) {   // the dense qwen35's FFN a column (laguna's layer 0): gate / up rows and the q8_1 h for down
         f(V->glm_dg, (size_t) g.n_ff_dense); f(V->glm_du, (size_t) g.n_ff_dense);
         b(V->glm_dhq, (size_t) g.n_ff_dense / 32 * kQ8);
     }
@@ -1601,6 +1608,26 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, (int) E};
             if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: ssm_out"; return false; }
             ++li;
+        } else if (g.laguna) {   // fast_laguna_attn over the columns (the window layers' rings keep their 512 rows)
+            namespace lk = strata::kernels::lag;
+            const int H = Ly.lag_heads, HDl = H * lk::kHeadDim;
+            float* gl = V->q35_qf + (size_t) TM * HD;   // (the gate logits: q35_qf's second half)
+            gf::MvJob j[4];
+            j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, (int) E, HDl};
+            j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, (int) E, KV};
+            j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, (int) E, KV};
+            j[3] = {Ly.lag_g.q, V->xq, V->x, gl, nullptr, 1.0f, Ly.lag_g.type, (int) E, H};
+            if (!gf::mvn(j, 4, T, s)) { err = "laguna verify: the attention projections"; return false; }
+            const bool swa = Ly.lag_swa;
+            lk::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv,
+                               swa ? g.n_rot_swa : g.n_rot, swa ? F->lag_freq_swa : F->lag_freq,
+                               swa ? F->lag_mscale_swa : F->lag_mscale, p0, T, Ly.lag_ring, Ly.kc, Ly.vc, V->q35_q, s);
+            lk::attn(V->q35_q, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, p0, T, swa ? g.n_swa : 0,
+                     1.0f / std::sqrt((float) lk::kHeadDim), V->lag_part, lk::kMaxSplits, V->q35_ao, s);
+            lk::gate_rows(V->q35_ao, gl, T, H, s);
+            gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HDl, s);
+            gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HDl, (int) E};
+            if (!gf::mvn(&o, 1, T, s)) { err = "laguna verify: attn_output"; return false; }
         } else {
             gf::MvJob j[3];
             j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, (int) E, 2 * HD};
