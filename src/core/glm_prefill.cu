@@ -2989,7 +2989,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     S->mark("start", s);
     if (g.v41) {   // the chunk's Engram row numbers (the n-gram history advances) and layer 0's one-hot pre
         if (S->toks_h.size() != (size_t) T) { err = "glm prefill: deepseek41 has no host token ids"; return false; }
-        if (!dsv41_engram_hash(S->toks_h.data(), p0, T, err)) return false;
+        // (and the next chunk's rows behind them, STRATA_DS41_ENGRAM_AHEAD=0: each chunk's own only)
+        static const bool eng_ahead = [] {
+            const char* v = getenv("STRATA_DS41_ENGRAM_AHEAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        const bool ah = eng_ahead && !pf_ahead_toks_.empty() && pf_ahead_p0_ == p0 + T;
+        if (!dsv41_engram_hash(S->toks_h.data(), p0, T, err, ah ? pf_ahead_toks_.data() : nullptr,
+                               ah ? (int) pf_ahead_toks_.size() : 0))
+            return false;
         std::vector<float> oh((size_t) T * 4, 0.0f);
         for (int t = 0; t < T; ++t) oh[(size_t) t * 4] = 1.0f;
         cudaMemcpyAsync(S->onehot, oh.data(), oh.size() * sizeof(float), cudaMemcpyHostToDevice, s);
@@ -5054,8 +5062,14 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             std::vector<int32_t> nx0;
             if (mtp_il_ >= 0 || q4d_ != nullptr) next_of(c, nx0);   // a single device carries the draft block itself
             pf_kv_cut_ = cs[(size_t) c + 1] <= cut ? yl : -1;
+            pf_ahead_toks_.clear();
+            if (g.v41 && c + 1 < nc) {   // (deepseek41: the next chunk's Engram rows prefetched, dsv41_engram_hash)
+                pf_ahead_toks_.assign(tokens.begin() + cs[(size_t) c + 1], tokens.begin() + cs[(size_t) c + 2]);
+                pf_ahead_p0_ = pos_start + cs[(size_t) c + 1];
+            }
             const bool half_ok = prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data());
             pf_kv_cut_ = -1;
+            pf_ahead_toks_.clear();
             if (!half_ok) return false;
             if (next_port_ != nullptr) {   // (qwen4exp's split: the chunk's rows to the next part, which runs the rest)
                 std::vector<int32_t> nx;

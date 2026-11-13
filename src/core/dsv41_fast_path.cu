@@ -135,6 +135,7 @@ struct V41Engram {
     std::vector<int32_t> hist;   // the compressed id of the token at each position (the n-grams read the three before -
                                  // a rewind to any position stays exact); kEngDead past a sequence start
     std::vector<uint64_t> chunk; // the prompt path's chunk: 2 x 24 row numbers a token
+    std::vector<uint64_t> ahead; // ... the next chunk's, prefetched behind it (dsv41_engram_hash)
     uint32_t lut[256][256];   // (scale, code) -> the BF16 value's F32 bits (ds4_engram.c init_engram_bf16); 0xffffffff
                               // marks an invalid pair
     // the RAW ROW CACHE (Xolotl's: the n-grams repeat - a few common ones hold most rows): direct-mapped, a row's raw
@@ -719,6 +720,39 @@ bool engram_sync(V41Engram& E, std::string& err) {
 }
 
 // n rows (table of each: k[j] or kk for all) -> dst rows, across the Engram pool
+// STRATA_DS41_ENGRAM_PREFETCH: the prompt path's prefetch threads (default 8; 1 = on: 8 threads; 0 = off)
+int engram_pf_threads() {
+    static const int n = [] {
+        const char* v = getenv("STRATA_DS41_ENGRAM_PREFETCH");
+        return v == nullptr ? 8 : std::max(0, std::min(16, std::atoi(v)));
+    }();
+    return n;
+}
+
+// rows into the row cache on the prefetch thread: the chunk's (T tokens x 2 tables x 24) - table 0's rows (layer 1
+// reads them right after layer 0), then table 1's (layer 14's) - then the next chunk's the same way (Tn tokens of
+// ahead; 0: none), as many tokens as half of the direct-mapped cache holds without crowding it out.  The vectors must
+// outlive the thread (engram_pf_stop before they change)
+void engram_prefetch(V41Engram& E0, int T, int Tn) {
+    V41Engram* E = &E0;
+    const int pf_threads = engram_pf_threads();
+    const int cap = (int) std::min<uint64_t>((uint64_t) INT32_MAX, (E->cmask + 1) / 4 / kEngCols);
+    const int tn = std::min(T, cap), tn2 = std::min(Tn, cap - tn);
+    if (pf_threads <= 0 || E->cmask == 0 || tn <= 0) return;
+    if (!E->ppool) E->ppool = std::make_unique<EngPool>(pf_threads == 1 ? 7 : pf_threads - 1);
+    E->p_th = std::thread([E, tn, tn2] {
+        const auto seg = [E](const uint64_t* rp, int n) {
+            E->ppool->run(2 * n * kEngCols, [E, n, rp](int j) {
+                if (E->p_stop.load(std::memory_order_relaxed)) return;
+                const int k = j / (n * kEngCols), t = (j / kEngCols) % n, c = j % kEngCols;
+                engram_cache_row(*E, k, rp[(size_t) t * 2 * kEngCols + (size_t) k * kEngCols + c]);
+            });
+        };
+        seg(E->chunk.data(), tn);
+        if (tn2 > 0 && !E->p_stop.load(std::memory_order_relaxed)) seg(E->ahead.data(), tn2);
+    });
+}
+
 bool engram_rows_par(V41Engram& E, int n, const uint64_t* rows, int kk, const int* ks, float* dst, std::string& err) {
     std::atomic<bool> bad{false};
     std::mutex mu;
@@ -771,7 +805,8 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
     return true;
 }
 
-bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::string& err) {
+bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::string& err, const int32_t* ahead,
+                                  int T_ahead) {
     auto* E = (V41Engram*) v41_eng_;
     if (E == nullptr) { err = "deepseek41: Engram is not open"; return false; }
     if (!engram_sync(*E, err)) return false;   // (the pool is the background reader's too)
@@ -780,23 +815,19 @@ bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::s
     for (int t = 0; t < T; ++t)
         if (!engram_rows(*E, toks[t], p0 + t, E->chunk.data() + (size_t) t * 2 * kEngCols, err, is_image_pos(p0 + t)))
             return false;
-    static const int pf_threads = [] {
-        const char* v = getenv("STRATA_DS41_ENGRAM_PREFETCH");
-        return v == nullptr ? 8 : std::max(0, std::min(16, std::atoi(v)));   // (1 = on: 8 threads; 0 = off)
-    }();
-    // table 0's rows (layer 1 reads them right after layer 0), then table 1's (layer 14's), as many tokens as half
-    // of the direct-mapped cache holds without crowding it out
-    const int tn = (int) std::min<uint64_t>((uint64_t) T, (E->cmask + 1) / 4 / kEngCols);
-    if (pf_threads > 0 && E->cmask != 0 && tn > 0) {
-        if (!E->ppool) E->ppool = std::make_unique<EngPool>(pf_threads == 1 ? 7 : pf_threads - 1);
-        E->p_th = std::thread([E, tn] {
-            E->ppool->run(2 * tn * kEngCols, [E, tn](int j) {
-                if (E->p_stop.load(std::memory_order_relaxed)) return;
-                const int k = j / (tn * kEngCols), t = (j / kEngCols) % tn, c = j % kEngCols;
-                engram_cache_row(*E, k, E->chunk[(size_t) t * 2 * kEngCols + (size_t) k * kEngCols + c]);
-            });
-        });
+    // (deepseek41's prompt path: the next chunk's rows behind this one's - its layer 1 waited on rows its own prefetch
+    // had just begun, V4.1 JA256 4K prompt cut into 1.4K + 2.7K rows: ~0.4 s.  The same row numbers its own hash
+    // computes again: the history up to it is this chunk's)
+    int tn2 = 0;
+    if (ahead != nullptr && T_ahead > 0) {
+        tn2 = T_ahead;
+        E->ahead.resize((size_t) tn2 * 2 * kEngCols);
+        for (int t = 0; t < tn2; ++t)
+            if (!engram_rows(*E, ahead[t], p0 + T + t, E->ahead.data() + (size_t) t * 2 * kEngCols, err,
+                             is_image_pos(p0 + T + t)))
+                return false;
     }
+    engram_prefetch(*E, T, tn2);
     return true;
 }
 

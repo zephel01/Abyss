@@ -525,7 +525,8 @@ public:
                                                               // rows of this token, upload them
     // layer il's Engram add into the streams R (rows: that token's 24 x 256 rows on the device; null: the token path's)
     bool dsv41_engram_add(int il, float* R, std::string& err, const float* rows = nullptr);
-    bool dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::string& err);   // the prompt path: a chunk's
+    bool dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::string& err,   // the prompt path: a chunk's
+                           const int32_t* ahead = nullptr, int T_ahead = 0);   // (and the next chunk's, prefetched)
     bool dsv41_engram_prompt(int il, int T, float* R, std::string& err);   // row numbers, then each Engram layer's adds
     void dsv41_reset();                                    // a new sequence: the Engram history, the pending pairs
     void dsv41_engram_report() const;                      // STRATA_GLM_TIMING: the Engram rows and the cache's share
@@ -836,6 +837,10 @@ public:
     // a long deepseek41 prompt's skip (prefill_run): the chunks before the cut stop at this layer - its attention (its
     // compressed KV and index keys, which the layers after it read) and no FFN, no layer after it (-1: every layer)
     int pf_kv_cut_ = -1;
+    // deepseek41's prompt path: the next chunk's tokens (prefill_run), whose Engram rows are prefetched behind the
+    // chunk's own (dsv41_engram_hash; empty: the last chunk, or STRATA_DS41_ENGRAM_AHEAD=0)
+    std::vector<int32_t> pf_ahead_toks_;
+    int64_t pf_ahead_p0_ = 0;
     // deepseek41's prompt path: the row's own top-k selection and candidate mask (fast_dsv41_attn reads and writes
     // these instead of the token path's ds_sel / v41_keep - the prompt runs a layer over every row before the next
     // layer, and a layer that is no index source reads the selection the last index source made for the same row)
