@@ -372,10 +372,15 @@ class DenseAllInVram(unittest.TestCase):
         self.assertEqual(f(self.KEY, 23.99, 65536), 65536)
 
     def test_a_small_gpu_stops_with_the_reason(self):
-        got, said = self.check(7.99)
+        got, said = self.check(5.99)
         self.assertEqual(got, "stopped")
-        self.assertIn("needs a GPU with 12 GB or more", said)
+        self.assertIn("needs a GPU with 8 GB or more", said)
         self.assertIn("--model qwen38", said)
+
+    def test_an_8_gb_gpu_gets_8k_with_the_head_partly_on_the_cpu(self):
+        got, said = self.check(7.99)
+        self.assertEqual(got, 8192)
+        self.assertIn("part of the FFN in RAM", said)
 
     def test_a_12_16_gb_gpu_runs_with_the_ffn_partly_in_ram(self):
         got, said = self.check(11.99)
