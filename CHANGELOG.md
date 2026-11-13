@@ -7,6 +7,26 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.144 - 2026-11-13
+
+- GLM-5.3-Flash / V4 / V4.1 / Laguna-S-2.1 decode: the CPU lane's serial steps (activation quantization, each
+  expert's h quantization, the weighted sum) now run in pieces on the pool. Same bytes, same outputs. Decode, 4K +
+  512, median of 3 vs v1.3.142 (RTX 5090, Gen4 x4, iGPU off): 16 cores GLM-5.3-Flash 52.96 -> 53.99 (+1.9%), V4 69.93
+  -> 71.02 (+1.6%), V4.1 JA256 60.93 -> 62.40 (+2.4%), Laguna 16 GB 47.42 -> 48.19 (+1.6%); 8 cores GLM-5.3-Flash
+  +0.7%, V4 +2.3%, V4.1 JA256 +3.2%. `STRATA_GLM_CPU_XQ_PAR` / `STRATA_GLM_CPU_HQ_PIECES` / `STRATA_GLM_CPU_BAND_SUM`
+  `=0` bring back each old step.
+- CPU lane split: on 8 cores the start-up timing of one CPU expert sat on the border between two splits and picked
+  either from one start to the next (both the same speed). When the CPU is fast enough that the lean start would send
+  every RAM-tier expert to it anyway, a plan within 5% of the best now goes to the CPU side: the same split every
+  start.
+- GLM / V4 / V4.1 prompt: in layers with CPU-lane experts, SSD-bound expert groups go to the GPU as their reads land
+  (the CPU starts its experts at once; 16 GB 4K: CPU start wait 371 -> 115 ms), and once a layer's staged copies end
+  the next MoE layer's prestage copies go out while the CPU computes. V4.1: the next prompt chunk's Engram rows are
+  read ahead (JA256 4K: second chunk's layer 1 425 -> 74 ms). Prompt tok/s vs v1.3.142: GLM-5.3-Flash +0.4-2.5%, V4.1
+  JA256 4K +0.7-5.2%, V4 unchanged. Only copy and read timing changes. `STRATA_GLM_PREFILL_DISK_DEFER=0`,
+  `STRATA_GLM_PRESTAGE_EARLY=0`, `STRATA_DS41_ENGRAM_AHEAD=0` bring back the old order.
+- Outputs: identical to v1.3.143 (md5 under `STRATA_DETERMINISTIC=1`).
+
 ## v1.3.143 - 2026-11-13
 
 - Fix (GLM-5.3-Flash, V4, V4.1, Qwen3.8, Ornith and the other fast-path models): when a VRAM -> RAM demotion copy was
