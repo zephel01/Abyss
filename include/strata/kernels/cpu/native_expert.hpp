@@ -51,6 +51,13 @@ bool native_fmt(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
+/// The gate/up activation's blocks (n_embd / its block size), and blocks [b0, b1) of it alone - the same bytes
+/// native_quant_act writes there (every block is quantized on its own)
+int64_t native_act_blocks(const NativeFmt& f);
+void native_quant_act_blocks(const NativeFmt& f, const float* x, void* dst, int64_t b0, int64_t b1);
+/// ... and the same for the down activation (n_ff values of d_act)
+int64_t native_h_blocks(const NativeFmt& f);
+void native_quant_h_blocks(const NativeFmt& f, const float* h, void* dst, int64_t b0, int64_t b1);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 

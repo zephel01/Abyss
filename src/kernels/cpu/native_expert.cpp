@@ -264,6 +264,30 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
+int64_t native_act_blocks(const NativeFmt& f) {
+    const int64_t b = ggml_blck_size((ggml_type) f.gu_act);
+    return b > 0 && f.n_embd % b == 0 ? f.n_embd / b : 0;
+}
+
+void native_quant_act_blocks(const NativeFmt& f, const float* x, void* dst, int64_t b0, int64_t b1) {
+    if (b1 <= b0) return;
+    const int64_t b = ggml_blck_size((ggml_type) f.gu_act);
+    traits(f.gu_act)->from_float(x + b0 * b, (uint8_t*) dst + (size_t) b0 * ggml_type_size((ggml_type) f.gu_act),
+                                 (b1 - b0) * b);
+}
+
+int64_t native_h_blocks(const NativeFmt& f) {
+    const int64_t b = ggml_blck_size((ggml_type) f.d_act);
+    return b > 0 && f.n_ff % b == 0 ? f.n_ff / b : 0;
+}
+
+void native_quant_h_blocks(const NativeFmt& f, const float* h, void* dst, int64_t b0, int64_t b1) {
+    if (b1 <= b0) return;
+    const int64_t b = ggml_blck_size((ggml_type) f.d_act);
+    traits(f.d_act)->from_float(h + b0 * b, (uint8_t*) dst + (size_t) b0 * ggml_type_size((ggml_type) f.d_act),
+                                (b1 - b0) * b);
+}
+
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }

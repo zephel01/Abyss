@@ -2517,6 +2517,15 @@ void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, co
 // kernels' integer and float steps, so an expert gives the GPU's numbers to float rounding) or ggml-cpu's (Q8_K /
 // Q8_0 activations and ggml's dots, ~2% from the device's).  x's activation: the device's own q8_1 blocks when the
 // request carries them (the same bytes the GPU's experts read), else x quantized here as the device does
+// the lane's weighted sum of its experts' down rows over rows [r0, r1): out[r] = w[0] dn[0][r] + w[1] dn[1][r] + ... in
+// expert order - the whole call's sum and the bands the down jobs finish (fast_cpu_experts) are this one loop
+static void lane_wsum_rows(int ne, const float* w, const float* dn, int n_embd, int r0, int r1, float* out) {
+    for (int r = r0; r < r1; ++r) {
+        float m = 0.0f;
+        for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
+        out[r] = m;
+    }
+}
 static void lane_quant_x(bool exact, const strata::kernels::cpu::NativeFmt& nf, const float* x, const void* xq, void* dst) {
     namespace kc = strata::kernels::cpu;
     static const bool own = getenv("STRATA_GLM_CPU_EXACT_XQ") != nullptr && std::atoi(getenv("STRATA_GLM_CPU_EXACT_XQ")) == 0;
@@ -2689,12 +2698,71 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const int threads = F->cpu_pool->active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
     const bool exact = F->cpu_exact[(size_t) il] != 0;
-    lane_quant_x(exact, nf, x, xq, F->cpu_act.data());
+    // STRATA_GLM_LANE_PROF=1 (investigation): where a lane call's time goes - x's quantization, the pool batch (the
+    // last thread's first job after the batch's start, the threads' busy share, the down jobs' waits for h), the
+    // weighted sum - printed every 4,096 calls
+    static const bool lprof = getenv("STRATA_GLM_LANE_PROF") != nullptr;
+    struct LProf {
+        uint64_t n = 0, ne = 0, qx = 0, run = 0, sum = 0, wake = 0, busy = 0, thr = 0, hw = 0, gu_end = 0, tail = 0;
+    };
+    static thread_local LProf lp;
+    static std::atomic<uint64_t> lp_call{0};
+    const uint64_t call_id = lprof ? lp_call.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    std::atomic<int64_t> lp_wake{0}, lp_busy{0}, lp_hw{0}, lp_gu_end{0}, lp_end{0};
+    std::atomic<int> lp_thr{0};
+    const auto lp_now = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const int64_t lp_t0 = lprof ? lp_now() : 0;
+    static const bool one_batch = [] {
+        const char* v = getenv("STRATA_GLM_CPU_ONE_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();    // STRATA_GLM_CPU_XQ_PAR (default on with one batch; 0 off): x's activation (the native rows' Q8_K / Q8_0) in up to
+    // 8 pieces of whole blocks, the batch's first jobs, instead of on the caller before the batch (~5 us of the call
+    // on one thread, GLM-5.3 16 cores); the gate/up jobs wait for every piece.  Each block is quantized on its own:
+    // the same bytes
+    static const bool xq_par_env = [] {
+        const char* v = getenv("STRATA_GLM_CPU_XQ_PAR");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const int64_t x_blocks = one_batch && xq_par_env && !exact ? kc::native_act_blocks(nf) : 0;
+    const int QX = x_blocks >= 2 ? (int) std::min<int64_t>(x_blocks, std::min(threads, 8)) : 0;
+    std::atomic<int> x_left{QX};
+    if (QX == 0) lane_quant_x(exact, nf, x, xq, F->cpu_act.data());
+    const int64_t lp_t1 = lprof ? lp_now() : 0;
+    const auto lp_max = [](std::atomic<int64_t>& a, int64_t v) {
+        int64_t o = a.load(std::memory_order_relaxed);
+        while (v > o && !a.compare_exchange_weak(o, v, std::memory_order_relaxed)) {}
+    };
+    const auto lp_job = [&](int64_t ts) {   // a job's start: this thread's first of the call?
+        static thread_local uint64_t seen_call = 0;
+        if (seen_call != call_id) {
+            seen_call = call_id;
+            lp_thr.fetch_add(1, std::memory_order_relaxed);
+            lp_max(lp_wake, ts - lp_t1);
+        }
+    };
     const int gu_tot = ne * n_ff;
     const bool slot_out = fx != nullptr && exact;   // (the exact combine: the fixed-point sum into fx, no part)
     float* const dn = F->cpu_dn.data();
     const int dn_tot = ne * n_embd;
+    // STRATA_GLM_CPU_HQ_PIECES (default on with one batch; 0 off): an expert's h (the native rows' Q8_K / Q8_0) in up
+    // to kHPieces pieces of whole blocks, each quantized by the gate/up job that finishes its rows - the down rows no
+    // longer wait for one job to quantize all of h after the last gate/up row (a single-expert call: every thread
+    // waited).  Each block on its own: the same bytes
+    static const bool hq_pieces_env = [] {
+        const char* v = getenv("STRATA_GLM_CPU_HQ_PIECES");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    constexpr int kHPieces = 8;
+    const int64_t h_blocks = one_batch && hq_pieces_env && !exact ? kc::native_h_blocks(nf) : 0;
+    const int hp_blocks = h_blocks >= 2 ? (int) ((h_blocks + kHPieces - 1) / kHPieces) : 0;
+    const int n_hp = hp_blocks > 0 ? (int) ((h_blocks + hp_blocks - 1) / hp_blocks) : 1;
+    const int hp_rows = hp_blocks > 0 ? (int) (n_ff / h_blocks) * hp_blocks : n_ff;
     const auto gu_job = [&](int job, std::atomic<int>* rows_done, std::atomic<int>* h_ready) {
+        const int64_t js = lprof ? lp_now() : 0;
+        if (lprof) lp_job(js);
+        while (QX > 0 && x_left.load(std::memory_order_acquire) != 0) glmfast::cpu_relax();
         const void* a[1] = {F->cpu_act.data()};
         const int q1 = (int) ((int64_t) gu_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
@@ -2702,24 +2770,66 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             float* o[1] = {F->cpu_ff.data() + (size_t) i * n_ff};
             lane_gu_rows(exact, nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp,
                          gs != nullptr ? gs[i] : 1.0f);
-            // the job that finishes expert i's last gate/up rows quantizes its h for the down rows
-            if (rows_done != nullptr && rows_done[i].fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == n_ff) {
-                lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
-                h_ready[i].store(1, std::memory_order_release);
+            // the job that finishes expert i's last gate/up rows of an h piece quantizes that piece (one piece, the
+            // whole h, unless the pieces below are on); the last piece's makes h ready for the down rows
+            if (rows_done != nullptr) {
+                float* hf = F->cpu_ff.data() + (size_t) i * n_ff;
+                uint8_t* hq8 = F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes;
+                for (int p = r0 / hp_rows; p * hp_rows < r1; ++p) {
+                    const int p0 = std::max(r0, p * hp_rows), p1 = std::min(r1, (p + 1) * hp_rows);
+                    std::atomic<int>& left = rows_done[i * kHPieces + p];
+                    if (left.fetch_sub(p1 - p0, std::memory_order_acq_rel) != p1 - p0) continue;
+                    if (n_hp == 1) lane_quant_h(exact, nf, hf, hq8);
+                    else kc::native_quant_h_blocks(nf, hf, hq8, (int64_t) p * hp_blocks,
+                                                   std::min<int64_t>(h_blocks, (int64_t) (p + 1) * hp_blocks));
+                    h_ready[i].fetch_sub(1, std::memory_order_acq_rel);   // (0: h ready)
+                }
             }
             q += r1 - r0;
         }
+        if (lprof) {
+            const int64_t je = lp_now();
+            lp_busy.fetch_add(je - js, std::memory_order_relaxed);
+            lp_max(lp_gu_end, je - lp_t1);
+            lp_max(lp_end, je - lp_t1);
+        }
     };
+    // STRATA_GLM_CPU_BAND_SUM (default on with one batch; 0 off): the weighted sum in bands of kBand rows, each by the
+    // down job that finishes the band's last rows (of every expert) - the caller no longer sums all n_embd rows alone
+    // after the batch.  The same loop on the same rows (lane_wsum_rows): the same bits
+    static const bool band_sum_env = [] {
+        const char* v = getenv("STRATA_GLM_CPU_BAND_SUM");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    constexpr int kBand = 256, kMaxBands = 64;
+    const int n_bands = (n_embd + kBand - 1) / kBand;
+    std::atomic<int>* band_left = nullptr;   // rows (of all experts) a band still waits for; set below
     const auto dn_job = [&](int job, const std::atomic<int>* h_ready) {
+        const int64_t js = lprof ? lp_now() : 0;
+        if (lprof) lp_job(js);
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
-            if (h_ready != nullptr)
-                while (h_ready[i].load(std::memory_order_acquire) == 0) glmfast::cpu_relax();
+            if (h_ready != nullptr && h_ready[i].load(std::memory_order_acquire) != 0) {
+                const int64_t ws = lprof ? lp_now() : 0;
+                while (h_ready[i].load(std::memory_order_acquire) != 0) glmfast::cpu_relax();
+                if (lprof) lp_hw.fetch_add(lp_now() - ws, std::memory_order_relaxed);
+            }
             const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
             float* o[1] = {dn + (size_t) i * n_embd};
             lane_down_rows(exact, nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+            if (band_left != nullptr)
+                for (int b = r0 / kBand; b * kBand < r1; ++b) {
+                    const int b0 = std::max(r0, b * kBand), b1 = std::min(r1, (b + 1) * kBand);
+                    if (band_left[b].fetch_sub(b1 - b0, std::memory_order_acq_rel) == b1 - b0)
+                        lane_wsum_rows(ne, w, dn, n_embd, b * kBand, std::min(n_embd, (b + 1) * kBand), out);
+                }
             q += r1 - r0;
+        }
+        if (lprof) {
+            const int64_t je = lp_now();
+            lp_busy.fetch_add(je - js, std::memory_order_relaxed);
+            lp_max(lp_end, je - lp_t1);
         }
     };
     // STRATA_GLM_CPU_ONE_BATCH (default on; 0 = two batches): gate/up and down as ONE batch of 2T jobs - expert i's
@@ -2727,35 +2837,99 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     // expert's gate/up, a pool barrier and the caller's serial h quantization.  The down jobs are claimed after every
     // gate/up job (ticket order) and gate/up jobs never wait, so the pool cannot deadlock; every row's sums and every
     // h are the two-batch ones (the same bits)
-    static const bool one_batch = [] {
-        const char* v = getenv("STRATA_GLM_CPU_ONE_BATCH");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+
+    bool banded = false;
+    std::atomic<int> band_rows[kMaxBands];
     if (one_batch) {
-        std::atomic<int> rows_done[gf::kMaxK], h_ready[gf::kMaxK];
+        std::atomic<int> rows_done[gf::kMaxK * kHPieces], h_ready[gf::kMaxK];   // (rows left a piece, pieces left)
         for (int i = 0; i < ne; ++i) {
-            rows_done[i].store(0, std::memory_order_relaxed);
-            h_ready[i].store(0, std::memory_order_relaxed);
+            for (int p = 0; p < n_hp; ++p)
+                rows_done[i * kHPieces + p].store(std::min(n_ff, (p + 1) * hp_rows) - p * hp_rows, std::memory_order_relaxed);
+            h_ready[i].store(n_hp, std::memory_order_relaxed);
         }
-        F->cpu_pool->run(2 * T, [&](int job) {
-            if (job < T) gu_job(job, rows_done, h_ready);
-            else dn_job(job - T, h_ready);
+        banded = band_sum_env && !slot_out && n_bands <= kMaxBands;
+        if (banded) {
+            for (int b = 0; b < n_bands; ++b)
+                band_rows[b].store(ne * (std::min(n_embd, (b + 1) * kBand) - b * kBand), std::memory_order_relaxed);
+            band_left = band_rows;
+        }
+        F->cpu_pool->run(QX + 2 * T, [&](int job) {
+            if (job < QX) {
+                kc::native_quant_act_blocks(nf, x, F->cpu_act.data(), x_blocks * job / QX, x_blocks * (job + 1) / QX);
+                x_left.fetch_sub(1, std::memory_order_acq_rel);
+            } else if (job < QX + T) {
+                gu_job(job - QX, rows_done, h_ready);
+            } else {
+                dn_job(job - QX - T, h_ready);
+            }
         });
+        // STRATA_GLM_CPU_XQ_CHECK=1 (debug): the pieces against the whole-row quantization, byte for byte
+        static const bool xq_check = getenv("STRATA_GLM_CPU_XQ_CHECK") != nullptr;
+        if (xq_check && (QX > 0 || n_hp > 1)) {   // (... and the h pieces against the whole-h quantization)
+            static thread_local std::vector<uint8_t> ref;
+            static std::atomic<uint64_t> calls{0}, bad{0}, hbad{0};
+            ref.assign(std::max(kc::kNativeActBytes, kc::kNativeHBytes), 0);
+            lane_quant_x(exact, nf, x, xq, ref.data());
+            if (std::memcmp(ref.data(), F->cpu_act.data(), nf.act_bytes) != 0) bad.fetch_add(1);
+            for (int i = 0; i < ne; ++i) {
+                lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, ref.data());
+                if (std::memcmp(ref.data(), F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes, nf.h_bytes) != 0)
+                    hbad.fetch_add(1);
+            }
+            if (calls.fetch_add(1) % 4096 == 4095)
+                std::fprintf(stderr, "cpu xq check: %llu calls, x differs in %llu, an expert's h in %llu\n",
+                             (unsigned long long) calls.load(), (unsigned long long) bad.load(),
+                             (unsigned long long) hbad.load());
+        }
     } else {
         F->cpu_pool->run(T, [&](int job) { gu_job(job, nullptr, nullptr); });
         for (int i = 0; i < ne; ++i)
             lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
         F->cpu_pool->run(T, [&](int job) { dn_job(job, nullptr); });
     }
+    const int64_t lp_t2 = lprof ? lp_now() : 0;
     if (slot_out) {   // (the exact combine: the rows' fixed-point sum, vectorised, as the float sum below)
         const float* rows[gf::kMaxK];
         for (int i = 0; i < ne; ++i) rows[i] = dn + (size_t) i * n_embd;
         kc::lane_q81_fx_sum(ne, w, rows, 0, n_embd, fx, gf::kFxShift);
     }
-    for (int r = 0; r < n_embd && !slot_out; ++r) {
-        float m = 0.0f;
-        for (int i = 0; i < ne; ++i) m += w[i] * F->cpu_dn[(size_t) i * n_embd + r];
-        out[r] = m;
+    if (!slot_out && !banded) lane_wsum_rows(ne, w, dn, n_embd, 0, n_embd, out);
+    // STRATA_GLM_CPU_BAND_CHECK=1 (debug): the banded sum against the whole-call loop, bit for bit
+    static const bool band_check = getenv("STRATA_GLM_CPU_BAND_CHECK") != nullptr;
+    if (band_check && banded) {
+        static thread_local std::vector<float> ref;
+        static std::atomic<uint64_t> calls{0}, bad{0};
+        ref.resize((size_t) n_embd);
+        lane_wsum_rows(ne, w, dn, n_embd, 0, n_embd, ref.data());
+        if (std::memcmp(ref.data(), out, (size_t) n_embd * sizeof(float)) != 0) bad.fetch_add(1);
+        if (calls.fetch_add(1) % 4096 == 4095)
+            std::fprintf(stderr, "cpu band check: %llu calls, %llu differ\n", (unsigned long long) calls.load(),
+                         (unsigned long long) bad.load());
+    }
+    if (lprof) {
+        const int64_t t3 = lp_now();
+        ++lp.n;
+        lp.ne += (uint64_t) ne;
+        lp.qx += (uint64_t) (lp_t1 - lp_t0);
+        lp.run += (uint64_t) (lp_t2 - lp_t1);
+        lp.sum += (uint64_t) (t3 - lp_t2);
+        lp.wake += (uint64_t) lp_wake.load();
+        lp.busy += (uint64_t) lp_busy.load();
+        lp.thr += (uint64_t) lp_thr.load();
+        lp.hw += (uint64_t) lp_hw.load();
+        lp.gu_end += (uint64_t) lp_gu_end.load();
+        lp.tail += (uint64_t) std::max<int64_t>(0, (lp_t2 - lp_t1) - lp_end.load());
+        if (lp.n % 4096 == 0) {
+            const double n = (double) lp.n;
+            std::fprintf(stderr, "lane prof CUDA%d: %llu calls, %.2f experts a call | quant x %.2f us | batch %.1f us "
+                                 "(last thread in %.1f us, %.1f threads, busy %.0f%%, h waits %.1f us/call, gate/up done "
+                                 "at %.1f us, last job end -> return %.1f us) | sum %.2f us | %.1f GB/s\n",
+                         dev_, (unsigned long long) lp.n, (double) lp.ne / n, lp.qx / n / 1e3, lp.run / n / 1e3,
+                         lp.wake / n / 1e3, lp.thr / n, 100.0 * (double) lp.busy / std::max(1.0, (double) lp.run * (double) threads),
+                         lp.hw / n / 1e3, lp.gu_end / n / 1e3, lp.tail / n / 1e3, lp.sum / n / 1e3,
+                         (double) lp.ne * (double) Ly.blob / std::max(1.0, (double) (lp.qx + lp.run + lp.sum)));
+            lp = LProf{};
+        }
     }
     // STRATA_GLM_CPU_LANE_VERIFY=1 (debug, slow): the same experts in double precision from ggml's dequantised rows;
     // the relative L2 distance of the lane's sum, accumulated and printed every 16 calls
