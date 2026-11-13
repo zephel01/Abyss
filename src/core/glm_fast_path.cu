@@ -2690,7 +2690,10 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const bool exact = F->cpu_exact[(size_t) il] != 0;
     lane_quant_x(exact, nf, x, xq, F->cpu_act.data());
     const int gu_tot = ne * n_ff;
-    F->cpu_pool->run(T, [&](int job) {
+    const bool slot_out = fx != nullptr && exact;   // (the exact combine: the fixed-point sum into fx, no part)
+    float* const dn = F->cpu_dn.data();
+    const int dn_tot = ne * n_embd;
+    const auto gu_job = [&](int job, std::atomic<int>* rows_done, std::atomic<int>* h_ready) {
         const void* a[1] = {F->cpu_act.data()};
         const int q1 = (int) ((int64_t) gu_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
@@ -2698,24 +2701,51 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
             float* o[1] = {F->cpu_ff.data() + (size_t) i * n_ff};
             lane_gu_rows(exact, nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp,
                          gs != nullptr ? gs[i] : 1.0f);
+            // the job that finishes expert i's last gate/up rows quantizes its h for the down rows
+            if (rows_done != nullptr && rows_done[i].fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == n_ff) {
+                lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
+                h_ready[i].store(1, std::memory_order_release);
+            }
             q += r1 - r0;
         }
-    });
-    for (int i = 0; i < ne; ++i)
-        lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
-    const bool slot_out = fx != nullptr && exact;   // (the exact combine: the fixed-point sum into fx, no part)
-    float* const dn = F->cpu_dn.data();
-    const int dn_tot = ne * n_embd;
-    F->cpu_pool->run(T, [&](int job) {
+    };
+    const auto dn_job = [&](int job, const std::atomic<int>* h_ready) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) dn_tot * job / T); q < q1;) {
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
+            if (h_ready != nullptr)
+                while (h_ready[i].load(std::memory_order_acquire) == 0) glmfast::cpu_relax();
             const void* h[1] = {F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes};
             float* o[1] = {dn + (size_t) i * n_embd};
             lane_down_rows(exact, nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
             q += r1 - r0;
         }
-    });
+    };
+    // STRATA_GLM_CPU_ONE_BATCH (default on; 0 = two batches): gate/up and down as ONE batch of 2T jobs - expert i's
+    // down rows wait only for its own h (quantized by the job that finished its last gate/up rows), not for every
+    // expert's gate/up, a pool barrier and the caller's serial h quantization.  The down jobs are claimed after every
+    // gate/up job (ticket order) and gate/up jobs never wait, so the pool cannot deadlock; every row's sums and every
+    // h are the two-batch ones (the same bits)
+    static const bool one_batch = [] {
+        const char* v = getenv("STRATA_GLM_CPU_ONE_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (one_batch) {
+        std::atomic<int> rows_done[gf::kMaxK], h_ready[gf::kMaxK];
+        for (int i = 0; i < ne; ++i) {
+            rows_done[i].store(0, std::memory_order_relaxed);
+            h_ready[i].store(0, std::memory_order_relaxed);
+        }
+        F->cpu_pool->run(2 * T, [&](int job) {
+            if (job < T) gu_job(job, rows_done, h_ready);
+            else dn_job(job - T, h_ready);
+        });
+    } else {
+        F->cpu_pool->run(T, [&](int job) { gu_job(job, nullptr, nullptr); });
+        for (int i = 0; i < ne; ++i)
+            lane_quant_h(exact, nf, F->cpu_ff.data() + (size_t) i * n_ff, F->cpu_hq.data() + (size_t) i * kc::kNativeHBytes);
+        F->cpu_pool->run(T, [&](int job) { dn_job(job, nullptr); });
+    }
     if (slot_out) {   // (the exact combine: the rows' fixed-point sum, vectorised, as the float sum below)
         const float* rows[gf::kMaxK];
         for (int i = 0; i < ne; ++i) rows[i] = dn + (size_t) i * n_embd;
