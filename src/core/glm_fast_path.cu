@@ -5972,6 +5972,15 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                 if (key >= 0 && (ro == s || ro < 0)) {
                     upd(F->rtab_key(key), 0ull);
                     if (ro == s) F->ram_of[(size_t) key] = -1;
+                } else if (key >= 0) {
+                    // ram_of names another copy: the RAM table may still point HERE (this copy went live when its
+                    // demotion landed after the expert had been promoted again and demoted anew - into ro, still
+                    // landing or landed).  Point it at ro when that one is live, else nowhere until it lands: freed
+                    // with the entry left on it, this slot could take another expert's demotion while a route still
+                    // fetched this expert from it (an emulated half-speed link: STRATA_DETERMINISTIC's answers changed
+                    // from run to run)
+                    upd(F->rtab_key(key), R.st[(size_t) ro] == FastState::kRHold
+                                              ? (unsigned long long) (R.base + (size_t) ro * R.stride) : 0ull);
                 }
                 R.key[(size_t) s] = -1;
                 R.st[(size_t) s] = FastState::kRFree;
@@ -5991,7 +6000,20 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
             continue;
         }
         auto& R = F->rc[(size_t) d.rclass];
-        if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key) {
+        // A copy that landed after its expert was demoted AGAIN (promoted back by a route while this copy was still
+        // crossing, then evicted at a later boundary: ram_of now names the newer copy's slot, still landing) is a
+        // stale duplicate: freed here, the RAM table left alone.  It used to go live - the table pointing here while
+        // the newer copy landed - and the next boundary's clean-up freed this slot (ram_of names the other) without
+        // clearing that entry: a route could then fetch the expert from a slot a later demotion or disk read was
+        // filling with another expert.  Only a copy still in flight two boundaries on hits this (a slow link, a long
+        // copy queue); STRATA_DETERMINISTIC's answers changed from run to run on an emulated half-speed link
+        const int ro = F->ram_of[(size_t) d.key];
+        if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key && ro >= 0 &&
+            ro != d.rslot) {
+            R.st[(size_t) d.rslot] = FastState::kRFree;
+            R.key[(size_t) d.rslot] = -1;
+            ++F->diag_stale_drain;
+        } else if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key) {
             R.st[(size_t) d.rslot] = FastState::kRHold;
             upd(F->rtab_key(d.key), (unsigned long long) (R.base + (size_t) d.rslot * R.stride));
             if (F->ram_resident) {   // the deferred half of the move: forget the VRAM copy only now
@@ -6597,8 +6619,10 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
             std::fprintf(stderr, "glm tier diag class %zu (%d layers, %.2f MB): %d slots, %d held, %d free, %d experts in "
                                  "no tier\n", c, layers, (double) R.stride / 1e6, R.n, held, nfree, out);
         }
-        std::fprintf(stderr, "glm tier diag clean-up: %llu duplicate RAM copies freed, %llu lost copies adopted\n",
-                     (unsigned long long) F->diag_dup, (unsigned long long) F->diag_adopt);
+        std::fprintf(stderr, "glm tier diag clean-up: %llu duplicate RAM copies freed, %llu lost copies adopted, %llu "
+                             "stale demotion copies freed\n",
+                     (unsigned long long) F->diag_dup, (unsigned long long) F->diag_adopt,
+                     (unsigned long long) F->diag_stale_drain);
     }
     return ok;
 }
