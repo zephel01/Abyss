@@ -112,17 +112,17 @@ bool Glm5Model::dsv4_alloc(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const size_t D = (size_t) g.head_dim, ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
-    // the caches: per layer the window ring; CSA: ctx/4 compressed rows + ctx/4 indexer keys and two rings of 8;
-    // HCA: ctx/128 compressed rows and a ring of 128
+    // the caches: per layer the window ring; CSA: ctx/4 compressed rows + ctx/4 indexer keys and two rings of 8
+    // (+ ds::kCompSlack spare rows each); HCA: ctx/128 compressed rows and a ring of 128 (+ the same)
     size_t bytes = 0;
     const auto layer_bytes = [&](int il) {
         const int r = g.ratio(il);
         size_t b = al((size_t) (g.n_swa + kSpecSlack) * D * 2);
         if (r == 4) {
             b += al((ctx / 4 + 1) * D * 2) + al((ctx / 4 + 1) * (size_t) g.idx_key * 2);
-            b += 2 * al((size_t) 8 * 2 * D * 4) + 2 * al((size_t) 8 * 2 * g.idx_key * 4);
+            b += 2 * al((size_t) ds::ring_rows(8) * 2 * D * 4) + 2 * al((size_t) ds::ring_rows(8) * 2 * g.idx_key * 4);
         } else if (r == 128) {
-            b += al((ctx / 128 + 1) * D * 2) + 2 * al((size_t) 128 * D * 4);
+            b += al((ctx / 128 + 1) * D * 2) + 2 * al((size_t) ds::ring_rows(128) * D * 4);
         }
         return b;
     };
@@ -154,14 +154,14 @@ bool Glm5Model::dsv4_alloc(std::string& err) {
         if (r == 4) {
             Ly.comp_cache = (uint16_t*) take((ctx / 4 + 1) * D * 2);
             Ly.idx_cache = (uint16_t*) take((ctx / 4 + 1) * (size_t) g.idx_key * 2);
-            Ly.ring_kv = (float*) take((size_t) 8 * 2 * D * 4);
-            Ly.ring_sc = (float*) take((size_t) 8 * 2 * D * 4);
-            Ly.iring_kv = (float*) take((size_t) 8 * 2 * g.idx_key * 4);
-            Ly.iring_sc = (float*) take((size_t) 8 * 2 * g.idx_key * 4);
+            Ly.ring_kv = (float*) take((size_t) ds::ring_rows(8) * 2 * D * 4);
+            Ly.ring_sc = (float*) take((size_t) ds::ring_rows(8) * 2 * D * 4);
+            Ly.iring_kv = (float*) take((size_t) ds::ring_rows(8) * 2 * g.idx_key * 4);
+            Ly.iring_sc = (float*) take((size_t) ds::ring_rows(8) * 2 * g.idx_key * 4);
         } else if (r == 128) {
             Ly.comp_cache = (uint16_t*) take((ctx / 128 + 1) * D * 2);
-            Ly.ring_kv = (float*) take((size_t) 128 * D * 4);
-            Ly.ring_sc = (float*) take((size_t) 128 * D * 4);
+            Ly.ring_kv = (float*) take((size_t) ds::ring_rows(128) * D * 4);
+            Ly.ring_sc = (float*) take((size_t) ds::ring_rows(128) * D * 4);
         }
     }
     for (int i = 0; i < 2; ++i) {
@@ -338,13 +338,13 @@ bool Glm5Model::dsv4_snap_copy(bool restore) {
         const auto& Ly = F->L[(size_t) il];
         runs.push_back({Ly.raw, (size_t) ds_ring_ * D * 2});
         if (Ly.ratio == 4) {
-            runs.push_back({Ly.ring_kv, (size_t) 8 * 2 * D * 4});
-            runs.push_back({Ly.ring_sc, (size_t) 8 * 2 * D * 4});
-            runs.push_back({Ly.iring_kv, (size_t) 8 * 2 * g.idx_key * 4});
-            runs.push_back({Ly.iring_sc, (size_t) 8 * 2 * g.idx_key * 4});
+            runs.push_back({Ly.ring_kv, (size_t) ds::ring_rows(8) * 2 * D * 4});
+            runs.push_back({Ly.ring_sc, (size_t) ds::ring_rows(8) * 2 * D * 4});
+            runs.push_back({Ly.iring_kv, (size_t) ds::ring_rows(8) * 2 * g.idx_key * 4});
+            runs.push_back({Ly.iring_sc, (size_t) ds::ring_rows(8) * 2 * g.idx_key * 4});
         } else if (Ly.ratio == 128) {
-            runs.push_back({Ly.ring_kv, (size_t) 128 * D * 4});
-            runs.push_back({Ly.ring_sc, (size_t) 128 * D * 4});
+            runs.push_back({Ly.ring_kv, (size_t) ds::ring_rows(128) * D * 4});
+            runs.push_back({Ly.ring_sc, (size_t) ds::ring_rows(128) * D * 4});
         }
     }
     size_t total = 0;

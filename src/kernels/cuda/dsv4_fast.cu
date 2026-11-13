@@ -130,7 +130,7 @@ __global__ void __launch_bounds__(512) prep_kernel(const PrepArgs a) {
     const Comp& C = a.comp[c];
     const int W = (C.overlap ? 2 : 1) * C.D;
     const int state = (C.overlap ? 2 : 1) * C.ratio;
-    const int row = a.p % state;
+    const int row = a.p % ring_rows(state);
     const float* ape = C.ape + (size_t) (a.p % C.ratio) * W;
     for (int i = tid; i < W; i += blockDim.x) {
         C.ring_kv[(size_t) row * W + i] = a.comp_kv[c][i];
@@ -159,14 +159,14 @@ __global__ void __launch_bounds__(512) compress_kernel(const PrepArgs a) {
             const int pos = C.overlap ? s0 - R + t : s0 + t;
             if (pos < 0) continue;
             const int half = C.overlap && t >= R ? D : 0;
-            m = fmaxf(m, C.ring_sc[(size_t) (pos % state) * W + half + d]);
+            m = fmaxf(m, C.ring_sc[(size_t) (pos % ring_rows(state)) * W + half + d]);
         }
         float den = 0.0f, num = 0.0f;
         for (int t = 0; t < n; ++t) {
             const int pos = C.overlap ? s0 - R + t : s0 + t;
             if (pos < 0) continue;
             const int half = C.overlap && t >= R ? D : 0;
-            const size_t at = (size_t) (pos % state) * W + half + d;
+            const size_t at = (size_t) (pos % ring_rows(state)) * W + half + d;
             const float e = expf(C.ring_sc[at] - m);
             den += e;
             num += e * C.ring_kv[at];
@@ -736,7 +736,7 @@ __global__ void __launch_bounds__(512) compress_batch_kernel(const BatchCompArgs
             kv = B.kv[at];
             sc = B.sc[at] + C.ape[(size_t) (pos % R) * W + col];
         } else {
-            const size_t at = (size_t) (pos % state) * W + col;
+            const size_t at = (size_t) (pos % ring_rows(state)) * W + col;
             kv = C.ring_kv[at];
             sc = C.ring_sc[at];
         }
@@ -781,7 +781,7 @@ __global__ void comp_ring_kernel(const BatchCompArgs a) {
     const int first = max(a.p0, a.p0 + a.T - state);
     const int pos = first + (int) blockIdx.x;
     if (pos >= a.p0 + a.T) return;
-    const size_t src = (size_t) (pos - a.p0) * W, dst = (size_t) (pos % state) * W;
+    const size_t src = (size_t) (pos - a.p0) * W, dst = (size_t) (pos % ring_rows(state)) * W;
     const float* ape = C.ape + (size_t) (pos % C.ratio) * W;
     for (int i = threadIdx.x; i < W; i += blockDim.x) {
         C.ring_kv[dst + i] = B.kv[src + i];

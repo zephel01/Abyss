@@ -568,6 +568,12 @@ public:
     // ---- DSpark, DeepSeek V4 Flash's block drafter (src/core/dspark.cu, STRATA_DS4_DSPARK=<its GGUF>)
     void* dsp_ = nullptr;
     bool dspark_load(std::string& err);            // in fast_setup, before the expert pool takes the VRAM left
+    // DeepSeek V4 0731 without STRATA_DS4_DSPARK: the drafter GGUF where setup puts it (<models>/bleysg/...), found
+    // from the pack's folders up; "" when there is none.  dsp_auto_: the drafter was loaded that way (only when the
+    // VRAM pool beside it still holds every expert: dspark_auto_keep)
+    std::string dspark_find() const;
+    bool dsp_auto_ = false;
+    bool dspark_auto_keep(const void* fast_state, double drafter_bytes) const;   // (glm_fast_path.cu)
     void dspark_destroy();
     size_t dspark_vram_bytes() const;              // the drafter's device memory (the RAM tier is that much smaller)
     void dspark_reset();                           // a new sequence / a restored snapshot: an empty context
@@ -611,6 +617,7 @@ public:
     // kda_prep / kda_rec in order (the state after column 0 kept: verify_rewind_glm restores it and replays the kept
     // columns from the window's saved inputs), the DSA rows written in position order before the reads
     static bool glm_window_env();
+    static bool glm_window_nextn_env();   // (the window's drafter is the NextN block: STRATA_GLM_WINDOW=1, unified memory)
     bool glm_window() const { return g_.arch == 0 && !g_.v41 && glm_window_env(); }
     bool verify_part_glm(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
     void verify_rewind_glm(int64_t pos);
@@ -619,6 +626,10 @@ public:
     // or gf::mvn (the weights read once for all columns) - STRATA_Q4X_VERIFY_EXACT, on by default on CUDA, off on HIP
     // (HIP's glm_mvn is a mv() a column: the dense weights read once per column, issue #42)
     bool q4x_mvn(const void* jobs, int n, int T, cudaStream_t s);
+    // deepseek4 / deepseek41's verify-window GEMVs: glm_mvn unless STRATA_DS4_VERIFY_EXACT=0 (as q4x_mvn: default on
+    // CUDA, off on HIP; STRATA_DETERMINISTIC sets 1) - gf::mvn's one warp a row against the token path's split Q6_K
+    // rows made 3-column windows part from the plain answer (V4 0731 at token 16, 2026-11-14)
+    bool ds_mvn(const void* jobs, int n, int T, cudaStream_t s);
     bool glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // STRATA_GLM_WINDOW_CHECK
     void kda_copy_layer(int il, int li, bool restore, float* bak = nullptr);   // one KDA layer's S + conv <-> kda_bak_
     // the NextN block (blk.<n_layers>) as the drafter on one GPU (qwen35_fast_path.cu, behind the q35_mtp_* hooks)
@@ -782,6 +793,9 @@ public:
     /// after part (each part's columns hop to the next through pinned host memory, as a token's residual does).
     static constexpr int kVerifyMax = 8;
     bool verify_ready() const;
+    /// The window's buffers allocated now (every part), before a decode chooses the speculative loop: false when they
+    /// do not fit the VRAM left (the decode then goes a token at a time instead of failing at its first window)
+    bool verify_warm(std::string& err);
     /// The refusal-direction edit (src/core/glm_abl.cu) - uncensoring at run time, on every write into the residual
     /// (or, an ABL1 file, the attention / shared-expert outputs it names).  abl_load: an ABL1 / ABL2 file (--uncensor;
     /// STRATA_GLM_ABL); abl_set: an ABL2 edit from memory (--abl-build tries its candidates); abl_clear drops it.

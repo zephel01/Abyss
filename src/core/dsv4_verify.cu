@@ -233,6 +233,17 @@ bool Glm5Model::verify_ready() const {
     return it != tail->ws_map_.end() && it->second.type != 0;
 }
 
+bool Glm5Model::verify_warm(std::string& err) {
+    bool ok = true;
+    for (Glm5Model* m = this; m != nullptr && ok; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        ok = m->verify_alloc(err);
+    }
+    if (!ok) cudaGetLastError();   // (a failed cudaMalloc leaves its error behind)
+    cudaSetDevice(dev_);
+    return ok;
+}
+
 const Glm5Model* Glm5Model::verify_tail() const {
     const Glm5Model* t = this;
     while (t->split_next_) t = t->split_next_.get();
@@ -493,7 +504,7 @@ bool Glm5Model::verify_attn(int il, int64_t p0, int tb, int T, cudaStream_t s, s
         j[nj++] = {Ly.idx_proj_f, nullptr, x, iwb, nullptr, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)),
                    gf::kTypeF32, E, g.idx_heads};
     }
-    if (!gf::mvn(j, nj, T, s)) { err = "deepseek4 verify: attention projections"; return false; }
+    if (!ds_mvn(j, nj, T, s)) { err = "deepseek4 verify: attention projections"; return false; }
     // 2. per token, in position order: norms, RoPE, the ring writes, a block end's compression
     for (int t = 0; t < T; ++t) {
         const int p = (int) (p0 + tb + t);
@@ -551,7 +562,7 @@ bool Glm5Model::verify_attn(int il, int64_t p0, int tb, int T, cudaStream_t s, s
     if (r == 4)
         j2[nj2++] = {Ly.idx_q_b_q.q, qr_qb, qr, iqb, nullptr, 1.0f, Ly.idx_q_b_q.type, g.q_lora,
                      g.idx_heads * g.idx_key};
-    if (!gf::mvn(j2, nj2, T, s)) { err = "deepseek4 verify: q_b"; return false; }
+    if (!ds_mvn(j2, nj2, T, s)) { err = "deepseek4 verify: q_b"; return false; }
     // 4. per token: the per-head norm + RoPE, the indexer's top-k, the attention
     for (int t = 0; t < T; ++t) {
         const int c = tb + t, p = (int) (p0 + c);
@@ -587,10 +598,10 @@ bool Glm5Model::verify_attn(int il, int64_t p0, int tb, int T, cudaStream_t s, s
         jo[gi] = {(const uint8_t*) Ly.out_a.q + (size_t) gi * g.o_lora * wrow,
                   (const uint8_t*) oqb + (size_t) gi * (gin / 32) * kQ8, ob + (size_t) gi * gin,
                   oab + (size_t) gi * g.o_lora, nullptr, 1.0f, Ly.out_a.type, gin, g.o_lora, HD / 32, OL};
-    if (!gf::mvn(jo, g.o_groups, T, s)) { err = "deepseek4 verify: wo_a"; return false; }
+    if (!ds_mvn(jo, g.o_groups, T, s)) { err = "deepseek4 verify: wo_a"; return false; }
     gf::quantize_q8_1(oab, oaqb, T * OL, s);
     gf::MvJob jb = {Ly.out_b.q, oaqb, oab, mixer, nullptr, 1.0f, Ly.out_b.type, OL, E};
-    if (!gf::mvn(&jb, 1, T, s)) { err = "deepseek4 verify: wo_b"; return false; }
+    if (!ds_mvn(&jb, 1, T, s)) { err = "deepseek4 verify: wo_b"; return false; }
     return true;
 }
 
@@ -635,7 +646,7 @@ bool Glm5Model::verify_attn_v41(int il, int64_t p0, int tb, int T, cudaStream_t 
     if (Ly.idx_src)
         j[nj++] = {Ly.idx_proj_f, nullptr, x, iwb, nullptr, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)),
                    gf::kTypeF32, E, g.idx_heads};
-    if (!gf::mvn(j, nj, T, s)) { err = "deepseek41 verify: attention projections"; return false; }
+    if (!ds_mvn(j, nj, T, s)) { err = "deepseek41 verify: attention projections"; return false; }
     // 2. per token, in position order: qr's norm, kv's norm + RoPE into the window ring, then the KV source's row
     for (int t = 0; t < T; ++t) {
         const int p = (int) (p0 + tb + t);
@@ -683,7 +694,7 @@ bool Glm5Model::verify_attn_v41(int il, int64_t p0, int tb, int T, cudaStream_t 
     if (Ly.idx_src)
         j2[nj2++] = {Ly.idx_q_b_q.q, qr_qb, qr, iqb, nullptr, 1.0f, Ly.idx_q_b_q.type, g.q_lora,
                      g.idx_heads * g.idx_key};
-    if (!gf::mvn(j2, nj2, T, s)) { err = "deepseek41 verify: q_b"; return false; }
+    if (!ds_mvn(j2, nj2, T, s)) { err = "deepseek41 verify: q_b"; return false; }
     // 4. per token: RoPE (no per-head norm), the keys - the window, and the slot's visible rows (all of them up to
     // top_k; beyond, the column's top-k: this layer's own when it is an index source, its last index source's
     // otherwise) - and the attention
@@ -728,10 +739,10 @@ bool Glm5Model::verify_attn_v41(int il, int64_t p0, int tb, int T, cudaStream_t 
         jo[gi] = {(const uint8_t*) Ly.out_a.q + (size_t) gi * g.o_lora * wrow,
                   (const uint8_t*) oqb + (size_t) gi * (gin / 32) * kQ8, ob + (size_t) gi * gin,
                   oab + (size_t) gi * g.o_lora, nullptr, 1.0f, Ly.out_a.type, gin, g.o_lora, HD / 32, OL};
-    if (!gf::mvn(jo, g.o_groups, T, s)) { err = "deepseek41 verify: wo_a"; return false; }
+    if (!ds_mvn(jo, g.o_groups, T, s)) { err = "deepseek41 verify: wo_a"; return false; }
     gf::quantize_q8_1(oab, oaqb, T * OL, s);
     gf::MvJob jb = {Ly.out_b.q, oaqb, oab, mixer, nullptr, 1.0f, Ly.out_b.type, OL, E};
-    if (!gf::mvn(&jb, 1, T, s)) { err = "deepseek41 verify: wo_b"; return false; }
+    if (!ds_mvn(&jb, 1, T, s)) { err = "deepseek41 verify: wo_b"; return false; }
     abl_apply(il, 0, mixer, T, E, s);
     return true;
 }
@@ -753,7 +764,7 @@ bool Glm5Model::verify_moe_router(int il, int tb, int T, cudaStream_t s, std::st
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     const int nj = verify_sh_late() && FFs > 0 ? 1 : 3;
-    if (!(g.arch == 0 ? glm_mvn(j, nj, T, s) : g.q4x ? q4x_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
+    if (!(g.arch == 0 ? glm_mvn(j, nj, T, s) : g.q4x ? q4x_mvn(j, nj, T, s) : g.dsv4() ? ds_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
     return true;
 }
 
@@ -845,7 +856,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         ++F->expected;
     }
     if (late) {
-        if (!(g.arch == 0 ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
+        if (!(g.arch == 0 ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : g.dsv4() ? ds_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
         gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, g.swiglu_shexp, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
@@ -867,7 +878,9 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     }();
     // (deepseek41: its SSD reads land in the column's scratch set - a column a set up to 1 + n_scr columns; a longer
     // window keeps each column's experts right after its own fetch)
-    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && T <= 1 + V->n_scr;
+    bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && T <= 1 + V->n_scr;
+    for (int a = tb; a < tb + T && cols; ++a)   // (and each column its own scratch set - see verify_part)
+        for (int b = tb; b < a && cols; ++b) cols = V->md[(size_t) a].scratch != V->md[(size_t) b].scratch;
     // (any model: a fetch with no spare left lands in its column's scratch set, so two columns sharing a set would
     // have the later fetch overwrite the earlier one's experts before the batched launches read them - qwen4exp's
     // 5-column MTP windows shared set 3 among columns 3-5 until 2026-10-31; a launch a column reads each in time)
@@ -1281,8 +1294,13 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
     int grp = !pipe ? T : grp_env > 0 ? std::min(grp_env, T) : (T + 1) / 2;
     while ((T + grp - 1) / grp > 1 + V->n_scr) ++grp;   // (a scratch set a group)
     const int n_grp = (T + grp - 1) / grp;
-    // (a batched window: a set a column again - a pipelined window before left its groups' sets in md)
-    for (int t = 0; t < T; ++t) V->md[(size_t) t].scratch = V->scr_set[pipe ? t / grp : std::min(t, V->n_scr)];
+    // (a batched window: a set a column again - a pipelined window before left its groups' sets in md).  A pipelined
+    // window takes a set a column too while there are sets enough (a group's columns go through the column-batched
+    // expert launches, which need each column's fetches in their own set: two columns of a group sharing one had the
+    // later fetch overwrite the earlier one's experts - V4 0731's 3-column windows parted from the plain answer at
+    // token 16, 2026-11-14); a longer window a set a group (verify_moe then launches its columns one at a time)
+    const bool set_col = !pipe || T <= 1 + V->n_scr;
+    for (int t = 0; t < T; ++t) V->md[(size_t) t].scratch = V->scr_set[set_col ? std::min(t, V->n_scr) : t / grp];
     const bool prof = F->prof_on;
     const std::string vt = "v" + std::to_string(T) + "_";
     static std::vector<std::string> names;   // (mark keeps the pointer)
@@ -1394,7 +1412,7 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (gf::mvn_supported(ow.type)) {
-        if (!gf::mvn(&o, 1, T, s)) { err = "deepseek4 verify: output head"; return false; }
+        if (!ds_mvn(&o, 1, T, s)) { err = "deepseek4 verify: output head"; return false; }
     } else {
         for (int t = 0; t < T; ++t) {
             gf::MvJob ot = o;
@@ -1526,7 +1544,7 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (gf::mvn_supported(ow.type)) {
-        if (!gf::mvn(&o, 1, T, s)) { err = "deepseek41 verify: output head"; return false; }
+        if (!ds_mvn(&o, 1, T, s)) { err = "deepseek41 verify: output head"; return false; }
     } else {
         for (int t = 0; t < T; ++t) {
             gf::MvJob ot = o;
@@ -2262,30 +2280,36 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
 // ---------------------------------------------------------------- glm5-next (GLM-5.3-Flash): the batched window
 // STRATA_GLM_WINDOW: verify windows on one part - the speculative decode's NextN drafter (the model's own
 // blk.<n_layers>) or the n-gram drafts. Default: on for a CUDA integrated GPU with unified memory (DGX Spark / GB10:
-// +14-16% decode, the same tokens), off elsewhere (a discrete card: the CPU lane's share makes it break-even or slower);
-// =1 / =0 force it.  Exactness: every kernel of a column is the token path's (hc, kda_prep /
+// +14-16% decode, the same tokens) with the NextN drafter; off elsewhere - on a discrete card + RAM tier (RTX 5090)
+// the NextN drafter's windows were break-even or slower (the CPU lane's share), and the n-gram's (=2, v1.3.145) pay on
+// an edit task (+9.3%) but cost 0.3-2.8% on prose and swe-bench text (the window's buffers take expert slots, its
+// columns crowd the tiers), so they are opt-in.  =1: the window with the NextN drafter; =2: with the n-gram drafts
+// only (the block not loaded); =0: off.  Exactness: every kernel of a
+// column is the token path's (hc, kda_prep /
 // kda_rec, dsa_prep / score / select / mla, swiglu_q8, hc_post, head_prep, the routes and experts' kernels) except the
 // dense GEMVs, which are mvn_mv - mv()'s sums a column, the weights read once (STRATA_GLM_MVN_CHECK shows it) - and the
 // column-batched experts (STRATA_DS4_WIN_COLS_CHECK).
-bool Glm5Model::glm_window_env() {
-    static const bool on = [] {
+static int glm_window_mode() {
+    static const int mode = [] {
         const char* v = getenv("STRATA_GLM_WINDOW");
-        if (v != nullptr) return std::atoi(v) != 0;
+        if (v != nullptr) return std::atoi(v) == 2 ? 2 : std::atoi(v) != 0 ? 1 : 0;
 #if defined(STRATA_USE_HIP) || defined(_WIN32)
-        return false;
+        return 0;
 #else
         const char* uv = getenv("STRATA_GLM_UMA");   // (the unified-memory policy off: the discrete defaults)
-        if (uv != nullptr && std::atoi(uv) == 0) return false;
+        if (uv != nullptr && std::atoi(uv) == 0) return 0;
         int integrated = 0, dev = 0;   // (the model's device is current when the load asks)
         if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
             cudaGetLastError();
-            return false;
+            return 0;
         }
-        return integrated != 0;
+        return integrated != 0 ? 1 : 0;
 #endif
     }();
-    return on;
+    return mode;
 }
+bool Glm5Model::glm_window_env() { return glm_window_mode() != 0; }
+bool Glm5Model::glm_window_nextn_env() { return glm_window_mode() == 1; }
 
 namespace {
 int glm_env_int(const char* name) {
@@ -2325,6 +2349,18 @@ void Glm5Model::kda_copy_layer(int il, int li, bool restore, float* bak) {
 bool Glm5Model::q4x_mvn(const void* jobs, int n, int T, cudaStream_t s) {
     static const bool exact = [] {
         const char* v = getenv("STRATA_Q4X_VERIFY_EXACT");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
+    return exact ? glm_mvn(jobs, n, T, s) : gf::mvn((const gf::MvJob*) jobs, n, T, s);
+}
+
+bool Glm5Model::ds_mvn(const void* jobs, int n, int T, cudaStream_t s) {
+    static const bool exact = [] {
+        const char* v = getenv("STRATA_DS4_VERIFY_EXACT");
 #if defined(STRATA_USE_HIP)
         return v != nullptr && std::atoi(v) != 0;
 #else

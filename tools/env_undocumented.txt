@@ -28,7 +28,6 @@ STRATA_DS4_DUMP_FEAT  # src/core/glm_fast_path.cu
 STRATA_DS4_DUMP_FEAT_LAYERS  # src/core/glm_fast_path.cu
 STRATA_DS4_IDX_ALL  # src/core/dsv4_fast_path.cu
 STRATA_DS4_OQ_FUSE  # src/kernels/cuda/dsv4_fast.cu
-STRATA_DS4_SPEC_ADAPT  # src/program/generate.cpp
 STRATA_DS4_SPEC_GATE_LEARN  # src/program/generate.cpp
 STRATA_DS4_WIN_TIMING  # src/core/dsv4_verify.cu
 STRATA_FORCE_AVX2  # src/kernels/cpu/exl3_cpu.cpp

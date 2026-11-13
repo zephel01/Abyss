@@ -1411,6 +1411,7 @@ static int glm_pack_generate(const Options& o) {
         // not the link's speed (STRATA_GLM_DRAIN_WAIT)
         static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"},
                                              {"STRATA_Q4X_VERIFY_EXACT", "1"},   // (Qwen3.8's verify GEMVs, #42)
+                                             {"STRATA_DS4_VERIFY_EXACT", "1"},   // (DeepSeek V4 / V4.1's, 2026-11-14)
                                              {"STRATA_GLM_DRAIN_WAIT", "1"}};
         std::string kept;
         for (const char* k : kOff) {
@@ -1440,11 +1441,14 @@ static int glm_pack_generate(const Options& o) {
         const char* v = std::getenv("STRATA_DS4_SPEC_MIN");
         return v ? std::max(2, std::min(4, std::atoi(v))) : 3;
     }();
-    // STRATA_DS4_SPEC_ADAPT=1 (experiment): without the DSpark drafter, its decode's repeats alone - the n-gram's drafts
-    // up to 5, as long as each position's share right says (instead of one a window and the gate below)
-    const bool spec_adapt = [] {
+    // STRATA_DS4_SPEC_ADAPT: without a drafter, the DSpark decode's repeats alone - the n-gram's drafts up to 5 while
+    // each position's share right says, the window's width by the tokens it keeps a millisecond (STRATA_DS4_SPEC_COST
+    // below) - instead of one draft a window and the gate.  Default (v1.3.145): on for GLM-5.3-Flash, DeepSeek V4 and
+    // V4.1 (a window of 4-6 columns costs little more than one of 2 there: V4.1 JA256 on an RTX 5090 17 / 34 / 45 /
+    // 43 / 54 ms for 1-5 columns), off for the other models; =1 / =0 force it.  -1 here: the model decides
+    const int spec_adapt_env = [] {
         const char* v = std::getenv("STRATA_DS4_SPEC_ADAPT");
-        return v != nullptr && std::atoi(v) != 0;
+        return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
     }();
     strata::core::Glm5Model model;
     std::string err;
@@ -1467,6 +1471,35 @@ static int glm_pack_generate(const Options& o) {
         return 1;
     }
     const int64_t n_vocab = model.geometry().n_vocab;
+    // (measured default, v1.3.145, RTX 5090 + 123 GB, 4K-class prompt + 512, median of 3 vs one draft a window: V4 0731
+    // edit +20.9%, swe-bench +11.9%, prose +0.5 / -1.7%; V4.1 JA256 swe-bench +1.9%, edit -0.3%, prose -0.6 / -1.0% -
+    // off there; GLM-5.3-Flash edit +9.3%, swe-bench -2.8%, prose -0.3 / -1.9% - its window stays opt-in,
+    // STRATA_GLM_WINDOW=2)
+    const bool ds_v4 = model.geometry().dsv4() && !model.geometry().v41;
+    const bool glm53 = model.geometry().arch == 0 && !model.geometry().v41;
+    const bool spec_adapt = spec_adapt_env >= 0 ? spec_adapt_env != 0 : ds_v4 || glm53;
+    // STRATA_DS4_SPEC_GATE_FRESH (the gate's and the cost table's warm-up, below): default on with the wider windows
+    // (V4 0731, GLM-5.3-Flash's opt-in window); V4.1 keeps v1.3.144's gate - with one draft a window the fresh gate let
+    // more windows through on prose (JA256: 9 against 4, 33% kept) and cost 4% there
+    const bool spec_fresh = [&] {
+        const char* v = std::getenv("STRATA_DS4_SPEC_GATE_FRESH");
+        return v != nullptr ? std::atoi(v) != 0 : spec_adapt;
+    }();
+    // the verify window usable: ready, and its buffers allocated (v1.3.145: before the first window - when they do not
+    // fit the VRAM left the decode goes a token at a time, said once, instead of the request failing at its first
+    // window; GLM-5.3-Flash's window is on by default on discrete cards now)
+    const auto verify_on = [&model]() {
+        static int warm = -1;   // (-1 not tried, 0 failed, 1 allocated)
+        if (!model.verify_ready()) return false;
+        if (warm < 0) {
+            std::string werr;
+            warm = model.verify_warm(werr) ? 1 : 0;
+            if (!warm)
+                std::fprintf(stderr, "NOTE: the verify window's buffers did not fit the VRAM left (%s): no speculative "
+                                     "decode, a token at a time\n", werr.c_str());
+        }
+        return warm == 1;
+    };
     // the driver samples on the device (sample_token), so the fast path never downloads the logits
     model.set_host_logits(false);
     if (model.fast()) {
@@ -2243,7 +2276,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-        } else if (req_spec && spec_k > 0 && (model.dspark_ready() || spec_adapt) && model.fast() && model.verify_ready()) {
+        } else if (req_spec && spec_k > 0 && (model.dspark_ready() || spec_adapt) && model.fast() && verify_on()) {
             // DSpark's speculative decode (STRATA_DS4_DSPARK=<the drafter GGUF>): after each token the drafter
             // proposes the next 5 with a confidence each; the leading ones at or above STRATA_DS4_DSPARK_THR (default
             // 0.6; ds4's 0.7: swe-bench 61.3 against 61.9 tok/s, 0.8 59.8) go through a verify window behind the token, compared and kept as the n-gram decode's below
@@ -2332,10 +2365,12 @@ static int glm_pack_generate(const Options& o) {
             // of the largest E(k) / cw[k+1] wins, a wider one only by 2%.  Every 16th step tries a width measured
             // fewer than 3 times.  Where windows cost the SSD more than they keep (short answers, new code), the
             // token goes alone.
-            static const bool d_cost = [] {
+            // Default (v1.3.145): on for the repeats alone (no drafter: STRATA_DS4_SPEC_ADAPT above), off with a drafter
+            static const int d_cost_env = [] {
                 const char* v = std::getenv("STRATA_DS4_SPEC_COST");
-                return v != nullptr && std::atoi(v) != 0;
+                return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
             }();
+            const bool d_cost = d_cost_env >= 0 ? d_cost_env != 0 : !model.dspark_ready();
             // (2026-11-06) the tables live as long as the process - the same model, the same machine - instead of
             // starting over every request (a short request's choices came from a handful of samples); a width's cost is
             // the MEDIAN of its last 16 steps (one slow step - an SSD spell - moved the old running mean for many);
@@ -2361,6 +2396,18 @@ static int glm_pack_generate(const Options& o) {
             double* cal_n = ct.cal_n;
             int64_t& n_cost = ct.n_cost;
             const auto cal_bin = [](float p) { return std::max(0, std::min(7, (int) (p * 8.0f))); };
+            // STRATA_DS4_SPEC_COST_MARGIN (v1.3.145): a window runs only when its tokens a millisecond beat the single
+            // token's by this much.  A window's columns route experts the single token would not, so the steps after
+            // it find fewer in VRAM and give the CPU lane more (GLM-5.3-Flash on a swe-bench prompt, RTX 5090: VRAM
+            // hits 56.7 -> 45.6%, the lane's experts 145 -> 215 a token); with 2% the windows that only broke even on
+            // their own time made GLM-5.3-Flash and V4.1 JA256 4-5% slower there than without them.  Default 1.10;
+            // DeepSeek V4 0731 1.02 (its windows paid there: 81.3 -> 95.0 tok/s at 1.02, 93.2 at 1.10)
+            const double d_margin = [&model] {
+                const char* v = std::getenv("STRATA_DS4_SPEC_COST_MARGIN");
+                const double def = model.geometry().dsv4() && !model.geometry().v41 ? 1.02 : 1.10;
+                const double m = v != nullptr ? std::atof(v) : def;
+                return m >= 1.0 && m <= 2.0 ? m : def;
+            }();
             const auto cost_pick = [&](const double* a, int kmax, int fallback) {
                 if (cw_n[1] == 0) return fallback;   // (nothing measured yet)
                 ++n_cost;
@@ -2384,7 +2431,9 @@ static int glm_pack_generate(const Options& o) {
                         t = t_last + 0.3 * cw[1] * (double) (kk + 1 - c_last);
                     }
                     const double v = e / t;
-                    if (v > best * (kk > 0 ? 1.02 : 1.0)) {
+                    // a window against the single token: by d_margin (its experts crowd the tiers and the CPU lane
+                    // for the steps after it, which its own time does not show); a wider window by 2%
+                    if (v > best * (kk == 0 ? 1.0 : bk == 0 ? d_margin : 1.02)) {
                         best = v;
                         bk = kk;
                     }
@@ -2402,6 +2451,13 @@ static int glm_pack_generate(const Options& o) {
                 cw[cols] = v[n / 2];
                 ct.since1 = cols == 1 ? 0 : ct.since1 + 1;
             };
+            // (v1.3.145) an answer's first 16 steps stay out of the cost table: right after a prompt the pool takes
+            // back the experts the prompt borrowed and a step runs slower (V4.1 JA256: single tokens there 21.5 ms
+            // against 17 later), and the singles a window-heavy answer takes are mostly those - the table's single
+            // token looked dear and 3-column windows that kept 2.8 tokens ran where they did not pay.
+            // STRATA_DS4_SPEC_GATE_FRESH=0: every step counts, as before
+            const bool cost_fresh = spec_fresh;
+            int64_t d_step = 0;
             for (;;) {
                 if (stop_req.load()) {
                     finish = "cancel";
@@ -2409,6 +2465,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 if (!on_token(tok)) break;
                 dr.push(tok);
+                const bool d_timed = !cost_fresh || ++d_step > 16;
                 const int64_t p0 = model.position();
                 const int room = (int) std::min<int64_t>(d_max, o.max_context - p0 - 1);
                 int32_t d[5];
@@ -2492,7 +2549,7 @@ static int glm_pack_generate(const Options& o) {
                     came.push_back(tok);
                     ng_learn();
                     cal_learn();
-                    cw_add(1, m1);
+                    if (d_timed) cw_add(1, m1);
                     continue;
                 }
                 win.assign(1, (int32_t) tok);
@@ -2540,7 +2597,7 @@ static int glm_pack_generate(const Options& o) {
                 cal_learn();
                 const double mw = ms_since(tw);
                 ms_win += mw;
-                cw_add(k + 1, mw);
+                if (d_timed) cw_add(k + 1, mw);
                 // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
                 static const int d_log = [] {
                     const char* v = std::getenv("STRATA_DS4_DSPARK_LOG");
@@ -2579,7 +2636,7 @@ static int glm_pack_generate(const Options& o) {
                              cw_n[6], cal_h[0] / cal_n[0], cal_h[1] / cal_n[1], cal_h[2] / cal_n[2],
                              cal_h[3] / cal_n[3], cal_h[4] / cal_n[4], cal_h[5] / cal_n[5], cal_h[6] / cal_n[6],
                              cal_h[7] / cal_n[7]);
-        } else if (req_spec && spec_k > 0 && model.fast() && model.verify_ready()) {
+        } else if (req_spec && spec_k > 0 && model.fast() && verify_on()) {
             // deepseek4's n-gram speculative decode (STRATA_DS4_SPEC=<k>): after each token, the latest earlier
             // occurrence of the last spec_min tokens in the prompt + the answer so far proposes the next k; the token
             // and its proposal go through one verify window, and each column's sample is compared with the proposal -
@@ -2611,6 +2668,14 @@ static int glm_pack_generate(const Options& o) {
                 return v == nullptr || std::atoi(v) != 0;
             }();
             int gated0 = -1;
+            // (v1.3.145) the gate's two times leave out the answer's first 16 steps: right after a prompt the pool
+            // takes back the experts the prompt borrowed and a token runs slower (V4.1 JA256: a single token measured
+            // there at 21.3 ms against 17.3 later), which made a window look cheap - on an edit task every window
+            // ran and the decode fell from 57.9 to 55.7 tok/s.  And while windows run back to back, every 32nd step
+            // goes alone so the single token's time stays current.  STRATA_DS4_SPEC_GATE_FRESH=0: the old gate
+            const bool gate_fresh = spec_fresh;
+            constexpr int64_t kGateWarm = 16;
+            int64_t step = 0, since_one = 0;
             const auto ms_since = [](std::chrono::steady_clock::time_point a) {
                 return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
             };
@@ -2621,6 +2686,8 @@ static int glm_pack_generate(const Options& o) {
                 }
                 if (!on_token(tok)) break;
                 dr.push(tok);
+                ++step;
+                const bool timed = !gate_fresh || step > kGateWarm;   // (this step's time goes into the gate's)
                 const int64_t p0 = model.position();
                 // NGRAM_LONG: the window sized by the match - 1 token under 6 matched, 2 under 12, 3 under 24, else
                 // up to the window's limit (kVerifyMax - 1 drafts; STRATA_DS4_SPEC does not cap this mode)
@@ -2642,9 +2709,13 @@ static int glm_pack_generate(const Options& o) {
                     gated0 = gate_learn ? draft[0] : -1;
                     draft.clear();
                     ++n_gated;
+                } else if (!draft.empty() && spec_gate && gate_fresh && timed && since_one >= 32) {
+                    gated0 = gate_learn ? draft[0] : -1;   // (the single token's time re-measured)
+                    draft.clear();
                 }
                 const auto tw = std::chrono::steady_clock::now();
                 if (draft.empty()) {
+                    since_one = 0;
                     ++n_one;
                     if (!model.forward({(int32_t) tok}, lg, err)) {
                         std::printf("ERR %s\n", err.c_str());
@@ -2663,9 +2734,10 @@ static int glm_pack_generate(const Options& o) {
                     sp.counter += 1;
                     const double m1 = ms_since(tw);
                     ms_one += m1;
-                    g_one = g_one > 0.0 ? 0.9 * g_one + 0.1 * m1 : m1;
+                    if (timed) g_one = g_one > 0.0 ? 0.9 * g_one + 0.1 * m1 : m1;
                     continue;
                 }
+                ++since_one;
                 win.assign(1, (int32_t) tok);
                 win.insert(win.end(), draft.begin(), draft.end());
                 if (!model.verify(win, err)) {
@@ -2702,17 +2774,18 @@ static int glm_pack_generate(const Options& o) {
                 model.spec_rewind(p0 + kept);
                 const double mw = ms_since(tw);
                 ms_win += mw;
-                g_win = g_win > 0.0 ? 0.9 * g_win + 0.1 * mw : mw;
+                if (timed) g_win = g_win > 0.0 ? 0.9 * g_win + 0.1 * mw : mw;
                 g_p = 0.9 * g_p + 0.1 * (double) (kept - 1) / (double) draft.size();
                 if (stopped) break;
                 tok = next;
             }
             std::fprintf(stderr, "ds4 spec: k %d, n-gram %d: %lld windows (%lld drafted, %lld accepted = %.0f%%) and "
-                                 "%lld single tokens (%lld proposals gated); %.1f ms a window, %.1f a single token\n",
+                                 "%lld single tokens (%lld proposals gated); %.1f ms a window, %.1f a single token; the "
+                                 "gate's: %.1f / %.1f ms, %.2f accepted\n",
                          spec_k, spec_min, (long long) n_win, (long long) n_draft, (long long) n_acc,
                          100.0 * (double) n_acc / (double) std::max<int64_t>(1, n_draft), (long long) n_one,
                          (long long) n_gated, ms_win / (double) std::max<int64_t>(1, n_win),
-                         ms_one / (double) std::max<int64_t>(1, n_one));
+                         ms_one / (double) std::max<int64_t>(1, n_one), g_win, g_one, g_p);
         } else {
             for (;;) {
                 if (stop_req.load()) {

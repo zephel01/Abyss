@@ -7,6 +7,42 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.145 - 2026-11-14
+
+- DeepSeek V4 0731 decode: up to 5 n-gram drafts a verify window instead of one (`STRATA_DS4_SPEC_ADAPT`, now on for
+  V4): each position of a repeat is used while it keeps being right, and the width comes from what each width costs
+  on the machine and how many tokens it keeps (`STRATA_DS4_SPEC_COST`, now on there). A window of 4-6 columns costs
+  little more than one of 2 (the CPU lane's RAM-tier experts take most of a step and the columns share them). RTX
+  5090 + 123 GB, iGPU off, 4K-class prompt + 512 greedy tokens, median of 3 vs v1.3.144: editing a Python file
+  73.3 -> 88.6 tok/s (+20.9%), a swe-bench-like fix 82.2 -> 92.0 (+11.9%), English prose 71.1 -> 71.4 (+0.5%),
+  Japanese prose 76.0 -> 74.7 (-1.7%). `STRATA_DS4_SPEC_ADAPT=0` brings back one draft a window and the gate.
+- V4.1 JA256 keeps one draft a window and v1.3.144's gate (edit / swe-bench / prose +2.1 / -0.3 / -0.5 / -1.0%, at
+  par). Not on by default: V4.1 with the wider windows (swe-bench +1.9%, edit -0.3%, prose -0.6 / -1.0%) and
+  GLM-5.3-Flash's verify window with the n-gram drafts on a discrete card (new `STRATA_GLM_WINDOW=2`, the NextN block
+  not loaded: edit +9.3%, swe-bench -2.8%, prose -0.3 / -1.9%) - opt-in for code-editing work.
+- A window has to beat the single token by 10% (`STRATA_DS4_SPEC_COST_MARGIN`; V4 0731 2%): its columns route experts
+  the single token would not, so the steps after it find fewer in VRAM (GLM-5.3-Flash on swe-bench text: VRAM hits
+  56.7 -> 45.6%).
+- With the wider windows (V4 0731): the n-gram gate and the cost table leave out an answer's first 16 steps (right after a
+  prompt a token runs slower while the pool takes back the experts the prompt borrowed, which made windows look cheap:
+  V4.1 JA256 on an edit task 57.9 -> 55.7 tok/s with every window running), and re-time the single token every 32nd
+  step of a run of windows. `STRATA_DS4_SPEC_GATE_FRESH=0`: as before.
+- DSpark drafter (V4 0731): loaded on its own when the file is beside the models (where `--dspark` puts it) and the
+  expert pool still holds every expert after its 6.48 GB (a ~48 GB+ card). Not on a 32 GB card + RAM tier: there it
+  is slower than the n-gram windows (RTX 5090: edit 75.9, swe-bench 78.3 tok/s against 88.6 / 92.0).
+  `STRATA_DS4_DSPARK=0` keeps it off, `=<file>` loads it as before. With the drafter the RAM tier no longer shrinks by
+  its size (the general RAM limits keep the box safe; `STRATA_DS4_DSPARK_TIER_CAP=1`: the old cap).
+- Fix (V4 0731): verify windows of 3 or more columns - DSpark's, and the n-gram's with `STRATA_DS4_SPEC` > 1 - could
+  give other greedy tokens than the token-by-token decode, also under `STRATA_DETERMINISTIC=1` (at token 16 on a 4K
+  prompt). The window's dense GEMVs now give each column the token path's sums (`STRATA_DS4_VERIFY_EXACT`, as
+  Qwen3.8's), a pipelined window's columns each get their own expert scratch set (two columns of a group shared one
+  while the column-batched expert launches read them), and the compressor rings have 8 spare rows so a rejected
+  column's row cannot land on one a later block end reads. With the drafter the answers now equal
+  `STRATA_DS4_DSPARK=0`'s.
+- When the verify window's buffers do not fit the VRAM left, the decode goes a token at a time (said once) instead
+  of the request failing at its first window.
+- Outputs: identical to v1.3.144 with drafts off and on (md5 under `STRATA_DETERMINISTIC=1`).
+
 ## v1.3.144 - 2026-11-13
 
 - GLM-5.3-Flash / V4 / V4.1 / Laguna-S-2.1 decode: the CPU lane's serial steps (activation quantization, each

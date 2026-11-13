@@ -800,10 +800,24 @@ prompt のまとめ処理でもこのレーンを使う。prompt のチャンク
 
 **投機デコード（`STRATA_DS4_SPEC`、既定でオン）。** この GGUF にはドラフトモデルがないが、応答は prompt や応答の
 前のほうに出てきた並び（コード、ファイルパス、ツール呼び出し）を繰り返すことが多い。エンジンは直近 3 トークンが
-前に出てきた場所を探し、その次のトークンを候補として次の 1 トークンと一緒に 1 回で確かめ、モデルの答えと一致すれば
-採用する。出力は使わない場合と同じで（同じロジットに同じサンプラー）、速さだけが変わる。リクエストごとに採用率を
-学習するゲートがあり、割に合わない間は候補を出さない。コーディングの prompt で +10〜13%（候補の 77〜85% が採用）、
-文章ではほぼ変わらない（採用は約 50%）。`STRATA_DS4_SPEC=0` でオフ。GPU を分割しているときも使う（v1.3.26）。
+前に出てきた場所を探し、その続きを次の 1 トークンと一緒に 1 回で確かめ（検証の窓）、モデルの答えと一致する間だけ
+採用する。出力は使わない場合と同じで（同じロジットに同じサンプラー。`STRATA_DETERMINISTIC=1` ではバイトまで同じ）、
+速さだけが変わる。v1.3.145 から DeepSeek V4 0731 では 1 回の窓に最大 5 トークンを下書きする
+（`STRATA_DS4_SPEC_ADAPT`）。繰り返しの各位置は当たり続けている間だけ使い、窓の幅は、この機械で幅ごとにかかる時間と
+残るトークン数から決める（`STRATA_DS4_SPEC_COST`）。4〜6 列の窓は 2 列の窓とあまり変わらない時間で済む。1 回の時間の大半は
+CPU レーンが計算する RAM 層の expert で、列どうしで同じ expert を多く使うため。RTX 5090 + RAM 123 GB、内蔵 GPU なし、
+4K 前後の prompt + 512 トークン（貪欲）、3 回の中央値、v1.3.144（1 回の窓に 1 トークン）との比較:
+
+| DeepSeek V4 0731 UD-Q2_K_XL | v1.3.144 | v1.3.145 |
+| --- | :---: | :---: |
+| Python のファイルの書き換え（型ヒント、prompt 約 3K トークン） | 73.3 tok/s | 88.6 tok/s（+20.9%） |
+| swe-bench 風のバグ修正（t030） | 82.2 tok/s | 92.0 tok/s（+11.9%） |
+| 英語の散文（4K の prompt） | 71.1 tok/s | 71.4 tok/s（+0.5%） |
+| 日本語の散文（鉄道史） | 76.0 tok/s | 74.7 tok/s（−1.7%） |
+
+DeepSeek V4.1 は 1 回の窓に 1 トークンのまま。広い窓は swe-bench の文で +1.9%、書き換えの作業で −0.3%、散文で −0.6 / −1.0% だった
+（`STRATA_DS4_SPEC_ADAPT=1` で使える）。`STRATA_DS4_SPEC=0` で下書きをオフ、`STRATA_DS4_SPEC_ADAPT=0` で V4 も 1 回の窓に
+1 トークンと採用率のゲートに戻る。GPU を分割しているときも使う（v1.3.26）。
 
 ## DSpark のドラフトモデル（DeepSeek V4 Flash）
 
@@ -825,11 +839,26 @@ v1.3.43 から、DeepSeek V4 Flash 0731 に DeepSeek の DSpark ブロックド�
 40-42, 5 drafts a step; 6.48 GB on CUDA0 ...`）。使えるのは DeepSeek V4 Flash 0731 を GPU 1 枚で動かすときだけで、層の分割、
 MTP ブロックとは併用できない（DeepSeek V4.1 は専用のドラフターのファイルを使う。[DeepSeek V4.1 Flash](#deepseek-v41-flash)）。そのときは `dspark: not loaded - <理由>` と出て、本体はドラフトモデルなしで動く。
 
-**かかるもの。** ドラフトモデルは重みと expert をすべて VRAM に置く。6.48 GB で、その分 expert のプールが小さくなる。RAM 層は
-ドラフトモデルなしのときの大きさのままにするので、いちばん使われない約 6.5 GB の expert は SSD から読むことになる（下の
-マシンの生成中で 1 トークンあたり 0.01 回）。RAM に余裕のある PC では、これまでどおり `STRATA_GLM_RAM_GB` で RAM 層の大きさを
-手で決められる。この上限がないと、RAM 層がその expert まで pinned で持とうとする。RAM 94 GB の PC では 73.9 GB を pinned に
-して空きが 13 GB になり、8K の prompt に 11 秒ではなく 301 秒かかった。下書き 1 回は AI PRO R9700 で約 4.4 ms。
+**自動で読む（v1.3.145）。** `STRATA_DS4_DSPARK` がないとき、エンジンはモデルの置き場でファイルを探し
+（`<models>/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF/DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`。`--dspark` が置く場所）、
+ドラフトモデルの 6.48 GB を引いても expert のプールにモデルの全 expert が入るときだけ読む。目安は 48 GB 以上のカード。
+32 GB のカードでは読まない。そこではドラフトモデルが取る 6.5 GB の分だけ expert のプールが小さくなり、上の n-gram の窓の
+ほうが速い（書き換えの作業でドラフトモデルあり 75.9、n-gram の窓 88.6 tok/s。swe-bench の文で 78.3 と 92.0）。ログには `dspark: the drafter beside the models (no STRATA_DS4_DSPARK) - on` または `- off` と
+大きさが出る。`STRATA_DS4_DSPARK=0` でどこでも読まない。`STRATA_DS4_DSPARK=<ファイル>` なら VRAM に関係なく読む（これまで
+どおり）。`STRATA_DETERMINISTIC=1` のときと、共有メモリ（DGX Spark）では自動では読まない（使うならファイルを指定する）。
+
+**かかるもの。** ドラフトモデルは重みと expert をすべて VRAM に置く。6.48 GB で、その分 expert のプールが小さくなる。
+v1.3.144 までは RAM 層をドラフトモデルなしのときの大きさのままにしたので、いちばん使われない約 6.5 GB の expert は SSD から
+読んでいた。v1.3.145 からは、RAM 全体の上限（RAM の 73%、100 GiB 以上の PC では RAM − 24 GB）に余裕があれば RAM 層が
+その expert も持つ（RTX 5090 + 123 GB の V4 0731 で pinned 70.0 → 76.5 GB、ディスク読みなし）。`STRATA_DS4_DSPARK_TIER_CAP=1`
+で前の上限に戻る。RAM 94 GB の PC を守っているのはこの全体の上限で、そこで RAM 層が 73.9 GB を pinned にすると空きが 13 GB に
+なり、8K の prompt に 11 秒ではなく 301 秒かかった。下書き 1 回は AI PRO R9700 で約 4.4 ms。
+
+**同じトークン（v1.3.145）。** V4 0731 の 3 列以上の窓（DSpark のもの、`STRATA_DS4_SPEC` を 2 以上にした n-gram のもの）は、
+`STRATA_DETERMINISTIC=1` でもトークンごとの答えから離れることがあった（4K の prompt で 16 トークン目）。窓の dense の GEMV が
+トークン経路と違う順に足していたこと（今は `STRATA_DS4_VERIFY_EXACT`）、pipelined の窓で同じグループの 2 列が expert の
+作業領域を 1 組で共有していたこと、捨てた列の compressor ring の行が、あとのブロックの終わりで読む行に重なりえたこと、の
+3 つ。すべて直し、ドラフトモデルありの答えは `STRATA_DS4_DSPARK=0` と同じになった。
 
 **速さ**（AI PRO R9700、OCuLink PCIe Gen4 x4。RAM 94 GB の Ryzen AI Max+ 395 の PC。UD-Q2_K_XL と Q5_K の attention pack、
 サーバー経由）:
@@ -857,7 +886,8 @@ DGX Spark（v1.3.114）で生成が 21.0 → 22.8 tok/s になり、下書きの
 
 | 設定 | 既定 | |
 | --- | --- | --- |
-| `STRATA_DS4_DSPARK` | オフ | `<ドラフトモデルの GGUF>`: DeepSeek の DSpark ドラフトモデルを読み、それで生成する |
+| `STRATA_DS4_DSPARK` | 自動 | `<ドラフトモデルの GGUF>`: DeepSeek の DSpark ドラフトモデルを読み、それで生成する。`0`: 読まない。指定なし（v1.3.145）: モデルの置き場のファイルを、読んだあとも expert のプールに全 expert が入るときだけ読む（48 GB 前後以上のカード。32 GB のカード + RAM 層では n-gram の窓のほうが速いので読まない）。`STRATA_DETERMINISTIC` と共有メモリでは読まない |
+| `STRATA_DS4_DSPARK_TIER_CAP` | オフ | `1`: ドラフトモデルがあるとき、RAM 層をドラフトモデルなしの大きさのままにする（v1.3.43〜v1.3.144 の動き。押し出された約 6.5 GB の expert は SSD から読む）。オフ: RAM 全体の上限で RAM 層の大きさを決める |
 | `STRATA_DS4_DSPARK_THR` | 0.6 | 下書きに必要な確信度。下回る最初の下書きで窓を打ち切る（swe-bench: 0.7 で 61.3、0.8 で 59.8 tok/s、0.6 は 61.9。ds4 は 0.7） |
 | `STRATA_DS4_DSPARK_K` | 5 | 1 回の窓の下書きの上限（1〜5） |
 | `STRATA_DS4_DSPARK_CHAIN` | オフ | `<p>`: 1 つずつのしきい値の代わりに、確信度の積が p 以上の間の下書きを使う |
@@ -906,6 +936,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_CPU_EXACT` | `1`（x86 の CPU で Qwen3.8）、`0`（ほかのモデル。RTX 5090 で GLM-5.3 の生成が 14%、V4.1 が 5% 遅くなったため） | CPU レーンのエキスパートを、GPU のカーネルと同じ計算（GPU と同じ 8 ビットの活性、同じ整数の和）で求めます。どちらで計算しても同じ値になります。`0` で従来の ggml-cpu の計算。ARM の CPU は従来の計算のまま |
 | `STRATA_GLM_LANE_XC` | `1`（x86 の CUDA で Qwen3.8）、`0`（ほかのモデル、HIP、ARM） | `STRATA_GLM_CPU_EXACT` と合わせて、CPU レーンのエキスパートが GPU とビット単位で同じ値になり（GPU と同じ足し算の順と、SiLU の exp）、層のエキスパートの和を固定小数点で取ります（重みを掛けた各エキスパートの行を 2^-34 単位の 64 ビット整数にして足し、最後に 1 回だけ float に丸める。どの順に足しても同じビットで、float の足し算と同じかそれ以上に正確）。どのエキスパートを CPU が計算したかで和が変わりません。prompt の CPU の分担もこれに合わせます（`STRATA_GLM_PREFILL_XROWS`）。これで `STRATA_DETERMINISTIC` なしでも、温度 0 の答えが毎回同じになります（Qwen3.8 で 1 チャンク約 2,000 トークンまでの prompt。それより長いチャンクは、出力の窓が埋まるたびに、エキスパートを走らせた順に足します）。`0` で従来の動き（CPU の分を別に足して最後に加え、prompt の分担は時間で決める）。エキスパートの先送り（`STRATA_GLM_DEFER`）と EXL3 のエキスパートでは使いません。ほかのモデル（GLM、Ornith、DeepSeek V4）は `1` で使えます（まだ測っていません） |
 | `STRATA_Q4X_VERIFY_EXACT` | `1`（CUDA）、`0`（HIP） | Qwen3.8 の下書き（MTP、DFlash 2）あり: 検証窓の dense の GEMV を列ごとにトークン経路と同じ和にして、温度 0 の答えが下書きなしと同じになります（v1.3.125）。HIP では 1 列ずつの GEMV になり、dense の重みと出力ヘッドを列の数だけ読むため、AI PRO R9700 + MTP で 87 -> 67 tok/s に落ちました（#42）。そのため HIP は重みを 1 回だけ読む GEMV のままです（v1.3.125 より前と同じ。下書きありの答えが、長い答えの後半で下書きなしと分かれることがあります）。`1` / `0` でどちらかに固定。`STRATA_DETERMINISTIC` は `1` にします |
+| `STRATA_DS4_VERIFY_EXACT` | `1`（CUDA）、`0`（HIP） | DeepSeek V4 / V4.1 の検証窓: dense の GEMV を列ごとにトークン経路と同じ和にする。`STRATA_Q4X_VERIFY_EXACT` と同じ（v1.3.145。1 行 1 warp のままだと、V4 0731 の 3 列の窓が `STRATA_DETERMINISTIC` でも 16 トークン目でトークン経路から離れた。`STRATA_DETERMINISTIC` は 1 にする） |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | 起動時の CPU レーンの計測が乱れていそうなとき（CPU の 4 分の 1 以上でほかの仕事が動いている、または一番遅い回が中央値の 3 倍を超える）、1 秒おきに最大この回数まで測り直し、一番小さい値を使います。それでも CPU が混んでいればログに出します。`0`: 1 回だけ |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | VRAM に全エキスパート・予備・プロンプト処理が借りる分がすべて入るとき、借りる分をエキスパートの置き場とは別に確保し、プロンプトでエキスパートを追い出さないようにします。v1.3.119 から共有メモリ（DGX Spark）でも、メモリに余裕があればそうします（Qwen3.8 ISTA IQ3_XXS：32K のプロンプトのあとのデコードで SSD からエキスパートを読み直さなくなった）。`0`：借りる分をエキスパートの置き場から削ります（v1.3.104 より前の動き。共有メモリでは v1.3.119 より前の動き） |
 | `STRATA_GLM_X3_SPLIT` | オフ | EXL3 の pack で、各ルートの RAM 層エキスパートのうちこの割合を CPU スレッドが、残りを iGPU が同時に計算する（`auto`: 起動時の計測から）。Ryzen AI Max+ 395 では電力と熱を共有するため遅くなる（[EXL3](exl3/README.md#settings)） |
@@ -1010,11 +1041,14 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_DS41_ENGRAM_AHEAD` | オン | DeepSeek V4.1: 先読みスレッドが、今の chunk の後に次の prompt の chunk の Engram 行も読みます（JA256 4K で 2 つ目の chunk の層 1 が 425 → 74 ms。出力は同じ。v1.3.144）。`0`: 各 chunk の行だけ |
 | `STRATA_DS4_SPEC` | 1（オン） | prompt と応答から作る投機デコード。1 回に試す候補トークン数（1〜3。実測では 1 が最速）。`0` でオフ |
 | `STRATA_DS4_SPEC_GATE` | オン | リクエストの採用率が検証窓の分に見合わない間は候補を出さない。`0`: 常に出す |
+| `STRATA_DS4_SPEC_ADAPT` | DeepSeek V4 0731 ではオン（`STRATA_GLM_WINDOW` をオンにした GLM-5.3-Flash も）、ほかのモデルではオフ | ドラフトモデルなしで、1 回の窓に最大 5 個の n-gram の下書きを出す。各位置は当たる割合が保たれている間だけ使い、幅は `STRATA_DS4_SPEC_COST` で決める（v1.3.145。DSpark の生成の繰り返しの部分だけ）。1 回の窓に 1 トークンとゲートの代わり。V4 0731: 書き換え / swe-bench の文 +20.9 / +11.9%、散文 +0.5 / −1.7%。V4.1 JA256 は swe-bench の文で +1.9%、書き換えで −0.3%、散文で −0.6 / −1.0% なのでオフ。`0` / `1` で固定 |
+| `STRATA_DS4_SPEC_GATE_FRESH` | `STRATA_DS4_SPEC_ADAPT` がオンのとき（V4 0731）オン、ほかはオフ | ゲートとコスト表の時間に、応答の最初の 16 ステップを入れない（prompt の直後はプールが prompt に貸した expert を取り戻すので 1 トークンが遅い。V4.1 JA256 で 21.3 ms、あとは 17.3 ms。窓が安く見えていた）。窓が続くときは 32 ステップに 1 回 1 トークンだけで進めて、その時間を測り直す（v1.3.145）。`0`: すべてのステップを数える |
 | `STRATA_DS4_SPEC_MIN` | 3 | 候補を探すときに一致させるトークン数（2〜4） |
-| `STRATA_DS4_SPEC_COST` | オフ | `1`: 窓の大きさを、決まった規則ではなく、この機械での幅ごとのかかる時間と下書きが残る割合から決める（v1.3.117 で作り直し: 表はプロセスのあいだ持ち続け、幅ごとの時間は直近 16 回の中央値、1 トークンだけの時間もときどき測り直す）。RTX 5090 の DeepSeek V4 0731 ではオフと同じ速さ |
+| `STRATA_DS4_SPEC_COST` | 繰り返しだけの生成（`STRATA_DS4_SPEC_ADAPT`）ではオン、ドラフトモデルありではオフ（v1.3.145） | 窓の大きさを、決まった規則ではなく、この機械での幅ごとのかかる時間と下書きが残る割合から決める（v1.3.117 で作り直し: 表はプロセスのあいだ持ち続け、幅ごとの時間は直近 16 回の中央値、1 トークンだけの時間もときどき測り直す）。`0` / `1` で固定 |
+| `STRATA_DS4_SPEC_COST_MARGIN` | 1.10（DeepSeek V4 0731 は 1.02） | `STRATA_DS4_SPEC_COST` で、窓の 1 ミリ秒あたりのトークン数が 1 トークンだけのときをこの倍率で上回るときだけ窓を使う（v1.3.145）。窓の列は 1 トークンなら使わない expert も呼ぶので、そのあとのステップで VRAM に当たる割合が下がる（GLM-5.3-Flash の swe-bench の prompt で VRAM ヒット 56.7 → 45.6%）。1.02 では、窓自身の時間だけ見れば五分の窓のせいで GLM-5.3-Flash と V4.1 JA256 がそこで 4〜5% 遅くなった。1.0〜2.0 |
 | `STRATA_DS4_NGRAM_LONG` | オフ | `1`: n-gram の下書きを、前に出てきたいちばん長い一致から出し、一致が長いほど多く下書きする（n-gram だけの生成。v1.3.117）。Qwen3.8 の写す作業で +8%、DeepSeek V4 0731 では窓が増えて −12% なので既定はオフ |
 | `STRATA_GLM_SAMPLE_COLS` | オン | 温度が 0 より大きいとき、検証窓の列を、列ごとのコピー・起動・待ちではなく、1 回の起動と 1 回の待ちでまとめて引く（v1.3.117。出力は同じ。`STRATA_GLM_SAMPLE_COLS_CHECK=1` で各列を前のやり方でも引いて食い違いを数える）。`0`: 1 列ずつ |
-| `STRATA_GLM_WINDOW` | 共有メモリ（DGX Spark）ではオン、ほかはオフ | GLM-5.3-Flash を GPU 1 枚で：検算の窓つきの投機的デコード。モデル自身の NextN 層が最大 `STRATA_Q35_MTP_K`（3）トークンの下書きを作り、1 つの窓でまとめて確かめる（密な重みは全列で 1 回だけ読む）。出力は窓なしと同じ（v1.3.118）。DGX Spark：94 GB の S1 で 21.4 → 24.3 tok/s、unsloth の UD-IQ2_XXS で 19.8 → 22.9。単体の GPU + RAM 層（RTX 5090）では同じか遅くなるので、そこではオフ。`1` / `0` で強制。確かめ（stderr の数、すべて 0 になること）：`STRATA_GLM_WINDOW_CHECK=1/2`、`STRATA_GLM_REWIND_CHECK=1`、`STRATA_GLM_MVN_CHECK=1` |
+| `STRATA_GLM_WINDOW` | 共有メモリ（DGX Spark）ではオン、ほかはオフ | GLM-5.3-Flash を GPU 1 枚で：検算の窓つきの投機的デコード。出力は窓なしと同じ（v1.3.118）。`1`: モデル自身の NextN 層が最大 `STRATA_Q35_MTP_K`（3）トークンの下書きを作り、1 つの窓でまとめて確かめる（密な重みは全列で 1 回だけ読む）。DGX Spark：94 GB の S1 で 21.4 → 24.3 tok/s、unsloth の UD-IQ2_XXS で 19.8 → 22.9。単体の GPU + RAM 層（RTX 5090）では同じか遅い。`2`（v1.3.145）: NextN 層を読まずに窓だけ使い、`STRATA_DS4_SPEC_ADAPT` の n-gram の下書きを確かめる。RTX 5090 で書き換えの作業 +9.3%、swe-bench の文 −2.8%、散文 −0.3 / −1.9%（窓のバッファが expert の置き場を取り、列が層を混ませる）なので、コードを書き換える使い方向けに手で選ぶ。`0`: オフ。検査（stderr の数、すべて 0 であること）: `STRATA_GLM_WINDOW_CHECK=1/2`、`STRATA_GLM_REWIND_CHECK=1`、`STRATA_GLM_MVN_CHECK=1` |
 | `STRATA_GLM_DENSE_Q8` | オン | GLM-5.3-Flash：GGUF の Q8_0 の密な重み（attention の k_b / v_b、indexer、KDA の f/g/beta、hc）を BF16 に広げずに Q8_0 のまま読む。1 トークンで読む量が 0.37 GB 減り、KL は 0.2708 → 0.2667（v1.3.118。DGX Spark で +2%）。`0`：前の BF16 のコピー |
 | `STRATA_GLM_KDA_SPLIT` | オフ | `1`：1 トークンの KDA の再帰を、1 ヘッド 4 つの列のまとまりで計算する（出力は同じ。GB10 でも RTX 5090 でも速くならなかった） |
 | `STRATA_GLM_COLS_ORDER` | オン（CUDA） | 検算の窓で列をまとめて走らせるエキスパートの計算（GLM-5.3-Flash、DeepSeek V4 / V4.1、DSpark の下書き）で、グリッドの先頭を列にする。2 つの列が同じエキスパートを使うとき、2 回目はメモリではなく L2 から読む（v1.3.119。同じブロックを順番だけ変えて走らせるので、出力は同じ）。DGX Spark で GLM の S1 も DeepSeek V4 0731 + DSpark も速くなった（CHANGELOG を参照）。`0`：前の順番。AMD 版は前の順番のまま |

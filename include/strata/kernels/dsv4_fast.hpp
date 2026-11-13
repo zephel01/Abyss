@@ -30,9 +30,17 @@ struct Rope {
 Rope make_rope(int n_rot, float base, float freq_scale, float ext_factor, int n_ctx_orig, float beta_fast,
                float beta_slow);
 
+/// A compressor ring's spare rows: a verify window writes its columns' rows before it knows which are kept, and a
+/// rejected column's row must not land on a row a later block end still reads (with exactly `state` rows, a 3-column
+/// window's rejected third column overwrote the oldest row of the next block's overlap - V4 0731's answers with
+/// drafts parted from the token-by-token ones).  Rows are indexed pos % (state + kCompSlack); kVerifyMax - 2 is
+/// enough (the first column is always kept), 8 covers it.
+constexpr int kCompSlack = 8;
+__host__ __device__ inline int ring_rows(int state) { return state + kCompSlack; }
+
 /// The compressor ring and its cache for one layer and one compressor.
 struct Comp {
-    float* ring_kv = nullptr;        // [state][2*D or D] f32 (state = 2*ratio for overlap, ratio otherwise)
+    float* ring_kv = nullptr;        // [ring_rows(state)][2*D or D] f32 (state = 2*ratio for overlap, ratio otherwise)
     float* ring_sc = nullptr;        // same shape: gate + ape
     uint16_t* cache = nullptr;       // [rows][D] FP16 compressed rows
     const float* ape = nullptr;      // [ratio][coff*D]
@@ -45,7 +53,7 @@ struct Comp {
 /// After the first projections of one token at position p:
 ///   qr = rms(qr_raw) * q_a_norm  -> qr (f32) and qr_q (q8_1);
 ///   kv = rope(rms(kv_raw) * kv_norm)  -> the raw ring row p % ring (FP16);
-///   each compressor: its ring row p % state <- (kv proj, gate proj + ape[p % ratio]).
+///   each compressor: its ring row p % ring_rows(state) <- (kv proj, gate proj + ape[p % ratio]).
 struct PrepArgs {
     const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
     int q_lora = 1024;

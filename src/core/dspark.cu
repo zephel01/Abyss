@@ -48,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -175,10 +176,54 @@ std::string slots_str(const DSparkState* D) {
 }
 }  // namespace
 
+// setup's place for the drafter (tools/abyss_setup.py DSPARK_REPO / DSPARK_FILE): <data>/models/<repo>/<file>.  The
+// pack is under the same models folder (<data>/models/<org>/<repo>/<quant>/pack), so the folders above it are looked
+// in, each as <folder>/<repo>/<file> and <folder>/models/<repo>/<file>
+std::string Glm5Model::dspark_find() const {
+    namespace fs = std::filesystem;
+    static const char* kRel = "bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF/DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf";
+    if (pack_dir_.empty()) return "";
+    std::error_code ec;
+    fs::path d = fs::absolute(fs::path(pack_dir_), ec);
+    if (ec) return "";
+    for (int up = 0; up < 8 && !d.empty(); ++up) {
+        for (const fs::path& c : {d / kRel, d / "models" / kRel})
+            if (fs::is_regular_file(c, ec) && fs::file_size(c, ec) > ((uintmax_t) 1 << 30)) return c.string();
+        if (d == d.parent_path()) break;
+        d = d.parent_path();
+    }
+    return "";
+}
+
 bool Glm5Model::dspark_load(std::string& err) {
-    const char* path = getenv("STRATA_DS4_DSPARK");
-    if (path == nullptr || !path[0]) return true;
     const Glm5Geometry& g = g_;
+    // STRATA_DS4_DSPARK=<the GGUF> loads that drafter; =0 (or off / none) keeps it off.  Unset: DeepSeek V4 0731 on
+    // one device loads the drafter setup downloaded, if there is one (v1.3.145), when the VRAM pool beside it still
+    // holds every expert (a 32 GB card + RAM tier: not loaded, dspark_auto_keep).  Not under STRATA_DETERMINISTIC (its
+    // VRAM would change the pool those tests compare), not with unified memory (its pool budget is another one)
+    const char* path = getenv("STRATA_DS4_DSPARK");
+    std::string found;
+    dsp_auto_ = false;
+    if (path != nullptr && (std::strcmp(path, "0") == 0 || std::strcmp(path, "off") == 0 || std::strcmp(path, "none") == 0))
+        return true;
+    if (path == nullptr || !path[0]) {
+        const FastState* F = fast_;
+        if (!g.dsv4() || g.v41 || n_parts_ != 1 || l0_ != 0 || l1_ != g.n_layers || mtp_il_ >= 0 || F == nullptr ||
+            F->unified_memory)
+            return true;
+        found = dspark_find();
+        if (found.empty()) return true;
+        if (getenv("STRATA_DETERMINISTIC") != nullptr && std::atoi(getenv("STRATA_DETERMINISTIC")) != 0) {
+            std::fprintf(stderr, "dspark: %s not loaded - STRATA_DETERMINISTIC (STRATA_DS4_DSPARK=<file> loads it)\n",
+                         found.c_str());
+            return true;
+        }
+        std::error_code ec;
+        const double bytes = (double) std::filesystem::file_size(found, ec);
+        if (ec || !dspark_auto_keep(F, bytes)) return true;
+        path = found.c_str();
+        dsp_auto_ = true;
+    }
     const auto refuse = [&](const std::string& why) {
         std::fprintf(stderr, "dspark: not loaded - %s\n", why.c_str());
         dspark_destroy();

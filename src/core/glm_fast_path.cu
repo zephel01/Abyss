@@ -596,6 +596,44 @@ static void* fa_take_b(uint8_t*& at, size_t bytes) {
     return p;
 }
 
+// DSpark found without STRATA_DS4_DSPARK (dspark.cu's dspark_load): loaded only when the VRAM pool it leaves still holds
+// every expert.  Its 6.5 GB come out of the expert pool; where the pool is the experts' cache in front of a RAM tier,
+// that costs more than its drafts give against the n-gram drafts (RTX 5090 + 123 GB, V4 0731 UD-Q2_K_XL, v1.3.145: the
+// VRAM hit 68 -> 56% on a code task; code edits 87.3 -> 79.1 and 79.3 -> 75.1 tok/s, prose 75.4 -> 71.6 and 71.9 ->
+// 73.8).  With room for every expert beside it (a 96 GB card) a window's columns cost GPU time only and its drafts
+// pay.  The pool's room is the one fast_setup computes below (the reserve, STRATA_GLM_VRAM_GB, STRATA_GLM_POOL_GB)
+bool Glm5Model::dspark_auto_keep(const void* fs, double dsp_bytes) const {
+    const FastState* F = (const FastState*) fs;
+    const Glm5Geometry& g = g_;
+    const double G = 1073741824.0;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::default_reserve_mb(total_b, g.q4x));
+    size_t room = free_b > reserve ? free_b - reserve : 0;
+    if (const size_t cap = vram_cap(); cap > 0) {
+        const size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
+        room = std::min(room, cap > used + reserve ? cap - used - reserve : (size_t) 0);
+    }
+    if (getenv("STRATA_GLM_POOL_GB")) room = std::min(room, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+    double experts = 0.0;
+    for (int il = l0_; il < lt_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (Ly.moe)
+            experts += (double) g.n_expert * (double) glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type);
+    }
+    // (called before the drafter loads: its bytes come off the room; the prompt path borrows the pool's tail while a
+    // prompt runs: 1 GB + 3% of margin)
+    const double left = std::max(0.0, (double) room - dsp_bytes);
+    const bool fits = experts * 1.03 + 1.0 * G <= left;
+    std::fprintf(stderr, "dspark: the drafter beside the models (no STRATA_DS4_DSPARK) - %s (experts %.1f GB, the VRAM pool "
+                         "with it ~%.1f GB, the drafter %.1f GB)\n",
+                 fits ? "on (STRATA_DS4_DSPARK=0 turns it off)"
+                      : "off: its VRAM would come out of the expert cache, which costs more than its drafts give "
+                        "(STRATA_DS4_DSPARK=<file> loads it anyway)",
+                 experts / G, left / G, dsp_bytes / G);
+    return fits;
+}
+
 bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
     auto* F = new FastState();
@@ -1763,7 +1801,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         // 73.9 GB pinned instead of 67.4 left 13 GB free, an 8K prompt took 301 s instead of 11 and the decode ran at
         // 1.6 tok/s (the same without the drafter and a pool as small).  The tier keeps its size without the drafter;
         // the coldest experts come from the disk (0.01 reads a token in the decode)
-        if (dsp_ != nullptr && !fixed_ram && budget > 0) {
+        // v1.3.145: off by default - that machine's tier is now capped at 73% of its RAM (68.6 GB, the size that ran
+        // for days), a 123 GB one's at the RAM less 24 GB, so the drafter's experts go to the RAM tier when it has
+        // room (V4 0731 UD-Q2_K_XL on an RTX 5090 + 123 GB: 70.0 -> 76.5 GB pinned, no disk reads).
+        // STRATA_DS4_DSPARK_TIER_CAP=1: the old cap
+        static const bool dsp_cap = [] {
+            const char* v = getenv("STRATA_DS4_DSPARK_TIER_CAP");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (dsp_ != nullptr && dsp_cap && !fixed_ram && budget > 0) {
             const int64_t keep = std::max<int64_t>(0, (int64_t) wsum - (int64_t) dspark_vram_bytes());
             if (budget > keep) {
                 std::fprintf(stderr, "glm fast: CUDA%d RAM tier without the %.2f GB the DSpark drafter took from the pool "

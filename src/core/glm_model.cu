@@ -3671,7 +3671,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
-        (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr || (g_.arch == 0 && l0_ == 0 && glm_window_env()))) {
+        (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr || (g_.arch == 0 && l0_ == 0 && glm_window_nextn_env()))) {
         // (glm5-next on one part with STRATA_GLM_WINDOW=1: the block drafts for the verify window, dsv4_verify.cu)   // any split: the speculative decode runs on 2+ parts; qwen35moe: its drafter
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;

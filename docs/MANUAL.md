@@ -845,11 +845,25 @@ clean.
 
 **Speculative decoding (`STRATA_DS4_SPEC`, on by default).** The GGUF has no draft model, but the answer often repeats
 what is in the prompt or earlier in the answer (code, file paths, tool calls). The engine looks up the last 3 tokens'
-earlier occurrence, checks the token that followed it together with the next one in one pass, and keeps it when the
-model agrees. The output is the same as without it (the same sampler on the same logits); only the time per token
-changes. A gate learns each request's acceptance and skips the draft while it would not pay. Coding prompts: +10-13%
-(77-85% of the drafts accepted); prose: about even (~50% accepted). `STRATA_DS4_SPEC=0` turns it off; a layer split
-across GPUs runs it too (v1.3.26).
+earlier occurrence, checks the tokens that followed it together with the next one in one pass (a verify window), and
+keeps each while the model agrees. The output is the same as without it (the same sampler on the same logits; under
+`STRATA_DETERMINISTIC=1` the same bytes); only the time per token changes. From v1.3.145 DeepSeek V4
+0731 drafts up to 5 tokens a window (`STRATA_DS4_SPEC_ADAPT`): each position of a repeat is used while it keeps being
+right, and the width comes from what each width costs on this machine and how many tokens it keeps
+(`STRATA_DS4_SPEC_COST`). A window of 4-6 columns costs little more than one of 2 - the RAM-tier experts the CPU lane
+computes take most of a step, and the columns share many of them. RTX 5090 + 123 GB RAM, iGPU off, 4K-class prompt +
+512 greedy tokens, median of 3, against v1.3.144 (one draft a window):
+
+| DeepSeek V4 0731 UD-Q2_K_XL | v1.3.144 | v1.3.145 |
+| --- | :---: | :---: |
+| edit a Python file (type hints, ~3K-token prompt) | 73.3 tok/s | 88.6 tok/s (+20.9%) |
+| swe-bench-like bug fix (t030) | 82.2 tok/s | 92.0 tok/s (+11.9%) |
+| English prose (4K prompt) | 71.1 tok/s | 71.4 tok/s (+0.5%) |
+| Japanese prose (railway history) | 76.0 tok/s | 74.7 tok/s (-1.7%) |
+
+DeepSeek V4.1 keeps one draft a window: the wider windows gave it +1.9% on swe-bench text, -0.3% on the edit task and -0.6 / -1.0% on prose
+(`STRATA_DS4_SPEC_ADAPT=1` turns them on). `STRATA_DS4_SPEC=0` turns drafting off; `STRATA_DS4_SPEC_ADAPT=0` brings
+back one draft a window with the acceptance gate on V4. A layer split across GPUs runs it too (v1.3.26).
 
 ## The DSpark drafter (DeepSeek V4 Flash)
 
@@ -873,11 +887,27 @@ target layers 40-42, 5 drafts a step; 6.48 GB on CUDA0 ...`). It runs with DeepS
 with a layer split or the MTP block (DeepSeek V4.1 takes its own drafter file, see [DeepSeek V4.1 Flash](#deepseek-v41-flash)); then the line says `dspark: not loaded - <why>` and the model runs
 on without it.
 
+**On its own (v1.3.145).** Without `STRATA_DS4_DSPARK` the engine looks for the file beside the models
+(`<models>/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF/DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf`, where `--dspark`
+puts it) and loads it only when the expert pool still holds every expert of the model after the drafter's 6.48 GB -
+a card of about 48 GB or more. On a 32 GB card it stays off: there the n-gram windows above are faster, because the
+6.5 GB the drafter takes come out of the expert pool (edit 75.9 and swe-bench text 78.3 tok/s with the drafter, 88.6 / 92.0 with the n-gram windows). The log says `dspark: the drafter beside the models
+(no STRATA_DS4_DSPARK) - on` or `- off` with the sizes. `STRATA_DS4_DSPARK=0` keeps it off everywhere,
+`STRATA_DS4_DSPARK=<file>` loads it whatever the VRAM (as before). Not under `STRATA_DETERMINISTIC=1`, not with
+unified memory (DGX Spark: set the file by hand).
+
 **What it costs.** The drafter keeps its weights and all of its experts in VRAM: 6.48 GB that the expert pool gives
-up. The RAM tier keeps the size it has without the drafter, so the coldest ~6.5 GB of experts are read from the SSD
-instead (0.01 reads a token in the decode on the machine below; `STRATA_GLM_RAM_GB` still sets the tier's size by
-hand, for a PC with RAM to spare). Without that cap the tier pinned those experts too: on a 94 GB PC 73.9 GB pinned
-left 13 GB free, and an 8K prompt took 301 s instead of 11. A draft takes ~4.4 ms on an AI PRO R9700.
+up. Up to v1.3.144 the RAM tier then kept the size it had without the drafter, so the coldest ~6.5 GB of experts were
+read from the SSD; from v1.3.145 the tier takes them when the general RAM limits leave room (73% of the RAM, or the RAM
+less 24 GB from 100 GiB up - V4 0731 on an RTX 5090 + 123 GB: 70.0 -> 76.5 GB pinned, no disk reads), and
+`STRATA_DS4_DSPARK_TIER_CAP=1` brings the old cap back. Those limits are what keeps a 94 GB PC safe: the tier pinning
+73.9 GB there left 13 GB free and an 8K prompt took 301 s instead of 11. A draft takes ~4.4 ms on an AI PRO R9700.
+
+**Same tokens (v1.3.145).** Windows of 3 or more columns on V4 0731 - the DSpark drafter's, and the n-gram's when
+`STRATA_DS4_SPEC` > 1 - could part from the token-by-token answer under `STRATA_DETERMINISTIC=1` (at token 16 on a 4K
+prompt): the window's dense GEMVs summed in another order than the token path's (now `STRATA_DS4_VERIFY_EXACT`), two
+columns of a pipelined group shared one expert scratch set, and a rejected column's compressor-ring row could land on
+a row a later block end still read. All three are fixed; the drafter's answers now equal `STRATA_DS4_DSPARK=0`'s.
 
 **Speed** (AI PRO R9700, OCuLink PCIe Gen4 x4, in a Ryzen AI Max+ 395 PC with 94 GB RAM; UD-Q2_K_XL with the Q5_K
 attention pack, through the server):
@@ -906,7 +936,8 @@ the windows, the drafts and the acceptance, and the tokens a step.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `STRATA_DS4_DSPARK` | off | `<the drafter GGUF>`: load DeepSeek's DSpark drafter and decode with it |
+| `STRATA_DS4_DSPARK` | auto | `<the drafter GGUF>`: load DeepSeek's DSpark drafter and decode with it; `0`: never. Unset (v1.3.145): the file beside the models is loaded when the expert pool still holds every expert after it (a ~48 GB+ card; not on a 32 GB card + RAM tier, where the n-gram windows are faster), not under `STRATA_DETERMINISTIC` or with unified memory |
+| `STRATA_DS4_DSPARK_TIER_CAP` | off | `1`: with the drafter, the RAM tier keeps the size it has without it (v1.3.43-v1.3.144; the drafter's ~6.5 GB of displaced experts are read from the SSD). Off: the general RAM limits size the tier |
 | `STRATA_DS4_DSPARK_THR` | 0.6 | the confidence a draft needs; the window stops at the first one below (swe-bench: 0.7 61.3, 0.8 59.8 tok/s against 0.6's 61.9; ds4 uses 0.7) |
 | `STRATA_DS4_DSPARK_K` | 5 | drafts a window at most (1-5) |
 | `STRATA_DS4_DSPARK_CHAIN` | off | `<p>`: keep drafts while the product of their confidences stays >= p, instead of each one >= the threshold |
@@ -955,6 +986,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_CPU_EXACT` | `1` (Qwen3.8 on x86 CPUs), `0` (other models: their rows were slower - GLM-5.3 decode -14%, V4.1 -5% on an RTX 5090) | the CPU lane computes its experts with the GPU kernels' own arithmetic (the GPU's 8-bit activations, its integer sums), so an expert gives the same numbers on either side; `0` = the older ggml-cpu dots. ARM CPUs keep the older dots |
 | `STRATA_GLM_LANE_XC` | `1` (CUDA on x86, Qwen3.8), `0` (other models, HIP, ARM) | with `STRATA_GLM_CPU_EXACT`, the CPU lane's experts give the GPU's bits exactly (the GPU's float order and its exp in the SiLU), and the layer's expert sum is taken in fixed point (each weighted expert row to a 64-bit integer of 2^-34, the sum rounded to a float once: the same bits in any order, at least as accurate as the float sum), so it does not depend on which experts the CPU computed. The prompt's CPU share follows too (`STRATA_GLM_PREFILL_XROWS`). Greedy answers are then the same run to run without `STRATA_DETERMINISTIC` (prompts up to about 2,000 tokens a chunk on Qwen3.8; longer chunks are added into the output window as it fills, in the order the experts ran). `0` = the CPU's experts summed apart and added last, the prompt's share by timing (the older behaviour). Off with expert deferral (`STRATA_GLM_DEFER`) and EXL3 experts. Other models (GLM, Ornith, DeepSeek V4): `1` turns it on (not measured yet) |
 | `STRATA_Q4X_VERIFY_EXACT` | `1` (CUDA), `0` (HIP) | Qwen3.8 with drafts (MTP, DFlash 2): the verify window's dense GEMVs give each column the token path's sums, so greedy answers with drafts equal the ones without (v1.3.125). On HIP that runs as one GEMV a column - the dense weights and the output head read once per column - and cost an AI PRO R9700 with MTP 87 -> 67 tok/s (#42), so HIP keeps the shared-read GEMVs (as before v1.3.125; answers with drafts can part from the ones without late in an answer). `1` / `0` force either; `STRATA_DETERMINISTIC` sets `1` |
+| `STRATA_DS4_VERIFY_EXACT` | `1` (CUDA), `0` (HIP) | DeepSeek V4 / V4.1 verify windows: the dense GEMVs give each column the token path's sums, as `STRATA_Q4X_VERIFY_EXACT` (v1.3.145; with one warp a row instead, V4 0731's 3-column windows parted from the token path at token 16 under `STRATA_DETERMINISTIC`, which sets 1) |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | when the start-up timing of the CPU lane looks disturbed (other work running on a quarter of the CPUs, or its slowest run over 3x the median), it is taken again up to this many times, 1 s apart, and the lowest kept; a CPU still busy after that is reported in the log. `0`: one timing |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | when VRAM holds every expert, the spares and the prompt path's borrowed tail, the tail is allocated on top of the experts' slots, so a prompt evicts none. With unified memory (DGX Spark) too from v1.3.119, where the shared memory has the room (Qwen3.8 ISTA IQ3_XXS: the decode after a 32K prompt no longer re-reads experts from the SSD). `0`: the tail is cut from the experts' slots (the layout before v1.3.104; on unified memory, before v1.3.119) |
 | `STRATA_GLM_X3_SPLIT` | off | an EXL3 pack: the CPU threads compute this fraction of each route's RAM-tier experts while the iGPU computes the rest (`auto`: by their timings); slower on a Ryzen AI Max+ 395 (shared power and heat), see [EXL3](exl3/README.md#settings) |
@@ -1059,11 +1091,14 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_DS41_ENGRAM_AHEAD` | on | DeepSeek V4.1: the prefetch threads also read the next prompt chunk's Engram rows after the current chunk's (JA256 4K: the second chunk's layer 1 425 -> 74 ms; same output; v1.3.144); `0`: each chunk's own rows only |
 | `STRATA_DS4_SPEC` | 1 (on) | speculative decoding from the prompt and the answer: draft tokens a step (1-3; 1 is the fastest measured); `0` off |
 | `STRATA_DS4_SPEC_GATE` | on | drop a draft while the request's acceptance does not pay for the verify window; `0`: always draft |
+| `STRATA_DS4_SPEC_ADAPT` | on for DeepSeek V4 0731 (and GLM-5.3-Flash when `STRATA_GLM_WINDOW` is on), off for the other models | without a drafter: up to 5 n-gram drafts a window, each position used while its share right holds, the width by `STRATA_DS4_SPEC_COST` (v1.3.145; the DSpark decode's repeats alone) instead of one draft a window and the gate. V4 0731: edit / swe-bench text +20.9 / +11.9%, prose +0.5 / -1.7%; V4.1 JA256 +1.9% on swe-bench text, -0.3% on the edit task, -0.6 / -1.0% on prose, so off there. `0` / `1` force it |
+| `STRATA_DS4_SPEC_GATE_FRESH` | on with `STRATA_DS4_SPEC_ADAPT` (V4 0731), off otherwise | the gate's and the cost table's times leave out an answer's first 16 steps (right after a prompt the pool takes back the experts the prompt borrowed and a token runs slower: V4.1 JA256 21.3 against 17.3 ms, which made windows look cheap), and every 32nd step of a run of windows goes alone to re-time the single token (v1.3.145); `0`: every step counts |
 | `STRATA_DS4_SPEC_MIN` | 3 | the tokens a draft's lookup matches (2-4) |
-| `STRATA_DS4_SPEC_COST` | off | `1`: the window's size from what each width costs here and how often drafts are kept, instead of fixed rules (v1.3.117: the tables live as long as the process, a width's cost is the median of its last 16 steps, the single token is re-timed now and then). DeepSeek V4 0731 on an RTX 5090: same speed as off |
+| `STRATA_DS4_SPEC_COST` | on for the repeats-only decode (`STRATA_DS4_SPEC_ADAPT`), off with a drafter (v1.3.145) | the window's size from what each width costs here and how often drafts are kept, instead of fixed rules (v1.3.117: the tables live as long as the process, a width's cost is the median of its last 16 steps, the single token is re-timed now and then); `0` / `1` force it |
+| `STRATA_DS4_SPEC_COST_MARGIN` | 1.10 (DeepSeek V4 0731: 1.02) | with `STRATA_DS4_SPEC_COST`: a window runs only when its tokens a millisecond beat the single token's by this factor (v1.3.145). A window's columns route experts the single token would not, so the steps after it find fewer in VRAM (GLM-5.3-Flash on a swe-bench prompt: VRAM hits 56.7 -> 45.6%); at 1.02 windows that only broke even on their own time made GLM-5.3-Flash and V4.1 JA256 4-5% slower there. 1.0-2.0 |
 | `STRATA_DS4_NGRAM_LONG` | off | `1`: the n-gram drafter proposes from the longest earlier match and drafts more tokens the longer it is (n-gram-only decode; v1.3.117). Qwen3.8 copy task +8%, DeepSeek V4 0731 -12% (more windows): off by default |
 | `STRATA_GLM_SAMPLE_COLS` | on | with temperature > 0, a verify window's columns are drawn in one launch and one wait instead of a copy, a launch and a wait a column (v1.3.117; same tokens - `STRATA_GLM_SAMPLE_COLS_CHECK=1` draws each column the old way too and counts differences); `0`: a column at a time |
-| `STRATA_GLM_WINDOW` | on with unified memory (DGX Spark), off elsewhere | GLM-5.3-Flash on one GPU: speculative decode with verify windows - the model's own NextN block drafts up to `STRATA_Q35_MTP_K` (3) tokens and one batched window checks them (the dense weights read once for all columns), the same tokens as without (v1.3.118). DGX Spark: 21.4 -> 24.3 tok/s with the 94 GB S1 build, 19.8 -> 22.9 with unsloth UD-IQ2_XXS. A discrete card + RAM tier (RTX 5090) is break-even or slower, so it stays off there; `1` / `0` force it. Checks (stderr counts, all must be 0): `STRATA_GLM_WINDOW_CHECK=1/2`, `STRATA_GLM_REWIND_CHECK=1`, `STRATA_GLM_MVN_CHECK=1` |
+| `STRATA_GLM_WINDOW` | on with unified memory (DGX Spark), off elsewhere | GLM-5.3-Flash on one GPU: speculative decode with verify windows, the same tokens as without (v1.3.118). `1`: the model's own NextN block drafts up to `STRATA_Q35_MTP_K` (3) tokens and one batched window checks them (the dense weights read once for all columns) - DGX Spark: 21.4 -> 24.3 tok/s with the 94 GB S1 build, 19.8 -> 22.9 with unsloth UD-IQ2_XXS; on a discrete card + RAM tier (RTX 5090) break-even or slower. `2` (v1.3.145): the window without the NextN block (not loaded) for the n-gram drafts of `STRATA_DS4_SPEC_ADAPT` - RTX 5090: an edit task +9.3%, swe-bench text -2.8%, prose -0.3 / -1.9% (the window's buffers take expert slots, its columns crowd the tiers), so opt-in for code-editing work. `0`: off. Checks (stderr counts, all must be 0): `STRATA_GLM_WINDOW_CHECK=1/2`, `STRATA_GLM_REWIND_CHECK=1`, `STRATA_GLM_MVN_CHECK=1` |
 | `STRATA_GLM_DENSE_Q8` | on | GLM-5.3-Flash: the GGUF's Q8_0 dense tensors (attention k_b / v_b, the indexer's, the KDA f/g/beta projections, the hc weights) are read as Q8_0 instead of a BF16 copy - 0.37 GB less read a token, KL 0.2708 -> 0.2667 (v1.3.118; DGX Spark +2%); `0`: the BF16 copy as before |
 | `STRATA_GLM_KDA_SPLIT` | off | `1`: the KDA recurrence of one token in 4 column blocks a head (the same tokens; no gain measured on GB10 or the RTX 5090) |
 | `STRATA_GLM_COLS_ORDER` | on (CUDA) | a verify window's column-batched expert launches (GLM-5.3-Flash, DeepSeek V4 / V4.1, the DSpark drafter) put the column first in the grid, so an expert two columns share is read from memory once and from L2 the second time (v1.3.119; the same blocks in another order, the same tokens). DGX Spark: GLM S1 and DeepSeek V4 0731 + DSpark both faster (see the changelog). `0`: the old launch order. The AMD build keeps its order |
