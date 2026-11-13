@@ -3595,6 +3595,28 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     F->cpu_c_ms = cpu_ms;   // (the prompt path splits its staged experts by them too: the CPU's own)
     F->cpu_p_ms = p_ms;
     F->cpu_ps_ms = ps_ms;
+    // STRATA_GLM_BG_LINK_GBS=<GB/s> (default 7.2; 0 off): the background copies' sizes (STRATA_GLM_BG_LANE's bytes a
+    // lane expert, its offset and cap, and the drain after the answer) were tuned on a Gen4 x4 link (7.2 GB/s by the
+    // copy engine, an RTX 5090 + Ryzen AI Max+ 395): the bytes that cross while the CPU lane computes / beside the next
+    // attention.  A slower link moves fewer bytes in those windows - the rest crossed when the device read the answer
+    // or wrote the next route.  Below 85% of that rate the sizes shrink in proportion (an emulated half-speed link,
+    // bench/glmspeed: GLM-5.3 32 GB 44 -> 49 tok/s, V4.1 JA256 49 -> 54 with half the bytes); above it nothing changes
+    {
+        const char* lv = getenv("STRATA_GLM_BG_LINK_GBS");
+        const double ref = lv != nullptr ? std::max(0.0, std::atof(lv)) : 7.2;
+        const double gbs = p_ms > 0.0 ? (double) blob / (p_ms * 1e6) : 0.0;
+        if (ref > 0.0 && gbs > 0.0 && gbs < 0.85 * ref && (F->bg_lane_per > 0 || F->bg_pace > 0)) {
+            const double k = gbs / ref;
+            const auto sc = [k](size_t b) { return (size_t) ((double) b * k) & ~(size_t) 4095; };
+            F->bg_lane_per = sc(F->bg_lane_per);
+            F->bg_lane_off = sc(F->bg_lane_off);
+            F->bg_lane_max = sc(F->bg_lane_max);
+            if (F->bg_pace > 0) F->bg_pace = std::max<size_t>(sc(F->bg_pace), 64 << 10);
+            std::fprintf(stderr, "glm fast: CUDA%d link %.2f GB/s by the copy engine (< 85%% of %.1f): background copies %zu KiB a "
+                                 "lane expert - %zu KiB, after the answer %zu KiB\n", dev_, gbs, ref,
+                         F->bg_lane_per >> 10, F->bg_lane_off >> 10, F->bg_pace >> 10);
+        }
+    }
     // the split: k of f to the host minimises max(PCIe (f - k) p, lane overhead + k c); ties keep the PCIe lane.  p is
     // the decode's own PCIe path (zero copy, above), the slower of the two timings
     const double over_ms = 0.04;
