@@ -738,7 +738,9 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, s)) { err = "qwen35 mtp: the head"; return false; }
+    if (q35d_head_split()) {
+        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err)) return false;
+    } else if (!gf::mv(&o, 1, s)) { err = "qwen35 mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
     cudaMemcpyAsync(tok_out, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToDevice, s);
@@ -930,7 +932,9 @@ bool Glm5Model::glm_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, s)) { err = "glm mtp: the head"; return false; }
+    if (q35d_head_split()) {
+        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err)) return false;
+    } else if (!gf::mv(&o, 1, s)) { err = "glm mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
     cudaMemcpyAsync(tok_out, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToDevice, s);

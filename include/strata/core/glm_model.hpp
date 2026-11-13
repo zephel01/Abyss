@@ -867,7 +867,7 @@ public:
     // the loan (a card the FFN does not fit): whole layers' FFN live in the prompt path's buffers between prompts -
     // q35d_evict (prefill_lend) gives the buffers back to the prompt, q35d_restore (prefill_return) uploads them again
     bool q35d_prompt_ram(int il) const;                    // the prompt path stages this layer's FFN
-    void q35d_evict();
+    void q35d_evict(size_t region_used);   // (the region's first bytes the prompt takes: the layers past them stay)
     bool q35d_restore(std::string& err);
     std::vector<std::pair<uint8_t*, size_t>> prefill_loan_blocks() const;   // the dense prompt path's scratch
     // the prompt path: layer il's FFN weights in a VRAM staging buffer (gate / up / down into w), in order on s;
@@ -875,6 +875,13 @@ public:
     bool q35d_stage(int il, cudaStream_t s, WSlot* w, std::string& err);
     void q35d_unstage(int il, cudaStream_t s);
     void q35d_destroy();
+    // the head: load_pack gives it its own allocation (q35d_head_set); a card that even every FFN in RAM leaves too
+    // little room keeps only its first rows in VRAM and the CPU computes the rest (q35d_place) - q35d_head then runs
+    // T columns of q8_1 x (xq, contiguous) into logits (T x n_vocab floats) on s; false with err empty: not split (the
+    // caller's own launches)
+    void q35d_head_set(const uint8_t* src, size_t bytes, int type, void* dev);
+    bool q35d_head_split() const;
+    bool q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err);
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

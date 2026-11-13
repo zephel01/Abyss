@@ -1696,7 +1696,9 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                    (uint8_t*) V->head_xq + (size_t) t * q8e, s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) E, g.n_vocab};
-    if (gf::mvn_supported(ow.type)) {
+    if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
+        if (!q35d_head(V->head_xq, T, V->logits, s, err)) return false;
+    } else if (gf::mvn_supported(ow.type)) {
         if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: output head"; return false; }
     } else {
         for (int t = 0; t < T; ++t) {

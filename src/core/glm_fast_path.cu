@@ -1977,6 +1977,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // arena; the prompt path gets a region of its own
         if (!prefill_setup_own(err)) return false;
         if (!q35d_place(err)) return false;   // (the trunk's FFN: VRAM as far as it goes, the rest in RAM)
+        strata::kernels::q35::attn_prompt_groups_tc(true);   // (its 6-head groups' prompt attention on tensor cores)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const double G = 1073741824.0;
@@ -7417,7 +7418,9 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, FT->cs)) {
+    if (tail->q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
+        if (!tail->q35d_head(FT->head_xq, 1, tail->sc_ + tail->sc_logits, FT->cs, err)) return false;
+    } else if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
@@ -8516,7 +8519,9 @@ bool Glm5Model::part_token_head(int64_t p, std::string& err) {
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, FT->cs)) {
+    if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
+        if (!q35d_head(FT->head_xq, 1, sc_ + sc_logits, FT->cs, err)) return false;
+    } else if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
