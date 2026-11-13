@@ -263,4 +263,5 @@ STRATA_Q35D_SPLIT_N  # src/core/qwen35_dense_ram.cu
 STRATA_Q35D_THREADS  # src/core/qwen35_dense_ram.cu
 STRATA_GLM_CPU_BAND_CHECK  # src/core/glm_fast_path.cu
 STRATA_GLM_CPU_XQ_CHECK  # src/core/glm_fast_path.cu
+STRATA_GLM_PREFILL_XQ_CHECK  # src/core/glm_prefill.cu
 STRATA_GLM_LANE_PROF  # src/core/glm_fast_path.cu

@@ -32,6 +32,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -562,6 +563,12 @@ struct Glm5Model::PrefillState {
     int* rt_h = nullptr;
     int* id_h = nullptr;      // 0, 1, 2, ..: the iGPU's row -> token map when x went down gathered (into out_h)
     bool x_gathered = false;  // this layer's host rows' x is in out_h (row r = the host's row r), not x_h
+    // this layer's x went down as Q8_K blocks (quantized on the device, the CPU's own format, byte for byte - a
+    // token's act_bytes at x_h + token * act_bytes) instead of floats: ~3.5x fewer bytes down.  xq_chk / xq_rows /
+    // xq_bad: STRATA_GLM_PREFILL_XQ_CHECK=1's floats and its counts (rows compared, rows that differed)
+    bool x_q8k = false;
+    std::vector<float> xq_chk;
+    uint64_t xq_rows = 0, xq_bad = 0;
     float* out_h = nullptr;
     size_t rows_h_n = 0;
     // the CPU lane's pinned buffers did not allocate (issue #31: a host whose RAM tier is pinned to the limit):
@@ -3011,6 +3018,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto& Ly = F->L[(size_t) il];
         const bool skip_output = (tail_skip && il == g.n_layers - 1) || il == kv_cut;
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
+        // (the layer before sent its x down quantized from S->mixer: the copy ends before this layer's mixer writes it)
+        if (S->x_q8k) {
+            cudaStreamWaitEvent(s, S->ev_xd, 0);
+            S->x_q8k = false;
+        }
         if (g.v41) {
             // deepseek41: an Engram layer writes the previous FFN alone, adds its rows, then reads without a write;
             // the read collapses with the previous sublayer's pre (layer 0: the one-hot)
@@ -3355,9 +3367,37 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // 537 MB, ~80 ms over PCIe Gen4 x4, against ~70 MB for a layer's ~4K host rows)
         bool x_down = false;
         if (Ly.moe && cpu_lane(il) && !(igpu_lane(il) && S->id_h != nullptr) && cpu_bufs(0)) {
+            // the host's experts read x as Q8_K (every K-quant and i-quant layer): quantized here into the mixer's
+            // rows (free from hc_read on - the next layer's mixer waits for the copy) with the CPU's quantizer's
+            // arithmetic, so the same bytes go down in ~28% of the floats' size (a 4K chunk of GLM-5.3: 100 -> 29 MB
+            // a layer).  Not the exact prompt's lane_q81 rows, not the iGPU's floats.  STRATA_GLM_PREFILL_XQ8K=0: floats
+            static const int xq8k_env = [] {
+                const char* v = getenv("STRATA_GLM_PREFILL_XQ8K");
+                return v == nullptr ? 1 : std::atoi(v);
+            }();
+            static const bool xq_check = [] {
+                const char* v = getenv("STRATA_GLM_PREFILL_XQ_CHECK");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            const bool q8k = xq8k_env != 0 && !F->xc && !igpu_lane(il) && !g.qwen35() && !g.q4x && E % 256 == 0 &&
+                             (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].gu_act == (int) GGML_TYPE_Q8_K &&
+                             F->cpu_fmt[(size_t) il].act_bytes == (size_t) (E / 256) * 292;
             cudaEventRecord(S->ev_x, s);
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
-            cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
+            if (q8k) {
+                // (on the copy's stream: beside the shared expert and the routing, not before them)
+                strata::kernels::quantize_q8_K(S->x, (uint8_t*) S->mixer, (int64_t) T * E, S->xs);
+                cudaMemcpyAsync(S->x_h, S->mixer, (size_t) T * (size_t) (E / 256) * 292, cudaMemcpyDeviceToHost, S->xs);
+                cudaEventRecord(S->ev_xd, S->xs);
+                S->x_q8k = true;
+                if (xq_check) {
+                    S->xq_chk.resize((size_t) T * E);
+                    cudaMemcpyAsync(S->xq_chk.data(), S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
+                    cudaEventRecord(S->ev_xd, S->xs);
+                }
+            } else {
+                cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
+            }
             x_down = true;
         }
 
@@ -4448,10 +4488,34 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 });
                 up(0, cpu_nrows);
             } else if (!on_igpu) {
+                if (S->x_q8k && !S->x_gathered) {
+                    // (x came down as Q8_K: a row's activation is its token's blocks - the bytes native_quant_act makes)
+                    const size_t ab = nf.act_bytes;
+                    F->cpu_pool->run(cpu_nrows, [&](int r) {
+                        std::memcpy(S->c_act.data() + (size_t) r * kA, (const uint8_t*) S->x_h + (size_t) S->rt_h[r] * ab, ab);
+                    });
+                    if (!S->xq_chk.empty()) {   // STRATA_GLM_PREFILL_XQ_CHECK=1: the CPU's quantizer on the floats
+                        std::vector<uint8_t> ref(ab);
+                        for (int r = 0; r < cpu_nrows; ++r) {
+                            kc::native_quant_act(nf, S->xq_chk.data() + (size_t) S->rt_h[r] * E, ref.data());
+                            const uint8_t* got = S->c_act.data() + (size_t) r * kA;
+                            bool bad = false;
+                            for (size_t b = 0; b < ab && !bad; b += 292) {
+                                float d;
+                                std::memcpy(&d, ref.data() + b, 4);
+                                // (an all-zero block: ggml leaves its bsums unwritten - only d and qs are compared)
+                                bad = std::memcmp(ref.data() + b, got + b, d == 0.0f ? 260 : 292) != 0;
+                            }
+                            ++S->xq_rows;
+                            if (bad) ++S->xq_bad;
+                        }
+                    }
+                } else {
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
                     const float* xr = S->x_gathered ? S->out_h + (size_t) r * E : S->x_h + (size_t) S->rt_h[r] * E;
                     kc::native_quant_act(nf, xr, S->c_act.data() + (size_t) r * kA);
                 });
+                }
                 // experts with enough rows take the multi-row AVX-512 kernel (a weight row unpacked once for all of them,
                 // ~2x ggml's per-pair dots from 8 rows on - kq_avx512.hpp); their activations packed once each
                 static const bool kq_on = [] {
@@ -5283,6 +5347,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     pf_->ms += ms;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pf_->tokens += n;
+    if (pf_->xq_rows > 0)
+        std::fprintf(stderr, "glm prefill: Q8_K x check: %llu of %llu host rows differ from the CPU quantizer's bytes\n",
+                     (unsigned long long) pf_->xq_bad, (unsigned long long) pf_->xq_rows);
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
     if (verbose) {
         uint64_t sr = 0, sv = 0, sd = 0, rr = 0, rs = 0, ce = 0, cr = 0, pi = 0, pf = 0, ph = 0, pr = 0, ige = 0, igr = 0;
