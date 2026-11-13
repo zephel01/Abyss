@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased (qwen35-dense-next)
+## v1.3.142 - 2026-11-13
 
 - Qwen3.8-27B on an 8 GB GPU (8K context): when even every FFN row in RAM leaves too little VRAM for the prompt path,
   the head (`output.weight`, 1 GB) keeps only its first rows in VRAM and the CPU computes the rest while the GPU
@@ -30,6 +30,28 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   uploaded again (a 361-token prompt at 16 GB: 5 of 6 layers).
 - Every other model's outputs unchanged (md5 under `STRATA_DETERMINISTIC=1` identical to v1.3.141 on Ornith-35B,
   Qwen3.8-Flash-Next, GLM-5.3-Flash, V4 0731, V4.1 JA256, Ornith-122B).
+- GLM-5.3-Flash / V4 / V4.1: the CPU lane leaves two cores free during decode, only on CPUs with 16+ cores
+  (`STRATA_GLM_CPU_LANE_SPARE=<n>` overrides; at 12 cores sparing was 2.5-3.5% slower, so it is off there). RTX 5090
+  (32 GB), 4K + 512, median of 3, 16 cores, against v1.3.141: GLM-5.3-Flash 51.2 -> 52.4 tok/s, V4 0731 68.1 -> 70.3,
+  V4.1 JA256 58.1 -> 59.8.
+- 8-core CPUs: when the start-up plan picks the lean split, the background moves (refill, swaps) now run while the lean
+  waits; before, the VRAM cache hit stayed at 48-56%. GLM-5.3-Flash 27.1-31.4 -> 32.5-36.6 tok/s (+17-20%, hit 56 ->
+  67%), V4.1 39.0 -> 45.8 (+17%, hit 72 -> 80%).
+- CPU lane: an expert's gate/up and down rows go out as one batch, and its down rows wait only for its own h
+  (`STRATA_GLM_CPU_ONE_BATCH=0` = the old two batches). GLM-5.3-Flash +2.9% (52.27 -> 53.80 tok/s), V4 0731 +0.4%, V4.1
+  JA256 +4.4% (58.59 -> 61.15), GLM-5.3-Flash on 8 cores +5.5% (39.3 -> 41.4), Laguna 16 GB +10.6% (43.38 -> 47.97).
+- Background copies shrink with the link speed measured at calibration when it is below 85% of Gen4 x4
+  (`STRATA_GLM_BG_LINK_GBS=<GB/s>` sets the reference, 0 = off). On an emulated half-speed link: GLM-5.3-Flash 43.98 ->
+  48.31 tok/s (+9.8%), V4.1 47.99 -> 53.77 (+12%). No change on Gen4 x4 and faster. Outputs of all of these
+  bit-identical to v1.3.141 under `STRATA_DETERMINISTIC=1`.
+- `glm_cpu_bench`: `GLM_BENCH_WARM` modes (a tool only).
+- Laguna-S-2.1: the verify window (n-gram drafts) is on by default, its attention runs over the window's columns and
+  layer 0's dense FFN is handled; the V loads of a step are issued before their sums; the decode attention is one block
+  per (row, head, split); a token's RoPE (cos, sin) is computed once per layer kind. RTX 5090 capped at 16 / 24 / 32 GB,
+  4,058-token prompt + 512, RAM tier 50 GB, median of 3: decode 36.9 -> 42.5 / 42.4 -> 50.9 / 47.5 -> 60.6 tok/s
+  (llama.cpp 32.0 / 38.1 / 43.2), prompts 846 -> 859 / 976 -> 1,005 / 1,139 -> 1,174. (These are before the one-batch
+  lane change above.) The drafts help on edit tasks (+5-14% on a 400-token code rewrite at 24 GB) and little on plain
+  prose. The verify window costs ~0.4 GB of VRAM (16 GB peak 14.8 -> 15.2 GB). Outputs bit-identical to v1.3.141.
 
 ## v1.3.141 - 2026-11-13
 

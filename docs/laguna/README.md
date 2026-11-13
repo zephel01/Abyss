@@ -41,9 +41,13 @@ the same caps for comparison:
 
 | VRAM | decode | prompt | llama.cpp decode / prompt |
 | --- | ---: | ---: | ---: |
-| 16 GB | 36.3 tok/s | 842 tok/s | 32.0 / 318 |
-| 24 GB | 41.4 tok/s | 975 tok/s | 38.1 / 391 |
-| 32 GB | 47.4 tok/s | 1,144 tok/s | 43.2 / 470 |
+| 16 GB | 42.5 tok/s | 859 tok/s | 32.0 / 318 |
+| 24 GB | 50.9 tok/s | 1,005 tok/s | 38.1 / 391 |
+| 32 GB | 60.6 tok/s | 1,174 tok/s | 43.2 / 470 |
+
+(v1.3.142: the n-gram drafts and a faster decode attention; v1.3.140 had 36.3 / 41.4 / 47.4 tok/s decode and 842 / 975 /
+1,144 prompts. The drafts help on edit tasks - +5-14% on a 400-token code rewrite at 24 GB - and little on plain prose.
+The verify window costs ~0.4 GB of VRAM. Outputs are bit-identical to v1.3.141's.)
 
 Every expert sits in VRAM or the RAM tier (nothing from the SSD); the decode waits on the CPU lane (the RAM tier's
 experts, 10-17 ms a token).
@@ -55,5 +59,5 @@ engines sit at that floor.
 
 ## Not yet
 
-- Speculative drafts (no NextN block in the GGUF; the n-gram drafts are not wired to this path).
+- A NextN drafter (no NextN block in the GGUF; the n-gram drafts work from v1.3.142).
 - AMD: the HIP build compiles (gfx1201 / gfx1151) but has not been run.
