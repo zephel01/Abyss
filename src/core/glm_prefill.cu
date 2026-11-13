@@ -600,6 +600,14 @@ struct Glm5Model::PrefillState {
     static constexpr int kPreEv = 8;      // an event every kPreEv copies: how far they are at the plan
     std::vector<cudaEvent_t> ev_pdone;
     cudaEvent_t ev_pready = nullptr, ev_pfree = nullptr, ev_pstart = nullptr;
+    // the early prestage (STRATA_GLM_PRESTAGE_EARLY): a layer whose CPU experts outlast its staged copies feeds the next
+    // layer's prestage copies in pieces of kFeed while the host computes - the link otherwise idled until the host's
+    // outputs went up.  ev_feed: the last piece; pre_tail: the copies a layer's prestage issued from ev_pstart on (the
+    // copy-time measurement's count: the pieces before it ran between the host's uploads)
+    static constexpr int kFeed = 2;
+    cudaEvent_t ev_feed = nullptr;
+    int pre_tail = 0;
+    uint64_t pre_fed = 0;                 // prestage copies issued early, all chunks (the verbose line)
     // STRATA_GLM_PRESTAGE_ADAPT=1 (experimental): how many a layer prestages, in experts per chunk token by mixer
     // (KDA, DSA), learned from its lanes - the copy stream idle before the plan: more; the CPU done before copies the
     // plan could not move to it: fewer (0: unset).  Off: every layer fills the buffer
@@ -1165,6 +1173,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         create_event(S->ev_pready, 0);   // (timed, flags 0: the controller reads when the copies landed)
         create_event(S->ev_pstart, 0);
         create_event(S->ev_pfree, cudaEventDisableTiming);
+        create_event(S->ev_feed, cudaEventDisableTiming);
     }
     if (!events_ok) {
         cudaGetLastError();
@@ -1786,6 +1795,7 @@ void Glm5Model::prefill_destroy() {
     if (S->ev_pready) cudaEventDestroy(S->ev_pready);
     if (S->ev_pstart) cudaEventDestroy(S->ev_pstart);
     if (S->ev_pfree) cudaEventDestroy(S->ev_pfree);
+    if (S->ev_feed) cudaEventDestroy(S->ev_feed);
     if (S->xs) cudaStreamDestroy(S->xs);
     S->mq.reset();
     if (S->blas) cublasDestroy(S->blas);
@@ -2727,44 +2737,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return pf_igpu && F->igpu_rows != nullptr && ok(Ly.gu_type) && ok(Ly.d_type) && !Ly.mixed() && 2 * g.n_ff_exp <= E &&
                E % 256 == 0;
     };
-    const auto prestage = [&](int il) {
-        S->pre_layer = -1;
-        S->pre_e.clear();
-        if (S->pbuf == nullptr || T < kPreMinT || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
-            (tail_skip && il == g.n_layers - 1))   // the skipped terminal FFN reads no experts
-            return;
+    // a prestage in three steps: pre_plan (the candidates, the count, the first n sorted), pre_issue (copies [issued,
+    // upto) into pbuf, an ev_pdone every kPreEv), pre_done (ev_pready, the layer pbuf now holds).  prestage(il) runs
+    // them back to back; the early prestage (below, the CPU lane's layers) issues the first pieces from a feeder thread
+    struct PreCand {
+        double pred;
+        int e, rs;
+    };
+    struct PrePlan {
+        int il = -1, n = 0, issued = 0, early = 0;
+        std::vector<PreCand> cand;
+    };
+    // layer il's count: the buffer's, or (STRATA_GLM_PRESTAGE_ADAPT=1) what its mixer's window took before
+    const auto pre_want = [&](int il) {
         const auto& Ly = F->L[(size_t) il];
         const auto& P = F->lp[(size_t) il];
-        const auto& RC = F->rc[(size_t) F->layer_rc[(size_t) il]];
-        const int NE = g.n_expert;
-        // an expert's predicted rows: its share of this machine's routing (the usage profile, which the prompts
-        // feed) and of the layer's last chunk, half each
-        double us = 0.0, ls = 0.0;
-        for (int e = 0; e < NE; ++e) us += F->usage[(size_t) il * NE + e];
-        const auto& lc = S->last_cnt[(size_t) il];
-        for (int c : lc) ls += c;
-        struct Cand {
-            double pred;
-            int e, rs;
-        };
-        std::vector<Cand> cand;
-        {
-            std::lock_guard<std::mutex> lk(F->mu);
-            for (int e = 0; e < NE; ++e) {
-                const size_t key = (size_t) il * NE + e;
-                const int vs = F->slot_of[key];
-                if (vs >= 0 && vs < P.n && P.st[(size_t) vs] == FastState::kResident && P.key[(size_t) vs] == e)
-                    continue;   // in VRAM (a main slot, or a tail slot this prompt did not borrow)
-                const int rs = F->ram_of[key];
-                if (rs < 0 || RC.st[(size_t) rs] != FastState::kRHold) continue;   // (disk: the reader's)
-                double sh = 0.0, w = 0.0;
-                if (us > 0.0) sh += F->usage[key] / us, w += 1.0;
-                if (ls > 0.0 && !lc.empty()) sh += lc[(size_t) e] / ls, w += 1.0;
-                const double pred = (w > 0.0 ? sh / w : 1.0 / NE) * (double) T * K;
-                if (pred >= kPreMinRows) cand.push_back(Cand{pred, e, rs});
-            }
-        }
-        // the layer's count: the buffer's, or (STRATA_GLM_PRESTAGE_ADAPT=1) what its mixer's window took before.
         // deepseek4 adapts by default (=0: the whole buffer): with the CPU lane's AVX-512 i-quant rows the host takes
         // the lightly routed experts the full buffer would have copied - Ryzen AI Max+ 395 + RTX 5090 on PCIe Gen4 x4,
         // UD-Q2_K_XL: a 5.6K prompt 693 -> 1065 tok/s, an 18K one 1752 -> 1720
@@ -2780,27 +2767,103 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const double first = igpu_lane(il) ? 32.0 / 8000.0 : 64.0 / 5600.0;
         const double rate = S->pre_rate[Ly.recr ? 0 : 1] > 0.0 ? S->pre_rate[Ly.recr ? 0 : 1]
                                                                  : (adapt && g.arch == 1 ? first : 0.0);
-        const int want = !adapt || rate <= 0.0 ? cap : std::max(std::min(cap, 16), std::min(cap, (int) std::lround(rate * T)));
-        const int n = (int) std::min<size_t>((size_t) want, cand.size());
-        if (n == 0) return;
-        std::partial_sort(cand.begin(), cand.begin() + n, cand.end(),
-                          [](const Cand& a, const Cand& b) { return a.pred > b.pred; });
+        return !adapt || rate <= 0.0 ? cap : std::max(std::min(cap, 16), std::min(cap, (int) std::lround(rate * T)));
+    };
+    const auto pre_sort = [](PrePlan& pp, int n0, int n1) {   // candidates [n0, n1) in place, the best first
+        std::partial_sort(pp.cand.begin() + n0, pp.cand.begin() + n1, pp.cand.end(),
+                          [](const PreCand& a, const PreCand& b) { return a.pred > b.pred; });
+    };
+    const auto pre_plan = [&](int il, PrePlan& pp) {
+        pp = PrePlan{};
+        if (S->pbuf == nullptr || T < kPreMinT || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
+            (tail_skip && il == g.n_layers - 1))   // the skipped terminal FFN reads no experts
+            return;
+        const auto& P = F->lp[(size_t) il];
+        const auto& RC = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        const int NE = g.n_expert;
+        // an expert's predicted rows: its share of this machine's routing (the usage profile, which the prompts
+        // feed) and of the layer's last chunk, half each
+        double us = 0.0, ls = 0.0;
+        for (int e = 0; e < NE; ++e) us += F->usage[(size_t) il * NE + e];
+        const auto& lc = S->last_cnt[(size_t) il];
+        for (int c : lc) ls += c;
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            for (int e = 0; e < NE; ++e) {
+                const size_t key = (size_t) il * NE + e;
+                const int vs = F->slot_of[key];
+                if (vs >= 0 && vs < P.n && P.st[(size_t) vs] == FastState::kResident && P.key[(size_t) vs] == e)
+                    continue;   // in VRAM (a main slot, or a tail slot this prompt did not borrow)
+                const int rs = F->ram_of[key];
+                if (rs < 0 || RC.st[(size_t) rs] != FastState::kRHold) continue;   // (disk: the reader's)
+                double sh = 0.0, w = 0.0;
+                if (us > 0.0) sh += F->usage[key] / us, w += 1.0;
+                if (ls > 0.0 && !lc.empty()) sh += lc[(size_t) e] / ls, w += 1.0;
+                const double pred = (w > 0.0 ? sh / w : 1.0 / NE) * (double) T * K;
+                if (pred >= kPreMinRows) pp.cand.push_back(PreCand{pred, e, rs});
+            }
+        }
+        pp.n = (int) std::min<size_t>((size_t) pre_want(il), pp.cand.size());
+        if (pp.n == 0) return;
+        pre_sort(pp, 0, pp.n);
+        pp.il = il;
+    };
+    const auto pre_issue = [&](PrePlan& pp, int upto) {
+        const auto& Ly = F->L[(size_t) pp.il];
+        const auto& P = F->lp[(size_t) pp.il];
+        const auto& RC = F->rc[(size_t) F->layer_rc[(size_t) pp.il]];
+        if (pp.issued == 0) cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
+        for (int j = pp.issued; j < upto; ++j) {
+            cudaMemcpyAsync(S->pbuf + (size_t) j * P.stride, RC.base + (size_t) pp.cand[(size_t) j].rs * RC.stride, Ly.blob,
+                            cudaMemcpyHostToDevice, F->copy);
+            if ((j + 1) % PrefillState::kPreEv == 0 || j + 1 == pp.n)
+                cudaEventRecord(S->ev_pdone[(size_t) j / PrefillState::kPreEv], F->copy);
+        }
+        pp.issued = std::max(pp.issued, upto);
+    };
+    const auto pre_done = [&](PrePlan& pp) {
+        cudaEventRecord(S->ev_pready, F->copy);
+        S->pre_e.clear();
+        for (int j = 0; j < pp.n; ++j) S->pre_e.push_back(pp.cand[(size_t) j].e);
+        if (S->trace) {
+            cudaEventRecord(S->tr[(size_t) pp.il].pre, F->copy);
+            S->tr[(size_t) pp.il].pre_n = pp.n;
+        }
+        S->pre_layer = pp.il;
+        S->pre_issued += (uint64_t) pp.n;
+        S->pre_fed += (uint64_t) pp.early;
+    };
+    const auto prestage = [&](int il) {
+        S->pre_layer = -1;
+        S->pre_e.clear();
+        PrePlan pp;
+        pre_plan(il, pp);
+        if (pp.n == 0) return;
         cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
         cudaEventRecord(S->ev_pstart, F->copy);
-        for (int j = 0; j < n; ++j) {
-            cudaMemcpyAsync(S->pbuf + (size_t) j * P.stride, RC.base + (size_t) cand[(size_t) j].rs * RC.stride, Ly.blob,
-                            cudaMemcpyHostToDevice, F->copy);
-            if ((j + 1) % PrefillState::kPreEv == 0 || j + 1 == n)
-                cudaEventRecord(S->ev_pdone[(size_t) j / PrefillState::kPreEv], F->copy);
-            S->pre_e.push_back(cand[(size_t) j].e);
+        S->pre_tail = pp.n;
+        pre_issue(pp, pp.n);
+        pre_done(pp);
+    };
+    // the rest of an early prestage after the host's outputs went up: the count again (the adapting one learned from
+    // this layer meanwhile; never fewer than issued), the copies from ev_pstart (the copy-time measurement's), pre_done.
+    // A plan the feeder did not make (the host done before the staged copies): prestage(il) as before
+    const auto prestage_rest = [&](PrePlan& pp, int il) {
+        if (pp.il != il || pp.issued == 0) {
+            prestage(il);
+            return;
         }
-        cudaEventRecord(S->ev_pready, F->copy);
-        if (S->trace) {
-            cudaEventRecord(S->tr[(size_t) il].pre, F->copy);
-            S->tr[(size_t) il].pre_n = n;
-        }
-        S->pre_layer = il;
-        S->pre_issued += (uint64_t) n;
+        S->pre_layer = -1;
+        const int want = std::max(pp.issued, std::min<int>(pre_want(il), (int) pp.cand.size()));
+        if (want > pp.n) pre_sort(pp, pp.n, want);
+        pp.n = want;
+        pp.early = pp.issued;
+        cudaEventRecord(S->ev_pstart, F->copy);
+        S->pre_tail = pp.n - pp.issued;
+        // (the last ev_pdone of the pieces was recorded at their own end: again at the new end)
+        if (pp.issued == pp.n) cudaEventRecord(S->ev_pdone[(size_t) (pp.n - 1) / PrefillState::kPreEv], F->copy);
+        pre_issue(pp, pp.n);
+        pre_done(pp);
     };
 
     // whether layer il's plan may give experts to the CPU (STRATA_GLM_PREFILL_CPU=0: never)
@@ -4166,59 +4229,128 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         int dk = 0;   // the next disk expert (index into dlist / gidx)
         int n_staged_pcie = 0;   // (the split's balance: the copy stream's time when the host computes experts too)
         for (const auto& st : staged) n_staged_pcie += st.dev ? 0 : 1;
-        for (size_t gi = 0; gi < groups.size(); ++gi) {
+        // THE DISK GROUPS BEHIND THE HOST: a layer with CPU experts whose next group waits for a disk read leaves that
+        // group and the ones after it to the feeder thread (below), which issues them as their experts land - the host
+        // starts its experts at once instead of after the layer's disk reads (16 GB VRAM, a 4K prompt: up to 160 ms a
+        // layer).  The same copies and products in the same order on the same streams.  STRATA_GLM_PREFILL_DISK_DEFER=0:
+        // the host waits for them as before
+        static const bool disk_defer = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_DISK_DEFER");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        const auto group_landed = [&](size_t gi) {   // (group gi's disk experts all landed; dk: its first)
             const Group& gr = groups[gi];
-            const int b = (int) (gi % PrefillState::NG);
-            uint8_t* gdst = S->gbuf + (size_t) b * PrefillState::GE * P.stride;
-            cudaStreamWaitEvent(F->copy, S->ev_free[b], 0);
-            const int dk0 = dk;
-            for (int j = 0; j < gr.n; ++j) {
-                const Staged& st = staged[(size_t) gr.first + j];
-                const uint8_t* src = st.ram;
-                if (src == nullptr) {
-                    const int gi2 = gidx[(size_t) dk];
-                    // every index below this one was copied (its event recorded) or predicted and never routed:
-                    // released, so the reader can get to this one however far the prediction's gaps put it
-                    if (dq.copied.load() < gi2) dq.copied.store(gi2, std::memory_order_release);
-                    if (dq.landed.load(std::memory_order_acquire) <= gi2) {
-                        const auto td = std::chrono::steady_clock::now();
-                        while (dq.landed.load(std::memory_order_acquire) <= gi2) glmfast::cpu_relax();
-                        S->ms_disk += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
+            int need = -1, d = dk;
+            for (int j = 0; j < gr.n; ++j)
+                if (staged[(size_t) gr.first + j].ram == nullptr) need = gidx[(size_t) d++];
+            return need < 0 || dq.landed.load(std::memory_order_acquire) > need;
+        };
+        // the groups from g0 on; may_defer: stop at the first whose disk experts have not all landed (returned)
+        const auto run_groups = [&](size_t g0, bool may_defer) {
+            for (size_t gi = g0; gi < groups.size(); ++gi) {
+                if (may_defer && !group_landed(gi)) return gi;
+                const Group& gr = groups[gi];
+                const int b = (int) (gi % PrefillState::NG);
+                uint8_t* gdst = S->gbuf + (size_t) b * PrefillState::GE * P.stride;
+                cudaStreamWaitEvent(F->copy, S->ev_free[b], 0);
+                for (int j = 0; j < gr.n; ++j) {
+                    const Staged& st = staged[(size_t) gr.first + j];
+                    const uint8_t* src = st.ram;
+                    if (src == nullptr) {
+                        const int gi2 = gidx[(size_t) dk];
+                        // every index below this one was copied (its event recorded) or predicted and never routed:
+                        // released, so the reader can get to this one however far the prediction's gaps put it
+                        if (dq.copied.load() < gi2) dq.copied.store(gi2, std::memory_order_release);
+                        if (dq.landed.load(std::memory_order_acquire) <= gi2) {
+                            const auto td = std::chrono::steady_clock::now();
+                            while (dq.landed.load(std::memory_order_acquire) <= gi2) glmfast::cpu_relax();
+                            S->ms_disk += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
+                        }
+                        src = S->gpin + (size_t) (gi2 % KL) * S->gstride;
+                        ++dk;
                     }
-                    src = S->gpin + (size_t) (gi2 % KL) * S->gstride;
-                    ++dk;
+                    cudaMemcpyAsync(gdst + (size_t) j * P.stride, src, Ly.blob,
+                                    st.dev ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, F->copy);
+                    if (st.ram == nullptr) {   // its landing slot is free once this copy ran
+                        cudaEventRecord(S->ev_land[gidx[(size_t) dk - 1] % KL], F->copy);
+                        dq.copied.store(gidx[(size_t) dk - 1] + 1, std::memory_order_release);
+                    }
+                    S->staged_ram += st.ram != nullptr && !st.dev;
+                    S->staged_vram += st.dev;
                 }
-                cudaMemcpyAsync(gdst + (size_t) j * P.stride, src, Ly.blob,
-                                st.dev ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, F->copy);
-                if (st.ram == nullptr) {   // its landing slot is free once this copy ran
-                    cudaEventRecord(S->ev_land[gidx[(size_t) dk - 1] % KL], F->copy);
-                    dq.copied.store(gidx[(size_t) dk - 1] + 1, std::memory_order_release);
-                }
-                S->staged_ram += st.ram != nullptr && !st.dev;
-                S->staged_vram += st.dev;
+                cudaEventRecord(S->ev_ready[b], F->copy);
+                cudaStreamWaitEvent(s, S->ev_ready[b], 0);
+                run_any(gdst, gr.n, P.stride, M.bounds + gr.b_off, S->h_bounds + gr.b_off, gr.r0);
+                cudaEventRecord(S->ev_free[b], s);
+                S->rows_staged += (uint64_t) gr.nrows;
             }
-            (void) dk0;
-            cudaEventRecord(S->ev_ready[b], F->copy);
-            cudaStreamWaitEvent(s, S->ev_ready[b], 0);
-            run_any(gdst, gr.n, P.stride, M.bounds + gr.b_off, S->h_bounds + gr.b_off, gr.r0);
-            cudaEventRecord(S->ev_free[b], s);
-            S->rows_staged += (uint64_t) gr.nrows;
-        }
-        dq.copied.store(std::max(dq.copied.load(), seg_end), std::memory_order_release);   // predicted, never routed
-        S->staged_disk += dlist.size();
-        if (cpu_nrows > 0) cudaEventRecord(S->ev_c1, F->copy);
-        if (S->trace) {
-            auto& t = S->tr[(size_t) il];
-            cudaEventRecord(t.c1, F->copy);
-            t.grp = n_staged_pcie;
-            t.ncpu = (int) cpu_set.size();
-            t.crows = cpu_nrows;
-            t.dl = t.dcpu = 0.0;
-        }
+            return groups.size();
+        };
+        const auto groups_end = [&] {
+            dq.copied.store(std::max(dq.copied.load(), seg_end), std::memory_order_release);   // predicted, never routed
+            S->staged_disk += dlist.size();
+            if (cpu_nrows > 0) cudaEventRecord(S->ev_c1, F->copy);
+            if (S->trace) {
+                auto& t = S->tr[(size_t) il];
+                cudaEventRecord(t.c1, F->copy);
+                t.grp = n_staged_pcie;
+                t.ncpu = (int) cpu_set.size();
+                t.crows = cpu_nrows;
+                t.dl = t.dcpu = 0.0;
+            }
+        };
+        const size_t g_def = run_groups(0, disk_defer && cpu_nrows > 0 && !dlist.empty());
+        if (g_def == groups.size()) groups_end();
         // the next MoE layer's prestage: its copies run once this layer's are done - during the next mixer.  With
         // CPU experts it is queued after their outputs' upload, on the same stream: an upload on a stream of its own
         // waited out the whole prestage (one copy engine a direction), and the combine with it
         if (cpu_nrows == 0) prestage(next_moe(il + 1));
+        // THE EARLY PRESTAGE: while the host computes its experts, a feeder thread waits for the staged copies to end
+        // (ev_c1) and then feeds the next MoE layer's prestage copies kFeed at a time, each once the one before landed -
+        // so the link moves the next layer's experts instead of idling until the host is done, and the host's outputs
+        // queue behind at most a piece.  The same experts in the same slots as the prestage after the uploads (which
+        // issues the rest): only when their copies run changes.  STRATA_GLM_PRESTAGE_EARLY=0: after the uploads only
+        static const bool pre_early = [] {
+            const char* v = getenv("STRATA_GLM_PRESTAGE_EARLY");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        PrePlan fplan;
+        std::atomic<bool> fstop{false};
+        std::thread feeder;
+        const auto feed_stop = [&] {
+            fstop.store(true, std::memory_order_release);
+            if (feeder.joinable()) feeder.join();
+        };
+        struct FeedJoin {
+            const std::function<void()> f;
+            ~FeedJoin() { f(); }
+        } feed_join{feed_stop};   // (an error return below: the feeder stops before the plan it fills goes)
+        const bool feed = cpu_nrows > 0 && pre_early && S->pbuf != nullptr && S->ev_feed != nullptr;
+        if (feed || g_def < groups.size()) {
+            const int nx = next_moe(il + 1);
+            feeder = std::thread([&, nx, feed, g_def] {
+                cudaSetDevice(dev_);
+                if (g_def < groups.size()) {   // the disk groups first, whatever fstop says (the combine needs them)
+                    run_groups(g_def, false);
+                    groups_end();
+                }
+                if (!feed) return;
+                for (;;) {   // the staged copies' end
+                    if (fstop.load(std::memory_order_acquire)) return;
+                    const cudaError_t q = cudaEventQuery(S->ev_c1);
+                    if (q == cudaSuccess) break;
+                    if (q != cudaErrorNotReady) return;
+                    std::this_thread::sleep_for(std::chrono::microseconds(30));
+                }
+                pre_plan(nx, fplan);
+                while (fplan.n > 0 && fplan.issued < fplan.n && !fstop.load(std::memory_order_acquire)) {
+                    pre_issue(fplan, std::min(fplan.n, fplan.issued + PrefillState::kFeed));
+                    cudaEventRecord(S->ev_feed, F->copy);
+                    while (!fstop.load(std::memory_order_acquire) && cudaEventQuery(S->ev_feed) == cudaErrorNotReady)
+                        std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
+            });
+        }
         if (cpu_nrows > 0) {
             namespace kc = strata::kernels::cpu;
             const auto tc = std::chrono::steady_clock::now();
@@ -4233,6 +4365,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
             for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;
             const auto up = [&](int ra, int rb) {
+                if (rb == cpu_nrows) feed_stop();   // (the last upload: no piece after it)
                 if (rb > ra)
                     cudaMemcpyAsync(M.OUTPc + (size_t) ra * E, S->out_h + (size_t) ra * E,
                                     (size_t) (rb - ra) * E * sizeof(float), cudaMemcpyHostToDevice, F->copy);
@@ -4472,6 +4605,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 down(j_split, ncx);
                 up(r_split, cpu_nrows);
             }
+            feed_stop();
             cudaEventRecord(S->ev_out, F->copy);
             cudaStreamWaitEvent(s, S->ev_out, 0);   // (the combine reads them; the next layer's x overwrites x after)
             // (the host's time, from the plan and from its experts' start, before any wait on the copies below)
@@ -4491,7 +4625,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (cudaEventElapsedTime(&landed, S->ev_c0, S->ev_pready) == cudaSuccess &&
                     cudaEventElapsedTime(&pc, S->ev_c0, S->ev_c1) == cudaSuccess &&
                     cudaEventElapsedTime(&pt, S->ev_pstart, S->ev_pready) == cudaSuccess) {
-                    const double cm = pt / pre_n;   // (the copies ran back to back from ev_pstart)
+                    // (the copies ran back to back from ev_pstart: all of them, or an early prestage's rest)
+                    const double cm = S->pre_tail >= 4 ? pt / S->pre_tail : 0.0;
                     if (cm > 0.2 && cm < 20.0) S->copy_ms = S->copy_ms > 0.0 ? 0.8 * S->copy_ms + 0.2 * cm : cm;
                     const double pm = S->copy_ms > 0.0 ? S->copy_ms : 1.6;
                     double nn = pre_n;
@@ -4501,7 +4636,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     r = r > 0.0 ? 0.5 * r + 0.5 * nn / T : nn / T;
                 }
             }
-            prestage(next_moe(il + 1));
+            prestage_rest(fplan, next_moe(il + 1));
             S->cpu_experts += (uint64_t) ncx;
             S->cpu_rows += (uint64_t) cpu_nrows;
             S->ms_cpu += dt;
@@ -5131,7 +5266,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pf_->tokens += n;
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
     if (verbose) {
-        uint64_t sr = 0, sv = 0, sd = 0, rr = 0, rs = 0, ce = 0, cr = 0, pi = 0, ph = 0, pr = 0, ige = 0, igr = 0;
+        uint64_t sr = 0, sv = 0, sd = 0, rr = 0, rs = 0, ce = 0, cr = 0, pi = 0, pf = 0, ph = 0, pr = 0, ige = 0, igr = 0;
         double plan = 0, mc = 0;
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             sr += m->pf_->staged_ram;
@@ -5144,6 +5279,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             rs += m->pf_->rows_staged;
             plan += m->pf_->ms_plan;
             pi += m->pf_->pre_issued;
+            pf += m->pf_->pre_fed;
             ph += m->pf_->pre_hit;
             pr += m->pf_->pre_rows;
             ige += m->pf_->ig_experts;
@@ -5152,11 +5288,11 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms (%.2f ms/token, %.0f tok/s) | staged experts: %llu vram, %llu "
                              "ram, %llu disk, %llu on the host (%llu rows, %.0f ms; %llu experts / %llu rows of them on the iGPU, %.4f ms a "
                              "row; split kappa %.2f, %.3f ms a CPU row), %llu prestaged "
-                             "(%llu routed, %llu rows) | rows resident %.1f%% | plan %.1f ms (cumulative)\n",
+                             "(%llu early, %llu routed, %llu rows) | rows resident %.1f%% | plan %.1f ms (cumulative)\n",
                      (long long) n, ms, ms / (double) n, 1000.0 * (double) n / ms, (unsigned long long) sv,
                      (unsigned long long) sr, (unsigned long long) sd, (unsigned long long) ce, (unsigned long long) cr, mc,
                      (unsigned long long) ige, (unsigned long long) igr, pf_->row_ms_ig, pf_->kappa,
-                     pf_->row_ms, (unsigned long long) pi, (unsigned long long) ph, (unsigned long long) pr,
+                     pf_->row_ms, (unsigned long long) pi, (unsigned long long) pf, (unsigned long long) ph, (unsigned long long) pr,
                      100.0 * (double) rr / (double) std::max<uint64_t>(1, rr + rs), plan);
         if (pf_->x_flushed > 0)
             std::fprintf(stderr, "glm prefill: the exact prompt's combine ran as the window filled in %llu layers (not one "
