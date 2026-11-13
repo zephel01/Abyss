@@ -7,6 +7,30 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased (qwen35-dense-next)
+
+- Qwen3.8-27B on an 8 GB GPU (8K context): when even every FFN row in RAM leaves too little VRAM for the prompt path,
+  the head (`output.weight`, 1 GB) keeps only its first rows in VRAM and the CPU computes the rest while the GPU
+  computes its own (token, drafts, verify window). `setup --model qwen38-27b` now writes 8K for an 8-11 GB GPU
+  (and warns under 9 GB to keep other programs off it). RTX 5090 capped at 8 GB, 4K prompt + 512 tokens, median of 3:
+  decode 15.5 tok/s with the NextN drafter, 8.4 without (llama.cpp 8.0), prompt 642 tok/s (llama.cpp 309; 1,121 with -ub 4096, which costs it decode: 7.2), peak
+  7,980 MiB. KL against llama.cpp with the head split 0.0025 / 0.0020 / 0.0034 (token / prompt / verify), as with it
+  all in VRAM.
+- Qwen3.8-27B uses ~350 MB less VRAM: a pack without experts loads the engine's GPU kernels lazily (every other pack
+  still loads them all at the start). 12 GB, no drafter: decode 13.6 -> 14.1 tok/s (llama.cpp 13.9); with the drafter
+  26.9 -> 28.4.
+- Qwen3.8-27B prompts (default change): the 16 attention layers' prompt attention runs on tensor cores for each KV
+  head's group of 6 query heads (FP16 operands, F32 sums), and the delta-net scan loads the next row while it computes
+  this one (bit-exact). 4K prompt, whole file in VRAM: 2,568 -> 3,100 tok/s (llama.cpp -ub 4096: 3,585); 16 GB 1,710
+  -> 2,143 (2,395); 12 GB 1,440 -> 1,525 (1,525). KL against llama.cpp on the prompt path 0.00196 (the F32 kernel
+  0.00193); outputs are not bit-identical to v1.3.141's on the prompt path. `STRATA_Q35_PATTN=1` brings back the F32
+  kernel (v1.3.141's results exactly). The MoE qwen35 models (Ornith, Qwen3.8-Flash-Next) keep their kernels
+  (`STRATA_Q35_PATTN=2` opts them in).
+- Qwen3.8-27B with the FFN partly in RAM: after a prompt only the loaned layers whose buffers the prompt reached are
+  uploaded again (a 361-token prompt at 16 GB: 5 of 6 layers).
+- Every other model's outputs unchanged (md5 under `STRATA_DETERMINISTIC=1` identical to v1.3.141 on Ornith-35B,
+  Qwen3.8-Flash-Next, GLM-5.3-Flash, V4 0731, V4.1 JA256, Ornith-122B).
+
 ## v1.3.141 - 2026-11-13
 
 - Windows: v1.3.140 did not compile (Laguna's YaRN used `M_PI`, which MSVC's `<cmath>` lacks without

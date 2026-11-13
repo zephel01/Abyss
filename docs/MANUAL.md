@@ -75,8 +75,9 @@ NextN block in its second shard):
 ```
 
 Qwen3.8-27B, a dense model, from unsloth's UD-Q4_K_XL (17.7 GB, v1.3.138): a GPU with 24 GB or more holds the whole file;
-from v1.3.140 a 12-20 GB GPU runs it too, with the FFN rows that do not fit in pinned RAM (32 GB of RAM needed). The setup
-stops on a GPU under 12 GB before downloading anything, and writes the context the GPU holds (24 GB: 32K, 32 GB: 128K;
+from v1.3.140 a 12-20 GB GPU runs it too, with the FFN rows that do not fit in pinned RAM (32 GB of RAM needed), and from
+v1.3.142 an 8 GB one (8K). The setup stops on a GPU under 8 GB before downloading anything, and writes the context the GPU
+holds (8-11 GB: 8K, 24 GB: 32K, 32 GB: 128K;
 [Qwen3.8-27B](#qwen38-27b-dense)):
 
 ```sh
@@ -743,16 +744,37 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
 - **12-20 GB GPUs (v1.3.140).** Every layer keeps its first FFN rows in VRAM and the rest in pinned RAM; in decode and the
   verify window the GPU computes its rows while the CPU computes the others (the hidden state is the only thing that
   crosses PCIe), and the CPU's answer is added. Between prompts the prompt path's idle buffers hold whole layers' FFN
-  (1-1.6 GB), given back at the start of a prompt. The setup needs 32 GB of RAM for it, writes the context the GPU holds,
-  and stops under 12 GB of VRAM; 8 GB does not fit (the non-FFN part alone is ~8.3 GB with caches). RTX 5090 capped,
-  4K prompt + 512 tokens, median of 3: 16 GB decode 65-68 tok/s with the NextN drafter, 42.2 without (llama.cpp 38.4),
-  prompt 1,710 tok/s; 12 GB 26.9 / 13.6 (llama.cpp 13.9), prompt 1,440; KL against llama.cpp unchanged (0.0024 / 0.0020).
+  (1-1.6 GB), given back at the start of a prompt (v1.3.142: only the layers the prompt's buffers reached are uploaded
+  again). The setup needs 32 GB of RAM for it and writes the context the GPU holds. A pack without experts loads the
+  engine's GPU kernels as they are first used (CUDA's lazy loading; ~350 MB less VRAM than loading them all at the start).
+- **8 GB GPUs (v1.3.142).** When even every FFN row in RAM leaves too little VRAM for the prompt path, the head
+  (`output.weight`, 1 GB) keeps only its first rows in VRAM and the CPU computes the rest while the GPU computes its
+  own (in the token, the drafts and the verify window). The setup writes 8K for a GPU of 8-11 GB and warns under 9 GB
+  to keep other programs off it (~0.2 GB to spare). `STRATA_Q35D_HEAD_ROWS=<n>` forces a split (tests).
+  RTX 5090 capped, 4K prompt + 512 tokens, median of 3 (llama.cpp: -ub 4096 prompt, the best -ngl for decode):
+
+  | VRAM | decode, NextN drafter | decode, no drafter | prompt | llama.cpp decode / prompt |
+  |---|---|---|---|---|
+  | 8 GB | 15.5 | 8.4 | 642 | 8.0 / 1,121 (default -ub: 309) |
+  | 12 GB | 28.4 | 14.1 | 1,525 | 13.9 / 1,525 |
+  | 16 GB | 71.0 | 45.2 | 2,143 | 38.4 / 2,395 |
+  | 20 GB | (all in VRAM) | 72.4 | 3,100 | 72.4 / 3,585 |
+
+  KL against llama.cpp with the head split: 0.0025 (token path) / 0.0020 (prompt path) / 0.0034 (verify window), as
+  with the whole head in VRAM.
   `STRATA_Q35D_SPLIT=0`: whole layers on the CPU instead of rows (the A/B; 16 GB no drafter 22.2 against 42.2).
 - **Quality.** The same token ids as llama.cpp; KL against llama.cpp 0.0025 (one token at a time) and 0.0019 (the
   prompt path) over 3,071 positions of English, Japanese and code; the first 212 greedy tokens of a 4K chat equal
   llama.cpp's.
 - **Speed.** RTX 5090, 4K prompt + 512 tokens, median of 3: decode 131.6 tok/s with the NextN drafter (82% of drafts
-  accepted), 72.7 without; llama.cpp 72.1. Prompts 2,538 tok/s (llama.cpp 3,463).
+  accepted), 72.7 without; llama.cpp 72.1. Prompts 2,538 tok/s in v1.3.141 (llama.cpp 3,463 / 3,585 with -ub 4096);
+  from v1.3.142 3,100 tok/s (see below).
+- **Prompt attention on tensor cores (v1.3.142, the default).** The 16 attention layers' prompt attention runs on
+  tensor cores for each KV head's group of 6 query heads (FP16 operands, F32 sums), and the delta-net scan loads the
+  next row while it computes this one: a 4K prompt 1,570 -> 1,313 ms with the whole file in VRAM (attention 0.072 ->
+  0.019 ms a token). KL against llama.cpp on the prompt path 0.00196 (the F32 kernel: 0.00193); the outputs are not
+  bit-identical to v1.3.141's on the prompt path. `STRATA_Q35_PATTN=1` brings back the F32 kernel (v1.3.141's results
+  exactly); `=2` also uses the new kernel on the MoE qwen35 models (Ornith, Qwen3.8-Flash-Next: off by default).
 - **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images.
 
 ## Laguna-S-2.1
