@@ -3802,6 +3802,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // STRATA_GLM_PCIE_SHARE=<0..1> (setup's calibration): the share of a route's RAM-tier experts that go over PCIe
     const char* sv = getenv("STRATA_GLM_PCIE_SHARE");
     const double share = sv != nullptr ? std::max(0.0, std::min(1.0, std::atof(sv))) : -1.0;
+    static const double lean = [] {
+        const char* v = getenv("STRATA_GLM_LANE_LEAN");
+        return v != nullptr ? std::max(0.0, std::atof(v)) : 4.0;
+    }();
+    // NEAR-TIES to the CPU when it is lean-fast (an expert STRATA_GLM_LANE_LEAN times faster than the link, the case
+    // the lean below sends every RAM-tier expert to the CPU anyway): a larger CPU share within 5% of the best plan's
+    // time is taken.  The timing's run-to-run spread (~4%) otherwise picked k or k + 1 from one start to the next on a
+    // box near a tie - 8 Zen 5 cores + RTX 5090, GLM-5.3: 7 or 8 of 8, both 41.0 tok/s, the VRAM hits a point apart
+    const bool tie_cpu = lean > 0.0 && c_ms * lean <= pd_ms;
     for (int f = 0; f <= plan_f(g); ++f) {
         int k = 0;
         if (pv != nullptr) {
@@ -3817,6 +3826,11 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                     k = kk;
                 }
             }
+            for (int kk = f; kk > k && tie_cpu; --kk)
+                if (std::max(pd_ms * (f - kk), over_ms + c_ms * kk) <= best * 1.05) {
+                    k = kk;
+                    break;
+                }
         }
         plan |= (unsigned long long) k << (4 * f);
         tab += " " + std::to_string(k);
@@ -3873,10 +3887,6 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // issue #14: from the start, the lane's share alone would never refill the pool after a prompt), and back when
     // the hit rate falls.  0 keeps the split; STRATA_GLM_PCIE_SHARE / _LATE / CPU_PLAN set by hand win.  A card
     // whose split already sends every RAM-tier expert to the CPU (a Gen4 x4 / OCuLink link) is as before.
-    static const double lean = [] {
-        const char* v = getenv("STRATA_GLM_LANE_LEAN");
-        return v != nullptr ? std::max(0.0, std::atof(v)) : 4.0;
-    }();
     if (lean > 0.0 && pv == nullptr && sv == nullptr && getenv("STRATA_GLM_PCIE_SHARE_LATE") == nullptr &&
         c_ms * lean <= pd_ms) {
         unsigned long long all_cpu = 0ull;
