@@ -629,6 +629,17 @@ struct Glm5Model::PrefillState {
     double copy_ms = 0.0;                 // a prestage copy's time, measured (the split's PCIe estimate)
     std::vector<std::vector<int>> last_cnt;   // per layer: the routing of its last chunk (half the prediction)
     uint64_t pre_issued = 0, pre_hit = 0, pre_rows = 0;
+    // THE SEED (STRATA_GLM_SEED_TAIL=<swaps a layer>, one GPU): in the prompt's last chunk each MoE layer's staged
+    // experts (the groups' and pbuf's, from the RAM tier) that the chunk's last rows routed most take the main slots
+    // of the residents those rows routed least - a device copy out of the staging slot while it holds the expert, and
+    // the resident goes down into the RAM slot the staged expert came from (the tiers stay exclusive) on seed_s, the
+    // idle D2H direction.  The decode then starts from the text's own experts.  The tables follow in prefill_return
+    bool seed_chunk = false;              // this chunk seeds (prefill_run: the last one)
+    cudaStream_t seed_s = nullptr;
+    cudaEvent_t ev_resdone = nullptr, ev_seedp = nullptr, ev_seed[NG] = {};
+    int* seed_h = nullptr;                // the chunk's last rows' routing counts (mapped)
+    std::vector<std::pair<size_t, unsigned long long>> seed_upd;   // the table edits owed (key, value)
+    uint64_t seeded = 0, seed_layers = 0;
     // STRATA_GLM_PREFILL_TRACE=1 (debug): per MoE layer of a chunk, when its lanes ended - printed after the chunk
     struct Tr {
         cudaEvent_t start = nullptr, plan = nullptr, pre = nullptr, c1 = nullptr, end = nullptr;
@@ -1800,6 +1811,35 @@ bool Glm5Model::prefill_return(std::string& err) {
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm return compute", err) ||
         !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm return copies", err)) return false;
     std::lock_guard<std::mutex> lk(F->mu);
+    // the seed's table edits (STRATA_GLM_SEED_TAIL): once its copies landed, before any decode route reads the tables
+    if (!S->seed_upd.empty()) {
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(S->seed_s), "glm seed copies", err)) return false;
+        const int ub = F->upd_buf;
+        int* kh = F->upd_key_h[ub];
+        unsigned long long* vh = F->upd_val_h[ub];
+        if (!glmfast::cuda_ok(cudaEventSynchronize(F->upd_ev[ub]), "glm seed set reuse", err)) return false;
+        for (size_t i0 = 0; i0 < S->seed_upd.size(); i0 += FastState::kMaxUpd) {
+            const int nu = (int) std::min<size_t>(FastState::kMaxUpd, S->seed_upd.size() - i0);
+            for (int i = 0; i < nu; ++i) {
+                kh[i] = (int) S->seed_upd[i0 + (size_t) i].first;
+                vh[i] = S->seed_upd[i0 + (size_t) i].second;
+            }
+            if (!glmfast::cuda_ok(cudaMemcpyAsync(F->upd_key_d[ub], kh, (size_t) nu * sizeof(int),
+                                                  cudaMemcpyHostToDevice, F->cs), "glm seed keys", err) ||
+                !glmfast::cuda_ok(cudaMemcpyAsync(F->upd_val_d[ub], vh, (size_t) nu * sizeof(unsigned long long),
+                                                  cudaMemcpyHostToDevice, F->cs), "glm seed values", err))
+                return false;
+            gf::tab_update(F->tab, F->upd_key_d[ub], F->upd_val_d[ub], nu, F->cs);
+            if (!glmfast::cuda_ok(cudaGetLastError(), "glm seed table update", err) ||
+                !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm seed table sync", err))
+                return false;
+        }
+        S->seed_upd.clear();
+    }
+    if (S->seeded > 0 && getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr)
+        std::fprintf(stderr, "glm prefill: CUDA%d seeded %llu experts in %llu layers from the last chunk's rows\n", dev_,
+                     (unsigned long long) S->seeded, (unsigned long long) S->seed_layers);
+    S->seeded = S->seed_layers = 0;
     for (int il = l0_; il < lt_; ++il) {
         auto& P = F->lp[(size_t) il];
         for (int s = P.n_main; s < P.n; ++s)
@@ -1851,6 +1891,13 @@ void Glm5Model::prefill_destroy() {
     if (S->ev_pstart) cudaEventDestroy(S->ev_pstart);
     if (S->ev_pfree) cudaEventDestroy(S->ev_pfree);
     if (S->ev_feed) cudaEventDestroy(S->ev_feed);
+    if (S->seed_s) cudaStreamSynchronize(S->seed_s);
+    for (cudaEvent_t e : {S->ev_resdone, S->ev_seedp})
+        if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : S->ev_seed)
+        if (e) cudaEventDestroy(e);
+    if (S->seed_s) cudaStreamDestroy(S->seed_s);
+    if (S->seed_h) cudaFreeHost(S->seed_h);
     if (S->xs) cudaStreamDestroy(S->xs);
     S->mq.reset();
     if (S->blas) cublasDestroy(S->blas);
@@ -2333,6 +2380,40 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const cudaStream_t s = F->cs;
     const int E = g.n_embd, DI = g.d_inner(), HD = g.kda_head_dim, K = g.n_exp_used;
     const float one = 1.0f, zero = 0.0f;
+    // THE SEED (PrefillState::seed_chunk): at most seed_cap swaps a MoE layer, ranked by the chunk's last seed_rows
+    // rows; a staged expert takes a resident's slot when those rows routed it at least seed_margin more times.
+    // Off by default: the copies down share the link with the prompt's staging (RTX 5090, Gen4 x4, 32 GB, 4K: the
+    // prompt ~1-2% slower).  16 for DeepSeek V4 / V4.1: the first 64 tokens after a 4K prompt +14-20%, 512 +4-5%;
+    // GLM-5.3 gains little (its 16K prompts' 512 tokens -8%: the text after them leaves the tail's experts)
+    static const char* seed_env = getenv("STRATA_GLM_SEED_TAIL");
+    const int seed_dflt = 0;
+    const int seed_cap = seed_env != nullptr ? std::max(0, std::atoi(seed_env)) : seed_dflt;
+    static const int seed_rows = [] { const char* v = getenv("STRATA_GLM_SEED_ROWS"); return v ? std::max(16, std::atoi(v)) : 128; }();
+    static const int seed_margin = [] { const char* v = getenv("STRATA_GLM_SEED_MARGIN"); return v ? std::max(1, std::atoi(v)) : 2; }();
+    // STRATA_GLM_SEED_DUMP=<file> (debug): the last rows' counts, "layer expert count" lines (tailsim.py), seed or not
+    static const char* seed_dump = getenv("STRATA_GLM_SEED_DUMP");
+    bool seed_on = S->seed_chunk && (seed_cap > 0 || seed_dump != nullptr) && T >= 128 && S->gbuf != nullptr;
+    if (seed_on && S->seed_s == nullptr) {
+        bool ok = cudaStreamCreateWithFlags(&S->seed_s, cudaStreamNonBlocking) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&S->ev_resdone, cudaEventDisableTiming) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&S->ev_seedp, cudaEventDisableTiming) == cudaSuccess &&
+                  cudaHostAlloc((void**) &S->seed_h, 4096 * sizeof(int), cudaHostAllocMapped) == cudaSuccess;
+        for (int b = 0; ok && b < PrefillState::NG; ++b)
+            ok = cudaEventCreateWithFlags(&S->ev_seed[b], cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {   // (a full GPU: no seed, the prompt as before; the next prompt tries again)
+            cudaGetLastError();
+            if (S->seed_s) cudaStreamDestroy(S->seed_s);
+            for (cudaEvent_t* e : {&S->ev_resdone, &S->ev_seedp, &S->ev_seed[0], &S->ev_seed[1], &S->ev_seed[2]}) {
+                if (*e) cudaEventDestroy(*e);
+                *e = nullptr;
+            }
+            if (S->seed_h) cudaFreeHost(S->seed_h);
+            S->seed_s = nullptr;
+            S->seed_h = nullptr;
+            seed_on = false;
+        }
+    }
+    if (seed_on && g.n_expert > 4096) seed_on = false;
 
     // Y[t][N] (row stride ldy) = alpha * X[t][K] (F32, row stride ldx) . W[N][K]^T, W BF16 (widened in slices)
     // (W8 != nullptr: W is the GGUF's Q8_0 blocks instead - STRATA_GLM_DENSE_Q8 - widened the same way)
@@ -2867,7 +2948,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto& Ly = F->L[(size_t) pp.il];
         const auto& P = F->lp[(size_t) pp.il];
         const auto& RC = F->rc[(size_t) F->layer_rc[(size_t) pp.il]];
-        if (pp.issued == 0) cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
+        if (pp.issued == 0) {
+            cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
+            if (S->seed_s != nullptr) cudaStreamWaitEvent(F->copy, S->ev_seedp, 0);   // (the seed's copies out)
+        }
         for (int j = pp.issued; j < upto; ++j) {
             cudaMemcpyAsync(S->pbuf + (size_t) j * P.stride, RC.base + (size_t) pp.cand[(size_t) j].rs * RC.stride, Ly.blob,
                             cudaMemcpyHostToDevice, F->copy);
@@ -2895,6 +2979,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         pre_plan(il, pp);
         if (pp.n == 0) return;
         cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
+        if (S->seed_s != nullptr) cudaStreamWaitEvent(F->copy, S->ev_seedp, 0);
         cudaEventRecord(S->ev_pstart, F->copy);
         S->pre_tail = pp.n;
         pre_issue(pp, pp.n);
@@ -3562,6 +3647,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->mark("router", s);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s, g.gating,
                   Ly.tid2eid, S->toks_d, Ly.router_bias_vl, S->img_on ? S->img_d : nullptr);
+        const bool seed_layer = seed_on && F->layer_rc[(size_t) il] >= 0;
+        if (seed_layer) {   // (the seed's ranking: the chunk's last rows alone, before the whole chunk's count)
+            const int R = std::min(T, seed_rows);
+            gb::expert_count(M.ids + (size_t) (T - R) * K, R * K, NE, M.counts, M.rank, s);
+            gb::copy_i32(M.counts, S->seed_h, NE, s);
+        }
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
         S->mark("route", s);
@@ -3858,6 +3949,123 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             err = "glm prefill: the expert bounds overflowed";
             return false;
         }
+        // ---- THE SEED's swaps (the prompt's last chunk, STRATA_GLM_SEED_TAIL): the staged RAM-tier experts (the
+        //      groups' and pbuf's) the chunk's last rows routed most take the main slots of the residents they routed
+        //      least.  The host's tiers change here (nothing reads this layer's again before the decode), the device's
+        //      tables in prefill_return once the copies landed
+        struct SeedSwap {
+            int src, v, rs;   // src: the staged index (its group's slot), or -1 - k: pbuf slot k
+        };
+        std::vector<SeedSwap> seeds;
+        if (seed_layer && seed_dump != nullptr) {   // (the counts of the last 128 .. 4096 rows, then the seed's again)
+            if (FILE* f = std::fopen(seed_dump, "a")) {
+                for (int R : {128, 256, 512, 1024, 2048, 4096}) {
+                    const int r = std::min(T, R);
+                    gb::expert_count(M.ids + (size_t) (T - r) * K, r * K, NE, M.counts, M.rank, s);
+                    gb::copy_i32(M.counts, S->seed_h, NE, s);
+                    cudaStreamSynchronize(s);
+                    for (int e = 0; e < NE; ++e)
+                        if (S->seed_h[e] > 0) std::fprintf(f, "%d %d %d %d\n", R, il, e, S->seed_h[e]);
+                }
+                std::fclose(f);
+                const int r = std::min(T, seed_rows);
+                gb::expert_count(M.ids + (size_t) (T - r) * K, r * K, NE, M.counts, M.rank, s);
+                gb::copy_i32(M.counts, S->seed_h, NE, s);
+                gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);   // (the rank again: the scatter reads it)
+                cudaStreamSynchronize(s);
+            }
+        }
+        if (seed_layer && seed_cap > 0) {
+            const int* tc = S->seed_h;
+            struct Cand {
+                int t, src, rs, e;
+            };
+            std::vector<Cand> cand;
+            std::vector<std::pair<uint64_t, int>> vict;   // (tail count << 32 | LFU count, main slot)
+            std::lock_guard<std::mutex> lk(F->mu);
+            const auto ram_slot = [&](int e, const uint8_t* src) {
+                const int rs = F->ram_of[(size_t) (il * NE + e)];
+                if (rs < 0 || RC.st[(size_t) rs] != FastState::kRHold) return -1;
+                return src == nullptr || RC.base + (size_t) rs * RC.stride == src ? rs : -1;
+            };
+            for (size_t i = 0; i < staged.size(); ++i) {
+                const Staged& st = staged[i];
+                if (st.dev || st.ram == nullptr || tc[st.e] < seed_margin) continue;
+                const int rs = ram_slot(st.e, st.ram);
+                if (rs >= 0) cand.push_back(Cand{tc[st.e], (int) i, rs, st.e});
+            }
+            // (a pbuf expert the plan staged or gave the host after all - the exact prompt's light ones - is not
+            // one: the host reads its RAM slot while the layer runs, and the groups' copy is the staged one)
+            std::vector<char> elsewhere;
+            if (S->pre_layer == il) {
+                elsewhere.assign((size_t) NE, 0);
+                for (const Staged& st : staged) elsewhere[(size_t) st.e] = 1;
+                for (const Staged& st : cpu_set) elsewhere[(size_t) st.e] = 1;
+            }
+            if (S->pre_layer == il)
+                for (size_t k = 0; k < S->pre_e.size(); ++k) {
+                    const int e = S->pre_e[k];
+                    if (tc[e] < seed_margin || elsewhere[(size_t) e]) continue;
+                    const int rs = ram_slot(e, nullptr);
+                    if (rs >= 0) cand.push_back(Cand{tc[e], -1 - (int) k, rs, e});
+                }
+            if (!cand.empty())
+                for (int sl = 0; sl < P.n_main; ++sl)
+                    if (P.st[(size_t) sl] == FastState::kResident && P.key[(size_t) sl] >= 0) {
+                        const int e = P.key[(size_t) sl];
+                        vict.push_back({((uint64_t) tc[e] << 32) | F->cnt[(size_t) (il * NE + e)], sl});
+                    }
+            std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.t > b.t; });
+            std::sort(vict.begin(), vict.end());
+            const size_t n = std::min<size_t>((size_t) seed_cap, std::min(cand.size(), vict.size()));
+            for (size_t j = 0; j < n; ++j) {
+                const Cand& c = cand[j];
+                const int v = vict[j].second, ve = P.key[(size_t) v];
+                if ((uint64_t) c.t < (vict[j].first >> 32) + (uint64_t) seed_margin) break;
+                const int ckey = il * NE + c.e, vkey = il * NE + ve;
+                F->slot_of[(size_t) ckey] = v;
+                F->slot_of[(size_t) vkey] = -1;
+                P.key[(size_t) v] = c.e;
+                P.tick[(size_t) v] = F->clock;
+                F->ram_of[(size_t) ckey] = -1;
+                S->seed_upd.push_back({F->tab_key(ckey), (unsigned long long) P.slot_ptr(v)});
+                S->seed_upd.push_back({F->tab_key(vkey), 0ull});
+                S->seed_upd.push_back({F->rtab_key(ckey), 0ull});
+                // (a free RAM slot instead, its copy down at once beside the products, measured slower: V4 0731 4K
+                // prompts 829 -> 815 tok/s - the copies down cost the link's staging copies the same either way)
+                F->ram_of[(size_t) vkey] = c.rs;
+                RC.key[(size_t) c.rs] = vkey;
+                RC.tick[(size_t) c.rs] = F->clock;
+                S->seed_upd.push_back({F->rtab_key(vkey), (unsigned long long) (RC.base + (size_t) c.rs * RC.stride)});
+                seeds.push_back(SeedSwap{c.src, v, c.rs});
+            }
+            S->seeded += seeds.size();
+            S->seed_layers += !seeds.empty();
+        }
+        // a seed swap's copies on seed_s: the resident down into the RAM slot the expert came from once its staging
+        // copy read that slot (ev; reading the resident beside the layer's products is fine), then - once the layer's
+        // residents were read (ev_resdone) - the expert from its staging slot `src` over the resident
+        const auto seed_down = [&](const std::vector<int>& idx, cudaEvent_t ev) {
+            cudaStreamWaitEvent(S->seed_s, ev, 0);
+            for (int q : idx)
+                cudaMemcpyAsync(RC.base + (size_t) seeds[(size_t) q].rs * RC.stride, P.slot_ptr(seeds[(size_t) q].v),
+                                Ly.blob, cudaMemcpyDeviceToHost, S->seed_s);
+        };
+        const auto seed_over = [&](const std::vector<int>& idx, const uint8_t* const* src) {
+            cudaStreamWaitEvent(S->seed_s, S->ev_resdone, 0);
+            for (size_t q = 0; q < idx.size(); ++q)
+                cudaMemcpyAsync(P.slot_ptr(seeds[(size_t) idx[q]].v), src[q], Ly.blob, cudaMemcpyDeviceToDevice,
+                                S->seed_s);
+        };
+        // pbuf's: down now (its copies landed during the mixer), over after the prestaged product
+        std::vector<int> pidx;
+        std::vector<const uint8_t*> psrc;
+        for (size_t q = 0; q < seeds.size(); ++q)
+            if (seeds[q].src < 0) {
+                pidx.push_back((int) q);
+                psrc.push_back(S->pbuf + (size_t) (-1 - seeds[q].src) * P.stride);
+            }
+        if (!pidx.empty()) seed_down(pidx, S->ev_pready);
         cudaMemcpyAsync(M.base, S->h_base, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, s);
         cudaMemcpyAsync(M.bounds, S->h_bounds, (size_t) nb * sizeof(int), cudaMemcpyHostToDevice, s);
         if (n_light > 0)
@@ -4298,6 +4506,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                          n_light, nl_rows, std::sqrt(num / std::max(1e-30, den)), worst);
         }
         run_any(P.base, P.n_main, P.stride, M.bounds + b_res, S->h_bounds + b_res, 0);
+        if (!seeds.empty()) cudaEventRecord(S->ev_resdone, s);   // (the seed's victims may go now)
         (void) max_res;
         S->rows_resident += (uint64_t) rows_res;
         S->mark("moe_resident", s);
@@ -4318,6 +4527,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     run_any(S->pbuf, npre, P.stride, M.bounds + b_pre, S->h_bounds + b_pre, rows_res);
                 }
                 S->pre_rows += (uint64_t) rows_pre;
+            }
+            if (!pidx.empty()) {   // the seed's pbuf experts (the next layer's prestage waits for ev_seedp too)
+                seed_over(pidx, psrc.data());
+                cudaEventRecord(S->ev_seedp, S->seed_s);
             }
             cudaEventRecord(S->ev_pfree, s);   // (the next layer's prestage overwrites pbuf after this)
             S->pre_layer = -1;
@@ -4350,6 +4563,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const int b = (int) (gi % PrefillState::NG);
                 uint8_t* gdst = S->gbuf + (size_t) b * PrefillState::GE * P.stride;
                 cudaStreamWaitEvent(F->copy, S->ev_free[b], 0);
+                if (S->seed_s != nullptr) cudaStreamWaitEvent(F->copy, S->ev_seed[b], 0);   // (the seed's copies out)
                 for (int j = 0; j < gr.n; ++j) {
                     const Staged& st = staged[(size_t) gr.first + j];
                     const uint8_t* src = st.ram;
@@ -4381,6 +4595,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->staged_vram += st.dev;
                 }
                 cudaEventRecord(S->ev_ready[b], F->copy);
+                if (!seeds.empty()) {   // the seed's experts of this group (staged indices gr.first ..)
+                    std::vector<int> gidx_s;
+                    std::vector<const uint8_t*> gsrc;
+                    for (size_t q = 0; q < seeds.size(); ++q)
+                        if (seeds[q].src >= gr.first && seeds[q].src < gr.first + gr.n) {
+                            gidx_s.push_back((int) q);
+                            gsrc.push_back(gdst + (size_t) (seeds[q].src - gr.first) * P.stride);
+                        }
+                    if (!gidx_s.empty()) {
+                        seed_down(gidx_s, S->ev_ready[b]);
+                        seed_over(gidx_s, gsrc.data());
+                        cudaEventRecord(S->ev_seed[b], S->seed_s);
+                    }
+                }
                 cudaStreamWaitEvent(s, S->ev_ready[b], 0);
                 run_any(gdst, gr.n, P.stride, M.bounds + gr.b_off, S->h_bounds + gr.b_off, gr.r0);
                 cudaEventRecord(S->ev_free[b], s);
@@ -5185,7 +5413,11 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 pf_ahead_toks_.assign(tokens.begin() + cs[(size_t) c + 1], tokens.begin() + cs[(size_t) c + 2]);
                 pf_ahead_p0_ = pos_start + cs[(size_t) c + 1];
             }
+            // the seed (STRATA_GLM_SEED_TAIL): the last chunk of a one-GPU prompt
+            pf_->seed_chunk = c + 1 == nc && split_next_ == nullptr && next_port_ == nullptr && !fast_->ram_resident &&
+                              !pf_->own;
             const bool half_ok = prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data());
+            pf_->seed_chunk = false;
             pf_kv_cut_ = -1;
             pf_ahead_toks_.clear();
             if (!half_ok) return false;
