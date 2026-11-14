@@ -524,7 +524,7 @@ public:
     bool dsv41_engram_token(int32_t tok, std::string& err);   // before the layers: hash, read and decode both tables'
                                                               // rows of this token, upload them
     // layer il's Engram add into the streams R (rows: that token's 24 x 256 rows on the device; null: the token path's)
-    bool dsv41_engram_add(int il, float* R, std::string& err, const float* rows = nullptr);
+    bool dsv41_engram_add(int il, float* R, std::string& err, const float* rows = nullptr, cudaStream_t s = nullptr);
     bool dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::string& err,   // the prompt path: a chunk's
                            const int32_t* ahead = nullptr, int T_ahead = 0);   // (and the next chunk's, prefetched)
     bool dsv41_engram_prompt(int il, int T, float* R, std::string& err);   // row numbers, then each Engram layer's adds
@@ -557,7 +557,7 @@ public:
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);
-    bool dsv41_engram_window_add(int il, int t, float* R, std::string& err);
+    bool dsv41_engram_window_add(int il, int t, float* R, std::string& err, cudaStream_t s = nullptr);
     void* vb_ = nullptr;                                   // the verify window's buffers (dsv4_verify.cu)
     bool verify_alloc(std::string& err);
     // columns tb .. tb + n - 1 on stream s (the batched window: all of them on the compute stream; the pipelined one:

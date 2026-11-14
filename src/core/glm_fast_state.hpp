@@ -855,6 +855,7 @@ struct Glm5Model::FastState {
     std::vector<const char*> pname;
     size_t pn = 0;
     std::map<std::string, double> pacc;
+    std::map<std::string, uint64_t> pcnt;   // (the calls a name, for ms a call)
     uint64_t ptokens = 0;
     void mark(const char* nm) {
         if (pn >= pev.size()) {
@@ -875,7 +876,10 @@ struct Glm5Model::FastState {
         }
         for (size_t i = 1; i < pn; ++i) {
             float ms = 0.0f;
-            if (cudaEventElapsedTime(&ms, pev[i - 1], pev[i]) == cudaSuccess) pacc[pname[i]] += ms;
+            if (cudaEventElapsedTime(&ms, pev[i - 1], pev[i]) == cudaSuccess) {
+                pacc[pname[i]] += ms;
+                ++pcnt[pname[i]];
+            }
         }
         if (pn > 0) ++ptokens;
         pn = 0;
