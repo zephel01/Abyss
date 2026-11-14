@@ -435,6 +435,75 @@ class DenseAllInVram(unittest.TestCase):
         self.assertNotIn("env", got)   # (no RAM tier: nothing of it is in RAM)
 
 
+class DenseOtherFiles(unittest.TestCase):
+    """--model qwen38-27b --quant <any file of unsloth's repo>: the VRAM a context needs moves with the file's size, the
+    PC-size proposal names the file a GPU holds (the default stays UD-Q4_K_XL), a file without the NextN block gets
+    unsloth's separate one (size + SHA-256 checked), an unknown name stops."""
+    KEY = "qwen38-27b"
+
+    def test_every_file_of_the_repo_is_offered(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual(m["quant"], "UD-Q4_K_XL")
+        for q in ("UD-IQ1_S", "UD-IQ2_XXS", "UD-IQ3_XXS", "UD-Q6_K", "Q4_0", "Q4_1", "Q8_0", "UD-Q8_K_XL", "BF16"):
+            self.assertIn(q, m["quants"])
+        no_nextn = sorted(q for q, (_, nx) in m["quant_gb"].items() if not nx)
+        self.assertEqual(no_nextn, ["UD-IQ1_M", "UD-IQ1_S", "UD-IQ2_S", "UD-IQ2_XS", "UD-IQ2_XXS"])
+
+    def test_the_vram_moves_with_the_file(self):
+        self.assertAlmostEqual(A.dense_need(self.KEY, 32768, "UD-Q4_K_XL"), 23.5)
+        self.assertAlmostEqual(A.dense_need(self.KEY, 32768, "UD-Q6_K"), 23.5 + 21.98 - 17.66)
+        self.assertEqual(A.dense_context(self.KEY, 31.84, 65536, "UD-Q6_K"), 65536)
+        self.assertEqual(A.dense_context(self.KEY, 31.84, 65536, "Q8_0"), None)   # (29 GB + caches: not all in VRAM)
+        self.assertEqual(A.dense_context(self.KEY, 11.99, 8192, "UD-IQ2_XXS"), 8192)
+
+    def test_the_pc_size_proposal(self):
+        self.assertEqual(A.dense_pick(self.KEY, 31.84), "UD-Q6_K")
+        self.assertEqual(A.dense_pick(self.KEY, 23.99), "UD-Q4_K_XL")
+        self.assertEqual(A.dense_pick(self.KEY, 15.92), "UD-IQ3_XXS")
+        self.assertEqual(A.dense_pick(self.KEY, 11.99), "UD-IQ2_XXS")
+        self.assertIsNone(A.dense_pick(self.KEY, 7.99))
+        a = Namespace(quant=None, yes=True, name=None)
+        with mock.patch.object(A.S, "ram_gb", return_value=96.0), mock.patch.object(A.S, "say"):
+            got = A.choose_quant(a, self.KEY, [{"index": 0, "name": "GPU", "vram_gb": 31.84}])
+        self.assertEqual(got, "UD-Q4_K_XL")   # (--yes: the default stays)
+        with self.assertRaises(SystemExit), mock.patch.object(A.S, "say"):
+            A.choose_quant(Namespace(quant="Q3_K_M", yes=True, name=None), self.KEY, [])
+
+    def test_an_8_gb_gpu_and_a_large_file(self):
+        a = Namespace(context=8192)
+        cards = [{"index": 0, "name": "GPU", "vram_gb": 7.99}]
+        with mock.patch.object(A.S, "say"):
+            self.assertEqual(A.dense_gpu_check(a, self.KEY, cards, "cuda", False, 96.0, quant="UD-IQ2_XXS"), 8192)
+            with self.assertRaises(SystemExit):
+                A.dense_gpu_check(a, self.KEY, cards, "cuda", False, 96.0, quant="Q8_0")
+
+    def test_the_side_files_are_size_and_sha_checked(self):
+        body = b"x" * 100
+        sha = hashlib.sha256(body).hexdigest()
+        items = [{"type": "file", "path": "MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "size": 100, "lfs": {"oid": sha}}]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        a = Namespace(download_model=True, yes=True)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A.urllib.request, "urlopen", return_value=R()), \
+                mock.patch.object(A.S, "say"), mock.patch.object(A.S, "ok"):
+            def good(url, dst, what=None):
+                Path(dst).write_bytes(body)
+            with mock.patch.object(A.S, "download", side_effect=good) as dl:
+                got = A.side_file(a, "unsloth/Qwen3.8-27B-GGUF", A.DENSE27_MTP, Path(d), "block")
+                self.assertEqual(got, Path(d) / "MTP" / "mtp-Qwen3.8-27B-Q4_0.gguf")
+                self.assertIn("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", dl.call_args[0][0])
+            got.unlink()
+            for f in Path(d, "MTP").glob("*.sha256"):
+                f.unlink()
+
+            def bad(url, dst, what=None):   # (a proxy's other bytes: right size, wrong content)
+                Path(dst).write_bytes(b"y" * 100)
+            with mock.patch.object(A.S, "download", side_effect=bad), self.assertRaises(SystemExit):
+                A.side_file(a, "unsloth/Qwen3.8-27B-GGUF", A.DENSE27_MTP, Path(d), "block")
+
+
 class TestVariants(unittest.TestCase):
     """--model qwen38 / glm / ornith: every quant the setup offers names a variant with a repo and a file prefix"""
 

@@ -21,6 +21,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/rope.hpp"
+#include "strata/kernels/mrope.hpp"
 
 #include "ggml.h"
 
@@ -53,9 +54,10 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     };
     const auto q = [&](const char* n, int64_t n_in, int64_t n_out) -> WSlot {
         auto it = ws_map_.find(P + n);
-        if ((it == ws_map_.end() || it->second.type == 0) && g.q4x) {
+        if ((it == ws_map_.end() || it->second.type == 0) && (g.q4x || (g.qwen35() && g.n_expert == 0 && !g.laguna))) {
             // ISTA-DASLab's GSQ-RCO Qwen3.8 keeps the hyper-connections and ssm_alpha / beta in BF16 (the pack's BF16
-            // arena): the GEMVs take BF16 rows with the float activation every job here passes beside its q8_1
+            // arena): the GEMVs take BF16 rows with the float activation every job here passes beside its q8_1.
+            // unsloth's Qwen3.8-27B files too: F32 ssm_alpha / beta (Q4_0, Q4_1), BF16 attention rows (UD-Q8_K_XL, BF16)
             const auto b = w16_.find(P + n);
             if (b != w16_.end()) return WSlot{nullptr, gf::kTypeBF16, b->second, n_in, n_out};
             const auto f = w_.find(P + n);   // (a small BF16 matrix - the injects - is widened to F32 at load)
@@ -130,6 +132,43 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     if (Ly.moe && g.n_shared > 0) Ly.sh_gate_w = f32("ffn_gate_inp_shexp.weight");
     if (Ly.mtp) {   // the NextN block: eh_proj in (2 n_embd -> n_embd) and its two norms; the head's norm the trunk's
         Ly.eh = q("nextn.eh_proj.weight", 2 * E, E);
+        // a BF16 / F32 eh_proj (unsloth's UD-Q8_K_XL and BF16 files): its GEMVs get only the q8_1 input, so the drafter
+        // reads a Q8_0 copy - the draft's guess only, the answer is still the trunk's
+        if ((Ly.eh.type == gf::kTypeBF16 || Ly.eh.type == gf::kTypeF32) && Ly.eh.q != nullptr && g.qwen35() && !g.q4x) {
+            const bool bf = Ly.eh.type == gf::kTypeBF16;
+            const size_t K = (size_t) 2 * E, N = (size_t) E, src_b = K * N * (bf ? 2 : 4);
+            const size_t q8_rb = ggml_row_size(GGML_TYPE_Q8_0, (int64_t) K);
+            std::vector<uint8_t> raw(src_b), q8(q8_rb * N);
+            std::vector<float> row(K);
+            const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+            if (cudaMemcpy(raw.data(), Ly.eh.q, src_b, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                for (size_t r = 0; r < N; ++r) {
+                    for (size_t k = 0; k < K; ++k) {
+                        if (bf) {
+                            uint16_t h;
+                            std::memcpy(&h, raw.data() + 2 * (r * K + k), 2);
+                            const uint32_t u = (uint32_t) h << 16;
+                            std::memcpy(&row[k], &u, 4);
+                        } else {
+                            std::memcpy(&row[k], raw.data() + 4 * (r * K + k), 4);
+                        }
+                    }
+                    tq->from_float_ref(row.data(), q8.data() + r * q8_rb, (int64_t) K);
+                }
+                if (F->q35_eh_q8 != nullptr) cudaFree(F->q35_eh_q8);
+                F->q35_eh_q8 = nullptr;
+                if (cudaMalloc(&F->q35_eh_q8, q8.size()) == cudaSuccess &&
+                    cudaMemcpy(F->q35_eh_q8, q8.data(), q8.size(), cudaMemcpyHostToDevice) == cudaSuccess) {
+                    Ly.eh = WSlot{nullptr, 8, F->q35_eh_q8, (int64_t) K, (int64_t) N};
+                } else {
+                    cudaGetLastError();
+                    missing += P + "nextn.eh_proj.weight (its Q8_0 copy) ";
+                }
+            } else {
+                cudaGetLastError();
+                missing += P + "nextn.eh_proj.weight (read back) ";
+            }
+        }
         Ly.enorm = f32("nextn.enorm.weight");
         Ly.hnorm = f32("nextn.hnorm.weight");
     }
@@ -739,7 +778,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (q35d_head_split()) {
-        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err)) return false;
+        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err, F->head_x)) return false;
     } else if (!gf::mv(&o, 1, s)) { err = "qwen35 mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
@@ -933,7 +972,7 @@ bool Glm5Model::glm_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (q35d_head_split()) {
-        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err)) return false;
+        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err, F->head_x)) return false;
     } else if (!gf::mv(&o, 1, s)) { err = "glm mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
@@ -1358,8 +1397,11 @@ bool Glm5Model::fast_dense_ffn(int il, std::string& err) {
         j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, FF};
         if (!gf::mv(j, 2, s)) { err = "qwen35: the dense FFN's gate / up"; return false; }
         if (F->prof_on) F->mark("q35_dense_gu");
-        gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
-        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
+        // (a BF16 / F32 down - unsloth's BF16 file - reads h as floats: kept in dg)
+        const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
+        if (hf) gf::swiglu_f32(F->dg, F->du, g.swiglu_shexp, FF, F->dg, s);
+        else gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
+        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, hf ? F->dg : nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
         if (!gf::mv(&dn, 1, s)) { err = "qwen35: the dense FFN's down"; return false; }
         if (F->prof_on) F->mark("q35_dense_down");
         return true;
@@ -1539,6 +1581,46 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
         q35_dump(s, "result_norm", l1_ - 1, F->head_x, g.n_embd);
     }
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen4exp: ") + cudaGetErrorString(e); return false; } }
+    return true;
+}
+
+
+// ---- images on qwen35 / qwen35moe (Qwen3.8-27B, Ornith): the image rows replace the <|image_pad|> embeddings
+// (set_image_rows) and the attention layers rotate with the cells' M-RoPE positions (set_mrope).  The delta-net
+// layers take no positions.  qwen4exp (Qwen3.8-Flash-Next) is left out: its QSA indexer, PLE and verify graphs read
+// positions their own ways, none of them checked with images; Laguna has no vision tower.
+bool Glm5Model::images_ok(std::string& why) const {
+    if (g_.v41 || (!g_.qwen35() && !g_.dsv4())) return true;   // (GLM-5.3's and V4.1's paths: their own rules)
+    if (g_.q4x) { why = "images on Qwen3.8-Flash-Next are not supported yet"; return false; }
+    if (g_.laguna) { why = "this model has no vision tower"; return false; }
+    if (g_.dsv4()) { why = "this model has no vision tower"; return false; }
+    return true;
+}
+
+bool Glm5Model::set_mrope(const std::vector<int32_t>& tab, std::string& err) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (tab.empty()) {
+            strata::kernels::mrope_table_set(nullptr);
+            continue;
+        }
+        // (the previous request's kernels may still read the old table: wait for the device before writing it)
+        if (!glmfast::cuda_ok(cudaDeviceSynchronize(), "images: the position table", err)) return false;
+        if (m->mrope_cap_ < tab.size()) {
+            if (m->mrope_d_ != nullptr) cudaFree(m->mrope_d_);
+            m->mrope_d_ = nullptr;
+            m->mrope_cap_ = 0;
+            const size_t cap = std::max(tab.size(), (size_t) (m->max_ctx_ + 64) * 3);
+            if (!glmfast::cuda_ok(cudaMalloc(&m->mrope_d_, cap * sizeof(int32_t)), "images: the position table", err))
+                return false;
+            m->mrope_cap_ = cap;
+        }
+        if (!glmfast::cuda_ok(cudaMemcpy(m->mrope_d_, tab.data(), tab.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                              "images: the position table", err))
+            return false;
+        strata::kernels::mrope_table_set(m->mrope_d_);
+    }
+    cudaSetDevice(dev_);
     return true;
 }
 

@@ -18,6 +18,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/kernels/mrope.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -222,7 +223,7 @@ __global__ void __launch_bounds__(kD) attn_prep_kernel(const float* __restrict__
                                                        const float* __restrict__ k_norm, float eps, int n_head,
                                                        int n_head_kv, int n_rot, float rope_base, int p,
                                                        uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
-                                                       float* __restrict__ q) {
+                                                       float* __restrict__ q, const int32_t* __restrict__ mtab) {
     STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     __shared__ float sv[kD];
     __shared__ float sred[8];
@@ -239,7 +240,9 @@ __global__ void __launch_bounds__(kD) attn_prep_kernel(const float* __restrict__
     if (d < n_rot) {   // NEOX pairs (i, i + n_rot / 2), theta_i = p * base^(-2 i / n_rot)
         const int half = n_rot / 2;
         const int i = d < half ? d : d - half;
-        const float theta = (float) p * powf(rope_base, -2.0f * (float) i / (float) n_rot);
+        // (an image request: the pair's M-RoPE stream position from the cell's (t, h, w), mrope.hpp; else the cell)
+        const float pr = mtab != nullptr ? (float) mrope_pos(mtab, (int) p, i) : (float) p;
+        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
         const float c = cosf(theta), s = sinf(theta);
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * s : x0 * s + x1 * c;
@@ -923,7 +926,7 @@ __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restr
                                                             const float* __restrict__ k_norm, float eps, int n_head,
                                                             int n_head_kv, int n_rot, float rope_base, int64_t p0,
                                                             uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
-                                                            float* __restrict__ q) {
+                                                            float* __restrict__ q, const int32_t* __restrict__ mtab) {
     __shared__ float sv[kD];
     __shared__ float sred[8];
     const int b = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
@@ -943,7 +946,9 @@ __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restr
     if (d < n_rot) {
         const int half = n_rot / 2;
         const int i = d < half ? d : d - half;
-        const float theta = (float) p * powf(rope_base, -2.0f * (float) i / (float) n_rot);
+        // (an image request: the pair's M-RoPE stream position from the cell's (t, h, w), mrope.hpp; else the cell)
+        const float pr = mtab != nullptr ? (float) mrope_pos(mtab, (int) p, i) : (float) p;
+        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
         const float c = cosf(theta), sn = sinf(theta);
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * sn : x0 * sn + x1 * c;
@@ -964,7 +969,7 @@ __global__ void __launch_bounds__(kD) attn_prep_q4_kernel(const float* __restric
                                                           const float* __restrict__ k_norm, float eps, int n_head,
                                                           int n_head_kv, int n_rot, float rope_base, int64_t p0,
                                                           uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
-                                                          float* __restrict__ q) {
+                                                          float* __restrict__ q, const int32_t* __restrict__ mtab) {
     __shared__ float sv[kD], sk[kD], sw[kD];
     __shared__ float sred[8];
     const int b = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
@@ -984,7 +989,9 @@ __global__ void __launch_bounds__(kD) attn_prep_q4_kernel(const float* __restric
     if (d < n_rot) {
         const int half = n_rot / 2;
         const int i = d < half ? d : d - half;
-        const float theta = (float) p * powf(rope_base, -2.0f * (float) i / (float) n_rot);
+        // (an image request: the pair's M-RoPE stream position from the cell's (t, h, w), mrope.hpp; else the cell)
+        const float pr = mtab != nullptr ? (float) mrope_pos(mtab, (int) p, i) : (float) p;
+        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
         const float c = cosf(theta), sn = sinf(theta);
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * sn : x0 * sn + x1 * c;
@@ -2343,13 +2350,13 @@ void attn_prep(const float* q_full, const float* k, const float* v, const float*
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
             attn_prep_q4_kernel<K()><<<dim3((unsigned) (n_head + n_head_kv), 1), kD, 0, s>>>(
-                q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, (int64_t) p, kc, vc, q);
+                q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, (int64_t) p, kc, vc, q, mrope_table());
         });
         check("attn_prep");
         return;
     }
     pdl_launch(attn_prep_kernel, n_head + n_head_kv, kD, 0, s, q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot,
-                                                       rope_base, p, kc, vc, q);
+                                                       rope_base, p, kc, vc, q, mrope_table());
     check("attn_prep");
 }
 // attn_split_kernel over the keys < p0 + T for T rows; part holds at least kMinChunks chunks a row and head.
@@ -2641,13 +2648,13 @@ void attn_prep_rows(const float* q_full, const float* k, const float* v, const f
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
             attn_prep_q4_kernel<K()><<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
-                q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q);
+                q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q, mrope_table());
         });
         check("attn_prep_rows");
         return;
     }
     attn_prep_rows_kernel<<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
-        q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q);
+        q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q, mrope_table());
     check("attn_prep_rows");
 }
 // the prompt / window kernels' query-head groups: 8 warps x HW heads (HW 1, 2, 4), whole warps - up to 8 heads, an even
@@ -2804,7 +2811,7 @@ void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
             attn_prep_q4_kernel<K()><<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(
-                k, k, v, k_norm, k_norm, eps, 0, n_head_kv, n_rot, rope_base, p0, kc, vc, nullptr);
+                k, k, v, k_norm, k_norm, eps, 0, n_head_kv, n_rot, rope_base, p0, kc, vc, nullptr, mrope_table());
         });
         check("attn_kv_rows");
         return;
@@ -2812,7 +2819,7 @@ void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps
     // n_head 0: every block a KV head (the q blocks come first in attn_prep_rows_kernel's numbering)
     attn_prep_rows_kernel<<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(k, k, v, k_norm, k_norm, eps, 0,
                                                                                 n_head_kv, n_rot, rope_base, p0, kc, vc,
-                                                                                nullptr);
+                                                                                nullptr, mrope_table());
     check("attn_kv_rows");
 }
 void top_prob(const float* logits, int n, const int* tok, float* out, cudaStream_t s) {

@@ -630,6 +630,9 @@ public:
     // CUDA, off on HIP; STRATA_DETERMINISTIC sets 1) - gf::mvn's one warp a row against the token path's split Q6_K
     // rows made 3-column windows part from the plain answer (V4 0731 at token 16, 2026-11-14)
     bool ds_mvn(const void* jobs, int n, int T, cudaStream_t s);
+    // the dense qwen35's (Qwen3.8-27B) verify-window GEMVs: glm_mvn unless STRATA_Q35_VERIFY_EXACT=0 (as q4x_mvn:
+    // default on with CUDA, off with HIP); the MoE qwen35 (Ornith) and Laguna keep gf::mvn
+    bool q35_mvn(const void* jobs, int n, int T, cudaStream_t s);
     bool glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // STRATA_GLM_WINDOW_CHECK
     void kda_copy_layer(int il, int li, bool restore, float* bak = nullptr);   // one KDA layer's S + conv <-> kda_bak_
     // the NextN block (blk.<n_layers>) as the drafter on one GPU (qwen35_fast_path.cu, behind the q35_mtp_* hooks)
@@ -766,6 +769,13 @@ public:
     /// Is position p an image row (V4.1: its router bias is exp_probs_b_vl and it gets no Engram)?  False at once when
     /// the request has no image.
     bool is_image_pos(int64_t p) const { return !img_pos_.empty() && image_row(p) != nullptr; }
+    /// qwen35 / qwen35moe images: the cells' multimodal rotary positions (Qwen's interleaved M-RoPE, sections 11/11/10:
+    /// strata/kernels/mrope.hpp), `tab` = cells x (t, h, w) from cell 0 - an image's cells share t and take h = t + row,
+    /// w = t + column, the text after it continues at t + max(rows, columns).  Every device of a layer split gets it; the
+    /// attention layers' rope kernels read it while it is set.  An empty `tab` clears it (each kernel takes the cell as
+    /// its position again: text requests compute exactly as without images).  Between requests only.
+    bool set_mrope(const std::vector<int32_t>& tab, std::string& err);
+    bool images_ok(std::string& why) const;   // can this model take image rows (GENI)?
     bool has_image_rows() const { return !img_pos_.empty(); }
     /// deepseek41: exp_probs_b_vl is loaded (STRATA_GLM_VL_BIAS, or <pack>/exp_probs_b_vl.f32); an image request needs it
     bool has_vl_bias() const { return vl_bias_ok_; }
@@ -777,6 +787,8 @@ public:
 private:
     std::vector<int64_t> img_pos_;                         // ascending
     std::vector<float> img_rows_;
+    int32_t* mrope_d_ = nullptr;                           // set_mrope's device table (this half's device)
+    size_t mrope_cap_ = 0;                                 // ... its int32 count
 public:
     /// The pipelined speculative decode (src/core/glm_fast_path.cu): needs a two-half split whose tail carries the
     /// NextN block.  After the prompt's last forward(), emits up to max_new tokens (emit returns false to stop) - the
@@ -900,7 +912,8 @@ public:
     // caller's own launches)
     void q35d_head_set(const uint8_t* src, size_t bytes, int type, void* dev);
     bool q35d_head_split() const;
-    bool q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err);
+    // (xf: the normed rows as floats, T x n_embd - a BF16 / F32 head's VRAM rows read them; null for the others)
+    bool q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err, const float* xf = nullptr);
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

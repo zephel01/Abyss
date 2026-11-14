@@ -1452,6 +1452,9 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
     case 10: block_elems = 256; block_bytes = 84; break;    // (sizing only: Q2_K is served by glm_fast mv)
+    case 3: block_elems = 32; block_bytes = 20; break;      // (sizing only: Q4_1, BF16 and F32 rows - unsloth's
+    case 30: block_elems = 32; block_bytes = 64; break;     //  Qwen3.8-27B Q4_1 / UD-Q8_K_XL / BF16 files - are
+    case 0: block_elems = 32; block_bytes = 128; break;     //  served by glm_fast mv)
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
     case 13: block_elems = 256; block_bytes = 176; break;

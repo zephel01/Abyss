@@ -21,6 +21,7 @@
 #include "strata/core/knobs.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/glm_ffn.hpp"
@@ -35,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -1218,6 +1220,11 @@ Glm5Model::~Glm5Model() {
     hop_link_.reset();   // (its buffers and events are on both parts' devices: before either goes)
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
+    if (mrope_d_ != nullptr) {
+        if (strata::kernels::mrope_table() == mrope_d_) strata::kernels::mrope_table_set(nullptr);
+        cudaFree(mrope_d_);
+        mrope_d_ = nullptr;
+    }
     fast_destroy();
     q35d_destroy();   // (load_pack's record when fast_setup never ran)
     if (!stage_workers_.empty()) {
@@ -2181,8 +2188,56 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     return best;
 }
 
+// A model GGUF without its NextN draft block (unsloth's Qwen3.8-27B UD-IQ1 / IQ2 quants) next to unsloth's separate
+// one (<gguf folder>/MTP/mtp-*.gguf: blk.<n_layers>.* of the same model): STRATA_GLM_MTP_GGUF is set to it, so the
+// loads below take the block from there.  An explicit STRATA_GLM_MTP_GGUF (empty: none) or STRATA_GLM_NO_MTP wins.
+static void mtp_auto(const std::string& pack_dir) {
+    if (getenv("STRATA_GLM_MTP_GGUF") != nullptr || getenv("STRATA_GLM_NO_MTP") != nullptr) return;
+    std::string err;
+    std::vector<std::string> names;
+    if (!pack_shard_names(pack_dir, names, err) || names.empty()) return;
+    try {
+        Glm5Geometry g;
+        std::vector<std::unique_ptr<strata::GgufFile>> gfs;
+        for (const auto& n : names) gfs.push_back(std::make_unique<strata::GgufFile>(pack_dir + "/../" + n));
+        if (!Glm5Geometry::from_gguf(*gfs[0], g, err) || !g.qwen35()) return;
+        const std::string key = "blk." + std::to_string(g.n_layers) + ".nextn.eh_proj.weight";
+        for (const auto& f : gfs)
+            if (f->find(key) != nullptr) return;   // (the model's own block)
+        namespace fs = std::filesystem;
+        // (beside the GGUF as the pack names it, and beside the file a symlink points to)
+        const fs::path named = fs::path(pack_dir + "/../" + names[0]);
+        std::error_code ec;
+        std::vector<fs::path> cand;
+        for (const fs::path& dir : {named.parent_path() / "MTP", fs::weakly_canonical(named, ec).parent_path() / "MTP"}) {
+            if (!fs::is_directory(dir, ec)) continue;
+            for (const auto& e : fs::directory_iterator(dir, ec))
+                if (e.path().extension() == ".gguf") cand.push_back(e.path());
+            if (!cand.empty()) break;
+        }
+        std::sort(cand.begin(), cand.end());
+        for (const auto& c : cand) {
+            strata::GgufFile m(c.string());
+            Glm5Geometry mg;
+            std::string e2;
+            if (m.find(key) == nullptr || !Glm5Geometry::from_gguf(m, mg, e2) || mg.n_embd != g.n_embd ||
+                mg.n_layers != g.n_layers || mg.n_vocab != g.n_vocab)
+                continue;
+#if defined(_WIN32)
+            _putenv_s("STRATA_GLM_MTP_GGUF", c.string().c_str());
+#else
+            setenv("STRATA_GLM_MTP_GGUF", c.string().c_str(), 1);
+#endif
+            std::fprintf(stderr, "glm mtp: the model's GGUF has no draft block - %s found beside it\n", c.string().c_str());
+            return;
+        }
+    } catch (const std::exception&) {
+    }
+}
+
 bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std::string& err,
                               const std::string& layer_split) {
+    mtp_auto(pack_dir);
     // the layer split is the DEFAULT on multi-GPU hosts (measured at steady state, 640-token GEN on
     // real text: 182 vs 840 MB/tok device bytes, decode 195 vs 506 ms/tok, hit 87-90 vs 64.4% - the
     // pools are per-part, so 2x capacity halves the demand reads).  STRATA_GLM_SPLIT=0 forces one
@@ -3348,13 +3403,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const auto q35d_role = [&](const std::string& n) -> int {
         if (!q35d_on || n.rfind("blk.", 0) != 0) return -1;
         const int il = std::atoi(n.c_str() + 4);
-        if (il < 0 || il >= g_.n_layers || row_kind_[n] != "0") return -1;   // (natively served rows only)
+        // (natively served rows, and the BF16 ones of unsloth's BF16 file - the GGUF's bytes as they are, type 30)
+        if (il < 0 || il >= g_.n_layers || (row_kind_[n] != "0" && row_kind_[n] != "4")) return -1;
         const std::string t = n.substr(n.find('.', 4) + 1);
         return t == "ffn_gate.weight" ? 0 : t == "ffn_up.weight" ? 1 : t == "ffn_down.weight" ? 2 : -1;
     };
     // ... and its head in an allocation of its own (q35d_place may keep only its first rows in VRAM)
     const auto q35d_head_row = [&](const std::string& n) {
-        return q35d_on && n == "output.weight" && row_kind_[n] == "0";
+        return q35d_on && n == "output.weight" && (row_kind_[n] == "0" || row_kind_[n] == "4");
     };
     const bool glm5_q8 = !g_.dsv4() && !g_.qwen35();   // (dense_q8_row: glm5 only)
     uint64_t bytes = 0;

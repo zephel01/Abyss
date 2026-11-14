@@ -82,7 +82,15 @@ holds (8-11 GB: 8K, 24 GB: 32K, 32 GB: 128K;
 
 ```sh
 ./setup-deepseek.sh --model qwen38-27b --download-model   # Qwen3.8-27B-UD-Q4_K_XL (17.7 GB)
+./setup-deepseek.sh --model qwen38-27b --quant UD-Q6_K --download-model   # any other file of the repo
 ```
+
+`--quant` takes every file of [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (UD-IQ1_S
+to UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16); without it the setup names the largest of UD-IQ2_XXS / UD-IQ3_XXS / UD-Q4_K_XL /
+UD-Q6_K / Q8_0 that the GPU holds all in VRAM and keeps UD-Q4_K_XL as the default. For the files without the NextN
+block (UD-IQ1_S, UD-IQ1_M, UD-IQ2_XXS, UD-IQ2_XS, UD-IQ2_S) it also fetches unsloth's separate one
+(`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, 1.4 GB). It then asks whether to set up images (unsloth's `mmproj-F16.gguf`, 0.93 GB,
+and the `strata-vision` build; `--no-vision` skips it).
 
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
 card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
@@ -775,7 +783,18 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
   0.019 ms a token). KL against llama.cpp on the prompt path 0.00196 (the F32 kernel: 0.00193); the outputs are not
   bit-identical to v1.3.141's on the prompt path. `STRATA_Q35_PATTN=1` brings back the F32 kernel (v1.3.141's results
   exactly); `=2` also uses the new kernel on the MoE qwen35 models (Ornith, Qwen3.8-Flash-Next: off by default).
-- **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images.
+- **Every file of unsloth's repo.** The GPU kernels, the prompt path and the CPU lane (12-20 GB / 8 GB GPUs) read
+  every type the files use: Q4_0 / Q4_1 rows, BF16 FFN rows (UD-Q8_K_XL, BF16), the i-quants (IQ1_S / IQ1_M / IQ2 /
+  IQ3) and Q2_K projections on the prompt path (FP16 products where MMQ lacks the type, per layer). Measured on an RTX 5090 (all in VRAM / 12 GB / 8 GB, decode tok/s with the drafter): UD-IQ2_XXS 114 / 117 / 81, UD-IQ3_XXS 141 / 140 / 27, UD-Q4_K_XL 133 / 30 / 17, UD-Q6_K 110 / 19 / 13, Q8_0 108 / 12 / 11; KL vs llama.cpp on the same file 0.0005-0.0025. BF16 rows on the CPU lane are still slow (12 GB and less).
+- **The separate NextN block.** A file without blk.64 takes the one in `MTP/` beside it (unsloth's
+  `mtp-Qwen3.8-27B-Q4_0.gguf`); `STRATA_GLM_MTP_GGUF=<file>` names another (also for a file that has its own),
+  `STRATA_GLM_NO_MTP=1` drafts nothing. The separate block drafts as well as a file's own (UD-Q4_K_XL: 133.0 vs 133.4 tok/s, 82% vs 83% accepted), and greedy answers with drafts equal the ones without (`STRATA_DETERMINISTIC=1`, same chunk size).
+- **Images.** With the `vision` entry (the setup writes it) the model reads pictures: OpenAI `image_url` items and
+  Anthropic `image` blocks; the picture's rows take their 2-D grid positions (interleaved M-RoPE, the sections from
+  the GGUF) and the text after them continues from there. A picture takes about 0.3-0.6 s (225-300 rows). Text-only requests are unchanged (the same tokens
+  as before). Settings: [docs/SETTINGS.md](SETTINGS.md#images-on-qwen38-27b).
+- **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images on AMD; Qwen3.8-Flash-Next refuses
+  images; the MoE qwen35 models (Ornith) take the same image path but are untested (no projector file tried).
 
 ## Laguna-S-2.1
 
@@ -1000,6 +1019,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_LANE_XC` | `1` (CUDA on x86, Qwen3.8), `0` (other models, HIP, ARM) | with `STRATA_GLM_CPU_EXACT`, the CPU lane's experts give the GPU's bits exactly (the GPU's float order and its exp in the SiLU), and the layer's expert sum is taken in fixed point (each weighted expert row to a 64-bit integer of 2^-34, the sum rounded to a float once: the same bits in any order, at least as accurate as the float sum), so it does not depend on which experts the CPU computed. The prompt's CPU share follows too (`STRATA_GLM_PREFILL_XROWS`). Greedy answers are then the same run to run without `STRATA_DETERMINISTIC` (prompts up to about 2,000 tokens a chunk on Qwen3.8; longer chunks are added into the output window as it fills, in the order the experts ran). `0` = the CPU's experts summed apart and added last, the prompt's share by timing (the older behaviour). Off with expert deferral (`STRATA_GLM_DEFER`) and EXL3 experts. Other models (GLM, Ornith, DeepSeek V4): `1` turns it on (not measured yet) |
 | `STRATA_Q4X_VERIFY_EXACT` | `1` (CUDA), `0` (HIP) | Qwen3.8 with drafts (MTP, DFlash 2): the verify window's dense GEMVs give each column the token path's sums, so greedy answers with drafts equal the ones without (v1.3.125). On HIP that runs as one GEMV a column - the dense weights and the output head read once per column - and cost an AI PRO R9700 with MTP 87 -> 67 tok/s (#42), so HIP keeps the shared-read GEMVs (as before v1.3.125; answers with drafts can part from the ones without late in an answer). `1` / `0` force either; `STRATA_DETERMINISTIC` sets `1` |
 | `STRATA_DS4_VERIFY_EXACT` | `1` (CUDA), `0` (HIP) | DeepSeek V4 / V4.1 verify windows: the dense GEMVs give each column the token path's sums, as `STRATA_Q4X_VERIFY_EXACT` (v1.3.145; with one warp a row instead, V4 0731's 3-column windows parted from the token path at token 16 under `STRATA_DETERMINISTIC`, which sets 1) |
+| `STRATA_Q35_VERIFY_EXACT` | `1` (CUDA), `0` (HIP) | Qwen3.8-27B (dense) verify windows: the GEMVs give each column the token path's sums, as `STRATA_Q4X_VERIFY_EXACT` (with one launch a type, UD-IQ2_XXS's n-gram windows parted from the answer without drafts at token 135 of a 4K prompt); `0`: that launch |
 | `STRATA_GLM_CPU_CAL_RETRY` | 3 | when the start-up timing of the CPU lane looks disturbed (other work running on a quarter of the CPUs, or its slowest run over 3x the median), it is taken again up to this many times, 1 s apart, and the lowest kept; a CPU still busy after that is reported in the log. `0`: one timing |
 | `STRATA_GLM_TAIL_ON_TOP` | 1 | when VRAM holds every expert, the spares and the prompt path's borrowed tail, the tail is allocated on top of the experts' slots, so a prompt evicts none. With unified memory (DGX Spark) too from v1.3.119, where the shared memory has the room (Qwen3.8 ISTA IQ3_XXS: the decode after a 32K prompt no longer re-reads experts from the SSD). `0`: the tail is cut from the experts' slots (the layout before v1.3.104; on unified memory, before v1.3.119) |
 | `STRATA_GLM_X3_SPLIT` | off | an EXL3 pack: the CPU threads compute this fraction of each route's RAM-tier experts while the iGPU computes the rest (`auto`: by their timings); slower on a Ryzen AI Max+ 395 (shared power and heat), see [EXL3](exl3/README.md#settings) |

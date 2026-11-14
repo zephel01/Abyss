@@ -1412,6 +1412,7 @@ static int glm_pack_generate(const Options& o) {
         static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"},
                                              {"STRATA_Q4X_VERIFY_EXACT", "1"},   // (Qwen3.8's verify GEMVs, #42)
                                              {"STRATA_DS4_VERIFY_EXACT", "1"},   // (DeepSeek V4 / V4.1's, 2026-11-14)
+                                             {"STRATA_Q35_VERIFY_EXACT", "1"},   // (Qwen3.8-27B's)
                                              {"STRATA_GLM_DRAIN_WAIT", "1"}};
         std::string kept;
         for (const char* k : kOff) {
@@ -3027,9 +3028,14 @@ static int glm_pack_generate(const Options& o) {
     // GENI: the embeddings file is one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd
     // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
     // tokens take no positions of their own: the rows only replace the embeddings)
+    // Qwen3.5 / 3.8 (qwen35, qwen35moe): one <|image_pad|> a row as well, and the rows also take M-RoPE positions - a
+    // record's rows are an nx x ny grid (row i at x = i % nx, y = i / nx) whose cells share t and take h = t + y,
+    // w = t + x; the text after the image goes on at t + max(nx, ny) (Glm5Model::set_mrope)
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
     constexpr int64_t kV41ImageToken = 129264;   // deepseek41: <｜deepseek_image｜> (one token a row of the record)
-    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : kGlmImageToken;
+    constexpr int64_t kQwenImageToken = 248056;  // qwen35: <|image_pad|> (config.json image_token_id)
+    const bool img_mrope = model.geometry().qwen35() && !model.geometry().v41;
+    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : img_mrope ? kQwenImageToken : kGlmImageToken;
     strata::program::LogposWriter logpos;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     std::string line;
@@ -3246,8 +3252,16 @@ static int glm_pack_generate(const Options& o) {
             lp_ctx.clear();   // a generation saves its own state over LOGP's
             cur_img_pos.clear();
             cur_img_rows.clear();
+            bool mrope_set = false;
             if (cmd == "GENI") {
                 const int64_t E = model.geometry().n_embd;
+                std::string why;
+                if (!model.images_ok(why)) {
+                    std::printf("ERR %s\n", why.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                std::vector<std::array<int32_t, 3>> grids;   // a record's (n, nx, ny)
                 std::FILE* f = std::fopen(emb_path.c_str(), "rb");
                 std::string ge = f ? "" : "cannot open " + emb_path;
                 while (f && ge.empty()) {
@@ -3261,6 +3275,7 @@ static int glm_pack_generate(const Options& o) {
                         ge = "not a strata-vision record for this model";
                         break;
                     }
+                    grids.push_back({hdr[1], hdr[2], hdr[3]});
                     const size_t at = cur_img_rows.size();
                     cur_img_rows.resize(at + (size_t) hdr[1] * (size_t) E);
                     if (std::fread(cur_img_rows.data() + at, sizeof(float) * (size_t) E, (size_t) hdr[1], f) !=
@@ -3277,6 +3292,44 @@ static int glm_pack_generate(const Options& o) {
                 if (ge.empty() && model.geometry().v41 && !cur_img_pos.empty() && !model.has_vl_bias())
                     ge = "this model has no exp_probs_b_vl (set STRATA_GLM_VL_BIAS or put exp_probs_b_vl.f32 in the "
                          "pack): image input is refused";
+                // qwen35: each record's rows on one run of consecutive <|image_pad|> cells, its grid whole; the cells'
+                // (t, h, w) then follow from the grids (a text cell's three are its rotary position)
+                std::vector<int32_t> mtab;
+                if (ge.empty() && img_mrope && !cur_img_pos.empty()) {
+                    const int64_t cells = std::max<int64_t>(o.max_context, (int64_t) toks.size()) + 64;
+                    mtab.resize((size_t) cells * 3);
+                    int64_t shift = 0, cell = 0;   // shift: cells minus rotary positions so far
+                    size_t k = 0;
+                    const auto text_to = [&](int64_t end) {
+                        for (; cell < end; ++cell)
+                            mtab[(size_t) cell * 3] = mtab[(size_t) cell * 3 + 1] = mtab[(size_t) cell * 3 + 2] =
+                                (int32_t) (cell - shift);
+                    };
+                    for (const auto& gr : grids) {
+                        const int64_t n = gr[0], nx = gr[1], ny = gr[2];
+                        if (nx <= 0 || ny <= 0 || nx * ny != n || k + (size_t) n > cur_img_pos.size()) {
+                            ge = "an image record's grid does not match its rows";
+                            break;
+                        }
+                        const int64_t s0 = cur_img_pos[k];
+                        if (cur_img_pos[k + (size_t) n - 1] != s0 + n - 1) {
+                            ge = "an image's <|image_pad|> tokens are not one run";
+                            break;
+                        }
+                        text_to(s0);
+                        const int32_t t = (int32_t) (s0 - shift);
+                        for (int64_t i = 0; i < n; ++i, ++cell) {
+                            mtab[(size_t) cell * 3] = t;
+                            mtab[(size_t) cell * 3 + 1] = t + (int32_t) (i / nx);
+                            mtab[(size_t) cell * 3 + 2] = t + (int32_t) (i % nx);
+                        }
+                        shift += n - std::max(nx, ny);
+                        k += (size_t) n;
+                    }
+                    if (ge.empty()) text_to(cells);
+                    if (ge.empty() && !model.set_mrope(mtab, ge)) ge = "images: " + ge;
+                    mrope_set = ge.empty();
+                }
                 if (!ge.empty()) {
                     cur_img_pos.clear();
                     cur_img_rows.clear();
@@ -3288,6 +3341,10 @@ static int glm_pack_generate(const Options& o) {
             model.set_image_rows(cur_img_pos, cur_img_rows);
             run_request(toks, max_new, rq);
             model.set_image_rows({}, {});
+            if (mrope_set) {
+                std::string me;
+                if (!model.set_mrope({}, me)) std::fprintf(stderr, "maya generate: %s\n", me.c_str());
+            }
             continue;
         }
         if (cmd.empty()) continue;

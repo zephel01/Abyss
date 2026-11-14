@@ -69,6 +69,22 @@ DENSE27_FFN_GB = 9.5
 # only (RTX 5090 capped to 8 GB, 8K, the drafter: peak 7.8 GB, 15.7 tok/s; llama.cpp 8.0) with nothing else on the GPU
 DENSE27_SMALL = (7.5, 8192)   # (the GPU size it takes as reported, the context it gets)
 DENSE27_RAM_GB = 32   # (up to 10 GB of FFN pinned + the 6 GB headroom + the server)
+# every file of unsloth/Qwen3.8-27B-GGUF the engine runs (2026-11-14): its size in GB and whether it carries the NextN
+# draft block - the UD-IQ1 / UD-IQ2 files do not, and the setup fetches unsloth's separate one (MTP/, 1.4 GB) for them.
+# The VRAM a context needs moves with the file's size (the table above is UD-Q4_K_XL's), the FFN part with its share
+DENSE27_QUANTS = {
+    "UD-IQ1_S": (6.19, False), "UD-IQ1_M": (6.73, False), "UD-IQ2_XXS": (7.21, False), "UD-IQ2_XS": (7.63, False),
+    "UD-IQ2_S": (8.42, False), "UD-Q2_K_XL": (9.95, True), "UD-IQ3_XXS": (10.93, True), "UD-IQ3_S": (12.04, True),
+    "UD-Q3_K_XL": (13.15, True), "UD-IQ4_XS": (14.35, True), "UD-Q4_K_S": (15.36, True), "Q4_0": (16.06, True),
+    "UD-Q4_K_M": (16.56, True), "Q4_1": (17.54, True), "UD-Q4_K_XL": (17.66, True), "UD-Q5_K_S": (18.76, True),
+    "UD-Q5_K_M": (19.87, True), "UD-Q5_K_XL": (20.98, True), "UD-Q6_K": (21.98, True), "UD-Q6_K_M": (23.09, True),
+    "UD-Q6_K_L": (24.18, True), "UD-Q6_K_XL": (25.30, True), "UD-Q8_K_L": (28.05, True), "Q8_0": (29.05, True),
+    "UD-Q8_K_XL": (31.46, True), "BF16": (54.66, True)}
+# the files the PC-size proposal picks among (the largest that holds an 8K context all in VRAM)
+DENSE27_PICKS = ("UD-IQ2_XXS", "UD-IQ3_XXS", "UD-Q4_K_XL", "UD-Q6_K", "Q8_0")
+# unsloth's separate NextN block for the files without one, and the image encoder's weights (Qwen3.8-27B reads images)
+DENSE27_MTP = "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+DENSE27_MMPROJ = "mmproj-F16.gguf"
 # the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
 # is a fixed set, the config's model_name, the config name's prefix, the env the model's measurements were made with,
 # the experts' size in GB at the default quant (for the RAM line)
@@ -126,7 +142,8 @@ MODELS = {
     # top level, NextN drafter from the file.  This first version runs the whole file in one GPU's VRAM (no RAM tier,
     # no layer split): "vram" is the GPU size each context needs (dense_context).  2026-11-12, RTX 5090, UD-Q4_K_XL:
     # decode 131.6 tok/s with the drafter, 72.7 without (llama.cpp 72.1)
-    "qwen38-27b": {"repo": "unsloth/Qwen3.8-27B-GGUF", "quant": "UD-Q4_K_XL", "quants": ("UD-Q4_K_XL",),
+    "qwen38-27b": {"repo": "unsloth/Qwen3.8-27B-GGUF", "quant": "UD-Q4_K_XL", "quants": tuple(DENSE27_QUANTS),
+                   "quant_gb": DENSE27_QUANTS, "picks": DENSE27_PICKS, "quant_folders": {"BF16": "BF16"},
                    "folder": "", "prefix_tmpl": "Qwen3.8-27B-{q}.", "model_name": "qwen3.8-27b",
                    "prefix": "qwen38-27b", "title": "Qwen3.8-27B", "env": {}, "gb": 18, "pack_args": [],
                    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
@@ -556,31 +573,52 @@ def fit_quant(key: str, vram: float, ram: float, shared: bool = False) -> dict |
             "extra": extra[-1] if extra else None}
 
 
-def dense_need(key: str, ctx: int) -> float | None:
+def dense_shift(key: str, quant: str | None) -> tuple[float, float]:
+    """Another file of a model that runs all in VRAM: (GB more than the default file the tables were measured with,
+    its size relative to that file) - (0, 1) for the default or an unknown name."""
+    m = MODELS[key]
+    q = m.get("quant_gb") or {}
+    if quant is None or quant not in q or m["quant"] not in q:
+        return 0.0, 1.0
+    return q[quant][0] - q[m["quant"]][0], q[quant][0] / q[m["quant"]][0]
+
+
+def dense_need(key: str, ctx: int, quant: str | None = None) -> float | None:
     """A model that runs all in VRAM ("vram_ctx"): the GPU size (GB) a context needs - the measured context at or above
     it; None above the longest measured."""
     need = MODELS[key]["vram_ctx"]
     at = [c for c in need if c >= ctx]
-    return need[min(at)] if at else None
+    return need[min(at)] + dense_shift(key, quant)[0] if at else None
 
 
-def dense_context(key: str, vram: float, ctx: int) -> int | None:
+def dense_context(key: str, vram: float, ctx: int, quant: str | None = None) -> int | None:
     """The context to write for a model that runs all in VRAM: `ctx` when this GPU holds it, else the longest measured
     one below it that it holds; None when it holds none (+0.5 GB: a 24 GB card reports 23.6-24.0)."""
-    n = dense_need(key, ctx)
+    n = dense_need(key, ctx, quant)
     if n is not None and vram + 0.5 >= n:
         return ctx
-    fits = [c for c, g in MODELS[key]["vram_ctx"].items() if vram + 0.5 >= g and c < ctx]
+    shift = dense_shift(key, quant)[0]
+    fits = [c for c, g in MODELS[key]["vram_ctx"].items() if vram + 0.5 >= g + shift and c < ctx]
     return max(fits) if fits else None
 
 
-def dense_split_context(key: str, vram: float, ctx: int) -> int | None:
+def dense_split_context(key: str, vram: float, ctx: int, quant: str | None = None) -> int | None:
     """dense_context for a GPU smaller than the file: the FFN rows that do not fit stay in RAM ("ffn_gb" less VRAM)."""
     m = MODELS[key]
-    return dense_context(key, vram + m.get("ffn_gb", 0.0), ctx) if m.get("ffn_gb") else None
+    return dense_context(key, vram + m.get("ffn_gb", 0.0) * dense_shift(key, quant)[1], ctx, quant) \
+        if m.get("ffn_gb") else None
 
 
-def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | None = None) -> int:
+def dense_pick(key: str, vram: float) -> str | None:
+    """The file of a model that runs all in VRAM ("picks") this GPU suits: the largest that holds an 8K context all in
+    VRAM (dense_gpu_check then gives it the longest context it holds); None when none does (the default file, its FFN
+    partly in RAM)."""
+    ok = [q for q in MODELS[key].get("picks") or () if dense_context(key, vram, 8192, q) == 8192]
+    return ok[-1] if ok else None
+
+
+def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | None = None,
+                    quant: str | None = None) -> int:
     """Step 1 for a dense model ("vram_ctx"): one GPU that holds the file, the KV cache and the prompt path - or, on a
     smaller GPU, all but the FFN rows the engine keeps in RAM (slower).  Returns the context to write (shorter than
     --context when this GPU holds only a shorter one); stops on a GPU too small for the shortest, or too little RAM
@@ -596,22 +634,26 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
         S.say(f"  ({model['title']} on a GPU that shares the RAM: untested so far; the whole file goes into that memory)")
         return a.context
     vram = gpus[0].get("vram_gb") or 0.0
-    ctx = dense_context(key, vram, a.context)
-    table = ", ".join(f"{c // 1024}K: {g:.0f} GB" for c, g in sorted(need.items()))
+    shift, scale = dense_shift(key, quant)
+    quant = quant or model["quant"]
+    ctx = dense_context(key, vram, a.context, quant)
+    table = ", ".join(f"{c // 1024}K: {g + shift:.0f} GB" for c, g in sorted(need.items()))
     if ctx == a.context:
         S.ok(f"{model['title']}: the whole file in VRAM - this {vram:.0f} GB GPU holds a {ctx // 1024}K context "
              f"(the GPU size a context needs: {table})")
         return ctx
     # short of that: the FFN rows that do not fit in RAM, on the CPU (the context asked for, or the longest it holds)
-    sctx = dense_split_context(key, vram, a.context)
+    sctx = dense_split_context(key, vram, a.context, quant)
     small = model.get("small_gpu")
-    if sctx is None and ctx is None and small and vram >= small[0]:
+    ffn_gb = model.get("ffn_gb", 0.0) * scale
+    # (an 8 GB card holds the rest of the default file; the rest of a larger one needs that much more)
+    if sctx is None and ctx is None and small and vram >= small[0] + max(0.0, shift - (scale - 1) * model.get("ffn_gb", 0.0)):
         sctx = small[1]   # (an 8 GB card: 8K, the head partly on the CPU too)
     if sctx is not None and (ctx is None or sctx > ctx):
         ram = S.ram_gb() if ram is None else ram
         if ram + 0.5 < model.get("ram_min", 0):
             S.fail(f"{model['title']} on this {vram:.0f} GB GPU keeps part of its FFN in RAM (up to "
-                   f"~{model['ffn_gb']:.0f} GB, pinned): it needs {model['ram_min']} GB of RAM, and this PC has {ram:.0f} GB",
+                   f"~{ffn_gb:.0f} GB, pinned): it needs {model['ram_min']} GB of RAM, and this PC has {ram:.0f} GB",
                    f"a PC with {model['ram_min']} GB of RAM or more, or a GPU that holds the file (24 GB or more)")
         S.ok(f"{model['title']}: this {vram:.0f} GB GPU holds a {sctx // 1024}K context with part of the FFN in RAM "
              f"(the engine computes those rows on the CPU: slower than all in VRAM - RTX 5090 capped to 12 / 16 GB: "
@@ -623,14 +665,15 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
             S.warn(f"--context {a.context} is longer than this GPU holds: the config gets {sctx} (a larger GPU holds more)")
         return sctx
     if ctx is None:
-        S.fail(f"{model['title']} needs a GPU with 8 GB or more: the {model['quant']} file (~{model['gb']} GB) runs "
+        gb = (model.get("quant_gb") or {}).get(quant, (model["gb"],))[0]
+        S.fail(f"{model['title']} needs a GPU with 8 GB or more: the {quant} file (~{gb:.0f} GB) runs "
                f"from VRAM, its FFN partly from RAM, and this GPU has {vram:.0f} GB (the GPU size a context needs all "
-               f"in VRAM: {table}; ~{model['ffn_gb']:.0f} GB less with the FFN in RAM)",
+               f"in VRAM: {table}; ~{ffn_gb:.0f} GB less with the FFN in RAM)",
                "a GPU with 8 GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or Ornith-1.5-35B-A3B "
                "(--model ornith35) run from VRAM + RAM")
     S.ok(f"{model['title']}: the whole file in VRAM - this {vram:.0f} GB GPU holds a {ctx // 1024}K context "
          f"(the GPU size a context needs: {table})")
-    n = dense_need(key, a.context)
+    n = dense_need(key, a.context, quant)
     S.warn(f"--context {a.context} " + (f"needs a ~{n:.0f} GB GPU" if n else "is longer than measured") +
            f": the config gets {ctx} (--context {ctx} says so; a larger GPU holds more)")
     return ctx
@@ -648,8 +691,22 @@ def choose_quant(a, key: str, gpus) -> str:
     a file of this model already set up (its config there, --name not given) is kept and the better one named."""
     model = MODELS[key]
     if a.quant:
+        if model.get("quant_gb") and a.quant not in model["quant_gb"]:
+            S.fail(f"{model['title']} has no file {a.quant!r}", "one of: " + ", ".join(model["quant_gb"]))
         return a.quant
     vram, ram, shared = pc_memory(gpus, S.ram_gb())
+    if model.get("picks"):
+        # (a model all in VRAM: the default stays the tested file - a setup run again must not start another download -
+        # and the file this GPU holds best is named)
+        pick = dense_pick(key, vram) if not shared else None
+        if pick and pick != model["quant"]:
+            gb = model["quant_gb"][pick][0]
+            S.say(f"  {pc_line(vram, ram, shared)} -> --quant {pick} (~{gb:.0f} GB) is the largest of "
+                  f"{', '.join(model['picks'])} this GPU holds all in VRAM; the default stays {model['quant']} "
+                  f"(every file of {model['repo']} runs: --quant names it)")
+        return S.ask(f"  Quant ({model['quant']} or {pick})" if pick and pick != model["quant"] else
+                     f"  Quant ({model['quant']})", [model["quant"], *([pick] if pick and pick != model["quant"] else [])],
+                     model["quant"], a.yes)
     rec = fit_quant(key, vram, ram, shared)
     if rec is None:
         return model["quant"]
@@ -688,6 +745,65 @@ def choose_quant(a, key: str, gpus) -> str:
     return S.ask(f"  Quant ({', '.join(variants)})", list(variants), default, a.yes)
 
 
+def side_file(a, repo: str, path: str, mdir: Path, what: str) -> Path:
+    """A file of the model's repo beside the GGUF (unsloth's MTP/ block, the mmproj): size and SHA-256 from Hugging
+    Face's file list, checked after the download like the model's files.  Returns where it is."""
+    folder, _, fname = path.rpartition("/")
+    got = [f for f in quant_files(folder or "", repo, folder, fname) if f[0] == path]
+    if not got:
+        S.fail(f"{repo} has no {path}", "check the repo on https://huggingface.co/" + repo)
+    _, size, sha = got[0]
+    dst = mdir / path
+    if not dst.exists() or dst.stat().st_size != size:
+        S.say(f"  {what}: {path}, {size / 1e9:.2f} GB")
+        if not a.download_model and S.ask("  Download it now?", ["y", "n"], "n", a.yes) != "y":
+            S.fail(f"{path} is not downloaded", "run again with --download-model, or put it into " + str(dst.parent))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        S.download(HF_FILE.format(repo=repo, path=path), dst, dst.name)
+    if dst.stat().st_size != size or (sha and not verified(dst, sha)):
+        S.fail(f"{dst.name} does not match Hugging Face's size / SHA-256", "delete it and run again")
+    S.ok(f"{path} checked")
+    return dst
+
+
+def vision_27b_step(a, repo: str, mdir: Path, gguf: Path, cfg: Path, gpus, backend: str, resident: bool = False) -> None:
+    """Qwen3.8-27B reads images: unsloth's mmproj-F16.gguf (0.93 GB) and strata-vision (llama.cpp's image library,
+    built once like ./abyss.sh's for GLM-5.3-Flash) - asked, default yes; the config's "vision" entry names them (the
+    encoder reads only the vocabulary of the model's GGUF).  --no-vision, or an AMD GPU (text only for now), skips it."""
+    S.step(9, "images (the vision encoder)")
+    conf = json.loads(cfg.read_text(encoding="utf-8"))
+    if getattr(a, "no_vision", False):
+        S.ok("skipped (--no-vision): the model reads text only")
+        return
+    if backend != "cuda":
+        S.ok("images: NVIDIA only for now - the model reads text only")
+        return
+    import abyss as M   # noqa: E402  (its vision build: llama.cpp's mtmd with tools/vision)
+    if conf.get("vision") and Path(conf["vision"].get("exe", "")).exists() and Path(conf["vision"].get("mmproj", "")).exists():
+        S.ok(f"images: {conf['vision']['mmproj']} (already set up)")
+        return
+    if S.ask("  Set up images (the vision encoder: a 0.93 GB download and a 10-20 minute build, once)?", ["y", "n"], "y",
+             a.yes) != "y":
+        S.ok("images: not set up - the model reads text only (setup again asks)")
+        return
+    mmproj = side_file(a, repo, DENSE27_MMPROJ, mdir, "the image encoder's weights")
+    nvcc = a.nvcc or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    pc = {"archs": cuda_archs(a.arch, gpus).split(";"), "nvcc": nvcc, "backend": backend}
+    src = S.source_hash(("tools/vision",))
+    vmeta = M.read_json(M.VSTAMP)
+    if not (M.VEXE.exists() and vmeta.get("src") == src and set(pc["archs"]) <= set(vmeta.get("archs", []))):
+        if not M.compile_vision(pc, {}, S.get_llama_cpp(), src):
+            S.warn("the vision encoder did not compile (the reason is above): the model reads text only - setup again "
+                   "tries again")
+            return
+    # (the dense model has no expert cache to lend the encoder: on a GPU with ~1.5 GB to spare beside the model and its
+    # context the encoder stays resident there (~1 GB), else it runs on the CPU)
+    conf["vision"] = {"exe": str(M.VEXE), "mmproj": str(mmproj), "model": str(gguf),
+                      **({"gpu": True, "resident": True} if resident else {"gpu": False})}
+    cfg.write_text(json.dumps(conf, indent=1) + "\n", encoding="utf-8")
+    S.ok(f"images: {M.VEXE} with {mmproj.name} ({cfg.name})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
@@ -695,7 +811,7 @@ def main() -> int:
                     "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: UD-Q4_K_XL; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -708,6 +824,7 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, help="the GPU, as nvidia-smi numbers it (default: the one with the most VRAM)")
     ap.add_argument("--gpus", help="several GPUs for a layer split, as nvidia-smi numbers them (\"0,1\"; the first is "
                                    "the main card), or \"all\": every NVIDIA GPU (default: one GPU, --gpu)")
+    ap.add_argument("--no-vision", action="store_true", help="qwen38-27b: skip the image encoder (text only)")
     ap.add_argument("--arch", help="the CUDA architecture to compile for (default: the GPU's; 120a on RTX 50)")
     ap.add_argument("--nvcc", help="the CUDA compiler to build with (default: nvcc on PATH, else /usr/local/cuda); a V100 "
                                    "needs a CUDA 12 one, e.g. /usr/local/cuda-12.9/bin/nvcc")
@@ -766,10 +883,10 @@ def main() -> int:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
     # a model that runs all in VRAM (Qwen3.8-27B): one GPU that holds it, and the context it holds - checked first
     ctx = a.context
-    if model.get("vram_ctx"):
-        ctx = dense_gpu_check(a, a.model, gpus, backend, pc_memory(gpus, S.ram_gb())[2])
     # the quant: --quant, else the PC-size file that suits this PC's VRAM + RAM (choose_quant)
     quant = choose_quant(a, a.model, gpus)
+    if model.get("vram_ctx"):
+        ctx = dense_gpu_check(a, a.model, gpus, backend, pc_memory(gpus, S.ram_gb())[2], quant=quant)
     own = quant in model.get("variants", {})   # (the quant is a PC size and picks zephel01's repo for it)
     if own:
         model = {**model, **model["variants"][quant]}
@@ -792,7 +909,8 @@ def main() -> int:
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: VRAM + RAM hold it all on an 8-16 GB GPU + "
              "32 GB RAM PC)")
     elif model.get("vram_ctx"):
-        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file, ~{model['gb']} GB, runs in VRAM: RAM holds the server and the "
+        gb = (model.get("quant_gb") or {}).get(quant, (model["gb"],))[0]
+        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file, ~{gb:.0f} GB, runs in VRAM: RAM holds the server and the "
              "page cache)")
     elif a.model in ("ornith", "qwen35"):
         S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 16 GB GPU + 64 GB RAM: with VRAM, ~60 GB holds every expert of the "
@@ -810,7 +928,9 @@ def main() -> int:
         build_engine(a.arch, gpus, a.nvcc)
 
     S.step(4, f"the model: {repo} {quant}")
-    files = quant_files(quant, repo, model.get("folder"), model.get("prefix_file", ""))
+    files = quant_files(quant, repo, (model.get("quant_folders") or {}).get(quant, model.get("folder")),
+                        model.get("prefix_file", "") if quant not in (model.get("quant_folders") or {})
+                        else model["prefix_file"].rstrip(".") + "-")
     total = sum(f[1] for f in files)
     S.say(f"  {len(files)} files, {total / 1e9:.1f} GB -> {mdir}")
     missing = [f for f in files if not (mdir / Path(f[0]).name).exists()]
@@ -826,6 +946,9 @@ def main() -> int:
             S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
     S.check_shards([mdir / Path(f[0]).name for f in files])
     S.ok("every file checked")
+    mtp = None
+    if (model.get("quant_gb") or {}).get(quant, (0, True))[1] is False:
+        mtp = side_file(a, repo, DENSE27_MTP, mdir, "the NextN draft block (this file has none)")
 
     S.step(5, "the pack")
     pack = mdir / ("pack-dsv4" if a.model == "v4" else "pack")
@@ -863,6 +986,9 @@ def main() -> int:
         # the page cache full, and without a cap systemd-oomd stops the server or the session that started it (the
         # card's numbers: 60 GB on 94 GB)
         extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 34))
+    if mtp is not None:
+        # (the engine also finds MTP/ beside the GGUF by itself; the config names it)
+        extra.setdefault("env", {})["STRATA_GLM_MTP_GGUF"] = str(mtp)
     cfg, _ = write_config(name, pack, ctx, a.port, a.rewrite_config,
                           gpus if len(gpus) > 1 and backend == "cuda" else None, extra or None, model)
 
@@ -886,9 +1012,14 @@ def main() -> int:
         S.ok("DSpark drafter: set up for DeepSeek V4 only" + (" (V4.1: by hand, docs/deepseek41/README.md)" if a.model == "v41"
              else " (Ornith drafts with its own NextN block from the shards)" if a.model in ("ornith", "ornith35")
              else " (Qwen3.8 drafts with its own MTP block from the shards)" if a.model == "qwen38"
-             else " (Qwen3.8-27B drafts with its own NextN block from the file)" if a.model == "qwen38-27b" else ""))
+             else (" (Qwen3.8-27B drafts with unsloth's separate NextN block, MTP/)" if mtp else
+                   " (Qwen3.8-27B drafts with its own NextN block from the file)") if a.model == "qwen38-27b" else ""))
     if a.model == "qwen38":
         dflash_step(a, data, cfg, gpus)
+    if a.model == "qwen38-27b":
+        need = dense_need(a.model, ctx, quant)
+        resident = bool(gpus) and need is not None and (gpus[0].get("vram_gb") or 0.0) - need >= 1.5
+        vision_27b_step(a, repo, mdir, mdir / Path(files[0][0]).name, cfg, gpus, backend, resident)
 
     S.step(8, "Abyss-tools")
     make_tools(tools)

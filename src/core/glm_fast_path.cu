@@ -4791,6 +4791,7 @@ void Glm5Model::fast_destroy() {
     if (F->scratch) cudaFree(F->scratch);
     if (F->mtp_h) cudaFree(F->mtp_h);
     if (F->mtp_catq) cudaFree(F->mtp_catq);
+    if (F->q35_eh_q8) cudaFree(F->q35_eh_q8);
     if (F->mtp_logits) cudaFree(F->mtp_logits);
     if (F->mtp_tok) cudaFree(F->mtp_tok);
     if (F->mtp_tok_h) cudaFreeHost(F->mtp_tok_h);
@@ -7684,7 +7685,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
                    g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (tail->q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
-        if (!tail->q35d_head(FT->head_xq, 1, tail->sc_ + tail->sc_logits, FT->cs, err)) return false;
+        if (!tail->q35d_head(FT->head_xq, 1, tail->sc_ + tail->sc_logits, FT->cs, err, FT->head_x)) return false;
     } else if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
@@ -8785,7 +8786,7 @@ bool Glm5Model::part_token_head(int64_t p, std::string& err) {
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
-        if (!q35d_head(FT->head_xq, 1, sc_ + sc_logits, FT->cs, err)) return false;
+        if (!q35d_head(FT->head_xq, 1, sc_ + sc_logits, FT->cs, err, FT->head_x)) return false;
     } else if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;

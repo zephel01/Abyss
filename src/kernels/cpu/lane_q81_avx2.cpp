@@ -408,6 +408,41 @@ struct T6 {   // Q5_0: the codes - 16 (the device's signed form)
         T20::fin2(p, v, A, B, g, a, b);
     }
 };
+struct T2 {   // Q4_0: the codes - 8 (the device's signed form; unsloth's Qwen3.8-27B Q4_0 file)
+    static constexpr int qk = 32, bytes = 18, form = SIGNED, needs_u = 0;
+    using P = T20::P;
+    static void dec(const uint8_t* b, int ns, __m256i* w, __m256i*, P& p) {
+        alignas(32) float dw[8] = {};
+        for (int j = 0; j < ns; ++j) {
+            const uint8_t* q = b + bytes * j;
+            w[j] = _mm256_sub_epi8(nib_plain(q + 2), _mm256_set1_epi8(8));
+            dw[j] = hf(q);
+        }
+        p.dw = _mm256_load_ps(dw);
+    }
+    static __m256 fin(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g) { return T20::fin(p, v, A, B, g); }
+    static void fin2(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        T20::fin2(p, v, A, B, g, a, b);
+    }
+};
+struct T3 {   // Q4_1 (the Q4_1 file): the plain codes, d and m as Q5_1's
+    static constexpr int qk = 32, bytes = 20, form = PLAIN, needs_u = 0;
+    struct P { __m256 dx, dy; };
+    static void dec(const uint8_t* b, int ns, __m256i* w, __m256i*, P& p) {
+        alignas(32) float dx[8] = {}, dy[8] = {};
+        for (int j = 0; j < ns; ++j) {
+            const uint8_t* q = b + bytes * j;
+            w[j] = nib_plain(q + 4);
+            dx[j] = hf(q);
+            dy[j] = hf(q + 2);
+        }
+        p.dx = _mm256_load_ps(dx);
+        p.dy = _mm256_load_ps(dy);
+    }
+    static __m256 fin(const P& p, const __m256i*, __m256i A, __m256i B, const TokG& g) {
+        return fadd(fmul(fmul(p.dx, g.d8), i2f(add(A, B))), fmul(p.dy, g.s8));
+    }
+};
 struct T7 {   // Q5_1
     static constexpr int qk = 32, bytes = 24, form = PLAIN, needs_u = 0;
     struct P { __m256 dx, dy; };
@@ -751,7 +786,7 @@ inline __m256 round_away(__m256 r) {   // roundf
 bool lane_q81_avx2_type(int t) noexcept {
     switch (t) {
         case 16: case 17: case 22: case 18: case 21: case 19: case 29: case 23: case 20: case 39: case 8: case 6:
-        case 7: case 42: case 40: case 10: case 11: case 12: case 13: case 14: return true;
+        case 7: case 42: case 40: case 10: case 11: case 12: case 13: case 14: case 2: case 3: return true;
         default: return false;
     }
 }
@@ -780,6 +815,8 @@ void lane_q81_avx2_rows(int t, const uint8_t* w, size_t row_bytes, int n, const 
         case 8: rows_any<T8>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 6: rows_any<T6>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 7: rows_any<T7>(w, row_bytes, n, act, nt, out, r0, r1); break;
+        case 2: rows_any<T2>(w, row_bytes, n, act, nt, out, r0, r1); break;
+        case 3: rows_any<T3>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 42: rows_any<T42>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 40: rows_any<T40>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 10: rows_any<T10>(w, row_bytes, n, act, nt, out, r0, r1); break;
