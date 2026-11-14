@@ -207,7 +207,7 @@ bool Glm5Model::q35d_head_split() const {
     return q35d_ != nullptr && q35d_->head.vg >= 0 && q35d_->head.vg < g_.n_vocab;
 }
 
-bool Glm5Model::q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err) {
+bool Glm5Model::q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err, const float* xf) {
     if (!q35d_head_split()) return false;
     Q35dRam* Q = q35d_;
     const auto& H = Q->head;
@@ -220,9 +220,14 @@ bool Glm5Model::q35d_head(const void* xq, int T, float* logits, cudaStream_t s, 
     ++Q->seq;
     if (Q->seq == 0) ++Q->seq;
     q35::dffn_post(xq, (size_t) T * q8e, Q->req_d, Q->seq, Q35dRam::kHeadReq, T, s);
+    const bool hf = H.type == gf::kTypeBF16 || H.type == gf::kTypeF32;
+    if (hf && xf == nullptr && H.vg > 0) {
+        err = "qwen35 dense: a BF16 / F32 head's VRAM rows without the float rows";
+        return false;
+    }
     for (int t = 0; H.vg > 0 && t < T; ++t) {   // (the GPU's rows while the CPU computes its own)
-        gf::MvJob o = {H.dev, (const uint8_t*) xq + (size_t) t * q8e, nullptr, logits + (size_t) t * V, nullptr, 1.0f,
-                       H.type, E, H.vg};
+        gf::MvJob o = {H.dev, (const uint8_t*) xq + (size_t) t * q8e, hf ? xf + (size_t) t * E : nullptr,
+                       logits + (size_t) t * V, nullptr, 1.0f, H.type, E, H.vg};
         if (!gf::mv(&o, 1, s)) { err = "qwen35 dense: the head's VRAM rows"; return false; }
     }
     q35::dffn_wait_cols(Q->ans_d, Q->seq, logits + H.vg, V - H.vg, T, (size_t) V, s);

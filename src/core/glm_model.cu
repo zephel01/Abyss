@@ -3403,13 +3403,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const auto q35d_role = [&](const std::string& n) -> int {
         if (!q35d_on || n.rfind("blk.", 0) != 0) return -1;
         const int il = std::atoi(n.c_str() + 4);
-        if (il < 0 || il >= g_.n_layers || row_kind_[n] != "0") return -1;   // (natively served rows only)
+        // (natively served rows, and the BF16 ones of unsloth's BF16 file - the GGUF's bytes as they are, type 30)
+        if (il < 0 || il >= g_.n_layers || (row_kind_[n] != "0" && row_kind_[n] != "4")) return -1;
         const std::string t = n.substr(n.find('.', 4) + 1);
         return t == "ffn_gate.weight" ? 0 : t == "ffn_up.weight" ? 1 : t == "ffn_down.weight" ? 2 : -1;
     };
     // ... and its head in an allocation of its own (q35d_place may keep only its first rows in VRAM)
     const auto q35d_head_row = [&](const std::string& n) {
-        return q35d_on && n == "output.weight" && row_kind_[n] == "0";
+        return q35d_on && n == "output.weight" && (row_kind_[n] == "0" || row_kind_[n] == "4");
     };
     const bool glm5_q8 = !g_.dsv4() && !g_.qwen35();   // (dense_q8_row: glm5 only)
     uint64_t bytes = 0;

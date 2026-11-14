@@ -5185,7 +5185,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     gf::MvJob job = {ow.q, fast_->head_xq, fast_->head_x, sc_ + sc_logits, nullptr,
                                      1.0f, ow.type, E, g.n_vocab};
                     if (ow.type == 0) job.w = ow.f32;
-                    if (!(q35d_head_split() ? q35d_head(fast_->head_xq, 1, sc_ + sc_logits, fast_->cs, err)
+                    if (!(q35d_head_split() ? q35d_head(fast_->head_xq, 1, sc_ + sc_logits, fast_->cs, err, fast_->head_x)
                                             : gf::mv(&job, 1, fast_->cs)) ||
                         !glmfast::cuda_ok(cudaMemcpyAsync(logits.data(), sc_ + sc_logits,
                             logits.size() * sizeof(float), cudaMemcpyDeviceToHost, fast_->cs),

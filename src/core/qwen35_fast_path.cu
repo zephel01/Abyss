@@ -54,9 +54,10 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     };
     const auto q = [&](const char* n, int64_t n_in, int64_t n_out) -> WSlot {
         auto it = ws_map_.find(P + n);
-        if ((it == ws_map_.end() || it->second.type == 0) && g.q4x) {
+        if ((it == ws_map_.end() || it->second.type == 0) && (g.q4x || (g.qwen35() && g.n_expert == 0 && !g.laguna))) {
             // ISTA-DASLab's GSQ-RCO Qwen3.8 keeps the hyper-connections and ssm_alpha / beta in BF16 (the pack's BF16
-            // arena): the GEMVs take BF16 rows with the float activation every job here passes beside its q8_1
+            // arena): the GEMVs take BF16 rows with the float activation every job here passes beside its q8_1.
+            // unsloth's Qwen3.8-27B files too: F32 ssm_alpha / beta (Q4_0, Q4_1), BF16 attention rows (UD-Q8_K_XL, BF16)
             const auto b = w16_.find(P + n);
             if (b != w16_.end()) return WSlot{nullptr, gf::kTypeBF16, b->second, n_in, n_out};
             const auto f = w_.find(P + n);   // (a small BF16 matrix - the injects - is widened to F32 at load)
@@ -131,6 +132,43 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     if (Ly.moe && g.n_shared > 0) Ly.sh_gate_w = f32("ffn_gate_inp_shexp.weight");
     if (Ly.mtp) {   // the NextN block: eh_proj in (2 n_embd -> n_embd) and its two norms; the head's norm the trunk's
         Ly.eh = q("nextn.eh_proj.weight", 2 * E, E);
+        // a BF16 / F32 eh_proj (unsloth's UD-Q8_K_XL and BF16 files): its GEMVs get only the q8_1 input, so the drafter
+        // reads a Q8_0 copy - the draft's guess only, the answer is still the trunk's
+        if ((Ly.eh.type == gf::kTypeBF16 || Ly.eh.type == gf::kTypeF32) && Ly.eh.q != nullptr && g.qwen35() && !g.q4x) {
+            const bool bf = Ly.eh.type == gf::kTypeBF16;
+            const size_t K = (size_t) 2 * E, N = (size_t) E, src_b = K * N * (bf ? 2 : 4);
+            const size_t q8_rb = ggml_row_size(GGML_TYPE_Q8_0, (int64_t) K);
+            std::vector<uint8_t> raw(src_b), q8(q8_rb * N);
+            std::vector<float> row(K);
+            const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+            if (cudaMemcpy(raw.data(), Ly.eh.q, src_b, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                for (size_t r = 0; r < N; ++r) {
+                    for (size_t k = 0; k < K; ++k) {
+                        if (bf) {
+                            uint16_t h;
+                            std::memcpy(&h, raw.data() + 2 * (r * K + k), 2);
+                            const uint32_t u = (uint32_t) h << 16;
+                            std::memcpy(&row[k], &u, 4);
+                        } else {
+                            std::memcpy(&row[k], raw.data() + 4 * (r * K + k), 4);
+                        }
+                    }
+                    tq->from_float_ref(row.data(), q8.data() + r * q8_rb, (int64_t) K);
+                }
+                if (F->q35_eh_q8 != nullptr) cudaFree(F->q35_eh_q8);
+                F->q35_eh_q8 = nullptr;
+                if (cudaMalloc(&F->q35_eh_q8, q8.size()) == cudaSuccess &&
+                    cudaMemcpy(F->q35_eh_q8, q8.data(), q8.size(), cudaMemcpyHostToDevice) == cudaSuccess) {
+                    Ly.eh = WSlot{nullptr, 8, F->q35_eh_q8, (int64_t) K, (int64_t) N};
+                } else {
+                    cudaGetLastError();
+                    missing += P + "nextn.eh_proj.weight (its Q8_0 copy) ";
+                }
+            } else {
+                cudaGetLastError();
+                missing += P + "nextn.eh_proj.weight (read back) ";
+            }
+        }
         Ly.enorm = f32("nextn.enorm.weight");
         Ly.hnorm = f32("nextn.hnorm.weight");
     }
@@ -740,7 +778,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (q35d_head_split()) {
-        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err)) return false;
+        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err, F->head_x)) return false;
     } else if (!gf::mv(&o, 1, s)) { err = "qwen35 mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
@@ -934,7 +972,7 @@ bool Glm5Model::glm_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (q35d_head_split()) {
-        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err)) return false;
+        if (!q35d_head(F->head_xq, 1, F->mtp_logits, s, err, F->head_x)) return false;
     } else if (!gf::mv(&o, 1, s)) { err = "glm mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);

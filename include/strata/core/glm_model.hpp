@@ -912,7 +912,8 @@ public:
     // caller's own launches)
     void q35d_head_set(const uint8_t* src, size_t bytes, int type, void* dev);
     bool q35d_head_split() const;
-    bool q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err);
+    // (xf: the normed rows as floats, T x n_embd - a BF16 / F32 head's VRAM rows read them; null for the others)
+    bool q35d_head(const void* xq, int T, float* logits, cudaStream_t s, std::string& err, const float* xf = nullptr);
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

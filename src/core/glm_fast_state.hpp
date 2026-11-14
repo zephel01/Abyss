@@ -333,6 +333,7 @@ struct Glm5Model::FastState {
     // the NextN block (the half that carries it): its residual, eh_proj's q8_1 input, its logits and token
     float* mtp_h = nullptr;
     void* mtp_catq = nullptr;
+    void* q35_eh_q8 = nullptr;   // the dense qwen35's BF16 / F32 eh_proj as Q8_0 (the drafter's GEMVs read q8_1 only)
     float* mtp_logits = nullptr;
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
