@@ -1656,8 +1656,19 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             if (!q35_mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
             q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                 g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s, q35_kv_);
-            q35::attn_window(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
-                             V->q35_part, V->q35_ao, s, q35_kv_);
+            if (q35_exact(g)) {
+                // the dense qwen35 (STRATA_Q35_VERIFY_EXACT): the token path's attention a column (attn_decode over the
+                // column's own p + 1 keys, the window's rows already in the cache).  attn_window sums a row's keys in
+                // another order (Qwen3.8-27B's 6 heads a KV head: 128 keys a block in order, where the token's
+                // attn_part_kernel takes 256 a block over 4 warps), so a column's mixer parted from the token path's in
+                // its last bits now and then and greedy answers with drafts parted from the ones without
+                for (int t = 0; t < T; ++t)
+                    q35::attn_decode(V->q35_q + (size_t) t * HD, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, (int) (p0 + t + 1),
+                                     1.0f / std::sqrt((float) D), V->q35_part, V->q35_ao + (size_t) t * HD, s, q35_kv_);
+            } else {
+                q35::attn_window(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
+                                 V->q35_part, V->q35_ao, s, q35_kv_);
+            }
             q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s, q35_kv_);
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, (int) E};
