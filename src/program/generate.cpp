@@ -2166,6 +2166,12 @@ static int glm_pack_generate(const Options& o) {
                             ans_guard ? "with no answer after the reasoning" : "inside the reasoning");
             std::printf("T %d\n", tok);
             ++produced;
+            // STRATA_GLM_TOKEN_MS=1 (debug): each token's time since the request began, on stderr (the slow stretch
+            // right after a prompt: the first tokens against the rest)
+            static const bool tok_ms = std::getenv("STRATA_GLM_TOKEN_MS") != nullptr;
+            if (tok_ms)
+                std::fprintf(stderr, "glm tok %lld %.2f\n", (long long) produced,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
             strata::core::progress_beat();
             gen_hist.push_back(tok);
