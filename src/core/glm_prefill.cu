@@ -448,6 +448,11 @@ struct Glm5Model::PrefillState {
     // expert anyway, and the decode's misses refill the tail after it (keep_small; STRATA_GLM_PREFILL_KEEP sets it)
     int64_t keep = 0, keep_small = 0;
     bool small = false;              // ... the small keep is in use (said once)
+    // the full keep's chunk below which the small keep is tried too (prefill_setup's small_below), and whether the
+    // small keep was taken for a chunk of 4096 tokens or more (only that threshold's doing: prefill_settle)
+    int64_t small_below = 4096;
+    bool small_long = false;
+    bool small_below_env = false;
     size_t need_min = 0, lend_max = 0;   // a 256-token chunk's bytes, and what the pool can lend at most (the refusal)
     std::string mode;
     int sub_env = 0;                 // STRATA_GLM_PREFILL_SUB: every sub-batch (0: mixer_sub, the shared expert kSub)
@@ -674,6 +679,28 @@ void Glm5Model::prefill_cap(int T, const char* why) {
 // more through them)
 void Glm5Model::prefill_settle(double pinned_share) {
     PrefillState* S = pf_;
+    // the small keep for a long chunk (STRATA_GLM_PREFILL_SMALL_BELOW's 32768) only where every expert is held pinned
+    // enough to keep the disk out of it: the residents a prompt moves out are parked in the RAM tier, and a full one
+    // sends as many others to the disk.  GLM-5.3-Flash Maya-S-v2 IQ2_XXS on 16 GB with a 60 GB RAM tier (82% held),
+    // 16K prompts at half the link speed: the prompt 332 -> 690 tok/s, but the 512 tokens after it 17.8 -> 15.3
+    // (every run slower, the disk reads); at full speed 18.6 -> 18.5.  An explicit setting is kept
+    if (S != nullptr && S->small_long && !S->small_below_env && pinned_share < 0.9) {
+        S->small_below = 4096;
+        S->small_long = false;
+        S->keep = g_.n_exp_used + gf::kSpares + 2;
+        const auto pick = S->choose(S->lend_pct_fixed ? S->lend_pct : 85);
+        if (pick.first > 0) {
+            std::fprintf(stderr, "glm prefill: CUDA%d %.0f%% of the experts' bytes are held pinned: the full keep while a "
+                                 "prompt runs (STRATA_GLM_PREFILL_SMALL_BELOW)\n", dev_, 100.0 * pinned_share);
+            if (!S->lend_pct_fixed) S->lend_pct = 85;
+            if (pick.first < S->T) {
+                S->NP = std::min(S->NP, pick.second);
+                S->pbuf_bytes = (size_t) S->NP * S->gstride;
+                prefill_cap((int) pick.first, "the full keep");
+            }
+            return;
+        }
+    }
     if (S == nullptr || S->lend_pct_fixed || pinned_share >= 0.9) return;
     S->lend_pct = 85;
     const auto pick = S->choose(S->lend_pct);
@@ -929,9 +956,19 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     S->keep_small = std::min<int64_t>(keep_full, gf::kSpares + 1);
     if (const char* v = getenv("STRATA_GLM_PREFILL_KEEP")) S->keep_small = std::max<int64_t>(1, std::atoll(v));
     // the full keep's chunk below which the small keep is tried too (when it lends one at least twice as long);
-    // STRATA_GLM_PREFILL_SMALL_BELOW=<tokens>, 0: the small keep only when the full one lends no chunk (v1.3.136)
-    int64_t small_below = 4096;
-    if (const char* v = getenv("STRATA_GLM_PREFILL_SMALL_BELOW")) small_below = std::max<int64_t>(0, std::atoll(v));
+    // STRATA_GLM_PREFILL_SMALL_BELOW=<tokens>, 0: the small keep only when the full one lends no chunk (v1.3.136).
+    // 32768 (was 4096): a 16 GB card's long prompt in one chunk instead of three - every chunk stages nearly every
+    // expert of a layer again (RTX 5090 capped to 16 GB, Gen4 x4, 16K prompts: GLM-5.3-Flash Maya-S-v2 IQ2_XXS
+    // 587 -> 1244 tok/s, DeepSeek V4 0731 UD-Q2_K_XL 1008 -> 1607; 4K prompts, 24 / 32 GB and V4.1 JA256 unchanged).
+    // The chunk changes the prompt's sum order only: V4 0731 16K, the next 512 tokens scored against the token path,
+    // KL 0.0081 against 0.0079 for the three chunks, two runs of the same path 0.0070 apart (bench/p1chunk).
+    // Below 90% of the experts held pinned, prefill_settle goes back to 4096.  =4096: the old chunks
+    // (prefill_settle takes it back to 4096 where the tiers leave experts on the disk)
+    S->small_below = 32768;
+    if (const char* v = getenv("STRATA_GLM_PREFILL_SMALL_BELOW")) {
+        S->small_below = std::max<int64_t>(0, std::atoll(v));
+        S->small_below_env = true;
+    }
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;
@@ -1032,7 +1069,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                                  (long long) keep_full, (long long) keep);
                 S->small = true;
             }
-        } else if (is_auto && T > 0 && T < small_below && S->keep_small < keep_full && mb_env == nullptr &&
+        } else if (is_auto && T > 0 && T < S->small_below && S->keep_small < keep_full && mb_env == nullptr &&
                    stride_sum > 0) {
             // a pool whose full keep lends only a short chunk (Ornith-1.5-397B 16G64G on a 16 GB card: 19 slots a
             // layer, 4 of them lent - chunks of 1024, 4K prompts 85 tok/s) lends a chunk at least twice as long with
@@ -1049,6 +1086,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                                  dev_, (long long) per, (long long) T, (long long) keep_full,
                                  (long long) S->keep_small, (long long) T_small);
                 S->small = true;
+                S->small_long = T >= 4096;
                 T = T_small;
                 keep = S->keep_small;
             } else {
