@@ -48,6 +48,7 @@ const Ty kTypes[] = {
     {20, 32, 18, "IQ4_NL"},   {39, 32, 17, "MXFP4"},   {40, 64, 36, "NVFP4"},   {8, 32, 34, "Q8_0"},
     {6, 32, 22, "Q5_0"},      {7, 32, 24, "Q5_1"},     {42, 64, 18, "Q2_0"},    {10, 256, 84, "Q2_K"},
     {11, 256, 110, "Q3_K"},   {12, 256, 144, "Q4_K"},  {13, 256, 176, "Q5_K"},  {14, 256, 210, "Q6_K"},
+    {2, 32, 18, "Q4_0"},      {3, 32, 20, "Q4_1"},     {30, 32, 64, "BF16"},
 };
 
 void put_h(uint8_t* p, float v) {
@@ -63,7 +64,16 @@ void make_rows(const Ty& T, int n, int rows, std::vector<uint8_t>& w) {
         uint8_t* b = &w[o];
         const float d = 0.002f + 0.001f * (float) (rnd() % 16);
         switch (T.t) {
-            case 7: put_h(b, d); put_h(b + 2, 0.001f * (float) (rnd() % 16)); break;
+            case 7: case 3: put_h(b, d); put_h(b + 2, 0.001f * (float) (rnd() % 16)); break;
+            case 30:
+                for (int j = 0; j < 32; ++j) {   // (sane BF16 weights: |w| < 0.06)
+                    const float v = (frnd() - 0.5f) * 0.12f;
+                    uint32_t u;
+                    std::memcpy(&u, &v, 4);
+                    const uint16_t h = (uint16_t) (u >> 16);
+                    std::memcpy(b + 2 * j, &h, 2);
+                }
+                break;
             case 39: b[0] = (uint8_t) (118 + rnd() % 12); break;
             case 40: break;
             case 10: put_h(b + 80, d); put_h(b + 82, 0.001f + 0.0005f * (float) (rnd() % 16)); break;

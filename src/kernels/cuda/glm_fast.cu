@@ -1073,6 +1073,40 @@ template<> __device__ __forceinline__ float dw<6>(const uint8_t* row, int kbx, i
 template<> struct F<6> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_q5_0);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
         return dw<6>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
+// Q4_0 (unsloth's Qwen3.8-27B Q4_0: every projection and FFN matrix): 32 values a block, an FP16 scale, codes 0..15
+// meaning -8..7 - made signed before the dot (as Q5_0 above), so the block's sum is an exact integer sum.  The block
+// is 18 bytes: its ints are read two bytes at a time
+template<> __device__ __forceinline__ float dw<2>(const uint8_t* row, int kbx, int, const XV& x, const uint32_t*) {
+    const block_q4_0* b = (const block_q4_0*) row + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int vl = get_int_b2(b->qs, i);
+        sumi = __dp4a((int) __vsub4(vl & 0x0F0F0F0F, 0x08080808), x.u[i], sumi);
+        sumi = __dp4a((int) __vsub4((vl >> 4) & 0x0F0F0F0F, 0x08080808), x.u[i + 4], sumi);
+    }
+    return __half2float(b->d) * x.d * (float) sumi;
+}
+template<> struct F<2> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_q4_0);
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
+        return dw<2>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
+// Q4_1 (unsloth's Qwen3.8-27B Q4_1, and Q4_0's few Q4_1 matrices): codes 0..15, an FP16 scale and min - d * d8 * the
+// integer sum plus the min times the q8_1 block's sum (s8 = d8 * its values' sum), once a block
+template<> __device__ __forceinline__ float dw<3>(const uint8_t* row, int kbx, int, const XV& x, const uint32_t*) {
+    const block_q4_1* b = (const block_q4_1*) row + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int vl = get_int_b4(b->qs, i);
+        sumi = __dp4a(vl & 0x0F0F0F0F, x.u[i], sumi);
+        sumi = __dp4a((vl >> 4) & 0x0F0F0F0F, x.u[i + 4], sumi);
+    }
+    const float2 dm = __half22float2(b->dm);
+    return dm.x * x.d * (float) sumi + dm.y * x.s;
+}
+template<> struct F<3> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_q4_1);
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
+        return dw<3>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
 // Q2_0 (ISTA-DASLab's GSQ-RCO Qwen3.8: down experts and shared experts): 64 values, one FP16 scale, 2-bit codes
 // 0..3 meaning -1..2 - vecdotq's vec_dot_q2_0_q8_1, a call per q8_1 block (iqs: the block's half).  The codes are
 // spread into bytes with shifts and masks (no byte permute: the same on CUDA and HIP)
@@ -1203,7 +1237,7 @@ __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, c
         case kTypeBF16: return row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
 #define GF_CASE(T) case T: return row_dot<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3)
 #undef GF_CASE
         default: return 0.0f;
     }
@@ -1216,7 +1250,7 @@ __device__ __forceinline__ size_t any_row_bytes(int type, int n_in) {
         case kTypeBF16: return (size_t) n_in * 2;
 #define GF_CASE(T) case T: return rbytes<T>(n_in);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3)
 #undef GF_CASE
         default: return 0;
     }
@@ -1267,7 +1301,7 @@ __device__ __forceinline__ float any_row_dot_part(int type, const void* w, int r
         }
 #define GF_CASE(T) case T: return row_dot_part<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane, p, split);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3)
 #undef GF_CASE
         default: return 0.0f;
     }
@@ -4837,7 +4871,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
 int mv_type_ok(int t) {
     switch (t) {
         case kTypeF32: case kTypeBF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23: case 10: case 11:
-        case 17: case 22: case 21: case 29: case 20: case 7: case 42: return 1;
+        case 17: case 22: case 21: case 29: case 20: case 7: case 42: case 2: case 3: return 1;
         case exl3::kTypeEXL3: return 1;   // forwarded to the EXL3 kernels (mv below)
         default: return 0;
     }
@@ -4903,13 +4937,15 @@ size_t row_bytes(int type, int64_t n_in) {
         case 7: return (size_t) (n_in / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n_in / 32) * sizeof(block_q5_0);
         case 42: return (size_t) (n_in / 64) * sizeof(block_q2_0);
+        case 2: return (size_t) (n_in / 32) * sizeof(block_q4_0);
+        case 3: return (size_t) (n_in / 32) * sizeof(block_q4_1);
         default: return 0;
     }
 }
 
 bool mvn_supported(int type) {   // (qwen4exp's i-quant projections too: IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
     return type == 8 || type == 12 || type == 13 || type == 14 || type == 18 || type == 20 || type == 21 || type == 22 ||
-           type == 23 || type == 7 || type == 42 ||
+           type == 23 || type == 7 || type == 42 || type == 2 || type == 3 ||   // (Q4_0 / Q4_1: Qwen3.8-27B's)
            type == kTypeBF16 || type == kTypeF32;
 }
 
@@ -4954,15 +4990,40 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
         }
         return true;
     }
-    for (int i = 0; i < n; ++i)
-        if (!mvn_supported(jobs[i].type)) {
-            std::fprintf(stderr, "glm_fast mvn: type %d unsupported\n", jobs[i].type);
-            return false;
+    // a type mvn has no multi-column kernel for (the i-quants of unsloth's Qwen3.8-27B IQ1 / IQ2 files: IQ2_XXS,
+    // IQ2_XS, IQ1_S, IQ1_M, Q2_K): those jobs a column at a time through mv - the token path's own sums, so the verify
+    // window's tokens stay the token path's (mvn_kernel_t on them changed the drafted outputs) - the others as before
+    const auto here = [](int t) { return mvn_supported(t); };
+    bool all = true;
+    for (int i = 0; i < n; ++i) all = all && here(jobs[i].type);
+    if (!all) {
+        MvJob sub[kMaxMvJobs];
+        int m = 0;
+        for (int i = 0; i < n; ++i)
+            if (here(jobs[i].type)) sub[m++] = jobs[i];
+        if (m > 0 && !mvn(sub, m, nc, s)) return false;
+        for (int i = 0; i < n; ++i) {
+            const MvJob& J = jobs[i];
+            if (here(J.type)) continue;
+            if (!mv_type_ok(J.type)) {
+                std::fprintf(stderr, "glm_fast mvn: type %d unsupported\n", J.type);
+                return false;
+            }
+            const size_t xs = J.xs ? (size_t) J.xs : (size_t) (J.n_in / 32);
+            for (int c = 0; c < nc; ++c) {
+                MvJob one = J;
+                if (J.xq != nullptr) one.xq = (const uint8_t*) J.xq + (size_t) c * xs * sizeof(block_q8_1);
+                if (J.xf != nullptr) one.xf = J.xf + (size_t) c * J.n_in;
+                one.y = J.y + (size_t) c * (J.ys ? (size_t) J.ys : (size_t) J.n_out);
+                if (!mv(&one, 1, s)) return false;
+            }
         }
+        return true;
+    }
     // one launch per type present (as mv's typed kernels), each compiled for the column count
     // (PDL + the early L2 pull as mv's: mvn_launch_pdl; STRATA_GLM_MVN_PDL=0 launches them plainly, A/B)
     const int pf = mvn_launch_pdl();
-    constexpr int kTypes[] = {14, 8, 12, 13, 18, 20, 21, 22, 23, 7, 42, kTypeBF16};
+    constexpr int kTypes[] = {14, 8, 12, 13, 18, 20, 21, 22, 23, 7, 42, 2, 3, kTypeBF16};
     bool done[kMaxMvJobs] = {};
     for (const int T : kTypes) {
         MvBatch b{};
@@ -4999,6 +5060,8 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
             case 23: GF_MVN(23) break;
             case 7: GF_MVN(7) break;
             case 42: GF_MVN(42) break;
+            case 2: GF_MVN(2) break;
+            case 3: GF_MVN(3) break;
             default:
                 switch (nc) {
                     case 2: mvn_go(mvn_kernel_f<2>, acc, s, b, pf); break;
@@ -5687,6 +5750,19 @@ void q8_0_to_f16(const void* src, uint16_t* dst, int64_t n, cudaStream_t s) {
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s) {
     swiglu_q8_kernel<<<(n + 255) / 256, 256, 0, s>>>(gate, up, limit, n, (block_q8_1*) hq);
     launch_check("swiglu_q8");
+}
+
+// swiglu_q8's values kept as floats (h may be gate: in place) - for a down matrix the GEMV reads in float (BF16 / F32)
+__global__ void swiglu_f32_kernel(const float* gate, const float* __restrict__ up, float limit, int n, float* h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = fminf(gate[i], limit);
+    const float u = fminf(fmaxf(up[i], -limit), limit);
+    h[i] = (g / (1.0f + expf(-g))) * u;
+}
+void swiglu_f32(const float* gate, const float* up, float limit, int n, float* h, cudaStream_t s) {
+    swiglu_f32_kernel<<<(n + 255) / 256, 256, 0, s>>>(gate, up, limit, n, h);
+    launch_check("swiglu_f32");
 }
 
 __global__ void sh_swiglu_kernel(const float* __restrict__ sh_gate, const float* __restrict__ sh_up, float sh_limit,

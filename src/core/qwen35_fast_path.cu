@@ -1359,8 +1359,11 @@ bool Glm5Model::fast_dense_ffn(int il, std::string& err) {
         j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, E, FF};
         if (!gf::mv(j, 2, s)) { err = "qwen35: the dense FFN's gate / up"; return false; }
         if (F->prof_on) F->mark("q35_dense_gu");
-        gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
-        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
+        // (a BF16 / F32 down - unsloth's BF16 file - reads h as floats: kept in dg)
+        const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
+        if (hf) gf::swiglu_f32(F->dg, F->du, g.swiglu_shexp, FF, F->dg, s);
+        else gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
+        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, hf ? F->dg : nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
         if (!gf::mv(&dn, 1, s)) { err = "qwen35: the dense FFN's down"; return false; }
         if (F->prof_on) F->mark("q35_dense_down");
         return true;

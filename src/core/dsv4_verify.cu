@@ -1695,10 +1695,18 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                 jd[0] = {Ly.ffn_gate.q, V->xq, V->x, V->glm_dg, nullptr, 1.0f, Ly.ffn_gate.type, (int) E, FF};
                 jd[1] = {Ly.ffn_up.q, V->xq, V->x, V->glm_du, nullptr, 1.0f, Ly.ffn_up.type, (int) E, FF};
                 if (!mvc(jd, 2, "dense ffn gate / up")) return false;
-                for (int t = 0; t < T; ++t)
-                    gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
-                                  (uint8_t*) V->glm_dhq + (size_t) t * hq, s);
-                gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, nullptr, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, (int) E};
+                // (a BF16 / F32 down reads h as floats, kept in glm_dg - unsloth's BF16 file)
+                const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
+                for (int t = 0; t < T; ++t) {
+                    if (hf)
+                        gf::swiglu_f32(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                                       V->glm_dg + (size_t) t * FF, s);
+                    else
+                        gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                                      (uint8_t*) V->glm_dhq + (size_t) t * hq, s);
+                }
+                gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, hf ? V->glm_dg : nullptr, V->ffn, nullptr, 1.0f,
+                                Ly.ffn_down.type, FF, (int) E};
                 return mvc(&dn, 1, "dense ffn down");
             };
             if (q35d_ram(il) ? !q35d_cpu_ffn(il, V->xq, T, V->ffn, s, err, rows) : !rows(g.n_ff_dense)) return false;

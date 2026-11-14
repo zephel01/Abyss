@@ -743,8 +743,13 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
         // (qwen4exp: the i-quant projections too - hgemm_q's dequant_f16 takes them)
-        const bool iq = g.q4x && (w.type == 16 || w.type == 17 || w.type == 18 || w.type == 21 || w.type == 22 ||
-                                  w.type == 29);
+        // (the dense qwen35 - Qwen3.8-27B's UD-IQ1 / IQ2 / IQ3 files - every i-quant, IQ1_S too: the FFN and the
+        // projections through dequant_f16 where MMQ lacks the type)
+        const bool dense35 = g.qwen35() && g.n_expert == 0;
+        const bool iq = (g.q4x && (w.type == 16 || w.type == 17 || w.type == 18 || w.type == 21 || w.type == 22 ||
+                                   w.type == 29)) ||
+                        (dense35 && (w.type == 16 || w.type == 17 || w.type == 18 || w.type == 19 || w.type == 21 ||
+                                     w.type == 22 || w.type == 29));
         // (qwen35 / qwen4exp: F32 rows too - unsloth's Qwen3.8 UD files keep ssm_alpha / ssm_beta F32 where ISTA's are
         // BF16, and hgemm_q widens F32 to FP16 as it does the injects; issue #25: they dropped the whole prompt path)
         const bool f32 = g.qwen35() && w.type == gf::kTypeF32;
@@ -1271,8 +1276,11 @@ bool Glm5Model::prefill_setup_own(std::string& err) {
     // n_ff multiples of 512 (no over-read past a matrix), every FFN type MMQ's
     static const bool mmq_env = [] { const char* v = getenv("STRATA_Q35D_MMQ"); return v == nullptr || std::atoi(v) != 0; }();
     const int64_t E = g_.n_embd, FF = g_.n_ff_dense;
-    bool types_ok = mmq::built() && E % 512 == 0 && FF % 512 == 0;
-    for (int il = l0_; il < l1_ && types_ok; ++il) {
+    // (a layer with a matrix MMQ lacks - IQ1_M, BF16 in unsloth's IQ1 / IQ2_S / IQ3_XXS / BF16 files - runs the FP16
+    // products instead (the FFN branch checks its three types); the buffers exist when any layer takes MMQ)
+    const bool dims_ok = mmq::built() && E % 512 == 0 && FF % 512 == 0;
+    bool types_ok = false;
+    for (int il = l0_; il < l1_ && dims_ok && !types_ok; ++il) {
         const auto& Ly = fast_->L[(size_t) il];
         types_ok = !Ly.moe && mmq::supported(Ly.ffn_gate.type) && mmq::supported(Ly.ffn_up.type) &&
                    mmq::supported(Ly.ffn_down.type);
@@ -3406,7 +3414,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         WSlot dffn[3] = {Ly.ffn_gate, Ly.ffn_up, Ly.ffn_down};
         const bool dram = !Ly.moe && q35d_prompt_ram(il);
         if (dram && !q35d_stage(il, s, dffn, err)) return false;
-        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr) {
+        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr && mmq::supported(dffn[0].type) &&
+            mmq::supported(dffn[1].type) && mmq::supported(dffn[2].type)) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
             // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into
             // S->ffn - the experts' MMQ path with one "expert" whose rows are the tokens

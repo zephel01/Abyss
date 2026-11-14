@@ -467,6 +467,43 @@ float dw20(const uint8_t* row, int kbx, const XB& x) {
     }
     return half_of(&b->d) * x.d * (float) sumi;
 }
+// Q4_0 / Q4_1 (unsloth's Qwen3.8-27B Q4_0 / Q4_1): the device's dw<2> / dw<3> - Q4_0's codes made signed first (an
+// exact integer sum), Q4_1's min times the q8_1 block's sum once a block
+float dw2(const uint8_t* row, int kbx, const XB& x) {
+    const block_q4_0* b = (const block_q4_0*) row + kbx;
+    int sumi = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int vl = get_int(b->qs, i);
+        sumi = dp4a(vsub4(vl & 0x0F0F0F0F, 0x08080808), x.u[i], sumi);
+        sumi = dp4a(vsub4((vl >> 4) & 0x0F0F0F0F, 0x08080808), x.u[i + 4], sumi);
+    }
+    return half_of(&b->d) * x.d * (float) sumi;
+}
+float dw3(const uint8_t* row, int kbx, const XB& x) {
+    const block_q4_1* b = (const block_q4_1*) row + kbx;
+    int sumi = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int vl = get_int(b->qs, i);
+        sumi = dp4a(vl & 0x0F0F0F0F, x.u[i], sumi);
+        sumi = dp4a((vl >> 4) & 0x0F0F0F0F, x.u[i + 4], sumi);
+    }
+    const float dmx = half_of((const uint8_t*) b), dmy = half_of((const uint8_t*) b + 2);
+    return dmx * x.d * (float) sumi + dmy * x.s;
+}
+// BF16 (unsloth's BF16 file, the UD-Q8_K_XL projections): 32 weights a call against the q8_1 block's values - the
+// CPU's rows of a BF16 matrix read x as q8_1 like every other type here (the GPU's BF16 GEMV reads it as floats)
+float dw30(const uint8_t* row, int kbx, const XB& x) {
+    const uint8_t* w = row + (size_t) kbx * 64;
+    int8_t q[32];
+    std::memcpy(q, x.u, 32);
+    float s = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        uint16_t h;
+        std::memcpy(&h, w + 2 * j, 2);
+        s += bits_f((uint32_t) h << 16) * (float) q[j];
+    }
+    return s * x.d;
+}
 float dw7(const uint8_t* row, int kbx, const XB& x) {
     const block_q5_1* b = (const block_q5_1*) row + kbx;
     const int qh = get_int(b->qh, 0);
@@ -553,6 +590,9 @@ bool fmt_of(int t, Fmt& f) {
         case 20: f = {32, 1, 1, sizeof(block_iq4_nl)}; return true;
         case 7: f = {32, 1, 1, sizeof(block_q5_1)}; return true;
         case 6: f = {32, 1, 1, sizeof(block_q5_0)}; return true;
+        case 2: f = {32, 1, 1, sizeof(block_q4_0)}; return true;
+        case 3: f = {32, 1, 1, sizeof(block_q4_1)}; return true;
+        case 30: f = {32, 1, 1, 64}; return true;
         case 42: f = {64, 2, 1, sizeof(block_q2_0)}; return true;
         default: return false;
     }
@@ -580,6 +620,9 @@ float call(int t, const uint8_t* row, const XB* y, int kbx, int iqs) {
         case 20: return dw20(row, kbx, y[0]);
         case 7: return dw7(row, kbx, y[0]);
         case 6: return dw6(row, kbx, y[0]);
+        case 2: return dw2(row, kbx, y[0]);
+        case 3: return dw3(row, kbx, y[0]);
+        case 30: return dw30(row, kbx, y[0]);
         case 42: return dw42(row, kbx, iqs, y[iqs]);
         default: return 0.0f;
     }

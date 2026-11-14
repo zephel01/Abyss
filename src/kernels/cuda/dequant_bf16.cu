@@ -54,6 +54,13 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             put(out, j, (float) ((b[2 + j] & 0x0F) - 8) * d);
             put(out, j + 16, (float) ((b[2 + j] >> 4) - 8) * d);
         }
+    } else if constexpr (TYPE == 3) {                              // Q4_1: d, m, qs[16] (unsloth's Qwen3.8-27B Q4_1)
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 20;
+        const float d = h2f(b), m = h2f(b + 2);
+        for (int j = 0; j < 16; ++j) {
+            put(out, j, (float) (b[4 + j] & 0x0F) * d + m);
+            put(out, j + 16, (float) (b[4 + j] >> 4) * d + m);
+        }
     } else if constexpr (TYPE == 6) {                              // Q5_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 22;
         const float d = h2f(b);
@@ -84,6 +91,16 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         for (int j = 0; j < 16; ++j) {
             put(out, j, d * (float) kv_iq4nl[b[2 + j] & 0xf]);
             put(out, j + 16, d * (float) kv_iq4nl[b[2 + j] >> 4]);
+        }
+    } else if constexpr (TYPE == 10) {                             // Q2_K: scales[16] qs[64] d dmin (unsloth's 27B UD-IQ2)
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 84;
+        const int gi = gi_in_row % 8, n = gi / 4, jj = gi % 4;
+        const uint8_t* q = b + 16 + n * 32;
+        const float d = h2f(b + 80), dmin = h2f(b + 82);
+        const int shift = 2 * jj;
+        for (int t = 0; t < 32; ++t) {
+            const uint8_t sc = b[n * 8 + jj * 2 + (t >= 16 ? 1 : 0)];
+            put(out, t, d * (float) (sc & 0xF) * (float) ((q[t] >> shift) & 3) - dmin * (float) (sc >> 4));
         }
     } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
@@ -261,10 +278,12 @@ __global__ void dequant_k_f16_kernel(const uint8_t* __restrict__ blocks, int64_t
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
+    case 3: block_elems = 32; block_bytes = 20; return true;
     case 6: block_elems = 32; block_bytes = 22; return true;
     case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
+    case 10: block_elems = 256; block_bytes = 84; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
     case 12: block_elems = 256; block_bytes = 144; return true;
     case 13: block_elems = 256; block_bytes = 176; return true;
@@ -290,9 +309,11 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
     switch (type) {
     case 2: STRATA_DQ(2);
+    case 3: STRATA_DQ(3);
     case 6: STRATA_DQ(6);
     case 7: STRATA_DQ(7);
     case 8: STRATA_DQ(8);
+    case 10: STRATA_DQ(10);
     case 11: STRATA_DQ(11);
     case 12: STRATA_DQ(12);
     case 13: STRATA_DQ(13);

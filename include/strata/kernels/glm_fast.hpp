@@ -211,6 +211,8 @@ __host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv
 
 /// SwiGLU with GLM's clamp (gate above, up both sides) and the q8_1 of h, n values.
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s);
+/// swiglu_q8 into floats (h may equal gate) - the input of a BF16 / F32 down matrix (mv reads its x as floats)
+void swiglu_f32(const float* gate, const float* up, float limit, int n, float* h, cudaStream_t s);
 
 // ---------------------------------------------------------------- the routed experts
 //
