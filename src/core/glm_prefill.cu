@@ -114,7 +114,9 @@ constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the s
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
 // the MMQ row-id table (iota) carries this many entries past T * n_exp_used: mul_mat_q loads a whole mmq_y tile of
 // ids before it checks the row bounds, so a table cut exactly at the last row is read past its end by the last tile
-// (a long prompt's / a split's "illegal memory access", cuda-memcheck's out-of-range read; Maya #645's IDS_PAD)
+// (a long prompt's / a split's "illegal memory access", cuda-memcheck's out-of-range read; Maya #645's IDS_PAD).
+// The dense products' tables (dq_iota, one product from row 0); the experts' table takes mmq::ids_pad(T) - the
+// stream-k fixup reads up to roundup(max_rows, tile) ids from the last expert's first row, and max_rows reaches T
 constexpr int kIdsPad = 512;
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
@@ -1363,7 +1365,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T * 16);
     a.take<float>(T);
     a.take<float>(T * 24);
-    a.take<int>(T * (size_t) g.n_exp_used + kIdsPad);   // iota (+ the tile over-read's pad)
+    a.take<int>(T * (size_t) g.n_exp_used + (size_t) mmq::ids_pad(T));   // iota (+ the tile over-read's pad)
     if (v41_row) a.take<uint8_t>(T * v41_row);   // v41_rows
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
@@ -1462,7 +1464,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->comb = a.take<float>(T * 16);
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
-    S->iota = a.take<int>(T * (size_t) g.n_exp_used + kIdsPad);
+    S->iota = a.take<int>(T * (size_t) g.n_exp_used + (size_t) mmq::ids_pad(T));
     S->v41_rows = prefill_v41_row() ? a.take<uint8_t>(T * prefill_v41_row()) : nullptr;
     S->uni = S->arena + a.off;
     S->uni_bytes = uni;
@@ -1489,7 +1491,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
                              "VRAM (%llu of them moved over colder ones)\n", dev_, S->need / 1048576.0, S->T_bound,
                      (unsigned long long) (S->dropped - dropped0), (unsigned long long) (S->moved - moved0));
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
-    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used + kIdsPad, F->cs);
+    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used + mmq::ids_pad(S->T_bound), F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
     if (S->ev_pfree) cudaEventRecord(S->ev_pfree, F->cs);
     S->pre_layer = -1;

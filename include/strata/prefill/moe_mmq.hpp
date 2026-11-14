@@ -52,6 +52,13 @@ struct Product {
 /// `n_ff` output rows: CUDA on an NVIDIA GPU with int8 tensor cores (Turing or later), n_ff a multiple of 128.
 bool glu_supported(int ggml_type, int64_t n_ff);
 
+/// Entries a row-id table (`Product::ids`) needs past its products' last row when one expert has at most `max_rows`
+/// rows: mul_mat_q copies a whole tile of ids (up to 128) before it checks the tile against the expert's rows, and
+/// its stream-k fixup copies the ids of every tile up to roundup(max_rows, tile) from an expert's first row - past
+/// an exact table's end for the last experts (compute-sanitizer: invalid reads; a table that ends an allocation can
+/// fault).  The ids read there are never used, so any values do; the callers write the identity over all of them.
+inline int64_t ids_pad(int64_t max_rows) { return (max_rows + 127) / 128 * 128 + 128; }
+
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
 public:

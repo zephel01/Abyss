@@ -1,5 +1,4 @@
 diff --git a/mmq-load-tiles.cuh b/mmq-load-tiles.cuh
-index 7f00bad..a9505ed 100644
 --- a/mmq-load-tiles.cuh
 +++ b/mmq-load-tiles.cuh
 @@ -4,8 +4,8 @@
@@ -13,7 +12,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -38,7 +38,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -38,7 +38,7 @@
              i = min(i, i_max);
          }
  
@@ -22,7 +21,7 @@ index 7f00bad..a9505ed 100644
          const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 2;
  
          const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
-@@ -85,7 +85,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -85,7 +85,7 @@
              i = min(i, i_max);
          }
  
@@ -31,7 +30,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                           + ksx] = bxi->d;
-@@ -95,8 +95,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -95,8 +95,8 @@
      }
  }
  
@@ -42,7 +41,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -129,7 +129,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -129,7 +129,7 @@
              i = min(i, i_max);
          }
  
@@ -51,7 +50,7 @@ index 7f00bad..a9505ed 100644
          const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 4;
  
          const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
-@@ -174,7 +174,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -174,7 +174,7 @@
              i = min(i, i_max);
          }
  
@@ -60,7 +59,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                           + ksx] = bxi->d;
-@@ -184,8 +184,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -184,8 +184,8 @@
      }
  }
  
@@ -71,7 +70,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -214,7 +214,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -214,7 +214,7 @@
              i = min(i, i_max);
          }
  
@@ -80,7 +79,7 @@ index 7f00bad..a9505ed 100644
          const int qs0 = get_int_b2(bxi->qs, kqsx);
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-@@ -237,7 +237,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -237,7 +237,7 @@
              i = min(i, i_max);
          }
  
@@ -89,7 +88,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                     + kbxd] = bxi->d;
-@@ -247,8 +247,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -247,8 +247,8 @@
      }
  }
  
@@ -100,7 +99,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -277,7 +277,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -277,7 +277,7 @@
              i = min(i, i_max);
          }
  
@@ -109,7 +108,7 @@ index 7f00bad..a9505ed 100644
          const int qs0 = get_int_b4(bxi->qs, kqsx);
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-@@ -300,7 +300,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -300,7 +300,7 @@
              i = min(i, i_max);
          }
  
@@ -118,7 +117,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_dm[i*sram_stride                     + kbxd] = bxi->dm;
-@@ -310,8 +310,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -310,8 +310,8 @@
      }
  }
  
@@ -129,7 +128,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -340,7 +340,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -340,7 +340,7 @@
              i = min(i, i_max);
          }
  
@@ -138,7 +137,7 @@ index 7f00bad..a9505ed 100644
  
          const int ql = get_int_b2(bxi->qs, kqsx);
          const int qh = get_int_b2(bxi->qh, 0) >> (4 * kqsx);
-@@ -380,7 +380,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -380,7 +380,7 @@
              i = min(i, i_max);
          }
  
@@ -147,7 +146,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                     + kbxd] = bxi->d;
-@@ -390,8 +390,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -390,8 +390,8 @@
      }
  }
  
@@ -158,7 +157,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -420,7 +420,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -420,7 +420,7 @@
              i = min(i, i_max);
          }
  
@@ -167,7 +166,7 @@ index 7f00bad..a9505ed 100644
  
          const int ql = get_int_b4(bxi->qs, kqsx);
          const int qh = get_int_b4(bxi->qh, 0) >> (4 * kqsx);
-@@ -458,7 +458,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -458,7 +458,7 @@
              i = min(i, i_max);
          }
  
@@ -176,7 +175,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_dm[i*sram_stride                     + kbxd] = bxi->dm;
-@@ -468,8 +468,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -468,8 +468,8 @@
      }
  }
  
@@ -187,7 +186,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -499,7 +499,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -499,7 +499,7 @@
              i = min(i, i_max);
          }
  
@@ -196,7 +195,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_qs[i*sram_stride + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
-@@ -522,7 +522,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -522,7 +522,7 @@
              i = min(i, i_max);
          }
  
@@ -205,7 +204,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                           + kbxd] = bxi->d;
-@@ -534,8 +534,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -534,8 +534,8 @@
  
  // ---------------------------------------------------------------------------------------------
  
@@ -216,7 +215,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -562,7 +562,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -562,7 +562,7 @@
              i = min(i, i_max);
          }
  
@@ -225,7 +224,7 @@ index 7f00bad..a9505ed 100644
  
          const int x_ql_0 = get_int_b2(bxi->qs, kqsx);
  
-@@ -595,8 +595,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -595,8 +595,8 @@
      }
  }
  
@@ -236,7 +235,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -624,7 +624,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -624,7 +624,7 @@
              i = min(i, i_max);
          }
  
@@ -245,7 +244,7 @@ index 7f00bad..a9505ed 100644
  
          const int x_ql_0 = get_int_b2(bxi->qs,    kqsx);
          const int x_qh_0 = get_int_b2(bxi->hmask, kqsx % (QI3_K/2)) >> (4 * (kqsx / (QI3_K/2)));
-@@ -655,7 +655,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -655,7 +655,7 @@
              i = min(i, i_max);
          }
  
@@ -254,7 +253,7 @@ index 7f00bad..a9505ed 100644
  
          const int ksc = threadIdx.x % 4;
  
-@@ -691,7 +691,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -691,7 +691,7 @@
              i = min(i, i_max);
          }
  
@@ -263,7 +262,7 @@ index 7f00bad..a9505ed 100644
  
          x_df[i] = bxi->d;
      }
-@@ -708,8 +708,8 @@ static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, co
+@@ -708,8 +708,8 @@
             ((scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030);  // upper 2 bits
  }
  
@@ -274,7 +273,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -737,7 +737,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -737,7 +737,7 @@
              i = min(i, i_max);
          }
  
@@ -283,7 +282,7 @@ index 7f00bad..a9505ed 100644
          const int qs0 = get_int_b4(bxi->qs, txi);
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-@@ -766,7 +766,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -766,7 +766,7 @@
                  i = min(i, i_max);
              }
  
@@ -292,7 +291,7 @@ index 7f00bad..a9505ed 100644
  
              const int * scales = (const int *) bxi->scales;
              const int ksc = threadIdx.x % 2;
-@@ -794,7 +794,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -794,7 +794,7 @@
              i = min(i, i_max);
          }
  
@@ -301,7 +300,7 @@ index 7f00bad..a9505ed 100644
  
          x_dm[i] = bxi->dm;
      }
-@@ -807,7 +807,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -807,7 +807,7 @@
              i = min(i, i_max);
          }
  
@@ -310,7 +309,7 @@ index 7f00bad..a9505ed 100644
  
          const int * scales = (const int *) bxi->scales;
  
-@@ -819,8 +819,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -819,8 +819,8 @@
  #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
  }
  
@@ -321,7 +320,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -848,7 +848,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -848,7 +848,7 @@
              i = min(i, i_max);
          }
  
@@ -330,7 +329,7 @@ index 7f00bad..a9505ed 100644
          const int ky = QR5_K*txi;
  
          const int ql = get_int_b4(bxi->qs, txi);
-@@ -889,7 +889,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -889,7 +889,7 @@
                  i = min(i, i_max);
              }
  
@@ -339,7 +338,7 @@ index 7f00bad..a9505ed 100644
  
              const int * scales = (const int *) bxi->scales;
              const int ksc = threadIdx.x % 2;
-@@ -917,7 +917,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -917,7 +917,7 @@
              i = min(i, i_max);
          }
  
@@ -348,7 +347,7 @@ index 7f00bad..a9505ed 100644
  
          x_dm[i] = bxi->dm;
      }
-@@ -931,7 +931,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -931,7 +931,7 @@
              i = min(i, i_max);
          }
  
@@ -357,7 +356,7 @@ index 7f00bad..a9505ed 100644
  
          const int * scales = (const int *) bxi->scales;
  
-@@ -943,8 +943,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -943,8 +943,8 @@
  #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
  }
  
@@ -368,7 +367,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -973,7 +973,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -973,7 +973,7 @@
              i = min(i, i_max);
          }
  
@@ -377,7 +376,7 @@ index 7f00bad..a9505ed 100644
  
          const int ql = get_int_b2(bxi->ql, txi);
          const int ql0 = (ql >> 0) & 0x0F0F0F0F;
-@@ -1003,7 +1003,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1003,7 +1003,7 @@
              i = min(i, i_max);
          }
  
@@ -386,7 +385,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride]                     = bxi->d;
-@@ -1021,7 +1021,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1021,7 +1021,7 @@
              i = min(i, i_max);
          }
  
@@ -395,7 +394,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_sc[i*sram_stride + threadIdx.x%4] = get_int_b2(bxi->scales, threadIdx.x % (MMQ_TILE_NE_K/8));
-@@ -1033,8 +1033,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1033,8 +1033,8 @@
  
  // ---------------------------------------------------------------------------------------------
  
@@ -406,16 +405,30 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1061,7 +1061,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1061,16 +1061,18 @@
              i = min(i, i_max);
          }
  
 -        const block_iq1_s * bxi = (const block_iq1_s *) x + kbx0 + i*stride;
 +        const block_iq1_s * bxi = ggml_cuda_mmq_x_row<block_iq1_s, has_fusion>(x, x_gate, kbx0, i, stride);
  
-         const int       qs_packed = get_int_b2(bxi->qs, kqsx);
-         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-@@ -1095,8 +1095,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+-        const int       qs_packed = get_int_b2(bxi->qs, kqsx);
+-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        // (the packed bytes by shift and mask, not through a uint8_t pointer to a local int: NVCC has miscompiled
++        // that form - Windows CUDA 13.2 read wrong codebook rows; the same bytes on a little-endian GPU)
++        const int qs_packed = get_int_b2(bxi->qs, kqsx);
+ 
+         const int qh = bxi->qh[kqsx];
+ 
+     #pragma unroll
+         for (int l = 0; l < QR1_S/2; ++l) {
+-            const int grid = iq1s_grid_gpu[qs[l] | (((qh >> (3*l)) & 0x07) << 8)];
++            const int qs_l = (qs_packed >> (8*l)) & 0xFF;
++            const int grid = iq1s_grid_gpu[qs_l | (((qh >> (3*l)) & 0x07) << 8)];
+ 
+             const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+             const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+@@ -1095,8 +1097,8 @@
      }
  }
  
@@ -426,7 +439,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1123,7 +1123,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1123,7 +1125,7 @@
              i = min(i, i_max);
          }
  
@@ -435,7 +448,7 @@ index 7f00bad..a9505ed 100644
  
          const int q2 = get_int_b2(bxi->qs, 2*kqsx+0);
          const uint8_t * aux8 = (const uint8_t *) &q2;
-@@ -1159,8 +1159,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1159,8 +1161,8 @@
      }
  }
  
@@ -446,7 +459,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1187,7 +1187,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1187,7 +1189,7 @@
              i = min(i, i_max);
          }
  
@@ -455,7 +468,7 @@ index 7f00bad..a9505ed 100644
  
          const int2 q2_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
          const uint16_t * q2 = (const uint16_t *) &q2_packed;
-@@ -1224,8 +1224,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1224,8 +1226,8 @@
      }
  }
  
@@ -466,16 +479,39 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1251,7 +1251,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1251,22 +1253,23 @@
              i = min(i, i_max);
          }
  
 -        const block_iq2_s * bxi = (const block_iq2_s *) x + kbx0 + i*stride;
 +        const block_iq2_s * bxi = ggml_cuda_mmq_x_row<block_iq2_s, has_fusion>(x, x_gate, kbx0, i, stride);
  
-         const int       qs_packed = get_int_b2(bxi->qs, kqsx);
-         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-@@ -1292,8 +1292,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+-        const int       qs_packed = get_int_b2(bxi->qs, kqsx);
+-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        // (bytes by shift and mask, as in the IQ1_S loader)
++        const int qs_packed = get_int_b2(bxi->qs, kqsx);
+ 
+         const int qh = bxi->qh[kqsx];
+ 
+-        const int       signs_packed_32 = get_int_b2(bxi->qs, QK_K/32 + kqsx);
+-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
++        const int signs_packed_32 = get_int_b2(bxi->qs, QK_K/32 + kqsx);
+ 
+ #pragma unroll
+         for (int l = 0; l < QR2_S; ++l) {
+-            const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
++            const int qs_l    = (qs_packed       >> (8*l)) & 0xFF;
++            const int signs_l = (signs_packed_32 >> (8*l)) & 0xFF;
++            const int * grid_pos = (const int *)(iq2s_grid + (qs_l | ((qh << (8-2*l)) & 0x300)));
+ 
+-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
++            const int signs0 = __vcmpne4(((signs_l & 0x03) << 7) | ((signs_l & 0x0C) << 21), 0x00000000);
++            const int signs1 = __vcmpne4(((signs_l & 0x30) << 3) | ((signs_l & 0xC0) << 17), 0x00000000);
+ 
+             const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+             const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+@@ -1292,8 +1295,8 @@
      }
  }
  
@@ -486,7 +522,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1320,7 +1320,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1320,7 +1323,7 @@
              i = min(i, i_max);
          }
  
@@ -495,7 +531,7 @@ index 7f00bad..a9505ed 100644
  
          const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
          const uint8_t * q3 = (const uint8_t *) &q3_packed;
-@@ -1356,8 +1356,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1356,8 +1359,8 @@
      }
  }
  
@@ -506,16 +542,45 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1384,7 +1384,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1384,24 +1387,28 @@
              i = min(i, i_max);
          }
  
 -        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
 +        const block_iq3_s * bxi = ggml_cuda_mmq_x_row<block_iq3_s, has_fusion>(x, x_gate, kbx0, i, stride);
  
-         const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-@@ -1425,8 +1425,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+-        const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        // (bytes by shift and mask, as in the IQ1_S loader: bytes 2l and 2l+1 of the 8 are in the first int for l < 2)
++        const int qs_packed0 = get_int_b2(bxi->qs, 2*kqsx+0);
++        const int qs_packed1 = get_int_b2(bxi->qs, 2*kqsx+1);
+ 
+         const int qh = bxi->qh[kqsx];
+ 
+-        const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
+-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
++        const int signs_packed_32 = get_int_b2(bxi->signs, kqsx);
+ 
+ #pragma unroll
+         for (int l = 0; l < QR3_S; ++l) {
++            const int qs_w    = l < 2 ? qs_packed0 : qs_packed1;
++            const int qs_l0   = (qs_w >> (16*(l & 1) + 0)) & 0xFF;
++            const int qs_l1   = (qs_w >> (16*(l & 1) + 8)) & 0xFF;
++            const int signs_l = (signs_packed_32 >> (8*l)) & 0xFF;
+             const int2 grid_pos = make_int2(
+-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
++                iq3s_grid[qs_l0 | ((qh << (8 - 2*l)) & 0x100)],
++                iq3s_grid[qs_l1 | ((qh << (7 - 2*l)) & 0x100)]);
+ 
+-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
++            const int signs0 = __vcmpne4(((signs_l & 0x03) << 7) | ((signs_l & 0x0C) << 21), 0x00000000);
++            const int signs1 = __vcmpne4(((signs_l & 0x30) << 3) | ((signs_l & 0xC0) << 17), 0x00000000);
+ 
+             const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+             const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+@@ -1425,8 +1432,8 @@
      }
  }
  
@@ -526,7 +591,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1453,7 +1453,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1453,7 +1460,7 @@
              i = min(i, i_max);
          }
  
@@ -535,7 +600,7 @@ index 7f00bad..a9505ed 100644
  
          const int aux_q4 = get_int_b4(bxi->qs, kqsx);
          const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
-@@ -1477,7 +1477,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1477,7 +1484,7 @@
              i = min(i, i_max);
          }
  
@@ -544,7 +609,7 @@ index 7f00bad..a9505ed 100644
  
          const float d = __half2float(bxi->d);
  
-@@ -1492,8 +1492,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1492,8 +1499,8 @@
      }
  }
  
@@ -555,7 +620,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1522,7 +1522,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1522,7 +1529,7 @@
              i = min(i, i_max);
          }
  
@@ -564,7 +629,7 @@ index 7f00bad..a9505ed 100644
  
          const int aux_q4 = get_int_b2(bxi->qs, kqsx);
          const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
-@@ -1549,7 +1549,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1549,7 +1556,7 @@
              i = min(i, i_max);
          }
  
@@ -573,7 +638,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                       + kbxd] = __half2float(bxi->d);
-@@ -1561,8 +1561,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1561,8 +1568,8 @@
  
  // ---------------------------------------------------------------------------------------------
  
@@ -584,7 +649,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1591,7 +1591,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1591,7 +1598,7 @@
              i = min(i, i_max);
          }
  
@@ -593,7 +658,7 @@ index 7f00bad..a9505ed 100644
  
          const int aux_q4 = get_int_b1(bxi->qs, kqsx);
          const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-@@ -1618,7 +1618,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1618,7 +1625,7 @@
              i = min(i, i_max);
          }
  
@@ -602,7 +667,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
-@@ -1628,8 +1628,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1628,8 +1635,8 @@
      }
  }
  
@@ -613,7 +678,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1655,7 +1655,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1655,7 +1662,7 @@
              i = min(i, i_max);
          }
  
@@ -622,7 +687,7 @@ index 7f00bad..a9505ed 100644
  
          // quantize_mxfp4_mmq permutes nibbles to match the quantized format
          const int k0 = kbx * 4;
-@@ -1670,8 +1670,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1670,8 +1677,10 @@
      }
  }
  
@@ -635,7 +700,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1726,8 +1728,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1726,8 +1735,10 @@
      }
  }
  
