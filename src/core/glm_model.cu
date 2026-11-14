@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -2187,8 +2188,56 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     return best;
 }
 
+// A model GGUF without its NextN draft block (unsloth's Qwen3.8-27B UD-IQ1 / IQ2 quants) next to unsloth's separate
+// one (<gguf folder>/MTP/mtp-*.gguf: blk.<n_layers>.* of the same model): STRATA_GLM_MTP_GGUF is set to it, so the
+// loads below take the block from there.  An explicit STRATA_GLM_MTP_GGUF (empty: none) or STRATA_GLM_NO_MTP wins.
+static void mtp_auto(const std::string& pack_dir) {
+    if (getenv("STRATA_GLM_MTP_GGUF") != nullptr || getenv("STRATA_GLM_NO_MTP") != nullptr) return;
+    std::string err;
+    std::vector<std::string> names;
+    if (!pack_shard_names(pack_dir, names, err) || names.empty()) return;
+    try {
+        Glm5Geometry g;
+        std::vector<std::unique_ptr<strata::GgufFile>> gfs;
+        for (const auto& n : names) gfs.push_back(std::make_unique<strata::GgufFile>(pack_dir + "/../" + n));
+        if (!Glm5Geometry::from_gguf(*gfs[0], g, err) || !g.qwen35()) return;
+        const std::string key = "blk." + std::to_string(g.n_layers) + ".nextn.eh_proj.weight";
+        for (const auto& f : gfs)
+            if (f->find(key) != nullptr) return;   // (the model's own block)
+        namespace fs = std::filesystem;
+        // (beside the GGUF as the pack names it, and beside the file a symlink points to)
+        const fs::path named = fs::path(pack_dir + "/../" + names[0]);
+        std::error_code ec;
+        std::vector<fs::path> cand;
+        for (const fs::path& dir : {named.parent_path() / "MTP", fs::weakly_canonical(named, ec).parent_path() / "MTP"}) {
+            if (!fs::is_directory(dir, ec)) continue;
+            for (const auto& e : fs::directory_iterator(dir, ec))
+                if (e.path().extension() == ".gguf") cand.push_back(e.path());
+            if (!cand.empty()) break;
+        }
+        std::sort(cand.begin(), cand.end());
+        for (const auto& c : cand) {
+            strata::GgufFile m(c.string());
+            Glm5Geometry mg;
+            std::string e2;
+            if (m.find(key) == nullptr || !Glm5Geometry::from_gguf(m, mg, e2) || mg.n_embd != g.n_embd ||
+                mg.n_layers != g.n_layers || mg.n_vocab != g.n_vocab)
+                continue;
+#if defined(_WIN32)
+            _putenv_s("STRATA_GLM_MTP_GGUF", c.string().c_str());
+#else
+            setenv("STRATA_GLM_MTP_GGUF", c.string().c_str(), 1);
+#endif
+            std::fprintf(stderr, "glm mtp: the model's GGUF has no draft block - %s found beside it\n", c.string().c_str());
+            return;
+        }
+    } catch (const std::exception&) {
+    }
+}
+
 bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std::string& err,
                               const std::string& layer_split) {
+    mtp_auto(pack_dir);
     // the layer split is the DEFAULT on multi-GPU hosts (measured at steady state, 640-token GEN on
     // real text: 182 vs 840 MB/tok device bytes, decode 195 vs 506 ms/tok, hit 87-90 vs 64.4% - the
     // pools are per-part, so 2x capacity halves the demand reads).  STRATA_GLM_SPLIT=0 forces one
