@@ -85,6 +85,10 @@ void indexer(const float* iq, const uint16_t* K, const float* w, int idx_heads, 
 void indexer_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, int n_vis, float* score,
                     cudaStream_t s);
 void indexer_select(const float* score, int n_vis, int top_k, int* sel, cudaStream_t s);
+/// The DSA top-pools selection (dsa_topk.cuh's select_top_pools: cells in rank order, score descending, ties by the
+/// lower pool) over several blocks when n_vis is large - the same cells.  Returns false (nothing launched) when the
+/// one-block kernel should run instead: STRATA_DSA_TOPK_MB=0, n_vis below the threshold, or no free scratch slot.
+bool select_pools_mb(const float* score, int n_vis, int top, int kpool, int* cells, cudaStream_t s);
 
 /// Attention of one token at position p over the raw window (rows p-n_raw+1 .. p of the ring) and n_comp compressed
 /// rows (comp_sel[i] when given, else rows 0..n_comp-1), V = K, scale 1/sqrt(head_dim), the per-head sink in the

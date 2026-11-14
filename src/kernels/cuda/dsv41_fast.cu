@@ -377,7 +377,8 @@ void candidates(const float* score, int n_vis, int block, int top_blocks, float*
     const int top = std::min({top_blocks, B, strata::kernels::dsa::kMaxTop});   // (cand_blocks 2048 = kMaxTop)
     cudaMemsetAsync(keep, 0, (size_t) B, s);
     block_max_kernel<<<(B + 255) / 256, 256, 0, s>>>(score, n_vis, block, bscore, B);
-    block_select_kernel<<<1, 1024, 0, s>>>(bscore, B, top, bsel);
+    if (!strata::kernels::dsv4::select_pools_mb(bscore, B, top, 1, bsel, s))
+        block_select_kernel<<<1, 1024, 0, s>>>(bscore, B, top, bsel);
     keep_kernel<<<(top + 255) / 256, 256, 0, s>>>(bsel, top, B, keep);
     check("candidates");
 }

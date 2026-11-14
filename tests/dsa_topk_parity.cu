@@ -1,11 +1,14 @@
 // tests/dsa_topk_parity.cu - the O(n) DSA pool selection (src/kernels/cuda/dsa_topk.cuh) against the rank order the
 // O(n^2) loop defined (score descending, ties by the lower index), on random scores, heavy ties (the ReLU sums are
 // often exactly 0), one value everywhere and negative scores, n from 1 to 250k pools; and the old and new kernels'
-// times at the context sizes that matter.
+// times at the context sizes that matter.  Then the several-block version (select_top_pools_mb) against the one-block
+// kernel's cells, every grid size, the same shapes plus ties straddling the cut, many equal keys and ReLU-like scores,
+// and both kernels' times.
 //   nvcc -O3 -std=c++17 -arch=sm_70 -I src/kernels/cuda tests/dsa_topk_parity.cu -o build/dsa_topk_parity
 #include "dsa_topk.cuh"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <numeric>
 #include <random>
@@ -13,6 +16,10 @@
 
 __global__ void new_kernel(const float* sc, int n, int top, int kpool, int* cells) {
     strata::kernels::dsa::select_top_pools(sc, n, top, kpool, cells);
+}
+__global__ void __launch_bounds__(1024) mb_kernel(const float* sc, int n, int top, int kpool, int* cells,
+                                                  strata::kernels::dsa::MbScratch* ws) {
+    strata::kernels::dsa::select_top_pools_mb(sc, n, top, kpool, cells, ws);
 }
 
 // the loop it replaces (glm_fast.cu before 2026-10-07), scores from global memory
@@ -104,5 +111,114 @@ int main() {
         std::printf("context %6d (%5d pools): old %8.3f ms, new %6.3f ms per DSA layer per token\n", ctx, n,
                     t_old / reps_old, t_new / 10);
     }
-    return bad ? 1 : 0;
+    // ---- the several-block version: the one-block kernel's cells for every grid size
+    strata::kernels::dsa::MbScratch* ws = nullptr;
+    cudaMalloc(&ws, sizeof(*ws));
+    cudaMemset(ws, 0, sizeof(*ws));
+    const int nmax = 1 << 20;
+    float* d_m = nullptr;
+    int *d_a = nullptr, *d_b = nullptr;
+    cudaMalloc(&d_m, nmax * sizeof(float));
+    cudaMalloc(&d_a, 2048 * 4 * sizeof(int));
+    cudaMalloc(&d_b, 2048 * 4 * sizeof(int));
+    int mb_bad = 0, mb_cases = 0, nsm = 0, occ = 0;
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mb_kernel, 1024, 0);
+    const int gres = nsm * occ;
+    std::printf("several blocks: %d SMs / CUs x %d resident blocks of 1024 threads\n", nsm, occ);
+    const int mb_sizes[] = {2, 7, 512, 513, 2048, 2049, 4095, 8192, 8193, 12289, 16384, 32768, 32771, 65536, 100003,
+                            131072, 262144, 1 << 20};
+    const int grids[] = {1, 2, 3, 5, 8, 13, 16, 32, 64};
+    const char* mkinds[] = {"random", "ties", "constant", "negative", "relu", "straddle", "fewpos"};
+    for (const auto& cfg : configs)
+      for (int n : mb_sizes)
+        for (int kind = 0; kind < 7; ++kind) {
+            const int kpool = cfg[0], top_max = cfg[1];
+            std::vector<float> s(n);
+            std::uniform_real_distribution<float> u(0.0f, 10.0f);
+            std::uniform_int_distribution<int> q(0, 6);
+            std::exponential_distribution<float> ex(1.0f);
+            const int top = std::min(top_max, n);
+            for (int i = 0; i < n; ++i) {
+                switch (kind) {
+                    case 0: s[i] = u(rng); break;
+                    case 1: s[i] = q(rng) < 4 ? 0.0f : 0.25f * (float) q(rng); break;
+                    case 2: s[i] = 1.5f; break;
+                    case 3: s[i] = -u(rng); break;
+                    case 4: s[i] = q(rng) < 3 ? 0.0f : ex(rng); break;        // ReLU sums: many exact zeros
+                    case 5: s[i] = u(rng) + 20.0f; break;                    // set below: a tie run across the cut
+                    default: s[i] = (i % 997 == 0) ? u(rng) : 0.0f; break;   // fewer positives than top
+                }
+            }
+            if (kind == 5 && n > top) {   // top / 2 clear winners, then 3 x top equal keys spread over every slice
+                std::vector<int> idx(n);
+                std::iota(idx.begin(), idx.end(), 0);
+                std::shuffle(idx.begin(), idx.end(), rng);
+                for (int i = 0; i < n; ++i) s[i] = u(rng);
+                for (int i = 0; i < top / 2; ++i) s[idx[i]] = 100.0f + (float) i;
+                for (int i = top / 2; i < std::min(n, top / 2 + 3 * top); ++i) s[idx[i]] = 50.0f;
+            }
+            cudaMemcpy(d_m, s.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemset(d_a, 0xff, top_max * kpool * sizeof(int));
+            new_kernel<<<1, 1024>>>(d_m, n, top, kpool, d_a);
+            std::vector<int> want((size_t) top * kpool), got((size_t) top * kpool);
+            cudaMemcpy(want.data(), d_a, want.size() * sizeof(int), cudaMemcpyDeviceToHost);
+            for (int G : grids) {
+                if (G > gres) continue;   // (the barrier needs every block resident at once)
+                cudaMemset(d_b, 0xff, top_max * kpool * sizeof(int));
+                mb_kernel<<<G, 1024>>>(d_m, n, top, kpool, d_b, ws);
+                cudaMemcpy(got.data(), d_b, got.size() * sizeof(int), cudaMemcpyDeviceToHost);
+                const cudaError_t e = cudaGetLastError();
+                const bool ok = e == cudaSuccess && got == want;
+                ++mb_cases;
+                mb_bad += !ok;
+                if (!ok)
+                    std::printf("MB MISMATCH top %d kpool %d n=%d %s G=%d (%s)\n", top_max, kpool, n, mkinds[kind], G,
+                                cudaGetErrorString(e));
+            }
+        }
+    // the scratch is left clean (a second round on the same scratch gives the same cells: covered above, every case
+    // reuses it); check it is all zero
+    {
+        std::vector<unsigned char> h(sizeof(*ws));
+        cudaMemcpy(h.data(), ws, h.size(), cudaMemcpyDeviceToHost);
+        const size_t off = offsetof(strata::kernels::dsa::MbScratch, win);
+        const size_t off2 = offsetof(strata::kernels::dsa::MbScratch, bar);
+        bool clean = true;
+        for (size_t i = 0; i < off; ++i) clean = clean && h[i] == 0;
+        for (size_t i = off2; i < h.size(); ++i) clean = clean && h[i] == 0;
+        if (!clean) { std::printf("MB scratch not clean after the calls\n"); ++mb_bad; }
+    }
+    std::printf("several blocks: %d of %d cases match the one-block kernel\n", mb_cases - mb_bad, mb_cases);
+    // times: one block vs several (kernel launches back to back, events around 50)
+    for (const auto& tk : {std::pair<int, int>{512, 1}, std::pair<int, int>{2048, 1}}) {
+        const int top = tk.first;
+        for (int n : {4096, 8192, 12288, 16384, 32768, 65536, 131072, 262144}) {
+            std::vector<float> s(n);
+            std::exponential_distribution<float> ex(1.0f);
+            std::uniform_int_distribution<int> q(0, 6);
+            for (float& v : s) v = q(rng) < 2 ? 0.0f : ex(rng);
+            cudaMemcpy(d_m, s.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+            const auto time = [&](auto&& launch) {
+                float t = 0;
+                for (int rep = 0; rep < 2; ++rep) {
+                    cudaEventRecord(a);
+                    for (int i = 0; i < 50; ++i) launch();
+                    cudaEventRecord(b);
+                    cudaEventSynchronize(b);
+                    cudaEventElapsedTime(&t, a, b);
+                }
+                return 1000.0f * t / 50;
+            };
+            const float t1 = time([&] { new_kernel<<<1, 1024>>>(d_m, n, top, 1, d_a); });
+            std::printf("top %4d n %6d: one block %6.1f us |", top, n, t1);
+            for (int slice : {1024, 2048, 4096}) {
+                const int G = std::min(std::min(64, gres / 2), std::max(2, (n + slice - 1) / slice));
+                const float t2 = time([&] { mb_kernel<<<G, 1024>>>(d_m, n, top, 1, d_b, ws); });
+                std::printf(" slice %4d G %2d %6.1f us |", slice, G, t2);
+            }
+            std::printf("\n");
+        }
+    }
+    return (bad || mb_bad) ? 1 : 0;
 }

@@ -16,7 +16,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::kernels::dsv4 {
@@ -409,6 +411,13 @@ __global__ void __launch_bounds__(IW_WAVES * 32) idx_score_wmma_kernel(const flo
 __global__ void __launch_bounds__(1024) idx_select_kernel(const float* __restrict__ score, int n_vis, int top,
                                                           int* __restrict__ sel) {
     strata::kernels::dsa::select_top_pools(score, n_vis, top, 1, sel);
+}
+// the same selection over gridDim.x blocks (dsa_topk.cuh), on scratch slot `slot` of this device (select_pools_mb)
+constexpr int kMbSlots = 16;
+__device__ strata::kernels::dsa::MbScratch g_mb_scratch[kMbSlots];
+__global__ void __launch_bounds__(1024) idx_select_mb_kernel(const float* __restrict__ score, int n_vis, int top,
+                                                             int kpool, int* __restrict__ sel, int slot) {
+    strata::kernels::dsa::select_top_pools_mb(score, n_vis, top, kpool, sel, &g_mb_scratch[slot]);
 }
 
 // ---------------------------------------------------------------- attention
@@ -1722,6 +1731,11 @@ __global__ void __launch_bounds__(256) dspark_markov_kernel(const float* __restr
     }
 }
 
+// the one-block selection is as fast below this many pools when top <= 1024 (RTX 5090, tests/dsa_topk_parity.cu: 8K
+// pools 11.4 us one block vs 11.8, 12K 12.5 vs 11.6, 32K 20.6 vs 11.2); past 1024 its rank step (top^2 compares in one
+// block) costs ~95 us at any size and the grid always wins (2K-4K blocks of V4.1's candidates: 95 -> 34 us)
+constexpr int kMbMinPools = 12288;
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "dsv4_fast %s: %s\n", what, cudaGetErrorString(e));
@@ -1818,6 +1832,59 @@ static bool hip_wmma_arch() {
     return state[dev] == 1;
 }
 #endif
+// STRATA_DSA_TOPK_MB: 0 = always the one-block selection; 1 (default) = several blocks from kMbMinPools pools on (any
+// size when top > 1024); N > 1 = from N pools on.  STRATA_DSA_TOPK_MB_SLICE: pools a block (default 1024)
+static int mb_min_pools() {
+    static const int v = [] {
+        const char* e = getenv("STRATA_DSA_TOPK_MB");
+        const int x = e ? std::atoi(e) : 1;
+        return x <= 0 ? 0 : x == 1 ? kMbMinPools : x;
+    }();
+    return v;
+}
+bool select_pools_mb(const float* score, int n_vis, int top, int kpool, int* cells, cudaStream_t s) {
+    const int minp = mb_min_pools();
+    if (minp == 0 || (n_vis < minp && top <= 1024) || top < 1 || top > strata::kernels::dsa::kMaxTop || top > n_vis)
+        return false;
+    static const int slice = [] {
+        const char* e = getenv("STRATA_DSA_TOPK_MB_SLICE");
+        const int x = e ? std::atoi(e) : 1024;
+        return std::max(256, x);
+    }();
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    // per device: the resident block count (the grid stays at half of it at most, so every block is resident at once
+    // with room to spare for other streams' kernels) and a
+    // scratch slot a stream (calls on one stream run one after another; two streams never share a slot)
+    static std::mutex mu;
+    static int sms[64] = {};
+    static std::vector<std::pair<cudaStream_t, int>> slots[64];
+    int slot = -1, nsm = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (sms[dev] == 0) {   // the blocks the device holds at once (a 1024-thread block: one a CU / SM, or less)
+            int v = 0, occ = 0;
+            if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, idx_select_mb_kernel, 1024, 0) != cudaSuccess)
+                v = 0;
+            sms[dev] = v * occ > 0 ? v * occ : -1;
+        }
+        nsm = sms[dev];
+        for (const auto& e : slots[dev])
+            if (e.first == s) slot = e.second;
+        if (slot < 0 && (int) slots[dev].size() < kMbSlots) {
+            slot = (int) slots[dev].size();
+            slots[dev].push_back({s, slot});
+        }
+    }
+    const int gmax = std::min(strata::kernels::dsa::kMbMaxBlocks, nsm / 2);
+    if (slot < 0 || gmax < 2) return false;
+    const int G = std::min(gmax, std::max(2, (n_vis + slice - 1) / slice));
+    idx_select_mb_kernel<<<G, 1024, 0, s>>>(score, n_vis, top, kpool, cells, slot);
+    check("idx_select_mb");
+    return true;
+}
+
 void indexer(const float* iq, const uint16_t* K, const float* w, int idx_heads, int idx_dim, int n_vis, int top_k,
              float* score, int* sel, cudaStream_t s) {
     if (n_vis <= 0) return;
@@ -1827,7 +1894,8 @@ void indexer(const float* iq, const uint16_t* K, const float* w, int idx_heads, 
         idx_score_wmma_kernel<<<(n_vis + IW_WAVES * 16 - 1) / (IW_WAVES * 16), IW_WAVES * 32, 0, s>>>(iq, K, w, n_vis,
                                                                                                      score);
         check("idx_score_wmma");
-        idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
+        if (!select_pools_mb(score, n_vis, std::min(top_k, n_vis), 1, sel, s))
+            idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
         check("idx_select");
         return;
     }
@@ -1836,14 +1904,16 @@ void indexer(const float* iq, const uint16_t* K, const float* w, int idx_heads, 
         idx_score_mma_kernel<<<(n_vis + IDXM_WARPS * 16 - 1) / (IDXM_WARPS * 16), IDXM_WARPS * 32, 0, s>>>(iq, K, w, n_vis,
                                                                                                          score);
         check("idx_score_mma");
-        idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
+        if (!select_pools_mb(score, n_vis, std::min(top_k, n_vis), 1, sel, s))
+            idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
         check("idx_select");
         return;
     }
     const size_t sm = (size_t) (idx_heads * 128 + idx_heads) * sizeof(float);
     idx_score_kernel<<<(n_vis + IDX_WARPS - 1) / IDX_WARPS, IDX_WARPS * 32, sm, s>>>(iq, K, w, idx_heads, n_vis, score);
     check("idx_score");
-    idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
+    if (!select_pools_mb(score, n_vis, std::min(top_k, n_vis), 1, sel, s))
+        idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
     check("idx_select");
 }
 
@@ -1863,7 +1933,8 @@ void indexer_scores(const float* iq, const uint16_t* K, const float* w, int idx_
 
 void indexer_select(const float* score, int n_vis, int top_k, int* sel, cudaStream_t s) {
     if (n_vis <= 0) return;
-    idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
+    if (!select_pools_mb(score, n_vis, std::min(top_k, n_vis), 1, sel, s))
+        idx_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, std::min(top_k, n_vis), sel);
     check("idx_select");
 }
 
