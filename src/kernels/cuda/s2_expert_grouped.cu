@@ -19,6 +19,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "strata/kernels/packed_bytes.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -518,12 +519,11 @@ constexpr int D_ROWS = 64;                       // down rows per block: 8 per w
 // One activation chunk's contribution, `row_dot_s2_q8`'s inner body with the 32 int8 of the chunk already in
 // aligned words: same dp4a sequence, same float expression, so the result is bitwise the per-entry kernel's.
 __device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, float dx) {
-    const uint8_t* cbytes = (const uint8_t*) &cb;
     int s = 0, hx = 0;
     const int ones = 0x01010101;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        const unsigned cbyte = cbytes[j];
+        const unsigned cbyte = pk_u8(cb, j);
         const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
                               (((cbyte >> 6) & 3u) << 24));
         s = __dp4a(cw, xw[j], s);

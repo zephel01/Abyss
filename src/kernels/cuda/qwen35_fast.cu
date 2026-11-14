@@ -21,6 +21,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "strata/kernels/packed_bytes.hpp"
 #if !defined(STRATA_USE_HIP)
 #include <mma.h>
 #include <cooperative_groups.h>
@@ -290,17 +291,15 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_kernel(const float* __r
         const size_t row = ((size_t) t * n_head_kv + g) * kD + lane * 8;
         const uint4 kw = *(const uint4*) (kc + row);
         const uint4 vw = *(const uint4*) (vc + row);
-        const uint16_t* kh = (const uint16_t*) &kw;
-        const uint16_t* vh = (const uint16_t*) &vw;
         float dot = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) dot += qv[i] * h2f(kh[i]);
+        for (int i = 0; i < 8; ++i) dot += qv[i] * h2f(pk_u16(kw, i));
         const float sc = warp_sum(dot);
         const float mn = fmaxf(m, sc);
         const float a = expf(m - mn), pr = expf(sc - mn);
         l = l * a + pr;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) acc[i] = acc[i] * a + pr * h2f(vh[i]);
+        for (int i = 0; i < 8; ++i) acc[i] = acc[i] * a + pr * h2f(pk_u16(vw, i));
         m = mn;
     }
     if (lane == 0) {
@@ -386,26 +385,24 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_ids_kernel(const float*
 #pragma unroll
         for (int u = 0; u < kU; ++u) {
             if (tb + u * kWarps >= t1) break;
-            const uint16_t* kh = (const uint16_t*) &kw[u];
 #pragma unroll
             for (int j = 0; j < HPW; ++j) {
                 float dot = 0.0f;
 #pragma unroll
-                for (int i = 0; i < 8; ++i) dot += qv[j][i] * h2f(kh[i]);
+                for (int i = 0; i < 8; ++i) dot += qv[j][i] * h2f(pk_u16(kw[u], i));
                 sc[u][j] = warp_sum(dot);
             }
         }
 #pragma unroll
         for (int u = 0; u < kU; ++u) {
             if (tb + u * kWarps >= t1) break;
-            const uint16_t* vh = (const uint16_t*) &vw[u];
 #pragma unroll
             for (int j = 0; j < HPW; ++j) {
                 const float mn = fmaxf(m[j], sc[u][j]);
                 const float a = expf(m[j] - mn), pr = expf(sc[u][j] - mn);
                 l[j] = l[j] * a + pr;
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[j][i] = acc[j][i] * a + pr * h2f(vh[i]);
+                for (int i = 0; i < 8; ++i) acc[j][i] = acc[j][i] * a + pr * h2f(pk_u16(vw[u], i));
                 m[j] = mn;
             }
         }

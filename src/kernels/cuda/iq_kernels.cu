@@ -8,6 +8,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "strata/kernels/packed_bytes.hpp"
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -80,12 +81,11 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
                                                       const int& kbx, const int& iqs) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
     const int q2 = get_int_b2(bq2->qs, iqs);
-    const uint8_t* aux8 = (const uint8_t*) &q2;
     const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+        const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[pk_u8(q2, k0 / 2)];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -106,14 +106,13 @@ __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(const void* __restrict__ vb
                                                      const int& kbx, const int& iqs) {
     const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
     const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
-    const uint16_t* q2 = (const uint16_t*) &q2_packed;
     const int ls0 = bq2->scales[iqs / 2] & 0x0F;
     const int ls1 = bq2->scales[iqs / 2] >> 4;
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid_pos = ((const uint2*) iq2xs_grid)[q2[l0 / 2] & 0x1FF];
-        const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+        const uint2 grid_pos = ((const uint2*) iq2xs_grid)[pk_u16(q2_packed, l0 / 2) & 0x1FF];
+        const uint32_t signs = unpack_ksigns(pk_u16(q2_packed, l0 / 2) >> 9);
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -137,18 +136,16 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
     const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq2->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
-    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     const int ls0 = bq2->scales[iqs / 2] & 0x0F;
     const int ls1 = bq2->scales[iqs / 2] >> 4;
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+        const int* grid_pos = (const int*) (iq2s_grid + (pk_u8(qs_packed, l0 / 2) | ((qh << (8 - l0)) & 0x300)));
+        const int signs0 = __vcmpne4(((pk_u8(signs_packed_32, l0 / 2) & 0x03) << 7) | ((pk_u8(signs_packed_32, l0 / 2) & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((pk_u8(signs_packed_32, l0 / 2) & 0x30) << 3) | ((pk_u8(signs_packed_32, l0 / 2) & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -170,12 +167,11 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
                                                       const int& kbx, const int& iqs) {
     const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
     const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* q3 = (const uint8_t*) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(iq3xxs_grid[pk_u8(q3_packed, l0 + 0)], iq3xxs_grid[pk_u8(q3_packed, l0 + 1)]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -196,17 +192,15 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
     const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq3->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
-    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                                        iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+        const int2 grid_pos = make_int2(iq3s_grid[pk_u8(qs_packed, l0 + 0) | ((qh << (8 - l0)) & 0x100)],
+                                        iq3s_grid[pk_u8(qs_packed, l0 + 1) | ((qh << (7 - l0)) & 0x100)]);
+        const int signs0 = __vcmpne4(((pk_u8(signs_packed_32, l0 / 2) & 0x03) << 7) | ((pk_u8(signs_packed_32, l0 / 2) & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((pk_u8(signs_packed_32, l0 / 2) & 0x30) << 3) | ((pk_u8(signs_packed_32, l0 / 2) & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -223,13 +217,12 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
     const int qs_packed = get_int_b4(bq1->qs, iqs);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     int sumi[2] = {0, 0};
     float sumf[2] = {0.0f, 0.0f};
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
-        const int grid = iq1s_grid_gpu[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+        const int grid = iq1s_grid_gpu[pk_u8(qs_packed, l0 / 2) | ((qhl & 0x07) << 8)];
         const int grid0 = (grid >> 0) & 0x0F0F0F0F;
         const int grid1 = (grid >> 4) & 0x0F0F0F0F;
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
@@ -258,12 +251,11 @@ __device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
     const int qs_packed = get_int_b2(bq1->qs, iqs);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq1->qh[iqs];
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int grid = iq1s_grid_gpu[qs[l0 / 2] | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
+        const int grid = iq1s_grid_gpu[pk_u8(qs_packed, l0 / 2) | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
         const int grid0 = (grid >> 0) & 0x0F0F0F0F;
         const int grid1 = (grid >> 4) & 0x0F0F0F0F;
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);

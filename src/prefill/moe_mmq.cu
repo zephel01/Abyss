@@ -6,6 +6,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
+#include "strata/kernels/packed_bytes.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -62,10 +63,9 @@ __global__ void strata_q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __r
         return;
     }
     const uint4 q = *(const uint4*) codes;
-    const uint16_t* qh = (const uint16_t*) &q;
     out[0] = *scale;
 #pragma unroll
-    for (int k = 0; k < 8; ++k) out[1 + k] = qh[k];
+    for (int k = 0; k < 8; ++k) out[1 + k] = pk_u16(q, k);
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
