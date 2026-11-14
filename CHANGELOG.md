@@ -7,6 +7,49 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.146 - 2026-11-14
+
+- DeepSeek V4.1 1017 decode: the verify window runs pipelined as V4's (the columns in two groups on two streams, one
+  group's attention while the other waits on the CPU lane; until now V4.1's window was batched only), and the wider
+  n-gram windows of v1.3.145 (`STRATA_DS4_SPEC_ADAPT`, `STRATA_DS4_SPEC_GATE_FRESH`) are on for V4.1 too. RTX 5090
+  + 123 GB, iGPU off, V4.1 Compact JA256, 512 greedy tokens, median of 3 vs v1.3.145: editing a Python file 55.5 ->
+  71.5 tok/s (+28.8%), a swe-bench-like fix 64.4 -> 77.1 (+19.8%), English prose 61.6 -> 62.2 (+1.0%), Japanese
+  prose 66.8 -> 66.3 (-0.7%). Same tokens as before under `STRATA_DETERMINISTIC=1`. `STRATA_DS4_SPEC_ADAPT=0`: one
+  draft a window, `STRATA_DS4_SPEC_PIPE=0`: the batched window.
+- Prompts on a 16 GB card: a prompt up to 32K tokens is read in one chunk (`STRATA_GLM_PREFILL_SMALL_BELOW`, 4096 ->
+  32768) when 90% or more of the expert bytes fit in VRAM + the RAM tier; below that the old chunks stay (a disk-bound
+  box would push other experts to the SSD and decode slower). RTX 5090 limited to 16 GB, 16K prompt: V4 0731
+  UD-Q2_K_XL 1021 -> 1635 tok/s (+60%), first token 15.7 -> 9.8 s, decode the same. The change is only the order of
+  sums (KL against the token path 0.00810 vs 0.00786, two runs of one setting differ by 0.0070); deterministic
+  outputs change where the prompt now goes in one chunk. GLM-5.3-Flash 16 GB with a 60 GB RAM tier keeps the old
+  chunks (with `STRATA_GLM_PREFILL_SMALL_BELOW=32768`: prompt 592 -> 1265 tok/s, decode up to 15% slower on a slow
+  link). `=4096` brings back the old chunks everywhere. New debug env `STRATA_GLM_TOKEN_MS=1`: each token's time
+  since the request began.
+- Qwen3.8-27B: every unsloth file loads and runs (Q4_0 / Q4_1, F32 / BF16 weights, the UD-IQ / UD-Q2_K..Q8_K_XL
+  mixes, BF16), and `setup --quant <name>` picks any of them (default UD-Q4_K_XL). RTX 5090, decode / prompt tok/s
+  all in VRAM: UD-IQ2_XXS 114 / 2803, UD-IQ3_XXS 141 / 2865, UD-Q4_K_XL 133 / 2973, UD-Q6_K 110 / 2646, Q8_0 108 /
+  3139. The CPU lane has AVX2 rows for Q4_0 / Q4_1 (a Q4_0 file at 12 GB: 3.1 -> 39.7 tok/s); BF16 FFN rows on the
+  CPU lane are still scalar (slow).
+- Qwen3.8-27B files without the NextN block (UD-IQ1_S, UD-IQ1_M, UD-IQ2_XXS, UD-IQ2_XS, UD-IQ2_S) take the one in
+  `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` beside them (setup downloads it; `STRATA_GLM_MTP_GGUF=<file>` names one): UD-Q4_K_XL
+  with it 133.0 tok/s, 82.0% kept, against its own block 133.4, 83.1%. The fetch checks the byte range, the size and
+  each tensor's sha256.
+- Qwen3.8-27B images: the mmproj-F16 file encodes pictures (strata-vision, built by setup), the engine places their
+  rows on the picture grid with interleaved M-RoPE, and the server takes Qwen's markers, OpenAI `image_url` and
+  Anthropic `image` blocks. 0.3-0.6 s a picture; synthetic shapes / text / charts read as with llama.cpp's mtmd.
+  Text-only requests give the same tokens as before.
+- Fix (Qwen3.8-27B): with the MTP / NextN drafts the answer could differ from the one without drafts, also under
+  `STRATA_DETERMINISTIC=1` (already in v1.3.145). The window's GEMVs now give each column the token path's sums
+  (`STRATA_Q35_VERIFY_EXACT`, on), and the window's attention runs per column as the token path (27B has 6 query heads
+  a KV head, and the two kernels added the keys in another order). Speed the same or a little higher.
+- Fix (MoE prompts, all models): the row-id tables of the MMQ expert kernels get padding for the tiles' over-read
+  (`mmq::ids_pad`); no run here read past a table's end, so this is a guard. The IQ1_S / IQ2_S / IQ3_S / IQ2_XXS /
+  IQ3_XXS / Q4_K / Q5_K tile loaders and 42 places in Abyss's own kernels read packed bytes by shift and mask instead
+  of a `uint8_t*` to a local int. Same outputs, same speed.
+- Fix (`--serve` with the `--pack` engine, Qwen3.8 + MTP drafter): a verify window that crossed EOS or `--max-new`
+  kept all its accepted rows in the conversation, so the next request could not continue from it and re-read the
+  conversation from the last turn boundary. Only the rows that were sent stay now.
+
 ## v1.3.145 - 2026-11-14
 
 - DeepSeek V4 0731 decode: up to 5 n-gram drafts a verify window instead of one (`STRATA_DS4_SPEC_ADAPT`, now on for
