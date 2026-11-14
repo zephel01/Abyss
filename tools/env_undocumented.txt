@@ -173,6 +173,7 @@ STRATA_GLM_TAIL_SKIP_W  # src/core/glm_fast_path.cu
 STRATA_GLM_TEST_PIPE  # src/core/glm_pack_test.cpp
 STRATA_GLM_TIER_DIAG  # src/core/glm_fast_path.cu
 STRATA_GLM_TIER_GC  # src/core/glm_fast_path.cu
+STRATA_GLM_TOKEN_MS  # src/program/generate.cpp
 STRATA_GLM_TOKEN_SPIN  # src/core/glm_fast_path.cu
 STRATA_GLM_TOPK_PAR  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_TRACE  # src/core/glm_model.cu
