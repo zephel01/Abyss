@@ -7,6 +7,19 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.147 - 2026-11-15
+
+- DeepSeek V4 0731 / V4.1 1017: the first tokens after a prompt are faster. In the prompt's last chunk each MoE
+  layer moves up to 16 experts that the chunk's last 128 rows routed most into the VRAM slots of residents those rows
+  routed least, copied inside the GPU from where the prompt staged them (the residents go down to the RAM tier). RTX
+  5090 + 123 GB, iGPU off, median of 3 vs v1.3.146, first 64 tokens / 512 tokens (tok/s):
+  V4 0731 UD-Q2_K_XL 4K 54.0 -> 62.2 (+15%) / +3.9%, 16K 58.0 -> 68.2 (+18%) / +6.9%;
+  V4.1 Compact JA256 4K 42.7 -> 50.4 (+18%) / +3.5%, 16K 42.1 -> 56.0 (+33%) / +10%;
+  a 16 GB card: +4-9% / about the same. The copies down share the link with the prompt, so the prompt is ~1-1.6%
+  slower on a 32 GB card (V4 4K: +0.08 s to the first token), but the first 64 tokens still end sooner. Weights move
+  only: the same tokens (deterministic md5 unchanged). `STRATA_GLM_SEED_TAIL=0` turns it off, `=<n>` sets the swaps
+  a layer (any model). Off for GLM-5.3-Flash (its 16K prompts' 512 tokens -8%) and the other models.
+
 ## v1.3.146 - 2026-11-14
 
 - DeepSeek V4.1 1017 decode: the verify window runs pipelined as V4's (the columns in two groups on two streams, one
