@@ -630,6 +630,9 @@ public:
     // CUDA, off on HIP; STRATA_DETERMINISTIC sets 1) - gf::mvn's one warp a row against the token path's split Q6_K
     // rows made 3-column windows part from the plain answer (V4 0731 at token 16, 2026-11-14)
     bool ds_mvn(const void* jobs, int n, int T, cudaStream_t s);
+    // the dense qwen35's (Qwen3.8-27B) verify-window GEMVs: glm_mvn unless STRATA_Q35_VERIFY_EXACT=0 (as q4x_mvn:
+    // default on with CUDA, off with HIP); the MoE qwen35 (Ornith) and Laguna keep gf::mvn
+    bool q35_mvn(const void* jobs, int n, int T, cudaStream_t s);
     bool glm_window_check(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // STRATA_GLM_WINDOW_CHECK
     void kda_copy_layer(int il, int li, bool restore, float* bak = nullptr);   // one KDA layer's S + conv <-> kda_bak_
     // the NextN block (blk.<n_layers>) as the drafter on one GPU (qwen35_fast_path.cu, behind the q35_mtp_* hooks)

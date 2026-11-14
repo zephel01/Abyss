@@ -1412,6 +1412,7 @@ static int glm_pack_generate(const Options& o) {
         static const char* const kOn[][2] = {{"STRATA_MMQ_WHOLE_K", "1"}, {"STRATA_GLM_PREFILL_WINDOW", "0"},
                                              {"STRATA_Q4X_VERIFY_EXACT", "1"},   // (Qwen3.8's verify GEMVs, #42)
                                              {"STRATA_DS4_VERIFY_EXACT", "1"},   // (DeepSeek V4 / V4.1's, 2026-11-14)
+                                             {"STRATA_Q35_VERIFY_EXACT", "1"},   // (Qwen3.8-27B's)
                                              {"STRATA_GLM_DRAIN_WAIT", "1"}};
         std::string kept;
         for (const char* k : kOff) {

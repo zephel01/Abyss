@@ -204,6 +204,8 @@ struct VerifyBuf {
 };
 }  // namespace
 
+static bool q35_exact(const Glm5Geometry& g);   // (the dense qwen35 verify window: q35_mvn below)
+
 bool Glm5Model::verify_ready() const {
     // every part of a split (the window runs part after part): the fast path, no draft block, prefetch or lookahead,
     // MoE layers; the head's weights on the last
@@ -1616,7 +1618,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             j[1] = {Ly.zg.q, V->xq, V->x, V->q35_z, nullptr, 1.0f, Ly.zg.type, (int) E, Vd};
             j[2] = {Ly.alpha_w.q, V->xq, V->x, alpha, nullptr, 1.0f, Ly.alpha_w.type, (int) E, HV};
             j[3] = {Ly.beta_w.q, V->xq, V->x, beta, nullptr, 1.0f, Ly.beta_w.type, (int) E, HV};
-            if (!gf::mvn(j, 4, T, s)) { err = "qwen35 verify: the delta-net projections"; return false; }
+            if (!q35_mvn(j, 4, T, s)) { err = "qwen35 verify: the delta-net projections"; return false; }
             q35::conv_rows(qkv, T, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, rows, s);
             q35::gdn_prep_gates(rows, T, C, HK, Sd, g.norm_eps, alpha, beta, Ly.dt_bias, Ly.ssm_a, HV, s);
             q35::gdn_scan(Ly.gdn_state, rows, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
@@ -1624,7 +1626,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                                                (void*) s);
             gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
             gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, (int) E};
-            if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: ssm_out"; return false; }
+            if (!q35_mvn(&o, 1, T, s)) { err = "qwen35 verify: ssm_out"; return false; }
             ++li;
         } else if (g.laguna) {   // fast_laguna_attn over the columns (the window layers' rings keep their 512 rows)
             namespace lk = strata::kernels::lag;
@@ -1651,7 +1653,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             j[0] = {Ly.aq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.aq.type, (int) E, 2 * HD};
             j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, (int) E, KV};
             j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, (int) E, KV};
-            if (!gf::mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
+            if (!q35_mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
             q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                 g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s, q35_kv_);
             q35::attn_window(V->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p0, T, 1.0f / std::sqrt((float) D),
@@ -1659,7 +1661,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s, q35_kv_);
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, (int) E};
-            if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: attn_output"; return false; }
+            if (!q35_mvn(&o, 1, T, s)) { err = "qwen35 verify: attn_output"; return false; }
         }
         mark(1);
         abl_out(il, 0, V->mixer, T, (int) E, s);
@@ -1675,8 +1677,8 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                 const auto mvc = [&](const gf::MvJob* j, int n, const char* what) {
                     bool all = true;
                     for (int i = 0; i < n; ++i) all = all && gf::mvn_supported(j[i].type);
-                    if (all) {
-                        if (!gf::mvn(j, n, T, s)) { err = std::string("qwen35 verify: ") + what; return false; }
+                    if (all || q35_exact(g)) {
+                        if (!q35_mvn(j, n, T, s)) { err = std::string("qwen35 verify: ") + what; return false; }
                         return true;
                     }
                     for (int i = 0; i < n; ++i) {
@@ -1725,7 +1727,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
     if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
         if (!q35d_head(V->head_xq, T, V->logits, s, err)) return false;
     } else if (gf::mvn_supported(ow.type)) {
-        if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: output head"; return false; }
+        if (!q35_mvn(&o, 1, T, s)) { err = "qwen35 verify: output head"; return false; }
     } else {
         for (int t = 0; t < T; ++t) {
             gf::MvJob ot = o;
@@ -2376,6 +2378,26 @@ bool Glm5Model::ds_mvn(const void* jobs, int n, int T, cudaStream_t s) {
 #endif
     }();
     return exact ? glm_mvn(jobs, n, T, s) : gf::mvn((const gf::MvJob*) jobs, n, T, s);
+}
+
+// the dense qwen35's verify window (Qwen3.8-27B with its NextN drafter or the n-gram windows): gf::mvn's one launch a
+// type summed some columns in another order than the token path's mv() (UD-IQ2_XXS / UD-IQ3_XXS: greedy answers with
+// drafts parted from the ones without at token 100-160 of a 4K prompt), so glm_mvn gives each column mv()'s sums -
+// STRATA_Q35_VERIFY_EXACT=0: gf::mvn (default on CUDA; HIP 0, as STRATA_Q4X_VERIFY_EXACT; STRATA_DETERMINISTIC sets 1)
+static bool q35_exact(const Glm5Geometry& g) {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_Q35_VERIFY_EXACT");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
+    return on && g.qwen35() && g.n_expert == 0 && !g.laguna && !g.q4x;
+}
+
+bool Glm5Model::q35_mvn(const void* jobs, int n, int T, cudaStream_t s) {
+    return q35_exact(g_) ? glm_mvn(jobs, n, T, s) : gf::mvn((const gf::MvJob*) jobs, n, T, s);
 }
 
 bool Glm5Model::glm_mvn(const void* jobs, int n, int T, cudaStream_t s) {
