@@ -216,3 +216,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 ### DeepSeek V4.1 の画像
 
 DeepSeek V4.1 の画像エンコーダーは、セットアップでは入りません。設定ファイルの `vision` を手で書きます（`exe` は llama.cpp b11870 以降で作った `strata-vision`、`mmproj` はモデルの `deepseek41v` の変換器ファイル、`model` はモデルの最初の GGUF ファイルで、エンコーダーが語彙を読みます）。`STRATA_GLM_VL_BIAS` は、画像の位置で専門家を選ぶときの偏り（`exp_probs_b_vl`。層数 × 専門家数、リトルエンディアンの F32、ヘッダーなし）のファイルを指します。指定がなければ、パックの横の `exp_probs_b_vl.f32` を読みます。これは GGUF に `exp_probs_b_vl.bias` があるとき `tools/iq_pack.py` が書き出します。どちらも無ければモデルは普通に起動し、画像つきの要求は断られます。画像の位置では、この偏りで専門家を選び、Engram は何も足しません。文字の位置は変わりません。HIP のビルドでは画像は使えません。
+
+### Qwen3.8-27B の画像
+
+`./setup-deepseek.sh --model qwen38-27b` は、画像を使えるようにするかを聞きます（既定は「はい」。`--no-vision` で飛ばす）。unsloth の `mmproj-F16.gguf`（0.93 GB。大きさと SHA-256 を確かめる）をダウンロードし、`strata-vision`（llama.cpp の画像ライブラリ。初回だけ 10〜20 分）を作り、`vision` を書きます。`exe` はエンコーダー、`mmproj` は変換器のファイル、`model` はモデルの GGUF です（エンコーダーは語彙だけを読みます）。dense のモデルにはエンコーダーに貸すエキスパートのキャッシュがないため、モデルと文脈のほかに約 1.5 GB 空く GPU では `"gpu": true, "resident": true`（エンコーダーは GPU に置いたまま、約 1 GB）、空かなければ `"gpu": false`（CPU で動く。遅い）と書きます。画像は OpenAI の `image_url`、Anthropic の `image` ブロックで渡します。エンジンは画像の行をその 2 次元の格子に並べ（M-RoPE。回転の位置は GGUF の `qwen35.rope.dimension_sections` に従う）、画像のあとの文字はそこから続けます。文字だけの要求は変わりません。HIP のビルドと Qwen3.8-Flash-Next では画像は使えません。MoE の qwen35（Ornith）も同じ経路を通りますが、未検証です（変換器ファイルは試していない）。

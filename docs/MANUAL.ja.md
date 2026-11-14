@@ -79,7 +79,15 @@ v1.3.142 からは 8 GB の GPU でも動く（8K）。8 GB 未満の GPU では
 
 ```sh
 ./setup-deepseek.sh --model qwen38-27b --download-model   # Qwen3.8-27B-UD-Q4_K_XL（17.7 GB）
+./setup-deepseek.sh --model qwen38-27b --quant UD-Q6_K --download-model   # リポジトリのほかのファイル
 ```
+
+`--quant` には [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) のどのファイルでも指定できる
+（UD-IQ1_S〜UD-Q8_K_XL、Q4_0、Q4_1、Q8_0、BF16）。指定しなければ、UD-IQ2_XXS / UD-IQ3_XXS / UD-Q4_K_XL / UD-Q6_K / Q8_0
+のうち GPU にすべて載る最大のものを示し、既定は UD-Q4_K_XL のまま。NextN ブロックのないファイル（UD-IQ1_S、UD-IQ1_M、
+UD-IQ2_XXS、UD-IQ2_XS、UD-IQ2_S）では、unsloth の別ファイル（`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`、1.4 GB）も取ってくる。
+そのあと画像を使えるようにするかを聞く（unsloth の `mmproj-F16.gguf` 0.93 GB と `strata-vision` のビルド。
+`--no-vision` で飛ばす）。
 
 zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
 から、モデルカードを測ったときの値にする。Qwen3.8 はシャードにある MTP 層で下書きする。V4 の自作版は単体 GPU では DSpark
@@ -732,7 +740,18 @@ SwiGLU FFN（5120 → 17408）でエキスパートはなく、下書きは Next
   プロンプト経路の llama.cpp との KL は 0.00196（F32 カーネルは 0.00193）。プロンプト経路の出力は v1.3.141 とビット単位では
   一致しません。`STRATA_Q35_PATTN=1` で F32 カーネルに戻ります（v1.3.141 と同じ結果）。`=2` は MoE の qwen35 モデル（Ornith、
   Qwen3.8-Flash-Next。デフォルトではオフ）にも新しいカーネルを使います。
-- **まだないもの:** 複数 GPU へのレイヤー分割、AMD（コンパイルは通る。未検証）、画像。
+- **unsloth のリポジトリのすべてのファイル。** GPU のカーネル、プロンプト経路、CPU レーン（12〜20 GB / 8 GB の GPU）が、
+  各ファイルの型をすべて読みます。Q4_0 / Q4_1 の行、BF16 の FFN の行（UD-Q8_K_XL、BF16）、プロンプト経路での i-quant
+  （IQ1_S / IQ1_M / IQ2 / IQ3）と Q2_K の射影（MMQ がその型を持たない層は、層ごとに FP16 の積で計算）。RTX 5090 での実測（VRAM にすべて / 12 GB / 8 GB、下書きありの生成 tok/s）: UD-IQ2_XXS 114 / 117 / 81、UD-IQ3_XXS 141 / 140 / 27、UD-Q4_K_XL 133 / 30 / 17、UD-Q6_K 110 / 19 / 13、Q8_0 108 / 12 / 11。同じファイルでの llama.cpp との KL は 0.0005〜0.0025。CPU レーンの BF16 の行はまだ遅いです（12 GB 以下）。
+- **別ファイルの NextN ブロック。** blk.64 のないファイルは、横の `MTP/` にあるもの（unsloth の
+  `mtp-Qwen3.8-27B-Q4_0.gguf`）を使います。`STRATA_GLM_MTP_GGUF=<ファイル>` でほかのものを指定でき（自分のブロックを
+  持つファイルでも）、`STRATA_GLM_NO_MTP=1` で下書きしません。別ファイルのブロックも自分のブロックと同じくらい当たります（UD-Q4_K_XL: 133.0 対 133.4 tok/s、採用率 82% 対 83%）。下書きありの greedy の答えは下書きなしと同じです（`STRATA_DETERMINISTIC=1`、同じチャンクの大きさ）。
+- **画像。** 設定に `vision` があれば（セットアップが書く）画像を読みます。OpenAI の `image_url`、Anthropic の `image`
+  ブロックで渡します。画像の行はその 2 次元の格子の位置を取り（interleaved M-RoPE。区分は GGUF から読む）、画像のあとの
+  文字はそこから続きます。画像 1 枚は 0.3〜0.6 秒ほど（225〜300 行）。 文字だけの要求は変わりません（前と同じトークン）。設定:
+  [docs/SETTINGS.ja.md](SETTINGS.ja.md#qwen38-27b-の画像)。
+- **まだないもの:** 複数 GPU へのレイヤー分割、AMD（コンパイルは通る。未検証）、AMD での画像。Qwen3.8-Flash-Next は画像を
+  断ります。MoE の qwen35（Ornith）も同じ画像の経路を通りますが未検証です（変換器ファイルは試していない）。
 
 ## Laguna-S-2.1
 

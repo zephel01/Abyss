@@ -82,7 +82,15 @@ holds (8-11 GB: 8K, 24 GB: 32K, 32 GB: 128K;
 
 ```sh
 ./setup-deepseek.sh --model qwen38-27b --download-model   # Qwen3.8-27B-UD-Q4_K_XL (17.7 GB)
+./setup-deepseek.sh --model qwen38-27b --quant UD-Q6_K --download-model   # any other file of the repo
 ```
+
+`--quant` takes every file of [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (UD-IQ1_S
+to UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16); without it the setup names the largest of UD-IQ2_XXS / UD-IQ3_XXS / UD-Q4_K_XL /
+UD-Q6_K / Q8_0 that the GPU holds all in VRAM and keeps UD-Q4_K_XL as the default. For the files without the NextN
+block (UD-IQ1_S, UD-IQ1_M, UD-IQ2_XXS, UD-IQ2_XS, UD-IQ2_S) it also fetches unsloth's separate one
+(`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, 1.4 GB). It then asks whether to set up images (unsloth's `mmproj-F16.gguf`, 0.93 GB,
+and the `strata-vision` build; `--no-vision` skips it).
 
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
 card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
@@ -775,7 +783,18 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
   0.019 ms a token). KL against llama.cpp on the prompt path 0.00196 (the F32 kernel: 0.00193); the outputs are not
   bit-identical to v1.3.141's on the prompt path. `STRATA_Q35_PATTN=1` brings back the F32 kernel (v1.3.141's results
   exactly); `=2` also uses the new kernel on the MoE qwen35 models (Ornith, Qwen3.8-Flash-Next: off by default).
-- **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images.
+- **Every file of unsloth's repo.** The GPU kernels, the prompt path and the CPU lane (12-20 GB / 8 GB GPUs) read
+  every type the files use: Q4_0 / Q4_1 rows, BF16 FFN rows (UD-Q8_K_XL, BF16), the i-quants (IQ1_S / IQ1_M / IQ2 /
+  IQ3) and Q2_K projections on the prompt path (FP16 products where MMQ lacks the type, per layer). Measured on an RTX 5090 (all in VRAM / 12 GB / 8 GB, decode tok/s with the drafter): UD-IQ2_XXS 114 / 117 / 81, UD-IQ3_XXS 141 / 140 / 27, UD-Q4_K_XL 133 / 30 / 17, UD-Q6_K 110 / 19 / 13, Q8_0 108 / 12 / 11; KL vs llama.cpp on the same file 0.0005-0.0025. BF16 rows on the CPU lane are still slow (12 GB and less).
+- **The separate NextN block.** A file without blk.64 takes the one in `MTP/` beside it (unsloth's
+  `mtp-Qwen3.8-27B-Q4_0.gguf`); `STRATA_GLM_MTP_GGUF=<file>` names another (also for a file that has its own),
+  `STRATA_GLM_NO_MTP=1` drafts nothing. The separate block drafts as well as a file's own (UD-Q4_K_XL: 133.0 vs 133.4 tok/s, 82% vs 83% accepted), and greedy answers with drafts equal the ones without (`STRATA_DETERMINISTIC=1`, same chunk size).
+- **Images.** With the `vision` entry (the setup writes it) the model reads pictures: OpenAI `image_url` items and
+  Anthropic `image` blocks; the picture's rows take their 2-D grid positions (interleaved M-RoPE, the sections from
+  the GGUF) and the text after them continues from there. A picture takes about 0.3-0.6 s (225-300 rows). Text-only requests are unchanged (the same tokens
+  as before). Settings: [docs/SETTINGS.md](SETTINGS.md#images-on-qwen38-27b).
+- **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images on AMD; Qwen3.8-Flash-Next refuses
+  images; the MoE qwen35 models (Ornith) take the same image path but are untested (no projector file tried).
 
 ## Laguna-S-2.1
 

@@ -98,7 +98,6 @@ STRATA_GLM_MTP_CHAIN_H  # src/core/qwen35_fast_path.cu (experiment)
 STRATA_GLM_MTP_KEEP  # src/core/glm_fast_path.cu
 STRATA_GLM_MTP_MISS  # src/core/glm_fast_path.cu
 STRATA_GLM_MV_GENERIC  # src/kernels/cuda/glm_fast.cu
-STRATA_GLM_NO_MTP  # src/core/glm_fast_path.cu
 STRATA_GLM_NO_PREFILL  # src/core/glm_prefill.cu
 STRATA_GLM_NO_SPEC  # src/core/glm_fast_path.cu
 STRATA_GLM_NO_STAGE  # src/core/glm_model.cu
