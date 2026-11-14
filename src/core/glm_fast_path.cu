@@ -4698,8 +4698,10 @@ void Glm5Model::fast_destroy() {
         std::fprintf(stderr, "glm fast prof CUDA%d (%llu tokens, %.2f ms/token of GPU stream time):\n", dev_,
                      (unsigned long long) F->ptokens, tot / (double) F->ptokens);
         for (auto& e : v)
-            std::fprintf(stderr, "  %-18s %7.3f ms/token  %5.1f%%\n", e.second.c_str(), e.first / (double) F->ptokens,
-                         100.0 * e.first / tot);
+            std::fprintf(stderr, "  %-18s %7.3f ms/token  %5.1f%%  %8.3f ms a call (%llu)\n", e.second.c_str(),
+                         e.first / (double) F->ptokens, 100.0 * e.first / tot,
+                         e.first / (double) std::max<uint64_t>(1, F->pcnt[e.second]),
+                         (unsigned long long) F->pcnt[e.second]);
     }
     for (auto e : F->pev) cudaEventDestroy(e);
     if (dsv4_snap_) {

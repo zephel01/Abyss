@@ -911,8 +911,9 @@ bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std:
     return true;
 }
 
-bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& err) {
+bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& err, cudaStream_t s) {
     FastState* F = fast_;
+    if (s == nullptr) s = F->cs;   // (the pipelined window: the column's group's stream)
     const int k = F->L[(size_t) il].eng;
     if (k < 0) { err = "deepseek41: layer " + std::to_string(il) + " has no Engram table"; return false; }
     auto* E = (V41Engram*) v41_eng_;
@@ -920,10 +921,10 @@ bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& er
     const size_t blk = (size_t) T * kEngCols * kEngDim;   // one table's rows of the window
     if (E != nullptr && E->w_async && !E->w_waited[k]) {   // the table's first use this window: its rows landed?
         d41::engram_wait(F->v41_eng_flag + k, E->w_seq, F->v41_pblk_h + (size_t) k * blk, F->v41_pblk + (size_t) k * blk,
-                         (int) blk, F->cs);
+                         (int) blk, s);
         E->w_waited[k] = true;
     }
-    return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) k * blk + (size_t) t * kEngCols * kEngDim);
+    return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) k * blk + (size_t) t * kEngCols * kEngDim, s);
 }
 
 // after a token's layers: the background reader's failure for this token, if any (its rows were never written, the
@@ -934,24 +935,25 @@ bool Glm5Model::dsv41_engram_ok(std::string& err) {
     return engram_sync(*E, err);
 }
 
-bool Glm5Model::dsv41_engram_add(int il, float* R, std::string& err, const float* rows) {
+bool Glm5Model::dsv41_engram_add(int il, float* R, std::string& err, const float* rows, cudaStream_t s) {
     FastState* F = fast_;
+    if (s == nullptr) s = F->cs;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
     if (rows == nullptr) {   // a decode token's rows
         rows = F->v41_eng + (size_t) Ly.eng * kEngCols * kEngDim;
         if (F->v41_eng_async)
             d41::engram_wait(F->v41_eng_flag + Ly.eng, F->v41_eng_seq, F->v41_eng_h + (size_t) Ly.eng * kEngCols * kEngDim,
-                             (float*) rows, kEngCols * kEngDim, F->cs);
+                             (float*) rows, kEngCols * kEngDim, s);
     }
     const void* rq = nullptr;   // (a quantized engram_kv - mrfakename's Q2_K - takes the rows as Q8_1)
     if (Ly.eng_kv.type != gf::kTypeBF16 && Ly.eng_kv.type != gf::kTypeF32) {
         rq = (const uint8_t*) F->v41_eng_q + (size_t) Ly.eng * kEngCols * kEngDim / 32 * 36;
-        gf::quantize_q8_1(rows, (void*) rq, kEngCols * kEngDim, F->cs);
+        gf::quantize_q8_1(rows, (void*) rq, kEngCols * kEngDim, s);
     }
     gf::MvJob j = {Ly.eng_kv.q, rq, rows, F->v41_eng_kv, nullptr, 1.0f, Ly.eng_kv.type, kEngCols * kEngDim, 5 * g.n_embd};
-    if (!gf::mv(&j, 1, F->cs)) { err = "deepseek41: engram_kv"; return false; }
-    d41::engram_add(R, F->v41_eng_kv, Ly.eng_qn, Ly.eng_kn, g.n_embd, g.norm_eps, F->cs);
+    if (!gf::mv(&j, 1, s)) { err = "deepseek41: engram_kv"; return false; }
+    d41::engram_add(R, F->v41_eng_kv, Ly.eng_qn, Ly.eng_kn, g.n_embd, g.norm_eps, s);
     if (F->prof_on) F->mark("v41_engram");
     return true;
 }

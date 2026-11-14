@@ -1444,8 +1444,8 @@ static int glm_pack_generate(const Options& o) {
     // STRATA_DS4_SPEC_ADAPT: without a drafter, the DSpark decode's repeats alone - the n-gram's drafts up to 5 while
     // each position's share right says, the window's width by the tokens it keeps a millisecond (STRATA_DS4_SPEC_COST
     // below) - instead of one draft a window and the gate.  Default (v1.3.145): on for GLM-5.3-Flash, DeepSeek V4 and
-    // V4.1 (a window of 4-6 columns costs little more than one of 2 there: V4.1 JA256 on an RTX 5090 17 / 34 / 45 /
-    // 43 / 54 ms for 1-5 columns), off for the other models; =1 / =0 force it.  -1 here: the model decides
+    // V4.1 (a window of 4-6 columns costs little more than one of 2 there: V4.1 JA256 on an RTX 5090, pipelined,
+    // 21 / 31 / 48 / 50 / 60 / 70 ms for 1-6 columns), off for the other models; =1 / =0 force it.  -1 here: the model decides
     const int spec_adapt_env = [] {
         const char* v = std::getenv("STRATA_DS4_SPEC_ADAPT");
         return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
@@ -1477,10 +1477,13 @@ static int glm_pack_generate(const Options& o) {
     // STRATA_GLM_WINDOW=2)
     const bool ds_v4 = model.geometry().dsv4() && !model.geometry().v41;
     const bool glm53 = model.geometry().arch == 0 && !model.geometry().v41;
-    const bool spec_adapt = spec_adapt_env >= 0 ? spec_adapt_env != 0 : ds_v4 || glm53;
+    // (V4.1 1017 too since its window is pipelined - dsv4_verify.cu verify_part_v41, 2026-11-14: JA256 against one
+    // draft a window, the edit task 55.5 -> 71.5 tok/s +28.8%, swe-bench text 64.4 -> 77.1 +19.8%, prose +1.0 / -0.7%;
+    // margin 1.10 - at 1.02 prose -0.9 / -1.4%)
+    const bool spec_adapt = spec_adapt_env >= 0 ? spec_adapt_env != 0 : ds_v4 || glm53 || model.geometry().v41;
     // STRATA_DS4_SPEC_GATE_FRESH (the gate's and the cost table's warm-up, below): default on with the wider windows
-    // (V4 0731, GLM-5.3-Flash's opt-in window); V4.1 keeps v1.3.144's gate - with one draft a window the fresh gate let
-    // more windows through on prose (JA256: 9 against 4, 33% kept) and cost 4% there
+    // (V4 0731, V4.1 1017, GLM-5.3-Flash's opt-in window); with one draft a window (STRATA_DS4_SPEC_ADAPT=0) the old
+    // gate - there the fresh gate let more windows through on prose (V4.1 JA256: 9 against 4, 33% kept) and cost 4%
     const bool spec_fresh = [&] {
         const char* v = std::getenv("STRATA_DS4_SPEC_GATE_FRESH");
         return v != nullptr ? std::atoi(v) != 0 : spec_adapt;

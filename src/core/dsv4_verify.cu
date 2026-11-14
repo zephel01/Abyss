@@ -22,7 +22,7 @@
 // A layer split: the parts one after another (verify_part), as a token's - each part's last layer writes its columns'
 // complete residuals, which cross to the next part through a pinned host buffer, the copies ordered by an event; the
 // last part runs the head and keeps the logits and the argmax (verify_argmax / _sample / _logits read its buffers).
-// deepseek41 (verify_part_v41, verify_attn_v41; the batched kind, one part): fast_dsv41_attn's attention with the
+// deepseek41 (verify_part_v41, verify_attn_v41; one part, pipelined or batched as deepseek4's): fast_dsv41_attn's attention with the
 // dense GEMVs over the columns; per column its two lagged pre buffers, its index selection and candidate blocks (a
 // later layer of the same column reads them), and its Engram rows - read for every column before the layers, the
 // n-gram history advancing over the window's tokens.  A rejected column leaves nothing a later position reads: the
@@ -444,7 +444,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
         }
         for (int t = 1; t < TM; ++t) V->md[(size_t) t].scratch = V->scr_set[std::min(t, NS)];
         V->n_scr = NS;
-        V->pipe = ok && !g.v41 && g.arch != 0;   // (deepseek41, glm5-next: the batched window only)
+        V->pipe = ok && g.arch != 0;   // (glm5-next: the batched window only)
     } else {
         cudaGetLastError();
         std::fprintf(stderr, "deepseek4 verify: no VRAM for the pipelined window's scratch slots (%.0f MB) - batched\n",
@@ -1071,8 +1071,8 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         return 1;
 #endif
     }();
-    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.v41 && !g.qwen35() && g.arch != 0;
-    const bool use_pipe = g.v41 || g.qwen35() || g.arch == 0 ? false   // (deepseek41, qwen35moe, glm5-next: batched)
+    bool timed = pipe_env < 0 && V->pipe_choice[T] < 0 && T > 1 && !F->prof_on && !g.qwen35() && g.arch != 0;
+    const bool use_pipe = g.qwen35() || g.arch == 0 ? false   // (qwen35moe, glm5-next: batched)
                         : pipe_env >= 0 ? pipe_env != 0
                         : V->pipe_choice[T] >= 0 ? V->pipe_choice[T] != 0
                         : V->ms_pipe[T].size() <= V->ms_batch[T].size();   // (timing: alternate a width, pipelined first)
@@ -1432,7 +1432,8 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
     return true;
 }
 
-// deepseek41's window (one part, the batched kind): fast_layers' V4.1 layer loop with the columns side by side -
+// deepseek41's window (one part; pipelined - the columns in groups on their own streams, as verify_part's - or batched):
+// fast_layers' V4.1 layer loop with the columns side by side -
 // an Engram layer writes the previous FFN alone, adds the column's rows, then reads without a write; the reads
 // collapse with the previous sublayer's pre (each column's pair of buffers, layer 0's one-hot set by verify); then
 // the last write half, the head's collapse with the last FFN's pre, the output rows of every column at once and each
@@ -1449,7 +1450,7 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
         Rc[(size_t) t] = V->R + (size_t) t * 2 * HCE;
         Ro[(size_t) t] = Rc[(size_t) t] + HCE;
     }
-    const auto hc_read = [&](int il, int t, const float* block_out, bool attn) {
+    const auto hc_read = [&](int il, int t, const float* block_out, bool attn, cudaStream_t hs) {
         const auto& Ly = F->L[(size_t) il];
         float* pp = V->v41_pre + (size_t) t * 8;   // [0, 4) the attention side's pre, [4, 8) the FFN side's
         gf::HcArgs h;
@@ -1479,13 +1480,47 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
             h.cpu_ans = V->md[(size_t) t].cpu_ans;
             V->hc_cpu[t] = false;
         }
-        gf::hc(h, s);
+        gf::hc(h, hs);
         if (block_out != nullptr) std::swap(Rc[(size_t) t], Ro[(size_t) t]);
         if (attn && V->bg_after[t]) {
             V->bg_after[t] = false;
-            F->bg_drain(s, F->bg_pace);
+            F->bg_drain(hs, F->bg_pace);
         }
     };
+    // an Engram layer's add for column t (the previous FFN written alone first), then the attention side's read
+    const auto attn_in = [&](int il, int t, cudaStream_t hs) -> bool {
+        bool wrote = il != l0_;
+        if (F->L[(size_t) il].eng >= 0) {
+            if (il != l0_) {   // (verify_moe leaves no answer for a read before an Engram layer)
+                gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16,
+                            g.n_embd, Ro[(size_t) t], hs);
+                std::swap(Rc[(size_t) t], Ro[(size_t) t]);
+                wrote = false;
+            }
+            if (!dsv41_engram_window_add(il, t, Rc[(size_t) t], err, hs)) return false;
+            abl_res(Rc[(size_t) t], g.hc, g.n_embd, hs);   // (Engram's rows are a residual write too)
+        }
+        hc_read(il, t, wrote ? V->ffn + (size_t) t * E : nullptr, true, hs);
+        return true;
+    };
+    // the pipelined window (verify's choice, V->pipe_now; not with PROF), as verify_part's: the columns in groups on
+    // their own streams, a group's attention of a layer after the group before's (the window ring, the pending pairs,
+    // the KV slots' rows, the compressor's state - all written in position order), its routes after the group before's
+    // (group 0: after the last group's of the layer before).  The host computes one group's RAM-tier experts while the
+    // device runs the next group's attention.  An Engram add waits for the group before's attention too (the add's
+    // engram_kv output and Q8_1 rows are one buffer)
+    static const bool pipe_env1 = getenv("STRATA_DS4_SPEC_PIPE") != nullptr && std::atoi(getenv("STRATA_DS4_SPEC_PIPE")) == 2;
+    const bool pipe = V->pipe_now && V->pipe && T > 1 && !F->prof_on;
+    static const int grp_env = [] {
+        const char* v = getenv("STRATA_DS4_SPEC_GROUP");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 0;
+    }();
+    int grp = !pipe ? T : grp_env > 0 ? std::min(grp_env, T) : (T + 1) / 2;
+    while ((T + grp - 1) / grp > 1 + V->n_scr) ++grp;
+    const int n_grp = (T + grp - 1) / grp;
+    const bool set_col = !pipe || T <= 1 + V->n_scr;   // (a scratch set a column: the column-batched experts)
+    for (int t = 0; t < T; ++t) V->md[(size_t) t].scratch = V->scr_set[set_col ? std::min(t, V->n_scr) : t / grp];
+    const auto st_of = [&](int t) { return pipe && !pipe_env1 ? V->st[t / grp] : s; };
     // STRATA_GLM_PROF (as the token path's): the window's phases, marked v<T>_*
     const bool prof = F->prof_on;
     static std::vector<std::string> names;   // (mark keeps the pointer)
@@ -1495,51 +1530,64 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
     const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 5 + ph].c_str()); };
     if (prof) F->mark("v_start");
     for (int t = 0; t < kVerifyMax; ++t) V->hc_cpu[t] = V->bg_after[t] = false;
-    for (int il = l0_; il < l1_; ++il) {
-        const auto& Ly = F->L[(size_t) il];
-        for (int t = 0; t < T; ++t) {
-            bool wrote = il != l0_;
-            if (Ly.eng >= 0) {
-                if (il != l0_) {   // (verify_moe leaves no answer for a read before an Engram layer)
-                    gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8,
-                                V->comb + (size_t) t * 16, g.n_embd, Ro[(size_t) t], s);
-                    std::swap(Rc[(size_t) t], Ro[(size_t) t]);
-                    wrote = false;
-                }
-                if (!dsv41_engram_window_add(il, t, Rc[(size_t) t], err)) return false;
-                abl_res(Rc[(size_t) t], g.hc, g.n_embd, s);   // (Engram's rows are a residual write too)
+    if (pipe) {
+        cudaEventRecord(V->ev_start, s);
+        for (int gi = 1; gi < n_grp; ++gi) cudaStreamWaitEvent(V->st[gi], V->ev_start, 0);
+        for (int il = l0_; il < l1_; ++il)
+            for (int gi = 0; gi < n_grp; ++gi) {
+                const int c0 = gi * grp, nc = std::min(grp, T - c0);
+                cudaStream_t st = pipe_env1 ? s : V->st[gi];
+                if (gi > 0) cudaStreamWaitEvent(st, V->ev_attn[gi - 1], 0);
+                for (int t = c0; t < c0 + nc; ++t)
+                    if (!attn_in(il, t, st)) return false;
+                if (!verify_attn_v41(il, p0, c0, nc, st, err)) return false;
+                cudaEventRecord(V->ev_attn[gi], st);
+                if (dsp_ != nullptr && il > l0_)
+                    for (int t = c0; t < c0 + nc; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, st);
+                abl_out(il, 0, V->mixer + (size_t) c0 * E, nc, (int) E, st);
+                for (int t = c0; t < c0 + nc; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, st);
+                cudaEvent_t after = gi > 0 ? V->ev_route[gi - 1] : il > l0_ ? V->ev_route[n_grp - 1] : nullptr;
+                if (!verify_moe(il, c0, nc, toks, st, after, V->ev_route[gi], err)) return false;
             }
-            hc_read(il, t, wrote ? V->ffn + (size_t) t * E : nullptr, true);
+    } else {
+        for (int il = l0_; il < l1_; ++il) {
+            for (int t = 0; t < T; ++t)
+                if (!attn_in(il, t, s)) return false;
+            mark(0);
+            if (!verify_attn_v41(il, p0, 0, T, s, err)) return false;
+            mark(1);
+            if (dsp_ != nullptr && il > l0_)   // DSpark's features: the layer before's output, each column's
+                for (int t = 0; t < T; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, s);
+            abl_out(il, 0, V->mixer, T, (int) E, s);
+            for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, s);
+            mark(2);
+            if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+            mark(3);
         }
-        mark(0);
-        if (!verify_attn_v41(il, p0, 0, T, s, err)) return false;
-        mark(1);
-        if (dsp_ != nullptr && il > l0_)   // DSpark's features: the layer before's output, each column's
-            for (int t = 0; t < T; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, s);
-        abl_out(il, 0, V->mixer, T, (int) E, s);
-        for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false);
-        mark(2);
-        if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
-        mark(3);
     }
     for (int t = 0; t < T; ++t) {   // (verify_moe leaves no answer past the last layer; the check is for safety)
         if (V->hc_cpu[t]) {
-            gf::moe_cpu_wait(V->md[(size_t) t], g.n_embd, V->ffn + (size_t) t * E, s);
+            gf::moe_cpu_wait(V->md[(size_t) t], g.n_embd, V->ffn + (size_t) t * E, st_of(t));
             V->hc_cpu[t] = false;
         }
         if (V->bg_after[t]) {
             V->bg_after[t] = false;
-            F->bg_drain(s, F->bg_pace);
+            F->bg_drain(st_of(t), F->bg_pace);
         }
     }
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "deepseek41 verify: output_norm.weight"; return false; }
     for (int t = 0; t < T; ++t) {
+        cudaStream_t st = st_of(t);
         gf::hc_post(V->ffn + (size_t) t * E, Rc[(size_t) t], V->post + (size_t) t * 8, V->comb + (size_t) t * 16,
-                    g.n_embd, Ro[(size_t) t], s);
+                    g.n_embd, Ro[(size_t) t], st);
         // the last sublayer (layer n-1's FFN) wrote its pre into the column's FFN-side buffer
         d41::head_prep(Ro[(size_t) t], V->v41_pre + (size_t) t * 8 + 4, nw->second, g.norm_eps, g.n_embd,
-                       V->head_x + (size_t) t * E, (uint8_t*) V->head_xq + (size_t) t * q8e, s);
+                       V->head_x + (size_t) t * E, (uint8_t*) V->head_xq + (size_t) t * q8e, st);
+        if (st != s && (t == T - 1 || st_of(t + 1) != st)) {   // (a group's last column: the head waits for it)
+            cudaEventRecord(V->ev_fin[t / grp], st);
+            cudaStreamWaitEvent(s, V->ev_fin[t / grp], 0);
+        }
     }
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
