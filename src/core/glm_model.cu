@@ -21,6 +21,7 @@
 #include "strata/core/knobs.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/glm_ffn.hpp"
@@ -1218,6 +1219,11 @@ Glm5Model::~Glm5Model() {
     hop_link_.reset();   // (its buffers and events are on both parts' devices: before either goes)
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
+    if (mrope_d_ != nullptr) {
+        if (strata::kernels::mrope_table() == mrope_d_) strata::kernels::mrope_table_set(nullptr);
+        cudaFree(mrope_d_);
+        mrope_d_ = nullptr;
+    }
     fast_destroy();
     q35d_destroy();   // (load_pack's record when fast_setup never ran)
     if (!stage_workers_.empty()) {

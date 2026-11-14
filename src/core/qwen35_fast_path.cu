@@ -21,6 +21,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/rope.hpp"
+#include "strata/kernels/mrope.hpp"
 
 #include "ggml.h"
 
@@ -1539,6 +1540,46 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
         q35_dump(s, "result_norm", l1_ - 1, F->head_x, g.n_embd);
     }
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen4exp: ") + cudaGetErrorString(e); return false; } }
+    return true;
+}
+
+
+// ---- images on qwen35 / qwen35moe (Qwen3.8-27B, Ornith): the image rows replace the <|image_pad|> embeddings
+// (set_image_rows) and the attention layers rotate with the cells' M-RoPE positions (set_mrope).  The delta-net
+// layers take no positions.  qwen4exp (Qwen3.8-Flash-Next) is left out: its QSA indexer, PLE and verify graphs read
+// positions their own ways, none of them checked with images; Laguna has no vision tower.
+bool Glm5Model::images_ok(std::string& why) const {
+    if (g_.v41 || (!g_.qwen35() && !g_.dsv4())) return true;   // (GLM-5.3's and V4.1's paths: their own rules)
+    if (g_.q4x) { why = "images on Qwen3.8-Flash-Next are not supported yet"; return false; }
+    if (g_.laguna) { why = "this model has no vision tower"; return false; }
+    if (g_.dsv4()) { why = "this model has no vision tower"; return false; }
+    return true;
+}
+
+bool Glm5Model::set_mrope(const std::vector<int32_t>& tab, std::string& err) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (tab.empty()) {
+            strata::kernels::mrope_table_set(nullptr);
+            continue;
+        }
+        // (the previous request's kernels may still read the old table: wait for the device before writing it)
+        if (!glmfast::cuda_ok(cudaDeviceSynchronize(), "images: the position table", err)) return false;
+        if (m->mrope_cap_ < tab.size()) {
+            if (m->mrope_d_ != nullptr) cudaFree(m->mrope_d_);
+            m->mrope_d_ = nullptr;
+            m->mrope_cap_ = 0;
+            const size_t cap = std::max(tab.size(), (size_t) (m->max_ctx_ + 64) * 3);
+            if (!glmfast::cuda_ok(cudaMalloc(&m->mrope_d_, cap * sizeof(int32_t)), "images: the position table", err))
+                return false;
+            m->mrope_cap_ = cap;
+        }
+        if (!glmfast::cuda_ok(cudaMemcpy(m->mrope_d_, tab.data(), tab.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                              "images: the position table", err))
+            return false;
+        strata::kernels::mrope_table_set(m->mrope_d_);
+    }
+    cudaSetDevice(dev_);
     return true;
 }
 

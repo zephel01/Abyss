@@ -766,6 +766,13 @@ public:
     /// Is position p an image row (V4.1: its router bias is exp_probs_b_vl and it gets no Engram)?  False at once when
     /// the request has no image.
     bool is_image_pos(int64_t p) const { return !img_pos_.empty() && image_row(p) != nullptr; }
+    /// qwen35 / qwen35moe images: the cells' multimodal rotary positions (Qwen's interleaved M-RoPE, sections 11/11/10:
+    /// strata/kernels/mrope.hpp), `tab` = cells x (t, h, w) from cell 0 - an image's cells share t and take h = t + row,
+    /// w = t + column, the text after it continues at t + max(rows, columns).  Every device of a layer split gets it; the
+    /// attention layers' rope kernels read it while it is set.  An empty `tab` clears it (each kernel takes the cell as
+    /// its position again: text requests compute exactly as without images).  Between requests only.
+    bool set_mrope(const std::vector<int32_t>& tab, std::string& err);
+    bool images_ok(std::string& why) const;   // can this model take image rows (GENI)?
     bool has_image_rows() const { return !img_pos_.empty(); }
     /// deepseek41: exp_probs_b_vl is loaded (STRATA_GLM_VL_BIAS, or <pack>/exp_probs_b_vl.f32); an image request needs it
     bool has_vl_bias() const { return vl_bias_ok_; }
@@ -777,6 +784,8 @@ public:
 private:
     std::vector<int64_t> img_pos_;                         // ascending
     std::vector<float> img_rows_;
+    int32_t* mrope_d_ = nullptr;                           // set_mrope's device table (this half's device)
+    size_t mrope_cap_ = 0;                                 // ... its int32 count
 public:
     /// The pipelined speculative decode (src/core/glm_fast_path.cu): needs a two-half split whose tail carries the
     /// NextN block.  After the prompt's last forward(), emits up to max_new tokens (emit returns false to stop) - the
