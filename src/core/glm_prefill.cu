@@ -2382,11 +2382,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const float one = 1.0f, zero = 0.0f;
     // THE SEED (PrefillState::seed_chunk): at most seed_cap swaps a MoE layer, ranked by the chunk's last seed_rows
     // rows; a staged expert takes a resident's slot when those rows routed it at least seed_margin more times.
-    // Off by default: the copies down share the link with the prompt's staging (RTX 5090, Gen4 x4, 32 GB, 4K: the
-    // prompt ~1-2% slower).  16 for DeepSeek V4 / V4.1: the first 64 tokens after a 4K prompt +14-20%, 512 +4-5%;
-    // GLM-5.3 gains little (its 16K prompts' 512 tokens -8%: the text after them leaves the tail's experts)
+    // 16 by default for DeepSeek V4 / V4.1: the first 64 tokens after a 4K prompt +14-20%, 512 +4-5%, though the
+    // copies down share the link with the prompt's staging (RTX 5090, Gen4 x4, 32 GB, 4K: the prompt ~1-1.6% slower;
+    // the first 64 tokens still end sooner).  Off for the rest: GLM-5.3 gains little (its 16K prompts' 512 tokens
+    // -8%: the text after them leaves the tail's experts)
     static const char* seed_env = getenv("STRATA_GLM_SEED_TAIL");
-    const int seed_dflt = 0;
+    const int seed_dflt = g.dsv4() ? 16 : 0;
     const int seed_cap = seed_env != nullptr ? std::max(0, std::atoi(seed_env)) : seed_dflt;
     static const int seed_rows = [] { const char* v = getenv("STRATA_GLM_SEED_ROWS"); return v ? std::max(16, std::atoi(v)) : 128; }();
     static const int seed_margin = [] { const char* v = getenv("STRATA_GLM_SEED_MARGIN"); return v ? std::max(1, std::atoi(v)) : 2; }();
