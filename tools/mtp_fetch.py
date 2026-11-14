@@ -9,6 +9,9 @@ at the start of each shard, so HTTP range requests can read the headers and then
 
 `fetch` writes one raw file per tensor plus `mtp-manifest.json` (dtype, shape, source shard, byte range,
 sha256). It never downloads anything but the ranges named in the headers. Nothing here runs a model.
+Every ranged answer must be 206 with the asked Content-Range (a proxy that ignores Range and sends the whole file
+stops the fetch instead of writing another part of the shard), each tensor's size must match its header, and its
+sha256 must match --expect's manifest (or an earlier fetch's mtp-manifest.json) when one is known.
 """
 import argparse
 import hashlib
@@ -23,17 +26,38 @@ REPO = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 
 
-def get(url, start=None, end=None, retries=4):
+class RangeError(IOError):
+    """The server did not answer a byte range with exactly that range (a proxy that ignores Range sends the whole file
+    with 200, or another range): the bytes would be another part of the shard and the drafter tensors silently wrong."""
+
+
+def check_range(status, content_range, start, end):
+    """A ranged answer must be 206 Partial Content with Content-Range "bytes <start>-<end>/<total>" for exactly the
+    asked range - else RangeError (never retried: the same proxy answers the same way)."""
+    if status != 206:
+        raise RangeError("asked for bytes %d-%d, the server answered %s instead of 206 Partial Content (a proxy that "
+                         "ignores Range?): set HTTPS_PROXY / no_proxy so huggingface.co is reached directly"
+                         % (start, end, status))
+    want = "bytes %d-%d/" % (start, end)
+    if not (content_range or "").startswith(want):
+        raise RangeError("asked for bytes %d-%d, the server's Content-Range is %r" % (start, end, content_range))
+
+
+def get(url, start=None, end=None, retries=4, opener=urllib.request.urlopen):
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "strata-mtp-fetch"})
             if start is not None:
                 req.add_header("Range", "bytes=%d-%d" % (start, end))
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with opener(req, timeout=120) as r:
+                if start is not None:
+                    check_range(getattr(r, "status", None) or r.getcode(), r.headers.get("Content-Range"), start, end)
                 data = r.read()
             if start is not None and len(data) != end - start + 1:
                 raise IOError("short range read: %d of %d" % (len(data), end - start + 1))
             return data
+        except RangeError:
+            raise
         except Exception as e:  # network errors are retried, then surfaced
             if attempt == retries - 1:
                 raise
@@ -78,9 +102,18 @@ def inventory(out):
     return rows
 
 
-def fetch(out, only):
+def known_hashes(out, expect=None):
+    """name -> sha256 the tensors must have: --expect's manifest, else an earlier fetch's mtp-manifest.json here."""
+    for path in ([expect] if expect else []) + [os.path.join(out, "mtp-manifest.json")]:
+        if path and os.path.exists(path):
+            return {m["name"]: m["sha256"] for m in json.load(open(path, encoding="utf-8")) if m.get("sha256")}
+    return {}
+
+
+def fetch(out, only, expect=None):
     inv_path = os.path.join(out, "mtp-inventory.json")
     rows = json.load(open(inv_path))["tensors"] if os.path.exists(inv_path) else inventory(out)
+    known = known_hashes(out, expect)
     tdir = os.path.join(out, "tensors")
     os.makedirs(tdir, exist_ok=True)
     manifest = []
@@ -103,6 +136,9 @@ def fetch(out, only):
                 h.update(block)
         if os.path.getsize(path) != r["bytes"]:
             sys.exit("%s: size %d != %d" % (path, os.path.getsize(path), r["bytes"]))
+        if r["name"] in known and known[r["name"]] != h.hexdigest():
+            os.remove(path)   # (wrong bytes: the next run fetches it again)
+            sys.exit("%s: sha256 %s, expected %s - removed, run fetch again" % (path, h.hexdigest(), known[r["name"]]))
         manifest.append(dict(r, file=os.path.relpath(path, out), sha256=h.hexdigest()))
     with open(os.path.join(out, "mtp-manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
@@ -113,8 +149,9 @@ def main():
     ap.add_argument("cmd", choices=["inventory", "fetch"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--expect", help="a manifest (mtp-manifest.json) whose sha256 the fetched tensors must match")
     a = ap.parse_args()
-    inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
+    inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only, a.expect)
 
 
 if __name__ == "__main__":
