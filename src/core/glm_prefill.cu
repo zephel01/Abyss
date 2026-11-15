@@ -31,6 +31,7 @@
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
+#include "strata/kernels/prompt_flash_attn.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -3245,8 +3246,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                        Ly.k_norm, g.norm_eps, H, g.attn_head_kv, swa ? g.n_rot_swa : g.n_rot,
                                        swa ? F->lag_freq_swa : F->lag_freq, swa ? F->lag_mscale_swa : F->lag_mscale,
                                        pt0 + a, an, Ly.lag_ring, Ly.kc, Ly.vc, B.q + (size_t) a * HDq, s);
-                    lk::attn(B.q + (size_t) a * HDq, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, pt0 + a, an,
-                             swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), nullptr, 1, B.ao + (size_t) a * HDq, s);
+                    // the tensor-core kernel (prompt_flash_attn), else (HIP, under sm_80, STRATA_PROMPT_FA_OLD=1)
+                    // the CUDA-core one
+                    if (!strata::kernels::fpa::attn(B.q + (size_t) a * HDq, Ly.kc, Ly.vc, Ly.lag_ring, H,
+                                                    g.attn_head_kv, D, pt0 + a, an, swa ? g.n_swa : 0,
+                                                    1.0f / std::sqrt((float) D), B.ao + (size_t) a * HDq, s))
+                        lk::attn(B.q + (size_t) a * HDq, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, pt0 + a, an,
+                                 swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), nullptr, 1, B.ao + (size_t) a * HDq, s);
                 }
                 lk::gate_rows(B.ao, gl, tn, H, s);
                 S->mark("lag_attn", s);
@@ -3298,8 +3304,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         Q4xBufs Q = carve_q4x(c, (size_t) tn, g);
                         if (!q4_attn(il, pt0, tn, xs, B.q, B.ao, Q, err)) return false;
                     } else {
-                        q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, tn,
-                                         1.0f / std::sqrt((float) D), B.ao, s, q35_kv_);
+                        // an FP16 cache: the one-pass tensor-core kernel (prompt_flash_attn); else, or with
+                        // STRATA_PROMPT_FA_OLD=1 / an explicit STRATA_Q35_PATTN, attn_prompt's kernels
+                        static const bool q35_pattn = getenv("STRATA_Q35_PATTN") != nullptr;
+                        if (q35_kv_ != 0 || q35_pattn ||
+                            !strata::kernels::fpa::attn(B.q, Ly.kc, Ly.vc, 0, g.n_head, g.attn_head_kv, D, pt0, tn, 0,
+                                                        1.0f / std::sqrt((float) D), B.ao, s))
+                            q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, tn,
+                                             1.0f / std::sqrt((float) D), B.ao, s, q35_kv_);
                     }
                     q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s, q35_kv_);
                     S->mark("q35_attn", s);

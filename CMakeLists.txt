@@ -275,6 +275,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dsv41_fast.cu
                           src/kernels/cuda/qwen35_fast.cu
                           src/kernels/cuda/laguna_fast.cu
+                          src/kernels/cuda/prompt_flash_attn.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_legacy.cu
                           src/kernels/ngram.cpp
