@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.154 - 2026-11-16
+
+- Server, for coding agents: the room left for the answer when the thinking runs long (a quarter of max tokens, at
+  least 1024, at most half) now applies also with the run config's `thinking_budget` 0 (`STRATA_ANSWER_ROOM=0`: off).
+  An end-of-turn token written inside the thinking or an open tool call is kept as text and the answer goes on (up to
+  `STRATA_SOFT_END`, 16 a request; 0 = off). The usage says who closed the thinking: `reasoning_tokens` and
+  `reasoning_closed_by` (model, budget, answer_room, end_guard, loop_guard, tool_call, wrap, unclosed) in
+  `completion_tokens_details` (OpenAI) / `output_tokens_details` (Anthropic).
+- Server: `tool_choice: "none"` answers in prose - a call the model writes anyway is neither a call nor markup, and in
+  a conversation that already holds tool calls a short closing note asks for prose (`STRATA_TOOL_NONE_NOTE=0`: no note).
+- Server, Claude Code: system blocks in mid-conversation, unknown block types and server tools no longer fail with
+  400; tools with `defer_loading` stay out of the prompt and a `tool_reference` result carries the loaded tool, so
+  ToolSearch no longer changes the system prompt (and conversation reuse holds); thinking blocks carry a
+  `signature` that brings the reasoning back exactly; `cache_control` is accepted; `POST /v1/messages/count_tokens`.
+  Anthropic API: a `max_tokens` beyond the context runs with the room left (`fit_max_tokens: false`: 400 as before;
+  OpenAI unchanged). Real Claude Code sessions with Qwen3.8: every follow-up reused the previous prompt, follow-up
+  prompts 0.15-0.36 s.
+- Fix: through the server, Qwen3.8 / Ornith answers could stop mid-text - the engine stopped on GLM's end-token ids,
+  which are ordinary pieces in their vocabulary. The server now sends the model's own end tokens.
+- Ordinary requests get the same prompt tokens as v1.3.153 (Qwen3.8, GLM-5.3, V4, V4.1, Laguna) and the same
+  answers; deterministic outputs unchanged on all six regression configs.
+
 ## v1.3.153 - 2026-11-16
 
 - Long prompts on Laguna-S-2.1 and the qwen35 family (Ornith-1.5-35B / 122B, Qwen3.8-27B, Qwen3.5-122B): the prompt's
