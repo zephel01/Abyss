@@ -7,6 +7,17 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.148 - 2026-11-15
+
+- DeepSeek V4 0731 / V4.1 1017 long contexts: the DSA indexer's top-k select runs over several GPU blocks (the same
+  three radix passes, the counts summed across blocks) once a context has 12,288 rows or more (or the top is over
+  1,024), in decode, in the verify window, in V4.1's per-row prompt path and in V4.1's candidate block. The same rows
+  win in the same order (score down, ties to the lower index), so the same tokens (deterministic md5 unchanged at 32K
+  and 128K). RTX 5090 + 123 GB, iGPU off, 512 tokens after the prompt, median vs v1.3.147 (tok/s): V4.1 Compact
+  JA256 64K 63.26 -> 64.42 (+1.8%), 128K 60.53 -> 61.79 (+2.1%), 32K the same; V4 0731 UD-Q2_K_XL 64K +0.6%, 128K
+  within noise (the select 0.49 -> 0.32 ms a token). Prompt speed the same. `STRATA_DSA_TOPK_MB=0`: the one-block
+  select, `=<n>`: from n rows.
+
 ## v1.3.147 - 2026-11-15
 
 - DeepSeek V4 0731 / V4.1 1017: the first tokens after a prompt are faster. In the prompt's last chunk each MoE
