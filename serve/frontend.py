@@ -16,9 +16,11 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -343,6 +345,47 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
+# A thinking block's `signature` (the Anthropic API): what the server writes there is the block's reasoning exactly as
+# the model wrote it (zlib + base64url behind SIGNATURE_TAG).  A client sends the block back with it, and the turn is
+# rendered from that text - not from the block's `thinking`, which a client may have trimmed, re-wrapped or left empty
+# ("display": "omitted") - so the re-rendered prompt is the one the model saw and the conversation cache still holds
+# it.  A signature that is not ours (or does not decode) leaves the block's own text.
+SIGNATURE_TAG = "abyss1:"
+
+
+def thinking_signature(text: str) -> str:
+    return SIGNATURE_TAG + base64.urlsafe_b64encode(zlib.compress(text.encode("utf-8"), 6)).decode("ascii")
+
+
+def signature_text(sig) -> str | None:
+    """The reasoning a signature of ours carries; None for any other signature."""
+    if not isinstance(sig, str) or not sig.startswith(SIGNATURE_TAG):
+        return None
+    try:
+        return zlib.decompress(base64.urlsafe_b64decode(sig[len(SIGNATURE_TAG):].encode("ascii"))).decode("utf-8")
+    except (ValueError, zlib.error, UnicodeDecodeError):
+        return None
+
+
+def _has_tool_calls(messages: list[dict]) -> bool:
+    return any(m.get("tool_calls") or m.get("role") == "tool" for m in messages)
+
+
+# tool_choice "none" in a conversation that holds tool calls: the model sees the earlier calls and their results but
+# no tools, and may write another call anyway.  A last user turn says the reply is prose (STRATA_TOOL_NONE_NOTE=0
+# leaves it out); a call the model still starts is never sent (OutputParser no_calls: the answer ends there).  It goes
+# at the END, so the conversation cache still holds everything before it.
+TOOL_NONE_NOTE = "No tools are available for this reply: answer in prose, without any tool call."
+
+
+def _tool_none(messages: list[dict], kwargs: dict) -> list[dict]:
+    import os
+    kwargs["_no_calls"] = True
+    if _has_tool_calls(messages) and os.environ.get("STRATA_TOOL_NONE_NOTE", "1") != "0":
+        messages = messages + [{"role": "user", "content": TOOL_NONE_NOTE}]
+    return messages
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -368,9 +411,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     tools = [t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
              for t in req.get("tools") or []] or None
     tc = req.get("tool_choice")
+    kwargs = {}
     if tc == "none":   # the tools stay declared to the client, but none is offered to the model
         tools = None
-    kwargs = {}
+        messages = _tool_none(messages, kwargs)
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
@@ -388,35 +432,82 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     return _late_system_to_user(messages), tools, kwargs
 
 
+def _tool_reference_text(block: dict, by_name: dict) -> str:
+    """A tool_reference block (Claude Code's ToolSearch result: a deferred tool is loaded) -> the tool's definition as
+    text, where the model reads it: the system prompt keeps only the tools that were not deferred, so it stays the
+    same while tools are loaded mid-conversation (and the conversation cache keeps it)."""
+    name = block.get("tool_name") or block.get("name") or ""
+    t = by_name.get(name)
+    if t is None:
+        return f"Tool {name} loaded."
+    fn = {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}
+    return f"Tool {name} loaded:\n" + json.dumps({"type": "function", "function": fn}, ensure_ascii=False)
+
+
+def _anthropic_tools(req: dict) -> tuple[list[dict], list[dict]]:
+    """-> (the tools the prompt shows, every tool a call may name).  A tool with "defer_loading": true (Claude Code's
+    deferred tools, found with its ToolSearch) is not in the prompt until a tool_reference loads it; a server tool
+    (a "type" other than "custom": web_search_..., code_execution_...) runs on Anthropic's side and is left out."""
+    shown, every = [], []
+    for t in req.get("tools") or []:
+        if not isinstance(t, dict) or not t.get("name") or t.get("type") not in (None, "custom"):
+            continue
+        d = {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
+        every.append(d)
+        if t.get("defer_loading") is not True:
+            shown.append(d)
+    return shown, every
+
+
+def _result_content(content, by_name: dict):
+    """A tool_result's content for the template: its tool_reference blocks become the tools' definitions (text)."""
+    if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_reference" for b in content):
+        content = [{"type": "text", "text": _tool_reference_text(b, by_name)} if isinstance(b, dict) and
+                   b.get("type") == "tool_reference" else b for b in content]
+    return _parts_of(content)
+
+
 def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
-    """Anthropic Messages -> (template messages, template tools, template kwargs)."""
+    """Anthropic Messages -> (template messages, template tools, template kwargs).  kwargs["_parser_tools"]: every
+    tool a call may name (the deferred ones too); kwargs["_no_calls"]: tool_choice none.  Block types this server does
+    not use (redacted_thinking, server tool results, documents, ...) are skipped, never a 400."""
     messages = []
     system = req.get("system")
     if system:
         messages.append({"role": "system", "content": _text_of(system)})
+    shown, every = _anthropic_tools(req)
+    by_name = {t["name"]: t for t in every}
     for m in req.get("messages", []):
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant", "system"):
+            continue
         content = m.get("content")
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
+        content = [b for b in content or [] if isinstance(b, dict)]
         if m.get("role") == "user" and _has_image(content) and not any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
         text, reasoning, calls, rest = [], [], [], []   # rest: the text and image blocks, in order (#41)
-        for block in content or []:
+        for block in content:
             kind = block.get("type")
             if kind == "text":
                 text.append(block.get("text", ""))
                 rest.append(block)
+            elif kind == "tool_reference":
+                t = _tool_reference_text(block, by_name)
+                text.append(t)
+                rest.append({"type": "text", "text": t})
             elif kind in IMAGE_PARTS:
                 rest.append(block)
             elif kind == "thinking":
-                reasoning.append(block.get("thinking", ""))
+                raw = signature_text(block.get("signature"))
+                reasoning.append(raw if raw is not None else block.get("thinking", "") or "")
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
             elif kind == "tool_result":   # an image tool's result keeps its images, as role "tool" does on /v1/chat (#41)
-                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+                messages.append({"role": "tool", "content": _result_content(block.get("content"), by_name)})
         images = m.get("role") == "user" and _has_image(rest)
         if text or calls or reasoning or images:
             out = {"role": m["role"], "content": _parts_of(rest) if images else "".join(text)}
@@ -425,12 +516,14 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
-    tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
-             for t in req.get("tools") or []] or None
+    tools = shown or None
+    kwargs = {}
+    if every:
+        kwargs["_parser_tools"] = every
     if isinstance(req.get("tool_choice"), dict) and req["tool_choice"].get("type") == "none":
         tools = None
-    kwargs = {}
-    # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
+        messages = _tool_none(messages, kwargs)
+    # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N} or {"type": "adaptive"};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
@@ -664,8 +757,11 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 think_token: bool = False, call_ends_think: bool = False):
+                 think_token: bool = False, call_ends_think: bool = False, no_calls: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # no_calls (tool_choice "none"): a call the model starts anyway is neither a call nor text - one
+        # "calls_refused" event, and everything after it is dropped (the caller ends the answer there)
+        self.no_calls = no_calls
         # call_ends_think: a <tool_call> at the top level of the reasoning ends it, as </think> does - the Qwen
         # templates' response_template (2026-11-07: "</think>|(?=<tool_call>)"), for a model that starts its call
         # without closing its thinking.  One inside a code fence or inline code of the reasoning stays reasoning.
@@ -992,6 +1088,8 @@ class OutputParser:
         return best
 
     def feed(self, delta: str, think_end: bool = False) -> list[Event]:
+        if self.state == "refused":
+            return []
         if self.state in ("call", "dsml"):
             self._body_push(delta)       # (the text before a call is short: it goes out as it comes; a call's body is not)
         else:
@@ -1086,6 +1184,10 @@ class OutputParser:
                     continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                if self.no_calls:
+                    out.append(Event("calls_refused"))
+                    self.state, self.buf = "refused", ""
+                    return out
                 self.state = "dsml" if dsml else "call"
                 self.dsml_tag = dtag
                 rest, self.buf = self.buf[i + len(tag):], ""
@@ -1136,6 +1238,8 @@ class OutputParser:
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
         out = []
+        if self.state == "refused":
+            return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             out += self._close_scan()

@@ -51,7 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, ContentGuard, Event,  # noqa: E402
-                            OutputParser,
+                            OutputParser, thinking_signature,
                             anthropic_to_messages, effort_kwargs, effort_level, images_of, openai_to_messages,
                             v41_images_as_text)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -581,6 +581,11 @@ class StrataEngine:
             ends = sampling.get("_end_ids")
             if ends:   # (the ids the server stops the turn on: the engine's own end list can be another model's)
                 think += " end_ids=" + ",".join(str(int(i)) for i in ends)
+        # the turn's end tokens as the server stops on them (stop_ids=; an engine that knows the key stops on these
+        # instead of its own list, which is GLM's on the glm path - Qwen3.8 there ended at ordinary Russian pieces)
+        sid = sampling.get("_stop_ids")
+        if sid:
+            think += " stop_ids=" + ",".join(str(int(i)) for i in sid)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
         if isinstance(tune, dict):
@@ -657,6 +662,7 @@ class StrataEngine:
         self.progress = None
         self.prefill_tok_s_mean = None
         self.prompt_reused = self.prompt_disk_ms = None
+        self.notes = []                                  # this run's NOTE lines (who closed the reasoning)
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -700,6 +706,7 @@ class StrataEngine:
                     self._parse_stat(line)
                 elif line.startswith("NOTE "):                # what happens to the kept conversations
                     print("[abyss] " + line[5:].strip(), flush=True)
+                    self.notes.append(line[5:].strip())
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
@@ -1310,14 +1317,17 @@ class Detokenizer:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         # a message's special-token text stays text (ContentGuard); a template that splits a turn's reasoning off at
         # its </think> still sees the marker in an assistant's content, and so do the model's own tags (ContentGuard)
         self.guard = ContentGuard(getattr(tokenizer, "special_tokens", None) or {},
                                   split_think=any(f"split({q}</think>{q})" in template.source for q in "'\""),
                                   model_tags=getattr(tokenizer, "user_defined", ()))
-        self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        # --fit-max-tokens: clamp the output cap instead of 400.  None (neither the flag nor the config's
+        # "fit_max_tokens" says): the Anthropic API clamps (its max_tokens is a required ceiling - Claude Code sends
+        # its model's own maximum, 128K, whatever the server's context), the OpenAI API refuses; False: both refuse
+        self.fit_max_tokens = fit_max_tokens
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
@@ -1756,12 +1766,13 @@ class Service:
                 ids.append(None)
         return ids, prefill
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, fit=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
+        the rest of the context.  fit: a max_new beyond the context left is shortened to it (None: --fit-max-tokens'
+        choice) instead of a 400.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
         starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
         given, force = kwargs, kwargs.get("_force_tool")
-        kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
+        kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}   # (the server's own keys: not the template's)
         if force is not None and tools:
             kwargs["enable_thinking"] = False
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
@@ -1816,15 +1827,18 @@ class Service:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
-        if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+        fit = bool(self.fit_max_tokens) if fit is None else fit
+        if max_new is None or max_new <= 0 or (fit and room < 1):
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = room
         elif max_new > room:
-            if not self.fit_max_tokens:
+            if not fit:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
+            print(f"[abyss] max tokens {max_new:,} is more than the context leaves after the prompt "
+                  f"({len(ids):,} of {self.engine.max_context:,}): answering with up to {max(1, room):,}", flush=True)
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -1833,7 +1847,7 @@ class Service:
         tools and tokenizer as prepare(), with nothing run (no image encoder: a picture counts as its marker, so the
         count is approximate then).  The web app's context meter."""
         messages, tools, kw = openai_to_messages(req)
-        kw = {k: v for k, v in kw.items() if k != "_force_tool"}
+        kw = {k: v for k, v in kw.items() if not k.startswith("_")}
         if req.get("strata_mcp") is True and self.mcp is not None:
             own = {t.get("name") for t in tools or []}
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
@@ -1842,6 +1856,16 @@ class Service:
         images = len(images_of(messages))
         ids, _ = self._prompt_ids(messages, tools, kw, None, images > 0 and self.template.dsv4)
         return {"tokens": len(ids), "images": images, "approximate": images > 0, "max_context": self.engine.max_context}
+
+    def count_anthropic(self, req: dict) -> dict:
+        """POST /v1/messages/count_tokens (Anthropic's): the prompt's tokens as /v1/messages would render it."""
+        messages, tools, kw = anthropic_to_messages(req)
+        kw = {k: v for k, v in kw.items() if not k.startswith("_")}
+        if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
+            kw = {**kw, **effort_kwargs(self.default_effort)}
+        images = len(images_of(messages))
+        ids, _ = self._prompt_ids(messages, tools, kw, None, images > 0 and self.template.dsv4)
+        return {"input_tokens": len(ids)}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1900,6 +1924,34 @@ class Service:
             self.think_close_cache[b] = t if 0 < len(t) <= 96 else []
         return self.think_close_cache[b]
 
+    @staticmethod
+    def answer_room(max_new: int) -> int:
+        """The answer room (STRATA_ANSWER_ROOM, default on; 0 off): never let the reasoning use the whole output - a
+        request whose max tokens is reached while still thinking ends with no answer at all.  A reasoning block still
+        open when a quarter of max tokens is left (at least STRATA_GLM_THINK_RESERVE = 1024 tokens, but never more
+        than half: with max tokens <= 1024 the floor used to leave the reasoning ONE token, issue #33) is closed the
+        way the thinking budget closes it (the bridge, then the model's own </think>) and the answer follows.  ->
+        the reasoning's token budget, 0 = none.  (Before, this clamp applied to the run config's thinking_budget only.)"""
+        if os.environ.get("STRATA_ANSWER_ROOM", "1") == "0" or not max_new:
+            return 0
+        floor = int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024)
+        reserve = max(int(max_new) // 4, min(floor, int(max_new) // 2))
+        return max(1, int(max_new) - reserve)
+
+    def soft_end_ok(self, parser) -> bool:
+        """An end-of-turn token where the turn cannot end - inside the reasoning or an open tool call - is kept as
+        text and the answer goes on (STRATA_SOFT_END=<n> such tokens at most, default 16; 0 = an end token always ends
+        it).  The engine's end guard closes a reasoning block at an end token first (STRATA_GLM_END_GUARD), so here it
+        is mostly an end token in a tool call's arguments (a file that quotes a chat template)."""
+        return parser.state in ("reasoning", "call", "dsml")
+
+    @staticmethod
+    def _soft_end_max() -> int:
+        try:
+            return max(0, int(os.environ.get("STRATA_SOFT_END", "16") or 16))
+        except ValueError:
+            return 16
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -1908,7 +1960,8 @@ class Service:
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                               think_token=self.think_end_id is not None,
-                              call_ends_think=getattr(self, "call_ends_think", False))
+                              call_ends_think=getattr(self, "call_ends_think", False),
+                              no_calls=(sampling or {}).get("_no_calls") is True)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -1923,6 +1976,11 @@ class Service:
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
+        # who closed the reasoning (usage.completion_tokens_details.reasoning_closed_by): model, budget, answer_room,
+        # end_guard, loop_guard, tool_call, wrap; "unclosed" when the answer ended inside it.  None: no reasoning.
+        closed_by, reasoning_tokens = None, 0
+        soft_ends, soft_max, runs = 0, self._soft_end_max(), 0
+        first_last = None                               # the first engine run's DONE (the prompt's figures)
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -1950,91 +2008,133 @@ class Service:
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 thinking_on = bool(thinking) and self.think_end_id is not None
-                in_think = thinking_on and self.think_budget > 0
-                # never let the reasoning use the whole output: a request whose max_tokens is reached while still
-                # thinking ends with no answer at all.  The budget is clamped to leave a quarter of max_tokens (at
-                # least 1024 tokens, STRATA_GLM_THINK_RESERVE=<tokens>) for the answer - but the floor never takes more
-                # than half of max_tokens: with max_tokens <= 1024 it used to leave the reasoning ONE token (issue
-                # #33: max_tokens 800 -> the model answered without thinking; a 1-bit build echoed the prompt back)
-                think_budget = self.think_budget
-                if in_think and max_new:
-                    floor = int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024)
-                    reserve = max(int(max_new) // 4, min(floor, int(max_new) // 2))
-                    think_budget = max(1, min(think_budget, int(max_new) - reserve))
-                if thinking_on:
+                # the run config's thinking budget (32768 unless it says otherwise) and the answer room (answer_room():
+                # what max tokens leaves the answer): the smaller one closes the reasoning, and says so in the usage
+                room_budget = self.answer_room(max_new) if thinking_on else 0
+                think_budget = self.think_budget if thinking_on else 0
+                by_room = room_budget > 0 and (think_budget <= 0 or room_budget < think_budget)
+                if by_room:
+                    think_budget = room_budget
+                in_think = think_budget > 0
+                if thinking and parser.state == "reasoning":
+                    closed_by = "unclosed"
+                # the turn's end tokens, for the engine to stop on (an engine that knows the key; else its own list)
+                base = {**(sampling or {}), "_stop_ids": sorted(self.stop_ids)} if self.stop_ids else dict(sampling or {})
+
+                def engine_sampling(done: int, reasoning: bool) -> dict:
+                    """The sampling keys for an engine run that starts `done` tokens into the answer, inside the
+                    reasoning or not (a run after a kept end token goes on where the last one stopped)."""
+                    if not (thinking_on and reasoning):
+                        return base
                     # think_end marks the open reasoning block (the loop guard's thinking window, the end guard); the
-                    # budget only when the run config sets one
-                    sampling = {**(sampling or {}), "_think_budget": think_budget if in_think else 0,
-                                "_think_end": self.think_end_id, "_think_close": self.think_close_ids(ids)}
+                    # budget only when the run config or the answer room sets one
+                    sp = {**base, "_think_budget": max(1, think_budget - done) if in_think else 0,
+                          "_think_end": self.think_end_id, "_think_close": self.think_close_ids(ids)}
                     if os.environ.get("STRATA_GLM_END_GUARD", "1") != "0" and self.ws_ids:
-                        sampling["_ws_ids"] = self.ws_ids
-                        sampling["_end_ids"] = sorted(self.stop_ids)
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
+                        sp["_ws_ids"] = self.ws_ids
+                        sp["_end_ids"] = sorted(self.stop_ids)
+                    return sp
+
+                runs = 0
+                run_ids, run_max, run_sampling = ids, max_new, engine_sampling(0, True)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
-                try:
-                    for t in gen:
-                        if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
-                            yield "ping", None
-                            continue
-                        n += 1
-                        is_think_end = self.think_end_id is not None and t == self.think_end_id
-                        if in_think and t == self.think_end_id:
-                            in_think = False
-                            if n > think_budget:
-                                print(f"[abyss] thinking reached its budget ({think_budget} tokens): closed, "
-                                      "answering", flush=True)
-                        if t in self.stop_ids:
-                            finish = "stop"
+                while True:
+                    runs += 1
+                    gen = self.engine.generate(run_ids, run_max, run_sampling, cancel, embeddings=emb) if emb else \
+                        self.engine.generate(run_ids, run_max, run_sampling, cancel)
+                    soft_tail = False               # the last token was an end token kept as text
+                    try:
+                        for t in gen:
+                            if t is None:               # heartbeat while the engine is quiet
+                                last_print = self._progress(last_print)
+                                yield "ping", None
+                                continue
+                            n += 1
+                            soft_tail = False
+                            is_think_end = self.think_end_id is not None and t == self.think_end_id
+                            if in_think and t == self.think_end_id:
+                                in_think = False
+                                if n > think_budget:
+                                    print(f"[abyss] thinking reached its {'answer room' if by_room else 'budget'} "
+                                          f"({think_budget} tokens{' of ' + str(max_new) if by_room else ''}): "
+                                          "closed, answering", flush=True)
+                            soft = False
+                            if t in self.stop_ids:
+                                if soft_ends < soft_max and self.soft_end_ok(parser):
+                                    soft, soft_tail = True, True
+                                    soft_ends += 1
+                                    print(f"[abyss] an end-of-turn token inside the "
+                                          f"{'reasoning' if parser.state == 'reasoning' else 'tool call'} "
+                                          f"({soft_ends} of {soft_max}): kept as text, going on", flush=True)
+                                else:
+                                    finish = "stop"
+                                    raw_ids.append(t)
+                                    break
                             raw_ids.append(t)
-                            break
-                        raw_ids.append(t)
-                        text, stopped = detok.push(t), False
-                        stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
-                        if is_think_end and parser.state == "reasoning":   # the real end: past the stop scan,
-                            text, held, stops = held + text, "", []         # with what it held back
-                        if stops:
-                            held += text
-                            hits = [(i, s) for s, i in ((s, held.find(s)) for s in stops) if i >= 0]
-                            if hits:
-                                cut, s = min(hits)
-                                text, held, stopped = held[:cut], "", True
-                                matched = s if s in client_stops and s not in self.stop_texts else None
-                            else:               # keep back the longest tail that could still grow into a marker
-                                k = max((j for s in stops for j in range(1, len(s))
-                                         if held.endswith(s[:j])), default=0)
-                                text, held = held[:len(held) - k], held[len(held) - k:]
-                        evs = parser.feed(text, think_end=is_think_end)
-                        self._note(n, evs)
-                        last_print = self._progress(last_print)
-                        for ev in evs:
-                            yield "event", ev
-                        if stopped:
-                            finish = "stop"
-                            break
-                    if held:                    # the run ended on what only looked like a marker's start
-                        for ev in parser.feed(held):
-                            yield "event", ev
-                        held = ""
-                    if cancel.is_set():
-                        finish = "cancel"
-                except EngineDied as e:
-                    finish = "error"
-                    note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
-                    print(f"[abyss] {e}. {note} The next request starts the engine again."
-                          f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
-                          flush=True)
-                    raise
-                except ValueError as e:                 # the engine's ERR line (it may have ended after it)
-                    finish = "error"
-                    print(f"[abyss] the engine reported an error: {e}", flush=True)
-                    raise
-                finally:
-                    gen.close()                         # STOP+drain to THIS request's DONE while still holding the
-                    #                                     fifo, so a stop-token break can't leave the shared engine
-                    #                                     queue mid-drain for the next request to read as its own DONE
+                            in_reasoning = parser.state == "reasoning"
+                            text, stopped = detok.push(t), False
+                            stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
+                            if (is_think_end and parser.state == "reasoning") or soft:   # the real end, or a kept end
+                                text, held, stops = held + text, "", []                  # token: past the stop scan
+                            if stops:
+                                held += text
+                                hits = [(i, s) for s, i in ((s, held.find(s)) for s in stops) if i >= 0]
+                                if hits:
+                                    cut, s = min(hits)
+                                    text, held, stopped = held[:cut], "", True
+                                    matched = s if s in client_stops and s not in self.stop_texts else None
+                                else:               # keep back the longest tail that could still grow into a marker
+                                    k = max((j for s in stops for j in range(1, len(s))
+                                             if held.endswith(s[:j])), default=0)
+                                    text, held = held[:len(held) - k], held[len(held) - k:]
+                            evs = parser.feed(text, think_end=is_think_end)
+                            if in_reasoning:
+                                reasoning_tokens += 1
+                                if parser.state != "reasoning":
+                                    closed_by = self._closed_by(is_think_end, n, think_budget, by_room)
+                            refused = any(ev.kind == "calls_refused" for ev in evs)
+                            if refused:
+                                evs = [ev for ev in evs if ev.kind != "calls_refused"]
+                                print("[abyss] tool_choice none: the model started a tool call - the answer ends "
+                                      "before it", flush=True)
+                            self._note(n, evs)
+                            last_print = self._progress(last_print)
+                            for ev in evs:
+                                yield "event", ev
+                            if stopped or refused:
+                                finish = "stop"
+                                break
+                        if held:                    # the run ended on what only looked like a marker's start
+                            for ev in parser.feed(held):
+                                yield "event", ev
+                            held = ""
+                        if cancel.is_set():
+                            finish = "cancel"
+                    except EngineDied as e:
+                        finish = "error"
+                        note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
+                        print(f"[abyss] {e}. {note} The next request starts the engine again."
+                              f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
+                              flush=True)
+                        raise
+                    except ValueError as e:                 # the engine's ERR line (it may have ended after it)
+                        finish = "error"
+                        print(f"[abyss] the engine reported an error: {e}", flush=True)
+                        raise
+                    finally:
+                        gen.close()                         # STOP+drain to THIS request's DONE while still holding the
+                        #                                     fifo, so a stop-token break can't leave the shared engine
+                        #                                     queue mid-drain for the next request to read as its own DONE
+                    if first_last is None:
+                        fl = getattr(self.engine, "last", None)
+                        first_last = dict(fl) if fl is not None and fl is not engine_last0 else {}
+                    # the engine ended its run on an end token the answer keeps (it stops on those itself): the run goes
+                    # on from there - the prompt and the answer so far, which the conversation cache mostly holds
+                    if not (soft_tail and finish == "length" and n < max_new and not cancel.is_set()):
+                        break
+                    run_ids, run_max = list(ids) + raw_ids, max_new - n
+                    run_sampling = engine_sampling(n, parser.state == "reasoning")
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise
@@ -2046,6 +2146,13 @@ class Service:
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
                     last = dict(getattr(self.engine, "last", {}) or {}) \
                         if getattr(self.engine, "last", None) is not engine_last0 else {}
+                    if runs > 1 and first_last and first_last.get("prompt_ms") is not None and \
+                            last.get("prompt_ms") is not None:
+                        # several engine runs (kept end tokens): the prompt's figures are the first run's, the
+                        # decode's all of them (a later run's prompt is the answer so far, read again)
+                        last = dict(first_last, generated=n,
+                                    decode_ms=(first_last.get("decode_ms") or 0.0) + last["prompt_ms"] +
+                                    (last.get("decode_ms") or 0.0))
                     started = self.status.get("started", time.time())
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -2092,8 +2199,29 @@ class Service:
                 self.status["busy"] = False
         for ev in parser.finish():
             yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings, "stop_sequence": matched if finish == "stop" else None}
+        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+                "timings": timings, "stop_sequence": matched if finish == "stop" else None}
+        if closed_by is not None:
+            done["reasoning_closed_by"] = closed_by
+            done["reasoning_tokens"] = reasoning_tokens
+        yield "done", done
+
+    def _closed_by(self, is_think_end: bool, n: int, think_budget: int, by_room: bool) -> str:
+        """Who closed the reasoning that just ended (see run()): the engine's NOTE lines of this request say the end
+        guard or the loop guard did it; a </think> after the budget's last token is the budget's (or the answer
+        room's); a tool call that starts inside the reasoning ends it too (call_ends_think)."""
+        notes = list(getattr(self.engine, "notes", None) or [])   # (this engine run's)
+        if any("inside the reasoning" in x for x in notes):
+            return "end_guard"
+        if any("thinking was repeating" in x for x in notes):
+            return "loop_guard"
+        if not is_think_end:                            # (a tokenizer without a </think> token: its text ended it)
+            return "tool_call" if self.think_end_id is not None else "model"
+        if self.stopping:
+            return "wrap"
+        if think_budget and n > think_budget:
+            return "answer_room" if by_room else "budget"
+        return "model"
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
@@ -2303,6 +2431,11 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "total_tokens": pt + x["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+            if x.get("reasoning_closed_by"):
+                # the reasoning's tokens, and who closed it: model, budget, answer_room, end_guard, loop_guard,
+                # tool_call, wrap - or unclosed (the answer ended inside it)
+                last["usage"]["completion_tokens_details"] = {"reasoning_tokens": x.get("reasoning_tokens") or 0,
+                                                              "reasoning_closed_by": x["reasoning_closed_by"]}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             yield last
@@ -2436,9 +2569,18 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
         "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
     index, open_kind, used_tool = -1, None, False
+    thought = []                                    # the open thinking block's text, for its signature
 
     def close():
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
+
+    def sign():
+        """A thinking block ends with its signature: the reasoning as written (frontend.thinking_signature), which a
+        client that sends the block back gets the same prompt from."""
+        sig = thinking_signature("".join(thought))
+        thought.clear()
+        return ("content_block_delta", {"type": "content_block_delta", "index": index,
+                                        "delta": {"type": "signature_delta", "signature": sig}})
 
     streamed = set()
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
@@ -2460,6 +2602,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 streamed.add(ev.call.id)
                 used_tool = True
             if open_kind != want or want == "tool_use":
+                if open_kind == "thinking":
+                    yield sign()
                 if open_kind is not None:
                     yield close()
                 index += 1
@@ -2470,6 +2614,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                                       ev.call.name if ev.call else "", "input": {}}}[want]
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
             if want == "thinking":
+                thought.append(ev.text)
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
                                               "delta": {"type": "thinking_delta", "thinking": ev.text}}
             elif want == "text":
@@ -2482,6 +2627,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
                     "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
         else:
+            if open_kind == "thinking":
+                yield sign()
             if open_kind is not None:
                 yield close()
             stop = "tool_use" if used_tool and x["finish"] == "stop" else \
@@ -2490,10 +2637,14 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
             # which is cache_read_input_tokens (message_start could only say the whole prompt)
             reused = min(x.get("reused") or 0, len(ids))
+            usage = {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
+                     "output_tokens": x["completion_tokens"]}
+            if x.get("reasoning_closed_by"):          # (OpenAI's completion_tokens_details, in the Responses API's name)
+                usage["output_tokens_details"] = {"reasoning_tokens": x.get("reasoning_tokens") or 0,
+                                                  "reasoning_closed_by": x["reasoning_closed_by"]}
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
                                                                        "stop_sequence": x.get("stop_sequence")},
-                                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
+                                    "usage": usage}
             yield "message_stop", {"type": "message_stop"}
 
 
@@ -2513,6 +2664,8 @@ def anthropic_collect(events) -> dict:
                 b["text"] += d["text"]
             elif d["type"] == "thinking_delta":
                 b["thinking"] += d["thinking"]
+            elif d["type"] == "signature_delta":
+                b["signature"] = d["signature"]
             else:                                  # input_json_delta pieces: parsed when complete
                 b["_json"] = b.get("_json", "") + d["partial_json"]
         elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
@@ -2925,6 +3078,9 @@ def make_handler(svc: Service):
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
                     return
+                if path == "/v1/messages/count_tokens":      # Anthropic's token count (Claude Code's /context)
+                    self._json(200, svc.count_anthropic(req))
+                    return
                 if path in ("/v1/chat/completions", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
                     why = ("Abyss is updating and starts again in a few minutes" if svc.updater.busy() else
@@ -3098,6 +3254,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_no_calls"):
+                req = {**req, "_no_calls": True}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -3185,7 +3343,11 @@ def make_handler(svc: Service):
             req["_api"] = "anthropic"
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, fit=svc.fit_max_tokens is not False)
+            if kw.get("_no_calls"):
+                req = {**req, "_no_calls": True}
+            if kw.get("_parser_tools"):                        # deferred tools too: a call may name one
+                tools = kw["_parser_tools"]
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
@@ -3551,7 +3713,8 @@ def main() -> int:
     svc = Service(engine, tok, template,
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=True if a.fit_max_tokens or cfg.get("fit_max_tokens") is True else
+                  False if cfg.get("fit_max_tokens") is False else None)
     if cfg.get("reasoning_effort"):
         try:
             effort_kwargs(cfg["reasoning_effort"])

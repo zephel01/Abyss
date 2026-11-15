@@ -89,11 +89,28 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(ct, want)
 
     def test_explicit_budget_over_the_context_is_rejected(self):
-        for api in ("openai", "anthropic"):
-            with self.subTest(api=api):
-                s, b, _, _ = self.call(api, max_tokens=CTX)
-                self.assertEqual(s, 400)
-                self.assertIn("exceeds the context", b["error"]["message"])
+        s, b, _, _ = self.call("openai", max_tokens=CTX)
+        self.assertEqual(s, 400)
+        self.assertIn("exceeds the context", b["error"]["message"])
+
+    def test_anthropic_budget_over_the_context_runs_with_the_room(self):
+        """Anthropic's max_tokens is a required ceiling: Claude Code sends its model's maximum (128K) whatever the
+        context.  Unless fit_max_tokens is false, the request runs with what the context leaves (and says so)."""
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            s, b, pt, _ = self.call("anthropic", max_tokens=128000)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+        self.assertIn("max tokens 128,000 is more than the context leaves", out.getvalue())
+        try:
+            self.svc.fit_max_tokens = False                 # "fit_max_tokens": false in the config: refused
+            s, b, _, _ = self.call("anthropic", max_tokens=CTX)
+            self.assertEqual(s, 400)
+            self.assertIn("exceeds the context", b["error"]["message"])
+        finally:
+            self.svc.fit_max_tokens = None
 
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)

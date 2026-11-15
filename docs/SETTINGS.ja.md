@@ -177,7 +177,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `host` | 待ち受けるアドレス。既定 `127.0.0.1`（この PC からだけ）。`0.0.0.0` で他の PC からも接続できる | `"0.0.0.0"` |
 | `api_key` | `/v1/*` に必要な合言葉（`Authorization: Bearer ...` か `x-api-key`）。カンマ区切りで複数。`host` を開けるときは必ず設定 | `"my-secret"` |
 | `allow_shutdown` | `false`: `POST /api/shutdown`（エンジン暴走時などに別のプログラムからサーバーとエンジンを止める）を断る。既定は有効で、`api_key` を送れば可、キーが無ければこの PC からだけ可。Tailscale 越しなら `api_key` を設定する（[MANUAL](MANUAL.ja.md#使い方)） | `false` |
-| `fit_max_tokens` | `true`: `max_tokens` が残りのコンテキストを超えたら縮めて受ける（既定は 400 で断る） | `true` |
+| `fit_max_tokens` | `true`：`max_tokens` が残りのコンテキストを超えたら縮めて受ける。書かないとき：Anthropic API（`/v1/messages`）は縮めて受け（`max_tokens` は必須の上限で、Claude Code はコンテキストに関係なくモデルの最大値 128K を送る）、OpenAI API は 400 で断る。`false`：どちらも断る | `true` |
 | `mcp_servers` | チャット画面から使う MCP サーバー（Claude Desktop と同じ形式） | `{"name": {...}}` |
 | `installer` | セットアップが選んだもの（モデルと量子化。Monitor の表示名用）。セットアップが書き、判断には使わない | `{"quant": "UD-IQ2_XXS"}` |
 
