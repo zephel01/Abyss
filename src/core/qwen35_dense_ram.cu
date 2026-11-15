@@ -90,6 +90,23 @@ int physical_core_count() {
 }
 }  // namespace
 
+
+// (the conversation slots' memory, conv_slots.hpp: the machine's available memory and pinned host buffers)
+int64_t Glm5Model::host_mem_available() { return ram_available(); }
+
+void* Glm5Model::host_pinned_alloc(size_t bytes) {
+    void* p = nullptr;
+    if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    return p;
+}
+
+void Glm5Model::host_pinned_free(void* p) {
+    if (p != nullptr) cudaFreeHost(p);
+}
+
 struct Glm5Model::Q35dRam {
     // load_pack's record: per trunk layer, the three FFN tensors in the mapping
     struct Ffn {

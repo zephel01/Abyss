@@ -50,6 +50,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/logpos.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/conv_slots.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1644,39 +1645,47 @@ static int glm_pack_generate(const Options& o) {
         }
         return h;
     };
-    // CONVERSATION SLOTS (the fast path): a request that does not continue the conversation in the model first sets
-    // that conversation aside in a file (Glm5Model::slot_save: its snapshot and DSA caches), then takes back the slot
-    // it does continue (slot_load) - chats, and an agent's side requests, that interleave no longer re-read each
-    // other's prompts.  STRATA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of STRATA_GLM_SLOT_MIN tokens
-    // or more (1024), in STRATA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most STRATA_GLM_SLOT_GB on
-    // disk (16) and never below 8 GB free.  Text only: a conversation with pictures is not set aside.
-    struct Slot {
-        std::vector<int32_t> tokens;
-        std::string path;
-        uint64_t bytes = 0, used = 0;
-    };
+    // CONVERSATION SLOTS (the fast path; strata/program/conv_slots.hpp): a request that does not continue the
+    // conversation in the model first sets that conversation aside, then takes back the slot it does continue -
+    // chats, and an agent's main thread and its subagents, that interleave no longer re-read each other's prompts.
+    //   GLM-5.3 (Glm5Model::slot_save / slot_load: its snapshot and DSA caches): files.
+    //   qwen35 (Qwen3.8 / Ornith / Qwen3.8-27B; Glm5Model::q35_slot_*: the snapshot and every attention cache's rows
+    //   up to it): host RAM first (pinned; STRATA_GLM_SLOT_RAM_GB, default a quarter of the memory free at the first
+    //   slot, at most 8 GB, and never below 8 GB of the machine's memory free), then files.
+    // STRATA_GLM_SLOTS=<n> slots (default 4, qwen35 8; 0 off: one conversation in the model, as before), for
+    // conversations of STRATA_GLM_SLOT_MIN tokens or more (1024), files in STRATA_GLM_SLOT_DIR (default <pack>/slots,
+    // emptied at start), at most STRATA_GLM_SLOT_GB on disk (16) and never below 8 GB free.  Text only: a
+    // conversation with pictures is not set aside.  A conversation belongs to the API key it came with (GEN key
+    // slot_ns=, the server's): another key's requests never take it back, nor continue it in the model.
+    namespace sl = strata::program::slots;
     constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
-    std::vector<Slot> slots;
-    uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
+    uint64_t snap_ns = 0, snap_sess = 0;   // the namespace (API key) and session hint of the conversation in the model
+    uint64_t req_ns = 0, req_sess = 0;     // this request's (GEN keys slot_ns=<hex>, slot_sess=<hex>)
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
-    int slot_max = model.fast() && !model.geometry().dsv4() && !model.geometry().qwen35() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
+    const bool q35_path = model.fast() && model.geometry().qwen35();
+    std::string q35_slot_why;
+    const bool q35_slot_ok = q35_path && model.q35_slot_supported(q35_slot_why);
+    int slot_max = model.fast() && !model.geometry().dsv4() && (!q35_path || q35_slot_ok) &&
+                           getenv("STRATA_GLM_NO_REUSE") == nullptr
+                       ? (int) env_num("STRATA_GLM_SLOTS", q35_path ? 8 : 4)
+                       : 0;
+    if (q35_path && !q35_slot_ok && getenv("STRATA_GLM_NO_REUSE") == nullptr && env_num("STRATA_GLM_SLOTS", 8) > 0)
+        std::fprintf(stderr, "qwen35 slots: off (%s) - one conversation in the model, as before\n", q35_slot_why.c_str());
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
-    const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
     // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
-    // and kept when they belong to this model), the conversation in the model is set aside when the engine ends
-    // (QUIT or end of input), and a file not used for STRATA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
+    // and kept when they belong to this model), the conversations are set aside on disk when the engine ends (QUIT
+    // or end of input), and a file not used for STRATA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
     // .meta beside it: this model's identity, the conversation's tokens and the slot's size; a slot whose .meta is
     // missing, foreign or does not match its file is deleted.  Both files are written under a temporary name first.
     const bool slot_keep = getenv("STRATA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("STRATA_GLM_SLOT_KEEP")) != 0;
-    const double slot_days = env_num("STRATA_GLM_SLOT_DAYS", 7);
     namespace fs = std::filesystem;
-    std::filesystem::path slot_dir;
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
     const std::string slot_identity = [&] {
         std::ostringstream id;
-        id << "maya-session-1 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
+        id << (q35_path ? "abyss-q35-slot-1" : "maya-session-1") << " engine=" << STRATA_VERSION
+           << " mtp=" << (model.has_mtp() ? 1 : 0);
         std::error_code ec;
         for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
@@ -1688,297 +1697,75 @@ static int glm_pack_generate(const Options& o) {
         for (const auto& s : shards) id << " " << s;
         return id.str();
     }();
-    constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
-    const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
-    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
-        const std::string tmp = path + ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            const uint64_t il = slot_identity.size(), nt = toks.size();
-            f.write((const char*) &kMetaMagic, 8);
-            f.write((const char*) &il, 8);
-            f.write(slot_identity.data(), (std::streamsize) il);
-            f.write((const char*) &bytes, 8);
-            f.write((const char*) &nt, 8);
-            f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
-            f.write((const char*) &kMetaMagic, 8);
-            f.flush();
-            if (!f) return false;
-        }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        return !ec;
-    };
-    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
-    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes) -> bool {
-        std::ifstream f(path, std::ios::binary);
-        uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
-        if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
-            return false;
-        std::string id(il, '\0');
-        if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
-        if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
-        toks.resize(nt);
-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
-               m1 == kMetaMagic;
-    };
-    const auto slot_age_days = [](const std::string& p) {
-        std::error_code ec;
-        const auto t = fs::last_write_time(p, ec);
-        if (ec) return 1e9;
-        return std::chrono::duration<double>(fs::file_time_type::clock::now() - t).count() / 86400.0;
-    };
-    // NOTE lines on stdout: the server shows them in its own log (what happens to the conversations)
-    const auto note = [&](const std::string& m) {
-        std::fprintf(stderr, "glm slots: %s\n", m.c_str());
-        if (o.serve) std::printf("NOTE sessions: %s\n", m.c_str());
-    };
-    const auto gb = [](uint64_t b) {
-        char s[32];
-        std::snprintf(s, sizeof s, "%.2f GB", (double) b / 1e9);
-        return std::string(s);
-    };
+    sl::Store slot_store;
     if (slot_max > 0) {
-        slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
-                                                 : std::filesystem::path(o.glm_pack) / "slots";
-        std::error_code ec;
-        std::filesystem::create_directories(slot_dir, ec);
-        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; };
-        std::vector<Found> found;
-        size_t refused = 0;
-        for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a previous run's slots
-            const std::string fn = de.path().filename().string(), p = de.path().string();
-            if (fn.rfind("slot-", 0) != 0) continue;
-            const bool is_bin = fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0;
-            const bool is_meta = fn.size() > 10 && fn.compare(fn.size() - 5, 5, ".meta") == 0;
-            if (!slot_keep || (!is_bin && !is_meta)) {   // not kept, or a .tmp an interrupted write left
-                std::filesystem::remove(de.path(), ec);
-                continue;
-            }
-            if (!is_meta) continue;                      // a .bin is judged by its .meta
-            const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-            Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec)};
-            const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-            if (meta_read(p, fd.toks, fd.bytes) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
-                found.push_back(std::move(fd));
-            } else {
-                ++refused;
-                std::filesystem::remove(p, ec);
-                std::filesystem::remove(bin, ec);
-            }
+        sl::Store::Config sc;
+        sc.max_slots = slot_max;
+        sc.min_tokens = slot_min;
+        sc.disk_cap = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
+        // the RAM tier: qwen35 only (GLM's slot_load reads its files); STRATA_GLM_SLOT_RAM_GB=0 files only
+        sc.ram_cap_gb = q35_path ? env_num("STRATA_GLM_SLOT_RAM_GB", -1) : 0;
+        sc.dir = getenv("STRATA_GLM_SLOT_DIR") ? fs::path(getenv("STRATA_GLM_SLOT_DIR")) : fs::path(o.glm_pack) / "slots";
+        sc.keep = slot_keep;
+        sc.days = env_num("STRATA_GLM_SLOT_DAYS", 7);
+        sc.identity = slot_identity;
+        sc.max_context = o.max_context;
+        sc.tag = q35_path ? "qwen35 slots" : "glm slots";
+        sl::Store::Hooks h;
+        // NOTE lines on stdout: the server shows them in its own log (what happens to the conversations)
+        h.note = [&](const std::string& m) {
+            if (o.serve) std::printf("NOTE sessions: %s\n", m.c_str());
+        };
+        if (q35_path) {
+            h.save = [&](std::string& e) -> sl::BufP {
+                const int64_t n = model.snapshot_pos();
+                const uint64_t bytes = n > 0 ? model.q35_slot_bytes(n) : 0;
+                if (bytes == 0) {
+                    e = "no snapshot";
+                    return nullptr;
+                }
+                sl::BufP b = slot_store.alloc(bytes);
+                if (!model.q35_slot_save(b->wdata(), bytes, e)) return nullptr;
+                return b;
+            };
+            h.load_mem = [&](const sl::Buf& b, int64_t n, std::string& e) {
+                return model.q35_slot_load(b.data(), b.size(), n, e);
+            };
+            h.mem_available = [] { return strata::core::Glm5Model::host_mem_available(); };
+            h.pinned_alloc = [](uint64_t n) { return strata::core::Glm5Model::host_pinned_alloc((size_t) n); };
+            h.pinned_free = [](void* p) { strata::core::Glm5Model::host_pinned_free(p); };
+        } else {
+            h.save = [&](std::string& e) -> sl::BufP {
+                auto b = std::make_shared<sl::Buf>();
+                // (mem != nullptr: the path is not written; the store's writer writes the bytes)
+                if (model.slot_save("", e, &b->s) == 0) return nullptr;
+                return b;
+            };
+            h.load_file = [&](const std::string& path, int64_t n, std::string& e) { return model.slot_load(path, n, e); };
         }
-        if (slot_keep)                                   // a .bin without its .meta was never completed
-            for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {
-                const std::string p = de.path().string(), fn = de.path().filename().string();
-                if (fn.rfind("slot-", 0) == 0 && fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0 &&
-                    !fs::exists(meta_of(p), ec))
-                    std::filesystem::remove(de.path(), ec);
-            }
-        std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
-        uint64_t total = 0;
-        for (auto& fd : found) {
-            total += fd.bytes;
-            slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
-        }
-        if (slot_keep) {
-            std::ostringstream m;
-            m << "folder " << slot_dir.string() << ": " << slots.size() << " conversation(s) kept from earlier runs ("
-              << gb(total) << ")";
-            if (refused) m << ", " << refused << " not this model's or incomplete - removed";
-            note(m.str());
-        }
-        if (!std::filesystem::is_directory(slot_dir, ec)) {
-            std::fprintf(stderr, "glm slots: %s is not writable - conversations are not set aside\n",
-                         slot_dir.string().c_str());
-            slot_max = 0;
-        }
+        if (!slot_store.start(sc, std::move(h))) slot_max = 0;
     }
-    // slot files are written by one thread from a queue (slot_put): the next prompt never waits for the disk - a
-    // 0.28 GB write took 5-50 s on a 94 GB machine whose RAM tier pins most of the RAM.  A slot is read back only
-    // after its own write ended (slot_take waits for that one), and a failed write drops the slot
-    struct SlotWriter {
-        struct Job { std::string path; std::string bytes; std::vector<int32_t> toks; uint64_t n; };
-        std::mutex mu;
-        std::condition_variable cv;
-        std::deque<Job> q;
-        std::set<std::string> pending, failed;
-        bool stop = false;
-        std::thread t;
-        std::function<bool(const Job&)> write;
-        void push(Job j) {
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return q.size() < 3; });   // (at most 3 waiting: their bytes are in RAM)
-            pending.insert(j.path);
-            q.push_back(std::move(j));
-            if (!t.joinable()) t = std::thread([this] { run(); });
-            cv.notify_all();
-        }
-        void run() {
-            std::unique_lock<std::mutex> lk(mu);
-            for (;;) {
-                cv.wait(lk, [&] { return stop || !q.empty(); });
-                if (q.empty()) return;
-                Job j = std::move(q.front());
-                q.pop_front();
-                cv.notify_all();
-                lk.unlock();
-                const bool ok = write(j);
-                lk.lock();
-                pending.erase(j.path);
-                if (!ok) failed.insert(j.path);
-                cv.notify_all();
-            }
-        }
-        void wait_for(const std::string& path) {   // until that file is written (or failed)
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return pending.count(path) == 0; });
-        }
-        bool take_failed(const std::string& path) {
-            std::lock_guard<std::mutex> lk(mu);
-            return failed.erase(path) > 0;
-        }
-        std::vector<std::string> take_all_failed() {
-            std::lock_guard<std::mutex> lk(mu);
-            std::vector<std::string> v(failed.begin(), failed.end());
-            failed.clear();
-            return v;
-        }
-        void finish() {
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                stop = true;
-            }
-            cv.notify_all();
-            if (t.joinable()) t.join();
-        }
-        ~SlotWriter() { finish(); }
-    } slot_w;
-    slot_w.write = [&](const SlotWriter::Job& j) {
-        std::error_code wec;
-        bool ok = false;
-        {
-            std::ofstream f(j.path + ".tmp", std::ios::binary | std::ios::trunc);
-            f.write(j.bytes.data(), (std::streamsize) j.bytes.size());
-            f.flush();
-            ok = (bool) f;
-        }
-        ok = ok && !(std::filesystem::rename(j.path + ".tmp", j.path, wec), wec) && meta_write(meta_of(j.path), j.toks, j.n);
-        if (!ok) {
-            std::filesystem::remove(j.path + ".tmp", wec);
-            std::filesystem::remove(j.path, wec);
-        }
-        return ok;
-    };
-    const auto slot_drop = [&](size_t i) {
-        slot_w.wait_for(slots[i].path);   // (its file may still be being written)
-        slot_w.take_failed(slots[i].path);
-        std::error_code ec;
-        std::filesystem::remove(slots[i].path, ec);
-        std::filesystem::remove(meta_of(slots[i].path), ec);
-        slots.erase(slots.begin() + (long) i);
-    };
-    const auto slot_lru = [&](size_t keep) {   // the least recently used slot other than `keep`
-        size_t lru = SIZE_MAX;
-        for (size_t i = 0; i < slots.size(); ++i)
-            if (i != keep && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
-        return lru;
-    };
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages ||
             snap_abl != abl_def) return;
-        for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (slots[i].tokens.size() <= snap_tokens.size() &&
-                std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
-                slot_drop(i);
-        while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
-        std::error_code ec;
-        const auto space = std::filesystem::space(slot_dir, ec);
-        if (!ec && space.available < (uint64_t) 8 << 30) {
-            std::fprintf(stderr, "glm slots: under 8 GB free in %s - the conversation is not set aside\n",
-                         slot_dir.string().c_str());
-            return;
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch()).count();
-        const std::string path = (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) +
-                                              ".bin")).string();
-        std::string e, buf;
-        for (const auto& fp : slot_w.take_all_failed()) {   // an earlier write that failed: that slot is gone
-            for (size_t i = 0; i < slots.size(); ++i)
-                if (slots[i].path == fp) {
-                    slots.erase(slots.begin() + (long) i);
-                    break;
-                }
-            note("setting a conversation aside failed (writing its files) - it is not kept");
-        }
-        const uint64_t bytes = model.slot_save(path + ".tmp", e, &buf);
-        if (bytes == 0) {
-            std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
-                         e.empty() ? "no snapshot" : e.c_str());
-            return;
-        }
-        slot_w.push({path, std::move(buf), snap_tokens, bytes});
-        slots.push_back({snap_tokens, path, bytes, ++slot_clock});
-        snap_in_slot = true;
-        uint64_t total = 0;
-        for (const auto& s : slots) total += s.bytes;
-        size_t evicted = 0;
-        while (slots.size() > 1 && total > slot_budget) {
-            const size_t i = slot_lru(slots.size() - 1);
-            total -= slots[i].bytes;
-            slot_drop(i);
-            ++evicted;
-        }
-        char m[256];
-        std::snprintf(m, sizeof m, "saved a %zu-token conversation%s (%s in %.1f s); %zu kept, %s%s",
-                      snap_tokens.size(), why, gb(bytes).c_str(),
-                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), slots.size(),
-                      gb(total).c_str(), evicted ? ", least recently used removed to stay under the size cap" : "");
-        note(m);
+        const uint64_t hint = q35_path ? model.q35_slot_bytes((int64_t) snap_tokens.size()) : 0;
+        if (slot_store.put(snap_tokens, snap_ns, snap_sess, why, hint)) snap_in_slot = true;
     };
-    // the longest slot this prompt continues, back in the model: the tokens it covers (0: none)
+    // the longest slot this prompt continues (this request's API key's), back in the model: the tokens it covers
+    // (0: none)
     const auto slot_take = [&](const std::vector<int32_t>& prompt) -> size_t {
         if (slot_max <= 0 || !cur_img_pos.empty()) return 0;
-        size_t best = SIZE_MAX, len = 0;
-        for (size_t i = 0; i < slots.size(); ++i) {
-            const auto& t = slots[i].tokens;
-            if (t.size() > len && t.size() < prompt.size() && std::equal(t.begin(), t.end(), prompt.begin())) {
-                best = i;
-                len = t.size();
-            }
-        }
-        if (best == SIZE_MAX) return 0;
-        {   // its file may still be being written (slot_put)
-            slot_w.wait_for(slots[best].path);
-            if (slot_w.take_failed(slots[best].path)) {
-                note("setting a conversation aside failed (writing its files) - reading its prompt again");
-                slots.erase(slots.begin() + (long) best);
-                return 0;
-            }
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        std::string e;
-        if (!model.slot_load(slots[best].path, (int64_t) len, e)) {
-            note("taking a conversation back failed (" + e + ") - reading its prompt again");
-            slot_drop(best);
-            snap_tokens.clear();
-            return 0;
-        }
-        snap_tokens = slots[best].tokens;
+        std::vector<int32_t> t;
+        bool failed = false;
+        const size_t len = slot_store.take(prompt, req_ns, req_sess, t, failed);
+        if (failed) snap_tokens.clear();
+        if (len == 0) return 0;
+        snap_tokens = std::move(t);
         snap_img_hash = kNoImages;
         snap_in_slot = true;
-        slots[best].used = ++slot_clock;
-        if (slot_keep) {   // its age counts from its last use
-            std::error_code ec;
-            fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
-        }
-        char m[160];
-        std::snprintf(m, sizeof m, "took back a %zu-token conversation from disk (%.1f s); %zu new tokens to read", len,
-                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-                      prompt.size() - len);
-        note(m);
+        snap_ns = req_ns;
+        snap_sess = req_sess;
         return len;
     };
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
@@ -2014,7 +1801,7 @@ static int glm_pack_generate(const Options& o) {
         size_t reuse = 0;
         if (model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
             std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
-            img_hash(snap_tokens.size()) == snap_img_hash &&
+            img_hash(snap_tokens.size()) == snap_img_hash && (slot_max <= 0 || snap_ns == req_ns) &&
             getenv("STRATA_GLM_NO_REUSE") == nullptr && model.snapshot_restore())
             reuse = snap_tokens.size();
         if (reuse == 0 && slot_max > 0 && abl_req == abl_def) {
@@ -2094,6 +1881,8 @@ static int glm_pack_generate(const Options& o) {
                     snap_tokens.assign(prompt.begin(), prompt.end() - 1);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
+                    snap_ns = req_ns;
+                    snap_sess = req_sess;
                 } else {
                     snap_tokens.clear();
                 }
@@ -3210,6 +2999,7 @@ static int glm_pack_generate(const Options& o) {
             req_stop_ids.clear();
             req_think_close.clear();
             req_spec = true;
+            req_ns = req_sess = 0;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
@@ -3252,6 +3042,10 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }
                 else if (k == "spec") { req_spec = std::atoi(v.c_str()) != 0; }
+                // the conversation's namespace (the API key it came with) and session hint, the server's: a slot of
+                // another namespace is never taken back for this request (conv_slots.hpp)
+                else if (k == "slot_ns") { req_ns = std::strtoull(v.c_str(), nullptr, 16); }
+                else if (k == "slot_sess") { req_sess = std::strtoull(v.c_str(), nullptr, 16); }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
@@ -3368,7 +3162,7 @@ static int glm_pack_generate(const Options& o) {
     }
     // the engine ends (QUIT, or the server gone): the conversation in the model is kept for the next start
     if (slot_keep) slot_put(" on shutdown");
-    slot_w.finish();   // (every queued conversation on disk before the engine ends)
+    slot_store.finish();   // (with keep, every conversation on disk; every queued write done before the engine ends)
     return 0;
 }
 

@@ -112,6 +112,17 @@ bool requant_rows(const void* src, int from, int to, int64_t rows, int64_t n_in,
 }
 }  // namespace
 
+// the draft layer's KV caches ([ctx][n_head_kv][head_dim] FP16, a row a position): the conversation slots save and
+// restore their rows
+bool Glm5Model::q4x_mtp_cache(uint16_t** kc, uint16_t** vc, size_t* row_bytes) const {
+    const auto* M = (const Q4xDrafter*) q4d_;
+    if (M == nullptr || M->kc == nullptr || M->vc == nullptr) return false;
+    *kc = M->kc;
+    *vc = M->vc;
+    *row_bytes = (size_t) g_.attn_head_kv * g_.head_dim * 2;
+    return true;
+}
+
 bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;

@@ -238,6 +238,20 @@ public:
     // 4-23 s on a 94 GB machine whose RAM tier pins 60 GB, and the next prompt waited for it)
     uint64_t slot_save(const std::string& path, std::string& err, std::string* mem = nullptr);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    /// Conversation slots on the qwen35 path (Qwen3.8, Ornith, Qwen3.8-27B; qwen35_fast_path.cu): the snapshot
+    /// (q35_snap_h_: the delta-net states, taken just before the prompt's last token) and every attention cache's
+    /// rows 0 .. n-1 - the NextN block's and the qwen4exp draft layer's caches, qwen4exp's QSA block keys - in one
+    /// host buffer of q35_slot_bytes(n).  q35_slot_load puts them back as the live state and the snapshot: the
+    /// model is then exactly as it was when that snapshot was taken.  q35_slot_supported: false (and why) on a
+    /// layout the slots do not cover (a model split across GPUs, laguna).
+    bool q35_slot_supported(std::string& why) const;
+    uint64_t q35_slot_bytes(int64_t n) const;
+    bool q35_slot_save(uint8_t* dst, uint64_t bytes, std::string& err);
+    bool q35_slot_load(const uint8_t* src, uint64_t bytes, int64_t n, std::string& err);
+    /// The machine's available memory (MemAvailable; 0 unknown) and pinned host buffers (null: none) for the slots.
+    static int64_t host_mem_available();
+    static void* host_pinned_alloc(size_t bytes);
+    static void host_pinned_free(void* p);
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
@@ -591,6 +605,7 @@ public:
     bool dflash_load(std::string& err);
     void dflash_destroy();
     void dflash_reset();
+    void dflash_forget();                          // (a slot of another conversation: no context)
     void dflash_report() const;
     // the residual entering target layer il (hc streams of n_embd, rows rs floats apart) -> the features of n rows:
     // the token path's / a window's columns 0..n-1 (prompt false), or a prompt chunk's last rows (prompt true, R the
@@ -658,6 +673,7 @@ public:
     // rows' input the trunk's final residual (4 streams) instead of a normed hidden
     void* q4d_ = nullptr;
     bool q4x_mtp_load(const std::string& dir, std::string& err);
+    bool q4x_mtp_cache(uint16_t** kc, uint16_t** vc, size_t* row_bytes) const;   // (its KV caches: the slots)
     bool q4x_mtp_forward(int64_t p0, int n, const float* Rin, size_t r_stride, const int* tok, bool full, float* conf_out,
                          int* tok_out, std::string& err);
     bool q4x_mtp_rows(int64_t p0, int n, const float* Rin, size_t r_stride, const int32_t* next, std::string& err);
@@ -678,6 +694,9 @@ public:
     bool q4x_qsa_setup(std::string& err);
     int64_t q35_snap_pend_ = -1, q35_snap_done_ = -1;
     bool q35_snap_copy(bool restore);
+    size_t q35_snap_bytes() const;                         // (q35_snap_h_'s size)
+    // the device runs a qwen35 slot of n positions holds after its header and the snapshot, in file order
+    void q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& out) const;
     bool q4x_mix(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
                  const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);
     bool q4x_mix5(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,

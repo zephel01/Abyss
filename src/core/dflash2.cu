@@ -797,6 +797,15 @@ void Glm5Model::dflash_reset() {
     }
 }
 
+// a slot of another conversation put back (Glm5Model::q35_slot_load): the ring's rows are not its - the context starts
+// over at the restored position
+void Glm5Model::dflash_forget() {
+    auto* D = (DflState*) dfl_;
+    if (D == nullptr) return;
+    D->win_p0 = -1;
+    D->ctx_lo = D->ctx_end = pos_;
+}
+
 void Glm5Model::dflash_capture(int il, const float* R, int n, size_t rs, bool prompt, cudaStream_t s) {
     auto* D = (DflState*) dfl_;
     if (D == nullptr || n <= 0) return;

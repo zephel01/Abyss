@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -626,6 +627,25 @@ void Glm5Model::qwen35_reset() {
     cudaStreamSynchronize(F->cs);
 }
 
+size_t Glm5Model::q35_snap_bytes() const {
+    const FastState* F = fast_;
+    if (F == nullptr || qwen35_state_ == nullptr) return 0;
+    const Glm5Geometry& g = g_;
+    const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim();
+    const size_t state_b = S * HV * S * 4, conv_b = C * (size_t) (g.d_conv - 1) * 4;
+    const size_t pend_b = F->q35_pend_h != nullptr ? (size_t) (g.q4x ? g.hc : 1) * g.n_embd * 4 : 0;
+    const size_t ple_b = F->ple_hist != nullptr ? (size_t) strata::kernels::NG_HIST * g.hc * g.n_embd * 4 : 0;
+    const size_t tail_b = (size_t) 3 * g.idx_key * sizeof(float);
+    size_t total = pend_b + ple_b;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (Ly.recr) total += state_b + conv_b;
+        else if (Ly.q4_tail != nullptr) total += tail_b;
+        total += 2 * (Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * 128 * 2 : (size_t) 0);
+    }
+    return total;
+}
+
 bool Glm5Model::q35_snap_copy(bool restore) {
     FastState* F = fast_;
     if (F == nullptr || qwen35_state_ == nullptr) return false;
@@ -637,17 +657,12 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     // (qwen4exp: every attention layer's QSA raw tail - the cells of the block being filled; a position restored inside
     // a block finds its earlier cells' keys there, not the later positions' that overwrote them)
     const size_t tail_b = (size_t) 3 * g.idx_key * sizeof(float);
-    size_t total = pend_b + ple_b;
     // laguna: a window layer's ring (the rows a later position overwrites; the full layers' rows past the snapshot are
     // written again in order)
     const auto ring_b = [&](const FastState::Layer& Ly) {
         return Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * 128 * 2 : (size_t) 0;
     };
-    for (int il = l0_; il < l1_; ++il) {
-        if (F->L[(size_t) il].recr) total += state_b + conv_b;
-        else if (F->L[(size_t) il].q4_tail != nullptr) total += tail_b;
-        total += 2 * ring_b(F->L[(size_t) il]);
-    }
+    const size_t total = q35_snap_bytes();   // (the runs below, in this order)
     if (q35_snap_h_ == nullptr) {
         if (restore) return false;
         if (cudaHostAlloc(&q35_snap_h_, total, cudaHostAllocDefault) != cudaSuccess) {
@@ -685,6 +700,197 @@ bool Glm5Model::q35_snap_copy(bool restore) {
         q35_snap_done_ = q35_row_done_;
     }
     return cudaStreamSynchronize(F->cs) == cudaSuccess;
+}
+
+// ---------------------------------------------------------------- conversation slots (strata/program/conv_slots.hpp)
+// A qwen35 conversation set aside while others run: the snapshot (q35_snap_h_, taken just before its prompt's last
+// token: the delta-net states and conv rows, qwen4exp's QSA tails and PLE history, the drafter's pending hidden) and
+// every attention cache's rows 0 .. n-1 - the trunk's layers, the NextN block's, qwen4exp's QSA block keys (the dead
+// key and the pooled rows of the blocks done by n) and the qwen4exp draft layer's caches.  These are all the state
+// a position < n holds: the rows are written once a position and only read after, so the model is then exactly as
+// it was when the snapshot was taken (the same tokens follow as on the conversation's own snapshot).
+// The buffer: a header (magic, n, a hash of the layout, the snapshot's size, the drafter's two positions), the
+// snapshot, then the runs (q35_slot_runs) in order.
+namespace {
+constexpr uint64_t kQ35SlotMagic = 0x314C53353351424Full;   // "OBQ35SL1"
+constexpr size_t kQ35SlotHdr = 6 * 8;
+}  // namespace
+
+bool Glm5Model::q35_slot_supported(std::string& why) const {
+    if (!g_.qwen35() || fast_ == nullptr || qwen35_state_ == nullptr) {
+        why = "not the qwen35 fast path";
+        return false;
+    }
+    if (split_next_ != nullptr || next_port_ != nullptr || l0_ != 0 || l1_ != g_.n_layers) {
+        why = "the model is split across GPUs";
+        return false;
+    }
+    if (g_.laguna) {
+        why = "laguna's window rings are not covered yet";
+        return false;
+    }
+    return true;
+}
+
+void Glm5Model::q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& out) const {
+    out.clear();
+    const FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const size_t KV = (size_t) g.attn_head_kv * g.head_dim;
+    const size_t rk = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, false) : KV * 2;
+    const size_t rv = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, true) : KV * 2;
+    const size_t N = (size_t) n;
+    for (int il = l0_; il < lt_; ++il) {   // (the NextN block's layer too)
+        const auto& Ly = F->L[(size_t) il];
+        if (Ly.recr || Ly.kc == nullptr || Ly.vc == nullptr) continue;
+        out.push_back({(void*) Ly.kc, N * rk});
+        out.push_back({(void*) Ly.vc, N * rv});
+        if (g.q4x && Ly.q4_pooled != nullptr && Ly.q4_dead != nullptr) {
+            const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+            const size_t ID = (size_t) sh.idx_dim;
+            const size_t rows = std::min<size_t>((size_t) F->q4_max_blocks, N / (size_t) sh.idx_block + 1);
+            out.push_back({(void*) Ly.q4_dead, ID * 4});
+            out.push_back({(void*) Ly.q4_pooled, rows * ID * 4});
+        }
+    }
+    uint16_t *dk = nullptr, *dv = nullptr;
+    size_t drow = 0;
+    if (g.q4x && q4x_mtp_cache(&dk, &dv, &drow)) {   // the qwen4exp draft layer's caches
+        out.push_back({(void*) dk, N * drow});
+        out.push_back({(void*) dv, N * drow});
+    }
+}
+
+uint64_t Glm5Model::q35_slot_bytes(int64_t n) const {
+    std::string why;
+    if (n <= 0 || n > max_ctx_ || !q35_slot_supported(why)) return 0;
+    std::vector<std::pair<void*, size_t>> runs;
+    q35_slot_runs(n, runs);
+    uint64_t b = kQ35SlotHdr + q35_snap_bytes();
+    for (const auto& r : runs) b += r.second;
+    return b;
+}
+
+namespace {
+// what a slot's runs must match: their count and sizes at 1 and at 4097 positions, the snapshot's size, the cache format
+uint64_t q35_layout_hash(const Glm5Model& m, size_t snap_b, int kv,
+                         const std::function<void(int64_t, std::vector<std::pair<void*, size_t>>&)>& runs) {
+    uint64_t h = 1469598103934665603ull;
+    const auto mix = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
+    };
+    (void) m;
+    mix(snap_b);
+    mix((uint64_t) kv);
+    std::vector<std::pair<void*, size_t>> r;
+    for (const int64_t n : {(int64_t) 1, (int64_t) 4097}) {
+        runs(n, r);
+        mix(r.size());
+        for (const auto& x : r) mix(x.second);
+    }
+    return h;
+}
+}  // namespace
+
+bool Glm5Model::q35_slot_save(uint8_t* dst, uint64_t bytes, std::string& err) {
+    const int64_t n = snap_pos_;
+    if (n <= 0 || q35_snap_h_ == nullptr) {
+        err = "no snapshot to save";
+        return false;
+    }
+    if (bytes != q35_slot_bytes(n)) {
+        err = "the slot's size differs from this model's";
+        return false;
+    }
+    FastState* F = fast_;
+    cudaSetDevice(dev_);
+    cudaDeviceSynchronize();   // (every write of the rows done: the prompt's streams, the background copies')
+    const size_t snap_b = q35_snap_bytes();
+    std::vector<std::pair<void*, size_t>> runs;
+    q35_slot_runs(n, runs);
+    const uint64_t hash = q35_layout_hash(*this, snap_b, q35_kv_, [&](int64_t k, std::vector<std::pair<void*, size_t>>& o) {
+        q35_slot_runs(k, o);
+    });
+    const int64_t hdr[6] = {(int64_t) kQ35SlotMagic, n, (int64_t) hash, (int64_t) snap_b, q35_snap_pend_, q35_snap_done_};
+    std::memcpy(dst, hdr, kQ35SlotHdr);
+    std::memcpy(dst + kQ35SlotHdr, q35_snap_h_, snap_b);
+    uint8_t* at = dst + kQ35SlotHdr + snap_b;
+    for (const auto& r : runs) {
+        if (r.second > 0 && cudaMemcpyAsync(at, r.first, r.second, cudaMemcpyDeviceToHost, F->cs) != cudaSuccess) {
+            cudaGetLastError();
+            err = "the caches did not copy back";
+            return false;
+        }
+        at += r.second;
+    }
+    if (cudaStreamSynchronize(F->cs) != cudaSuccess) {
+        cudaGetLastError();
+        err = "the caches did not copy back";
+        return false;
+    }
+    return true;
+}
+
+bool Glm5Model::q35_slot_load(const uint8_t* src, uint64_t bytes, int64_t n, std::string& err) {
+    std::string why;
+    if (!q35_slot_supported(why)) {
+        err = why;
+        return false;
+    }
+    int64_t hdr[6] = {};
+    if (bytes < kQ35SlotHdr) {
+        err = "not a slot of this model";
+        return false;
+    }
+    std::memcpy(hdr, src, kQ35SlotHdr);
+    const size_t snap_b = q35_snap_bytes();
+    const uint64_t hash = q35_layout_hash(*this, snap_b, q35_kv_, [&](int64_t k, std::vector<std::pair<void*, size_t>>& o) {
+        q35_slot_runs(k, o);
+    });
+    if ((uint64_t) hdr[0] != kQ35SlotMagic || hdr[1] != n || n <= 0 || n > max_ctx_ || (uint64_t) hdr[2] != hash ||
+        (uint64_t) hdr[3] != snap_b || bytes != q35_slot_bytes(n)) {
+        err = "not a slot of this model";
+        return false;
+    }
+    FastState* F = fast_;
+    cudaSetDevice(dev_);
+    cudaDeviceSynchronize();
+    if (q35_snap_h_ == nullptr && cudaHostAlloc(&q35_snap_h_, snap_b, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        q35_snap_h_ = nullptr;
+        err = "the snapshot did not allocate";
+        return false;
+    }
+    std::memcpy(q35_snap_h_, src + kQ35SlotHdr, snap_b);
+    q35_snap_pend_ = hdr[4];
+    q35_snap_done_ = hdr[5];
+    std::vector<std::pair<void*, size_t>> runs;
+    q35_slot_runs(n, runs);
+    const uint8_t* at = src + kQ35SlotHdr + snap_b;
+    for (const auto& r : runs) {
+        if (r.second > 0 && cudaMemcpyAsync(r.first, at, r.second, cudaMemcpyHostToDevice, F->cs) != cudaSuccess) {
+            cudaGetLastError();
+            snap_pos_ = -1;
+            err = "the slot did not read back";
+            return false;
+        }
+        at += r.second;
+    }
+    if (cudaStreamSynchronize(F->cs) != cudaSuccess) {
+        cudaGetLastError();
+        snap_pos_ = -1;
+        err = "the slot did not read back";
+        return false;
+    }
+    snap_pos_ = n;
+    // the snapshot into the live state, as a conversation's own snapshot is restored (it also sets the position)
+    if (!snapshot_restore()) {
+        snap_pos_ = -1;
+        err = "the snapshot did not restore";
+        return false;
+    }
+    dflash_forget();   // (DFlash 2's context ring holds the other conversation's rows)
+    return true;
 }
 
 // ---------------------------------------------------------------- the NextN block as the drafter
