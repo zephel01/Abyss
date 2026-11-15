@@ -155,10 +155,6 @@ STRATA_GLM_SEED_DUMP  # src/core/glm_prefill.cu
 STRATA_GLM_SEED_PRIOR  # src/core/glm_fast_path.cu
 STRATA_GLM_SERVICE_IDLE_MS  # src/core/glm_fast_path.cu
 STRATA_GLM_SH_LATE  # src/core/dsv4_verify.cu
-STRATA_GLM_SLOT_DAYS  # src/program/generate.cpp
-STRATA_GLM_SLOT_DIR  # src/program/generate.cpp
-STRATA_GLM_SLOT_GB  # src/program/generate.cpp
-STRATA_GLM_SLOT_MIN  # src/program/generate.cpp
 STRATA_GLM_SLOT_ROUNDTRIP  # src/program/generate.cpp
 STRATA_GLM_SLOT_TIMING  # src/core/glm_fast_path.cu
 STRATA_GLM_SLOW  # src/core/glm_model.cu

@@ -486,6 +486,9 @@ ABYSS_KEY=... ./abyss.sh --connect claude --url http://192.168.1.20:8082 --key-e
   ask whether to use it. If your `~/.claude/settings.json` has `ANTHROPIC_*` in its `env`, those win - take them out.
   Claude Code's own prompt is about 20K tokens: set the server up with a context of 32K or more (64K+ is comfortable).
   A model name that starts with `claude-` is taken for one of Claude's models: give the config another `model_name`.
+  Claude Code's subagents run as separate conversations next to the main thread: the engine sets each aside when the
+  other runs and takes it back (`STRATA_GLM_SLOTS`), so a switch back reads only what is new (Qwen3.8: 11 s -> 0.2 s
+  at 30K tokens).
 - **OpenCode:** provider `abyss` (`@ai-sdk/openai-compatible`, base URL `.../v1`, `limit.context` = the server's
   context, the key as `{env:ABYSS_API_KEY}`). Your default model is kept if you have one; pick `abyss/<model>` with
   `/models`. A config with comments (JSONC) is not touched: copy the printed block by hand.
@@ -1050,6 +1053,10 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | your expert usage between starts; `0` = off |
 | `STRATA_GLM_PRIOR` | set by the server | a routing profile (`expert_counts.txt` lines, `tools/glm_expert_prior.py`) for a pack without its own: the tiers warm in its order and each layer's VRAM share follows it. The server points it at `data/expert_counts/` for the models Abyss ships one for (Qwen3.8-Flash-Next, any quant; v1.3.86: RTX 5090, ISTA IQ3_S, `--bench` 87.6 -> 116 tok/s with the swap rule above) |
 | `STRATA_GLM_NO_REUSE` | off | `1`: no conversation reuse |
+| `STRATA_GLM_SLOTS` | 4 (GLM-5.3), 8 (Qwen3.8 / Ornith / Qwen3.8-27B) | conversation slots: the engine holds one conversation; a request that does not continue it first sets it aside and then takes back the slot it does continue (the longest whose tokens are an exact prefix of the prompt), so chats - and Claude Code's main thread and its subagents - that take turns no longer read each other's prompts again. GLM-5.3: files. Qwen3.8 / Ornith / Qwen3.8-27B: host RAM first (`STRATA_GLM_SLOT_RAM_GB`), then files; a slot holds the delta-net states and every attention cache's rows (Qwen3.8 UD-IQ3_XXS: 1.05 GB at 36K tokens). RTX 5090, Qwen3.8 UD-IQ3_XXS, a 30K main thread and a 20K subagent taking turns: each switch back 11.1 s -> 0.2 s of prompt (+0.1-0.3 s to set aside and take back). A slot gives the same state as the conversation's own snapshot (the same tokens follow). A conversation belongs to the API key it came with: another key's requests never take it back. Text only (a conversation with pictures is not set aside); off for DeepSeek V4 / V4.1 and for a model split across GPUs. `0`: off - one conversation, as before |
+| `STRATA_GLM_SLOT_RAM_GB` | auto | the slots' RAM on Qwen3.8 / Ornith / Qwen3.8-27B (pinned host memory, outside the RAM tier): auto = a quarter of the memory free when the first slot is set aside, at most 8 GB; a slot is never kept in RAM with less than 8 GB of the machine's memory left after it. Over it the least recently used slot goes to a file (read back in ~0.3 s a GB). `0`: files only (GLM-5.3 always) |
+| `STRATA_GLM_SLOT_GB` / `STRATA_GLM_SLOT_DIR` / `STRATA_GLM_SLOT_MIN` | 16 / `<pack>/slots` / 1024 | the slots' files: at most this many GB (least recently used removed), in this folder (emptied at start unless `STRATA_GLM_SLOT_KEEP`), never written with under 8 GB free on its drive; conversations shorter than `_MIN` tokens are not set aside |
+| `STRATA_GLM_SLOT_KEEP` / `STRATA_GLM_SLOT_DAYS` | off / 7 | `1`: the slots outlive the engine - the conversations go to files when it ends and the next start takes them back (a file unused for `_DAYS` days, or another model's, is removed) |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | (server) tokens a thinking block always leaves for the answer (at most half of the request's `max_tokens`) |
 | `STRATA_GLM_END_GUARD` | 1 | (server) the end-of-turn guard: a turn that ends inside the reasoning closes the reasoning instead, and a turn that ends right after it with no answer takes the next most likely token, once each (a heavily quantized model's empty answers); `0` = off |
 | `STRATA_GLM_THINK_BRIDGE` | (a sentence) | (server) what a reasoning block closed by the thinking budget or the loop guard says just before its `</think>`: that the thinking stops here and the answer follows in the question's language (a bare `</think>` mid-thought let Qwen3.8 go on thinking in English in the answer, issue #36); another text replaces it, `0` = a bare `</think>` as before |
@@ -1190,7 +1197,7 @@ KL 0.009 over 3000 tokens, with the same next-token accuracy.
 - No MTP drafter: this GGUF has no MTP block. DeepSeek's DSpark drafter runs from v1.3.43 (`--dspark`, one GPU; see
   [The DSpark drafter](#the-dspark-drafter-deepseek-v4-flash)); without it speculative decoding drafts from the text
   itself (`STRATA_DS4_SPEC`).
-- Conversation slots on disk (`STRATA_GLM_SLOTS`) are off for DeepSeek V4; the live reuse of the last conversation works.
+- Conversation slots (`STRATA_GLM_SLOTS`) are off for DeepSeek V4; the live reuse of the last conversation works.
 - No images (DeepSeek V4 Flash is text-only here).
 - Several GPUs: the layer split runs (see "Several GPUs"), and a slower second card
   does not beat one fast card with the iGPU lane - `auto` then runs on the fast card alone. Windows is untested for DeepSeek V4.
