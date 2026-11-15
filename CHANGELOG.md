@@ -7,6 +7,17 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.149 - 2026-11-15
+
+- DeepSeek V4.1 1017: the 32-head lightning indexer runs on tensor cores (CUDA sm_80+: mma.sync in decode, the
+  verify window and the prompt; HIP gfx11 / gfx12: WMMA in decode, the prompt was WMMA already), on the same kernels
+  as V4's 64 heads. RTX 5090 + 123 GB, iGPU off, V4.1 Compact JA256, 512 tokens, median vs v1.3.148 (tok/s): prompt
+  32K 1,488 -> 1,549 (+4.1%), 64K 2,127 -> 2,425 (+14.0%), 128K 2,564 -> 3,252 (+26.8%); decode 32K 63.62 -> 64.88
+  (+2.0%), 64K 63.76 -> 65.80 (+3.2%), 128K 61.25 -> 62.31 (+1.7%). The change is the order of sums only: KL
+  against the token path 0.00867 vs 0.00962 (two runs of one setting differ by 0.0084-0.0097); deterministic V4.1
+  outputs change (`STRATA_DS4_IDX=1`: the FP32 kernels, the old outputs exactly). V4 0731 and the other models: the
+  same outputs and speed.
+
 ## v1.3.148 - 2026-11-15
 
 - DeepSeek V4 0731 / V4.1 1017 long contexts: the DSA indexer's top-k select runs over several GPU blocks (the same
