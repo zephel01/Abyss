@@ -586,6 +586,12 @@ class StrataEngine:
         sid = sampling.get("_stop_ids")
         if sid:
             think += " stop_ids=" + ",".join(str(int(i)) for i in sid)
+        # the conversation slots' namespace (the API key's) and session hint (slot_hint): an engine that knows the keys
+        # never takes another namespace's conversation back for this request
+        for k in ("slot_ns", "slot_sess"):
+            v = sampling.get("_" + k)
+            if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{1,16}", v):
+                think += f" {k}={v}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
         if isinstance(tune, dict):
@@ -2708,6 +2714,35 @@ class BadBody(Exception):
         self.status = status
 
 
+def slot_hint(headers, req: dict, api_key) -> tuple[str, str]:
+    """The conversation slots' namespace and session hint for a request (GEN keys slot_ns= / slot_sess=, hex): the
+    engine sets a conversation aside when another one runs and takes it back when it continues
+    (include/strata/program/conv_slots.hpp).  Namespace: a hash of the API key the request came with, when the server
+    has keys - one key's conversations are never taken back by another key's requests ("" without keys: one
+    namespace).  Session hint: Claude Code's X-Claude-Code-Session-Id, else the session_id in Anthropic's
+    metadata.user_id, else OpenAI's "user" - a hint only (the engine matches the tokens)."""
+    ns = ""
+    if key_list(api_key):
+        auth = headers.get("Authorization", "") or ""
+        given = auth[7:].strip() if auth.lower().startswith("bearer ") else (headers.get("x-api-key", "") or "")
+        if given:
+            ns = hashlib.sha256(b"abyss-slot-ns\0" + given.encode()).hexdigest()[:16]
+    sess = headers.get("X-Claude-Code-Session-Id", "") or ""
+    if not sess:
+        md = req.get("metadata")
+        uid = md.get("user_id") if isinstance(md, dict) else None
+        if isinstance(uid, str) and "session_id" in uid:
+            try:
+                j = json.loads(uid)
+                sess = str(j.get("session_id") or "") if isinstance(j, dict) else ""
+            except ValueError:
+                sess = uid
+        elif isinstance(req.get("user"), str):
+            sess = req["user"]
+    sess_h = hashlib.sha256(b"abyss-slot-sess\0" + str(sess).encode()).hexdigest()[:16] if sess else ""
+    return ns, sess_h
+
+
 def key_list(value) -> list[str]:
     """The API keys the server accepts (Strata #1344): llama.cpp's form, several separated by commas ("k1,k2"), or a
     list in the config ("api_key": ["k1", "k2"], for a key that contains a comma)."""
@@ -3243,6 +3278,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
+            req["_slot_ns"], req["_slot_sess"] = slot_hint(self.headers, req, svc.api_key)
             messages, tools, kw = openai_to_messages(req)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -3344,6 +3380,7 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
+            req["_slot_ns"], req["_slot_sess"] = slot_hint(self.headers, req, svc.api_key)
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, fit=svc.fit_max_tokens is not False)
