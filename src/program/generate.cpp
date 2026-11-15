@@ -1626,6 +1626,10 @@ static int glm_pack_generate(const Options& o) {
     // GEN key end_ids=<a,b,..>: the turn's end tokens as the server stops on them (Qwen3.8's <|im_end|> on the glm
     // path, whose own end list is GLM's); the guard watches these, else the engine's end list
     std::vector<int64_t> req_end_ids;
+    // GEN key stop_ids=<a,b,..>: the turn's end tokens as the server stops on them, the template's turn end first -
+    // this request stops on these instead of the engine's list (GLM's on the glm path: Qwen3.8 and Ornith there
+    // stopped at ordinary pieces of their vocabulary, and the answer's loop guard ended a turn with a byte token)
+    std::vector<int64_t> req_stop_ids;
     // GEN key spec=0: this request token by token - no drafter, no verify windows (--bench compares a greedy answer
     // with and without them: greedy speculation must give the same tokens)
     bool req_spec = true;
@@ -1984,7 +1988,8 @@ static int glm_pack_generate(const Options& o) {
         model.force_next(-1);
         bool in_think = req_think_end >= 0;
         bool ans_guard = false;   // the answer has had only whitespace since the reasoning closed (end guard armed)
-        const std::vector<int64_t>& guard_ids = req_end_ids.empty() ? eos : req_end_ids;
+        const std::vector<int64_t>& stops = req_stop_ids.empty() ? eos : req_stop_ids;   // (this request's end list)
+        const std::vector<int64_t>& guard_ids = req_end_ids.empty() ? stops : req_end_ids;
         model.end_guard(req_end_guard && in_think ? &guard_ids : nullptr, req_think_end);
         std::vector<int32_t> prompt;
         prompt.reserve(ids.size());
@@ -2195,7 +2200,11 @@ static int glm_pack_generate(const Options& o) {
                 // an agent to go on (GLM's single-token tags)
                 // (deepseek4 has no single-token argument tags: its turn ends with <｜end▁of▁sentence｜>, 1)
                 const bool ds4 = model.geometry().dsv4();
-                const int kArgValue = ds4 ? -2 : 154849, kArgValueEnd = ds4 ? -2 : 154850, kUser = ds4 ? 1 : 154827;
+                const int kArgValue = ds4 ? -2 : 154849, kArgValueEnd = ds4 ? -2 : 154850;
+                int kUser = ds4 ? 1 : 154827;   // (the server's turn end when its list has no GLM <|user|>)
+                if (!req_stop_ids.empty() &&
+                    std::find(req_stop_ids.begin(), req_stop_ids.end(), (int64_t) kUser) == req_stop_ids.end())
+                    kUser = (int) req_stop_ids.front();
                 if (tok == kArgValue) in_arg = true;
                 if (tok == kArgValueEnd) in_arg = false;
                 if (const int per = looping(loop_w_answer)) {
@@ -2266,7 +2275,7 @@ static int glm_pack_generate(const Options& o) {
                 if (stat_ring.size() > 8) stat_ring.pop_front();
             }
             bool eos_hit = false;
-            for (const int64_t e : eos)
+            for (const int64_t e : stops)
                 if (e == tok) eos_hit = true;
             if (eos_hit && stop_on_eos) {
                 finish = "stop";
@@ -3198,6 +3207,7 @@ static int glm_pack_generate(const Options& o) {
             req_end_guard = false;
             req_ws_ids.clear();
             req_end_ids.clear();
+            req_stop_ids.clear();
             req_think_close.clear();
             req_spec = true;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
@@ -3232,6 +3242,12 @@ static int glm_pack_generate(const Options& o) {
                     for (int64_t x : c) if (x >= 0 && c.size() <= 96) req_think_close.push_back((int32_t) x);
                 }
                 else if (k == "end_ids") { std::string e; parse_i64_list(v.c_str(), req_end_ids, e); }
+                else if (k == "stop_ids") {
+                    std::string e;
+                    if (!parse_i64_list(v.c_str(), req_stop_ids, e)) req_stop_ids.clear();
+                    for (const int64_t x : req_stop_ids)
+                        if (x < 0 || x >= n_vocab) { req_stop_ids.clear(); break; }
+                }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }

@@ -179,7 +179,8 @@ class AnswerRoom(Base):
 
     def test_engine_stop_ids_go_along(self):
         self.ask(max_tokens=100)
-        self.assertEqual(self.engine.runs[-1]["_stop_ids"], sorted(self.svc.stop_ids))
+        self.assertEqual(self.engine.runs[-1]["_stop_ids"], self.svc.stop_order)
+        self.assertEqual(set(self.svc.stop_order), self.svc.stop_ids)
 
 
 class ClosedByGuard(Base):

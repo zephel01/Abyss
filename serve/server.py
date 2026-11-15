@@ -1369,6 +1369,9 @@ class Service:
                             _special_ids("<|observation|>") + _special_ids("<\uff5cend\u2581of\u2581sentence\uff5c>") +
                             # (Laguna: an assistant turn ends with </assistant>, a document with its EOS)
                             _special_ids("</assistant>") + _special_ids("\u3008|EOS|\u3009"))
+        # (as the engine gets them: the template's turn end first - the answer-loop guard ends a turn with it)
+        turn_end = (_special_ids(IM_END) + _special_ids("</assistant>"))[:1]
+        self.stop_order = turn_end + sorted(self.stop_ids - set(turn_end))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
@@ -2019,7 +2022,7 @@ class Service:
                 if thinking and parser.state == "reasoning":
                     closed_by = "unclosed"
                 # the turn's end tokens, for the engine to stop on (an engine that knows the key; else its own list)
-                base = {**(sampling or {}), "_stop_ids": sorted(self.stop_ids)} if self.stop_ids else dict(sampling or {})
+                base = {**(sampling or {}), "_stop_ids": self.stop_order} if self.stop_ids else dict(sampling or {})
 
                 def engine_sampling(done: int, reasoning: bool) -> dict:
                     """The sampling keys for an engine run that starts `done` tokens into the answer, inside the
