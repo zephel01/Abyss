@@ -771,12 +771,21 @@ class OutputParser:
         self.glm = False             # the call is in GLM's form (NAME<arg_key>..), not Qwen's (<function=NAME>..)
         self.vend = "</parameter>"   # what ends the value being streamed
 
-    def _start_call(self, name: str, out: list, args) -> None:
+    def _declared(self, name: str) -> bool:
+        """A call runs only for a tool the request declared: a model quoting a call, or one that writes a stray
+        <tool_call> token in its thinking, must not hand the client a call to a tool that does not exist.  A request
+        that declares no tools gets a call back as before (the client decides)."""
+        return not self.schemas or name in self.schemas
+
+    def _start_call(self, name: str, out: list, args) -> bool:
+        if not self._declared(name):
+            return False                  # not announced: the whole body decides at its end (text)
         self.scall = ToolCall(name=name, arguments={})
         props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
         self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
         out.append(Event("tool_start", call=self.scall))
         args("{")
+        return True
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body (see stream_tools): self.srest holds what the scanner has not
@@ -800,7 +809,9 @@ class OutputParser:
                     b = rest.find(">", a + len(FUNC_START))
                     if b < 0:
                         return out
-                    self._start_call(rest[a + len(FUNC_START):b], out, args)
+                    if not self._start_call(rest[a + len(FUNC_START):b], out, args):
+                        self.ss = "done"
+                        return out
                     take(b + 1)
                     self.ss = "between"
                 else:
@@ -809,7 +820,9 @@ class OutputParser:
                             default=-1)
                     if b < 0 or not rest[:b].strip():
                         return out      # (no name before a tag: malformed - the whole call's parse says so)
-                    self._start_call(rest[:b].strip(), out, args)
+                    if not self._start_call(rest[:b].strip(), out, args):
+                        self.ss = "done"
+                        return out
                     take(b)
                     self.glm, self.vend, self.ss = True, ARG_VAL_END, "between"
             elif self.ss == "between" and self.glm:
@@ -929,9 +942,11 @@ class OutputParser:
             j -= 1
         return len(self.buf) - j
 
-    def _think_call(self) -> int:
-        """Where a <tool_call> at the top level of the reasoning starts in buf (call_ends_think), or -1.  Only the
-        text before </think> counts (THINK_END in the text form; with think_token the end comes as its own token)."""
+    def _think_call(self) -> tuple[int, bool]:
+        """(where a <tool_call> at the top level of the reasoning starts in buf, pending) (call_ends_think), or
+        (-1, False).  Only a call to a declared tool ends the reasoning: pending means its name has not arrived yet
+        (hold the text from there); one naming no declared tool stays reasoning.  Only the text before </think>
+        counts (THINK_END in the text form; with think_token the end comes as its own token)."""
         end = len(self.buf) if self.think_token else self.buf.find(THINK_END)
         if end < 0:
             end = len(self.buf)
@@ -940,14 +955,32 @@ class OutputParser:
             while True:
                 c = self.buf.find(CALL_START, at, end)
                 if c < 0:
-                    return -1
+                    return -1, False
                 self._track(self.buf[at:c])
                 if not self._in_code():
-                    return c
+                    name = self._think_call_name(self.buf[c + len(CALL_START):])
+                    if name is None:
+                        return c, True
+                    if self._declared(name):
+                        return c, False
                 self._track(CALL_START)
                 at = c + len(CALL_START)
         finally:
             self.fence, self.line, self.ticks = snap
+
+    _THINK_NAME_HOLD = 256          # characters after a <tool_call> in the reasoning that may still be its opening
+
+    def _think_call_name(self, tail: str) -> str | None:
+        """The tool name after a <tool_call> in the reasoning, "" when what follows is no call opening, or None
+        while it may still become one."""
+        t = tail.lstrip()
+        m = re.match(r"<function=([A-Za-z_][A-Za-z0-9_.\-]*)>", t) or _CALL_OPEN_SLIP.match(t) or \
+            _CALL_OPEN_NAME.match(t)
+        if m:
+            return m.group(1)
+        if len(tail) < self._THINK_NAME_HOLD and (not t or (t.startswith("<") and ">" not in t)):
+            return None
+        return ""
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
@@ -966,7 +999,17 @@ class OutputParser:
         out: list[Event] = []
         while True:
             if self.state == "reasoning" and self.call_ends_think:
-                c = self._think_call()
+                c, pending = self._think_call()
+                if pending and self.think_token and think_end:
+                    c, pending = -1, False      # the reasoning ended before the name came: no call
+                if pending:                     # a call's name still arriving: the text before it goes out
+                    j = c
+                    while j > 0 and self.buf[j - 1] == "\n":
+                        j -= 1
+                    if j > 0:
+                        out.append(Event("reasoning", self._think_track(self.buf[:j])))
+                        self.buf = self.buf[j:]
+                    return out
                 if c >= 0:
                     text = self.buf[:c].rstrip("\n")
                     if text:
@@ -1077,6 +1120,8 @@ class OutputParser:
                     call = parse_tool_call(fixed, self.schemas.get(call_name(fixed)))
                 except ValueError:                  # a malformed call is returned as text, never a failed request
                     call = None
+                if call is not None and not self._declared(call.name):
+                    call = None                     # a call to a tool the request did not declare: text
                 if call is None and self.scall is None:
                     out.append(Event("content", self._track(CALL_START + body)))
                 elif call is None:                  # already announced while streaming: close it as scanned

@@ -617,6 +617,42 @@ class CallEndsThink(unittest.TestCase):
         self.assertEqual([k for k, _, _ in got], ["reasoning"])
         self.assertIn("<tool_call>", got[0][1])
 
+    def test_an_undeclared_name_in_the_thinking_stays_reasoning(self):
+        # the model writes a <tool_call> token while quoting source in its thinking (seen on Qwen3.8: a fake call
+        # named "\\n" came back with finish tool_calls); only a declared tool's call ends the reasoning
+        text = 'MARK is "<tool_call>\\n<function=x>" in the file. So yes.</think>\n\nYes, it does.'
+        for think_token in (False, True):   # (think_token: the end is its own token, not fed here - all reasoning)
+            whole = self.feed(text, len(text), think_token)
+            self.assertEqual([k for k, _, _ in whole], ["reasoning"] if think_token else ["reasoning", "content"])
+            self.assertIn("<tool_call>", whole[0][1])
+            if not think_token:
+                self.assertEqual(whole[1][1], "Yes, it does.")
+            for step in (1, 2, 3, 5, 7):
+                self.assertEqual(self.feed(text, step, think_token), whole, (think_token, step))
+
+    def test_a_declared_call_after_an_undeclared_one(self):
+        text = "Quote: <tool_call>\n<function=nope>\n then act.\n\n" + QWEN
+        for step in (len(text), 1, 3, 7):
+            got = self.feed(text, step)
+            self.assertEqual(got[0][0], "reasoning", step)
+            self.assertIn("<function=nope>", got[0][1])
+            self.assertEqual([c[0] for k, _, c in got if k == "tool_call"], ["get_weather"], step)
+
+    def test_an_undeclared_call_in_the_answer_is_text(self):
+        body = "<tool_call>\n<function=rm_all>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+        text = "Done.</think>\n\nSee " + body
+        for step in (len(text), 1, 3, 7):
+            got = self.feed(text, step, flag=False)
+            kinds = [k for k, _, _ in got]
+            self.assertNotIn("tool_call", kinds, step)
+            self.assertNotIn("tool_start", kinds, step)
+            self.assertIn("<function=rm_all>", "".join(t for k, t, _ in got if k == "content"), step)
+
+    def test_no_declared_tools_keeps_calls(self):
+        p = OutputParser(thinking=False, tools=None, stream_tools=True)
+        got = merged(p.feed("<tool_call>\n<function=anything>\n</function>\n</tool_call>") + p.finish())
+        self.assertEqual([c[0] for k, _, c in got if k == "tool_call"], ["anything"])
+
     def test_qwen_templates_turn_it_on(self):
         svc = Service(MockEngine(ByteTokenizer(), "", max_context=512), ByteTokenizer(),
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
