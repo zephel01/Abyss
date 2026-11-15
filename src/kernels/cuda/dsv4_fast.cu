@@ -1419,6 +1419,224 @@ __global__ void __launch_bounds__(128) attend_batch_mma_kernel(const float* __re
     for (int i = tid; i < ABM_H * D / 4; i += blockDim.x) og[i] = reinterpret_cast<const float4*>(s_o)[i];
 }
 
+// The same attention, a block = one token x 32 heads (v1.3.151): 8 warps, warp (hg, ds) = heads [16hg, 16hg + 16) x
+// dims [128ds, 128ds + 128), the arithmetic per head exactly the kernel above's (the same mma order, the same softmax
+// sums: bit-identical output), but
+//  - a key tile is gathered once for 32 heads (the kernel above: once for 16), by cp.async into one of two stages
+//    while the tile before it is computed (the kernel above waited on each tile's gather);
+//  - the softmax runs in every warp's registers on its own S fragments (the C layout of m16n8k16 is the A layout P . V
+//    takes), so a tile costs two barriers instead of three and P never goes through shared memory;
+//  - a token's head groups are neighbours on the grid (x = head group, y = token), so its rows are read from L2 by
+//    all of its blocks at about the same time.
+// 90 KB of dynamic shared memory, one block (8 warps) an SM. STRATA_DS4_PATTN=1: the kernel above.
+__device__ __forceinline__ void ab2_cp16(void* dst, const void* src) {
+#if !STRATA_DS4_IDX_SM80
+    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+#else
+    const unsigned a = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a), "l"(src));
+#endif
+}
+__device__ __forceinline__ void ab2_commit() {
+#if STRATA_DS4_IDX_SM80
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void ab2_wait_all() {
+#if STRATA_DS4_IDX_SM80
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+constexpr int AB2_HEADS = 32, AB2_SS = 40;          // heads a block, an S row's stride (floats)
+constexpr int AB2_KSTAGE = 4 * ABM_TILE * ABM_KS;   // a stage of keys (halves): [4 dim slices][32 keys][ABM_KS]
+constexpr size_t AB2_SMEM = 2 * (size_t) AB2_KSTAGE * sizeof(uint16_t) + (size_t) 4 * AB2_HEADS * AB2_SS * sizeof(float);
+static_assert((size_t) AB2_HEADS * 512 * sizeof(float) <= 2 * (size_t) AB2_KSTAGE * sizeof(uint16_t), "O fits the keys");
+__global__ void __launch_bounds__(256, 1) attend_batch_mma2_kernel(const float* __restrict__ q, const uint16_t* __restrict__ keys,
+                                                                   int n_hist, int n_swa, const uint16_t* __restrict__ comp,
+                                                                   const int* __restrict__ sel, int top_k, int sel_ld, int ratio,
+                                                                   const float* __restrict__ sinks, int n_head, int n_rot,
+                                                                   Rope rope, int p0, float scale, float* __restrict__ out) {
+    constexpr int D = 512;
+    extern __shared__ __align__(16) unsigned char ab2_sm[];
+    uint16_t* const s_k = reinterpret_cast<uint16_t*>(ab2_sm);                                        // [2][AB2_KSTAGE]
+    float* const s_s = reinterpret_cast<float*>(ab2_sm + 2 * (size_t) AB2_KSTAGE * sizeof(uint16_t));  // [4][32][AB2_SS]
+    const int t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int ds = w & 3, hl = (w >> 2) * ABM_H, hb = blockIdx.x * AB2_HEADS, h0 = hb + hl;
+    const int g = lane >> 2, t4 = lane & 3;
+    const int p = p0 + t;
+    const int n_raw = min(p + 1, n_swa);
+    const int raw0 = p - n_raw + 1 - (p0 - n_hist);
+    bool use_sel;
+    const int n_c = comp_rows(ratio, p, top_k, use_sel);
+    const int n = n_raw + n_c;
+    // the gather: thread tid copies key (tid >> 3) of a tile, its 16-byte chunks (tid & 7) + 8i
+    const int lk = tid >> 3, lc = tid & 7;
+    auto load = [&](int j0, int st) {
+        const int j = j0 + lk;
+        uint16_t* const dst = s_k + (size_t) st * AB2_KSTAGE + lk * ABM_KS;
+        if (j < n) {
+            const uint16_t* row = j < n_raw ? keys + (size_t) (raw0 + j) * D
+                                            : comp + (size_t) (use_sel ? sel[(size_t) t * sel_ld + (j - n_raw)] : j - n_raw) * D;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int c = lc + 8 * i;   // dims [8c, 8c + 8): slice c / 16, offset (c % 16) * 8
+                ab2_cp16(dst + (c >> 4) * ABM_TILE * ABM_KS + (c & 15) * 8, row + c * 8);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int c = lc + 8 * i;
+                *reinterpret_cast<uint4*>(dst + (c >> 4) * ABM_TILE * ABM_KS + (c & 15) * 8) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        ab2_commit();
+    };
+    const int n_tiles = (n + ABM_TILE - 1) / ABM_TILE;
+    load(0, 0);
+    // Q's A fragments for this warp's heads and dims: [k step 8][4], hi and lo
+    unsigned qa[8][4], ql[8][4];
+    {
+        const float* qg = q + ((size_t) t * n_head + h0 + g) * D + ds * 128;
+        const float* qg8 = qg + 8 * D;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int c = ks * 16 + t4 * 2;
+            const float2 v[4] = {*reinterpret_cast<const float2*>(qg + c), *reinterpret_cast<const float2*>(qg8 + c),
+                                 *reinterpret_cast<const float2*>(qg + c + 8), *reinterpret_cast<const float2*>(qg8 + c + 8)};
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                qa[ks][r] = abm_h2(v[r].x, v[r].y);
+                const float2 hv = __half22float2(*reinterpret_cast<const __half2*>(&qa[ks][r]));
+                ql[ks][r] = abm_h2(v[r].x - hv.x, v[r].y - hv.y);
+            }
+        }
+    }
+    float o[16][4];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    // the softmax's state of rows g (a) and g + 8 (b); the four threads of a quad hold the same
+    float ma = sinks[h0 + g], mb = sinks[h0 + g + 8], suma = 1.0f, sumb = 1.0f;
+    constexpr int SLICE = ABM_H * 2 * AB2_SS;                    // a dim slice's partials: [32 heads][AB2_SS]
+    float* const s_row_a = s_s + (size_t) (hl + g) * AB2_SS;     // + k * SLICE: slice k's partials of row a
+    float* const s_row_b = s_row_a + 8 * AB2_SS;
+    for (int it = 0; it < n_tiles; ++it) {
+        const int st = it & 1, j0 = it * ABM_TILE;
+        ab2_wait_all();
+        __syncthreads();   // tile it in shared memory; every warp past tile it - 1 (its keys' stage, the S partials)
+        if (it + 1 < n_tiles) load(j0 + ABM_TILE, st ^ 1);
+        const uint16_t* const kw = s_k + (size_t) st * AB2_KSTAGE + ds * ABM_TILE * ABM_KS;
+        // 1. S partials over this warp's 128 dims: 16 heads x 32 keys
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const uint16_t* kr = kw + (nt * 8 + g) * ABM_KS + t4 * 2;
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+                const unsigned b0 = *reinterpret_cast<const unsigned*>(kr + ks * 16);
+                const unsigned b1 = *reinterpret_cast<const unsigned*>(kr + ks * 16 + 8);
+                idx_mma16816(d, qa[ks], b0, b1);
+                idx_mma16816(d, ql[ks], b0, b1);
+            }
+            *reinterpret_cast<float2*>(s_row_a + ds * SLICE + nt * 8 + t4 * 2) = make_float2(d[0], d[1]);
+            *reinterpret_cast<float2*>(s_row_b + ds * SLICE + nt * 8 + t4 * 2) = make_float2(d[2], d[3]);
+        }
+        __syncthreads();
+        // 2. the online softmax of rows a and b over the tile's 32 keys, in registers, with the kernel above's sums in
+        // its order (this thread's keys 2t4 + 8nt and 2t4 + 1 + 8nt are its sub 2t4 and 2t4 + 1)
+        unsigned pha[4], pla[4], phb[4], plb[4];
+        {
+            float la[4][2], lb[4][2], xa = -INFINITY, xb = -INFINITY;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int col = nt * 8 + t4 * 2;
+                float2 va[4], vb[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    va[k] = *reinterpret_cast<const float2*>(s_row_a + k * SLICE + col);
+                    vb[k] = *reinterpret_cast<const float2*>(s_row_b + k * SLICE + col);
+                }
+                const bool ok0 = j0 + col < n, ok1 = j0 + col + 1 < n;
+                la[nt][0] = ok0 ? (va[0].x + va[1].x + va[2].x + va[3].x) * scale : -INFINITY;
+                la[nt][1] = ok1 ? (va[0].y + va[1].y + va[2].y + va[3].y) * scale : -INFINITY;
+                lb[nt][0] = ok0 ? (vb[0].x + vb[1].x + vb[2].x + vb[3].x) * scale : -INFINITY;
+                lb[nt][1] = ok1 ? (vb[0].y + vb[1].y + vb[2].y + vb[3].y) * scale : -INFINITY;
+                xa = fmaxf(xa, fmaxf(la[nt][0], la[nt][1]));
+                xb = fmaxf(xb, fmaxf(lb[nt][0], lb[nt][1]));
+            }
+            xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, 1));
+            xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, 2));
+            xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, 1));
+            xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, 2));
+            const float mna = fmaxf(ma, xa), sca = expf(ma - mna);
+            const float mnb = fmaxf(mb, xb), scb = expf(mb - mnb);
+            float pa0 = 0.0f, pa1 = 0.0f, pb0 = 0.0f, pb1 = 0.0f;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const float ea0 = expf(la[nt][0] - mna), ea1 = expf(la[nt][1] - mna);
+                const float eb0 = expf(lb[nt][0] - mnb), eb1 = expf(lb[nt][1] - mnb);
+                pha[nt] = abm_h2(ea0, ea1);
+                phb[nt] = abm_h2(eb0, eb1);
+                const float2 fa = __half22float2(*reinterpret_cast<const __half2*>(&pha[nt]));
+                const float2 fb = __half22float2(*reinterpret_cast<const __half2*>(&phb[nt]));
+                pla[nt] = abm_h2(ea0 - fa.x, ea1 - fa.y);
+                plb[nt] = abm_h2(eb0 - fb.x, eb1 - fb.y);
+                pa0 += ea0;
+                pa1 += ea1;
+                pb0 += eb0;
+                pb1 += eb1;
+            }
+            float psa = pa0 + pa1, psb = pb0 + pb1;
+            psa += __shfl_xor_sync(0xffffffffu, psa, 1);
+            psb += __shfl_xor_sync(0xffffffffu, psb, 1);
+            psa += __shfl_xor_sync(0xffffffffu, psa, 2);
+            psb += __shfl_xor_sync(0xffffffffu, psb, 2);
+            suma = suma * sca + psa;
+            sumb = sumb * scb + psb;
+            ma = mna;
+            mb = mnb;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                o[i][0] *= sca; o[i][1] *= sca; o[i][2] *= scb; o[i][3] *= scb;
+            }
+        }
+        // 3. O += P . V over this warp's 128 dims
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            const unsigned pa[4] = {pha[2 * ks], phb[2 * ks], pha[2 * ks + 1], phb[2 * ks + 1]};
+            const unsigned pl[4] = {pla[2 * ks], plb[2 * ks], pla[2 * ks + 1], plb[2 * ks + 1]};
+            const int kr = ks * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+#pragma unroll
+            for (int np = 0; np < 8; ++np) {
+                unsigned b0, b1, b2, b3;
+                abm_ldsm_t(kw + kr * ABM_KS + np * 16 + (lane >> 4) * 8, b0, b1, b2, b3);
+                idx_mma16816(o[2 * np], pa, b0, b1);
+                idx_mma16816(o[2 * np + 1], pa, b2, b3);
+                idx_mma16816(o[2 * np], pl, b0, b1);
+                idx_mma16816(o[2 * np + 1], pl, b2, b3);
+            }
+        }
+    }
+    // 4. normalise, de-rope (V = K carries the rotation) and write
+    ab2_wait_all();
+    __syncthreads();
+    float* const s_o = reinterpret_cast<float*>(ab2_sm);   // [32][512]
+    {
+        const float ra = 1.0f / suma, rb = 1.0f / sumb;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int dcol = ds * 128 + i * 8 + t4 * 2;
+            *reinterpret_cast<float2*>(&s_o[(hl + g) * D + dcol]) = make_float2(o[i][0] * ra, o[i][1] * ra);
+            *reinterpret_cast<float2*>(&s_o[(hl + g + 8) * D + dcol]) = make_float2(o[i][2] * rb, o[i][3] * rb);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < AB2_HEADS * (n_rot / 2); i += blockDim.x)
+        rope_pair(s_o + (i / (n_rot / 2)) * D, D, n_rot, rope, p, false, i % (n_rot / 2));
+    __syncthreads();
+    float4* og = reinterpret_cast<float4*>(out + ((size_t) t * n_head + hb) * D);
+    for (int i = tid; i < AB2_HEADS * D / 4; i += blockDim.x) og[i] = reinterpret_cast<const float4*>(s_o)[i];
+}
+
 #if defined(STRATA_USE_HIP)
 // The prompt path's attention on RDNA's WMMA (HIP, gfx11 / gfx12; the HIP counterpart of attend_batch_mma_kernel, as
 // glm_batch.cu's mla_attn_wmma2_kernel): a block = one token x 16 heads, 8 waves, wave w owns
@@ -2196,6 +2414,31 @@ static bool attn_use_mma(int n_head, int head_dim) {
     return false;
 #endif
 }
+// ... and, of those, attend_batch_mma2_kernel (32 heads a block, v1.3.151) where 32 | n_head and the device takes its
+// 90 KB of shared memory, unless STRATA_DS4_PATTN=1 (attend_batch_mma_kernel; the outputs are the same bits)
+static bool attn_use_mma2(int n_head) {
+    static const bool old = [] { const char* v = getenv("STRATA_DS4_PATTN"); return v && std::atoi(v) == 1; }();
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    if (old || n_head % AB2_HEADS != 0) return false;
+    static int state[64] = {};   // per device: 0 unknown, 1 yes, -1 no
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (state[dev] == 0) {
+        int optin = 0;
+        const bool ok = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess &&
+                        (size_t) optin >= AB2_SMEM &&
+                        cudaFuncSetAttribute(attend_batch_mma2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int) AB2_SMEM) == cudaSuccess;
+        state[dev] = ok ? 1 : -1;
+    }
+    return state[dev] == 1;
+#else
+    (void) old;
+    (void) n_head;
+    return false;
+#endif
+}
 void attend_batch(const float* q, const uint16_t* keys, int n_hist, int n_swa, const uint16_t* comp, const int* sel,
                   int top_k, int ratio, const float* sinks, int n_head, int head_dim, int n_rot, const Rope& rope, int p0,
                   int T, float* out, cudaStream_t s, int sel_ld) {
@@ -2212,6 +2455,13 @@ void attend_batch(const float* q, const uint16_t* keys, int n_hist, int n_swa, c
     }
 #endif
     if (attn_use_mma(n_head, head_dim)) {
+        if (T <= 65535 && attn_use_mma2(n_head)) {   // (T on the grid's y)
+            attend_batch_mma2_kernel<<<dim3((unsigned) (n_head / AB2_HEADS), (unsigned) T), 256, AB2_SMEM, s>>>(
+                q, keys, n_hist, n_swa, comp, sel, top_k, sel_ld, ratio, sinks, n_head, n_rot, rope, p0,
+                1.0f / sqrtf((float) head_dim), out);
+            check("attend_batch_mma2");
+            return;
+        }
         attend_batch_mma_kernel<<<dim3((unsigned) T, (unsigned) (n_head / ABM_H)), 128, 0, s>>>(
             q, keys, n_hist, n_swa, comp, sel, top_k, sel_ld, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
             out);
