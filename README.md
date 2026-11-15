@@ -149,11 +149,11 @@ does not fit in VRAM + RAM, the SSD's speed sets the decode speed.
 
 ## 🖼️ The dashboard
 
-![The dashboard's Monitor: decode 92.1 tok/s, the experts in VRAM and pinned RAM, the GPU](docs/img/dashboard-monitor.png)
+![The dashboard's Monitor: decode 136.8 tok/s, the bottleneck, where a token's time goes](docs/img/dashboard-monitor.png)
 
-The browser dashboard (`http://127.0.0.1:8082/`, Monitor tab) right after a 3,000-token coding answer: Qwen3.8-Flash-Next-IQ3_M-16G64G
-set up with `./setup-deepseek.sh --model qwen38` on an RTX 5090 (32 GB) + 123 GB RAM - 92.1 tok/s decode, 83.8% of the
-experts a token found in VRAM, the rest in pinned RAM, none read from the SSD. The Chat tab is the chat; the same server answers the OpenAI / Anthropic APIs.
+The browser dashboard (`http://127.0.0.1:8082/`, Monitor tab) right after a 3,000-token coding answer (v1.3.150):
+Qwen3.8-Flash-Next UD-IQ3_XXS on an RTX 5090 (32 GB) + 123 GB RAM - 136.8 tok/s decode, 94.5% of the experts a token
+uses found in VRAM, the rest in pinned RAM, none read from the SSD; the GPU itself is the bottleneck. The Chat tab is the chat; the same server answers the OpenAI / Anthropic APIs.
 
 ## 📊 Performance
 
