@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.151 - 2026-11-15
+
+- DeepSeek V4.1 1017 long prompts: the Engram rows of a prompt chunk are read ahead from the SSD into a per-chunk row
+  store by 64 threads, as soon as the chunk's row numbers are hashed, in the order the layers use them; a layer only
+  waits for its block's rows. Until now the host read the rows of each 256-token block synchronously and the GPU
+  waited 11.3 ms a block (28% of a 128K prompt). The same rows, so the same outputs. +0.45 GB RAM during a prompt
+  (two chunks of raw rows), freed when generation starts. `STRATA_DS41_ENGRAM_STORE=0`: the old read-ahead,
+  `STRATA_DS41_ENGRAM_STORE_THREADS=<n>`: the thread count (64).
+- DeepSeek V4 0731 / V4.1 prompt attention (CUDA sm_80+ with 90 KB of shared memory a block): a new kernel with 32
+  heads a block, the key tiles gathered once by cp.async into two stages that overlap the previous tile's math, and
+  the softmax in registers. The same sums in the same order, so bit-identical outputs (2,048 tokens x 640 keys 3.38
+  -> 2.27 ms). `STRATA_DS4_PATTN=1`: the old 16-head kernel. HIP is unchanged.
+- RTX 5090 + 123 GB, iGPU off, 512 tokens, median vs v1.3.150 (tok/s), prompt: V4.1 Compact JA256 32K 1,508 -> 2,590
+  (+71.8%), 64K 2,296 -> 3,535 (+53.9%), 128K 3,304 -> 4,265 (+29.1%); V4 0731 UD-Q2_K_XL 128K 2,680 -> 2,798
+  (+4.4%). Decode within 1%. Deterministic md5 the same on V4.1 and V4 at 128K and on the six-model regression set.
+
 ## v1.3.150 - 2026-11-15
 
 - Qwen3.8 / Ornith tool calls: a `<tool_call>` that the model starts inside its thinking, without closing it with
