@@ -335,6 +335,11 @@ in the browser, `--gpu 0` picks the GPU.
 - **Tool calls:** OpenAI `tools` / Anthropic `tools` work, including several calls in one turn. The model writes them
   in DeepSeek's DSML form; the server turns them into `tool_calls` and renders past calls and `tool` results back into
   the prompt.
+- **Special-token text in messages stays text:** a `<|im_end|>`, `</think>`, `<tool_call>` or `<｜deepseek_image｜>`
+  inside a message, a tool result or a tool call's arguments (pasted source code, logs) goes to the model as the
+  characters it is, not as the control token; only the markers the chat template writes are tokens. `/api/tokens`
+  counts the same way. A request the chat template refuses gets a `400` with the template's message, and any other
+  server-side failure a `500` with its reason (both used to close the connection with no answer).
 - **Conversation reuse:** a request that continues the previous one (the same messages plus new ones) reads only the
   new tokens; the same prompt again reads only its last one (V4.1: 5K and 23K tokens to the first token in 0.04 s).
   Only the last conversation is kept: another request in between replaces it, and so does a restart. The tokens must

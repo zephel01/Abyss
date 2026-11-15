@@ -237,6 +237,99 @@ def v41_images_as_text(messages: list[dict]) -> list[dict]:
     return out
 
 
+SPECIAL_MARK = ""
+
+
+class ContentGuard:
+    """A special token's text inside a message stays text.  The prompt is encoded with the special tokens parsed, so
+    a `<|im_end|>`, `</think>` or `<｜deepseek_image｜>` typed in a message, pasted with source code or returned by a
+    tool became the real token: a turn ended mid-message, or an image's place with no image (DeepSeek V4.1's official
+    template refuses the marker in content outright).  Before the template runs, each special token's text inside the
+    messages (contents, reasoning, tool-call arguments) and the tool definitions becomes a private-use sentinel; after
+    it, restore() puts the text back and says where, and the tokenizer encodes those places as plain text while the
+    markers the template writes stay special.
+
+    Kept as they are: <think> / </think> in a past assistant turn's content when the template splits a turn's reasoning
+    off at them itself (GLM-5.3's: `content.split('</think>')`), and <tool_response> ... </tool_response> around a whole user message (Qwen's template
+    tells a tool result sent as a user turn by them)."""
+
+    THINK = ("<think>", "</think>")
+    TOOL_RESPONSE = ("<tool_response>", "</tool_response>")
+
+    def __init__(self, specials, split_think: bool = False):
+        self.split_think = split_think
+        # the sentinels' own characters too: a private-use character typed in a message can never pose as one
+        lits = sorted(set(specials) | {SPECIAL_MARK, V41_IMAGE_SENTINEL[0]}, key=len, reverse=True)
+        self.lits = lits
+        self.index = {s: i for i, s in enumerate(lits)}
+        self.pat = re.compile("|".join(re.escape(s) for s in lits))
+        self.back = re.compile(SPECIAL_MARK + r"(\d+)" + SPECIAL_MARK)
+
+    def text(self, s, keep=()):
+        if not isinstance(s, str):
+            return s
+        return self.pat.sub(lambda m: m.group(0) if m.group(0) in keep else
+                            f"{SPECIAL_MARK}{self.index[m.group(0)]}{SPECIAL_MARK}", s)
+
+    def value(self, v):
+        """Every string inside a JSON value (tool-call arguments, a tool's schema); keys are names and stay."""
+        if isinstance(v, str):
+            return self.text(v)
+        if isinstance(v, dict):
+            return {k: self.value(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [self.value(x) for x in v]
+        return v
+
+    def content(self, c, keep=()):
+        if isinstance(c, list):            # the template's list form: text items and image items
+            return [dict(p, text=self.text(p["text"], keep)) if isinstance(p, dict) and isinstance(p.get("text"), str)
+                    else p for p in c]
+        return self.text(c, keep)
+
+    def messages(self, messages: list[dict], tools: list[dict] | None):
+        out = []
+        for m in messages:
+            m = dict(m)
+            c = m.get("content")
+            keep = ()
+            if m.get("role") == "assistant" and self.split_think:
+                keep = self.THINK
+            elif (m.get("role") == "user" and isinstance(c, str) and c.startswith(self.TOOL_RESPONSE[0])
+                  and c.endswith(self.TOOL_RESPONSE[1])):
+                keep = self.TOOL_RESPONSE
+            if "content" in m:
+                m["content"] = self.content(c, keep)
+            for k in ("reasoning_content", "thinking"):
+                if isinstance(m.get(k), str):
+                    m[k] = self.text(m[k])
+            if m.get("tool_calls"):
+                m["tool_calls"] = [dict(tc, function=dict(tc["function"],
+                                                          arguments=self.value(tc["function"].get("arguments"))))
+                                   if isinstance(tc, dict) and isinstance(tc.get("function"), dict) else tc
+                                   for tc in m["tool_calls"]]
+            out.append(m)
+        return out, (self.value(tools) if tools else tools)
+
+    def restore(self, prompt: str) -> tuple[str, list[tuple[int, int]]]:
+        """The rendered prompt with the messages' text back, and the (start, end) ranges of that text."""
+        parts, spans, pos, n = [], [], 0, 0
+        for m in self.back.finditer(prompt):
+            k = int(m.group(1))
+            if k >= len(self.lits):
+                continue
+            parts.append(prompt[pos:m.start()])
+            n += m.start() - pos
+            parts.append(self.lits[k])
+            spans.append((n, n + len(self.lits[k])))
+            n += len(self.lits[k])
+            pos = m.end()
+        if not spans:
+            return prompt, []
+        parts.append(prompt[pos:])
+        return "".join(parts), spans
+
+
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user

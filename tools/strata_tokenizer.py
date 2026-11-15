@@ -328,6 +328,27 @@ class Tokenizer:
         """
         return self._encode_matching(text, self._special_re if parse_special else self._always_re)
 
+    def encode_spans(self, text: str, plain: list[tuple[int, int]]) -> list[int]:
+        """encode(text, parse_special=True), except inside the `plain` (start, end) character ranges (sorted, apart):
+        no special or user-defined token is matched there, so that text is BPE'd as ordinary text together with the
+        text around it - a chat prompt whose messages quote `<|im_end|>` or `</think>` (pasted source, a tool's
+        output) keeps them as the characters they are.  No ranges: exactly encode(text, parse_special=True)."""
+        pat = self._special_re
+        if pat is None or not plain:
+            return self.encode(text, parse_special=True)
+        out: list[int] = []
+        seg, start = 0, 0
+        for a, b in list(plain) + [(len(text), len(text))]:
+            for m in pat.finditer(text, start, a):      # the specials between two plain ranges only
+                if m.start() > seg:
+                    out.extend(self._encode_segment(text[seg:m.start()]))
+                out.append(self.special_tokens[m.group(0)])
+                seg = m.end()
+            start = b
+        if seg < len(text):
+            out.extend(self._encode_segment(text[seg:]))
+        return out
+
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
         cache = self.__dict__.setdefault("_bytes_cache", {})

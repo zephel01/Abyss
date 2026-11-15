@@ -45,10 +45,13 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+import jinja2.exceptions
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, ContentGuard, Event,  # noqa: E402
+                            OutputParser,
                             anthropic_to_messages, effort_kwargs, effort_level, images_of, openai_to_messages,
                             v41_images_as_text)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -1261,6 +1264,19 @@ class ByteTokenizer:
                 i += 1
         return out
 
+    @property
+    def special_tokens(self) -> dict[str, int]:
+        return {s: 256 + k for k, s in enumerate(self.SPECIALS)}
+
+    def encode_spans(self, text, plain):
+        """encode(text, parse_special=True) with no special matched inside the `plain` (start, end) ranges
+        (strata_tokenizer.Tokenizer.encode_spans)."""
+        out, seg = [], 0
+        for a, b in list(plain) + [(len(text), len(text))]:
+            out += self.encode(text[seg:a], parse_special=True) + self.encode(text[a:b])
+            seg = b
+        return out
+
     def decode(self, ids, errors="replace"):
         raw = bytearray()
         for t in ids:
@@ -1296,6 +1312,10 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        # a message's special-token text stays text (ContentGuard); a template that splits a turn's reasoning off at
+        # its </think> still sees the marker in an assistant's content
+        self.guard = ContentGuard(getattr(tokenizer, "special_tokens", None) or {},
+                                  split_think=any(f"split({q}</think>{q})" in template.source for q in "'\""))
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
@@ -1696,25 +1716,18 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
-        """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
-        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
-        given, force = kwargs, kwargs.get("_force_tool")
-        kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
-        if force is not None and tools:
-            kwargs["enable_thinking"] = False
-        if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
-            kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
-        images = images_of(messages)
+    def _prompt_ids(self, messages, tools, kwargs, force, v41_images):
+        """-> (the prompt's ids, the forced call's opening).  The template renders the messages with every special
+        token's text inside them swapped for a sentinel (ContentGuard): that text goes back in as plain text, the
+        template's own markers stay special.  v41_images (DeepSeek V4.1): each image is None in the ids, its place."""
+        messages, shown = self.guard.messages(messages, tools)
         # DeepSeek V4.1: every image becomes a sentinel in the text.  The GGUF templates print a message's content as it
         # is; the official one writes its own <｜deepseek_image｜> for an image block, which the path below would not take
         # for an image (no start marker before it), so it gets the sentinel too: the same prompt, the blocks joined by a
         # blank line either way
-        v41_images = bool(images) and self.template.dsv4
         if v41_images:
             messages = v41_images_as_text(messages)
-        prompt = self.template.render(messages, tools=tools, **kwargs)
+        prompt = self.template.render(messages, tools=shown, **kwargs)
         if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
             # GLM-5.3's template opens the thinking block whatever it is told (no enable_thinking, and an effort it
             # does not know means 'max'): with thinking off the answer was written inside an open <think>.  Close
@@ -1726,19 +1739,37 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
+        prompt, spans = self.guard.restore(prompt)
+        if not v41_images:
+            return self.tok.encode_spans(prompt, spans), prefill
+        # the prompt up to each sentinel, then None: this image's place (expanded to its rows in prepare()).  The
+        # sentinel is the template's text, never a message's (ContentGuard), so no plain range crosses one
+        ids, at = [], 0
+        pieces = prompt.split(V41_IMAGE_SENTINEL)
+        for k, piece in enumerate(pieces):
+            local = [(a - at, b - at) for a, b in spans if at <= a and b <= at + len(piece)]
+            ids += self.tok.encode_spans(piece, local) if piece else []
+            at += len(piece) + len(V41_IMAGE_SENTINEL)
+            if k < len(pieces) - 1:
+                ids.append(None)
+        return ids, prefill
+
+    def prepare(self, messages, tools, kwargs, max_new=None):
+        """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+        the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
+        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
+        given, force = kwargs, kwargs.get("_force_tool")
+        kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
+        if force is not None and tools:
+            kwargs["enable_thinking"] = False
+        if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
+            kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
+        images = images_of(messages)
+        v41_images = bool(images) and self.template.dsv4
+        ids, prefill = self._prompt_ids(messages, tools, kwargs, force, v41_images)
         given["_prefill"] = prefill
-        if v41_images:
-            # the prompt up to each sentinel, then None: this image's place (expanded to its rows below)
-            pieces = prompt.split(V41_IMAGE_SENTINEL)
-            if len(pieces) - 1 != len(images):
-                raise ValueError("the chat template dropped an image")
-            ids = []
-            for k, piece in enumerate(pieces):
-                ids += self.tok.encode(piece, parse_special=True) if piece else []
-                if k < len(images):
-                    ids.append(None)
-        else:
-            ids = self.tok.encode(prompt, parse_special=True)
+        if v41_images and ids.count(None) != len(images):
+            raise ValueError("the chat template dropped an image")
         self.embeddings.path = None
         if images:
             if self.vision is None:
@@ -1806,10 +1837,9 @@ class Service:
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **effort_kwargs(self.default_effort)}
-        prompt = self.template.render(messages, tools=tools, **kw)
         images = len(images_of(messages))
-        return {"tokens": len(self.tok.encode(prompt, parse_special=True)), "images": images,
-                "approximate": images > 0, "max_context": self.engine.max_context}
+        ids, _ = self._prompt_ids(messages, tools, kw, None, images > 0 and self.template.dsv4)
+        return {"tokens": len(ids), "images": images, "approximate": images > 0, "max_context": self.engine.max_context}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -2923,6 +2953,17 @@ def make_handler(svc: Service):
                 if not self.answer_started:
                     self._json(400, {"error": {"type": "invalid_request_error",
                                                "message": f"malformed request ({type(e).__name__}: {e})"}})
+            except jinja2.exceptions.TemplateError as e:
+                # the model's chat template refused the conversation (raise_exception): a 400 with its words - it was
+                # a dropped connection, as every exception below was (ThreadingHTTPServer closes the socket)
+                if not self.answer_started:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": f"chat template: {e}"}})
+            except ConnectionError:                         # the client went away: nobody to answer
+                raise
+            except Exception as e:                          # anything else: a 500 with the reason, never silence
+                traceback.print_exc()
+                if not self.answer_started:
+                    self._json(500, {"error": {"type": "server_error", "message": f"{type(e).__name__}: {e}"}})
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
