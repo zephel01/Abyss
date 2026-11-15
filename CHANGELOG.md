@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.152 - 2026-11-15
+
+- Server: special-token text inside a message stays text. The prompt was encoded with the special tokens parsed, so
+  a `<|im_end|>`, `<tool_call>` or `</think>` in pasted source code or a tool result became the real token: the turn
+  ended mid-message (Qwen3.8 answered with the rest of the question; GLM wrote to the token limit). Now the special
+  tokens' text in user, system and tool contents, reasoning, tool-call arguments and tool definitions is encoded as
+  plain text, while the markers the chat template writes stay special. In past assistant turns the model's own tags
+  (`<think>`, `<tool_call>`, DSML, ...) stay special, as the model wrote them. A conversation without such text gets
+  the same tokens as before (checked on the eight model templates), and conversation reuse is unchanged.
+  `/api/tokens` counts the same way. `STRATA_RAW_SPECIALS=1`: the old encoding exactly.
+- Server: a chat template that refuses a request (DeepSeek V4.1's official template refuses a `<｜deepseek_image｜>`
+  typed in a message) is now an HTTP 400 with the template's message, and any other error is a 500 with its reason;
+  until now the connection was closed with no answer.
+
 ## v1.3.151 - 2026-11-15
 
 - DeepSeek V4.1 1017 long prompts: the Engram rows of a prompt chunk are read ahead from the SSD into a per-chunk row
