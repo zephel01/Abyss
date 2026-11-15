@@ -27,7 +27,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -118,6 +120,19 @@ struct EngPool {
 };
 
 // the Engram tables (pack/engram.txt, engram_token_map.u32 - tools/iq_pack.py write_engram) and the n-gram history
+// a prompt chunk's ROW STORE (v1.3.151): every row the chunk's two Engram layers take (T tokens x 24 a table), raw,
+// read by the store's own threads in the order the layers take them (table 0's blocks, then table 1's) - the chunk's
+// own as soon as its row numbers are known, then the next chunk's behind it - so the layers wait only on rows not read
+// yet.  The rows (and so the sums) are the same as the row-at-a-time reads'
+struct EngStore {
+    int64_t p0 = -1;
+    int T = 0;
+    std::vector<uint64_t> rows;                     // T x 2 x 24, as V41Engram::chunk
+    std::unique_ptr<uint8_t[]> raw[2];              // table k: T x 24 raw rows, token-major
+    std::unique_ptr<std::atomic<int>[]> done[2];    // table k, block b of kV41Blk tokens: its rows in raw so far
+    std::atomic<bool> cancel{false}, bad{false};
+};
+
 struct V41Engram {
     int gtype = -1;            // llama.cpp's layout: a ggml row type (Q8_0 / Q2_K ...) decoded by ggml; ds4: e4m3 + e8m0 rows (264)
     int row_bytes = 264;
@@ -174,6 +189,14 @@ struct V41Engram {
     std::thread p_th;
     std::atomic<bool> p_stop{false};
     std::atomic<uint64_t> p_reads{0};
+    // the prompt path's row stores (STRATA_DS41_ENGRAM_STORE, default on): the chunk the layers read, the one behind
+    // it, the reader's queue, its threads (STRATA_DS41_ENGRAM_STORE_THREADS, default 64)
+    std::mutex s_m;
+    std::condition_variable s_cv;
+    std::deque<std::shared_ptr<EngStore>> s_q;
+    std::shared_ptr<EngStore> s_cur, s_next;
+    std::unique_ptr<EngPool> s_pool;
+    bool s_started = false;
 };
 
 float e4m3(uint8_t b) {
@@ -599,6 +622,21 @@ static bool engram_read(V41Engram& E, int k, uint64_t at, uint8_t* dst, size_t n
 }
 
 // table k's 24 rows (row numbers rows[0..23]) -> dst, 24 x 256 floats
+// a row's raw bytes -> 256 floats
+bool engram_decode(const V41Engram& E, const uint8_t* raw, float* dst, std::string& err) {
+    if (E.gtype >= 0) {   // llama.cpp's get_rows: ggml's dequantizer, F32 (no BF16 rounding)
+        ggml_get_type_traits((ggml_type) E.gtype)->to_float(raw, dst, kEngDim);
+        return true;
+    }
+    uint32_t* du = (uint32_t*) dst;
+    for (int i = 0; i < kEngDim; ++i) {
+        const uint32_t v = E.lut[raw[kEngDim + i / 32]][raw[i]];
+        if (v == 0xffffffffu) { err = "deepseek41: an invalid Engram row (NaN code or scale)"; return false; }
+        du[i] = v;
+    }
+    return true;
+}
+
 // one row of table k -> dst (256 floats), through the raw row cache
 bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err) {
     if (row == kEngRowZero) {   // an image row's: nothing to read
@@ -632,17 +670,7 @@ bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err)
             std::memcpy(E.cache.data() + slot * (uint64_t) RB, raw, (size_t) RB);
         }
     }
-    if (E.gtype >= 0) {   // llama.cpp's get_rows: ggml's dequantizer, F32 (no BF16 rounding)
-        ggml_get_type_traits((ggml_type) E.gtype)->to_float(raw, dst, kEngDim);
-        return true;
-    }
-    uint32_t* du = (uint32_t*) dst;
-    for (int i = 0; i < kEngDim; ++i) {
-        const uint32_t v = E.lut[raw[kEngDim + i / 32]][raw[i]];
-        if (v == 0xffffffffu) { err = "deepseek41: an invalid Engram row (NaN code or scale)"; return false; }
-        du[i] = v;
-    }
-    return true;
+    return engram_decode(E, raw, dst, err);
 }
 
 bool engram_rows_par(V41Engram& E, int n, const uint64_t* rows, int kk, const int* ks, float* dst, std::string& err);
@@ -702,6 +730,103 @@ void engram_pf_stop(V41Engram& E) {
     E.p_stop.store(true, std::memory_order_relaxed);
     E.p_th.join();
     E.p_stop.store(false, std::memory_order_relaxed);
+}
+
+// the row stores (EngStore): on unless STRATA_DS41_ENGRAM_STORE=0 (then the chunk's rows are prefetched into the row
+// cache as far as half of it holds, and the layers read the rest a block at a time)
+bool engram_store_on() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_DS41_ENGRAM_STORE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// a row's raw bytes: from the row cache, else from the table (and into the cache)
+bool engram_fetch_raw(V41Engram& E, int k, uint64_t row, uint8_t* dst) {
+    const int RB = E.row_bytes;
+    const uint64_t key = (((uint64_t) k << 63) | row) + 1;
+    uint64_t slot = 0;
+    if (E.cmask != 0) {
+        slot = (row * 0x9E3779B97F4A7C15ull ^ (uint64_t) k) & E.cmask;
+        std::lock_guard<std::mutex> l(E.stripe[slot & 255]);
+        if (E.tag[slot] == key) {
+            std::memcpy(dst, E.cache.data() + slot * (uint64_t) RB, (size_t) RB);
+            E.hits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    if (!engram_read(E, k, E.off[k] + row * (uint64_t) RB, dst, (size_t) RB)) return false;
+    E.misses.fetch_add(1, std::memory_order_relaxed);
+    if (E.cmask != 0) {
+        std::lock_guard<std::mutex> l(E.stripe[slot & 255]);
+        E.tag[slot] = key;
+        std::memcpy(E.cache.data() + slot * (uint64_t) RB, dst, (size_t) RB);
+    }
+    return true;
+}
+
+// the stores' reader (started with the first store; lives as long as the process, as the pools do): a store at a
+// time, its rows across the store's threads in the layers' order; a cancelled store's rest is skipped
+void engram_store_loop(V41Engram* E) {
+    for (;;) {
+        std::shared_ptr<EngStore> S;
+        {
+            std::unique_lock<std::mutex> l(E->s_m);
+            E->s_cv.wait(l, [&] { return !E->s_q.empty(); });
+            S = std::move(E->s_q.front());
+            E->s_q.pop_front();
+        }
+        if (S->cancel.load(std::memory_order_relaxed)) continue;
+        const int n = S->T * kEngCols, RB = E->row_bytes;
+        EngStore* st = S.get();
+        E->s_pool->run(2 * n, [E, st, n, RB](int j) {
+            const int k = j / n, e = j % n, t = e / kEngCols, c = e % kEngCols;
+            if (!st->cancel.load(std::memory_order_relaxed)) {
+                const uint64_t row = st->rows[(size_t) t * 2 * kEngCols + (size_t) k * kEngCols + c];
+                if (row != kEngRowZero && !engram_fetch_raw(*E, k, row, st->raw[k].get() + (size_t) e * RB))
+                    st->bad.store(true, std::memory_order_relaxed);
+            }
+            st->done[k][t / kV41Blk].fetch_add(1, std::memory_order_release);
+        });
+    }
+}
+
+// a store for T tokens at p0 (rows: T x 2 x 24), queued for the reader
+std::shared_ptr<EngStore> engram_store_push(V41Engram& E, int64_t p0, int T, const uint64_t* rows) {
+    auto S = std::make_shared<EngStore>();
+    S->p0 = p0;
+    S->T = T;
+    S->rows.assign(rows, rows + (size_t) T * 2 * kEngCols);
+    const int nb = (T + kV41Blk - 1) / kV41Blk;
+    for (int k = 0; k < 2; ++k) {
+        S->raw[k].reset(new uint8_t[(size_t) T * kEngCols * (size_t) E.row_bytes]);
+        S->done[k].reset(new std::atomic<int>[(size_t) nb]);
+        for (int b = 0; b < nb; ++b) S->done[k][b].store(0, std::memory_order_relaxed);
+    }
+    std::lock_guard<std::mutex> l(E.s_m);
+    if (!E.s_pool) {
+        const int n = (int) strata::core::env_num("STRATA_DS41_ENGRAM_STORE_THREADS", 64, 1, 128);
+        E.s_pool = std::make_unique<EngPool>(n - 1);   // (+ the reader itself)
+    }
+    E.s_q.push_back(S);
+    if (!E.s_started) {
+        E.s_started = true;
+        std::thread(engram_store_loop, &E).detach();
+    }
+    E.s_cv.notify_all();
+    return S;
+}
+
+// the stores dropped (a token or a window reads its own rows): the reader skips what is left of them
+void engram_store_drop(V41Engram& E) {
+    std::lock_guard<std::mutex> l(E.s_m);
+    for (auto& S : E.s_q) S->cancel.store(true, std::memory_order_relaxed);
+    E.s_q.clear();
+    if (E.s_cur) E.s_cur->cancel.store(true, std::memory_order_relaxed);
+    if (E.s_next) E.s_next->cancel.store(true, std::memory_order_relaxed);
+    E.s_cur.reset();
+    E.s_next.reset();
 }
 
 // waits for the background reader to be idle; its failure, if any, is this call's - and this call's only: the flag
@@ -778,6 +903,7 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
     }();
     if (!engram_sync(*E, err)) return false;
     engram_pf_stop(*E);
+    if (E->s_cur || E->s_next) engram_store_drop(*E);
     uint64_t rows[2 * kEngCols];
     if (!engram_rows(*E, tok, pos_ - 1, rows, err, is_image_pos(pos_ - 1))) return false;   // (pos_ has moved past this token already)
     F->v41_eng_async = async && F->v41_eng_flag != nullptr;
@@ -827,6 +953,28 @@ bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::s
                              is_image_pos(p0 + T + t)))
                 return false;
     }
+    if (engram_store_on()) {
+        // this chunk's store: the one queued behind the last chunk when its rows are these, else a new one; then the
+        // next chunk's behind it
+        std::shared_ptr<EngStore> nx;
+        {
+            std::lock_guard<std::mutex> l(E->s_m);
+            nx = std::move(E->s_next);
+            if (E->s_cur) E->s_cur->cancel.store(true);   // (the last chunk's: read; the rest of a cut one skipped)
+            E->s_cur.reset();
+        }
+        const bool same = nx && nx->p0 == p0 && nx->T == T && !nx->cancel.load() &&
+                          std::equal(nx->rows.begin(), nx->rows.end(), E->chunk.begin());
+        if (!same) {
+            if (nx) nx->cancel.store(true);
+            nx = engram_store_push(*E, p0, T, E->chunk.data());
+        }
+        std::shared_ptr<EngStore> ah = tn2 > 0 ? engram_store_push(*E, p0 + T, tn2, E->ahead.data()) : nullptr;
+        std::lock_guard<std::mutex> l(E->s_m);
+        E->s_cur = std::move(nx);
+        E->s_next = std::move(ah);
+        return true;
+    }
     engram_prefetch(*E, T, tn2);
     return true;
 }
@@ -839,9 +987,52 @@ bool Glm5Model::dsv41_engram_prompt(int il, int T, float* R, std::string& err) {
     if (E == nullptr || k < 0 || E->chunk.size() < (size_t) T * 2 * kEngCols) { err = "deepseek41: no Engram rows"; return false; }
     // blocks of kV41Blk tokens: their rows read by the workers into the pinned block, up, then one add a token
     const size_t per = (size_t) kEngCols * kEngDim;
+    std::shared_ptr<EngStore> S;
+    {
+        std::lock_guard<std::mutex> l(E->s_m);
+        S = E->s_cur;
+    }
+    if (S && S->T != T) S.reset();
     for (int b0 = 0; b0 < T; b0 += kV41Blk) {
         const int bn = std::min(kV41Blk, T - b0);
         if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "deepseek41 Engram block", err)) return false;
+        if (S) {   // the store's rows of this block, once read (a failed read: this block the old way, its error)
+            std::atomic<int>& dn = S->done[k][b0 / kV41Blk];
+            while (dn.load(std::memory_order_acquire) < bn * kEngCols && !S->bad.load(std::memory_order_relaxed))
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            if (!S->bad.load(std::memory_order_relaxed)) {
+                std::atomic<bool> bad{false};
+                std::mutex mu;
+                const int RB = E->row_bytes;
+                EngStore* st = S.get();
+                E->pool->run(bn * kEngCols, [&, st, RB](int j) {
+                    const int t = b0 + j / kEngCols, c = j % kEngCols;
+                    const uint64_t row = st->rows[(size_t) t * 2 * kEngCols + (size_t) k * kEngCols + c];
+                    float* dst = F->v41_pblk_h + (size_t) j * kEngDim;
+                    if (row == kEngRowZero) {
+                        std::memset(dst, 0, kEngDim * sizeof(float));
+                        return;
+                    }
+                    std::string e;
+                    if (!engram_decode(*E, st->raw[k].get() + ((size_t) t * kEngCols + c) * RB, dst, e)) {
+                        std::lock_guard<std::mutex> lk(mu);
+                        err = e;
+                        bad = true;
+                    }
+                });
+                if (bad) return false;
+                cudaMemcpyAsync(F->v41_pblk, F->v41_pblk_h, (size_t) bn * per * 4, cudaMemcpyHostToDevice, F->cs);
+                if (prefill_v41_engram_gemm()) {
+                    if (!prefill_v41_engram_block(il, bn, (int) per, F->v41_pblk, R + (size_t) b0 * 4 * g.n_embd, err))
+                        return false;
+                    continue;
+                }
+                for (int t = 0; t < bn; ++t)
+                    if (!dsv41_engram_add(il, R + (size_t) (b0 + t) * 4 * g.n_embd, err, F->v41_pblk + (size_t) t * per))
+                        return false;
+                continue;
+            }
+        }
         std::vector<uint64_t> rr((size_t) bn * kEngCols);
         for (int t = 0; t < bn; ++t)
             for (int c = 0; c < kEngCols; ++c)
@@ -866,6 +1057,7 @@ bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std:
     if (T < 1 || T * 2 > kV41Blk) { err = "deepseek41: a verify window of " + std::to_string(T) + " columns"; return false; }
     if (!engram_sync(*E, err)) return false;   // (the pool is the background reader's too)
     engram_pf_stop(*E);
+    if (E->s_cur || E->s_next) engram_store_drop(*E);
     // TABLE-MAJOR: table k, column t: rows (k * T + t) * 24 .. of the prompt path's block buffers (pinned, then the
     // device's) - so each table's rows are one block the background reader fills and flags on its own
     std::vector<uint64_t> rows((size_t) T * 2 * kEngCols);
