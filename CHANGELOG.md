@@ -7,6 +7,26 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.153 - 2026-11-16
+
+- Long prompts on Laguna-S-2.1 and the qwen35 family (Ornith-1.5-35B / 122B, Qwen3.8-27B, Qwen3.5-122B): the prompt's
+  attention runs on one tensor-core kernel (CUDA sm_80+, FP16 cache): mma.sync with key tiles double-buffered by
+  cp.async, one pass with the online softmax in registers, rows grouped per KV head, causal and sliding window (a
+  window layer's ring cache read in place), head_dim 128 and 256. Until now Laguna used the token path's CUDA-core
+  kernel (93% of a 60K prompt), Ornith-35B fell to the FP32 kernel, and the WMMA kernel of the others read the keys
+  twice. RTX 5090 + 123 GB, iGPU off, real source code, median, prompt 60K / 125K (tok/s): Laguna-S-2.1 UD-IQ4_XS
+  531 / 259 -> 4,108 / 3,403 (first token at 125K 483 -> 37 s), Ornith-1.5-35B-A3B Q4_K_M 1,908 / 911 -> 8,280 /
+  6,043, Qwen3.8-27B UD-Q4_K_XL 1,893 / 1,262 -> 2,667 / 2,131, Ornith-1.5-122B 24G64G 2,198 / 1,492 -> 2,926 /
+  2,356. Decode the same, 4K prompts not slower. Another order of sums: KL against llama.cpp after a 32K context
+  (Laguna) 0.0246 -> 0.0248 (8K 0.0148 -> 0.0144); against the token path Ornith-35B 0.0105 -> 0.0088, Qwen3.8-27B
+  0.0039 -> 0.0030, Ornith-122B 0.0040 -> 0.0044. Deterministic outputs of these models change; the other models
+  are unchanged. `STRATA_PROMPT_FA_OLD=1`: the old kernels (the old outputs exactly). HIP, GPUs below sm_80 and a
+  q4_0 / q8_0 KV cache keep the old kernels.
+- Server: with tools declared, a tool call to a name the request did not declare is returned as text, and a
+  `<tool_call>` in the thinking ends it only when it calls a declared tool. Qwen3.8, quoting source code in its
+  thinking, wrote a real `<tool_call>` token, and since v1.3.150 that came back as a call to a tool named `\n`
+  (finish `tool_calls`) instead of the answer. Requests without tools are unchanged.
+
 ## v1.3.152 - 2026-11-15
 
 - Server: special-token text inside a message stays text. The prompt was encoded with the special tokens parsed, so
