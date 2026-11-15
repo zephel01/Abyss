@@ -1346,6 +1346,10 @@ class Service:
         self.think_budget = 0
         end = _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # Qwen's call form (<tool_call><function=NAME>...): its templates' response_template ends the reasoning at a
+        # <tool_call> as well as at </think> (2026-11-07), so a call started inside the thinking is still a call
+        src = getattr(template, "source", "") or ""
+        self.call_ends_think = isinstance(src, str) and "<tool_call>" in src and "<function=" in src
         # what a reasoning block closed by the budget or the loop guard says before its </think> (the engine forces these
         # tokens, then </think>): that the thinking stops here and the answer follows in the question's language.  A bare
         # </think> in the middle of a thought let Qwen3.8 go on thinking in the answer, in English (issue #36).
@@ -1871,7 +1875,8 @@ class Service:
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
-                              think_token=self.think_end_id is not None)
+                              think_token=self.think_end_id is not None,
+                              call_ends_think=getattr(self, "call_ends_think", False))
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"

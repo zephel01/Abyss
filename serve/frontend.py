@@ -566,8 +566,12 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 think_token: bool = False):
+                 think_token: bool = False, call_ends_think: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # call_ends_think: a <tool_call> at the top level of the reasoning ends it, as </think> does - the Qwen
+        # templates' response_template (2026-11-07: "</think>|(?=<tool_call>)"), for a model that starts its call
+        # without closing its thinking.  One inside a code fence or inline code of the reasoning stays reasoning.
+        self.call_ends_think = call_ends_think
         self.dsml_tag = DSML_CALLS                      # the block opening seen last (V4 or V4.1 spelling)
         # think_token: the model ends its reasoning with a SPECIAL token the caller reports (feed(..., think_end=True));
         # the text "</think>" inside the reasoning is then the model writing about the tag (DeepSeek V4.1 explaining
@@ -815,6 +819,38 @@ class OutputParser:
         self.ss = "done"
         return out
 
+    def _think_track(self, text: str) -> str:
+        """Reasoning text that goes out: followed for code fences when a <tool_call> can end the reasoning."""
+        return self._track(text) if self.call_ends_think else text
+
+    def _think_keep(self, tags: tuple[str, ...]) -> int:
+        """What the reasoning holds back when a <tool_call> can end it: a partial tag AND the newlines before it (they
+        are dropped if a call follows, so streamed and whole outputs agree)."""
+        j = len(self.buf) - self._hold(self.buf, tags)
+        while j > 0 and self.buf[j - 1] == "\n":
+            j -= 1
+        return len(self.buf) - j
+
+    def _think_call(self) -> int:
+        """Where a <tool_call> at the top level of the reasoning starts in buf (call_ends_think), or -1.  Only the
+        text before </think> counts (THINK_END in the text form; with think_token the end comes as its own token)."""
+        end = len(self.buf) if self.think_token else self.buf.find(THINK_END)
+        if end < 0:
+            end = len(self.buf)
+        snap, at = (self.fence, self.line, self.ticks), 0
+        try:
+            while True:
+                c = self.buf.find(CALL_START, at, end)
+                if c < 0:
+                    return -1
+                self._track(self.buf[at:c])
+                if not self._in_code():
+                    return c
+                self._track(CALL_START)
+                at = c + len(CALL_START)
+        finally:
+            self.fence, self.line, self.ticks = snap
+
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
         best = 0
@@ -831,11 +867,23 @@ class OutputParser:
             self.buf += delta
         out: list[Event] = []
         while True:
+            if self.state == "reasoning" and self.call_ends_think:
+                c = self._think_call()
+                if c >= 0:
+                    text = self.buf[:c].rstrip("\n")
+                    if text:
+                        out.append(Event("reasoning", text))
+                    self.buf = self.buf[c:]
+                    self.state, self.lead = "content", True
+                    self.fence, self.line, self.ticks = "", "", 0
+                    think_end = False
+                    continue
             if self.state == "reasoning" and self.think_token:
                 if not think_end:   # (no tag to hold back: the end comes as its own token)
-                    if self.buf:
-                        out.append(Event("reasoning", self.buf))
-                        self.buf = ""
+                    keep = self._think_keep((CALL_START,)) if self.call_ends_think else 0
+                    if len(self.buf) > keep:
+                        out.append(Event("reasoning", self._think_track(self.buf[:len(self.buf) - keep])))
+                        self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 i = self.buf.rfind(THINK_END)   # the special token's text ends this delta
                 if i < 0:
@@ -849,9 +897,10 @@ class OutputParser:
             elif self.state == "reasoning":
                 i = self.buf.find(THINK_END)
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END,))
+                    keep = self._think_keep((THINK_END, CALL_START)) if self.call_ends_think else \
+                        self._hold(self.buf, (THINK_END,))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        out.append(Event("reasoning", self._think_track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:

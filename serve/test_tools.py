@@ -584,6 +584,46 @@ class SplitMarkers(unittest.TestCase):
         self.assertEqual([k for k, _, _ in got if k == "tool_call"], ["tool_call"])
 
 
+class CallEndsThink(unittest.TestCase):
+    """Qwen's response_template (2026-11-07): a <tool_call> ends the reasoning as </think> does."""
+
+    def feed(self, text, step, think_token=False, flag=True):
+        p = OutputParser(thinking=True, tools=TOOLS, stream_tools=True, think_token=think_token, call_ends_think=flag)
+        out = []
+        for i in range(0, len(text), step):
+            out += p.feed(text[i:i + step])
+        return merged(out + p.finish())
+
+    def test_a_call_without_closing_the_thinking(self):
+        text = "I should check the weather.\n\n" + QWEN
+        for think_token in (False, True):
+            whole = self.feed(text, len(text), think_token)
+            self.assertEqual(whole[0], ("reasoning", "I should check the weather.", None))
+            self.assertEqual([c[0] for k, _, c in whole if k == "tool_call"], ["get_weather"])
+            for step in (1, 2, 3, 5, 7):
+                self.assertEqual(self.feed(text, step, think_token), whole, (think_token, step))
+
+    def test_a_quoted_call_in_the_thinking_stays_reasoning(self):
+        text = "The format is `<tool_call>` then a function.\n```\n" + QWEN + "\n```\nOk.</think>\n\n" + QWEN
+        for step in (len(text), 1, 3, 7):
+            got = self.feed(text, step)
+            self.assertEqual([k for k, _, _ in got if k != "tool_start" and k != "tool_args"], ["reasoning", "tool_call"],
+                             step)
+            self.assertIn("The format is", got[0][1])
+
+    def test_off_keeps_the_call_in_the_reasoning(self):
+        text = "Check.\n\n" + QWEN
+        got = self.feed(text, len(text), flag=False)
+        self.assertEqual([k for k, _, _ in got], ["reasoning"])
+        self.assertIn("<tool_call>", got[0][1])
+
+    def test_qwen_templates_turn_it_on(self):
+        svc = Service(MockEngine(ByteTokenizer(), "", max_context=512), ByteTokenizer(),
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        src = ChatTemplate(ROOT / "serve/chat_template.jinja").source
+        self.assertEqual(svc.call_ends_think, "<tool_call>" in src and "<function=" in src)
+
+
 class StreamSockets(unittest.TestCase):
     def test_no_nagle_on_the_server_connections(self):
         from serve.server import make_handler

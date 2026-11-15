@@ -7,6 +7,16 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.150 - 2026-11-15
+
+- Qwen3.8 / Ornith tool calls: a `<tool_call>` that the model starts inside its thinking, without closing it with
+  `</think>`, is now a call (until now it stayed in the reasoning and no tool ran). This follows the
+  `response_template` Qwen added to Qwen3.8-27B and Qwen3.8-Flash-Next on 2026-11-07 (the reasoning ends at
+  `</think>` or at a `<tool_call>`). A `<tool_call>` inside a code fence or inline code of the thinking stays text.
+  On for the models whose chat template writes Qwen's call form (`<tool_call>` + `<function=`); GLM, DeepSeek V4 /
+  V4.1 and Laguna are unchanged. The same 2026-11-07 change wrapped the templates' assistant turns in `{% generation
+  %}` tags: they render the same text, and Abyss already reads them, so the GGUFs' templates need no update.
+
 ## v1.3.149 - 2026-11-15
 
 - DeepSeek V4.1 1017: the 32-head lightning indexer runs on tensor cores (CUDA sm_80+: mma.sync in decode, the
