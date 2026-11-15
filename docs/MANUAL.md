@@ -337,9 +337,11 @@ in the browser, `--gpu 0` picks the GPU.
   the prompt.
 - **Special-token text in messages stays text:** a `<|im_end|>`, `</think>`, `<tool_call>` or `<｜deepseek_image｜>`
   inside a message, a tool result or a tool call's arguments (pasted source code, logs) goes to the model as the
-  characters it is, not as the control token; only the markers the chat template writes are tokens. `/api/tokens`
+  characters it is, not as the control token; only the markers the chat template writes are tokens. A past answer's
+  own tags (`<think>...</think>`, a call written as `<tool_call>` text) keep the tokens the model wrote. `/api/tokens`
   counts the same way. A request the chat template refuses gets a `400` with the template's message, and any other
   server-side failure a `500` with its reason (both used to close the connection with no answer).
+  `STRATA_RAW_SPECIALS=1` goes back to the old encode.
 - **Conversation reuse:** a request that continues the previous one (the same messages plus new ones) reads only the
   new tokens; the same prompt again reads only its last one (V4.1: 5K and 23K tokens to the first token in 0.04 s).
   Only the last conversation is kept: another request in between replaces it, and so does a restart. The tokens must
@@ -1059,6 +1061,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_VISION_START_S` / `STRATA_VISION_ENCODE_S` | 600 / 120 | (server) the image encoder's start and each picture's answer; past them it is ended, the request gets an error and the next picture starts it again (v1.3.78) |
 | `STRATA_HTTP_BACKLOG` | 256 | (server) the listen backlog: requests waiting to be accepted |
 | `STRATA_MAX_BODY_MIB` | 256 | (server) the largest request body; a larger one is answered 413 before it is read |
+| `STRATA_RAW_SPECIALS` | 0 | (server) `1`: special-token text inside messages becomes the control token again (the old encode, every such text a token) |
 | `GPU_MAX_HW_QUEUES` | 2 (HIP) | ROCm's hardware queues a device: the server passes 2 when neither the shell nor the config sets it (v1.3.40). AI PRO R9700 DeepSeek V4 prompts 8K / 16K: 586-650 / 676-684 tok/s on 1 (a value R9700 guides spread against a MES firmware's idle power; 12 W idle here either way), 653-737 / 748-756 on ROCm's 4, 866-995 / 999-1,011 on 2 |
 | `STRATA_GLM_IGPU` | auto | the iGPU lane: on when `libabyss_igpu.so` and a HIP device are there and it is clearly faster than the CPU (`STRATA_GLM_IGPU_MARGIN`); `0` off, `1` on even when slower. `STRATA_GLM_IGPU_LIB=<path>`: another library |
 | `STRATA_GLM_IGPU_MARGIN` | 1.5 | auto: the iGPU takes the lane only when its start-up timing of an expert is this many times faster than the CPU's (the timing leaves out what an iGPU call costs inside a real token: on a Ryzen AI Max+ 395 + RTX 5090, Qwen3.8 16G64G timed a near tie - 0.022 ms vs 0.019-0.025 - and every run that picked the iGPU decoded slower, MTP 141 -> 132 tok/s, default 94 -> 89; GLM-5.3 / V4 / V4.1 time the iGPU 1.9-2.7x faster and keep it). With the exact combine (`STRATA_GLM_LANE_XC`, Qwen3.8 by default) the CPU keeps the lane: the iGPU's sums are not the GPU's bits and the answers would depend on the lane again. `1` = the faster of the two (the older pick) |

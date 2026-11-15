@@ -1313,9 +1313,10 @@ class Service:
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         # a message's special-token text stays text (ContentGuard); a template that splits a turn's reasoning off at
-        # its </think> still sees the marker in an assistant's content
+        # its </think> still sees the marker in an assistant's content, and so do the model's own tags (ContentGuard)
         self.guard = ContentGuard(getattr(tokenizer, "special_tokens", None) or {},
-                                  split_think=any(f"split({q}</think>{q})" in template.source for q in "'\""))
+                                  split_think=any(f"split({q}</think>{q})" in template.source for q in "'\""),
+                                  model_tags=getattr(tokenizer, "user_defined", ()))
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
@@ -1720,7 +1721,8 @@ class Service:
         """-> (the prompt's ids, the forced call's opening).  The template renders the messages with every special
         token's text inside them swapped for a sentinel (ContentGuard): that text goes back in as plain text, the
         template's own markers stay special.  v41_images (DeepSeek V4.1): each image is None in the ids, its place."""
-        messages, shown = self.guard.messages(messages, tools)
+        raw = os.environ.get("STRATA_RAW_SPECIALS") == "1"   # the old encode: every special's text a token
+        messages, shown = (messages, tools) if raw else self.guard.messages(messages, tools)
         # DeepSeek V4.1: every image becomes a sentinel in the text.  The GGUF templates print a message's content as it
         # is; the official one writes its own <｜deepseek_image｜> for an image block, which the path below would not take
         # for an image (no start marker before it), so it gets the sentinel too: the same prompt, the blocks joined by a
@@ -1739,7 +1741,7 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
-        prompt, spans = self.guard.restore(prompt)
+        prompt, spans = (prompt, []) if raw else self.guard.restore(prompt)
         if not v41_images:
             return self.tok.encode_spans(prompt, spans), prefill
         # the prompt up to each sentinel, then None: this image's place (expanded to its rows in prepare()).  The

@@ -174,6 +174,7 @@ class Tokenizer:
         # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
+        self.user_defined = tuple(always)   # the tags matched in any text (<think>, <tool_call>, ...)
         self._special_re = self._alt(list(self.special_tokens))
 
     @staticmethod

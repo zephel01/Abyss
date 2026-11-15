@@ -237,7 +237,7 @@ def v41_images_as_text(messages: list[dict]) -> list[dict]:
     return out
 
 
-SPECIAL_MARK = ""
+SPECIAL_MARK = "\ue001"
 
 
 class ContentGuard:
@@ -249,15 +249,20 @@ class ContentGuard:
     it, restore() puts the text back and says where, and the tokenizer encodes those places as plain text while the
     markers the template writes stay special.
 
-    Kept as they are: <think> / </think> in a past assistant turn's content when the template splits a turn's reasoning
-    off at them itself (GLM-5.3's: `content.split('</think>')`), and <tool_response> ... </tool_response> around a whole user message (Qwen's template
-    tells a tool result sent as a user turn by them)."""
+    Kept as they are, in a past assistant turn's content: the model's own tags (`model_tags`: the tokenizer's
+    USER_DEFINED tokens - <think> / </think>, <tool_call>, GLM's <arg_key>, DeepSeek's ｜DSML｜), which the model writes
+    as those tokens, so a client that sends a turn back as "<think>...</think>answer" or with its calls written in the
+    text gets the tokens the model wrote (and a template that splits reasoning off at </think> still can); also
+    <think> / </think> there when the template splits at them (`split_think`, for a tokenizer without types), and
+    <tool_response> ... </tool_response> around a whole user message (Qwen's template tells a tool result sent as a
+    user turn by them).  The CONTROL tokens (<|im_end|>, <｜User｜>, ...) are text everywhere in a message.
+    STRATA_RAW_SPECIALS=1 turns all of it off (Service._prompt_ids): the prompt encoded as rendered, as before."""
 
     THINK = ("<think>", "</think>")
     TOOL_RESPONSE = ("<tool_response>", "</tool_response>")
 
-    def __init__(self, specials, split_think: bool = False):
-        self.split_think = split_think
+    def __init__(self, specials, split_think: bool = False, model_tags=()):
+        self.assistant_keep = frozenset(model_tags) | (frozenset(self.THINK) if split_think else frozenset())
         # the sentinels' own characters too: a private-use character typed in a message can never pose as one
         lits = sorted(set(specials) | {SPECIAL_MARK, V41_IMAGE_SENTINEL[0]}, key=len, reverse=True)
         self.lits = lits
@@ -293,8 +298,8 @@ class ContentGuard:
             m = dict(m)
             c = m.get("content")
             keep = ()
-            if m.get("role") == "assistant" and self.split_think:
-                keep = self.THINK
+            if m.get("role") == "assistant":
+                keep = self.assistant_keep
             elif (m.get("role") == "user" and isinstance(c, str) and c.startswith(self.TOOL_RESPONSE[0])
                   and c.endswith(self.TOOL_RESPONSE[1])):
                 keep = self.TOOL_RESPONSE
