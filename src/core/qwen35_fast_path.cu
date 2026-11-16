@@ -130,7 +130,9 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
             Ly.q4_ikn = f32("indexer.k_norm.weight");
             Ly.q4_iqn = f32("indexer.q_norm.weight");
         }
-        if (g.qsa27 && il < g.n_layers) {   // Qwen3.8-27B QSA: FP32 projections (the NextN block has no indexer)
+        // Qwen3.8-27B QSA: FP32 projections (the NextN block has no indexer; a layer kept dense - compress ratio 0 -
+        // has none or ignores its own: q27_qsa_setup gives it no block keys, so its rows attend densely)
+        if (g.qsa27 && il < g.n_layers && g.comp_ratio[(size_t) il] != 0) {
             const auto m32 = [&](const char* n, int64_t n_out) -> WSlot {
                 const auto it = w_.find(P + n);
                 if (it == w_.end()) { missing += P + n + " (f32) "; return WSlot{}; }
@@ -454,8 +456,10 @@ bool Glm5Model::q27_qsa_setup(std::string& err) {
     bool ok = true;
     const auto dm = [&](auto** p, size_t b) { ok = ok && cudaMalloc((void**) p, b) == cudaSuccess; };
     int n = 0;
+    std::string kept;   // (attention layers kept dense: compress ratio 0 in the GGUF, or STRATA_Q35_QSA_DENSE_LAYERS)
     for (int il = l0_; il < l1_; ++il) {
         auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr && Ly.q27_kbn == nullptr && il < g.n_layers) kept += (kept.empty() ? "" : ",") + std::to_string(il);
         if (Ly.recr || Ly.q27_kbn == nullptr) continue;
         dm(&Ly.q4_tail, (size_t) (q27::kBlock - 1) * ID * 4);
         dm(&Ly.q4_dead, ID * 4);
@@ -490,8 +494,9 @@ bool Glm5Model::q27_qsa_setup(std::string& err) {
     F->q27 = n > 0;
     if (l0_ == 0)
         std::fprintf(stderr, "qwen35: QSA on %d attention layers (past %lld cells: the indexer's %d best 4-cell blocks "
-                             "and the query's own block; STRATA_Q35_QSA=0 for dense)\n",
-                     n, (long long) g.idx_top_k + q27::kBlock - 1, g.idx_top_k / q27::kBlock);
+                             "and the query's own block; STRATA_Q35_QSA=0 for dense)%s%s\n",
+                     n, (long long) g.idx_top_k + q27::kBlock - 1, g.idx_top_k / q27::kBlock,
+                     kept.empty() ? "" : "; dense attention layers: ", kept.c_str());
     return true;
 }
 

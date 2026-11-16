@@ -782,13 +782,32 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
     if (dense && g.get(p + "attention.indexer.head_count") != nullptr) {
         const char* qe = getenv("STRATA_Q35_QSA");
         const bool off = qe != nullptr && std::atoi(qe) == 0;
+        // compress_ratios 4 on the attention layers that carry an indexer; 0 on a recurrent layer, and 0 on an
+        // attention layer kept dense (no indexer tensors). STRATA_Q35_QSA_DENSE_LAYERS=3,31 keeps those attention
+        // layers dense too (a test switch: the same file, those layers' indexers unused)
+        std::vector<int> keep_dense;
+        if (const char* dl = getenv("STRATA_Q35_QSA_DENSE_LAYERS"))
+            for (const char* c = dl; *c;) {
+                char* e = nullptr;
+                const long v = std::strtol(c, &e, 10);
+                if (e == c) { ++c; continue; }
+                keep_dense.push_back((int) v);
+                c = e;
+            }
         bool ratios = false;
+        std::vector<int> cr((size_t) out.n_layers, 0);
         if (const auto* v = g.get(p + "attention.compress_ratios"); v && v->type == strata::MetaType::ARRAY &&
                                                                     v->items.size() >= (size_t) out.n_layers) {
             ratios = true;
-            for (int il = 0; il < out.n_layers; ++il)
-                if ((v->items[(size_t) il].is_num() && v->items[(size_t) il].num() != 0) != (out.n_head_kv[(size_t) il] != 0))
-                    ratios = false;
+            int n_qsa = 0;
+            for (int il = 0; il < out.n_layers; ++il) {
+                const bool r = v->items[(size_t) il].is_num() && v->items[(size_t) il].num() != 0;
+                if (r && out.n_head_kv[(size_t) il] == 0) ratios = false;   // (an indexer on a recurrent layer)
+                const bool q = r && std::find(keep_dense.begin(), keep_dense.end(), il) == keep_dense.end();
+                cr[(size_t) il] = q ? 4 : 0;
+                n_qsa += q;
+            }
+            if (n_qsa == 0) ratios = false;
         }
         const int ih = (int) num("attention.indexer.head_count", 4), ik = (int) num("attention.indexer.key_length", 128),
                   it = (int) num("attention.indexer.top_k", 2048);
@@ -801,6 +820,7 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
             if (!said) std::fprintf(stderr, "qwen35: QSA indexers in the GGUF, off by STRATA_Q35_QSA=0 - dense attention\n");
         } else {
             out.qsa27 = true;
+            out.comp_ratio = cr;
             out.idx_heads = ih;
             out.idx_key = ik;
             out.idx_top_k = it;
