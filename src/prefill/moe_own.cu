@@ -48,7 +48,7 @@ bool stats_on() { static const bool on = getenv("STRATA_PROMPT_OWN_STATS") != nu
 
 // ---------------------------------------------------------------- the activations
 // A warp takes 128 values of a row: a thread 4 of them, 8 threads a 32-value block.  d = max|x| / 127 over the block,
-// q = round(x * (127 / max|x|)).  The int8 plane holds the 128 values' 4-value words in the GEMM's order (below).  (x rows are float-aligned only: scalar loads; the int8 words are aligned.)
+// q = round(x * (127 / max|x|)).  The int8 plane holds the 128 values' 4-value words in the GEMM's order (below).  
 __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, uint32_t* __restrict__ q,
                              float* __restrict__ d, int cols, int64_t ld, int64_t rows) {
     const int64_t wi = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // the warp: (row, 128 values)
@@ -57,7 +57,13 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
     if (r >= rows) return;
     const int c = (int) (wi - r * per_row);
     const float* src = x + (ids != nullptr ? (int64_t) ids[r] : r) * ld + (int64_t) c * 128 + lane * 4;
-    const float v0 = src[0], v1 = src[1], v2 = src[2], v3 = src[3];
+    float v0, v1, v2, v3;
+    if (((uintptr_t) src & 15) == 0) {   // (the engine's rows: one 16-byte load)
+        const float4 v = *(const float4*) src;
+        v0 = v.x; v1 = v.y; v2 = v.z; v3 = v.w;
+    } else {
+        v0 = src[0]; v1 = src[1]; v2 = src[2]; v3 = src[3];
+    }
     float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
     amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
     amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
@@ -484,7 +490,7 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
     }
     if (tiles == nullptr) ck(cudaMalloc(&tiles, (size_t) 1025 * sizeof(int32_t)), "tile table");
     // The tile shape and the tokens a tile, from a small cost model fitted to measurements (tests/moe_own_test
-    // --bench, RTX 5090): a tile's time is its decode (about 3 token groups' worth) plus its token groups; the GPU
+    // --bench, RTX 5090): a tile's time is its decode (about 6 token groups' worth; 3 to 10 choose alike) plus its token groups; the GPU
     // runs `slots` tiles at once; up to two rounds are whole rounds (a launch of 176 coarse tiles on 170 SMs took
     // two), more are a stream.  Large tiles share the decode (many rows: coarse, 128 tokens); a small set wants enough
     // tiles to fill the GPU once (2 experts of 384 rows in 64-token tiles: a third of the SMs idle).
@@ -528,7 +534,7 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
             const long tiles = count(c, crs), slots = crs ? sms : 2 * sms;
             const double rounds = tiles <= slots ? 1.0 : tiles <= 2 * slots ? 2.0 : (double) tiles / (double) slots;
             // (a coarse tile: twice the warps of a fine one on the SM, the same time)
-            const double est = rounds * (3.0 + (double) groups / (double) tt);
+            const double est = rounds * (6.0 + (double) groups / (double) tt);
             if (est <= best) {   // (ties: the larger tile, less decode)
                 best = est;
                 tc = c;
