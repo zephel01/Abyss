@@ -208,6 +208,10 @@ STRATA_PREFILL_RING  # src/prefill/prefill.cpp
 STRATA_PREFILL_TIMING  # src/prefill/prefill.cpp
 STRATA_PROMPT_ATTN_OLD  # src/prefill/prefill.cpp
 STRATA_PROMPT_ATTN_V1  # src/kernels/cuda/qsa_prompt_attn.cu
+STRATA_PROMPT_OWN_DUMP  # src/core/glm_prefill.cu
+STRATA_PROMPT_OWN_DUMP_LAYER  # src/core/glm_prefill.cu
+STRATA_PROMPT_OWN_STATS  # src/prefill/moe_own.cu
+STRATA_PROMPT_OWN_TILE  # src/prefill/moe_own.cu
 STRATA_Q35_ATTN_CHUNK_MIN  # src/kernels/cuda/qwen35_fast.cu
 STRATA_Q35_GDN_STEP  # src/core/qwen35_fast_path.cu
 STRATA_Q35_MTP_MIN  # src/core/qwen35_fast_path.cu
