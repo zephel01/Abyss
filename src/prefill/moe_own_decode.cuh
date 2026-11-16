@@ -12,6 +12,7 @@
 //   AL      what a chunk's offset in the row is a multiple of
 //   SUB     values one scale covers: 32 (one float scale a step) or 16 (two integer multipliers a step and one float a
 //           chunk)
+//   GW, table()             the codebook (the kernel reads it from a copy in shared memory)
 //   head(p)                 the chunk's own scale (p: the chunk's first byte)
 //   step(p, ib, t, hd)      the 32 values ib of the chunk -> Step
 // The formats are the published GGUF block layouts (third_party/ggml/ggml-common.h holds the structs and the
@@ -38,7 +39,8 @@ __device__ __forceinline__ uint32_t neg_any(uint32_t v, uint32_t m) {
     return ((a & 0x7F7F7F7Fu) + b) ^ (a & 0x80808080u);
 }
 // The i-quants' signs: 7 stored bits s7 for 8 values (the eighth sign makes the count of minus signs even) -> 0xFF
-// in the bytes of the negative ones among values 4 half .. 4 half + 3.  (A 256-entry table measured the same.)
+// in the bytes of the negative ones among values 4 half .. 4 half + 3.  (A 256-entry table measured the same from
+// global memory and 3% slower from shared memory: the kernel's time goes with its loads.)
 __device__ __forceinline__ uint32_t sign_mask(uint32_t s7, int half) {
     const uint32_t s8 = (s7 & 127u) | ((uint32_t) (__popc(s7 & 127u) & 1) << 7);
     return nib_mask(s8 >> (4 * half));
@@ -51,12 +53,13 @@ template<int TY> struct Dec;
 
 // IQ2_XXS: {f16 d; 8 x [4 codebook bytes (8 values each) | u32: 4 x 7 sign bits, 4 scale bits]}
 template<> struct Dec<16> {
+    static constexpr int GW = 512;   // the codebook's 32-bit words
+    __device__ static __forceinline__ const uint32_t* table() { return (const uint32_t*) iq2xxs_grid; }
     static constexpr int WCH = 256, CB = 66, AL = 2, SUB = 32;
     __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p) * 0.125f; }
-    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float hd) {
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float hd, const uint32_t* grid) {
         const uint8_t* q = p + 2 + 8 * ib;
         const uint32_t idx = rd16(q) | rd16(q + 2) << 16, aux = rd16(q + 4) | rd16(q + 6) << 16;
-        const uint32_t* grid = (const uint32_t*) iq2xxs_grid;
         const int e = t >> 1, half = t & 1;
         Step r;
         r.lo = neg_nz(grid[2 * ((idx >> (8 * e)) & 255u) + half], sign_mask((aux >> (7 * e)) & 127u, half));
@@ -70,13 +73,14 @@ template<> struct Dec<16> {
 
 // IQ2_XS: {f16 d; 32 x u16: 9 codebook bits (8 values), 7 sign bits; 8 x u8: two 4-bit scales, one a 16 values}
 template<> struct Dec<17> {
+    static constexpr int GW = 1024;   // the codebook's 32-bit words
+    __device__ static __forceinline__ const uint32_t* table() { return (const uint32_t*) iq2xs_grid; }
     static constexpr int WCH = 256, CB = 74, AL = 2, SUB = 16;
     __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p) * 0.125f; }
-    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float) {
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t* grid) {
         const uint8_t* q = p + 2 + 8 * ib;
         const int e = t >> 1, half = t & 1;
         const uint32_t q0 = rd16(q + 2 * e), q1 = rd16(q + 2 * (e + 2)), sc = p[2 + 64 + ib];
-        const uint32_t* grid = (const uint32_t*) iq2xs_grid;
         Step r;
         r.lo = neg_nz(grid[2 * (q0 & 511u) + half], sign_mask(q0 >> 9, half));
         r.hi = neg_nz(grid[2 * (q1 & 511u) + half], sign_mask(q1 >> 9, half));
@@ -90,14 +94,15 @@ template<> struct Dec<17> {
 // IQ2_S: {f16 d; 32 codebook bytes (8 values each, 2 more index bits in qh); 32 sign bytes; 8 x u8 qh; 8 x u8: two
 // 4-bit scales, one a 16 values}
 template<> struct Dec<22> {
+    static constexpr int GW = 2048;   // the codebook's 32-bit words
+    __device__ static __forceinline__ const uint32_t* table() { return (const uint32_t*) iq2s_grid; }
     static constexpr int WCH = 256, CB = 82, AL = 2, SUB = 16;
     __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p) * 0.125f; }
-    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float) {
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t* grid) {
         const uint8_t* q = p + 2 + 4 * ib;
         const int e = t >> 1, half = t & 1;
         const uint32_t qh = p[2 + 64 + ib], sc = p[2 + 72 + ib];
         const uint32_t i0 = q[e] | ((qh << (8 - 2 * e)) & 0x300u), i1 = q[e + 2] | ((qh << (8 - 2 * (e + 2))) & 0x300u);
-        const uint32_t* grid = (const uint32_t*) iq2s_grid;
         Step r;
         r.lo = neg_nz(grid[2 * i0 + half], nib_mask((uint32_t) q[32 + e] >> (4 * half)));
         r.hi = neg_nz(grid[2 * i1 + half], nib_mask((uint32_t) q[32 + e + 2] >> (4 * half)));
@@ -110,16 +115,18 @@ template<> struct Dec<22> {
 
 // IQ3_XXS: {f16 d; 64 codebook bytes (4 values each); 8 x u32: 4 x 7 sign bits, 4 scale bits}
 template<> struct Dec<18> {
+    static constexpr int GW = 256;   // the codebook's 32-bit words
+    __device__ static __forceinline__ const uint32_t* table() { return iq3xxs_grid; }
     static constexpr int WCH = 256, CB = 98, AL = 2, SUB = 32;
     __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p) * 0.25f; }
-    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float hd) {
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float hd, const uint32_t* grid) {
         const uint8_t* q = p + 2 + 8 * ib;
         const uint8_t* a = p + 2 + 64 + 4 * ib;
         const uint32_t aux = rd16(a) | rd16(a + 2) << 16;
         const int e = t >> 1, half = t & 1;
         Step r;
-        r.lo = neg_nz(iq3xxs_grid[q[t]], sign_mask((aux >> (7 * e)) & 127u, half));
-        r.hi = neg_nz(iq3xxs_grid[q[4 + t]], sign_mask((aux >> (7 * (e + 2))) & 127u, half));
+        r.lo = neg_nz(grid[q[t]], sign_mask((aux >> (7 * e)) & 127u, half));
+        r.hi = neg_nz(grid[q[4 + t]], sign_mask((aux >> (7 * (e + 2))) & 127u, half));
         r.s = hd * (float) (2 * (int) (aux >> 28) + 1);
         r.m0 = r.m1 = 0;
         return r;
@@ -136,9 +143,11 @@ __device__ __forceinline__ uint32_t fp4_bytes(uint32_t n) {   // 4 nibbles in th
     return neg_any(mag, ((n >> 3) & 0x01010101u) * 0xFFu);
 }
 template<> struct Dec<39> {
+    static constexpr int GW = 0;   // the codebook's 32-bit words
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
     static constexpr int WCH = 128, CB = 68, AL = 1, SUB = 32;
     __device__ static __forceinline__ float head(const uint8_t*) { return 0.0f; }
-    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float) {
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t* grid) {
         const uint8_t* b = p + 17 * ib;
         const uint8_t* q = b + 1 + 4 * t;
         const uint32_t v = (uint32_t) q[0] | (uint32_t) q[1] << 8 | (uint32_t) q[2] << 16 | (uint32_t) q[3] << 24;

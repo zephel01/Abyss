@@ -24,7 +24,8 @@ bool supported(int ggml_type);
 bool usable(int ggml_type, int64_t rows, int64_t cols);
 
 /// Bytes of `rows` activation rows of `cols` values in the kernels' form: an int8 plane [rows][cols], then a float
-/// plane [rows][cols / 32] (the blocks' scales).  cols a multiple of 256.
+/// plane [rows][cols / 32] (the blocks' scales).  cols a multiple of 256.  (The int8 plane is in the kernels' own
+/// word order, see moe_own.cu.)
 size_t act_bytes(int64_t rows, int64_t cols);
 /// Row i of the output is row ids[i] of x (row i when ids is null); x has `ld` floats a row.  xq: 16-byte aligned.
 void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream);

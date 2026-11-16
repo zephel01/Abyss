@@ -99,6 +99,16 @@ void quant_ref(const float* x, int64_t cols, std::vector<int8_t>& q, std::vector
     }
 }
 
+// the device's int8 plane: in each 128 values, block i's 4-value word w (w = t + 4 half) at word t * 8 + i * 2 + half
+std::vector<int8_t> dev_order(const std::vector<int8_t>& q) {
+    std::vector<int8_t> o(q.size());
+    for (size_t c = 0; c < q.size() / 128; ++c)
+        for (int i = 0; i < 4; ++i)
+            for (int w = 0; w < 8; ++w)
+                std::memcpy(o.data() + c * 128 + 4 * ((w & 3) * 8 + i * 2 + (w >> 2)), q.data() + c * 128 + i * 32 + 4 * w, 4);
+    return o;
+}
+
 struct Stat {
     double worst = 0;   // max |got - ref| / (FP32 eps * the row's absolute sum)
     double rel = 0;     // max |got - ref| / rms(ref)
@@ -195,7 +205,7 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
                 continue;
             // the quantizer, bit for bit
             quant_ref(c.x.data() + (size_t) r * E, E, q, d);
-            if (std::memcmp(q.data(), xq_h.data() + (size_t) r * E, (size_t) E) != 0 ||
+            if (std::memcmp(dev_order(q).data(), xq_h.data() + (size_t) r * E, (size_t) E) != 0 ||
                 std::memcmp(d.data(), xq_h.data() + (size_t) rows * E + (size_t) r * (E / 32) * 4, (size_t) (E / 32) * 4) != 0)
                 ++q_bad;
             ref_product(c.gu_type, blob, FF, E, q, d, rg, mg);
@@ -211,7 +221,7 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
             accumulate(sg, h_h.data() + (size_t) r * FF, rh, mh);
             // down from the kernel's own h (its quantized form as the device wrote it)
             quant_ref(h_h.data() + (size_t) r * FF, FF, q, d);
-            if (std::memcmp(q.data(), hq_h.data() + (size_t) r * FF, (size_t) FF) != 0) ++q_bad;
+            if (std::memcmp(dev_order(q).data(), hq_h.data() + (size_t) r * FF, (size_t) FF) != 0) ++q_bad;
             ref_product(c.d_type, blob + c.down_off, E, FF, q, d, rd, md);
             accumulate(sd, out_h.data() + (size_t) r * E, rd, md);
         }

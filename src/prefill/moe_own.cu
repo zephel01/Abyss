@@ -48,7 +48,7 @@ bool stats_on() { static const bool on = getenv("STRATA_PROMPT_OWN_STATS") != nu
 
 // ---------------------------------------------------------------- the activations
 // A warp takes 128 values of a row: a thread 4 of them, 8 threads a 32-value block.  d = max|x| / 127 over the block,
-// q = round(x * (127 / max|x|)).  (x rows are float-aligned only: scalar loads; the int8 words are aligned.)
+// q = round(x * (127 / max|x|)).  The int8 plane holds the 128 values' 4-value words in the GEMM's order (below).  (x rows are float-aligned only: scalar loads; the int8 words are aligned.)
 __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, uint32_t* __restrict__ q,
                              float* __restrict__ d, int cols, int64_t ld, int64_t rows) {
     const int64_t wi = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // the warp: (row, 128 values)
@@ -65,7 +65,10 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     const uint32_t w = (uint32_t) (__float2int_rn(v0 * inv) & 255) | (uint32_t) (__float2int_rn(v1 * inv) & 255) << 8 |
                        (uint32_t) (__float2int_rn(v2 * inv) & 255) << 16 | (uint32_t) (__float2int_rn(v3 * inv) & 255) << 24;
-    q[(r * cols + (int64_t) c * 128) / 4 + lane] = w;
+    // (the GEMM's order: block i's word w - values 4 w .. 4 w + 3 - at t * 8 + i * 2 + half, w = t + 4 half: a thread
+    // t of the GEMM reads its two words of all four blocks in two 16-byte loads)
+    const int wd = lane & 7, bi = lane >> 3;
+    q[(r * cols + (int64_t) c * 128) / 4 + (wd & 3) * 8 + bi * 2 + (wd >> 2)] = w;
     if ((lane & 7) == 0) d[r * (cols / 32) + c * 4 + (lane >> 3)] = amax / 127.0f;
 }
 
@@ -168,7 +171,8 @@ __device__ __forceinline__ void mma16(int c[4], uint32_t a0, uint32_t a1, uint32
 // 16-byte words a slot holds (a chunk from any offset its alignment allows), and a CTA's shared memory
 template<int TY, int CF> struct Lay {
     static constexpr int WS = (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
-    static constexpr size_t smem = (size_t) (2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + 2 * Cfg<CF>::TC) * 16;
+    static constexpr int BUF = 2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + 2 * Cfg<CF>::TC;   // 16-byte words
+    static constexpr size_t smem = (size_t) BUF * 16 + (size_t) Dec<TY>::GW * 4;   // (+ the codebook)
 };
 
 // One tile of ng groups of 8 tokens (ng <= TC / 8: the loops over the groups are unrolled to that and each group is
@@ -183,6 +187,11 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     uint4* wbuf = smem;                       // [2][NT slots][WS]
     uint4* xbuf = wbuf + 2 * NT * WS;         // [2][TC][8]
     uint4* sbuf = xbuf + 2 * TC * 8;          // [2][TC]
+#if defined(OWN_GRID_GLOBAL)
+    const uint32_t* grid = D::table();
+#else
+    const uint32_t* grid = (const uint32_t*) (smem + Lay<TY, CF>::BUF);   // (own_kernel copied it)
+#endif
     const uint8_t* we = a.w + (size_t) e * a.stride;
     const size_t row_bytes = (size_t) (a.K / D::WCH) * D::CB;
     const int n_h = a.K / 128, n_wc = a.K / D::WCH;
@@ -259,39 +268,47 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                     hd[f][h8] = D::head(sp[f][h8]);
                 }
         }
-        const uint32_t* xw = (const uint32_t*) (xbuf + (h & 1) * TC * 8);
-        const float* xs = (const float*) (sbuf + (h & 1) * TC);
+        const uint4* xw = xbuf + (h & 1) * TC * 8;
+        const uint4* xs = sbuf + (h & 1) * TC;
+        // the half chunk's four steps decoded, then a token group at a time: its activation words and scales for the
+        // four steps come in four 16-byte loads (the kernel's time goes with its loads)
+        Step st[SPH][2][2];
 #pragma unroll
-        for (int i = 0; i < SPH; ++i) {
-            const int ib = (h % HPW) * SPH + i;
-            Step st[2][2];
+        for (int i = 0; i < SPH; ++i)
 #pragma unroll
             for (int f = 0; f < 2; ++f)
 #pragma unroll
-                for (int h8 = 0; h8 < 2; ++h8) st[f][h8] = D::step(sp[f][h8], ib, t, hd[f][h8]);
+                for (int h8 = 0; h8 < 2; ++h8) st[i][f][h8] = D::step(sp[f][h8], (h % HPW) * SPH + i, t, hd[f][h8], grid);
 #pragma unroll
-            for (int j = 0; j < NG; ++j) {
-                if (j >= ng) break;
-                const uint32_t bl = xw[(j * 8 + g) * 32 + i * 8 + t], bh = xw[(j * 8 + g) * 32 + i * 8 + 4 + t];
-                const float x0 = xs[(j * 8 + 2 * t) * 4 + i], x1 = xs[(j * 8 + 2 * t + 1) * 4 + i];
+        for (int j = 0; j < NG; ++j) {
+            if (j >= ng) break;
+            const uint4 b01 = xw[(j * 8 + g) * 8 + t * 2], b23 = xw[(j * 8 + g) * 8 + t * 2 + 1];
+            const uint4 s0 = xs[j * 8 + 2 * t], s1 = xs[j * 8 + 2 * t + 1];
+            const uint32_t bw[8] = {b01.x, b01.y, b01.z, b01.w, b23.x, b23.y, b23.z, b23.w};
+            const float xa[4] = {__uint_as_float(s0.x), __uint_as_float(s0.y), __uint_as_float(s0.z), __uint_as_float(s0.w)};
+            const float xb[4] = {__uint_as_float(s1.x), __uint_as_float(s1.y), __uint_as_float(s1.z), __uint_as_float(s1.w)};
+#pragma unroll
+            for (int i = 0; i < SPH; ++i) {
+                const uint32_t bl = bw[2 * i], bh = bw[2 * i + 1];
+                const float x0 = xa[i], x1 = xb[i];
 #pragma unroll
                 for (int f = 0; f < 2; ++f) {
                     float v[4];
                     if constexpr (D::SUB == 32) {
                         int cc[4];
-                        mma32(cc, st[f][0].lo, st[f][1].lo, st[f][0].hi, st[f][1].hi, bl, bh);
-                        v[0] = (float) cc[0] * st[f][0].s;
-                        v[1] = (float) cc[1] * st[f][0].s;
-                        v[2] = (float) cc[2] * st[f][1].s;
-                        v[3] = (float) cc[3] * st[f][1].s;
+                        mma32(cc, st[i][f][0].lo, st[i][f][1].lo, st[i][f][0].hi, st[i][f][1].hi, bl, bh);
+                        v[0] = (float) cc[0] * st[i][f][0].s;
+                        v[1] = (float) cc[1] * st[i][f][0].s;
+                        v[2] = (float) cc[2] * st[i][f][1].s;
+                        v[3] = (float) cc[3] * st[i][f][1].s;
                     } else {
                         int cl[4], ch[4];
-                        mma16(cl, st[f][0].lo, st[f][1].lo, bl);
-                        mma16(ch, st[f][0].hi, st[f][1].hi, bh);
-                        v[0] = (float) (cl[0] * st[f][0].m0 + ch[0] * st[f][0].m1) * hd[f][0];
-                        v[1] = (float) (cl[1] * st[f][0].m0 + ch[1] * st[f][0].m1) * hd[f][0];
-                        v[2] = (float) (cl[2] * st[f][1].m0 + ch[2] * st[f][1].m1) * hd[f][1];
-                        v[3] = (float) (cl[3] * st[f][1].m0 + ch[3] * st[f][1].m1) * hd[f][1];
+                        mma16(cl, st[i][f][0].lo, st[i][f][1].lo, bl);
+                        mma16(ch, st[i][f][0].hi, st[i][f][1].hi, bh);
+                        v[0] = (float) (cl[0] * st[i][f][0].m0 + ch[0] * st[i][f][0].m1) * hd[f][0];
+                        v[1] = (float) (cl[1] * st[i][f][0].m0 + ch[1] * st[i][f][0].m1) * hd[f][0];
+                        v[2] = (float) (cl[2] * st[i][f][1].m0 + ch[2] * st[i][f][1].m1) * hd[f][1];
+                        v[3] = (float) (cl[3] * st[i][f][1].m0 + ch[3] * st[i][f][1].m1) * hd[f][1];
                     }
                     acc[f][j][0] = fmaf(v[0], x0, acc[f][j][0]);
                     acc[f][j][1] = fmaf(v[1], x1, acc[f][j][1]);
@@ -332,6 +349,12 @@ template<int TY, bool GLU, int CF>
 __global__ void __launch_bounds__(Cfg<CF>::NT) own_kernel(const KArgs a) {
     constexpr int NW = Cfg<CF>::NW;
     extern __shared__ uint4 smem[];
+    {   // the codebook into shared memory: the decode's lookups stay off the global-memory path
+        uint32_t* g = (uint32_t*) (smem + Lay<TY, CF>::BUF);
+        const uint32_t* src = Dec<TY>::table();
+        for (int i = threadIdx.x; i < Dec<TY>::GW; i += Cfg<CF>::NT) g[i] = src[i];
+        __syncthreads();
+    }
     const int n_rt = (a.w_rows + (GLU ? NW * 16 : NW * 32) - 1) / (GLU ? NW * 16 : NW * 32);
     const int tt = blockIdx.x / n_rt, rt = blockIdx.x % n_rt;
     const auto tile_at = [&](int i) { return a.tiles != nullptr ? a.tiles[i] : a.itiles[i]; };
