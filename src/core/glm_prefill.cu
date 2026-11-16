@@ -32,6 +32,8 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/prompt_flash_attn.hpp"
+#include "strata/kernels/qsa27.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -181,6 +183,13 @@ struct Q4xBufs {
 };
 Q4xBufs carve_q4x(Carve& c, size_t T, const Glm5Geometry& g) {
     Q4xBufs b{};
+    if (g.qsa27 && !g.q4x) {   // Qwen3.8-27B QSA: the indexer's raw keys, queries, step records and query positions
+        b.kraw = c.take<float>(T * (size_t) g.idx_key);
+        b.iq = c.take<float>(T * (size_t) g.idx_heads * g.idx_key);
+        b.steps = c.take<int32_t>(T * 4);
+        b.ipos = c.take<int32_t>(T * (size_t) g.idx_heads);
+        return b;
+    }
     if (!g.q4x) return b;
     const size_t E = (size_t) g.n_embd, HE = (size_t) g.hc * E, LR = (size_t) g.hc_lr;
     b.xn = c.take<float>(T * HE);
@@ -3304,14 +3313,57 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         Q4xBufs Q = carve_q4x(c, (size_t) tn, g);
                         if (!q4_attn(il, pt0, tn, xs, B.q, B.ao, Q, err)) return false;
                     } else {
+                        // Qwen3.8-27B QSA (qsa27.hpp): the rows' indexer keys into the block keys; the rows up to
+                        // 2,051 cells attend densely below (exact: their selection is every cell), the later ones to
+                        // their own selection (q27_attn_rows; images: dense, as the reference)
+                        int nd = tn;
+                        Q4xBufs Q{};
+                        const bool q27 = F->q27 && Ly.q4_pooled != nullptr;
+                        if (q27) {
+                            namespace q27k = strata::kernels::qsa27;
+                            Q = carve_q4x(c, (size_t) tn, g);
+                            const int ID = q27k::kDim;
+                            blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, ID, tn, E, &one, (const float*) Ly.q4_ik.q,
+                                                E, xs, E, &zero, Q.kraw, ID),
+                                    "qsa27 k_proj");
+                            q27k::key_append_rows(Q.kraw, ID, pt0, tn, Ly.q4_ikn, Ly.q27_kbn, g.norm_eps, Ly.q4_tail,
+                                                  Ly.q4_pooled, F->q4_cos, F->q4_sin, s);
+                            static const bool dense_env = [] {
+                                const char* v = getenv("STRATA_Q35_QSA");
+                                return v != nullptr && std::atoi(v) == 2;
+                            }();
+                            if (!dense_env && strata::kernels::mrope_table() == nullptr)
+                                nd = (int) std::max<int64_t>(0, std::min<int64_t>(tn, (int64_t) g.idx_top_k + 3 - pt0));
+                        }
                         // an FP16 cache: the one-pass tensor-core kernel (prompt_flash_attn); else, or with
                         // STRATA_PROMPT_FA_OLD=1 / an explicit STRATA_Q35_PATTN, attn_prompt's kernels
                         static const bool q35_pattn = getenv("STRATA_Q35_PATTN") != nullptr;
-                        if (q35_kv_ != 0 || q35_pattn ||
-                            !strata::kernels::fpa::attn(B.q, Ly.kc, Ly.vc, 0, g.n_head, g.attn_head_kv, D, pt0, tn, 0,
-                                                        1.0f / std::sqrt((float) D), B.ao, s))
-                            q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, tn,
+                        if (nd > 0 &&
+                            (q35_kv_ != 0 || q35_pattn ||
+                             !strata::kernels::fpa::attn(B.q, Ly.kc, Ly.vc, 0, g.n_head, g.attn_head_kv, D, pt0, nd, 0,
+                                                         1.0f / std::sqrt((float) D), B.ao, s)))
+                            q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, nd,
                                              1.0f / std::sqrt((float) D), B.ao, s, q35_kv_);
+                        if (q27 && nd < tn) {
+                            namespace q27k = strata::kernels::qsa27;
+                            const int ns = tn - nd, IH = q27k::kHeads, IW = IH * q27k::kDim;
+                            auto& hs = S->q4_steps_h;
+                            hs.assign((size_t) ns * (4 + IH), 0);
+                            for (int t = 0; t < ns; ++t) {
+                                q27k::step_fill(hs.data() + (size_t) t * 4, pt0 + nd + t, g.idx_top_k);
+                                for (int h = 0; h < IH; ++h) hs[(size_t) ns * 4 + (size_t) t * IH + h] = (int32_t) (pt0 + nd + t);
+                            }
+                            cudaMemcpyAsync(Q.steps, hs.data(), (size_t) ns * 4 * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+                            cudaMemcpyAsync(Q.ipos, hs.data() + (size_t) ns * 4, (size_t) ns * IH * sizeof(int32_t),
+                                            cudaMemcpyHostToDevice, s);
+                            blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, IW, ns, E, &one, (const float*) Ly.q4_iq.q,
+                                                E, xs + (size_t) nd * E, E, &zero, Q.iq, IW),
+                                    "qsa27 q_proj");
+                            if (!q27_attn_rows(il, pt0 + nd, ns, B.q + (size_t) nd * HDq, Q.iq, Q.ipos, Q.steps,
+                                               B.ao + (size_t) nd * HDq, s, err))
+                                return false;
+                            S->mark("q27_qsa", s);
+                        }
                     }
                     q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s, q35_kv_);
                     S->mark("q35_attn", s);

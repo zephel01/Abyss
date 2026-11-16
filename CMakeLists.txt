@@ -267,6 +267,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
+                          src/kernels/cuda/qsa27.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
@@ -343,6 +344,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(qsa_topk_parity src/kernels/qsa_topk_parity.cpp)
     target_include_directories(qsa_topk_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_topk_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # Qwen3.8-27B QSA's indexer keys and selection (qsa27.hpp) against a host reference from the model card's PyTorch
+    # code: the pooled keys and the selected cells (GPU, synthetic)
+    add_executable(qsa27_parity src/kernels/qsa27_parity.cpp)
+    target_include_directories(qsa27_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qsa27_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)

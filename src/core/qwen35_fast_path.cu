@@ -18,6 +18,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa27.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/rope.hpp"
@@ -127,6 +128,18 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
             Ly.q4_ik = b16("indexer.k_proj.weight", g.idx_key);
             Ly.q4_iq = b16("indexer.q_proj.weight", (int64_t) g.idx_heads * g.idx_key);
             Ly.q4_ikn = f32("indexer.k_norm.weight");
+            Ly.q4_iqn = f32("indexer.q_norm.weight");
+        }
+        if (g.qsa27 && il < g.n_layers) {   // Qwen3.8-27B QSA: FP32 projections (the NextN block has no indexer)
+            const auto m32 = [&](const char* n, int64_t n_out) -> WSlot {
+                const auto it = w_.find(P + n);
+                if (it == w_.end()) { missing += P + n + " (f32) "; return WSlot{}; }
+                return WSlot{it->second, gf::kTypeF32, it->second, E, n_out};
+            };
+            Ly.q4_ik = m32("indexer.k_proj.weight", g.idx_key);
+            Ly.q4_iq = m32("indexer.q_proj.weight", (int64_t) g.idx_heads * g.idx_key);
+            Ly.q4_ikn = f32("indexer.k_norm.pre_weight");
+            Ly.q27_kbn = f32("indexer.k_norm.weight");
             Ly.q4_iqn = f32("indexer.q_norm.weight");
         }
     }
@@ -331,6 +344,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
+    if (g.qsa27 && !q27_qsa_setup(err)) return false;
     // (STRATA_Q4X_DFLASH: DFlash 2 replaces the MTP layer - the two drafters never run together)
     const char* dfl_env = getenv("STRATA_Q4X_DFLASH");
     const bool dfl_set = dfl_env != nullptr && dfl_env[0] != '\0';
@@ -403,6 +417,121 @@ bool Glm5Model::q4x_qsa_setup(std::string& err) {
         cudaMemcpy(F->q4_sin, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice);
     }
     F->q4_step_at = -1;
+    return true;
+}
+
+// Qwen3.8-27B QSA (higa2515/Qwen3.8-27B-QSA-GGUF, qsa27.hpp): each attention layer's block keys - the raw keys of the
+// block being filled (q4_tail), the pooled keys (q4_pooled), a zero key for the incomplete block's score (q4_dead: its
+// cells are kept by the +1e9 anyway) - and the shared scratch qwen4exp's selection uses (the same fields), sized for
+// top_k + 4 cells a row.  The rows' attention reads FP16 caches: with --kv the selection stays off (dense attention).
+bool Glm5Model::q27_qsa_setup(std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    namespace k = strata::kernels;
+    namespace q27 = strata::kernels::qsa27;
+    F->q27 = false;
+    if (g.n_rot != q27::kRot || g.idx_heads != q27::kHeads || g.idx_key != q27::kDim || g.head_dim != 256) {
+        if (l0_ == 0) std::fprintf(stderr, "qwen35: QSA indexers with a geometry the kernels do not take - dense attention\n");
+        return true;
+    }
+    if (q35_kv_ != 0) {
+        if (l0_ == 0)
+            std::fprintf(stderr, "qwen35: QSA is off with --kv (the selected rows' attention reads FP16 caches) - dense "
+                                 "attention\n");
+        return true;
+    }
+#if defined(STRATA_USE_HIP)
+    if (l0_ == 0) std::fprintf(stderr, "qwen35: QSA is not built for HIP yet - dense attention\n");
+    return true;
+#endif
+    const int64_t ctx = std::max<int64_t>(max_ctx_, 1);
+    F->q4_max_blocks = (int) (ctx / q27::kBlock + 2);
+    F->q4_cap = (int) q27::cap(g.idx_top_k);
+    // (qsa_block_topk refuses a cap under Flash-Next's widest selection)
+    F->q4_cap = std::max<int>(F->q4_cap, (int) k::qsa_selection_width(k::kTopkMaxCells, k::qsa_real_shapes()));
+    const size_t ID = (size_t) q27::kDim, half = (size_t) q27::kRot / 2;
+    const int G = FastState::kQ4Grp;
+    bool ok = true;
+    const auto dm = [&](auto** p, size_t b) { ok = ok && cudaMalloc((void**) p, b) == cudaSuccess; };
+    int n = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        auto& Ly = F->L[(size_t) il];
+        if (Ly.recr || Ly.q27_kbn == nullptr) continue;
+        dm(&Ly.q4_tail, (size_t) (q27::kBlock - 1) * ID * 4);
+        dm(&Ly.q4_dead, ID * 4);
+        dm(&Ly.q4_pooled, (size_t) F->q4_max_blocks * ID * 4);
+        if (ok) cudaMemset(Ly.q4_dead, 0, ID * 4);
+        ++n;
+    }
+    dm(&F->q4_cos, (size_t) ctx * half * 4);
+    dm(&F->q4_sin, (size_t) ctx * half * 4);
+    dm(&F->q4_iraw, ID * 4);
+    dm(&F->q4_iq, (size_t) q27::kHeads * ID * 4);
+    dm(&F->q4_step, 64);
+    dm(&F->q4_pos, 256);
+    dm(&F->q4_pf_scores, (size_t) G * F->q4_max_blocks * 4);
+    dm(&F->q4_pf_ids, (size_t) G * F->q4_cap * 4);
+    dm(&F->q4_pf_part, q35::attn_rows_part_floats(G, g.n_head, g.head_dim, F->q4_cap) * 4);
+    dm(&F->q27_st2, (size_t) G * k::kStepCount * 4);
+    ok = ok && cudaHostAlloc((void**) &F->q4_step_h, 64, cudaHostAllocDefault) == cudaSuccess &&
+         cudaHostAlloc((void**) &F->q4_pos_h, 256, cudaHostAllocDefault) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        err = "qwen35: the QSA indexer's buffers did not allocate";
+        return false;
+    }
+    {   // the RoPE table in float64 on the host (rope.hpp): the indexer's 64 rotated dims at the model's rope_base
+        std::vector<float> c((size_t) ctx * half), sn((size_t) ctx * half);
+        k::build_rope_table(q27::kRot, (double) g.rope_base, (int) ctx, c.data(), sn.data());
+        cudaMemcpy(F->q4_cos, c.data(), c.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(F->q4_sin, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice);
+    }
+    F->q4_step_at = -1;
+    F->q27 = n > 0;
+    if (l0_ == 0)
+        std::fprintf(stderr, "qwen35: QSA on %d attention layers (past %lld cells: the indexer's %d best 4-cell blocks "
+                             "and the query's own block; STRATA_Q35_QSA=0 for dense)\n",
+                     n, (long long) g.idx_top_k + q27::kBlock - 1, g.idx_top_k / q27::kBlock);
+    return true;
+}
+
+bool Glm5Model::q27_attn_rows(int il, int64_t p0, int n, const float* q, float* iq, const int32_t* ipos,
+                              const int32_t* steps, float* ao, cudaStream_t s, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    namespace k = strata::kernels;
+    namespace q27 = strata::kernels::qsa27;
+    const auto& Ly = F->L[(size_t) il];
+    if (n <= 0) return true;
+    if (Ly.q4_pooled == nullptr) { err = "qwen35: QSA rows on a layer without block keys"; return false; }
+    const k::QsaShapes sh = q27::shapes(g.idx_top_k, g.n_head, g.attn_head_kv, g.head_dim);
+    const int D = g.head_dim, HD = g.n_head * D, IW = q27::kHeads * q27::kDim;
+    const float scale = 1.0f / std::sqrt((float) D);
+    k::rms_norm_weighted(iq, Ly.q4_iqn, (int64_t) n * q27::kHeads, q27::kDim, g.norm_eps, (void*) s);
+    k::rope_neox_apply_pairs(iq, iq, (int64_t) n * q27::kHeads, q27::kDim, q27::kRot, F->q4_cos, F->q4_sin, ipos,
+                             (void*) s);
+    const int G = FastState::kQ4Grp;
+    for (int r0 = 0; r0 < n; r0 += G) {
+        const int ng = std::min(G, n - r0);
+        const int32_t* st = steps + (size_t) r0 * k::kStepCount;
+        const int64_t reach = (p0 + r0 + ng) / q27::kBlock + 1;   // (the group's largest n_bid + 1)
+        k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, iq + (size_t) r0 * IW, st, ng, F->q4_max_blocks, sh,
+                            F->q4_pf_scores, (void*) s, reach);
+        // STRATA_Q35_QSA_PICK (a test control, not for use): recent = the newest 512 blocks, first = the oldest ones
+        static const int pick = [] {
+            const char* v = getenv("STRATA_Q35_QSA_PICK");
+            return v == nullptr ? 0 : std::strcmp(v, "recent") == 0 ? 1 : std::strcmp(v, "first") == 0 ? 2 : 0;
+        }();
+        if (pick != 0) q27::pick_scores(F->q4_pf_scores, F->q4_max_blocks, st, ng, pick, s);
+        k::qsa_block_topk(F->q4_pf_scores, st, ng, F->q4_max_blocks, F->q4_cap, sh, F->q4_pf_ids, (void*) s);
+        q27::own_block(F->q4_pf_ids, F->q4_cap, st, F->q27_st2, ng, s);
+        if (!q35::attn_decode_rows(q + (size_t) r0 * HD, Ly.kc, Ly.vc, F->q4_pf_ids, F->q4_cap, F->q27_st2, ng,
+                                   F->q4_cap, g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part,
+                                   ao + (size_t) r0 * HD, s)) {
+            err = "qwen35: QSA rows - the attention kernel does not take this shape";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -745,7 +874,7 @@ void Glm5Model::q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& 
         if (Ly.recr || Ly.kc == nullptr || Ly.vc == nullptr) continue;
         out.push_back({(void*) Ly.kc, N * rk});
         out.push_back({(void*) Ly.vc, N * rv});
-        if (g.q4x && Ly.q4_pooled != nullptr && Ly.q4_dead != nullptr) {
+        if ((g.q4x || F->q27) && Ly.q4_pooled != nullptr && Ly.q4_dead != nullptr) {   // (Qwen3.8-27B QSA's too)
             const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
             const size_t ID = (size_t) sh.idx_dim;
             const size_t rows = std::min<size_t>((size_t) F->q4_max_blocks, N / (size_t) sh.idx_block + 1);
@@ -1390,11 +1519,12 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     j[1] = {Ly.ak.q, F->xq, F->x, F->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
     j[2] = {Ly.av.q, F->xq, F->x, F->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
     const bool qsa = g.q4x && Ly.q4_pooled != nullptr;
-    if (qsa) {   // (qwen4exp: the indexer's raw key and queries from the same input)
+    const bool q27 = F->q27 && Ly.q4_pooled != nullptr;   // (Qwen3.8-27B QSA: FP32 projections, qsa27.hpp)
+    if (qsa || q27) {   // (qwen4exp: the indexer's raw key and queries from the same input)
         j[3] = {Ly.q4_ik.q, F->xq, F->x, F->q4_iraw, nullptr, 1.0f, Ly.q4_ik.type, E, g.idx_key};
         j[4] = {Ly.q4_iq.q, F->xq, F->x, F->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, g.idx_heads * g.idx_key};
     }
-    if (!gf::mv(j, qsa ? 5 : 3, s)) { err = "qwen35moe: the attention projections"; return false; }
+    if (!gf::mv(j, qsa || q27 ? 5 : 3, s)) { err = "qwen35moe: the attention projections"; return false; }
     if (F->prof_on) F->mark("q35_attn_mv");
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     if (dumps) {
@@ -1414,6 +1544,24 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v == nullptr || std::atoi(v) != 0; }();
 #endif
     bool done = false;
+    if (q27) {
+        // Qwen3.8-27B QSA: the cell's key into the block keys; past the dense window (and without images: their
+        // M-RoPE positions are not the cells', the reference runs those dense) the selected cells (q27_attn_rows)
+        namespace q27k = strata::kernels::qsa27;
+        q27k::key_append_rows(F->q4_iraw, q27k::kDim, p64, 1, Ly.q4_ikn, Ly.q27_kbn, g.norm_eps, Ly.q4_tail, Ly.q4_pooled,
+                              F->q4_cos, F->q4_sin, s);
+        static const bool dense_env = [] { const char* v = getenv("STRATA_Q35_QSA"); return v != nullptr && std::atoi(v) == 2; }();
+        if (!dense_env && !q27k::dense_at(p64, g.idx_top_k) && k::mrope_table() == nullptr) {
+            if (F->q4_step_at != p64) {   // the step record and the rows' positions, once a token
+                q27k::step_fill(F->q4_step_h, p64, g.idx_top_k);
+                const int32_t* hs = F->q4_step_h;
+                q35::q4_step_set(F->q4_step, F->q4_pos, hs[0], hs[1], hs[2], hs[3], p, s);
+                F->q4_step_at = p64;
+            }
+            if (!q27_attn_rows(il, p64, 1, F->q35_q, F->q4_iq, F->q4_pos, F->q4_step, F->q35_ao, s, err)) return false;
+            done = true;
+        }
+    }
     if (qsa) {
         const k::QsaShapes sh = k::qsa_real_shapes();
         if (F->q4_step_at != p64) {   // the step record and the rows' positions, once a token

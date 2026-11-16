@@ -30,6 +30,8 @@
 // past it, and a ratio-2 slot parks a pair's first token in the pair's own entry (kV41PendRing).
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/kernels/qsa27.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/gdn.hpp"
@@ -324,6 +326,20 @@ bool Glm5Model::verify_alloc(std::string& err) {
         const size_t tail_rows = (size_t) strata::kernels::qsa_real_shapes().idx_block - 1;
         if (na > 0)
             ok = ok && cudaMalloc((void**) &V->q4_tsnap, (size_t) na * tail_rows * ID * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &V->q4_rawk, (size_t) na * TM * ID * sizeof(float)) == cudaSuccess;
+    }
+    if (ok && g.qsa27 && !g.q4x && fast_->q27) {
+        // Qwen3.8-27B QSA: the columns' indexer queries, step records and query positions, and each QSA layer's raw-key
+        // tail before the window and the columns' raw keys (verify_rewind_q35)
+        const size_t ID = (size_t) g.idx_key, IH = (size_t) g.idx_heads;
+        f(V->q4_iq, IH * ID);
+        ok = ok && cudaMalloc((void**) &V->q4_steps, (size_t) TM * (4 + IH) * sizeof(int32_t)) == cudaSuccess &&
+             cudaHostAlloc((void**) &V->q4_steps_h, (size_t) TM * (4 + IH) * sizeof(int32_t), cudaHostAllocDefault) == cudaSuccess;
+        int na = 0;
+        for (int il = l0_; il < l1_; ++il) na += fast_->L[(size_t) il].q4_tail != nullptr ? 1 : 0;
+        V->q4_nattn = na;
+        if (na > 0)
+            ok = ok && cudaMalloc((void**) &V->q4_tsnap, (size_t) na * 3 * ID * sizeof(float)) == cudaSuccess &&
                  cudaMalloc((void**) &V->q4_rawk, (size_t) na * TM * ID * sizeof(float)) == cudaSuccess;
     }
     if (ok && g.v41) {
@@ -1649,7 +1665,18 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
         cudaMemcpyAsync(V->q35_csnap + (size_t) li * conv_n, Ly.gdn_conv, conv_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
         ++li;
     }
+    if (F->q27 && V->q4_tsnap != nullptr) {   // Qwen3.8-27B QSA: every QSA layer's raw-key tail as before the window
+        const size_t tail_n = (size_t) 3 * g.idx_key;
+        int la = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (Ly.q4_tail == nullptr) continue;
+            cudaMemcpyAsync(V->q4_tsnap + (size_t) la * tail_n, Ly.q4_tail, tail_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            ++la;
+        }
+    }
     li = 0;
+    int qa = 0;   // (the QSA layers so far: their raw keys' rows in q4_rawk)
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         for (int t = 0; t < T; ++t)
@@ -1704,13 +1731,53 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             if (!q35_mvn(j, 3, T, s)) { err = "qwen35 verify: the attention projections"; return false; }
             q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                 g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s, q35_kv_);
-            if (q35_exact(g)) {
+            // Qwen3.8-27B QSA (fast_qwen35_attn's): the columns' indexer keys (kept for the rewind) into the block keys,
+            // then the columns past the dense window attend to their selections, the others as below
+            int t_sel = T;   // (the first column with a selection)
+            if (F->q27 && Ly.q4_pooled != nullptr && V->q4_rawk != nullptr) {
+                namespace q27k = strata::kernels::qsa27;
+                const int ID = q27k::kDim, IH = q27k::kHeads;
+                float* rawk = V->q4_rawk + (size_t) qa++ * TM * ID;
+                gf::MvJob ij[2];
+                ij[0] = {Ly.q4_ik.q, nullptr, V->x, rawk, nullptr, 1.0f, Ly.q4_ik.type, (int) E, ID};
+                ij[1] = {Ly.q4_iq.q, nullptr, V->x, V->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, (int) E, IH * ID};
+                for (int t = 0; t < T; ++t) {   // (F32 rows: a column at a time, mv's sums - the token path's)
+                    gf::MvJob c[2] = {ij[0], ij[1]};
+                    c[0].xf = V->x + (size_t) t * E;
+                    c[0].y = rawk + (size_t) t * ID;
+                    c[1].xf = V->x + (size_t) t * E;
+                    c[1].y = V->q4_iq + (size_t) t * IH * ID;
+                    if (!gf::mv(c, 2, s)) { err = "qwen35 verify: the QSA indexer projections"; return false; }
+                }
+                q27k::key_append_rows(rawk, ID, p0, T, Ly.q4_ikn, Ly.q27_kbn, g.norm_eps, Ly.q4_tail, Ly.q4_pooled,
+                                      F->q4_cos, F->q4_sin, s);
+                static const bool dense_env = [] { const char* v = getenv("STRATA_Q35_QSA"); return v != nullptr && std::atoi(v) == 2; }();
+                if (!dense_env && strata::kernels::mrope_table() == nullptr) {
+                    t_sel = 0;
+                    while (t_sel < T && q27k::dense_at(p0 + t_sel, g.idx_top_k)) ++t_sel;
+                }
+                if (t_sel < T) {
+                    const int ns = T - t_sel;
+                    int32_t* hs = V->q4_steps_h;
+                    for (int t = 0; t < ns; ++t) {
+                        q27k::step_fill(hs + (size_t) t * 4, p0 + t_sel + t, g.idx_top_k);
+                        for (int h = 0; h < IH; ++h) hs[(size_t) ns * 4 + (size_t) t * IH + h] = (int32_t) (p0 + t_sel + t);
+                    }
+                    cudaMemcpyAsync(V->q4_steps, hs, (size_t) ns * (4 + IH) * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+                    if (!q27_attn_rows(il, p0 + t_sel, ns, V->q35_q + (size_t) t_sel * HD, V->q4_iq + (size_t) t_sel * IH * ID,
+                                       V->q4_steps + (size_t) ns * 4, V->q4_steps, V->q35_ao + (size_t) t_sel * HD, s, err))
+                        return false;
+                }
+            }
+            if (t_sel == 0) {
+            } else if (t_sel < T || q35_exact(g)) {
                 // the dense qwen35 (STRATA_Q35_VERIFY_EXACT): the token path's attention a column (attn_decode over the
                 // column's own p + 1 keys, the window's rows already in the cache).  attn_window sums a row's keys in
                 // another order (Qwen3.8-27B's 6 heads a KV head: 128 keys a block in order, where the token's
                 // attn_part_kernel takes 256 a block over 4 warps), so a column's mixer parted from the token path's in
                 // its last bits now and then and greedy answers with drafts parted from the ones without
-                for (int t = 0; t < T; ++t)
+                // (a window across the dense window's end: its dense columns the same way)
+                for (int t = 0; t < t_sel; ++t)
                     q35::attn_decode(V->q35_q + (size_t) t * HD, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, (int) (p0 + t + 1),
                                      1.0f / std::sqrt((float) D), V->q35_part, V->q35_ao + (size_t) t * HD, s, q35_kv_);
             } else {
@@ -2303,6 +2370,23 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
         q35_mtp_pend_set(p0 + kept - 1, h + (size_t) (kept - 1) * E);
     }
     if (kept >= T) return;   // (every column kept: the states are after the window already)
+    if (!g.q4x && F->q27 && V->q4_nattn > 0 && V->q4_tsnap != nullptr) {
+        // Qwen3.8-27B QSA: the raw-key tail back to before the window, then the kept columns' keys again (a dropped
+        // column in the next block wrote over tail slots of cells the kept block still pools; a block a dropped column
+        // completed is pooled again when its last cell comes)
+        const size_t ID = (size_t) g.idx_key, tail_n = (size_t) 3 * ID;
+        int la = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (Ly.q4_tail == nullptr) continue;
+            cudaMemcpyAsync(Ly.q4_tail, V->q4_tsnap + (size_t) la * tail_n, tail_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            if (kept > 0)
+                strata::kernels::qsa27::key_append_rows(V->q4_rawk + (size_t) la * TM * ID, (int64_t) ID, p0, kept, Ly.q4_ikn,
+                                                        Ly.q27_kbn, g.norm_eps, Ly.q4_tail, Ly.q4_pooled, F->q4_cos,
+                                                        F->q4_sin, s);
+            ++la;
+        }
+    }
     if (g.q4x && V->q4_nattn > 0 && V->q4_tsnap != nullptr) {
         // qwen4exp's QSA layers: the raw-key tail back to before the window, then the kept columns' keys again (a
         // dropped column in the next block wrote over slots of cells the kept block still pools)

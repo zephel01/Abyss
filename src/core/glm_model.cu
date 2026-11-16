@@ -777,6 +777,36 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
     }
     out.indexer_full.assign((size_t) out.n_layers, 1);
     out.comp_ratio.assign((size_t) out.n_layers, 0);
+    // QSA (Qwen3.8-27B-QSA): the indexer's geometry, and compress_ratios 4 on the attention layers
+    if (dense && g.get(p + "attention.indexer.head_count") != nullptr) {
+        const char* qe = getenv("STRATA_Q35_QSA");
+        const bool off = qe != nullptr && std::atoi(qe) == 0;
+        bool ratios = false;
+        if (const auto* v = g.get(p + "attention.compress_ratios"); v && v->type == strata::MetaType::ARRAY &&
+                                                                    v->items.size() >= (size_t) out.n_layers) {
+            ratios = true;
+            for (int il = 0; il < out.n_layers; ++il)
+                if ((v->items[(size_t) il].is_num() && v->items[(size_t) il].num() != 0) != (out.n_head_kv[(size_t) il] != 0))
+                    ratios = false;
+        }
+        const int ih = (int) num("attention.indexer.head_count", 4), ik = (int) num("attention.indexer.key_length", 128),
+                  it = (int) num("attention.indexer.top_k", 2048);
+        static bool said = false;   // (the geometry is read more than once at load)
+        if (!ratios || ih != 4 || ik != 128 || it <= 0 || it % 4 != 0) {
+            if (!said) std::fprintf(stderr, "qwen35: QSA indexers in the GGUF but not the geometry the kernels take (heads %d, key "
+                                 "%d, top_k %d, ratios on the attention layers: %s) - running dense\n", ih, ik, it,
+                         ratios ? "yes" : "no");
+        } else if (off) {
+            if (!said) std::fprintf(stderr, "qwen35: QSA indexers in the GGUF, off by STRATA_Q35_QSA=0 - dense attention\n");
+        } else {
+            out.qsa27 = true;
+            out.idx_heads = ih;
+            out.idx_key = ik;
+            out.idx_top_k = it;
+            out.idx_kpool = 4;
+        }
+        said = true;
+    }
     return true;
 }
 

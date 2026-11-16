@@ -437,6 +437,9 @@ struct Glm5Model::FastState {
         const float *q4_ikn = nullptr, *q4_iqn = nullptr;
         float *q4_tail = nullptr, *q4_dead = nullptr, *q4_pooled = nullptr;
         int32_t* q4_bpos = nullptr;
+        // Qwen3.8-27B QSA (qsa27.hpp): the same fields with FP32 k_proj / q_proj, q4_ikn the cell key's norm
+        // (k_norm.pre_weight) and this the block key's (k_norm.weight); q4_tail the raw keys of the block being filled
+        const float* q27_kbn = nullptr;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;
@@ -523,6 +526,8 @@ struct Glm5Model::FastState {
     float* q4_pf_scores = nullptr;
     int32_t* q4_pf_ids = nullptr;
     float* q4_pf_part = nullptr;                                 // ... their attention partials (CUDA)
+    int32_t* q27_st2 = nullptr;                                  // Qwen3.8-27B QSA: the records after own_block (kQ4Grp)
+    bool q27 = false;                                            // ... the selection is on (q27_qsa_setup)
     float* ple_pf_h = nullptr;
     size_t ple_pf_n = 0;
     WSlot q4_head_w[2];                                          // output_hc_down, output_hc_up

@@ -120,6 +120,11 @@ struct Glm5Geometry {
     // sigmoid, top-k up to glmf::kMaxK, the attention layers' QSA indexer and layer 1's per-layer embedding (PLE)
     bool q4x = false;
     int hc_lr = 320;
+    // ---- Qwen3.8-27B with QSA (higa2515/Qwen3.8-27B-QSA-GGUF: the dense qwen35 plus FP32 indexers on the attention
+    // layers, attention.indexer.* and compress_ratios in the GGUF; src/core/qwen35_fast_path.cu, kernels/qsa27.hpp):
+    // past 2,051 cells a query attends to the indexer's 512 best 4-cell blocks and its own block.  STRATA_Q35_QSA=0:
+    // the indexers are not used (the dense model, the same tokens as the file without them)
+    bool qsa27 = false;
     static bool from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
     // ---- laguna (poolside Laguna-S-2.1, llama.cpp src/models/laguna.cpp; src/core/qwen35_fast_path.cu's laguna
     // branches, kernels/laguna_fast.hpp): arch stays 2 with laguna set - every layer attention (no delta-net), head_dim
@@ -697,6 +702,15 @@ public:
     void q4x_ple_spec(int32_t token, int64_t p);
     bool q4x_ple_apply(std::string& err);
     bool q4x_qsa_setup(std::string& err);
+    // Qwen3.8-27B QSA (qsa27.hpp): the block keys' buffers; false only on an allocation failure.  On, it sets
+    // FastState::q27 (off: --kv quantized caches - the selection's attention reads FP16 rows)
+    bool q27_qsa_setup(std::string& err);
+    /// A Qwen3.8-27B QSA attention layer's selected attention for rows p0 .. p0 + n - 1 (q [n][n_head][head_dim], the
+    /// indexer queries iq [n][4][128] raw - normed and rotated here at ipos [n][4], steps [n][4] qsa27::step_fill's
+    /// records, device), every row past the dense window: their scores, top-k, own block and the attention into ao,
+    /// kQ4Grp rows a pass.  The keys must be appended already.
+    bool q27_attn_rows(int il, int64_t p0, int n, const float* q, float* iq, const int32_t* ipos, const int32_t* steps,
+                       float* ao, cudaStream_t s, std::string& err);
     int64_t q35_snap_pend_ = -1, q35_snap_done_ = -1;
     bool q35_snap_copy(bool restore);
     size_t q35_snap_bytes() const;                         // (q35_snap_h_'s size)
