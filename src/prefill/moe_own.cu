@@ -115,26 +115,54 @@ struct KArgs {
     float limit;
 };
 
+// (mma.sync s8 and cp.async need sm_80: device code for an older target traps - built() is false on such a device)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#define STRATA_OWN_SM80 1
+#else
+#define STRATA_OWN_SM80 0
+#endif
 __device__ __forceinline__ void cp16(void* smem, const void* gmem) {
+#if STRATA_OWN_SM80
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+#else
+    __trap();
+#endif
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
+__device__ __forceinline__ void cp_commit() {
+#if STRATA_OWN_SM80
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void cp_wait_all() {
+#if STRATA_OWN_SM80
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
 
 // C[16 x 8] = A[16 x 32] B[32 x 8], int8 -> int32
 __device__ __forceinline__ void mma32(int c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if STRATA_OWN_SM80
     const int z = 0;
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
                  : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z));
+#else
+    c[0] = c[1] = c[2] = c[3] = (int) (a0 + a1 + a2 + a3 + b0 + b1);
+    __trap();
+#endif
 }
 // C[16 x 8] = A[16 x 16] B[16 x 8]
 __device__ __forceinline__ void mma16(int c[4], uint32_t a0, uint32_t a1, uint32_t b0) {
+#if STRATA_OWN_SM80
     const int z = 0;
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
                  : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
                  : "r"(a0), "r"(a1), "r"(b0), "r"(z));
+#else
+    c[0] = c[1] = c[2] = c[3] = (int) (a0 + a1 + b0);
+    __trap();
+#endif
 }
 
 // 16-byte words a slot holds (a chunk from any offset its alignment allows), and a CTA's shared memory
