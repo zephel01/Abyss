@@ -1946,6 +1946,27 @@ static int glm_pack_generate(const Options& o) {
         static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
         static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
         std::vector<int> gen_hist;
+        // ... and a LONG loop while thinking: a block of 33..STRATA_GLM_LOOP_LONG (1024; 0 off) tokens written three
+        // times in a row, token for token (V4.1 at temperature 0 went over the same 143-token list of a kernel's
+        // arguments for 18K tokens until the answer room closed it - far past the 32-token patterns above).  For each
+        // period p, run_p[p] counts the tokens in a row that equal the one p back; the guard fires when some
+        // run_p[p] >= max(2p, 256): the last 3p tokens are one block three times (and at least 256 tokens repeat).
+        // Only thinking is watched (an answer may legitimately repeat a long block - a table, generated code).
+        static const int loop_long = (int) env_num("STRATA_GLM_LOOP_LONG", 1024);
+        std::vector<int> run_p;
+        const auto looping_long = [&]() -> int {   // the shortest such period, 0 when none
+            const int n = (int) gen_hist.size();
+            if (loop_long <= 32) return 0;
+            if (n == 1 || run_p.empty()) run_p.assign((size_t) loop_long + 1, 0);   // (gen_hist starts over)
+            const int tok = gen_hist[(size_t) n - 1], top = std::min(loop_long, n - 1);
+            int hit = 0;
+            for (int p = 33; p <= top; ++p) {
+                int& r = run_p[(size_t) p];
+                r = gen_hist[(size_t) (n - 1 - p)] == tok ? r + 1 : 0;
+                if (hit == 0 && r >= std::max(2 * p, 256)) hit = p;
+            }
+            return hit;
+        };
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
         int guard_fired = 0;     // soft landings in this answer: a second loop ends it
         const auto looping = [&](int w) -> int {   // the pattern's period, 0 when the tail is not one
@@ -1981,7 +2002,9 @@ static int glm_pack_generate(const Options& o) {
             strata::core::progress_beat();
             gen_hist.push_back(tok);
             if (in_think && tok != req_think_end && !think_closing) {
-                if (const int per = looping(loop_w_think)) {
+                int per = looping(loop_w_think);
+                if (const int lp = looping_long(); per == 0) per = lp;
+                if (per != 0) {
                     close_think();   // as the budget does: the bridge, then </think>
                     char m[200];
                     std::snprintf(m, sizeof m, "thinking was repeating a %d-token pattern (%d tokens in): closed, "
