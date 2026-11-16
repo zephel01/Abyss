@@ -2,7 +2,11 @@
 // expert gathers, the SwiGLU kernel and the identity row map.  Built with moe_mmq.cu (MMQ) or moe_mmq_none.cu.
 #include "strata/prefill/moe_mmq.hpp"
 
+#if defined(GGML_USE_HIP)
+#include "common.cuh"   // (the HIP MMQ build: ggml's CUDA-to-HIP names, as moe_mmq.cu)
+#else
 #include <cuda_runtime.h>
+#endif
 #include "strata/kernels/packed_bytes.hpp"
 
 #include <cstdio>

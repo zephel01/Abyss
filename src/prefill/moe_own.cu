@@ -26,11 +26,13 @@
 #include <string>
 #include <vector>
 
-#if !defined(__HIPCC__)
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 #include "moe_own_decode.cuh"
+
+#if defined(__HIPCC__)
+#include <cstring>
 #endif
 
 namespace strata::prefill::own {
@@ -76,7 +78,12 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
     // (the GEMM's order: block i's word w - values 4 w .. 4 w + 3 - at t * 8 + i * 2 + half, w = t + 4 half: a thread
     // t of the GEMM reads its two words of all four blocks in two 16-byte loads)
     const int wd = lane & 7, bi = lane >> 3;
+#if defined(__HIPCC__)
+    // (the WMMA backend: the values in their own order - a lane reads 16 consecutive ones)
+    q[(r * cols + (int64_t) c * 128) / 4 + bi * 8 + wd] = w;
+#else
     q[(r * cols + (int64_t) c * 128) / 4 + (wd & 3) * 8 + bi * 2 + (wd >> 2)] = w;
+#endif
     // the block's scale, and - a second plane - its sum of activations as rounded (the K-quants' offsets)
     int si = (int) (int8_t) (w & 255) + (int) (int8_t) ((w >> 8) & 255) + (int) (int8_t) ((w >> 16) & 255) + (int) (int8_t) (w >> 24);
     si += __shfl_xor_sync(0xFFFFFFFFu, si, 1);
@@ -89,7 +96,6 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
     }
 }
 
-#if !defined(__HIPCC__)
 // ---------------------------------------------------------------- the tile plan
 // Tile shapes.  Fine (0): 4 warps (64 gate/up or 128 down rows), 64 tokens - two CTAs an SM, more and smaller tiles:
 // a small set still fills the GPU.  Coarse (1): 8 warps, 128 tokens - the weights are decoded once for twice the
@@ -138,6 +144,8 @@ struct KArgs {
     float limit;
 };
 
+#if !defined(__HIPCC__)
+// ================================================================ the NVIDIA backend (mma.sync, cp.async)
 // (mma.sync s8 and cp.async need sm_80: device code for an older target traps - built() is false on such a device)
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 #define STRATA_OWN_SM80 1
@@ -466,6 +474,268 @@ void launch_t(const KArgs& a, unsigned grid, int shape, cudaStream_t s) {
     }
 }
 
+
+#else   // __HIPCC__
+// ================================================================ the AMD backend: WMMA int8 (wave32)
+// v_wmma_i32_16x16x16_iu8: D[16 x 16] = A[16 x 16] B[16 x 16] + C, int8 -> int32, one wave.
+//   gfx11 (RDNA3 / 3.5): A lane l holds the 16 k of row l % 16 (both halves of the wave the same), B lane l the 16 k
+//     of column l % 16, D lane l holds D[2 i + l / 16][l % 16] (i < 8).
+//   gfx12 (RDNA4): A lane l holds A[l % 16][8 (l / 16) + j], B lane l B[8 (l / 16) + j][l % 16] (j < 8), D lane l
+//     holds D[8 (l / 16) + i][l % 16].
+// The tile: one shape - 4 waves, 64 tokens (LDS is 64 KiB a work group), single buffers filled with plain loads (no
+// cp.async here): a wave takes 16 rows of two fragments as on NVIDIA, a lane decodes all 32 values of its row
+// (l % 16) a step, the rows' scales go through a small LDS table of the wave (a lane's D holds 8 rows, not its own),
+// a token group is 16 tokens (lane l: token l % 16).  One k16 WMMA for the first 16 values of a step, one for the
+// second.  The per-arch choices are the two macros below and the fragment helpers; the tile's size is one constant
+// set (gfx12 on an R9700 will want its own - it is not measured yet).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define STRATA_OWN_W12 1
+#else
+#define STRATA_OWN_W12 0
+#endif
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#define STRATA_OWN_W11 1
+#else
+#define STRATA_OWN_W11 0
+#endif
+typedef int ow_i2 __attribute__((ext_vector_type(2)));
+typedef int ow_i4 __attribute__((ext_vector_type(4)));
+typedef int ow_i8 __attribute__((ext_vector_type(8)));
+// D = A B + C; a16 / b16: the lane's 16 int8 of its row / its token column (gfx12 takes the half its lane group holds)
+__device__ __forceinline__ ow_i8 wmma(uint4 a16, uint4 b16, ow_i8 c, int hi) {
+#if STRATA_OWN_W11
+    (void) hi;
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ow_i4{(int) a16.x, (int) a16.y, (int) a16.z, (int) a16.w}, true,
+                                                      ow_i4{(int) b16.x, (int) b16.y, (int) b16.z, (int) b16.w}, c, false);
+#elif STRATA_OWN_W12
+    const ow_i2 a = hi ? ow_i2{(int) a16.z, (int) a16.w} : ow_i2{(int) a16.x, (int) a16.y};
+    const ow_i2 b = hi ? ow_i2{(int) b16.z, (int) b16.w} : ow_i2{(int) b16.x, (int) b16.y};
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#else
+    (void) a16; (void) b16; (void) hi;
+    __builtin_trap();   // (an architecture without WMMA: built() is false there)
+    return c;
+#endif
+}
+// the D row (0-15) of a lane's element i, and where a row's scale sits so that a lane's eight are consecutive
+#if STRATA_OWN_W12
+#define OW_DROW(i, hi) (8 * (hi) + (i))
+#define OW_POS(r) (r)
+#else
+#define OW_DROW(i, hi) (2 * (i) + (hi))
+#define OW_POS(r) ((((r) & 1) << 3) + ((r) >> 1))
+#endif
+
+constexpr int HNW = 4, HTC = 64, HNT = HNW * 32, HNG = HTC / 16;
+template<int TY> struct HLay {
+    static constexpr int WH = Rng<TY>::HDR > 0 ? (16 - Dec<TY>::AL + Rng<TY>::HDR + 15) / 16 : 0;
+    static constexpr int WD = (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
+    static constexpr int W2 = Rng2<TY>::CB2 > 0 ? (16 - Dec<TY>::AL + Rng2<TY>::CB2 + 15) / 16 : 0;
+    static constexpr int WS = WH + WD + W2;
+    static constexpr int GW = Dec<TY>::GW > 0 ? Dec<TY>::GW : 4;
+};
+
+template<int TY, bool GLU>
+__global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
+    typedef Dec<TY> D;
+    constexpr int WS = HLay<TY>::WS, WH = HLay<TY>::WH, WD = HLay<TY>::WD, W2 = HLay<TY>::W2, HPW = D::WCH / 128, SPH = 4;
+    __shared__ __align__(16) uint4 wbuf[HNT * WS];          // the rows' raw chunks: a slot a thread
+    __shared__ __align__(16) uint4 xbuf[HTC * 8];           // the tokens' 128 int8 of the half chunk
+    __shared__ __align__(16) uint4 sbuf[HTC], ubuf[HTC];    // their four scales, their four block sums
+    __shared__ __align__(16) float scl[HNW][2][SPH][2][16]; // a wave's rows' scales: [fragment][step][first / second 16][OW_POS(row)]
+    __shared__ __align__(16) float ofs[HNW][2][SPH][16];    // their offsets (SUMS types)
+    __shared__ __align__(16) uint32_t gridb[HLay<TY>::GW];
+    {
+        const uint32_t* src = D::table();
+        for (int i = threadIdx.x; i < D::GW; i += HNT) gridb[i] = src[i];
+    }
+    const uint32_t* grid = gridb;
+    const int n_rt = (a.w_rows + (GLU ? HNW * 16 : HNW * 32) - 1) / (GLU ? HNW * 16 : HNW * 32);
+    const int tt = blockIdx.x / n_rt, rt = blockIdx.x % n_rt;
+    const auto tile_at = [&](int i) { return a.tiles != nullptr ? a.tiles[i] : a.itiles[i]; };
+    int lo = 0, hi_e = a.n;
+    while (hi_e - lo > 1) {
+        const int mid = (lo + hi_e) / 2;
+        if (tile_at(mid) <= tt) lo = mid;
+        else hi_e = mid;
+    }
+    const int e = lo, b1 = a.bounds[e + 1], b0 = a.bounds[e] + (tt - tile_at(e)) * a.tc;
+    const int ntok = min(b1 - b0, a.tc), ng = (ntok + 15) / 16;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, r = lane & 15, hi = lane >> 4;
+    const uint8_t* we = a.w + (size_t) e * a.stride;
+    const size_t row_bytes = (size_t) (a.K / D::WCH) * Rng<TY>::RB;
+    const int n_h = a.K / 128;
+    const auto slot_row = [&](int s) -> const uint8_t* {
+        const int f = s / (HNT / 2), ww = (s / 16) % HNW, rr = s % 16;
+        const int row = GLU ? rt * (HNW * 16) + ww * 16 + rr : rt * (HNW * 32) + (2 * ww + f) * 16 + rr;
+        return we + (GLU && f ? a.up_off : (ptrdiff_t) 0) + (size_t) min(row, a.w_rows - 1) * row_bytes;
+    };
+    const uint8_t* my_slot = slot_row(threadIdx.x);
+    // a range of the row into the slot: the 16-byte words around it (none past it)
+    const auto copy_range = [&](uint4* dst, const uint8_t* srcp, int bytes, int words) {
+        const uintptr_t src = (uintptr_t) srcp;
+        const uint4* pw = (const uint4*) (src & ~(uintptr_t) 15);
+        const int last = (int) (((src & 15) + bytes - 1) / 16);
+#pragma unroll
+        for (int k = 0; k < words; ++k) dst[k] = pw[min(k, last)];
+    };
+    const uint8_t* rowp[2];
+    int soff[2];
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+        soff[f] = f * (HNT / 2) + wp * 16 + r;
+        rowp[f] = slot_row(soff[f]);
+    }
+    float acc[2][HNG][8];
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int j = 0; j < HNG; ++j)
+#pragma unroll
+            for (int k = 0; k < 8; ++k) acc[f][j][k] = 0.0f;
+    const uint8_t* sp[2];
+    const uint8_t* hp[2] = {};
+    const uint8_t* sp2[2] = {};
+    float hd[2];
+    for (int h = 0; h < n_h; ++h) {
+        __syncthreads();   // everyone is done with the buffers of half chunk h - 1 (and the codebook is in place)
+        const int c = h / HPW;
+        if (h % HPW == 0) {
+            uint4* dst = wbuf + threadIdx.x * WS;
+            if constexpr (WH > 0) copy_range(dst, my_slot + Rng<TY>::hdr(c), Rng<TY>::HDR, WH);
+            copy_range(dst + WH, my_slot + Rng<TY>::dat(c), D::CB, WD);
+            if constexpr (W2 > 0) copy_range(dst + WH + WD, my_slot + Rng2<TY>::dat2(c), Rng2<TY>::CB2, W2);
+        }
+#pragma unroll
+        for (int k = 0; k < HTC * 8 / HNT; ++k) {
+            const int i = threadIdx.x + k * HNT, tok = i >> 3, word = i & 7;
+            if (tok < ng * 16) {
+                const int64_t rr = min(b0 + tok, b1 - 1) - a.row0;
+                xbuf[i] = *(const uint4*) (a.xq + rr * a.K + (int64_t) h * 128 + word * 16);
+            }
+        }
+        if ((int) threadIdx.x < ng * 16) {
+            const int64_t rr = min(b0 + (int) threadIdx.x, b1 - 1) - a.row0;
+            sbuf[threadIdx.x] = *(const uint4*) (a.xd + rr * (a.K / 32) + (int64_t) h * 4);
+            if constexpr (Sums<TY>::on) ubuf[threadIdx.x] = *(const uint4*) (a.xsum + rr * (a.K / 32) + (int64_t) h * 4);
+        }
+        __syncthreads();
+        if (h % HPW == 0) {
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                const uint8_t* slot = (const uint8_t*) (wbuf + soff[f] * WS);
+                sp[f] = slot + WH * 16 + ((uintptr_t) (rowp[f] + Rng<TY>::dat(c)) & 15);
+                if constexpr (W2 > 0) sp2[f] = slot + (WH + WD) * 16 + ((uintptr_t) (rowp[f] + Rng2<TY>::dat2(c)) & 15);
+                if constexpr (WH > 0) {
+                    hp[f] = slot + ((uintptr_t) (rowp[f] + Rng<TY>::hdr(c)) & 15);
+                    hd[f] = D::head(hp[f]);
+                } else {
+                    hd[f] = D::head(sp[f]);
+                }
+            }
+        }
+        // the lane's row of both fragments, the half chunk's four steps: its 32 int8 a step, its scales into the wave's
+        // table (the lanes of one wave write and then read it: no barrier)
+        uint4 a_lo[SPH][2], a_hi[SPH][2];
+#pragma unroll
+        for (int i = 0; i < SPH; ++i)
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                Step st[4];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    if constexpr (W2 > 0) st[t] = D::step_h(sp[f], hp[f], h / HPW, (h % HPW) * SPH + i, t, hd[f], sp2[f]);
+                    else if constexpr (WH > 0) st[t] = D::step_h(sp[f], hp[f], h / HPW, (h % HPW) * SPH + i, t, hd[f]);
+                    else st[t] = D::step(sp[f], (h % HPW) * SPH + i, t, hd[f], grid);
+                }
+                a_lo[i][f] = make_uint4(st[0].lo, st[1].lo, st[2].lo, st[3].lo);
+                a_hi[i][f] = make_uint4(st[0].hi, st[1].hi, st[2].hi, st[3].hi);
+                if (hi == 0) {
+                    float s0, s1;   // the first and the second 16 values' scales
+                    if constexpr (Fs16<TY>::on) {
+                        s0 = st[0].s;
+                        s1 = st[0].o;
+                    } else if constexpr (D::SUB == 16) {
+                        s0 = (float) st[0].m0 * hd[f];
+                        s1 = (float) st[0].m1 * hd[f];
+                    } else {
+                        s0 = s1 = st[0].s;
+                    }
+                    scl[wp][f][i][0][OW_POS(r)] = s0;
+                    scl[wp][f][i][1][OW_POS(r)] = s1;
+                    if constexpr (Sums<TY>::on) ofs[wp][f][i][OW_POS(r)] = st[0].o;
+                }
+            }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < HNG; ++j) {
+            if (j >= ng) break;
+            const int tok = j * 16 + r;
+            const uint4 xs4 = sbuf[tok];
+            const float xs[4] = {__uint_as_float(xs4.x), __uint_as_float(xs4.y), __uint_as_float(xs4.z), __uint_as_float(xs4.w)};
+            uint4 us4 = {};
+            if constexpr (Sums<TY>::on) us4 = ubuf[tok];
+            const float us[4] = {__uint_as_float(us4.x), __uint_as_float(us4.y), __uint_as_float(us4.z), __uint_as_float(us4.w)};
+#pragma unroll
+            for (int i = 0; i < SPH; ++i) {
+                const uint4 b_lo = xbuf[tok * 8 + i * 2], b_hi = xbuf[tok * 8 + i * 2 + 1];
+#pragma unroll
+                for (int f = 0; f < 2; ++f) {
+                    const ow_i8 z = {0, 0, 0, 0, 0, 0, 0, 0};
+                    float v[8];
+                    if constexpr (D::SUB == 32 && !Fs16<TY>::on) {   // one scale the 32 values: both k16 into one sum
+                        ow_i8 d = wmma(a_lo[i][f], b_lo, z, hi);
+                        d = wmma(a_hi[i][f], b_hi, d, hi);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) v[k] = (float) d[k] * scl[wp][f][i][0][8 * hi + k];
+                    } else {
+                        const ow_i8 d0 = wmma(a_lo[i][f], b_lo, z, hi), d1 = wmma(a_hi[i][f], b_hi, z, hi);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k)
+                            v[k] = fmaf((float) d0[k], scl[wp][f][i][0][8 * hi + k], (float) d1[k] * scl[wp][f][i][1][8 * hi + k]);
+                    }
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        acc[f][j][k] = fmaf(v[k], xs[i], acc[f][j][k]);
+                        if constexpr (Sums<TY>::on) acc[f][j][k] = fmaf(-ofs[wp][f][i][8 * hi + k], us[i], acc[f][j][k]);
+                    }
+                }
+            }
+        }
+    }
+    // the write-back: acc[f][j][k] is row OW_DROW(k, hi) of fragment f, token j * 16 + r
+#pragma unroll
+    for (int j = 0; j < HNG; ++j)
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int tok = j * 16 + r, rr = OW_DROW(k, hi);
+            if (tok >= ntok) continue;
+            float* out = a.dst + (int64_t) (b0 + tok - a.row0) * a.ld;
+            if constexpr (GLU) {
+                const int row = rt * (HNW * 16) + wp * 16 + rr;
+                if (row < a.w_rows) {
+                    const float gt = fminf(acc[0][j][k], a.limit);
+                    const float up = fminf(fmaxf(acc[1][j][k], -a.limit), a.limit);
+                    out[row] = (gt / (1.0f + expf(-gt))) * up;
+                }
+            } else {
+#pragma unroll
+                for (int f = 0; f < 2; ++f) {
+                    const int row = rt * (HNW * 32) + (2 * wp + f) * 16 + rr;
+                    if (row < a.w_rows) out[row] = acc[f][j][k];
+                }
+            }
+        }
+}
+
+template<int TY> struct Wide { static constexpr bool on = false; };   // (one shape here)
+template<int TY, bool GLU>
+void launch_t(const KArgs& a, unsigned grid, int, cudaStream_t s) {
+    own_kernel<TY, GLU><<<grid, HNT, 0, s>>>(a);
+    ck(cudaGetLastError(), GLU ? "gate_up" : "down");
+}
+#endif   // backends
+
 template<bool GLU>
 void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) {
     switch (type) {
@@ -509,14 +779,24 @@ bool wide_type(int type) {
         default: return false;
     }
 }
-#endif   // !__HIPCC__
 
 }  // namespace
 
 #if defined(__HIPCC__)
-bool built() { return false; }
-bool tuned_device() { return false; }
-bool supported(int) { return false; }
+// the current device has WMMA int8 and this binary carries its code: gfx11 (RDNA3 / 3.5), gfx12 (RDNA4)
+bool built() {
+    int dev = 0;
+    hipDeviceProp_t p{};
+    if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&p, dev) != hipSuccess) return false;
+    static const char* const ok[] = {"gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"};
+    for (const char* a : ok)
+        if (std::strncmp(p.gcnArchName, a, 7) == 0) return true;
+    return false;
+}
+bool tuned_device() { return false; }   // (no AMD card is measured against MMQ yet: MMQ stays the default)
+bool supported(int t) {
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40);
+}
 #else
 namespace {
 // the current device's compute capability major * 10 + minor (cached a device: a box may hold different cards)
@@ -582,6 +862,13 @@ size_t act_bytes(int64_t rows, int64_t cols, bool sums) {
     return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * (sums ? 8 : 4);
 }
 bool needs_sums(int t) { return t == 12; }
+bool act_natural_order() {
+#if defined(__HIPCC__)
+    return true;
+#else
+    return false;
+#endif
+}
 
 void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream, bool sums) {
     if (rows <= 0) return;
@@ -594,26 +881,14 @@ void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_
 Context::Context() {}
 Context::~Context() {
     if (tiles_ != nullptr) cudaFree(tiles_);
-#if !defined(__HIPCC__)
     if (stats_on() && stats().launches > 0) {
         const Stats& t = stats();
         std::fprintf(stderr, "prefill own: %ld launches (%ld coarse, %ld with the tile table inline), %.1f experts and %.0f "
                              "rows a launch, %.0f tiles a launch\n", t.launches, t.coarse, t.inline_,
                      (double) t.experts / t.launches, (double) t.rows / t.launches, (double) t.tiles / t.launches);
     }
-#endif
 }
 
-#if defined(__HIPCC__)
-void Context::gate_up(const Set&, int, int64_t, int64_t, size_t, float, void*) {
-    std::fprintf(stderr, "prefill own: no kernels in this build\n");
-    std::exit(1);
-}
-void Context::down(const Set&, int, int64_t, int64_t, size_t, void*) {
-    std::fprintf(stderr, "prefill own: no kernels in this build\n");
-    std::exit(1);
-}
-#else
 namespace {
 void check_ptr(const Set& s, int type, size_t off) {
     if ((((uintptr_t) s.w + off) | s.stride) % align_of(type) != 0 || (uintptr_t) s.xq % 16 != 0) {
@@ -678,7 +953,12 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
     if (tc == 0) {
         const long sms = sm_count();
         double best = 1e300;
-        for (int c = 8; c <= (wide ? Cfg<2>::TC : Cfg<1>::TC); c += 8) {
+#if defined(__HIPCC__)
+        const int c_step = 16, c_max = HTC;   // (one shape; a token group is 16)
+#else
+        const int c_step = 8, c_max = wide ? Cfg<2>::TC : Cfg<1>::TC;
+#endif
+        for (int c = c_step; c <= c_max; c += c_step) {
             const bool crs = c > Cfg<0>::TC;
             long groups = 0;
             const long tt = token_tiles(c, groups);
@@ -694,6 +974,9 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
         }
         if (tc == 0) return;
     }
+#if defined(__HIPCC__)
+    tc = std::clamp((tc + 15) / 16 * 16, 16, HTC);
+#endif
     if (wide) tc = std::min(tc, Cfg<2>::TC);
     const bool coarse = tc > Cfg<0>::TC;
     const long total = count(tc, coarse);
@@ -762,6 +1045,5 @@ void Context::down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t 
     a.limit = 0.0f;
     run<false>(s, type, a, tiles_, (cudaStream_t) stream);
 }
-#endif
 
 }  // namespace strata::prefill::own

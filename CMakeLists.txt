@@ -432,9 +432,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # The prompt path's experts on Strata's own int8 tensor-core grouped GEMM (include/strata/prefill/moe_own.hpp):
-    # no llama.cpp sources - third_party/ggml/ggml-common.h (the block layouts and codebooks) only.
+    # no llama.cpp sources - third_party/ggml/ggml-common.h (the block layouts and codebooks) only.  CUDA: mma.sync;
+    # HIP: WMMA on gfx11 / gfx12 (MMQ stays the default there).
     add_library(strata_moe_own STATIC src/prefill/moe_own.cu)
     target_include_directories(strata_moe_own PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${_strata_gpu_include_directories})
@@ -1255,6 +1256,14 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
 
+    if(STRATA_BUILD_TESTS)
+      # the own prompt GEMM (WMMA) against a scalar reference and against MMQ
+      add_executable(moe_own_test tests/moe_own_test.cu)
+      target_compile_definitions(moe_own_test PRIVATE STRATA_TEST_HAVE_MMQ=1)
+      target_link_libraries(moe_own_test PRIVATE strata_moe_own strata_mmq strata_kernels_cpu strata_hip_runtime)
+      add_test(NAME moe_own_test COMMAND moe_own_test)
+      set_tests_properties(moe_own_test PROPERTIES TIMEOUT 600)
+    endif()
     # Maya's GLM batched prompt path calls MMQ and BLAS directly, as on CUDA.
     target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.

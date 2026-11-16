@@ -113,6 +113,7 @@ void quant_ref(const float* x, int64_t cols, std::vector<int8_t>& q, std::vector
 
 // the device's int8 plane: in each 128 values, block i's 4-value word w (w = t + 4 half) at word t * 8 + i * 2 + half
 std::vector<int8_t> dev_order(const std::vector<int8_t>& q) {
+    if (own::act_natural_order()) return q;
     std::vector<int8_t> o(q.size());
     for (size_t c = 0; c < q.size() / 128; ++c)
         for (int i = 0; i < 4; ++i)

@@ -36,6 +36,8 @@ bool usable(int ggml_type, int64_t rows, int64_t cols);
 /// plane [rows][cols / 32] (the blocks' scales) and - `sums` - another of that shape (the blocks' sums).  cols a multiple of 128.  (The int8 plane is in the kernels' own
 /// word order, see moe_own.cu.)
 size_t act_bytes(int64_t rows, int64_t cols, bool sums = false);
+/// The int8 plane holds the values in their own order (the WMMA backend); false: in the mma.sync threads' order.
+bool act_natural_order();
 /// The type's products read the activations' block sums: quantize its activations with `sums`.
 bool needs_sums(int ggml_type);
 /// Row i of the output is row ids[i] of x (row i when ids is null); x has `ld` floats a row.  xq: 16-byte aligned.
