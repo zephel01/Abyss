@@ -1,0 +1,246 @@
+# The prebuilt CUDA engine (tools/prebuilt.py): users need no CUDA toolkit, Visual Studio or compiler.  Windows x64 and
+# Linux x64, CUDA 13.3, one binary for RTX 30 (sm_86), RTX 40 (sm_89) and RTX 50 (sm_120a) - the CUDA runtime loads the
+# GPU's own code, and the engine's per-GPU choices ask the device at run time.  Each archive carries the engine, the
+# GPU tuner and the CUDA libraries they load (NVIDIA's CUDA EULA, Attachment A: cudart, cuBLAS / cuBLASLt may be
+# distributed with an application, unmodified), and SHA256SUMS lists them.
+# Trial: the archives are workflow artifacts.  The release step (attach to a tag's release) is written but off.
+name: prebuilt
+
+on:
+  push:
+    branches: ["ci-*"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d   # setup.py LLAMA_CPP_COMMIT (ggml-cuda's MMQ sources)
+  CUDA_FULL: "13.3.0"
+  CUDA_MM: "13.3"
+  CUDA_VER: "13-3"                       # the apt packages' suffix
+  # SASS only (no PTX): 8.6 code also runs on 8.7; 12.0a only on 12.0 (RTX 50 desktop / RTX PRO Blackwell)
+  ARCHS: "86-real;89-real;120a-real"
+
+jobs:
+  linux-x64:
+    # Ubuntu 22.04: glibc 2.35, so the binary runs on 22.04 and newer; libstdc++ linked in
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      CUDA_HOME: /usr/local/cuda-13.3
+      PKG: abyss-engine-cuda-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: CUDA toolkit (NVIDIA's apt repository) and g++ 12
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++-12 patchelf \
+            cuda-minimal-build-${CUDA_VER} libcublas-dev-${CUDA_VER} cuda-nvtx-${CUDA_VER}
+          "$CUDA_HOME/bin/nvcc" --version
+          cmake --version
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CUDA_HOST_COMPILER=g++-12
+          -DSTRATA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$ARCHS"
+          -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"
+          -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF -DSTRATA_PORTABLE=ON
+          -DSTRATA_GGML=OFF
+          "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+          -DSTRATA_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build the engine and the GPU tuner
+        # (nvcc takes 2-4 GB a job on the big kernels: the runner's 16 GB allow four)
+        run: |
+          date -u +"build start %H:%M:%S"
+          cmake --build build --target strata abyss_gpu_tune -j4
+          date -u +"build end %H:%M:%S"
+      - name: Package
+        run: |
+          set -euo pipefail
+          d="pkg/$PKG"; mkdir -p "$d"
+          cp build/strata build/abyss_gpu_tune "$d/"
+          # the engine finds its libraries beside it (its own binaries only: NVIDIA's files stay unmodified)
+          patchelf --set-rpath '$ORIGIN' "$d/strata" "$d/abyss_gpu_tune"
+          # every library they load from the toolkit, by its soname, as a plain file
+          for lib in $(LD_LIBRARY_PATH="$CUDA_HOME/lib64" ldd build/strata build/abyss_gpu_tune | awk '/=>/ {print $3}' | grep "^$CUDA_HOME\|^/usr/local/cuda" | sort -u); do
+            cp -L "$lib" "$d/$(basename "$lib")"
+          done
+          ls -la "$d"
+          cp LICENSE "$d/LICENSE-Abyss.txt"
+          cp ops/prebuilt/NOTICE-NVIDIA.txt "$d/"
+          python3 - "$d" <<'EOF'
+          import json, os, sys
+          d = sys.argv[1]
+          json.dump({"version": open("VERSION").read().strip(), "commit": os.environ["GITHUB_SHA"],
+                     "platform": "linux-x64", "cuda": os.environ["CUDA_MM"], "archs": [86, 89, 120],
+                     "driver_min": 580, "driver_recommended": 610,
+                     "files": sorted(os.listdir(d))}, open(f"{d}/PREBUILT.json", "w"), indent=1)
+          EOF
+          tar -C pkg -czf "$PKG.tar.gz" "$PKG"
+          sha256sum "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256"
+          ls -la "$PKG.tar.gz"
+      - name: The packed engine starts without the toolkit
+        # no GPU here: only that it loads with nothing but its own folder (no LD_LIBRARY_PATH, no CUDA on PATH)
+        run: |
+          set -euo pipefail
+          mkdir t && tar -C t -xzf "$PKG.tar.gz"
+          env -i PATH=/usr/bin:/bin ldd "t/$PKG/strata" | tee ldd.txt
+          ! grep -q "not found" ldd.txt
+          ! grep -q "/usr/local/cuda" ldd.txt
+          env -i PATH=/usr/bin:/bin "t/$PKG/strata" --help > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            ${{ env.PKG }}.tar.gz
+            ${{ env.PKG }}.tar.gz.sha256
+          compression-level: 0
+          retention-days: 14
+
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      PKG: abyss-engine-cuda-windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_CPP_COMMIT }}
+          path: third_party/llama.cpp
+      - name: CUDA toolkit (NVIDIA's network installer, silent)
+        shell: pwsh
+        run: |
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_FULL/network_installers/cuda_${env:CUDA_FULL}_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\cuda.exe" -ArgumentList "-s" -Wait -NoNewWindow
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$env:CUDA_MM"
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { Write-Error "nvcc not found under $cuda"; exit 1 }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          if (Test-Path "$cuda\bin\x64") { "$cuda\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
+          & "$cuda\bin\nvcc.exe" --version
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS"
+          -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
+          -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF -DSTRATA_PORTABLE=ON
+          -DSTRATA_GGML_DIR="$env:GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build the engine and the GPU tuner
+        shell: pwsh
+        run: |
+          Get-Date -AsUTC -Format "'build start' HH:mm:ss"
+          cmake --build build --target strata abyss_gpu_tune -j4 2>&1 | Tee-Object -FilePath build.log
+          $rc = $LASTEXITCODE
+          Get-Date -AsUTC -Format "'build end' HH:mm:ss"
+          if ($rc -ne 0) {
+            Select-String -Path build.log -Pattern ': (fatal )?error|error:|FAILED:' | Select-Object -First 15 |
+              ForEach-Object { Write-Output ("::error::" + $_.Line.Trim()) }
+            exit $rc
+          }
+      - name: Package
+        shell: pwsh
+        run: |
+          $d = "pkg\$env:PKG"; New-Item -ItemType Directory -Force $d | Out-Null
+          $exe = Get-ChildItem -Path build -Recurse -Filter strata.exe | Select-Object -First 1
+          $tune = Get-ChildItem -Path build -Recurse -Filter abyss_gpu_tune.exe | Select-Object -First 1
+          Copy-Item $exe.FullName, $tune.FullName $d
+          # the DLLs they load from the toolkit (dumpbin), and what those load from it in turn (cuBLAS -> cuBLASLt)
+          $dirs = @("$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\bin") | Where-Object { Test-Path $_ }
+          $todo = [System.Collections.Generic.Queue[string]]::new()
+          $todo.Enqueue($exe.FullName); $todo.Enqueue($tune.FullName)
+          $seen = @{}
+          while ($todo.Count -gt 0) {
+            $f = $todo.Dequeue()
+            foreach ($dll in (dumpbin /dependents $f | Select-String '^\s+(\S+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })) {
+              if ($seen.ContainsKey($dll.ToLower())) { continue }
+              $seen[$dll.ToLower()] = $true
+              foreach ($dir in $dirs) {
+                if (Test-Path "$dir\$dll") { Copy-Item "$dir\$dll" $d; $todo.Enqueue("$dir\$dll"); break }
+              }
+            }
+          }
+          Get-ChildItem $d | Format-Table Name, Length
+          Copy-Item LICENSE "$d\LICENSE-Abyss.txt"
+          Copy-Item ops\prebuilt\NOTICE-NVIDIA.txt $d
+          $files = (Get-ChildItem $d | ForEach-Object Name) + "PREBUILT.json" | Sort-Object
+          @{ version = (Get-Content VERSION -Raw).Trim(); commit = $env:GITHUB_SHA; platform = "windows-x64";
+             cuda = $env:CUDA_MM; archs = @(86, 89, 120); driver_min = 580; driver_recommended = 610;
+             files = $files } | ConvertTo-Json | Out-File -Encoding utf8NoBOM "$d\PREBUILT.json"
+          Push-Location pkg; 7z a -tzip -mx=9 "..\$env:PKG.zip" $env:PKG | Out-Null; Pop-Location
+          $h = (Get-FileHash "$env:PKG.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $env:PKG.zip" | Out-File -Encoding ascii -NoNewline "$env:PKG.zip.sha256"
+          Get-Item "$env:PKG.zip" | Format-Table Name, Length
+          Get-Content "$env:PKG.zip.sha256"
+      - name: The packed engine starts without the toolkit
+        # no GPU here: that it loads with only Windows' own folders on PATH (the DLLs from its folder)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory t | Out-Null
+          7z x "$env:PKG.zip" -ot | Out-Null
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          Remove-Item Env:CUDA_PATH -ErrorAction SilentlyContinue
+          & "t\$env:PKG\strata.exe" --help > $null
+          if ($LASTEXITCODE -ne 0) { Write-Error "strata --help exited $LASTEXITCODE"; exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            ${{ env.PKG }}.zip
+            ${{ env.PKG }}.zip.sha256
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    # attach both archives and SHA256SUMS to the tag's release (the setups download them from there).
+    # OFF for the trial: remove `false &&` once the archives were checked on real GPUs
+    if: false && startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x64, windows-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum abyss-engine-cuda-*.tar.gz abyss-engine-cuda-*.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload to the release (made by hand for the tag; created here when it is missing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" > /dev/null 2>&1 || gh release create "$tag" --title "Abyss $tag" --notes ""
+          gh release upload "$tag" dist/abyss-engine-cuda-*.tar.gz dist/abyss-engine-cuda-*.zip dist/SHA256SUMS --clobber
+          # the assets' note under the release text: what they are and the driver they need
+          gh release view "$tag" --json body --jq .body > body.md
+          if ! grep -q "Prebuilt engine" body.md; then
+            cat >> body.md <<'EOF'
+
+          ---
+          **Prebuilt engine** (no CUDA toolkit or compiler needed; the setups take it when nvcc is missing, or with `--prebuilt`):
+          `abyss-engine-cuda-linux-x64.tar.gz` / `abyss-engine-cuda-windows-x64.zip`, CUDA 13.3, RTX 30 / 40 / 50 (sm_86, sm_89, sm_120a).
+          NVIDIA driver: **580 or newer required** (CUDA minor version compatibility), **610 or newer recommended** (CUDA 13.3's branch). SHA-256: `SHA256SUMS`.
+          EOF
+            gh release edit "$tag" --notes-file body.md
+          fi

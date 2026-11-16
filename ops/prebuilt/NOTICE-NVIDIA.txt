@@ -1,0 +1,11 @@
+This archive contains Abyss's engine (strata, abyss_gpu_tune; Abyss's LICENSE in LICENSE-Abyss.txt) and, unmodified,
+these NVIDIA CUDA Toolkit 13.3 libraries, which the engine loads:
+
+  Linux:   libcudart.so.13, libcublas.so.13, libcublasLt.so.13
+  Windows: cublas64_13.dll, cublasLt64_13.dll   (the CUDA runtime is linked into the engine)
+
+They are distributed under the NVIDIA CUDA Toolkit End User License Agreement, which lists them as files that "may be
+distributed with applications" (Attachment A: CUDA Runtime, CUDA BLAS Library):
+  https://docs.nvidia.com/cuda/eula/index.html#attachment-a
+They are for use by this application only, on systems with NVIDIA GPUs, and are not a stand-alone distribution of
+the CUDA Toolkit.  Copyright NVIDIA Corporation.  All rights reserved.
