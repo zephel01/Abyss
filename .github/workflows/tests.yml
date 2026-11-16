@@ -15,14 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # no llama.cpp here: the tools read and write GGUF themselves (tools/gguf_io.py); the gguf-py oracle job is below
       - uses: actions/checkout@v4
-      # llama.cpp's gguf-py at the commit the installer pins (setup.py LLAMA_CPP_COMMIT), where tools/_paths.py looks
-      - uses: actions/checkout@v4
-        with:
-          repository: ggml-org/llama.cpp
-          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
-          path: third_party/llama.cpp
-          sparse-checkout: gguf-py
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -37,3 +31,51 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+
+  gguf-oracle:
+    # tools/gguf_io.py against llama.cpp's gguf-py (the writer the published packs were made with): the same bytes for
+    # the same calls, the same dequantized bits.  The one test that takes gguf-py (STRATA_GGUF_PY), at the commit the
+    # installer pins (setup.py LLAMA_CPP_COMMIT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: third_party/llama.cpp
+          sparse-checkout: gguf-py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy pyyaml tqdm
+      - name: gguf_io against gguf-py
+        env:
+          STRATA_GGUF_PY: ${{ github.workspace }}/third_party/llama.cpp/gguf-py
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest tools.test_gguf_io -v'
+
+  cpu-no-llamacpp:
+    # the CPU-side libraries and their tests built with no llama.cpp at all (STRATA_GGML=OFF, no CUDA: nothing is
+    # fetched) - the own dot products' AVX2 and portable builds (own_dot_test checks them against each other here; the
+    # ggml oracle runs in the maintainers' STRATA_GGML=ON build).  expert_parity and pool_test need a real pack
+    # (pack/full/experts.bin), so they are left out
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+      - name: Configure (no llama.cpp)
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML=OFF -DSTRATA_BUILD_TESTS=ON
+      - name: Nothing from llama.cpp was fetched
+        run: '! test -e build/_deps/strata_llamacpp-src'
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: CPU tests
+        run: ctest --test-dir build --output-on-failure -j"$(nproc)" -E "^(expert_parity|pool_test)$"

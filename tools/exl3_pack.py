@@ -661,18 +661,33 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
 
 # ------------------------------------------------------------------ --check
 def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGUFReader
-    from gguf.quants import dequantize
+    import types
+    import gguf_io
+
+    class Ref:   # a tensor of the reference GGUF: .data shaped (outer dims..., row values / row bytes)
+        def __init__(self, t):
+            self.tensor_type = types.SimpleNamespace(name=t.type_name, id=t.type)
+            if t.type_name in ("F32", "F16", "BF16"):
+                d = t.data.view({"F32": "<f4", "F16": "<f2", "BF16": "<u2"}[t.type_name])
+                self.data = d.reshape(*reversed(t.shape))
+            else:
+                self.data = t.data.reshape(*reversed(t.shape[1:]), -1)
+
+    def dequantize(raw, tt):
+        raw = np.asarray(raw)
+        if tt.name == "BF16":
+            return (raw.astype(np.uint32) << 16).view(np.float32)
+        if tt.name in ("F32", "F16"):
+            return raw.astype(np.float32)
+        return gguf_io.dequantize_any(raw, tt.id).reshape(*raw.shape[:-1], -1)
     shards = [ref]
     m = re.match(r"(.*)-00001-of-(\d{5})\.gguf$", ref.name)
     if m:
         shards = [ref.parent / ("%s-%05d-of-%s.gguf" % (m.group(1), i, m.group(2))) for i in range(1, int(m.group(2)) + 1)]
     R = {}
     for s in shards:
-        for tt in GGUFReader(s).tensors:
-            R[tt.name] = tt
+        for tt in gguf_io.Reader(s).tensors:
+            R[tt.name] = Ref(tt)
     # unsloth / Maya spell the arch without the hyphen, the tensors the same
 
     def ref_rows(name, r0=None, r1=None):

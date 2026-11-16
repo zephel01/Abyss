@@ -193,21 +193,17 @@ def index_shape(shape) -> tuple[int, int]:
 
 
 def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    values = quants.dequantize(raw, Q[type_name])
+    import gguf_io
+    values = gguf_io.dequantize(raw, type_name)
     if not np.isfinite(values).all():
         raise ValueError("cannot convert non-finite weights to BF16")
-    # ggml's round-to-nearest-even conversion, including correct halfway rounding.
-    return quants.quantize(values, Q.BF16).tobytes()
+    # round to nearest even (the halfway cases to the even neighbour), as ggml's conversion
+    return gguf_io.to_bf16(values).tobytes()
 
 
 def f32_bytes(raw: np.ndarray, type_name: str) -> bytes:
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    values = quants.dequantize(raw, Q[type_name]).astype(np.float32)
+    import gguf_io
+    values = gguf_io.dequantize(raw, type_name).astype(np.float32)
     if not np.isfinite(values).all():
         raise ValueError("cannot widen non-finite weights to F32")
     return values.tobytes()

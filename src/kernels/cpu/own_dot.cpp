@@ -98,6 +98,8 @@ bool use_avx2() {
 }
 }  // namespace
 
+bool own_dot_simd() noexcept { return use_avx2(); }
+
 bool own_quant_act(int act_type, const float* x, void* dst, int64_t n) noexcept {
 #if defined(__x86_64__) || defined(_M_X64)
     if (use_avx2()) return avx2::quant_simd(act_type, x, dst, n);

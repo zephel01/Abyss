@@ -24,7 +24,8 @@
 What it does:
 
   1. checks the PC: an NVIDIA GPU, nvcc, RAM
-  2. Python packages into .venv; llama.cpp's source at the pinned commit (third_party/llama.cpp)
+  2. Python packages into .venv; llama.cpp's source at the pinned commit (third_party/llama.cpp) - for the GPU
+     engine's prompt MMQ kernels, which still compile ggml-cuda's sources, and for images (llama.cpp's mtmd)
   3. compiles the engine (build/strata) for the GPU - arch 120a on RTX 50, whose MXFP4 kernels need it
   4. the model: unsloth's DeepSeek-V4-Flash-0731-GGUF quant into <data>/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/<quant>
      (--model v41: zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF, 132G or 139G)
@@ -303,7 +304,7 @@ def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
     conf = [cmake, "-S", ROOT, "-B", ROOT / "build", "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
             "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cc}",
             "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_COMPILER={nvcc}",
-            f"-DSTRATA_GGML_DIR={ROOT / 'third_party' / 'llama.cpp'}"]
+            f"-DSTRATA_GGML_DIR={ROOT / 'third_party' / 'llama.cpp'}"] + S.ggml_libs_flag()
     # (configured again when the GPUs need other architectures - a second card of another generation - or --nvcc names
     # another toolkit than build/ was configured with; then from scratch, S.cmake_fresh)
     if (not (ROOT / "build" / "build.ninja").exists() or configured_archs() not in (None, cc)
@@ -792,7 +793,7 @@ def vision_27b_step(a, repo: str, mdir: Path, gguf: Path, cfg: Path, gpus, backe
     src = S.source_hash(("tools/vision",))
     vmeta = M.read_json(M.VSTAMP)
     if not (M.VEXE.exists() and vmeta.get("src") == src and set(pc["archs"]) <= set(vmeta.get("archs", []))):
-        if not M.compile_vision(pc, {}, S.get_llama_cpp(), src):
+        if not M.compile_vision(pc, {}, S.get_llama_cpp(S.llama_cpp_reasons(gpu_engine=False, images=True)), src):
             S.warn("the vision encoder did not compile (the reason is above): the model reads text only - setup again "
                    "tries again")
             return
@@ -921,7 +922,8 @@ def main() -> int:
 
     S.step(2, "Python packages and llama.cpp's source")
     S.pip_install(S.PY_PACKAGES, ", ".join(S.PY_PACKAGES))
-    S.ok(f"llama.cpp: {S.get_llama_cpp()}")
+    why = S.llama_cpp_reasons(gpu_engine=True)   # (images fetch it in their own step)
+    S.ok(f"llama.cpp: {S.get_llama_cpp(why)} ({'; '.join(why)})" if why else "llama.cpp's source: not needed")
 
     S.step(3, "the engine")
     if backend == "cuda":

@@ -239,7 +239,7 @@ another 366 GB (~25 minutes); the pack takes its expert statistics and tokenizer
 
 ```sh
 M=<models dir>
-GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
+LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
   .venv/bin/python -I tools/requant_dense.py $M/nazeshinjite/DeepSeek-V4.1-Flash-1017-Q2.gguf \
   $M/nazeshinjite-attn-q5k q5_k 'blk\.\d+\.attn_q_b\.weight' 'blk\.\d+\.attn_output_[ab]\.weight'
 .venv/bin/python tools/iq_pack.py --gguf $M/nazeshinjite-attn-q5k/DeepSeek-V4.1-Flash-1017-Q2.gguf \
@@ -270,12 +270,12 @@ O=<models dir>/ud-iq2xxs-q5k
 .venv/bin/python -I tools/dense_overlay.py $U/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf $O \
   --type=q5_k --from=q8_0,q6_k \
   'blk\.\d+\.(attn_q_a|attn_q_b|attn_kv|attn_output_a|attn_output_b|ffn_(gate|up|down)_shexp|engram_kv)\.weight'
-STRATA_GGUF_PY=third_party/llama.cpp/gguf-py .venv/bin/python tools/iq_pack.py \
+.venv/bin/python tools/iq_pack.py \
   --gguf $O/overlay-00001-of-00007.gguf --out $O/pack --compat-bf16 --first-wins
 cp $U/pack/expert_*.txt $O/pack/
 ```
 
-Then point the config's `--glm-pack` and `tokenizer` at `$O/pack` (`GGUF_PY` / `LIBGGML` as for `requant_dense.py`).
+Then point the config's `--glm-pack` and `tokenizer` at `$O/pack` (`LIBGGML` as for `requant_dense.py`).
 
 Two uses on unsloth's UD-IQ1_S (AI PRO R9700 + 8060S lane, 94 GB RAM, the 8 held-out sequences and the swe-bench
 subset of 8 tasks):
@@ -295,7 +295,7 @@ O=<models dir>/ud-iq1s-q5k
 cp $U/pack/expert_*.txt $O/pack/
 ```
 
-Then point the config's `--glm-pack` and `tokenizer` at `$O/pack`. `GGUF_PY` / `LIBGGML` as for `requant_dense.py`.
+Then point the config's `--glm-pack` and `tokenizer` at `$O/pack`. `LIBGGML` as for `requant_dense.py`.
 
 ## Quality and speed (measured in v1.3.31 on an RTX 5090 + Radeon 8060S lane + 94 GB RAM + NVMe at 3.4 GB/s; the R9700 numbers are in the README and docs/BENCH)
 

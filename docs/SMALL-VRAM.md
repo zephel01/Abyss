@@ -130,13 +130,13 @@ must not touch), the F32 norms and router, and the Q8_0 recurrence / indexer ten
 the GGUF files untouched.
 
 `tools/requant_dense.py` needs a llama.cpp build's `libggml-base.so` (the quantizer; `llama-quantize` itself refuses
-an i-quant model without an imatrix) and gguf-py (Abyss's `third_party/llama.cpp/gguf-py`). It rewrites the 96 GB
+an i-quant model without an imatrix; the GGUF it reads and writes itself, `tools/gguf_io.py`). It rewrites the 96 GB
 of shards (~15 minutes on an NVMe) into a new directory beside the original, then `iq_pack.py` builds the pack:
 
 ```sh
 cd ~/llm/apps/Abyss
 M=~/llm/apps/Maya-data/models
-GGUF_PY=$PWD/third_party/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
+LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
   .venv/bin/python -I tools/requant_dense.py $M/Maya-S-v2-IQ2_XXS/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf \
   $M/Maya-S-v2-IQ2_XXS-iq4dense iq4_xs --from=q6_k \
   'blk\.\d+\.attn_output\.weight' 'blk\.\d+\.attn_[qkv]\.weight' 'blk\.\d+\.attn_q_[ab]\.weight' \

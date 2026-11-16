@@ -457,11 +457,45 @@ def check_shards(shards):
                  "delete it and run setup again (or copy the whole file into --gguf-dir)")
 
 
-def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
+# What llama.cpp's source is still fetched for (the move off llama.cpp, worklog 2026-11-16_no-llamacpp): the pack
+# tools read and write GGUF themselves (tools/gguf_io.py) and the CPU experts have their own dot products, so only
+#   - the GPU engine's prompt MMQ kernels (src/prefill/moe_mmq.cu, CUDA and HIP) still compile ggml-cuda's sources:
+#     MMQ_NEEDS_LLAMA_CPP, False once the engine has its own MMQ (then a GPU engine builds without llama.cpp)
+#   - images: strata-vision (tools/vision) is llama.cpp's mtmd, fetched only when images are set up
+# A CPU-only build (no CUDA, no HIP) fetches nothing.
+MMQ_NEEDS_LLAMA_CPP = True
+
+
+def llama_cpp_reasons(gpu_engine: bool = True, images: bool = False) -> list:
+    """Why this step needs llama.cpp's source (empty: it does not)."""
+    why = []
+    if gpu_engine and MMQ_NEEDS_LLAMA_CPP:
+        why.append("the GPU engine's prompt kernels (MMQ) still compile ggml-cuda's sources")
+    if images:
+        why.append("the image encoder (strata-vision) is llama.cpp's mtmd")
+    return why
+
+
+def ggml_libs_flag() -> list:
+    """The CMake option for the engine build: no ggml libraries (STRATA_GGML=OFF) where the own CPU dot products are
+    the ones it runs and were checked - Linux x86-64.  Windows (MSVC builds) and aarch64 (ggml-cpu's NEON dots stay
+    the faster ones on the DGX Spark) keep building them for now."""
+    return ["-DSTRATA_GGML=OFF"] if sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64") else []
+
+
+def is_llama_cpp(path) -> bool:
+    """A llama.cpp source tree the engine (ggml/) and the image encoder (tools/mtmd/) build from."""
+    return (Path(path) / "ggml" / "CMakeLists.txt").exists()
+
+
+def get_llama_cpp(why=None):
+    """llama.cpp at the pinned commit (ggml-cuda's MMQ for the GPU engine, mtmd for images), as a zip: no git.
+    why: llama_cpp_reasons(...) for the message when it is downloaded."""
     llama = ROOT / "third_party" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+    if is_llama_cpp(llama):
         return llama
+    if why:
+        say("  llama.cpp's source is needed: " + "; ".join(why))
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"

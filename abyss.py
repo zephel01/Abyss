@@ -1171,21 +1171,24 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
 
 # ------------------------------------------------------------------------------------------------ 3. tools
 def tools_step(a) -> Path:
-    """The Python packages (into .venv) and llama.cpp's source at the pinned commit - listed, and asked, first."""
+    """The Python packages (into .venv) and llama.cpp's source at the pinned commit - listed, and asked, first.
+    llama.cpp is fetched only for what still needs it (S.llama_cpp_reasons): the GPU engine's prompt MMQ kernels
+    (S.MMQ_NEEDS_LLAMA_CPP) and images (the vision step fetches it itself when images are set up)."""
     step(3, "Python packages and llama.cpp's source")
     stamp = Path(sys.prefix) / ".strata-pip.json"          # S.pip_install's record of what it installed
     have = read_json(stamp) if stamp.exists() else []
     need = [p for p in PY_PACKAGES if p not in (have if isinstance(have, list) else [])]
     llama = Path(a.llama_dir).expanduser().resolve() if a.llama_dir else ROOT / "third_party" / "llama.cpp"
-    llama_ok = (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir()
+    llama_ok = S.is_llama_cpp(llama)
     if a.llama_dir and not llama_ok:
-        fail(f"{llama} is not a llama.cpp checkout (its ggml/ and gguf-py/ folders are missing)")
+        fail(f"{llama} is not a llama.cpp checkout (its ggml/ folder is missing)")
+    why = S.llama_cpp_reasons(gpu_engine=True)
     downloads = []
     if need:
         downloads.append("Python packages from PyPI into .venv: " + ", ".join(need) + " (roughly 50-100 MB)")
-    if not llama_ok:
+    if why and not llama_ok:
         downloads.append(f"llama.cpp's source at the pinned commit {S.LLAMA_CPP_COMMIT[:10]} from GitHub, "
-                         f"{S.LLAMA_CPP_ZIP} (tens of MB): ggml for the engine build, gguf-py for the pack builder")
+                         f"{S.LLAMA_CPP_ZIP} (tens of MB): " + "; ".join(why))
     if downloads:
         say("  This step downloads:")
         for d in downloads:
@@ -1194,9 +1197,12 @@ def tools_step(a) -> Path:
             fail("nothing was downloaded", f"run {ME} again when you are ready (or pass --llama-dir with a "
                                            f"llama.cpp checkout at commit {S.LLAMA_CPP_COMMIT[:10]})")
     S.pip_install(PY_PACKAGES, ", ".join(PY_PACKAGES))
-    if not llama_ok:
-        llama = S.get_llama_cpp()
-    ok(f"llama.cpp {S.LLAMA_CPP_COMMIT[:10]}: {llama}")
+    if why and not llama_ok:
+        llama = S.get_llama_cpp(why)
+    if why:
+        ok(f"llama.cpp {S.LLAMA_CPP_COMMIT[:10]}: {llama} ({'; '.join(why)})")
+    else:
+        ok("llama.cpp's source: not needed")
     return llama
 
 
@@ -1245,7 +1251,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
              "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
-             f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"]
+             f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"] + S.ggml_libs_flag()
     if host_compiler:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
     # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
@@ -1454,7 +1460,7 @@ def refresh_engine(cfg: dict) -> None:
     if cfg.get("backend") == "hip":
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
-        if hip_clang(root) is None or not (llama / "ggml/CMakeLists.txt").exists():
+        if hip_clang(root) is None or (S.MMQ_NEEDS_LLAMA_CPP and not S.is_llama_cpp(llama)):
             warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
             return
         pc = {"rocm": str(root), "archs": meta["archs"],
@@ -1465,7 +1471,7 @@ def refresh_engine(cfg: dict) -> None:
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
-    if not nvcc or not Path(nvcc).exists() or not (llama / "ggml" / "CMakeLists.txt").exists():
+    if not nvcc or not Path(nvcc).exists() or (S.MMQ_NEEDS_LLAMA_CPP and not S.is_llama_cpp(llama)):
         warn("the compiler or llama.cpp's source it was built with is gone: starting the engine compiled before "
              f"({ME} --setup --rebuild compiles it again)")
         return
@@ -1741,7 +1747,7 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
              "--gguf-dir DIR")
     say("  Writing the index of every tensor, the small float weights (about 1 GB) and the tokenizer; the experts")
     say("  stay in the GGUF files (a few minutes) ...")
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ)   # (the pack builder reads the GGUF itself, tools/gguf_io.py: no gguf-py)
     # --compat-bf16: the GLM pack stores the projections its kernels read as BF16 (router, indexer, absorbed MLA,
     # KDA gates) in BF16 even where the GGUF quantized them or keeps them F32 (tools/iq_pack.py GLM5NEXT_BF16)
     run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
@@ -1863,6 +1869,8 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     vmeta = read_json(VSTAMP)
     if not (VEXE.exists() and not a.rebuild and vmeta.get("src") == src
             and set(meta.get("archs") or pc["archs"]) <= set(vmeta.get("archs", []))):
+        if not S.is_llama_cpp(llama):   # (images are the one thing here that needs llama.cpp when the engine does not)
+            llama = S.get_llama_cpp(S.llama_cpp_reasons(gpu_engine=False, images=True))
         if not compile_vision(pc, meta, llama, src):
             warn("the vision encoder did not compile (the reason is above): the model reads text only - "
                  f"{ME} --setup --rebuild tries again")

@@ -19,10 +19,16 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
-from _paths import add_gguf_py
-add_gguf_py()
-from gguf import GGUFWriter, GGMLQuantizationType as Q, GGML_QUANT_SIZES
+import gguf_io as G
 import iq_pack
+
+
+class _Ids:   # GGML_TYPE_<NAME> -> the GGUF type id (tools/gguf_io.py's table)
+    def __getattr__(self, n):
+        return G.TYPE_ID[n.upper()]
+
+
+Q = _Ids()
 from gguf_remote_types import TYPE_NAMES
 
 FIXTURE = HERE / "fixtures" / "unsloth_q38_ud31_types.txt"
@@ -103,7 +109,7 @@ class UnslothUd31Types(unittest.TestCase):
         E, FF, NE = 256, 64, 8
 
         def raw(t, rows, cols):
-            blk, size = GGML_QUANT_SIZES[Q(t)]
+            _, blk, size = G.TYPES[t]
             return np.zeros((NE, rows, cols // blk * size), np.uint8)
 
         for s, layers in self.sets.items():
@@ -115,16 +121,13 @@ class UnslothUd31Types(unittest.TestCase):
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                 root = Path(tmp)
                 first = root / "model-00001-of-00001.gguf"
-                w = GGUFWriter(first, "qwen4exp")
+                w = G.Writer(first, "qwen4exp")
                 for i, (g, u, d) in enumerate(pick):
-                    w.add_tensor("blk.%d.ffn_gate_inp.weight" % i, np.ones((NE, E), np.float32))
-                    w.add_tensor("blk.%d.ffn_gate_exps.weight" % i, raw(g, FF, E), raw_dtype=Q(g))
-                    w.add_tensor("blk.%d.ffn_up_exps.weight" % i, raw(u, FF, E), raw_dtype=Q(u))
-                    w.add_tensor("blk.%d.ffn_down_exps.weight" % i, raw(d, E, FF), raw_dtype=Q(d))
-                w.write_header_to_file()
-                w.write_kv_data_to_file()
-                w.write_tensors_to_file()
-                w.close()
+                    w.add_tensor("blk.%d.ffn_gate_inp.weight" % i, [E, NE], "F32", np.ones((NE, E), np.float32))
+                    w.add_tensor("blk.%d.ffn_gate_exps.weight" % i, [E, FF, NE], g, raw(g, FF, E))
+                    w.add_tensor("blk.%d.ffn_up_exps.weight" % i, [E, FF, NE], u, raw(u, FF, E))
+                    w.add_tensor("blk.%d.ffn_down_exps.weight" % i, [FF, E, NE], d, raw(d, E, FF))
+                w.write()
                 out = root / "pack"
                 (out / "tokenizer").mkdir(parents=True)
                 for name in ["vocab.json", "chat_template.jinja"]:

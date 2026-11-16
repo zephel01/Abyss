@@ -20,9 +20,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import add_gguf_py  # noqa: E402
-add_gguf_py()
-import gguf  # noqa: E402
+import gguf_io  # noqa: E402
 
 H, FF, NE = 2560, 640, 512
 BLOB = 3 * (H * FF * 18 // 64)
@@ -65,10 +63,11 @@ def main() -> int:
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    r = gguf.GGUFReader(a.gguf)
+    r = gguf_io.Reader(a.gguf)
     tens = {t.name: t for t in r.tensors}
-    gu = np.asarray(tens["mtp.layers.0.mlp.experts.gate_up_proj"].data)
-    dn = np.asarray(tens["mtp.layers.0.mlp.experts.down_proj"].data)
+    gt, dt = tens["mtp.layers.0.mlp.experts.gate_up_proj"], tens["mtp.layers.0.mlp.experts.down_proj"]
+    gu = gt.data.reshape(*reversed(gt.shape[1:]), -1)   # (experts, rows, row bytes)
+    dn = dt.data.reshape(*reversed(dt.shape[1:]), -1)
     assert gu.shape == (NE, 2 * FF, 720) and dn.shape == (NE, H, 180), (gu.shape, dn.shape)
     with open(out / "experts.bin", "wb") as f:
         for e in range(NE):
@@ -81,13 +80,11 @@ def main() -> int:
                 continue
             short = name[len("mtp."):]
             short = short[len("layers.0."):] if short.startswith("layers.0.") else short
-            data = np.asarray(t.data)
-            if int(t.tensor_type) == 0:        # F32 norm weights: raw GemmaRMSNorm w -> 1 + w
-                arr = (data.astype(np.float32) + 1.0)
+            if t.type == 0:                    # F32 norm weights: raw GemmaRMSNorm w -> 1 + w
+                arr = (t.data.view("<f4").astype(np.float32) + 1.0)
                 raw, kind, rows, cols = arr.tobytes(), "f32", 1, arr.size
-            else:                              # BF16
-                u16 = data.view(np.uint16) if data.dtype != np.uint16 else data
-                u16 = u16.reshape(data.shape[0], -1)
+            else:                              # BF16: (rows, cols), the outer dimensions as the rows
+                u16 = t.data.view("<u2").reshape(int(np.prod(t.shape[1:])) if len(t.shape) > 1 else 1, -1)
                 rows, cols = u16.shape
                 if short in Q8:
                     f32 = (u16.astype(np.uint32) << 16).view(np.float32)

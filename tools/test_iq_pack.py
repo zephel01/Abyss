@@ -12,20 +12,28 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
-from _paths import add_gguf_py
-add_gguf_py()
-from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
+import gguf_io as G
 import iq_pack
 
 
+class Q:   # the GGUF type ids these fixtures use
+    F32, F16, Q8_0, BF16 = 0, 1, 8, 30
+
+
+class quants:   # noqa: N801  (the fixtures' encoder: tools/gguf_io.py)
+    quantize = staticmethod(G.quantize)
+    dequantize = staticmethod(G.dequantize)
+
+
+def add(writer, name, values, kind):
+    writer.add_tensor(name, list(reversed(np.shape(values))), kind, G.quantize(values, kind))
+
+
 def write_gguf(path, tensors):
-    writer = GGUFWriter(path, "qwen4exp")
+    writer = G.Writer(path, "qwen4exp")
     for name, values, kind in tensors:
-        writer.add_tensor(name, quants.quantize(values, kind), raw_dtype=kind)
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+        add(writer, name, values, kind)
+    writer.write()
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -156,15 +164,12 @@ class CompatibilityTests(unittest.TestCase):
             exp = np.ones((512, 2, 32), np.float32)
 
             def write_shard(path, pad, tensors):
-                writer = GGUFWriter(path, "qwen4exp")
+                writer = G.Writer(path, "qwen4exp")
                 if pad:
                     writer.add_string("general.name", "p" * pad)
                 for name, values, kind in tensors:
-                    writer.add_tensor(name, quants.quantize(values, kind), raw_dtype=kind)
-                writer.write_header_to_file()
-                writer.write_kv_data_to_file()
-                writer.write_tensors_to_file()
-                writer.close()
+                    add(writer, name, values, kind)
+                writer.write()
 
             first = root / "model-00001-of-00003.gguf"
             second = root / "model-00002-of-00003.gguf"

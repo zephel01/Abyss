@@ -127,13 +127,13 @@ KL 0）。DeepSeek V4 で attention を Q5_K にしたときは KL 0.006 → 0.0
 GGUF のまま手を付けません。
 
 `tools/requant_dense.py` には llama.cpp のビルドの `libggml-base.so`（量子化器。`llama-quantize` 自体は imatrix の
-ない i-quant モデルを拒否します）と gguf-py（Abyss の `third_party/llama.cpp/gguf-py`）が要ります。96 GB の shard
+ない i-quant モデルを拒否します）が要ります（GGUF の読み書きは自前の `tools/gguf_io.py`）。96 GB の shard
 を元のディレクトリの隣に書き直し（NVMe で約 15 分）、続けて `iq_pack.py` で pack を作ります:
 
 ```sh
 cd ~/llm/apps/Abyss
 M=~/llm/apps/Maya-data/models
-GGUF_PY=$PWD/third_party/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
+LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
   .venv/bin/python -I tools/requant_dense.py $M/Maya-S-v2-IQ2_XXS/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf \
   $M/Maya-S-v2-IQ2_XXS-iq4dense iq4_xs --from=q6_k \
   'blk\.\d+\.attn_output\.weight' 'blk\.\d+\.attn_[qkv]\.weight' 'blk\.\d+\.attn_q_[ab]\.weight' \

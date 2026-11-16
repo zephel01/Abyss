@@ -6,12 +6,11 @@
 The block's tensors (blk.<block_count - nextn_predict_layers>.*) are copied as stored, except the routed experts, which
 are requantized to a type the engine's expert kernels serve (the default Q4_K; q5_k, q6_k; the block's own are often
 Q8_0, as in unsloth's Ornith-1.5-122B GGUFs, and Q8_0 experts have no decode kernel yet) through ggml's quantizer
-(ggml_quantize_chunk of a libggml-base shared library: llama.cpp's build, or --ggml-lib). The model's general.* and
+(ggml_quantize_chunk of a libggml-base shared library: trench-gguf's or llama.cpp's build, LIBGGML or --ggml-lib;
+the only step here that needs llama.cpp - reading and writing the GGUF is tools/gguf_io.py). The model's general.* and
 <arch>.* keys come along so the file reads as the same model. Load it with STRATA_GLM_MTP_GGUF=<nextn.gguf> (the
 engine looks the block up there first; the trunk, the head and the embedding stay in the model's shards).
 """
-import ctypes
-import glob
 import argparse
 import os
 import sys
@@ -27,49 +26,17 @@ def main() -> int:
     ap.add_argument("--experts", default="q4_k", help="the routed experts' type: q4_k (default), q5_k, q6_k, or q8_0 (as stored)")
     ap.add_argument("--ggml-lib", default="", help="libggml-base.so (.dylib / ggml-base.dll) with ggml_quantize_chunk")
     a = ap.parse_args()
-    here = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, os.environ.get("STRATA_GGUF_PY", os.path.join(here, "..", "third_party", "llama.cpp", "gguf-py")))
-    import gguf
-    from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
-    from gguf.quants import dequantize, quantize
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import gguf_io as G
 
-    want = {"q4_k": GGMLQuantizationType.Q4_K, "q5_k": GGMLQuantizationType.Q5_K, "q6_k": GGMLQuantizationType.Q6_K,
-            "q8_0": GGMLQuantizationType.Q8_0}.get(a.experts.lower())
+    want = {"q4_k": 12, "q5_k": 13, "q6_k": 14, "q8_0": 8}.get(a.experts.lower())
     if want is None:
         print("--experts: q4_k, q5_k, q6_k or q8_0")
         return 2
-    # ggml's quantizer (gguf-py quantizes Q8_0 alone)
-    lib = None
-    if want != GGMLQuantizationType.Q8_0:
-        cands = [a.ggml_lib] if a.ggml_lib else []
-        for d in (os.path.join(here, "..", "build"), os.path.join(here, "..", "build-hip"),
-                  os.path.join(here, "..", "third_party", "llama.cpp", "build", "bin"),
-                  os.path.join(here, "..", "..", "Abyss-tools", "llama-build", "bin")):
-            cands += glob.glob(os.path.join(d, "libggml-base.so")) + glob.glob(os.path.join(d, "libggml-base.dylib")) + \
-                     glob.glob(os.path.join(d, "ggml-base.dll"))
-        for c in cands:
-            try:
-                lib = ctypes.CDLL(c)
-                lib.ggml_quantize_chunk
-                break
-            except (OSError, AttributeError):
-                lib = None
-        if lib is None:
-            print("no libggml-base with ggml_quantize_chunk found (build llama.cpp, or pass --ggml-lib); --experts q8_0 copies")
-            return 1
-        lib.ggml_quantize_chunk.restype = ctypes.c_size_t
-        lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
-                                            ctypes.c_int64, ctypes.c_void_p]
-        lib.ggml_row_size.restype = ctypes.c_size_t
-        lib.ggml_row_size.argtypes = [ctypes.c_int, ctypes.c_int64]
-    first = GGUFReader(a.gguf)
-    fields = first.fields
-    arch = str(bytes(fields["general.architecture"].parts[fields["general.architecture"].data[0]]), "utf-8")
-    def num(key, default):
-        f = fields.get(key)
-        return int(f.parts[f.data[0]][0]) if f is not None else default
-    block_count = num(arch + ".block_count", 0)
-    nextn = num(arch + ".nextn_predict_layers", 0)
+    first = G.Reader(a.gguf)
+    arch = first.get("general.architecture")
+    block_count = int(first.get(arch + ".block_count", 0))
+    nextn = int(first.get(arch + ".nextn_predict_layers", 0))
     if block_count <= 0 or nextn <= 0:
         print("%s: block_count %d, nextn_predict_layers %d - no NextN block" % (arch, block_count, nextn))
         return 1
@@ -77,7 +44,7 @@ def main() -> int:
     P = "blk.%d." % L
     # the shards: split.count files named ...-0000i-of-0000n.gguf
     paths = [a.gguf]
-    n_split = num("split.count", 1)
+    n_split = int(first.get("split.count", 1))
     if n_split > 1:
         base = os.path.basename(a.gguf)
         i = base.rfind("-00001-of-")
@@ -86,71 +53,69 @@ def main() -> int:
             return 1
         for k in range(2, n_split + 1):
             paths.append(os.path.join(os.path.dirname(a.gguf), base[:i] + "-%05d-of-%05d.gguf" % (k, n_split)))
-    readers = [first] + [GGUFReader(p) for p in paths[1:]]
-    tensors = []
-    for r in readers:
-        for t in r.tensors:
-            if t.name.startswith(P):
-                tensors.append(t)
+    readers = [first] + [G.Reader(p) for p in paths[1:]]
+    tensors = [t for r in readers for t in r.tensors if t.name.startswith(P)]
     if not any(t.name == P + "nextn.eh_proj.weight" for t in tensors):
         print("%s: no %snextn.eh_proj.weight in the shards" % (arch, P))
         return 1
-    w = GGUFWriter(a.out, arch)
-    # the model's keys (not the tokenizer's, not the split's)
-    for key, f in fields.items():
+    # ggml's quantizer, when an expert tensor changes type (a NeedsLlamaCpp error otherwise)
+    lib = None
+    if any(t.name.endswith("_exps.weight") and t.type != want for t in tensors):
+        try:
+            lib = G.ggml_lib(a.ggml_lib)
+        except G.NeedsLlamaCpp as e:
+            print("%s; --experts q8_0 copies Q8_0 experts as stored" % e)
+            return 1
+    w = G.Writer(a.out, arch)
+    # the model's keys (not the tokenizer's, not the split's); a scalar integer is written as u32 / i32 / u64, as
+    # this tool always has
+    for key, f in first.fields.items():
         if key == "general.architecture" or key.startswith("tokenizer.") or key.startswith("split.") or key.startswith("GGUF."):
             continue
         if not (key.startswith("general.") or key.startswith(arch + ".")):
             continue
-        vt = f.types[0]
-        if len(f.types) == 1:
-            val = f.parts[f.data[0]]
-            if vt == gguf.GGUFValueType.STRING:
-                w.add_string(key, str(bytes(val), "utf-8"))
-            elif vt in (gguf.GGUFValueType.UINT32, gguf.GGUFValueType.INT32, gguf.GGUFValueType.UINT64, gguf.GGUFValueType.INT64,
-                        gguf.GGUFValueType.UINT8, gguf.GGUFValueType.INT8, gguf.GGUFValueType.UINT16, gguf.GGUFValueType.INT16):
-                w.add_uint32(key, int(val[0])) if vt == gguf.GGUFValueType.UINT32 else w.add_int32(key, int(val[0])) if vt == gguf.GGUFValueType.INT32 else w.add_uint64(key, int(val[0]))
-            elif vt == gguf.GGUFValueType.FLOAT32:
-                w.add_float32(key, float(val[0]))
-            elif vt == gguf.GGUFValueType.BOOL:
-                w.add_bool(key, bool(val[0]))
-        elif vt == gguf.GGUFValueType.ARRAY:
-            et = f.types[1]
-            if et == gguf.GGUFValueType.STRING:
-                w.add_array(key, [str(bytes(f.parts[i]), "utf-8") for i in f.data])
-            elif et in (gguf.GGUFValueType.BOOL,):
-                w.add_array(key, [bool(f.parts[i][0]) for i in f.data])
-            elif et == gguf.GGUFValueType.FLOAT32:
-                w.add_array(key, [float(f.parts[i][0]) for i in f.data])
+        vt = f.vtype
+        if vt == G.STRING:
+            w.add_string(key, f.value)
+        elif vt in (G.U32, G.I32, G.U64, G.I64, G.U8, G.I8, G.U16, G.I16):
+            w.add_uint32(key, f.value) if vt == G.U32 else w.add_int32(key, f.value) if vt == G.I32 else \
+                w.add_uint64(key, f.value)
+        elif vt == G.F32V:
+            w.add_float32(key, f.value)
+        elif vt == G.BOOL:
+            w.add_bool(key, f.value)
+        elif vt == G.ARRAY:
+            if f.etype == G.STRING:
+                w.add_array(key, list(f.value))
+            elif f.etype == G.BOOL:
+                w.add_array(key, [bool(x) for x in f.value])
+            elif f.etype == G.F32V:
+                w.add_array(key, [float(x) for x in f.value])
             else:
-                w.add_array(key, [int(f.parts[i][0]) for i in f.data])
+                w.add_array(key, [int(x) for x in f.value])
     total = 0
     for t in tensors:
-        data = np.asarray(t.data)
-        qt = t.tensor_type
+        data, qt = t.data, t.type
         if t.name.endswith("_exps.weight") and qt != want:
             t0 = time.time()
-            f32 = np.ascontiguousarray(dequantize(data, qt), dtype=np.float32)
-            n_per_row = int(f32.shape[-1])
+            n_per_row = int(t.shape[0])
+            f32 = np.ascontiguousarray(G.dequantize(data, qt), dtype=np.float32)
             nrows = int(f32.size // n_per_row)
-            row_bytes = int(lib.ggml_row_size(int(want), n_per_row))
-            out = np.empty(f32.shape[:-1] + (row_bytes,), dtype=np.uint8)
-            wrote = lib.ggml_quantize_chunk(int(want), f32.ctypes.data, out.ctypes.data, 0, nrows, n_per_row, None)
+            out = np.empty(nrows * G.row_bytes(want, n_per_row), dtype=np.uint8)
+            wrote = lib.ggml_quantize_chunk(want, f32.ctypes.data, out.ctypes.data, 0, nrows, n_per_row, None)
             if wrote != out.nbytes:
                 print("%s: ggml_quantize_chunk wrote %d bytes, expected %d" % (t.name, wrote, out.nbytes))
                 return 1
             data = out
             del f32
-            print("%s: %s -> %s, %.1f MB, %.0f s" % (t.name, qt.name, want.name, data.nbytes / 1e6, time.time() - t0), flush=True)
+            print("%s: %s -> %s, %.1f MB, %.0f s" % (t.name, G.type_name(qt), G.type_name(want), data.nbytes / 1e6,
+                                                    time.time() - t0), flush=True)
             qt = want
         else:
-            print("%s: %s as stored, %.1f MB" % (t.name, qt.name, data.nbytes / 1e6), flush=True)
-        w.add_tensor(t.name, data, raw_dtype=qt)
+            print("%s: %s as stored, %.1f MB" % (t.name, G.type_name(qt), data.nbytes / 1e6), flush=True)
+        w.add_tensor(t.name, t.shape, qt, data)
         total += data.nbytes
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file(progress=False)
-    w.close()
+    w.write()
     print("%s: %d tensors of blk.%d, %.2f GB -> %s" % (arch, len(tensors), L, total / 1e9, a.out))
     return 0
 

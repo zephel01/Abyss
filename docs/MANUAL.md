@@ -164,7 +164,7 @@ cd ~/llm/apps/Abyss
 python3 -m venv .venv
 .venv/bin/pip install numpy jinja2 regex pyyaml tqdm requests cmake ninja pillow psutil
 
-# llama.cpp's source at the commit the engine is pinned to (setup.py LLAMA_CPP_COMMIT): ggml, the MMQ kernels, gguf-py
+# llama.cpp's source at the commit the engine is pinned to (setup.py LLAMA_CPP_COMMIT): the MMQ kernels (ggml-cuda); the tools no longer need its gguf-py
 C=3cf03257f219afbe7334045ff7c6a06ac68c627d
 curl -L -o /tmp/llama.zip https://github.com/ggml-org/llama.cpp/archive/$C.zip
 unzip -q /tmp/llama.zip -d third_party && mv third_party/llama.cpp-$C third_party/llama.cpp
@@ -240,7 +240,7 @@ every other byte of the shards as it is; `iq_pack.py` then packs the new files l
 
 ```sh
 cd ~/llm/apps/Abyss
-GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
+LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
   .venv/bin/python -I tools/requant_dense.py $M/UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf \
   $M/UD-Q2_K_XL-attn-q6k q6_k 'blk\.\d+\.attn_q_b\.weight' 'blk\.\d+\.attn_output_[ab]\.weight'
 .venv/bin/python tools/iq_pack.py --gguf $M/UD-Q2_K_XL-attn-q6k/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf \
@@ -1137,7 +1137,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_MMQ_GLU` | on | the prompt path's expert gate/up product writes the SwiGLU itself (NVIDIA Turing and newer); `0`: the separate SwiGLU kernel, bit-identical to older builds |
 | `STRATA_GLM_CPU_MT` | on | CPU experts shared by several tokens (prompts, verify windows) decode each weight row once for all of them, bit-identical to ggml's dot (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers where `STRATA_GLM_CPU_1T` says, v1.3.41); `0` off |
 | `STRATA_GLM_CPU_1T` | on | cheaper one-token rows on the CPU lane, bit-identical to ggml's dot: on an AVX-512 CPU with VNNI and VBMI (Zen 4 / Ice Lake and later) IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers (v1.3.41; a Ryzen AI Max+ 395's 16 threads, a DeepSeek V4 expert 109 -> 90 us, decode without the iGPU lane +3-9%; `STRATA_NO_IQ512_VBMI=1` only these off), else IQ3_S / IQ3_XXS in AVX2; `0` off |
-| `STRATA_CPU_GGML` | off | `1`: the CPU experts use ggml-cpu's dot products and activation quantizers again, as before the own ones (no-ggml work, branch no-ggml); only in a build with `STRATA_GGML=ON`.  The own ones give the same bits (own_dot_test checks every type against ggml-cpu) |
+| `STRATA_CPU_GGML` | off (on where the own dots have no SIMD build - aarch64 - and the build has ggml) | `1`: the CPU experts use ggml-cpu's dot products and activation quantizers again, as before the own ones (no-ggml work, branch no-ggml); only in a build with `STRATA_GGML=ON`.  `0`: the own ones on aarch64 too.  The own ones give the same bits (own_dot_test checks every type against ggml-cpu) |
 | `STRATA_GLM_VRAM_EVICT` | counts | `lru`: the VRAM tier's refill evicts the least recently used expert (for cache studies) |
 | `STRATA_GLM_DISK_READERS` | off | prompts read SSD-held experts with this many threads (try it on a DRAM-less NVMe; DeepSeek V4.1: `8`, a 1K-token prompt 33 -> 27 s) |
 | `STRATA_GLM_DISK_PAR` | off | `1`: while answering, the experts a token misses are read from the SSD by a pool of their own with one thread for every chunk of an expert (3 parts x `STRATA_GLM_READ_CHUNKS` (8) = 24, the calling thread included), so an expert's chunks are all in flight at once instead of 9 threads taking them in about three rounds; `<n>` (2-64): that many threads. Only the order of the reads changes - the answers are the same. The threads wait inside the reads; between misses they spin `STRATA_GLM_DISK_PAR_SPIN_US` (50) µs and then sleep. With `STRATA_GLM_TIMING=1` the engine prints its disk reads (the rate while waiting, and the mean / p50 / p90 / p99 of the waits for one expert) either way, for an A/B. Not measured yet (fio on a 6.7 GB/s NVMe: 9 x 424 KB reads at once 4.64 GB/s, 24 at once 5.10 GB/s) |
