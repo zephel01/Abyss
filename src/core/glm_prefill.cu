@@ -380,40 +380,11 @@ size_t act_bytes(int64_t rows, int64_t cols) {
 #endif
     return n;
 }
-// The prompt's experts on Strata's own int8 tensor-core GEMM instead of MMQ, a weight type at a time.
-// STRATA_PROMPT_MMQ=1: MMQ for every type (the old path).  STRATA_PROMPT_OWN_TYPES=all | <type id>,..: the types the
-// own GEMM takes, instead of the default list.
-// The default list (kOwnDefaultTypes): the types measured not slower than MMQ on every model and prompt length - on
-// the GPUs they were measured on (own::tuned_device(): sm_120, the RTX 5090; any other GPU keeps MMQ until it is
-// measured).  A build without MMQ: all the covered types everywhere.
-// 2026-11-17, RTX 5090 (worklog/2026-11-16_no-llamacpp.md section 8): IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ2_S 22,
-// IQ1_S 19, IQ4_NL 20, Q2_0 42.  Not in it: MXFP4 (MMQ multiplies in FP4 there), IQ4_XS, Q4_K, Q6_K, Q8_0 (slower in
-// small launches), IQ1_M (no model here to measure with; MMQ has no IQ1_M, the layer takes the FP16 path).
-static const char* const kOwnDefaultTypes = "16,17,18,22,19,20,42";
+// The prompt's products on Strata's own int8 tensor-core GEMM instead of MMQ, a weight type at a time
+// (own::type_on: STRATA_PROMPT_MMQ=1, STRATA_PROMPT_OWN_TYPES, the default list).
 bool own_type(int type) {
 #if defined(STRATA_MOE_OWN)
-    // (the lists once; which one applies follows the current device)
-    static const auto parse = [](const std::string& list) {
-        std::vector<int> v;
-        if (list == "all") {
-            for (int t = 0; t < 64; ++t) v.push_back(t);
-            return v;
-        }
-        for (size_t i = 0; i < list.size();) {
-            size_t j = list.find(',', i);
-            if (j == std::string::npos) j = list.size();
-            v.push_back(std::atoi(list.substr(i, j - i).c_str()));
-            i = j + 1;
-        }
-        return v;
-    };
-    static const bool mmq_only = [] { const char* m = getenv("STRATA_PROMPT_MMQ"); return m != nullptr && std::atoi(m) != 0; }();
-    static const char* const env = getenv("STRATA_PROMPT_OWN_TYPES");
-    static const std::vector<int> from_env = parse(env != nullptr ? env : ""), all = parse("all"), tuned = parse(kOwnDefaultTypes);
-    if (mmq_only || !own::supported(type)) return false;
-    // (a build without MMQ: every type the own GEMM covers - the other choice there is the FP16 path)
-    const std::vector<int>& on = env != nullptr ? from_env : !mmq::built() ? all : own::tuned_device() ? tuned : from_env;
-    return std::find(on.begin(), on.end(), type) != on.end();
+    return own::type_on(type, mmq::built());
 #else
     (void) type;
     return false;

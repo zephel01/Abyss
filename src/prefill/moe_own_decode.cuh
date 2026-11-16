@@ -389,6 +389,43 @@ template<> struct Dec<8> {
     }
 };
 
+// NVFP4: 64 values a block: {4 x u8 UE4M3 scales, one a 16 values; 32 bytes: sub-block s's values 0-7 in the low
+// nibbles of bytes 8 s .. 8 s + 7, 8-15 in their high nibbles}; the nibbles as MXFP4's (sign | 3 bits, the table
+// doubled).  A step is two sub-blocks: lo is the first, hi the second, each under its own float scale (FS16).  The
+// tensor's second-level scale (an expert's) is the caller's.  A chunk is two blocks.
+__device__ __forceinline__ float ue4m3_half(uint32_t x) {   // the scale / 2 (the table's values are doubled)
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t e = (x >> 3) & 15u, m = x & 7u;
+    return 0.5f * (e == 0 ? (float) m * (1.0f / 512.0f) : __uint_as_float((e + 120u) << 23 | m << 20));
+}
+template<> struct Dec<40> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 72, AL = 1, SUB = 16;
+    static constexpr bool FS16 = true;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 36 * (ib >> 1);
+        const int s0 = 2 * (ib & 1);   // the step's first sub-block
+        // thread t's four values of a sub-block: t < 2 the low nibbles of its bytes 4 t .., else the high ones of 4 (t - 2) ..
+        const int o = 4 * (t & 1), sh = 4 * (t >> 1);
+        const uint8_t* q0 = b + 4 + 8 * s0 + o;
+        const uint8_t* q1 = q0 + 8;
+        const uint32_t v0 = (uint32_t) q0[0] | (uint32_t) q0[1] << 8 | (uint32_t) q0[2] << 16 | (uint32_t) q0[3] << 24;
+        const uint32_t v1 = (uint32_t) q1[0] | (uint32_t) q1[1] << 8 | (uint32_t) q1[2] << 16 | (uint32_t) q1[3] << 24;
+        Step r;
+        r.lo = fp4_bytes((v0 >> sh) & 0x0F0F0F0Fu);
+        r.hi = fp4_bytes((v1 >> sh) & 0x0F0F0F0Fu);
+        r.s = ue4m3_half(b[s0]);       // lo's scale
+        r.o = ue4m3_half(b[s0 + 1]);   // hi's scale (FS16 reads it here)
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+// (a Dec with FS16: two float scales a step, Step::s for lo and Step::o for hi)
+template<int TY, typename = void> struct Fs16 { static constexpr bool on = false; };
+template<int TY> struct Fs16<TY, decltype((void) Dec<TY>::FS16)> { static constexpr bool on = Dec<TY>::FS16; };
+
 // A chunk's bytes in its row: one range (chunk c at c * CB), or - a Dec with HDR - a header range and a data range
 template<int TY, typename = void> struct Rng {
     static constexpr int HDR = 0, RB = Dec<TY>::CB;

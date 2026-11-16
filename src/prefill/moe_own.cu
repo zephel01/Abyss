@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 #if !defined(__HIPCC__)
 #define GGML_COMMON_DECL_CUDA
@@ -122,7 +124,7 @@ __global__ void tiles_kernel(const int32_t* __restrict__ bounds, int32_t* __rest
 struct KArgs {
     const uint8_t* w;       // expert 0's blob + the first matrix's offset
     size_t stride;          // bytes between experts
-    size_t up_off;          // gate/up: the up matrix after the gate matrix
+    ptrdiff_t up_off;       // gate/up: the up matrix from the gate matrix (two tensors: any distance)
     const uint8_t* xq;      // activations: int8 [rows][K]
     const float* xd;        // their scales [rows][K / 32]
     const float* xsum;      // their block sums (scale x the sum of the int8), the same shape
@@ -223,7 +225,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     const auto slot_row = [&](int s) -> const uint8_t* {
         const int f = s / (NT / 2), ww = (s / 16) % NW, rr = s % 16;
         const int row = GLU ? rt * (NW * 16) + ww * 16 + rr : rt * (NW * 32) + (2 * ww + f) * 16 + rr;
-        return we + (GLU && f ? a.up_off : (size_t) 0) + (size_t) min(row, a.w_rows - 1) * row_bytes;
+        return we + (GLU && f ? a.up_off : (ptrdiff_t) 0) + (size_t) min(row, a.w_rows - 1) * row_bytes;
     };
     const uint8_t* my_slot = slot_row(threadIdx.x);
     const auto issue_w = [&](int c) {   // this thread's slot: the 16-byte words around its row's chunk c
@@ -358,6 +360,14 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                         v[1] = (float) cc[1] * st[i][f][0].s;
                         v[2] = (float) cc[2] * st[i][f][1].s;
                         v[3] = (float) cc[3] * st[i][f][1].s;
+                    } else if constexpr (Fs16<TY>::on) {   // (a float scale a 16 values)
+                        int cl[4], ch[4];
+                        mma16(cl, st[i][f][0].lo, st[i][f][1].lo, bl);
+                        mma16(ch, st[i][f][0].hi, st[i][f][1].hi, bh);
+                        v[0] = fmaf((float) cl[0], st[i][f][0].s, (float) ch[0] * st[i][f][0].o);
+                        v[1] = fmaf((float) cl[1], st[i][f][0].s, (float) ch[1] * st[i][f][0].o);
+                        v[2] = fmaf((float) cl[2], st[i][f][1].s, (float) ch[2] * st[i][f][1].o);
+                        v[3] = fmaf((float) cl[3], st[i][f][1].s, (float) ch[3] * st[i][f][1].o);
                     } else {
                         int cl[4], ch[4];
                         mma16(cl, st[i][f][0].lo, st[i][f][1].lo, bl);
@@ -471,6 +481,7 @@ void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) 
         case 12: launch_t<12, GLU>(a, grid, shape, s); break;
         case 14: launch_t<14, GLU>(a, grid, shape, s); break;
         case 8: launch_t<8, GLU>(a, grid, shape, s); break;
+        case 40: launch_t<40, GLU>(a, grid, shape, s); break;
         case 39: launch_t<39, GLU>(a, grid, shape, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
@@ -478,7 +489,7 @@ void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) 
     }
 }
 
-int align_of(int type) { return type == 39 ? 1 : 2; }
+int align_of(int type) { return type == 39 || type == 40 ? 1 : 2; }
 bool wide_type(int type) {
     switch (type) {
         case 16: return Wide<16>::on;
@@ -493,6 +504,7 @@ bool wide_type(int type) {
         case 12: return Wide<12>::on;
         case 14: return Wide<14>::on;
         case 8: return Wide<8>::on;
+        case 40: return Wide<40>::on;
         case 39: return Wide<39>::on;
         default: return false;
     }
@@ -523,13 +535,45 @@ int device_cc() {
 bool tuned_device() { return device_cc() == 120; }
 bool built() { return device_cc() >= 80; }   // (int8 mma.sync and cp.async)
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40);
 }
 #endif
 
+// The default list: the types measured not slower than MMQ on every model and prompt length, on the GPUs they were
+// measured on (tuned_device(): sm_120, the RTX 5090; any other GPU keeps MMQ until it is measured).
+// 2026-11-17, RTX 5090 (worklog/2026-11-16_no-llamacpp.md section 8): IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ2_S 22,
+// IQ1_S 19, IQ4_NL 20, Q2_0 42.  Not in it: MXFP4 and NVFP4 (MMQ multiplies in FP4 there), IQ4_XS, Q4_K, Q6_K, Q8_0
+// (slower in small launches), IQ1_M (no model here to measure with; MMQ has no IQ1_M: the layer takes the FP16 path).
+static const char* const kDefaultTypes = "16,17,18,22,19,20,42";
+
+bool type_on(int type, bool mmq_built) {
+    // (the lists once; which one applies follows the current device)
+    static const auto parse = [](const std::string& list) {
+        std::vector<int> v;
+        if (list == "all") {
+            for (int t = 0; t < 64; ++t) v.push_back(t);
+            return v;
+        }
+        for (size_t i = 0; i < list.size();) {
+            size_t j = list.find(',', i);
+            if (j == std::string::npos) j = list.size();
+            v.push_back(std::atoi(list.substr(i, j - i).c_str()));
+            i = j + 1;
+        }
+        return v;
+    };
+    static const bool mmq_only = [] { const char* m = getenv("STRATA_PROMPT_MMQ"); return m != nullptr && std::atoi(m) != 0; }();
+    static const char* const env = getenv("STRATA_PROMPT_OWN_TYPES");
+    static const std::vector<int> from_env = parse(env != nullptr ? env : ""), all = parse("all"), tuned = parse(kDefaultTypes);
+    if (mmq_only || !supported(type)) return false;
+    // (a build without MMQ: every type the own GEMM covers - the other choice there is the FP16 path)
+    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() ? tuned : from_env;
+    return std::find(on.begin(), on.end(), type) != on.end();
+}
+
 bool usable(int t, int64_t rows, int64_t cols) {
     // (a chunk of the type's blocks: 256 values, 128 for the 32- and 64-value block types)
-    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 8) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
+    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 8 || t == 40) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 
@@ -683,7 +727,7 @@ void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size
     KArgs a{};
     a.w = (const uint8_t*) s.w;
     a.stride = s.stride;
-    a.up_off = up_off;
+    a.up_off = (ptrdiff_t) up_off;
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_embd);
     a.xsum = a.xd + s.rows * (n_embd / 32);

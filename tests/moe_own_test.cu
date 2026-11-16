@@ -66,7 +66,9 @@ void random_rows(int type, uint8_t* dst, int64_t rows, int64_t cols, std::mt1993
     for (int64_t b = 0; b < nb; ++b) {
         uint8_t* p = dst + b * bs;
         for (size_t i = 0; i < bs; ++i) p[i] = (uint8_t) byte(rng);
-        if (type == qt::MXFP4) {
+        if (type == qt::NVFP4) {   // (four UE4M3 scales: exponents in a narrow band)
+            for (int k = 0; k < 4; ++k) p[k] = (uint8_t) (((6 + byte(rng) % 3) << 3) | (byte(rng) & 7));
+        } else if (type == qt::MXFP4) {
             p[0] = (uint8_t) (119 + byte(rng) % 6);
         } else if (type == qt::IQ1_M) {   // (the f16 scale's nibbles on top of the four scale words)
             const uint16_t d = qt::fp32_to_fp16(sc(rng));
@@ -310,7 +312,7 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
             // compared with --dump)
             // (Q4_K the same: the types whose MMQ product takes the activations' block sums)
             const bool fp4 = c.gu_type == qt::MXFP4 || c.d_type == qt::MXFP4 || c.gu_type == qt::IQ1_S || c.d_type == qt::IQ1_S ||
-                             c.gu_type == qt::Q4_K || c.d_type == qt::Q4_K;
+                             c.gu_type == qt::Q4_K || c.d_type == qt::Q4_K || c.gu_type == qt::NVFP4 || c.d_type == qt::NVFP4;
             if (!fp4 && (!(eh < 2e-2) || !(ed < 5e-2))) {
                 std::printf("%-28s FAIL  vs MMQ: h differs %.2e of its norm, the output %.2e\n", name, eh, ed);
                 ok = false;
@@ -492,7 +494,7 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K, qt::Q6_K, qt::Q8_0};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K, qt::Q6_K, qt::Q8_0, qt::NVFP4};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {

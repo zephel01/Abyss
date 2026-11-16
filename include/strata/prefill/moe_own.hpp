@@ -21,6 +21,10 @@ bool built();
 /// The current device is one the kernels were measured against MMQ on (sm_120: RTX 5090 class): the prompt path's
 /// default types apply there.
 bool tuned_device();
+/// The prompt path gives products of this type to the own GEMM instead of MMQ: STRATA_PROMPT_MMQ=1 - none;
+/// STRATA_PROMPT_OWN_TYPES=all | <type id>,.. - those; otherwise the default list on a tuned device (none elsewhere), and
+/// every covered type in a build without MMQ (`mmq_built` false).
+bool type_on(int ggml_type, bool mmq_built);
 /// The kernels read weights of this ggml type.
 bool supported(int ggml_type);
 /// supported(type) and a [rows, cols] matrix of it fits the kernels' tiles (cols a multiple of 256 - of 128 for the
@@ -65,6 +69,8 @@ public:
     /// h in its first n_ff floats.
     void gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size_t up_off, float limit, void* stream);
     /// Down [n_embd, n_ff] of `type`, `down_off` bytes into the blob: dst row r gets n_embd floats.
+    /// (Any plain product: a [rows, K] matrix `off` bytes into the blob as (type, rows, K, off) - a gate or an up
+    /// matrix alone, a dense layer's projection with one "expert" whose rows are the tokens.)
     void down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t down_off, void* stream);
 
 private:
