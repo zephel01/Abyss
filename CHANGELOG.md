@@ -7,6 +7,27 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.161 - 2026-11-17
+
+Abyss's own int8 tensor-core GEMM for the prompt's expert (and dense FFN) products, in place of llama.cpp's MMQ, on the
+RTX 5090 (sm_120). Prompts are as fast or faster; KL is unchanged (within run-to-run spread).
+
+- Default on sm_120 for IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S, IQ1_S, IQ4_NL and Q2_0 experts, and for dense FFN layers of
+  those types. Other GPUs and other types stay on MMQ until measured. `STRATA_PROMPT_MMQ=1` = the old path (outputs
+  as in v1.3.160); `STRATA_PROMPT_OWN_TYPES` picks the types (`all` = every type).
+- Prompt speed, MMQ -> own (tok/s, median of 3): GLM-5.3-Flash Maya-S-v2 IQ2_XXS 32K 2,324 -> 2,366, 128K 2,306 ->
+  2,346; V4 0731 UD-Q2_K_XL 32K 3,020 -> 3,054, 128K 2,798 -> 2,845; V4.1 JA256 32K 2,583 -> 2,857 (+10.6%), 128K
+  4,223 -> 4,394; Qwen3.8 UD-IQ3_XXS 32K 3,115 -> 3,260; Qwen3.8-27B UD-IQ2_XXS (dense) 4K 2,914 -> 3,150 (+8.1%),
+  128K 2,028 -> 2,133 (+5.2%).
+- KL vs the token path (2 runs each, MMQ / own): GLM 0.0200 / 0.0205, V4 0.0053 / 0.0055, V4.1 JA256 0.0082 / 0.0071,
+  Qwen3.8 0.0237 / 0.0243, Qwen3.8-27B UD-IQ3_XXS 0.00083 / 0.00075.
+- The kernel reads every type MMQ reads (plus IQ1_M and NVFP4); the types not on by default are slower than MMQ on
+  small expert launches for now. A HIP (WMMA int8, gfx11 / gfx12) version is in and correct, but slower than
+  MMQ-on-HIP, so HIP stays on MMQ.
+- Deterministic md5 changes on the default path for the models whose products moved (GLM, V4, V4.1, Qwen3.8);
+  Ornith-35B / Ornith-122B unchanged; with `STRATA_PROMPT_MMQ=1` all six match v1.3.160.
+- CI: expert_multi_test is skipped (not failed) on a runner without AVX512-VNNI/VBMI.
+
 ## v1.3.160 - 2026-11-16
 
 Language profiles against stray scripts in answers, and the #48 follow-up. Without a profile the outputs are
