@@ -3138,11 +3138,22 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     // SSDs add up their speed without a RAID; anything not mirrored is read from here as before
     if (const char* mv = getenv("STRATA_GLM_MIRROR"); mv != nullptr && *mv != 0 && s.fd_direct >= 0) {
         const std::string base_name = path.substr(path.find_last_of('/') + 1);
+        // an overlay pack (tools/dense_overlay.py) opens the model's shards through symlinks named overlay-NNNNN-of-
+        // NNNNN.gguf: a mirror of the original shards is found by the link target's name too (#48)
+        std::string target_name;
+        if (char* rp = realpath(path.c_str(), nullptr); rp != nullptr) {
+            const std::string t = rp;
+            free(rp);
+            target_name = t.substr(t.find_last_of('/') + 1);
+            if (target_name == base_name) target_name.clear();
+        }
         std::string dirs = mv;
-        for (size_t a = 0; a <= dirs.size() && s.fd_mirror < 0;) {
+        for (size_t a = 0, pass = 0; a <= dirs.size() && s.fd_mirror < 0;) {
             const size_t b = std::min(dirs.find(':', a), dirs.size());
-            const std::string mp = dirs.substr(a, b - a) + "/" + base_name;
-            a = b + 1;
+            const std::string& nm = pass == 0 ? base_name : target_name;
+            const std::string mp = dirs.substr(a, b - a) + "/" + nm;
+            if (pass == 0 && !target_name.empty()) pass = 1;   // the same directory again, by the target's name
+            else { pass = 0; a = b + 1; }
             struct stat ms{};
             if (stat(mp.c_str(), &ms) != 0) continue;
             if ((uint64_t) ms.st_size != s.size) {

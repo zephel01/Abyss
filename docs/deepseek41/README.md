@@ -264,6 +264,13 @@ overlay; the VRAM tier gets the 1.9 GB. RTX 5090 + Radeon 8060S lane, the everyd
 alternated 4 times: 47.5 -> 50.5 tok/s (+6%; a token -6 / -9 / -18% on the three tasks), 8 held-out texts with exact
 routing: KL 0.1420 -> 0.1456, ppl 8.79 -> 8.87, same top 83.8 -> 83.7%.
 
+On a **16 GB card at long context** it helps much more ([#48](https://github.com/zephel01/Abyss/issues/48), RX 9070 16 GB +
+64 GB, two NVMe drives, `--max-context 507904`, tail skip 4/1, 2026-11-16): the dense Q8_0 left the expert pool 10 slots a
+layer and no prestage; the overlay gives 15 slots and 5,376-token prompt chunks. Decode 15.4 -> 17.4 tok/s (+13%),
+prompts 2K / 8K 108 / 142 -> 180 / 334 tok/s, a 469,446-token prompt 1,720 s -> 629 s (273 -> 746 tok/s) with the same
+three facts recalled; KL against the stock file 0.0047 -> 0.0153 (511 tokens). An `--uncensor` file made on the Q8_0
+pack works on the overlay as is.
+
 ```sh
 U=<models dir>/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS
 O=<models dir>/ud-iq2xxs-q5k
