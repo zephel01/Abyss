@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.157 - 2026-11-16
+
+- Qwen3.8-27B with QSA (Qwen Sparse Attention; e.g. higa2515/Qwen3.8-27B-QSA-GGUF, indexers on the 16 full-attention
+  layers): a GGUF with indexer tensors is detected at load and runs QSA in the prompt, in decode and in the MTP verify
+  windows - past 2,051 cells each attention layer reads only the indexer's top 512 blocks of 4 cells plus its own
+  block (all KV is kept). Layer, head and block counts come from the GGUF, so other qwen35 models with indexers run on
+  the same code. RTX 5090, iGPU off, MTP on, Qwen3.8-27B-QSA UD-Q4_K_M, median of 3 (dense -> QSA, same file): decode
+  32K 103.2 -> 146.9 tok/s (+42%), 64K 83.4 -> 141.3 (+69%), 128K 50.9 -> 129.5 (2.5x); prompt 4K -11%, 32K -8%,
+  64K +2%, 128K +15%. Quality against dense on the same weights (1,023 teacher-forced tokens): KL 8K 0.003, 32K 0.034,
+  64K 0.069, 124K 0.114 (nll +0.6% / +2% / +5% / +5%); a 3-secret needle and a code question at 60K and 125K are
+  right with both. The verify windows give the same tokens as one at a time. `STRATA_Q35_QSA=0`: dense (the old
+  outputs exactly). QSA is off with `--kv` quantized caches, on HIP and for requests with pictures.
+- Files without indexers are unchanged (deterministic outputs the same on all six regression configs and Qwen3.8-27B).
+
 ## v1.3.156 - 2026-11-16
 
 - Long-loop guard while thinking: a block of 33-1,024 tokens written three times in a row, token for token (at least
