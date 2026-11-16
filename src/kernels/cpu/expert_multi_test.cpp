@@ -32,7 +32,10 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    c::cpu_require_expert_support();
+    if (!c::cpu_features().usable()) {  // a CI runner without AVX-512: nothing to test here (ctest SKIP)
+        std::printf("expert_multi_test: skipped, this CPU has no AVX512-VNNI/VBMI (%s)\n", c::cpu_features().reason());
+        return 77;
+    }
     std::mt19937 rng(9);
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const int E = bench ? (argc > 2 ? std::atoi(argv[2]) : 256) : 4;

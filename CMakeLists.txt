@@ -1304,6 +1304,7 @@ if(STRATA_BUILD_TESTS)
     add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
     target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
     add_test(NAME expert_multi_test COMMAND expert_multi_test)
+    set_tests_properties(expert_multi_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
   # own_dot_test: the own GGUF arithmetic (qtypes.cpp, own_dot*.cpp) against ggml's, bit for bit (STRATA_GGML=ON;
