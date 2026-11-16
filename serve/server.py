@@ -153,6 +153,27 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+class EngineError(ValueError):
+    """The engine's own ERR line: it stopped this answer itself (a GPU failure, a sample that failed, ...).  A
+    ValueError as before, so every handler that caught the engine's ERR still does."""
+
+
+class EngineStopped(Exception):
+    """An answer the engine stopped (its ERR, or the process died after the answer began), with what it had written:
+    HTTP 422, type engine_error, the partial text and reasoning in the body.  Not a 5xx: the OpenAI and Anthropic SDKs
+    send 5xx (and 408/409/429) again by themselves, and the same long answer ran a second time (Maya #827's idea).
+    503 stays for an engine that is not running or still loading."""
+
+    def __init__(self, message: str, text: str = "", reasoning: str = ""):
+        super().__init__(message)
+        self.partial_text, self.partial_reasoning = text, reasoning
+
+    def body(self, anthropic: bool = False) -> dict:
+        err = {"type": "engine_error", "message": str(self), "partial_text": self.partial_text,
+               "partial_reasoning": self.partial_reasoning}
+        return {"type": "error", "error": err} if anthropic else {"error": {**err, "code": "engine_error"}}
+
+
 # CUDA errors after which the context is unusable: every later launch fails the same way, so an ERR with one of
 # these means the engine is as good as dead (2026-10-19: a DeepSeek V4.1 chat's 16,385th token -> "an illegal memory
 # access was encountered", then 125 answers of 0 tokens until the server was restarted by hand)
@@ -728,7 +749,7 @@ class StrataEngine:
                     if cuda_context_lost(msg):          # its GPU context is gone: end it, the next request restarts it
                         self._end(f"the engine's CUDA context is lost ({msg}); ending it")
                         raise EngineDied(f"the engine's CUDA context is lost: {msg}")
-                    raise ValueError(msg)
+                    raise EngineError(msg)
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -2549,6 +2570,40 @@ def jobs_put(job: StreamJob) -> None:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    with engine_stopped(content, reasoning):
+        last = _openai_collect(chunks, content, reasoning, by_index, mcp)
+    calls = [by_index[i] for i in sorted(by_index)]
+    msg = {"role": "assistant", "content": "".join(content) or None}
+    if "".join(reasoning):
+        msg["reasoning_content"] = "".join(reasoning)
+    if calls:
+        msg["tool_calls"] = calls
+    if mcp:
+        msg["strata_mcp"] = mcp
+    out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
+           "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
+           "usage": last["usage"]}
+    if last.get("timings"):
+        out["timings"] = last["timings"]
+    return out
+
+
+@contextlib.contextmanager
+def engine_stopped(text: list, reasoning: list):
+    """A non-streamed answer the engine stopped -> EngineStopped with what was written so far (`text` / `reasoning`:
+    the collector's pieces).  An engine that died before writing anything stays EngineDied (503: not running)."""
+    try:
+        yield
+    except EngineError as e:
+        raise EngineStopped(str(e), "".join(text), "".join(reasoning)) from e
+    except EngineDied as e:
+        if not "".join(text) and not "".join(reasoning):
+            raise
+        raise EngineStopped(f"{e}; the next request restarts it", "".join(text), "".join(reasoning)) from e
+
+
+def _openai_collect(chunks, content, reasoning, by_index, mcp) -> dict:
+    last = None
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
@@ -2565,20 +2620,7 @@ def openai_collect(chunks) -> dict:
             cur["function"]["name"] += fn.get("name") or ""
             cur["function"]["arguments"] += fn.get("arguments") or ""
         last = c
-    calls = [by_index[i] for i in sorted(by_index)]
-    msg = {"role": "assistant", "content": "".join(content) or None}
-    if "".join(reasoning):
-        msg["reasoning_content"] = "".join(reasoning)
-    if calls:
-        msg["tool_calls"] = calls
-    if mcp:
-        msg["strata_mcp"] = mcp
-    out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
-           "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
-           "usage": last["usage"]}
-    if last.get("timings"):
-        out["timings"] = last["timings"]
-    return out
+    return last
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
@@ -2668,7 +2710,22 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
 
 
 def anthropic_collect(events) -> dict:
-    msg, blocks = None, []
+    blocks = []
+    text, thinking = [], []                        # (only for an answer the engine stops: its partial text)
+    try:
+        return _anthropic_collect(events, blocks)
+    except (EngineError, EngineDied):
+        for b in blocks:
+            if b.get("type") == "text":
+                text.append(b.get("text") or "")
+            elif b.get("type") == "thinking":
+                thinking.append(b.get("thinking") or "")
+        with engine_stopped(text, thinking):
+            raise
+
+
+def _anthropic_collect(events, blocks) -> dict:
+    msg = None
     for item in events:
         if item is None:                           # a heartbeat
             continue
@@ -3149,6 +3206,9 @@ def make_handler(svc: Service):
                     self._json(404, {"error": {"message": "not found"}})
             except BadBody as e:
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except EngineStopped as e:                       # the engine stopped the answer itself: not retried
+                if not self.answer_started:
+                    self._json(422, e.body(anthropic=path == "/v1/messages"))
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
@@ -3337,7 +3397,8 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
-                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+                err = {"error": {"type": "engine_error" if isinstance(e, EngineError) else "server_error",
+                                 "message": str(e)}}                       # headers are sent, so no 400 now
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _stream_job(self, job: StreamJob, n: int):
@@ -3422,7 +3483,8 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
-                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                err = {"type": "error", "error": {"type": "engine_error" if isinstance(e, EngineError) else "api_error",
+                                                  "message": str(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
 
     return Handler
