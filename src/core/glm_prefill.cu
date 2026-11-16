@@ -1476,7 +1476,7 @@ bool Glm5Model::prefill_setup_own(std::string& err) {
             S->dq_iota = (int32_t*) b; b += b_io;
             S->dq_bounds = (int32_t*) b;
             mmq::iota(S->dq_iota, (int64_t) rows + kIdsPad, fast_->cs);
-            std::fprintf(stderr, "glm prefill: CUDA%d the dense FFN through MMQ, %d tokens a pass (%.0f MB)\n", dev_, rows,
+            std::fprintf(stderr, "glm prefill: CUDA%d the dense FFN on the int8 tensor cores (MMQ / own GEMM), %d tokens a pass (%.0f MB)\n", dev_, rows,
                          (double) (b_gu + b_xq + b_hq + b_io + b_bd) / 1048576.0);
         }
     }
