@@ -22,11 +22,14 @@
 namespace strata::kernels::cpu {
 namespace {
 
-// STRATA_CPU_GGML=1 (a build with ggml only): ggml-cpu's quantizers and dots, as before own_dot
+// STRATA_CPU_GGML=1 (a build with ggml only): ggml-cpu's quantizers and dots, as before own_dot.  Unset: the own
+// dots, except where they have no SIMD build (aarch64: the DGX Spark) and ggml-cpu is linked in - its NEON dots are
+// the faster ones there; =0 takes the own ones anyway.
 bool use_ggml() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CPU_GGML");
-        if (v == nullptr || std::atoi(v) == 0) return false;
+        if (v == nullptr) return ggml_cpu_have() && !own_dot_simd();
+        if (std::atoi(v) == 0) return false;
         if (ggml_cpu_have()) return true;
         std::fprintf(stderr, "native experts: STRATA_CPU_GGML=1 needs a build with ggml (STRATA_GGML=ON) - own dots\n");
         return false;

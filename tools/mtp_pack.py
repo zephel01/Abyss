@@ -31,9 +31,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import add_gguf_py  # noqa: E402
-add_gguf_py()
-import gguf  # noqa: E402  (the pinned llama.cpp gguf-py, which knows Q2_0 = type 42)
+import gguf_io  # noqa: E402  (Abyss's own GGUF writer, which knows Q2_0 = type 42)
 
 EXPERT_TENSORS = ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
 
@@ -126,9 +124,9 @@ def dequant(kind: str, blob: np.ndarray, n: int) -> np.ndarray:
     return (b[:, 2:].view(np.int8).astype(np.float32) * d).reshape(-1)[:n]
 
 
-QUANT = {"q2_0": (q2_0, gguf.GGMLQuantizationType.Q2_0, 64, 18),
-         "q4_0": (q4_0, gguf.GGMLQuantizationType.Q4_0, 32, 18),
-         "q8_0": (q8_0, gguf.GGMLQuantizationType.Q8_0, 32, 34)}
+QUANT = {"q2_0": (q2_0, "Q2_0", 64, 18),
+         "q4_0": (q4_0, "Q4_0", 32, 18),
+         "q8_0": (q8_0, "Q8_0", 32, 34)}
 
 
 def main() -> int:
@@ -141,7 +139,7 @@ def main() -> int:
     src = Path(a.src)
     manifest = json.loads((src / "mtp-manifest.json").read_text())
     fn, qtype, block, block_bytes = QUANT[a.experts]
-    w = gguf.GGUFWriter(a.out, "qwen4exp-mtp")
+    w = gguf_io.Writer(a.out, "qwen4exp-mtp")
     w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
@@ -165,24 +163,21 @@ def main() -> int:
                 ref = x[e].reshape(-1)
                 got = dequant(a.experts, parts[e], ref.size)
                 errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
-            # gguf-py takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
-            w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
+            # GGUF order is innermost-first: the row length, then the outer dimensions reversed
+            w.add_tensor(name, [shape[-1]] + list(reversed(shape[:-1])), qtype, blob)
             report.append({"tensor": name, "format": a.experts, "bytes": int(blob.size),
                            "relative_rms_error_first_experts": round(float(np.mean(errs)), 5),
                            "seconds": round(time.time() - t0, 1)})
         elif len(shape) == 1:
             x = load_bf16(src / t["file"], shape)
-            w.add_tensor(name, x.astype(np.float32))
+            w.add_tensor(name, list(reversed(shape)), "F32", x.astype(np.float32))
             report.append({"tensor": name, "format": "F32", "bytes": x.size * 4})
         else:
             bf = np.fromfile(src / t["file"], dtype="<u2").reshape(shape)
-            w.add_tensor(name, bf, raw_dtype=gguf.GGMLQuantizationType.BF16)
+            w.add_tensor(name, list(reversed(shape)), "BF16", bf)
             report.append({"tensor": name, "format": "BF16", "bytes": bf.size * 2})
         print(f"{name}: {report[-1]['format']} {report[-1]['bytes'] / 1e6:.1f} MB", flush=True)
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file()
-    w.close()
+    w.write()
     total = sum(r["bytes"] for r in report)
     Path(a.out + ".report.json").write_text(json.dumps({"total_bytes": total, "tensors": report}, indent=1))
     print(f"wrote {a.out}: {total / 1e9:.3f} GB of tensor data")

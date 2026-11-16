@@ -13,6 +13,8 @@ namespace strata::kernels::cpu {
 int own_vec_dot_type(int type) noexcept;
 /// x (n floats) -> the activation blocks of act_type (Q8_0 / Q8_1 / Q8_K); false for any other type.
 bool own_quant_act(int act_type, const float* x, void* dst, int64_t n) noexcept;
+/// Whether this CPU runs the own dots' SIMD build (x86 with AVX2 + FMA); false: the portable C++ build.
+bool own_dot_simd() noexcept;
 /// One row's dot product (the portable reference, every type own_vec_dot_type knows).
 float own_dot(int type, int n, const void* w, const void* act) noexcept;
 /// The same, by the AVX2 + FMA build where the CPU has it (same bits).

@@ -6,26 +6,24 @@ usage: dense_overlay.py <in shard 1> <out dir> [--type=q5_k] [--from=q6_k[,...]]
   a tensor in several shards is taken from the first, so the changed copies shadow the model's (the engine looks
   tensors up in shard order too).  The overlay costs only the changed tensors' bytes (DeepSeek V4.1 UD-IQ1_S: 1.4 GB
   for the abliteration edit, 3.2 GB for its dense Q6_K -> Q5_K) instead of another copy of the model.
-  <regex> ...    tensors of a --from type (default Q6_K) re-quantized to --type (default Q5_K): dequantized by gguf-py,
-                 quantized by ggml_quantize_chunk (libggml-base.so, no imatrix), so the two roundings add up
+  <regex> ...    tensors of a --from type (default Q6_K) re-quantized to --type (default Q5_K): dequantized by
+                 tools/gguf_io.py, quantized by ggml_quantize_chunk (libggml-base.so, no imatrix), so the two
+                 roundings add up
   --abl=<npz>    a refusal-direction edit as mrfakename/DeepSeek-V4.1-Flash-1017-abliterated ships it
                  (abliteration-edit.npz: Q [n_embd, r] orthonormal, scales [layer, (attn_output_b, ffn_down_shexp)]):
                  W' = W - s Q Q^T W on the rows (the residual writes) of blk.N.attn_output_b / blk.N.ffn_down_shexp,
                  re-quantized to the tensor's own type unless a <regex> also matches it
-GGUF_PY (default: a llama.cpp checkout's gguf-py) and LIBGGML (a llama.cpp build's libggml-base.so) as for
-requant_dense.py.  Quality and speed of the overlays made this way: docs/deepseek41/README.md.
+LIBGGML (a libggml-base shared library: the one step that needs llama.cpp) as for requant_dense.py.  Quality and speed of the overlays made this way: docs/deepseek41/README.md.
 """
-import ctypes
 import os
 import re
 import sys
 
-sys.path.insert(0, os.environ.get("GGUF_PY", "/home/zephel01/llm/apps/llama.cpp/gguf-py"))   # llama.cpp/gguf-py
-import numpy as np  # noqa: E402
-import gguf  # noqa: E402
-from gguf import GGMLQuantizationType as Q  # noqa: E402
+import numpy as np
 
-LIBGGML = os.environ.get("LIBGGML", "/home/zephel01/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so")   # a llama.cpp build
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gguf_io as G  # noqa: E402
+
 ABL = re.compile(r"^blk\.(\d+)\.(attn_output_b|ffn_down_shexp)\.weight$")
 
 
@@ -37,8 +35,8 @@ def main() -> int:
         return 2
     shard1, out_dir = args[0], args[1]
     pats = [re.compile(p) for p in args[2:]]
-    new_type = Q[opts.get("--type", "q5_k").upper()]
-    src_types = {Q[n.upper()] for n in opts.get("--from", "q6_k").split(",")}
+    new_type = G.TYPE_ID[opts.get("--type", "q5_k").upper()]
+    src_types = {G.TYPE_ID[n.upper()] for n in opts.get("--from", "q6_k").split(",")}
     abl = None
     if "--abl" in opts:
         z = np.load(opts["--abl"])
@@ -50,10 +48,11 @@ def main() -> int:
             return 0.0
         return float(abl[1][int(m.group(1)), 0 if m.group(2) == "attn_output_b" else 1])
 
-    lib = ctypes.CDLL(LIBGGML)
-    lib.ggml_quantize_chunk.restype = ctypes.c_size_t
-    lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
-                                        ctypes.c_int64, ctypes.c_void_p]
+    try:
+        lib = G.ggml_lib()
+    except G.NeedsLlamaCpp as e:
+        print(e)
+        return 1
     m = re.match(r"(.*)-00001-of-(\d{5})\.gguf$", os.path.basename(shard1))
     if m is None:
         print("%s is not shard 1 of a split GGUF (<name>-00001-of-0000N.gguf)" % shard1)
@@ -63,26 +62,18 @@ def main() -> int:
               for i in range(1, total + 1)]
     n_out = total + 1
     os.makedirs(out_dir, exist_ok=True)
-    r0 = gguf.GGUFReader(shards[0])
-    w = gguf.GGUFWriter(os.path.join(out_dir, "overlay-00001-of-%05d.gguf" % n_out),
-                        r0.fields[gguf.Keys.General.ARCHITECTURE].contents())
-    for f in r0.fields.values():
-        if f.name == gguf.Keys.General.ARCHITECTURE or f.name.startswith(("GGUF.", "split.")):
-            continue
-        if f.name == gguf.Keys.General.ALIGNMENT:   # the writer's padding too, not just the key
-            w.add_custom_alignment(int(f.contents()))
-            continue
-        vt = f.types[0]
-        w.add_key_value(f.name, f.contents(), vt, sub_type=f.types[-1] if vt == gguf.GGUFValueType.ARRAY else None)
+    r0 = G.Reader(shards[0])
+    w = G.Writer(os.path.join(out_dir, "overlay-00001-of-%05d.gguf" % n_out), r0.get("general.architecture"))
+    G.copy_fields(r0, w, skip=lambda k: k.startswith("split."))
     plan, old, new = [], 0, 0
     for sh in shards:
-        for t in gguf.GGUFReader(sh).tensors:
-            hit = t.tensor_type in src_types and any(p.search(t.name) for p in pats)
+        for t in G.Reader(sh).tensors:
+            hit = t.type in src_types and any(p.search(t.name) for p in pats)
             sc = abl_scale(t.name)
             if not hit and sc == 0.0:
                 continue
-            ty = new_type if hit else t.tensor_type
-            bs, ts = gguf.GGML_QUANT_SIZES[ty]
+            ty = new_type if hit else t.type
+            _, bs, ts = G.TYPES[ty]
             ne0 = int(t.shape[0])
             ne1 = int(np.prod(t.shape[1:])) if len(t.shape) > 1 else 1
             if ne0 % bs:
@@ -93,27 +84,27 @@ def main() -> int:
                 continue
             nb = ne1 * (ne0 // bs) * ts
             plan.append((t, ne0, ne1, nb, ty, sc))
-            old += t.n_bytes
+            old += t.nbytes
             new += nb
+    n_abl = [0]
+
+    def make(t, ne0, ne1, nb, ty, sc):
+        def run():
+            f32 = np.ascontiguousarray(G.dequantize(t.data, t.type).reshape(ne1, ne0), dtype=np.float32)
+            if sc != 0.0:   # the rows are the residual (n_embd outputs): the edit takes the subspace out of what it writes
+                Qm = abl[0]
+                f32 = np.ascontiguousarray(f32 - (sc * (Qm @ (Qm.T @ f32.astype(np.float64)))).astype(np.float32))
+                n_abl[0] += 1
+            dst = np.empty(nb, dtype=np.uint8)
+            got = lib.ggml_quantize_chunk(int(ty), f32.ctypes.data, dst.ctypes.data, 0, ne1, ne0, None)
+            if got != nb:
+                raise RuntimeError("ggml_quantize_chunk wrote %d bytes, expected %d for %s" % (got, nb, t.name))
+            return dst
+        return run
     for t, ne0, ne1, nb, ty, sc in plan:
-        w.add_tensor_info(t.name, (ne1, nb // ne1), np.uint8, nb, raw_dtype=ty)
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_ti_data_to_file()
-    n_abl = 0
-    for t, ne0, ne1, nb, ty, sc in plan:
-        f32 = np.ascontiguousarray(gguf.quants.dequantize(t.data, t.tensor_type).reshape(ne1, ne0), dtype=np.float32)
-        if sc != 0.0:   # the rows are the residual (n_embd outputs): the edit takes the subspace out of what it writes
-            Qm = abl[0]
-            f32 = np.ascontiguousarray(f32 - (sc * (Qm @ (Qm.T @ f32.astype(np.float64)))).astype(np.float32))
-            n_abl += 1
-        dst = np.empty(nb, dtype=np.uint8)
-        got = lib.ggml_quantize_chunk(int(ty), f32.ctypes.data, dst.ctypes.data, 0, ne1, ne0, None)
-        if got != nb:
-            print("ggml_quantize_chunk wrote %d bytes, expected %d for %s" % (got, nb, t.name))
-            return 1
-        w.write_tensor_data(dst.reshape(ne1, nb // ne1))
-    w.close()
+        w.add_tensor(t.name, [ne0, ne1], ty, make(t, ne0, ne1, nb, ty, sc))
+    w.write()
+    n_abl = n_abl[0]
     for k, sh in enumerate(shards, start=2):
         dst = os.path.join(out_dir, "overlay-%05d-of-%05d.gguf" % (k, n_out))
         if not os.path.lexists(dst):

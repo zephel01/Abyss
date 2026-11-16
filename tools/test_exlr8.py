@@ -8,9 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
-from _paths import add_gguf_py
-add_gguf_py()
-from gguf import GGMLQuantizationType as Q, quants
+import gguf_io as G
 import exl3_pack
 import exlr8_convert as C
 
@@ -55,9 +53,9 @@ class Dense(unittest.TestCase):
         w = C.decode_dense([C.MXFP8, 1, 32, 0, 0, 0, 0, 0], {"fp8": fp8, "e8m0": e8})
         np.testing.assert_array_equal(w[0, :4], np.array([8, -8, 16, 2.0 ** -6], dtype=np.float32))
 
-    def test_q8_0_matches_gguf_py(self):
+    def test_q8_0_matches_the_reference_quantizer(self):
         a = np.random.default_rng(3).normal(0, 0.05, (4, 256)).astype(np.float32)
-        self.assertEqual(exl3_pack.to_q8_0(a), quants.quantize(a, Q.Q8_0).tobytes())
+        self.assertEqual(exl3_pack.to_q8_0(a), G.quantize(a, "Q8_0").tobytes())
 
 
 if __name__ == "__main__":

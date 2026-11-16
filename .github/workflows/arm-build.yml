@@ -15,7 +15,8 @@ permissions:
   contents: read
 
 env:
-  # llama.cpp at the commit the installer pins (setup.py LLAMA_CPP_COMMIT; tests.yml uses the same)
+  # llama.cpp at the commit the installer pins (setup.py LLAMA_CPP_COMMIT; tests.yml uses the same): ggml-cpu for the
+  # CPU tests' oracle and the NEON dots, ggml-cuda's MMQ sources for the engine
   LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
   CUDA_VER: "13-3"         # the apt packages' suffix (cuda-*-13-3)
   CUDA_HOME: /usr/local/cuda-13.3
@@ -25,13 +26,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ggml-org/llama.cpp
-          ref: ${{ env.LLAMA_CPP_COMMIT }}
-          path: third_party/llama.cpp
-          sparse-checkout: gguf-py
+      - uses: actions/checkout@v4   # (no gguf-py: the tools read GGUF themselves, tools/gguf_io.py)
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
