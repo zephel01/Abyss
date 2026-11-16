@@ -68,7 +68,10 @@ void random_rows(int type, uint8_t* dst, int64_t rows, int64_t cols, std::mt1993
         for (size_t i = 0; i < bs; ++i) p[i] = (uint8_t) byte(rng);
         if (type == qt::MXFP4) {
             p[0] = (uint8_t) (119 + byte(rng) % 6);
-        } else {   // (the i-quants: an fp16 scale first)
+        } else if (type == qt::IQ1_M) {   // (the f16 scale's nibbles on top of the four scale words)
+            const uint16_t d = qt::fp32_to_fp16(sc(rng));
+            for (int k = 0; k < 4; ++k) p[48 + 2 * k + 1] = (uint8_t) ((p[48 + 2 * k + 1] & 0x0F) | (((d >> (4 * k)) & 0xF) << 4));
+        } else {   // (the others: an fp16 scale first)
             const uint16_t d = qt::fp32_to_fp16(sc(rng));
             std::memcpy(p, &d, 2);
         }
@@ -296,7 +299,9 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
             if (verbose) std::printf("%-28s       vs MMQ: h differs %.2e of its norm, the output %.2e\n", name, eh, ed);
             // (MXFP4 on Blackwell: MMQ rounds the activations to FP4, not int8 - its output is ~12% of the norm away
             // from the int8 one; the reference above is what the own kernel is held to)
-            const bool fp4 = c.gu_type == qt::MXFP4 || c.d_type == qt::MXFP4;
+            // (IQ1_S: on random blocks MMQ's result is ~1% of the norm away, or not finite; real IQ1_S tensors are
+            // compared with --dump)
+            const bool fp4 = c.gu_type == qt::MXFP4 || c.d_type == qt::MXFP4 || c.gu_type == qt::IQ1_S || c.d_type == qt::IQ1_S;
             if (!fp4 && (!(eh < 2e-2) || !(ed < 5e-2))) {
                 std::printf("%-28s FAIL  vs MMQ: h differs %.2e of its norm, the output %.2e\n", name, eh, ed);
                 ok = false;
@@ -478,7 +483,7 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {
@@ -491,6 +496,9 @@ int main(int argc, char** argv) {
             std::snprintf(name, sizeof name, "%s/%s 512x256 limit", qt::type_name(gt), qt::type_name(dt));
             if (!run_case(synthetic(gt, dt, 512, 256, {33, 0, 17}, 0, 0.75f, rng), name, true)) ++bad;
         }
+    // K a multiple of 128 only (Qwen3.8's experts: n_ff 640), the types of 32- and 64-value blocks on the down side
+    if (!run_case(synthetic(qt::IQ2_S, qt::IQ4_NL, 1024, 640, {0, 3, 9, 20, 70, 131, 1, 64}, 2, INFINITY, rng), "iq2_s/iq4_nl 1024x640", true)) ++bad;
+    if (!run_case(synthetic(qt::IQ3_XXS, qt::Q2_0, 1024, 640, {5, 70, 140}, 0, 10.0f, rng), "iq3_xxs/q2_0 1024x640", true)) ++bad;
     std::printf(bad ? "moe_own_test: %d FAILED\n" : "moe_own_test: all passed\n", bad);
     return bad ? 1 : 0;
 }

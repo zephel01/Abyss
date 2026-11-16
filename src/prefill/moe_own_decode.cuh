@@ -162,4 +162,114 @@ template<> struct Dec<39> {
     }
 };
 
+// bytes of a + b, a byte at a time (no carry between bytes)
+__device__ __forceinline__ uint32_t add8(uint32_t a, uint32_t b) {
+    return ((a & 0x7F7F7F7Fu) + (b & 0x7F7F7F7Fu)) ^ ((a ^ b) & 0x80808080u);
+}
+
+// IQ1_S: {f16 d; 32 codebook bytes (8 values each); 8 x u16: 4 x 3 more index bits, 3 scale bits, the shift's sign}.
+// A value is d (2 s + 1) (g +- 1/8), g in {-1, 0, 1}: as int8 8 g +- 1 under d (2 s + 1) / 8.  The codebook
+// (iq1s_grid_gpu) holds g + 1 a nibble: values 0-3 in the bytes' low nibbles, 4-7 in the high ones.
+__device__ __forceinline__ uint32_t iq1_word(uint32_t entry, int half, bool minus) {
+    const uint32_t q = (half ? entry >> 4 : entry) & 0x0F0F0F0Fu;      // g + 1: 0, 1, 2
+    return add8(q << 3, minus ? 0xF7F7F7F7u : 0xF9F9F9F9u);           // 8 (g + 1) - 8 -+ 1
+}
+template<> struct Dec<19> {
+    static constexpr int GW = 2048;
+    __device__ static __forceinline__ const uint32_t* table() { return iq1s_grid_gpu; }
+    static constexpr int WCH = 256, CB = 50, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p) * 0.125f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float hd, const uint32_t* grid) {
+        const uint8_t* q = p + 2 + 4 * ib;
+        const uint32_t qh = rd16(p + 2 + 32 + 2 * ib);
+        const int e = t >> 1, half = t & 1;
+        const bool minus = (qh & 0x8000u) != 0;
+        Step r;
+        r.lo = iq1_word(grid[q[e] | (((qh >> (3 * e)) & 7u) << 8)], half, minus);
+        r.hi = iq1_word(grid[q[e + 2] | (((qh >> (3 * (e + 2))) & 7u) << 8)], half, minus);
+        r.s = hd * (float) (2 * (int) ((qh >> 12) & 7u) + 1);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
+// IQ1_M: {32 codebook bytes; 16 x u8: two nibbles (3 more index bits, the shift's sign), one a 8 values; 4 x u16: four
+// 3-bit scales (one a 16 values) and in the top nibbles the block's f16 scale}.  Values as IQ1_S.
+template<> struct Dec<29> {
+    static constexpr int GW = 2048;
+    __device__ static __forceinline__ const uint32_t* table() { return iq1s_grid_gpu; }
+    static constexpr int WCH = 256, CB = 56, AL = 2, SUB = 16;
+    __device__ static __forceinline__ float head(const uint8_t* p) {
+        const uint32_t s0 = rd16(p + 48), s1 = rd16(p + 50), s2 = rd16(p + 52), s3 = rd16(p + 54);
+        const uint16_t u = (uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00F0u) | ((s2 >> 4) & 0x0F00u) | (s3 & 0xF000u));
+        return __half2float(__ushort_as_half(u)) * 0.125f;
+    }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t* grid) {
+        const uint8_t* q = p + 4 * ib;
+        const int e = t >> 1, half = t & 1;
+        // (group l of 8 values: qh[2 ib + l / 2]'s nibble l % 2; lo is group e, hi group e + 2)
+        const uint32_t h0 = (uint32_t) p[32 + 2 * ib] >> (4 * e), h1 = (uint32_t) p[32 + 2 * ib + 1] >> (4 * e);
+        const uint32_t sc = rd16(p + 48 + 2 * (ib >> 1)) >> (6 * (ib & 1));
+        Step r;
+        r.lo = iq1_word(grid[q[e] | ((h0 & 7u) << 8)], half, (h0 & 8u) != 0);
+        r.hi = iq1_word(grid[q[e + 2] | ((h1 & 7u) << 8)], half, (h1 & 8u) != 0);
+        r.s = 0.0f;
+        r.m0 = 2 * (int) (sc & 7u) + 1;
+        r.m1 = 2 * (int) ((sc >> 3) & 7u) + 1;
+        return r;
+    }
+};
+
+// 4 nibbles in the low nibbles of n's bytes -> the 4 bytes table[nibble] (the table as four 32-bit words)
+__device__ __forceinline__ uint32_t lut16(uint32_t n, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
+    uint32_t x = n & 0x0F0F0F0Fu;
+    x = (x | x >> 4) & 0x00FF00FFu;
+    x = (x | x >> 8) & 0x0000FFFFu;                       // the nibbles at bits 0, 4, 8, 12
+    const uint32_t a = __byte_perm(t0, t1, x), b = __byte_perm(t2, t3, x);   // (a selector's low 3 bits)
+    return __byte_perm(a, b, 0x3210u | ((x & 0x8888u) >> 1));              // nibble bit 3: byte i of a, or of b
+}
+// the i-quants' 4-bit values (kvalues_iq4nl)
+__device__ __forceinline__ uint32_t iq4_bytes(uint32_t n) { return lut16(n, 0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u); }
+
+// IQ4_NL: 32 values a block: {f16 d; 16 bytes: value i in byte i's low nibble, value 16 + i in its high nibble}.  A
+// chunk is four blocks.
+template<> struct Dec<20> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 72, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 18 * ib;
+        const uint32_t v = rd16(b + 2 + 4 * t) | rd16(b + 4 + 4 * t) << 16;
+        Step r;
+        r.lo = iq4_bytes(v);
+        r.hi = iq4_bytes(v >> 4);
+        r.s = rd_f16(b);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
+// Q2_0: 64 values a block: {f16 d; 16 bytes: 4 values a byte, 2 bits each, value = code - 1}.  A chunk is two blocks.
+__device__ __forceinline__ uint32_t q2_bytes(uint32_t byte) {
+    const uint32_t v = (byte | byte << 6 | byte << 12 | byte << 18) & 0x03030303u;   // the four codes, a byte each
+    return ((v | 0x80808080u) - 0x01010101u) ^ 0x80808080u;                           // - 1
+}
+template<> struct Dec<42> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 36, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 18 * (ib >> 1);
+        const uint8_t* q = b + 2 + 8 * (ib & 1);
+        Step r;
+        r.lo = q2_bytes(q[t]);
+        r.hi = q2_bytes(q[4 + t]);
+        r.s = rd_f16(b);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
 }  // namespace strata::prefill::own

@@ -398,6 +398,10 @@ void launch(int type, const KArgs& a, unsigned grid, bool coarse, cudaStream_t s
         case 17: launch_t<17, GLU>(a, grid, coarse, s); break;
         case 18: launch_t<18, GLU>(a, grid, coarse, s); break;
         case 22: launch_t<22, GLU>(a, grid, coarse, s); break;
+        case 19: launch_t<19, GLU>(a, grid, coarse, s); break;
+        case 29: launch_t<29, GLU>(a, grid, coarse, s); break;
+        case 20: launch_t<20, GLU>(a, grid, coarse, s); break;
+        case 42: launch_t<42, GLU>(a, grid, coarse, s); break;
         case 39: launch_t<39, GLU>(a, grid, coarse, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
@@ -423,11 +427,15 @@ bool built() {
     }();
     return ok;
 }
-bool supported(int t) { return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39); }
+bool supported(int t) {
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42);
+}
 #endif
 
 bool usable(int t, int64_t rows, int64_t cols) {
-    return supported(t) && rows > 0 && cols > 0 && cols % 256 == 0 && rows % 16 == 0;
+    // (a chunk of the type's blocks: 256 values, 128 for the 32- and 64-value block types)
+    const int64_t chunk = (t == 39 || t == 20 || t == 42) ? 128 : 256;
+    return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * 4; }

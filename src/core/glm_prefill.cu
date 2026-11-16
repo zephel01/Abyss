@@ -373,7 +373,7 @@ int moe_window_rows(size_t T, const Glm5Geometry& g) {
 size_t act_bytes(int64_t rows, int64_t cols) {
     size_t n = mmq::q8_bytes(rows, cols);
 #if defined(STRATA_MOE_OWN)
-    if (cols % 256 == 0) n = std::max(n, own::act_bytes(rows, cols));
+    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols));
 #endif
     return n;
 }

@@ -20,11 +20,12 @@ namespace strata::prefill::own {
 bool built();
 /// The kernels read weights of this ggml type.
 bool supported(int ggml_type);
-/// supported(type) and a [rows, cols] matrix of it fits the kernels' tiles (cols a multiple of 256, rows of 16).
+/// supported(type) and a [rows, cols] matrix of it fits the kernels' tiles (cols a multiple of 256 - of 128 for the
+/// types of 32- and 64-value blocks -, rows of 16).
 bool usable(int ggml_type, int64_t rows, int64_t cols);
 
 /// Bytes of `rows` activation rows of `cols` values in the kernels' form: an int8 plane [rows][cols], then a float
-/// plane [rows][cols / 32] (the blocks' scales).  cols a multiple of 256.  (The int8 plane is in the kernels' own
+/// plane [rows][cols / 32] (the blocks' scales).  cols a multiple of 128.  (The int8 plane is in the kernels' own
 /// word order, see moe_own.cu.)
 size_t act_bytes(int64_t rows, int64_t cols);
 /// Row i of the output is row ids[i] of x (row i when ids is null); x has `ld` floats a row.  xq: 16-byte aligned.
