@@ -176,7 +176,8 @@ __device__ __forceinline__ void mma16(int c[4], uint32_t a0, uint32_t a1, uint32
 
 // 16-byte words a slot holds (a chunk from any offset its alignment allows), and a CTA's shared memory
 template<int TY, int CF> struct Lay {
-    static constexpr int WS = (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
+    static constexpr int WH = Rng<TY>::HDR > 0 ? (16 - Dec<TY>::AL + Rng<TY>::HDR + 15) / 16 : 0;   // the header's words
+    static constexpr int WS = WH + (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
     static constexpr int BUF = 2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + 2 * Cfg<CF>::TC;   // 16-byte words
     static constexpr size_t smem = (size_t) BUF * 16 + (size_t) Dec<TY>::GW * 4;   // (+ the codebook)
 };
@@ -188,7 +189,7 @@ template<int TY, bool GLU, int CF>
 __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, int rt, int b0, int b1, int ng) {
     typedef Dec<TY> D;
     constexpr int NW = Cfg<CF>::NW, TC = Cfg<CF>::TC, NT = Cfg<CF>::NT, NG = TC / 8;
-    constexpr int WS = Lay<TY, CF>::WS, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
+    constexpr int WS = Lay<TY, CF>::WS, WH = Lay<TY, CF>::WH, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     uint4* wbuf = smem;                       // [2][NT slots][WS]
     uint4* xbuf = wbuf + 2 * NT * WS;         // [2][TC][8]
@@ -199,7 +200,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     const uint32_t* grid = (const uint32_t*) (smem + Lay<TY, CF>::BUF);   // (own_kernel copied it)
 #endif
     const uint8_t* we = a.w + (size_t) e * a.stride;
-    const size_t row_bytes = (size_t) (a.K / D::WCH) * D::CB;
+    const size_t row_bytes = (size_t) (a.K / D::WCH) * Rng<TY>::RB;
     const int n_h = a.K / 128, n_wc = a.K / D::WCH;
 
     // slot s (0 .. NT-1) = fragment f (s / (NT / 2)), warp, row in the fragment -> that row's bytes
@@ -210,12 +211,19 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     };
     const uint8_t* my_slot = slot_row(threadIdx.x);
     const auto issue_w = [&](int c) {   // this thread's slot: the 16-byte words around its row's chunk c
-        const uintptr_t src = (uintptr_t) (my_slot + (size_t) c * D::CB);
+        uint4* dst = wbuf + ((c & 1) * NT + threadIdx.x) * WS;
+        if constexpr (WH > 0) {   // (the chunk's header range first)
+            const uintptr_t src = (uintptr_t) (my_slot + Rng<TY>::hdr(c));
+            const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
+            const int last = (int) (((src & 15) + Rng<TY>::HDR - 1) / 16);
+#pragma unroll
+            for (int k = 0; k < WH; ++k) cp16(dst + k, p + 16 * min(k, last));
+        }
+        const uintptr_t src = (uintptr_t) (my_slot + Rng<TY>::dat(c));
         const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
         const int last = (int) (((src & 15) + D::CB - 1) / 16);   // (no word past the chunk: it may be past the pool)
-        uint4* dst = wbuf + ((c & 1) * NT + threadIdx.x) * WS;
 #pragma unroll
-        for (int k = 0; k < WS; ++k) cp16(dst + k, p + 16 * min(k, last));
+        for (int k = 0; k < WS - WH; ++k) cp16(dst + WH + k, p + 16 * min(k, last));
     };
     const auto issue_x = [&](int h) {
         uint4* xd = xbuf + (h & 1) * TC * 8;
@@ -256,6 +264,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     issue_w(0);
     cp_commit();
     const uint8_t* sp[2][2];
+    const uint8_t* hp[2][2] = {};   // (the chunk's header, the types that have one)
     float hd[2][2];
     for (int h = 0; h < n_h; ++h) {
         cp_wait_all();
@@ -269,9 +278,14 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
             for (int f = 0; f < 2; ++f)
 #pragma unroll
                 for (int h8 = 0; h8 < 2; ++h8) {
-                    const uintptr_t src = (uintptr_t) (rowp[f][h8] + (size_t) c * D::CB);
-                    sp[f][h8] = (const uint8_t*) (wbuf + ((c & 1) * NT + soff[f][h8]) * WS) + (src & 15);
-                    hd[f][h8] = D::head(sp[f][h8]);
+                    const uint8_t* slot = (const uint8_t*) (wbuf + ((c & 1) * NT + soff[f][h8]) * WS);
+                    sp[f][h8] = slot + WH * 16 + ((uintptr_t) (rowp[f][h8] + Rng<TY>::dat(c)) & 15);
+                    if constexpr (WH > 0) {
+                        hp[f][h8] = slot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::hdr(c)) & 15);
+                        hd[f][h8] = D::head(hp[f][h8]);
+                    } else {
+                        hd[f][h8] = D::head(sp[f][h8]);
+                    }
                 }
         }
         const uint4* xw = xbuf + (h & 1) * TC * 8;
@@ -284,7 +298,10 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
 #pragma unroll
             for (int f = 0; f < 2; ++f)
 #pragma unroll
-                for (int h8 = 0; h8 < 2; ++h8) st[i][f][h8] = D::step(sp[f][h8], (h % HPW) * SPH + i, t, hd[f][h8], grid);
+                for (int h8 = 0; h8 < 2; ++h8) {
+                    if constexpr (WH > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8]);
+                    else st[i][f][h8] = D::step(sp[f][h8], (h % HPW) * SPH + i, t, hd[f][h8], grid);
+                }
 #pragma unroll
         for (int j = 0; j < NG; ++j) {
             if (j >= ng) break;
@@ -402,6 +419,7 @@ void launch(int type, const KArgs& a, unsigned grid, bool coarse, cudaStream_t s
         case 29: launch_t<29, GLU>(a, grid, coarse, s); break;
         case 20: launch_t<20, GLU>(a, grid, coarse, s); break;
         case 42: launch_t<42, GLU>(a, grid, coarse, s); break;
+        case 23: launch_t<23, GLU>(a, grid, coarse, s); break;
         case 39: launch_t<39, GLU>(a, grid, coarse, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
@@ -428,13 +446,13 @@ bool built() {
     return ok;
 }
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23);
 }
 #endif
 
 bool usable(int t, int64_t rows, int64_t cols) {
     // (a chunk of the type's blocks: 256 values, 128 for the 32- and 64-value block types)
-    const int64_t chunk = (t == 39 || t == 20 || t == 42) ? 128 : 256;
+    const int64_t chunk = (t == 39 || t == 20 || t == 42) ? 128 : 256;   // (IQ4_XS: 256-value blocks)
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 

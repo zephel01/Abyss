@@ -483,7 +483,7 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {

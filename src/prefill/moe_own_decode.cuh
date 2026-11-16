@@ -272,4 +272,44 @@ template<> struct Dec<42> {
     }
 };
 
+// IQ4_XS: 256 values: {f16 d; u16 scales_h; 4 x u8 scales_l; 128 bytes as IQ4_NL's, 16 a 32-value block}; block ib's
+// scale is d (ls - 32), ls = scales_l's nibble ib | scales_h's 2 bits ib << 4.
+// A chunk is half of it (the whole 136 bytes of 256 rows twice over do not fit a CTA's shared memory): the 8-byte
+// header (HDR; both halves' chunks bring it) and the half's 64 bytes.
+template<> struct Dec<23> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 32;
+    static constexpr int HDR = 8, RB = 68;   // (header bytes; row bytes a chunk)
+    __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 136; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 136 + 8 + (size_t) (c & 1) * 64; }
+    __device__ static __forceinline__ float head(const uint8_t* ph) { return rd_f16(ph); }
+    // pd: the chunk's data; ph: its header; c: the chunk (its parity: which half)
+    __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float hd) {
+        const int g = (c & 1) * 4 + ib;   // the block in its 256
+        const uint32_t sh = rd16(ph + 2), sl = ph[4 + (g >> 1)];
+        const int ls = (int) (((sl >> (4 * (g & 1))) & 15u) | (((sh >> (2 * g)) & 3u) << 4));
+        const uint8_t* q = pd + 16 * ib + 4 * t;
+        const uint32_t v = rd16(q) | rd16(q + 2) << 16;
+        Step r;
+        r.lo = iq4_bytes(v);
+        r.hi = iq4_bytes(v >> 4);
+        r.s = hd * (float) (ls - 32);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
+// A chunk's bytes in its row: one range (chunk c at c * CB), or - a Dec with HDR - a header range and a data range
+template<int TY, typename = void> struct Rng {
+    static constexpr int HDR = 0, RB = Dec<TY>::CB;
+    __device__ static __forceinline__ size_t hdr(int) { return 0; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) c * Dec<TY>::CB; }
+};
+template<int TY> struct Rng<TY, decltype((void) Dec<TY>::HDR)> {
+    static constexpr int HDR = Dec<TY>::HDR, RB = Dec<TY>::RB;
+    __device__ static __forceinline__ size_t hdr(int c) { return Dec<TY>::hdr(c); }
+    __device__ static __forceinline__ size_t dat(int c) { return Dec<TY>::dat(c); }
+};
+
 }  // namespace strata::prefill::own
