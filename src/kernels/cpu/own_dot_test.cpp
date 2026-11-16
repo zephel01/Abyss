@@ -63,6 +63,12 @@ std::vector<uint8_t> blocks(int t, int64_t n) {
     return w;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr bool kOracleExact = true;    // the own x86 builds follow ggml-cpu's x86 order: bit for bit
+#else
+constexpr bool kOracleExact = false;   // elsewhere ggml-cpu uses its own SIMD order (NEON): compare values
+#endif
+
 int fails = 0;
 void check(bool ok, const std::string& what) {
     if (!ok) {
@@ -77,7 +83,8 @@ const int kTypes[] = {2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21,
 int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     const bool g = kc::ggml_cpu_have();
-    std::printf("own_dot_test: oracle %s\n", g ? "ggml (bit for bit)" : "none (AVX2 build vs portable build only)");
+    std::printf("own_dot_test: oracle %s\n", !g ? "none (AVX2 build vs portable build only)"
+                                             : kOracleExact ? "ggml (bit for bit)" : "ggml (values, summation-order bound)");
     if (g && !bench) {
         // fp16, both ways, every pattern
         uint64_t bad = 0;
@@ -155,7 +162,23 @@ int main(int argc, char** argv) {
                 const float s2 = kc::own_dot_fast(t, (int) n, w.data(), aq.data());
                 if (std::memcmp(&s1, &s2, 4) != 0 && fails < 5) std::printf("  n %lld portable %.9g avx2 %.9g\n", (long long) n, (double) s1, (double) s2);
                 check(std::memcmp(&s1, &s2, 4) == 0, std::string("avx2 vs portable ") + qt::type_name(t));
-                if (g) {
+                if (g && !kOracleExact) {
+                    // aarch64 (no own SIMD build): ggml-cpu's NEON dots and quantizers sum in another order, so bits
+                    // differ by design (and ggml stays the default there, STRATA_CPU_GGML).  Check the value instead:
+                    // the same activations into both dots, within a summation-order bound of sum |w x|.
+                    const qt::Traits* tw = qt::traits(t);
+                    std::vector<float> wf((size_t) n);
+                    tw->to_float(w.data(), wf.data(), n);
+                    double l1 = 0.0;
+                    for (int64_t k = 0; k < n; ++k) l1 += std::fabs((double) wf[(size_t) k] * (double) x[(size_t) k]);
+                    const float sg = kc::ggml_cpu_dot(t, (int) n, w.data(), aq.data());
+                    const double tol = 2e-4 * l1 + 1e-6;
+                    if (std::fabs((double) s1 - (double) sg) > tol && fails < 40)
+                        std::printf("  %s n %lld rep %d: own %.9g ggml %.9g (tol %.3g)\n", qt::type_name(t), (long long) n,
+                                    rep, (double) s1, (double) sg, tol);
+                    check(std::fabs((double) s1 - (double) sg) <= tol,
+                          std::string("dot (value) ") + qt::type_name(t) + " n " + std::to_string(n));
+                } else if (g) {
                     kc::ggml_cpu_quant(at, x.data(), ag.data(), n);
                     check(aq == ag, std::string("activation ") + qt::type_name(at) + " for " + qt::type_name(t) + " n " +
                                         std::to_string(n));
