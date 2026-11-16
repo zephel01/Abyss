@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.155 - 2026-11-16
+
+- Conversation slots on Qwen3.8 / Ornith / Qwen3.8-27B: a request that does not continue the engine's conversation
+  first sets it aside (host RAM first, then a file) and then takes back the slot it does continue (the longest one
+  whose tokens are an exact prefix of the prompt). Claude Code's main thread and its subagents, or several chats,
+  taking turns no longer read each other's prompts again. RTX 5090, Qwen3.8 UD-IQ3_XXS, iGPU off, a main thread and a
+  20K subagent taking turns, each switch back (prompt): main 30K 11.1 s -> 0.18-0.21 s, main 115K 33.8 s -> 0.21-0.31
+  s (+0.1-0.3 s at 36K, +0.4-0.9 s at 115K to set aside and take back); Ornith-1.5-35B-A3B 30K 3.56 -> 0.06 s. A slot
+  holds the delta-net states and every attention cache's rows (Qwen3.8 1.05 GB at 36K tokens) and gives the same
+  state as the conversation's own snapshot: the same tokens follow. Up to 8 slots; RAM `STRATA_GLM_SLOT_RAM_GB`
+  (auto: a quarter of the free memory, at most 8 GB, never leaving under 8 GB free), files as GLM-5.3's (16 GB in
+  `<pack>/slots`). A conversation belongs to the API key it came with. `STRATA_GLM_SLOTS=0`: one conversation, as
+  before. Not yet for DeepSeek V4 / V4.1, Laguna, or a model split across GPUs.
+- GLM-5.3's slots now run on the same store; behavior, messages and files are unchanged (same answers and reuse as
+  v1.3.154). Deterministic outputs unchanged on all six regression configs.
+
 ## v1.3.154 - 2026-11-16
 
 - Server, for coding agents: the room left for the answer when the thinking runs long (a quarter of max tokens, at
