@@ -370,10 +370,13 @@ int moe_window_rows(size_t T, const Glm5Geometry& g) {
 
 // the MoE runs on the WHOLE chunk (every expert's weights are read once per chunk); the shared expert in sub-batches
 // the experts' quantized activations: MMQ's form or the own GEMM's (moe_own.hpp), whichever is larger
+bool own_type(int type);
 size_t act_bytes(int64_t rows, int64_t cols) {
     size_t n = mmq::q8_bytes(rows, cols);
 #if defined(STRATA_MOE_OWN)
-    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols));
+    // (the block sums' plane only where a type that reads them is on: the buffers - and with them the chunk plan -
+    // stay as MMQ's otherwise)
+    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols, own_type(12)));
 #endif
     return n;
 }
@@ -4378,7 +4381,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     os.host_bounds = hb + i0;
                     os.row0 = a;
                     os.rows = nrows;
-                    if (own_gu) own::quantize(S->x, M.row_tok + r0 + a, M.Xq, E, E, nrows, s);
+                    if (own_gu) own::quantize(S->x, M.row_tok + r0 + a, M.Xq, E, E, nrows, s, own::needs_sums(Ly.gu_type));
                     else
 #endif
                     mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s, M.Xs);
@@ -4434,7 +4437,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->mark("x_gate_up", s);
 #if defined(STRATA_MOE_OWN)
                     if (own_dn) {
-                        own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s);
+                        own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s, own::needs_sums(Ly.d_type));
                         S->mark("x_quant", s);
                         os.xq = M.Hq;
                         os.dst = M.OUTP + (size_t) o * E;

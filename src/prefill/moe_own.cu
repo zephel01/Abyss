@@ -50,7 +50,7 @@ bool stats_on() { static const bool on = getenv("STRATA_PROMPT_OWN_STATS") != nu
 // A warp takes 128 values of a row: a thread 4 of them, 8 threads a 32-value block.  d = max|x| / 127 over the block,
 // q = round(x * (127 / max|x|)).  The int8 plane holds the 128 values' 4-value words in the GEMM's order (below).  
 __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, uint32_t* __restrict__ q,
-                             float* __restrict__ d, int cols, int64_t ld, int64_t rows) {
+                             float* __restrict__ d, int cols, int64_t ld, int64_t rows, bool sums) {
     const int64_t wi = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // the warp: (row, 128 values)
     const int lane = threadIdx.x & 31, per_row = cols / 128;
     const int64_t r = wi / per_row;
@@ -83,7 +83,7 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
     if ((lane & 7) == 0) {
         const int64_t nb = cols / 32;
         d[r * nb + c * 4 + (lane >> 3)] = amax / 127.0f;
-        d[rows * nb + r * nb + c * 4 + (lane >> 3)] = (amax / 127.0f) * (float) si;
+        if (sums) d[rows * nb + r * nb + c * 4 + (lane >> 3)] = (amax / 127.0f) * (float) si;
     }
 }
 
@@ -533,13 +533,16 @@ bool usable(int t, int64_t rows, int64_t cols) {
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 
-size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * 8; }
+size_t act_bytes(int64_t rows, int64_t cols, bool sums) {
+    return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * (sums ? 8 : 4);
+}
+bool needs_sums(int t) { return t == 12; }
 
-void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream, bool sums) {
     if (rows <= 0) return;
     const int64_t n = rows * (cols / 128) * 32;   // threads
     quant_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
-        x, ids, (uint32_t*) xq, (float*) ((uint8_t*) xq + rows * cols), (int) cols, ld, rows);
+        x, ids, (uint32_t*) xq, (float*) ((uint8_t*) xq + rows * cols), (int) cols, ld, rows, sums);
     ck(cudaGetLastError(), "quantize");
 }
 

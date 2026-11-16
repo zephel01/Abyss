@@ -171,8 +171,8 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
     uint8_t* w = up(c.w);
     int32_t* bounds = up(c.bounds);
     float* x = up(c.x);
-    uint8_t* xq = dev<uint8_t>(own::act_bytes(rows, E));
-    uint8_t* hq = dev<uint8_t>(own::act_bytes(rows, FF));
+    uint8_t* xq = dev<uint8_t>(own::act_bytes(rows, E, true));
+    uint8_t* hq = dev<uint8_t>(own::act_bytes(rows, FF, true));
     float* h = dev<float>((size_t) rows * FF);
     float* out = dev<float>((size_t) rows * E);
     check(cudaMemset(h, 0xFF, (size_t) rows * FF * sizeof(float)), "memset");
@@ -189,15 +189,15 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
     set.xq = xq;
     set.dst = h;
     set.ld = FF;
-    own::quantize(x, nullptr, xq, E, E, rows, s);
+    own::quantize(x, nullptr, xq, E, E, rows, s, own::needs_sums(c.gu_type));
     ctx.gate_up(set, c.gu_type, FF, E, c.up_off, c.limit, s);
-    own::quantize(h, nullptr, hq, FF, FF, rows, s);
+    own::quantize(h, nullptr, hq, FF, FF, rows, s, own::needs_sums(c.d_type));
     set.xq = hq;
     set.dst = out;
     set.ld = E;
     ctx.down(set, c.d_type, E, FF, c.down_off, s);
     check(cudaDeviceSynchronize(), "sync");
-    const std::vector<uint8_t> xq_h = down(xq, own::act_bytes(rows, E)), hq_h = down(hq, own::act_bytes(rows, FF));
+    const std::vector<uint8_t> xq_h = down(xq, own::act_bytes(rows, E, true)), hq_h = down(hq, own::act_bytes(rows, FF, true));
     const std::vector<float> h_h = down(h, (size_t) rows * FF), out_h = down(out, (size_t) rows * E);
 
     bool ok = true;
@@ -398,8 +398,8 @@ int bench_case(const Case& c) {
     uint8_t* w = up(c.w);
     int32_t* bounds = up(c.bounds);
     float* x = up(c.x);
-    uint8_t* xq = dev<uint8_t>(std::max(own::act_bytes(rows, E) * 2, (size_t) rows * FF * 4));
-    uint8_t* hq = dev<uint8_t>(own::act_bytes(rows, FF) * 2);
+    uint8_t* xq = dev<uint8_t>(std::max(own::act_bytes(rows, E, true) * 2, (size_t) rows * FF * 4));
+    uint8_t* hq = dev<uint8_t>(own::act_bytes(rows, FF, true) * 2);
     float* gu = dev<float>((size_t) rows * 2 * FF);
     float* out = dev<float>((size_t) rows * E);
     const auto time = [&](const char* nm, const auto& fn) {
@@ -421,9 +421,9 @@ int bench_case(const Case& c) {
     set.w = w; set.stride = c.stride; set.n = n_exp; set.bounds = bounds; set.host_bounds = c.bounds.data(); set.rows = rows;
     set.row0 = row0;
     double o_tot = 0, m_tot = 0;
-    o_tot += time("own quantize x", [&] { own::quantize(x, nullptr, xq, E, E, rows, s); });
+    o_tot += time("own quantize x", [&] { own::quantize(x, nullptr, xq, E, E, rows, s, own::needs_sums(c.gu_type)); });
     o_tot += time("own gate/up+swiglu", [&] { set.xq = xq; set.dst = gu; set.ld = 2 * FF; ctx.gate_up(set, gu_type, FF, E, c.up_off, INFINITY, s); });
-    o_tot += time("own quantize h", [&] { own::quantize(gu, nullptr, hq, FF, 2 * FF, rows, s); });
+    o_tot += time("own quantize h", [&] { own::quantize(gu, nullptr, hq, FF, 2 * FF, rows, s, own::needs_sums(d_type)); });
     o_tot += time("own down", [&] { set.xq = hq; set.dst = out; set.ld = E; ctx.down(set, d_type, E, FF, c.down_off, s); });
 #if defined(STRATA_TEST_HAVE_MMQ)
     namespace mmq = strata::prefill::mmq;
