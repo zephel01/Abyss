@@ -17,7 +17,7 @@
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 #include <cuda_runtime.h>
 
 #ifndef _WIN32
@@ -222,9 +222,9 @@ bool engram_open(const std::string& pack, V41Engram& E, std::string& err) {
                 E.gtype = E.row_bytes;
                 is >> E.row_bytes;
             }
-            const ggml_type_traits* tt = E.gtype >= 0 && E.gtype < GGML_TYPE_COUNT ? ggml_get_type_traits((ggml_type) E.gtype) : nullptr;
+            const strata::qt::Traits* tt = E.gtype >= 0 && E.gtype < strata::qt::COUNT ? strata::qt::traits((strata::qt::Type) E.gtype) : nullptr;
             if ((E.gtype >= 0 && (tt == nullptr || tt->to_float == nullptr || E.row_bytes <= 0 || E.row_bytes > kEngRowMax ||
-                                  ggml_row_size((ggml_type) E.gtype, kEngDim) != (size_t) E.row_bytes)) ||
+                                  strata::qt::row_size((strata::qt::Type) E.gtype, kEngDim) != (size_t) E.row_bytes)) ||
                 (E.gtype < 0 && (name != "row264" || E.row_bytes != 264))) {
                 err = "deepseek41: engram.txt: unknown row format " + name;
                 return false;
@@ -625,7 +625,7 @@ static bool engram_read(V41Engram& E, int k, uint64_t at, uint8_t* dst, size_t n
 // a row's raw bytes -> 256 floats
 bool engram_decode(const V41Engram& E, const uint8_t* raw, float* dst, std::string& err) {
     if (E.gtype >= 0) {   // llama.cpp's get_rows: ggml's dequantizer, F32 (no BF16 rounding)
-        ggml_get_type_traits((ggml_type) E.gtype)->to_float(raw, dst, kEngDim);
+        strata::qt::traits((strata::qt::Type) E.gtype)->to_float(raw, dst, kEngDim);
         return true;
     }
     uint32_t* du = (uint32_t*) dst;

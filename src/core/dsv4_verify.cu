@@ -1128,7 +1128,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         wt_mark = now;
     };
     // ---- the embedding rows -> each token's 4 streams (the first part's columns)
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "deepseek4 verify: no embedding dequantizer";
         return false;
@@ -1139,7 +1139,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, V->tok_in_d, T, g.n_embd, V->emb, s);
     } else {
         for (int t = 0; t < T; ++t)
-            tt->to_float(pack_emb_src_ + (size_t) toks[(size_t) t] * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd),
+            tt->to_float(pack_emb_src_ + (size_t) toks[(size_t) t] * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd),
                          V->emb_h + (size_t) t * E, g.n_embd);
         cudaMemcpyAsync(V->emb, V->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, s);
     }

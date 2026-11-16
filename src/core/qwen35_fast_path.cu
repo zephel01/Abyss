@@ -24,7 +24,7 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -151,10 +151,10 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         if ((Ly.eh.type == gf::kTypeBF16 || Ly.eh.type == gf::kTypeF32) && Ly.eh.q != nullptr && g.qwen35() && !g.q4x) {
             const bool bf = Ly.eh.type == gf::kTypeBF16;
             const size_t K = (size_t) 2 * E, N = (size_t) E, src_b = K * N * (bf ? 2 : 4);
-            const size_t q8_rb = ggml_row_size(GGML_TYPE_Q8_0, (int64_t) K);
+            const size_t q8_rb = strata::qt::row_size(strata::qt::Q8_0, (int64_t) K);
             std::vector<uint8_t> raw(src_b), q8(q8_rb * N);
             std::vector<float> row(K);
-            const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+            const strata::qt::Traits* tq = strata::qt::traits(strata::qt::Q8_0);
             if (cudaMemcpy(raw.data(), Ly.eh.q, src_b, cudaMemcpyDeviceToHost) == cudaSuccess) {
                 for (size_t r = 0; r < N; ++r) {
                     for (size_t k = 0; k < K; ++k) {
@@ -603,9 +603,9 @@ bool Glm5Model::q4x_ple_setup(std::string& err) {
     cudaMemset(F->ple_hist, 0, (size_t) k::NG_HIST * HE * 4);
     {   // the conv taps as F16 (the pack widened the GGUF's F16 to F32: exact both ways)
         std::vector<float> c32(n_conv);
-        std::vector<ggml_fp16_t> c16(n_conv);
+        std::vector<uint16_t> c16(n_conv);
         cudaMemcpy(c32.data(), conv, n_conv * 4, cudaMemcpyDeviceToHost);
-        ggml_fp32_to_fp16_row(c32.data(), c16.data(), (int64_t) n_conv);
+        strata::qt::fp32_to_fp16_row(c32.data(), c16.data(), (int64_t) n_conv);
         cudaMemcpy(F->ple_conv16, c16.data(), n_conv * 2, cudaMemcpyHostToDevice);
     }
     F->ple_w.conv1d_f16 = F->ple_conv16;

@@ -25,7 +25,7 @@
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -686,11 +686,11 @@ bool Glm5Model::dflash_load(std::string& err) {
     if (!gf::mvn_supported(kQ8_0)) return refuse("the Q8_0 kernels");
     if (ws_map_.find("output.weight") == ws_map_.end()) return refuse("the target's output.weight");
     // the mask token's embedding, once
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) return refuse("the target's embedding");
     {
         std::vector<float> e((size_t) E);
-        tt->to_float(pack_emb_src_ + (size_t) D->mask * ggml_row_size((ggml_type) pack_emb_type_, E), e.data(), E);
+        tt->to_float(pack_emb_src_ + (size_t) D->mask * strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), e.data(), E);
         D->emb_mask = (float*) dev((size_t) E * sizeof(float));
         if (ok) ok = cudaMemcpy(D->emb_mask, e.data(), (size_t) E * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
     }
@@ -909,8 +909,8 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     *D->par_h = DflPar{(long long) pos, (long long) lo, n_ctx, 0};
     const bool host_emb = F->emb_tab_d == nullptr && F->emb_q8_d == nullptr;
     if (host_emb) {
-        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-        tt->to_float(pack_emb_src_ + (size_t) y * ggml_row_size((ggml_type) pack_emb_type_, E), D->emb_h, E);
+        const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
+        tt->to_float(pack_emb_src_ + (size_t) y * strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), D->emb_h, E);
     }
     const int R = NB - 1;
     // the draft's kernels and copies on stream s (once into the graph, or launched one by one)

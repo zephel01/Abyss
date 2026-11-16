@@ -30,7 +30,7 @@
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -1128,7 +1128,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     std::memset(F->tok_in_h, 0, 64 * sizeof(int));
     // the pinned copy of token_embd (Q8_0 / Q5_K - the other types keep the host dequantizer and its copy)
     if (F->zero_copy && pack_emb_src_ != nullptr && gf::embed_rows_q_supported(pack_emb_type_, (int) g.n_embd)) {
-        const size_t bytes = (size_t) g.n_vocab * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
+        const size_t bytes = (size_t) g.n_vocab * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd);
         if (cudaHostAlloc((void**) &F->emb_tab_h, bytes, cudaHostAllocMapped) == cudaSuccess) {
             if (cudaHostGetDevicePointer((void**) &F->emb_tab_d, F->emb_tab_h, 0) == cudaSuccess) {
                 std::memcpy(F->emb_tab_h, pack_emb_src_, bytes);
@@ -1157,14 +1157,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                            (q4f != nullptr && q4f[0] != '\0'));
     const bool glm_draft = g.arch == 0 && mtp_il_ >= 0 && F->q35_pend_h != nullptr;   // (the one-GPU NextN drafter)
     if ((g.qwen35() || glm_draft) && (mtp_il_ >= 0 || q4_draft) && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
-        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-        const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
+        const strata::qt::Traits* tq = strata::qt::traits(strata::qt::Q8_0);
         const int E = (int) g.n_embd;
-        const size_t src_rb = ggml_row_size((ggml_type) pack_emb_type_, E), q8_rb = ggml_row_size(GGML_TYPE_Q8_0, E);
+        const size_t src_rb = strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), q8_rb = strata::qt::row_size(strata::qt::Q8_0, E);
         const size_t bytes = (size_t) g.n_vocab * q8_rb;
         if (tt == nullptr || tt->to_float == nullptr || tq->from_float_ref == nullptr || E % 32 != 0) {
             std::fprintf(stderr, "glm fast: the NextN drafter is off: token_embd (%s) has no row reader\n",
-                         ggml_type_name((ggml_type) pack_emb_type_));
+                         strata::qt::type_name((strata::qt::Type) pack_emb_type_));
         } else if (cudaHostAlloc((void**) &F->emb_q8_h, bytes, cudaHostAllocMapped) != cudaSuccess ||
                    cudaHostGetDevicePointer((void**) &F->emb_q8_d, F->emb_q8_h, 0) != cudaSuccess) {
             cudaGetLastError();
@@ -1186,7 +1186,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 });
             for (auto& t : th) t.join();
             std::fprintf(stderr, "glm fast: CUDA%d the NextN drafter reads a Q8_0 copy of token_embd (%s, %.0f MB pinned)\n",
-                         dev_, ggml_type_name((ggml_type) pack_emb_type_), (double) bytes / 1048576.0);
+                         dev_, strata::qt::type_name((strata::qt::Type) pack_emb_type_), (double) bytes / 1048576.0);
         }
     }
 
@@ -2983,9 +2983,9 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     if (verify && !Ly.exl3 && !slot_out) {
         static double e2 = 0, n2 = 0, worst = 0;
         static int calls = 0;
-        const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
-        const ggml_type_traits* tu = ggml_get_type_traits((ggml_type) Ly.up_type);
-        const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
+        const strata::qt::Traits* tg = strata::qt::traits((strata::qt::Type) Ly.gu_type);
+        const strata::qt::Traits* tu = strata::qt::traits((strata::qt::Type) Ly.up_type);
+        const strata::qt::Traits* td = strata::qt::traits((strata::qt::Type) Ly.d_type);
         std::vector<float> row((size_t) std::max(n_embd, n_ff));
         std::vector<double> hr((size_t) n_ff), ref((size_t) n_embd, 0.0);
         const double lim = g.swiglu_exp;
@@ -4091,9 +4091,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaStreamSynchronize(F->cs);
         fast_cpu_experts(il_cal, 1, &cal, &sdn, xc.data(), oc.data(), nullptr, nv ? &sgu : nullptr);
         // the reference: rows dequantised by ggml, dots in double
-        const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
-        const ggml_type_traits* tu = ggml_get_type_traits((ggml_type) Ly.up_type);
-        const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Ly.d_type);
+        const strata::qt::Traits* tg = strata::qt::traits((strata::qt::Type) Ly.gu_type);
+        const strata::qt::Traits* tu = strata::qt::traits((strata::qt::Type) Ly.up_type);
+        const strata::qt::Traits* td = strata::qt::traits((strata::qt::Type) Ly.d_type);
         std::vector<float> row((size_t) std::max(E, FFE));
         std::vector<double> hr((size_t) FFE), orf((size_t) E);
         for (int r = 0; r < FFE; ++r) {
@@ -5081,9 +5081,9 @@ void Glm5Model::fast_service() {
                             const auto& Lc = F->L[(size_t) wq_layer];
                             const auto& nfc = F->cpu_fmt[(size_t) wq_layer];
                             if (Lc.exl3 || nfc.n_ff <= 0) continue;
-                            const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Lc.gu_type);
-                            const ggml_type_traits* tu = ggml_get_type_traits((ggml_type) Lc.up_type);
-                            const ggml_type_traits* td = ggml_get_type_traits((ggml_type) Lc.d_type);
+                            const strata::qt::Traits* tg = strata::qt::traits((strata::qt::Type) Lc.gu_type);
+                            const strata::qt::Traits* tu = strata::qt::traits((strata::qt::Type) Lc.up_type);
+                            const strata::qt::Traits* td = strata::qt::traits((strata::qt::Type) Lc.d_type);
                             if (!tg || !tg->to_float || !tu || !tu->to_float || !td || !td->to_float) continue;
                             const int E = g.n_embd, FF = g.n_ff_exp;
                             const float lim = g.swiglu_exp;
@@ -7547,7 +7547,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         }
     }
     // ---- the embedding row (host-dequantized from the shard mapping) -> the 4 streams
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "glm fast: no embedding dequantizer";
         return false;
@@ -7558,7 +7558,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         F->tok_in_h[0] = token;
         gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, F->tok_in_d, 1, g.n_embd, F->emb, F->cs);
     } else {
-        tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd), F->emb_h,
+        tt->to_float(pack_emb_src_ + (size_t) token * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd), F->emb_h,
                      g.n_embd);
         if (img) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
         cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
@@ -7775,14 +7775,14 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err) {
     }
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "glm mtp: no embedding dequantizer";
         return false;
     }
     if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp embedding sync", err) || !F->route_ok(err))
         return false;   // emb_h may still feed an earlier copy
-    tt->to_float(pack_emb_src_ + (size_t) next_tok * ggml_row_size((ggml_type) pack_emb_type_, E), F->emb_h, E);
+    tt->to_float(pack_emb_src_ + (size_t) next_tok * strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), F->emb_h, E);
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
     gf::mtp_in(F->emb, F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
@@ -8112,8 +8112,8 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     if (F->prof_on) F->collect();
     if (!fast_boundary(err)) return false;
     lap(1);
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-    tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd), F->emb_h,
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
+    tt->to_float(pack_emb_src_ + (size_t) token * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd), F->emb_h,
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);

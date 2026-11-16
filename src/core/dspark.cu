@@ -38,7 +38,7 @@
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -367,8 +367,8 @@ bool Glm5Model::dspark_load(std::string& err) {
         if (t == nullptr) { ok = false; return false; }
         h.resize((size_t) t->elements());
         if (type == kF16) {
-            const ggml_fp16_t* src = (const ggml_fp16_t*) G.tensor_data(*t);
-            for (size_t i = 0; i < h.size(); ++i) h[i] = ggml_fp16_to_fp32(src[i]);
+            const uint16_t* src = (const uint16_t*) G.tensor_data(*t);
+            for (size_t i = 0; i < h.size(); ++i) h[i] = strata::qt::fp16_to_fp32(src[i]);
         } else {
             std::memcpy(h.data(), G.tensor_data(*t), h.size() * sizeof(float));
         }
@@ -467,11 +467,11 @@ bool Glm5Model::dspark_load(std::string& err) {
     if (!gf::moe_supported(D->etype) || (!D->v41 && !gf::mvn_supported(kQ8_0)))
         return refuse("the experts' type " + std::to_string(D->etype) + " / the Q8_0 kernels");
     // the noise token's embedding, once
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) return refuse("the target's embedding");
     {
         std::vector<float> e((size_t) E);
-        tt->to_float(pack_emb_src_ + (size_t) noise * ggml_row_size((ggml_type) pack_emb_type_, E), e.data(), E);
+        tt->to_float(pack_emb_src_ + (size_t) noise * strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), e.data(), E);
         D->emb_noise = (float*) dev((size_t) E * sizeof(float));
         if (ok) ok = cudaMemcpy(D->emb_noise, e.data(), (size_t) E * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
     }
@@ -856,11 +856,11 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     mark();
     // the rows' streams: y's embedding, then the noise token's
     D->y_h[0] = y;
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (F->emb_tab_d != nullptr) {
         gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, D->y_d, 1, E, D->emb_y, s);
     } else {
-        tt->to_float(pack_emb_src_ + (size_t) y * ggml_row_size((ggml_type) pack_emb_type_, E), D->emb_h, E);
+        tt->to_float(pack_emb_src_ + (size_t) y * strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), D->emb_h, E);
         cudaMemcpyAsync(D->emb_y, D->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
     }
     cudaMemcpyAsync(D->dtok, D->y_h, sizeof(int), cudaMemcpyHostToDevice, s);

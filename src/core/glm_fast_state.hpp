@@ -13,7 +13,7 @@
 #include "glm_expert_helper.hpp"
 #include "glm_layer_graphs.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -204,9 +204,9 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 // past the matrix.  The prompt path zeroes those bytes in the slot's padding (glm_prefill.cu, zero_tails).
 inline size_t mmq_down_over(int d_type, int64_t n_ff) {
     if (n_ff <= 0 || n_ff % 512 == 0 || d_type == strata::kernels::exl3::kTypeEXL3) return 0;
-    const int64_t qk = ggml_blck_size((ggml_type) d_type);
+    const int64_t qk = strata::qt::blck_size((strata::qt::Type) d_type);
     if (qk <= 0) return 0;
-    return (size_t) ((512 - n_ff % 512) / qk) * ggml_type_size((ggml_type) d_type);
+    return (size_t) ((512 - n_ff % 512) / qk) * strata::qt::type_size((strata::qt::Type) d_type);
 }
 
 // A layer's VRAM slot stride: the expert blob ([gate | up | down]) rounded up so that both matrices' block sizes and
@@ -220,11 +220,11 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type, int64_t n_ff, 
     if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
         return (blob + 255) / 256 * 256;
     size_t a = 16;
-    const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
+    const size_t b1 = strata::qt::type_size((strata::qt::Type) gu_type), b2 = strata::qt::type_size((strata::qt::Type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
     if (b2 > 0) a = std::lcm(a, b2);
     if (up_type >= 0 && up_type != gu_type) {   // a mixed layer: up's blocks whole too
-        const size_t b3 = ggml_type_size((ggml_type) up_type);
+        const size_t b3 = strata::qt::type_size((strata::qt::Type) up_type);
         if (b3 > 0) a = std::lcm(a, b3);
     }
     const size_t s = (blob + a - 1) / a * a, over = mmq_down_over(d_type, n_ff);

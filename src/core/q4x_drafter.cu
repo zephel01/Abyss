@@ -24,7 +24,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -87,9 +87,9 @@ bool read_all(const std::string& path, std::vector<uint8_t>& out) {
 // rows x n_in values of type `from` (host) re-quantized to `to` (ggml's own quantizers, no importance matrix),
 // row-parallel over the host's threads; false when either type has no row converter
 bool requant_rows(const void* src, int from, int to, int64_t rows, int64_t n_in, std::vector<uint8_t>& out) {
-    const ggml_type_traits* tf = ggml_get_type_traits((ggml_type) from);
-    if (tf == nullptr || tf->to_float == nullptr || n_in % ggml_blck_size((ggml_type) to) != 0) return false;
-    const size_t rb_from = ggml_row_size((ggml_type) from, n_in), rb_to = ggml_row_size((ggml_type) to, n_in);
+    const strata::qt::Traits* tf = strata::qt::traits((strata::qt::Type) from);
+    if (tf == nullptr || tf->to_float == nullptr || n_in % strata::qt::blck_size((strata::qt::Type) to) != 0) return false;
+    const size_t rb_from = strata::qt::row_size((strata::qt::Type) from, n_in), rb_to = strata::qt::row_size((strata::qt::Type) to, n_in);
     out.assign((size_t) rows * rb_to, 0);
     const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::vector<std::thread> th;
@@ -103,7 +103,7 @@ bool requant_rows(const void* src, int from, int to, int64_t rows, int64_t n_in,
                 const int64_t m = std::min<int64_t>(64, r1 - r);
                 for (int64_t i = 0; i < m; ++i)
                     tf->to_float((const uint8_t*) src + (size_t) (r + i) * rb_from, f.data() + (size_t) i * n_in, n_in);
-                ggml_quantize_chunk((ggml_type) to, f.data(), out.data() + (size_t) r * rb_to, 0, m, n_in, nullptr);
+                strata::qt::quantize_chunk(to, f.data(), out.data() + (size_t) r * rb_to, 0, m, n_in);
             }
         });
     }
@@ -208,7 +208,7 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
             if (t.type != 8) continue;
             std::vector<uint8_t> r;
             const size_t off = (size_t) ((const uint8_t*) t.p - (const uint8_t*) M->dense);
-            if (!requant_rows(blob.data() + off, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, t.n_out, t.n_in, r)) continue;
+            if (!requant_rows(blob.data() + off, strata::qt::Q8_0, strata::qt::IQ4_NL, t.n_out, t.n_in, r)) continue;
             at.push_back({kv.first, blob4.size()});
             blob4.insert(blob4.end(), r.begin(), r.end());
             blob4.resize((blob4.size() + 255) & ~(size_t) 255, 0);
@@ -218,7 +218,7 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
             M->vram += blob4.size();
             for (auto& a : at) {
                 Q4xDrafter::W& t = M->w[a.first];
-                t.type = GGML_TYPE_IQ4_NL;
+                t.type = strata::qt::IQ4_NL;
                 t.p = (const uint8_t*) M->dense4 + a.second;
             }
             std::fprintf(stderr, "q4x mtp: CUDA%d %zu Q8_0 projections read as IQ4_NL copies (%.1f MB; STRATA_Q35_MTP_Q4)\n",
@@ -256,7 +256,7 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
         if (getenv("STRATA_Q4X_MTP_FULLHEAD") == nullptr && read_all(dir + "/draft_vocab.bin", raw) && raw.size() >= 4 &&
             raw.size() % 4 == 0) {
             const int64_t n = (int64_t) (raw.size() / 4);
-            const size_t rb = ow.type == 0 ? (size_t) E * 4 : ggml_row_size((ggml_type) ow.type, E);
+            const size_t rb = ow.type == 0 ? (size_t) E * 4 : strata::qt::row_size((strata::qt::Type) ow.type, E);
             std::vector<uint8_t> full((size_t) g.n_vocab * rb), sub((size_t) n * rb);
             cudaMemcpy(full.data(), M->head, full.size(), cudaMemcpyDeviceToHost);
             const int32_t* id = (const int32_t*) raw.data();
@@ -266,14 +266,14 @@ bool Glm5Model::q4x_mtp_load(const std::string& dir, std::string& err) {
                 if (ok) std::memcpy(sub.data() + (size_t) i * rb, full.data() + (size_t) id[i] * rb, rb);
             }
             // STRATA_Q35_MTP_Q4: the head's rows as Q4_K (144 bytes a 256 values; the GGUF's Q5_K is 176)
-            if (ok && q4 && ow.type != 0 && ow.type != GGML_TYPE_Q4_K && E % 256 == 0) {
+            if (ok && q4 && ow.type != 0 && ow.type != strata::qt::Q4_K && E % 256 == 0) {
                 std::vector<uint8_t> r4;
-                if (requant_rows(sub.data(), ow.type, GGML_TYPE_Q4_K, n, E, r4)) {
+                if (requant_rows(sub.data(), ow.type, strata::qt::Q4_K, n, E, r4)) {
                     std::fprintf(stderr, "q4x mtp: CUDA%d the head's %lld rows read as Q4_K (%.0f -> %.0f MB; "
                                          "STRATA_Q35_MTP_Q4)\n", dev_, (long long) n, (double) sub.size() / 1048576.0,
                                  (double) r4.size() / 1048576.0);
                     sub.swap(r4);
-                    M->head_type = GGML_TYPE_Q4_K;
+                    M->head_type = strata::qt::Q4_K;
                 }
             }
             if (ok && cudaMalloc(&M->head, sub.size()) == cudaSuccess &&

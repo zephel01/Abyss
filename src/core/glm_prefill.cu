@@ -47,7 +47,7 @@
 #endif
 #include "strata/prefill/moe_mmq.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -3578,7 +3578,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 return v != nullptr && std::atoi(v) != 0;
             }();
             const bool q8k = xq8k_env != 0 && !F->xc && !igpu_lane(il) && !g.qwen35() && !g.q4x && E % 256 == 0 &&
-                             (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].gu_act == (int) GGML_TYPE_Q8_K &&
+                             (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].gu_act == (int) strata::qt::Q8_K &&
                              F->cpu_fmt[(size_t) il].act_bytes == (size_t) (E / 256) * 292;
             cudaEventRecord(S->ev_x, s);
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
@@ -4209,8 +4209,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
         // (the down matrices' over-read past their last row, see zero_tails; 0: n_ff fills MMQ's tiles)
-        const int64_t dn_qk = ggml_blck_size((ggml_type) Ly.d_type);
-        const size_t dn_end = Ly.down_off + (size_t) E * (size_t) (nff / dn_qk) * ggml_type_size((ggml_type) Ly.d_type);
+        const int64_t dn_qk = strata::qt::blck_size((strata::qt::Type) Ly.d_type);
+        const size_t dn_end = Ly.down_off + (size_t) E * (size_t) (nff / dn_qk) * strata::qt::type_size((strata::qt::Type) Ly.d_type);
         const int dn_over = (int) glmfast::mmq_down_over(Ly.d_type, nff);   // (expert_stride leaves room for it)
         const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
@@ -5153,12 +5153,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // qwen35moe: the block's K / V rows alone - eh_proj of [enorm(the next token's embedding) | hnorm(the trunk's
             // normed hidden)], the attention norm, k / v (k_norm, RoPE) into its caches at the rows' positions
             const auto& Ly = F->L[(size_t) mtp_il_];
-            const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+            const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
             if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
                 err = "glm prefill: no embedding dequantizer for the draft block";
                 return false;
             }
-            const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
+            const size_t row_b = strata::qt::row_size((strata::qt::Type) pack_emb_type_, E);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt mtp embedding", err)) return false;
             for (int t = 0; t < Tv; ++t)
                 tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
@@ -5185,12 +5185,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->mark("mtp_rows", s);
         } else if (Tv > 0) {
             const auto& Ly = F->L[(size_t) mtp_il_];
-            const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+            const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
             if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
                 err = "glm prefill: no embedding dequantizer for the draft block";
                 return false;
             }
-            const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
+            const size_t row_b = strata::qt::row_size((strata::qt::Type) pack_emb_type_, E);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt mtp embedding", err)) return false;
             for (int t = 0; t < Tv; ++t)
                 tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
@@ -5362,14 +5362,14 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
               std::to_string(max_ctx_) + ")";
         return false;
     }
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "glm prefill: no embedding dequantizer";
         return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
     const int E = g.n_embd;
-    const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
+    const size_t row_b = strata::qt::row_size((strata::qt::Type) pack_emb_type_, E);
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
     const int64_t pos_start = pos_;

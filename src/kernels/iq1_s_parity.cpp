@@ -9,7 +9,7 @@
 // activation rounding.  Byte accounting (native_mmvq_weight_bytes) is asserted too.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -44,17 +44,17 @@ int main() {
             uint8_t* blk = raw.data() + ((size_t) r * kBlocks + b) * kBlockBytes;
             float d = 1.f / 256.f + ud(rng) * 0.25f;
             if ((r ^ b) & 1) d = -d;
-            const uint16_t dh = ggml_fp32_to_fp16(d);
+            const uint16_t dh = strata::qt::fp32_to_fp16(d);
             blk[0] = (uint8_t) dh;
             blk[1] = (uint8_t) (dh >> 8);
             for (int i = 2; i < kBlockBytes; ++i) blk[i] = (uint8_t) byte(rng);
         }
 
-    // 3. dequant parity vs ggml's trait table
+    // 3. dequant parity vs the IQ1_S row dequantizer (qtypes.cpp; own_dot_test checks it against ggml-base)
     std::vector<float> ref((size_t) kRows * kCols);
-    const ggml_type_traits* tt = ggml_get_type_traits(GGML_TYPE_IQ1_S);
+    const strata::qt::Traits* tt = strata::qt::traits(strata::qt::IQ1_S);
     if (!tt || !tt->to_float) {
-        std::printf("FAIL ggml has no IQ1_S to_float\n");
+        std::printf("FAIL no IQ1_S to_float\n");
         return 1;
     }
     tt->to_float(raw.data(), ref.data(), (int64_t) kRows * kCols);

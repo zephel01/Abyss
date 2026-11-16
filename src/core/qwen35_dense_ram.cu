@@ -21,7 +21,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -131,7 +131,7 @@ struct Glm5Model::Q35dRam {
         size_t part(int k, int n_embd) const {
             return k <= 0 ? 0
                           : al256((size_t) k * row[0]) + al256((size_t) k * row[1]) +
-                                al256((size_t) n_embd * ggml_row_size((ggml_type) type[2], k));
+                                al256((size_t) n_embd * strata::qt::row_size((strata::qt::Type) type[2], k));
         }
     };
     std::vector<Ffn> L;
@@ -601,7 +601,7 @@ bool Glm5Model::q35d_place(std::string& err) {
         auto& f = Q->L[(size_t) il];
         f.kg = f.lent ? FF : kg[(size_t) il];
         f.ram = f.kg < FF;
-        f.drow_g = ggml_row_size((ggml_type) f.type[2], f.kg);
+        f.drow_g = strata::qt::row_size((strata::qt::Type) f.type[2], f.kg);
         f.drow_c = f.row[2] - f.drow_g;
         if (f.lent) {
             ram_b += f.total();   // (its whole pinned copy: the prompt stages it, a restore uploads it)

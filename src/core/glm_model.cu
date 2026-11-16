@@ -31,7 +31,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
-#include "ggml.h"
+#include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
 
@@ -529,8 +529,8 @@ cudaError_t gm_gemv(const strata::core::WSlot& w, const float* x, const float* b
 // dequantize one quantized row tensor to F32 using ggml's trait table
 static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src, std::vector<float>& dst,
                                 std::string& err) {
-    const ggml_type ty = (ggml_type) t.type;
-    const ggml_type_traits* tt = ggml_get_type_traits(ty);
+    const strata::qt::Type ty = (strata::qt::Type) t.type;
+    const strata::qt::Traits* tt = strata::qt::traits(ty);
     if (tt == nullptr || tt->to_float == nullptr) {
         err = "pack: no dequantizer for tensor type " + std::to_string(t.type) + " (" + t.name + ")";
         return false;
@@ -1779,7 +1779,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         return nullptr;
     };
     const auto tensor_bytes = [](const strata::TensorInfo* t) {
-        return (double) ggml_row_size((ggml_type) t->type, t->shape[0]) * (double) (t->elements() / t->shape[0]);
+        return (double) strata::qt::row_size((strata::qt::Type) t->type, t->shape[0]) * (double) (t->elements() / t->shape[0]);
     };
     Exl3Table xtab;   // an EXL3 pack: its matrices (index kind x) and experts
     {
@@ -1922,7 +1922,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             const double dn = fsize(d + "/dense.bin"), ex = fsize(d + "/experts.bin"), dv = fsize(d + "/draft_vocab.bin");
             if (dn > 0 && ex > 0) {
                 const strata::TensorInfo* ow = find("output.weight");
-                const double row = ow != nullptr ? (double) ggml_row_size((ggml_type) ow->type, g.n_embd) : 0.0;
+                const double row = ow != nullptr ? (double) strata::qt::row_size((strata::qt::Type) ow->type, g.n_embd) : 0.0;
                 q4_draft = dn + ex + (dv > 0 ? dv / 4.0 * (row + 4.0) : 0.0) +
                            2.0 * 2.0 * (double) max_ctx * g.attn_head_kv * g.head_dim + 4.0 * g.n_vocab +
                            (double) (64u << 20);
@@ -2413,15 +2413,15 @@ bool Glm5Model::step_issue(int32_t token, int64_t& p, std::string& err) {
             // one row this token needs is dequantized from the host mapping with ggml's own traits
             static std::vector<float> emb_host;
             emb_host.resize((size_t) g.n_embd);
-            const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+            const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
             if (tt == nullptr || tt->to_float == nullptr) {
                 err = "pack: no dequantizer for the quantized token_embd";
                 return false;
             }
-            tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd),
+            tt->to_float(pack_emb_src_ + (size_t) token * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd),
                          emb_host.data(), g.n_embd);
             if (getenv("STRATA_GLM_EMB_PROBE") && token < 3) {
-                const size_t rb = ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
+                const size_t rb = strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd);
                 const uint8_t* rp = pack_emb_src_ + (size_t) token * rb;
                 std::fprintf(stderr, "emb probe: token %d type %d row_bytes %zu src+0: %02x %02x %02x %02x "
                                      "vals %.6f %.6f %.6f %.6f\n",
@@ -3183,7 +3183,7 @@ void strata::core::Glm5Model::pack_release_views() {
         if (s.base != nullptr && s.h_direct == nullptr) return;
     for (const Shard& s : pack_shards_)
         if (pack_emb_src_ != nullptr && pack_emb_src_ >= s.base && pack_emb_src_ < s.base + s.size) {
-            const size_t bytes = (size_t) g_.n_vocab * ggml_row_size((ggml_type) pack_emb_type_, g_.n_embd);
+            const size_t bytes = (size_t) g_.n_vocab * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g_.n_embd);
             pack_emb_copy_.assign(pack_emb_src_, pack_emb_src_ + bytes);
             pack_emb_src_ = pack_emb_copy_.data();
             break;
@@ -3730,7 +3730,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
             }
-            ggml_get_type_traits(GGML_TYPE_F16)->to_float(raw.data(), host.data(), (int64_t) n_f32);
+            strata::qt::traits(strata::qt::F16)->to_float(raw.data(), host.data(), (int64_t) n_f32);
         } else {
             err = "pack: unsupported dense kind '" + r.kind + "' for " + r.name;
             return false;
@@ -4258,8 +4258,8 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         // (unsloth's Ornith-1.5-122B: Q8_0 experts in the block, which the decode's expert kernels do not take)
         std::fprintf(stderr, "glm mtp: CUDA%d the NextN block's experts are %s / %s, which the expert kernels do not serve - "
                              "no drafts from it (tools/nextn_pack.py repacks the block with Q4_K experts; "
-                             "STRATA_GLM_MTP_GGUF=<that file> loads it)\n", dev_, ggml_type_name((ggml_type) tg->type),
-                     ggml_type_name((ggml_type) td->type));
+                             "STRATA_GLM_MTP_GGUF=<that file> loads it)\n", dev_, strata::qt::type_name((strata::qt::Type) tg->type),
+                     strata::qt::type_name((strata::qt::Type) td->type));
         cudaFree(mtp_arena_);
         mtp_arena_ = nullptr;
         return true;
@@ -4284,6 +4284,6 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     }
     mtp_il_ = il;
     std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB dense, experts %s/%s\n", dev_, il,
-                 (double) bytes / 1048576.0, ggml_type_name((ggml_type) tg->type), ggml_type_name((ggml_type) td->type));
+                 (double) bytes / 1048576.0, strata::qt::type_name((strata::qt::Type) tg->type), strata::qt::type_name((strata::qt::Type) td->type));
     return true;
 }

@@ -743,11 +743,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
   # INSIDE the test.  A test that passes by finding nothing to compare is the failure mode this project keeps
   # re-learning.
-  add_executable(embed_rows_parity src/kernels/embed_rows_parity.cpp)
-  target_include_directories(embed_rows_parity PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(embed_rows_parity PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
-  add_test(NAME embed_rows_parity COMMAND embed_rows_parity)
-  set_tests_properties(embed_rows_parity PROPERTIES SKIP_RETURN_CODE 77)
+  if(STRATA_NATIVE_EXPERTS AND STRATA_GGML)   # (ggml-base's dequantizers as the oracle)
+    add_executable(embed_rows_parity src/kernels/embed_rows_parity.cpp)
+    target_include_directories(embed_rows_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(embed_rows_parity PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
+    add_test(NAME embed_rows_parity COMMAND embed_rows_parity)
+    set_tests_properties(embed_rows_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   add_executable(ple_rows_test src/kernels/ple_rows_test.cpp)
   target_include_directories(ple_rows_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_rows_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -896,6 +898,25 @@ else()
               src/kernels/cpu/expert_layout.cpp src/kernels/cpu/exl3_ref.cpp src/kernels/cpu/exl3_cpu.cpp)
 endif()
 target_include_directories(strata_kernels_cpu PUBLIC include)
+# the GGUF types without ggml (include/strata/qtypes.hpp) and the CPU experts' own dot products and activation
+# quantizers (own_dot.hpp; ggml_cpu_oracle.cpp is ggml-cpu's, compiled in only with STRATA_GGML): no FP contraction -
+# their float steps are the ones written (own_dot_body.hpp)
+target_sources(strata_kernels_cpu PRIVATE src/kernels/qtypes.cpp src/kernels/cpu/own_dot.cpp
+                                         src/kernels/cpu/ggml_cpu_oracle.cpp)
+target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+if(STRATA_X86)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/own_dot_avx2.cpp)
+endif()
+if(MSVC)
+  set_source_files_properties(src/kernels/qtypes.cpp src/kernels/cpu/own_dot.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  set_source_files_properties(src/kernels/cpu/own_dot_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+else()
+  set_source_files_properties(src/kernels/qtypes.cpp src/kernels/cpu/own_dot.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  if(STRATA_X86)
+    set_source_files_properties(src/kernels/cpu/own_dot_avx2.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx2;-mfma;-mf16c;-ffp-contract=off")
+  endif()
+endif()
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 if(NOT STRATA_X86)
@@ -914,15 +935,37 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
-# The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
-# weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
-# with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
-option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+# The CPU computes a native expert with Strata's own dot products (src/kernels/cpu/own_dot*.cpp): the arithmetic of
+# the x86 AVX2 dots of ggml-cpu, so an IQ weight means exactly what it means in llama.cpp.
+#
+# STRATA_GGML=ON (the default while the move off llama.cpp goes on) still builds ggml (ggml-base, ggml-cpu) static
+# from a llama.cpp checkout - a local one with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit
+# (third_party/ggml/VERSION.txt) - for the old CPU path (STRATA_CPU_GGML=1) and the parity tests' oracles.
+# STRATA_GGML=OFF builds no ggml library.  The MMQ prompt kernels (CUDA, and HIP's STRATA_PREFILL_MMQ) still compile
+# ggml-cuda's sources from the checkout until Strata has its own (worklog: no-llamacpp); a CPU-only build fetches
+# nothing.
+option(STRATA_NATIVE_EXPERTS "Native (GGUF-form) CPU experts" ON)
+option(STRATA_GGML "Build llama.cpp's ggml libraries (the old CPU dots, STRATA_CPU_GGML=1, and test oracles)" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
-if(STRATA_NATIVE_EXPERTS)
+set(_strata_need_ggml_src OFF)
+if(STRATA_NATIVE_EXPERTS AND (STRATA_GGML OR STRATA_ENABLE_CUDA OR STRATA_PREFILL_MMQ))
+  set(_strata_need_ggml_src ON)
+endif()
+if(_strata_need_ggml_src AND NOT STRATA_GGML_DIR)
+  include(FetchContent)
+  FetchContent_Declare(strata_llamacpp
+    GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
+    GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
+    GIT_SHALLOW FALSE)
+  FetchContent_GetProperties(strata_llamacpp)
+  if(NOT strata_llamacpp_POPULATED)
+    FetchContent_Populate(strata_llamacpp)
+  endif()
+endif()
+if(STRATA_NATIVE_EXPERTS AND STRATA_GGML)
   enable_language(C)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(GGML_STATIC ON CACHE BOOL "" FORCE)
@@ -967,17 +1010,10 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_GGML_DIR)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
-    include(FetchContent)
-    FetchContent_Declare(strata_llamacpp
-      GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-      GIT_SHALLOW FALSE)
-    FetchContent_GetProperties(strata_llamacpp)
-    if(NOT strata_llamacpp_POPULATED)
-      FetchContent_Populate(strata_llamacpp)
-    endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
+endif()
+if(STRATA_NATIVE_EXPERTS)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/lane_q81.cpp
@@ -1019,9 +1055,13 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma")
   endif()
-  target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  if(STRATA_GGML)
+    # ggml-cpu stays linked as the old path (STRATA_CPU_GGML=1) and own_dot_test's oracle
+    target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+    target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_HAVE_GGML_CPU=1)
+  endif()
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
-  if(STRATA_BUILD_TESTS)
+  if(STRATA_BUILD_TESTS AND STRATA_GGML)   # (these take ggml-cpu's dots as the oracle)
     # GLM's split-base expert rows (the CPU lane on a GGUF's own gate/up/down tensors) vs the contiguous blob path
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
@@ -1116,12 +1156,18 @@ if(STRATA_NATIVE_EXPERTS)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    if(STRATA_GGML)
+      target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    else()
+      # (no ggml library: the three ggml-base functions the MMQ sources call, on Strata's type table)
+      target_sources(strata_mmq PRIVATE src/prefill/ggml_base_shim.cpp)
+      target_link_libraries(strata_mmq PUBLIC strata_kernels_cpu ${_strata_gpu_runtime_target})
+    endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
     # the GLM fast path's prompt path (src/core/glm_prefill.cu) multiplies its experts with MMQ too
     target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
-    if(STRATA_BUILD_TESTS)
+    if(STRATA_BUILD_TESTS AND STRATA_GGML)
       # the fused gate/up + SwiGLU product against the plain product + the SwiGLU kernel, bit for bit (synthetic
       # weights from ggml's quantizers)
       add_executable(glm_mmq_glu_test tests/glm_mmq_glu_test.cu)
@@ -1155,7 +1201,12 @@ if(STRATA_NATIVE_EXPERTS)
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
-    target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
+    if(STRATA_GGML)
+      target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
+    else()
+      target_sources(strata_mmq PRIVATE src/prefill/ggml_base_shim.cpp)
+      target_link_libraries(strata_mmq PUBLIC strata_kernels_cpu hip::host roc::hipblas)
+    endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
 
@@ -1169,12 +1220,12 @@ if(STRATA_NATIVE_EXPERTS)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
   endif()
-  if(STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_HIP AND STRATA_NATIVE_EXPERTS AND STRATA_GGML)
     # Optional real-model diagnostic: pass the GGUF shard containing the native PLE key.
     add_executable(hip_ple_iq4 tests/hip/ple_iq4.cpp)
     target_link_libraries(hip_ple_iq4 PRIVATE strata_kernels strata_hip_runtime ggml-base)
   endif()
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND STRATA_NATIVE_EXPERTS AND STRATA_GGML)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
     target_include_directories(native_expert_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
@@ -1200,6 +1251,15 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
     add_test(NAME expert_multi_test COMMAND expert_multi_test)
   endif()
+
+  # own_dot_test: the own GGUF arithmetic (qtypes.cpp, own_dot*.cpp) against ggml's, bit for bit (STRATA_GGML=ON;
+  # without ggml: the AVX2 build against the portable one).  --bench: one-row timings, own vs ggml-cpu
+  add_executable(own_dot_test src/kernels/cpu/own_dot_test.cpp)
+  target_link_libraries(own_dot_test PRIVATE strata_kernels_cpu)
+  add_test(NAME own_dot_test COMMAND own_dot_test)
+  set_tests_properties(own_dot_test PROPERTIES TIMEOUT 600)
+  add_test(NAME own_dot_test_portable COMMAND own_dot_test)   # the portable quantizers and dots (no AVX2 build)
+  set_tests_properties(own_dot_test_portable PROPERTIES TIMEOUT 600 ENVIRONMENT "STRATA_NO_OWN_AVX2=1")
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
