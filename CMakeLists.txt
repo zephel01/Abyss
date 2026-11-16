@@ -431,6 +431,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  if(STRATA_ENABLE_CUDA)
+    # The prompt path's experts on Strata's own int8 tensor-core grouped GEMM (include/strata/prefill/moe_own.hpp):
+    # no llama.cpp sources - third_party/ggml/ggml-common.h (the block layouts and codebooks) only.
+    add_library(strata_moe_own STATIC src/prefill/moe_own.cu)
+    target_include_directories(strata_moe_own PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${_strata_gpu_include_directories})
+    target_link_libraries(strata_moe_own PUBLIC ${_strata_gpu_runtime_target})
+    target_link_libraries(strata_engine PUBLIC strata_moe_own)
+    target_compile_definitions(strata_engine PUBLIC STRATA_MOE_OWN=1)
+  endif()
   if(STRATA_ENABLE_HIP)
     # glm_prefill.cu (strata_engine) multiplies with strata::prefill::Gemm on HIP (hipBLASLt): every target that links
     # the engine alone (file_expert_source_test, hip_expert_cache_staging) needs the prefill library too
@@ -946,12 +956,16 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # nothing.
 option(STRATA_NATIVE_EXPERTS "Native (GGUF-form) CPU experts" ON)
 option(STRATA_GGML "Build llama.cpp's ggml libraries (the old CPU dots, STRATA_CPU_GGML=1, and test oracles)" ON)
+# STRATA_MMQ=OFF (CUDA): no ggml-cuda sources either - the prompt path's experts run on Strata's own int8 GEMM
+# (src/prefill/moe_own.cu) for the weight types it covers and on the FP16 path for the rest.  With STRATA_GGML=OFF
+# too, the build takes nothing from llama.cpp but third_party/ggml/ggml-common.h.
+option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels on CUDA (OFF: Strata's own prompt GEMM only)" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
 set(_strata_need_ggml_src OFF)
-if(STRATA_NATIVE_EXPERTS AND (STRATA_GGML OR STRATA_ENABLE_CUDA OR STRATA_PREFILL_MMQ))
+if(STRATA_NATIVE_EXPERTS AND (STRATA_GGML OR (STRATA_ENABLE_CUDA AND STRATA_MMQ) OR STRATA_PREFILL_MMQ))
   set(_strata_need_ggml_src ON)
 endif()
 if(_strata_need_ggml_src AND NOT STRATA_GGML_DIR)
@@ -1077,7 +1091,24 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(lane_q81_test PRIVATE third_party/ggml)
     add_test(NAME lane_q81_test COMMAND lane_q81_test)
   endif()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_MMQ)
+    # no MMQ: the wrapper's ggml-free helpers and a stub (mmq::built() is false)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq_none.cu src/prefill/moe_mmq_util.cu)
+    target_include_directories(strata_mmq PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+    target_link_libraries(strata_mmq PUBLIC strata_kernels_cpu ${_strata_gpu_runtime_target})
+    target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    # (the mmq:: functions come from strata_mmq, not prefill.cpp's own stubs)
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+    target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
+    if(STRATA_BUILD_TESTS)
+      add_executable(moe_own_test tests/moe_own_test.cu)
+      target_include_directories(moe_own_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(moe_own_test PRIVATE strata_moe_own strata_kernels_cpu ${_strata_gpu_runtime_target})
+      add_test(NAME moe_own_test COMMAND moe_own_test)
+      set_tests_properties(moe_own_test PROPERTIES TIMEOUT 300)
+    endif()
+  elseif(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
     # the few host symbols of ggml-cuda.cu they use in src/prefill/ggml_cuda_host.cu
@@ -1143,7 +1174,8 @@ if(STRATA_NATIVE_EXPERTS)
     else()
       set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     endif()
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_mmq_util.cu src/prefill/ggml_cuda_host.cu
+                ${_strata_mmq}/quantize.cu)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
@@ -1167,6 +1199,15 @@ if(STRATA_NATIVE_EXPERTS)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
     # the GLM fast path's prompt path (src/core/glm_prefill.cu) multiplies its experts with MMQ too
     target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
+    if(STRATA_BUILD_TESTS)
+      # the own prompt GEMM against a scalar reference and against MMQ (random blocks; --dump: real expert tensors)
+      add_executable(moe_own_test tests/moe_own_test.cu)
+      target_include_directories(moe_own_test PRIVATE ${_strata_gpu_include_directories})
+      target_compile_definitions(moe_own_test PRIVATE STRATA_TEST_HAVE_MMQ=1)
+      target_link_libraries(moe_own_test PRIVATE strata_moe_own strata_mmq strata_kernels_cpu ${_strata_gpu_runtime_target})
+      add_test(NAME moe_own_test COMMAND moe_own_test)
+      set_tests_properties(moe_own_test PROPERTIES TIMEOUT 300)
+    endif()
     if(STRATA_BUILD_TESTS AND STRATA_GGML)
       # the fused gate/up + SwiGLU product against the plain product + the SwiGLU kernel, bit for bit (synthetic
       # weights from ggml's quantizers)
@@ -1190,6 +1231,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/moe_mmq_util.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_0 iq1_s q2_k q3_k q4_k q5_k q6_k mxfp4 nvfp4 q4_0 q4_1)   # mxfp4: deepseek4 (moe_mmq.cu's case 39), nvfp4 (case 40)
