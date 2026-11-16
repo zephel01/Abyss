@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.162 - 2026-11-17
+
+Qwen3.5-9B with QSA (sparse attention for long prompts), and a server settings fix (#50).
+
+- qwen35 QSA: an attention layer whose `attention.compress_ratios` entry is 0 now attends densely while the other
+  attention layers keep the indexer's selection (before, any mismatch made the whole file dense). Its indexer
+  tensors can be left out of the file. `STRATA_Q35_QSA_DENSE_LAYERS=3,31` keeps listed layers dense (a test
+  override); the start-up line names the dense layers. Files with ratios on every attention layer (Qwen3.8-27B QSA)
+  run as before (same md5).
+- This runs the new Qwen3.5-9B QSA files (layer 3 dense, top_k 4096; MANUAL "Qwen3.5-9B QSA"). Q4_K_M at a 128K
+  prompt on the RTX 5090: decode 132.7 -> 239.9 tok/s (1.81x dense attention on the same file), prompt 6,026 ->
+  5,554 tok/s (-7.9%); 128K KL vs dense +0.6% to +3.1% over 8 texts (largest: Japanese +3.1%, agent +2.8%); needle
+  at 125K 4/4. `STRATA_Q35_QSA=0` = dense. llama.cpp cannot load these files.
+- Server: `STRATA_LANG` / `STRATA_LANG_THINK` in a config's `"env"` now reach the server, where the language profile
+  is applied (they went to the engine only, so the profile stayed off unless set in the server's own environment)
+  (#50).
+
 ## v1.3.161 - 2026-11-17
 
 Abyss's own int8 tensor-core GEMM for the prompt's expert (and dense FFN) products, in place of llama.cpp's MMQ, on the
