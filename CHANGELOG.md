@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.156 - 2026-11-16
+
+- Long-loop guard while thinking: a block of 33-1,024 tokens written three times in a row, token for token (at least
+  256 repeated tokens), closes the reasoning the way the thinking budget does and the answer follows. Until now the
+  guard only caught blocks up to 32 tokens: DeepSeek V4.1 at temperature 0, reviewing a 30K conversation's code,
+  repeated a 143-token list for ~18K tokens - 21,811 tokens / 216 s -> 6,937 tokens / 109 s with an on-topic answer.
+  The answer itself is not watched. `STRATA_GLM_LOOP_LONG=0`: the old guard.
+- Fix: Qwen3.8 / Ornith / Laguna on the GLM engine path used GLM-5.3's token ids in places - the loop guard's
+  tool-argument tags (on Qwen a Cyrillic and a Hangul piece: writing the first could force the second and the turn
+  did not end), the default end tokens, the forced turn end and `--stop-eos`. Each family now uses its own (the
+  server sends the template's tags; the CLI reads the end tokens from the GGUF).
+- Server: an answer the engine itself stopped is HTTP 422 `engine_error` with the text written so far
+  (`partial_text` / `partial_reasoning`; OpenAI and Anthropic shapes, and an `engine_error` event when streaming),
+  instead of 503, which SDKs retry automatically - running a long answer again. An engine ERR is 422 too (was 400).
+  503 stays for an engine that is not running or loading.
+- Server (Qwen3.8-Flash-Next verify path): a stop during a verify window drops that window instead of committing it.
+- Deterministic outputs unchanged on all six regression configs.
+
 ## v1.3.155 - 2026-11-16
 
 - Conversation slots on Qwen3.8 / Ornith / Qwen3.8-27B: a request that does not continue the engine's conversation
