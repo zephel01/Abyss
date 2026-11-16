@@ -61,7 +61,6 @@ public:
 
 private:
     int32_t* tiles_ = nullptr;   // the set's tile prefix table
-    int cap_ = 0;
 };
 
 }  // namespace strata::prefill::own

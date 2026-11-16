@@ -10,7 +10,8 @@
 //   - mma.sync m16n8k32 s8 (two m16n8k16 where a scale covers 16 values) a group of 8 tokens, the int32 sums scaled
 //     and added in FP32 in registers.
 // One barrier a 128 values.  The tiles of a set are listed exactly (a prefix table of the experts' token tiles, made
-// by a small kernel from the device bounds): no empty CTAs, no fix-up pass.
+// by a small kernel from the device bounds) and the CTAs take them from a counter until none is left: no empty CTAs,
+// no fix-up pass, and no SM idles while tiles remain.
 //
 // The tensor-core part (mma.sync, cp.async) is NVIDIA's; the decoders and the tile plan are not - a WMMA backend
 // (gfx12: 16x16x16 int8 tiles) replaces `tile_body` only.
@@ -41,43 +42,45 @@ void ck(cudaError_t e, const char* what) {
 }
 
 // ---------------------------------------------------------------- the activations
-// one thread a 32-value block: d = max|x| / 127, q = round(x / d)
+// A warp takes 128 values of a row: a thread 4 of them, 8 threads a 32-value block.  d = max|x| / 127 over the block,
+// q = round(x * (127 / max|x|)).  (x rows are float-aligned only: scalar loads; the int8 words are aligned.)
 __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids, uint32_t* __restrict__ q,
-                             float* __restrict__ d, int nb, int64_t ld, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const int64_t r = i / nb;
-    const int kb = (int) (i - r * nb);
-    const float* src = x + (ids != nullptr ? (int64_t) ids[r] : r) * ld + (int64_t) kb * 32;
-    float v[32];
-    float amax = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 32; ++k) {
-        v[k] = src[k];
-        amax = fmaxf(amax, fabsf(v[k]));
-    }
+                             float* __restrict__ d, int cols, int64_t ld, int64_t rows) {
+    const int64_t wi = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // the warp: (row, 128 values)
+    const int lane = threadIdx.x & 31, per_row = cols / 128;
+    const int64_t r = wi / per_row;
+    if (r >= rows) return;
+    const int c = (int) (wi - r * per_row);
+    const float* src = x + (ids != nullptr ? (int64_t) ids[r] : r) * ld + (int64_t) c * 128 + lane * 4;
+    const float v0 = src[0], v1 = src[1], v2 = src[2], v3 = src[3];
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4));
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-    uint32_t* dst = q + i * 8;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        uint32_t w = 0;
-#pragma unroll
-        for (int b = 0; b < 4; ++b) w |= (uint32_t) (__float2int_rn(v[4 * k + b] * inv) & 255) << (8 * b);
-        dst[k] = w;
-    }
-    d[i] = amax / 127.0f;
+    const uint32_t w = (uint32_t) (__float2int_rn(v0 * inv) & 255) | (uint32_t) (__float2int_rn(v1 * inv) & 255) << 8 |
+                       (uint32_t) (__float2int_rn(v2 * inv) & 255) << 16 | (uint32_t) (__float2int_rn(v3 * inv) & 255) << 24;
+    q[(r * cols + (int64_t) c * 128) / 4 + lane] = w;
+    if ((lane & 7) == 0) d[r * (cols / 32) + c * 4 + (lane >> 3)] = amax / 127.0f;
 }
 
 #if !defined(__HIPCC__)
 // ---------------------------------------------------------------- the tile plan
-constexpr int NW = 4;     // warps a CTA
-constexpr int TC = 64;    // tokens a tile
-constexpr int NT = NW * 32;
+// Two tile shapes.  Fine: 4 warps (64 gate/up or 128 down rows), 64 tokens - two CTAs an SM, more and smaller tiles:
+// a small set still fills the GPU.  Coarse: 8 warps, 128 tokens - the weights are decoded once for twice the tokens
+// (a set of many rows an expert: ~10% less time).
+template<int CF> struct Cfg {
+    static constexpr int NW = CF ? 8 : 4;       // warps a CTA
+    static constexpr int TC = CF ? 128 : 64;    // tokens a tile
+    static constexpr int NT = NW * 32;
+};
 
-// tiles[e] = token tiles of experts < e (n + 1 entries); n <= 1024
-__global__ void tiles_kernel(const int32_t* __restrict__ bounds, int32_t* __restrict__ tiles, int n) {
+// tiles[e] = token tiles (of tc tokens) of experts < e (n + 1 entries); n <= 1024.  tiles[n + 1] = 0: the launch's
+// tile counter
+__global__ void tiles_kernel(const int32_t* __restrict__ bounds, int32_t* __restrict__ tiles, int n, int tc) {
     __shared__ int a[1025], b[1025];
-    for (int i = threadIdx.x; i <= n; i += blockDim.x) a[i] = i == 0 ? 0 : (bounds[i] - bounds[i - 1] + TC - 1) / TC;
+    if (threadIdx.x == 0) tiles[n + 1] = 0;
+    for (int i = threadIdx.x; i <= n; i += blockDim.x) a[i] = i == 0 ? 0 : (bounds[i] - bounds[i - 1] + tc - 1) / tc;
     __syncthreads();
     int* src = a;
     int* dst = b;
@@ -99,6 +102,9 @@ struct KArgs {
     const float* xd;        // their scales [rows][K / 32]
     const int32_t* bounds;
     const int32_t* tiles;
+    int* counter;           // the next tile (the CTAs take tiles until none is left)
+    int total;              // tiles: token tiles x row tiles
+    int persist;            // 0: a CTA takes tile blockIdx.x and ends
     float* dst;
     int64_t ld;
     int n, row0, w_rows, K;
@@ -128,17 +134,19 @@ __device__ __forceinline__ void mma16(int c[4], uint32_t a0, uint32_t a1, uint32
 }
 
 // 16-byte words a slot holds (a chunk from any offset its alignment allows), and a CTA's shared memory
-template<int TY> struct Lay {
+template<int TY, int CF> struct Lay {
     static constexpr int WS = (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
-    static constexpr size_t smem = (size_t) (2 * NT * WS + 2 * TC * 8 + 2 * TC) * 16;
+    static constexpr size_t smem = (size_t) (2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + 2 * Cfg<CF>::TC) * 16;
 };
 
-// One tile with NG groups of 8 tokens.  e: the expert; rt: the row tile; b0, b1: the tile's first activation row
-// and the expert's end.
-template<int TY, bool GLU, int NG>
-__device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, int rt, int b0, int b1) {
+// One tile of ng groups of 8 tokens (ng <= TC / 8: the loops over the groups are unrolled to that and each group is
+// skipped past ng - the sums stay in registers, a tile costs its own groups).  e: the expert; rt: the row tile; b0, b1:
+// the tile's first activation row and the expert's end.
+template<int TY, bool GLU, int CF>
+__device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, int rt, int b0, int b1, int ng) {
     typedef Dec<TY> D;
-    constexpr int WS = Lay<TY>::WS, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
+    constexpr int NW = Cfg<CF>::NW, TC = Cfg<CF>::TC, NT = Cfg<CF>::NT, NG = TC / 8;
+    constexpr int WS = Lay<TY, CF>::WS, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     uint4* wbuf = smem;                       // [2][NT slots][WS]
     uint4* xbuf = wbuf + 2 * NT * WS;         // [2][TC][8]
@@ -167,12 +175,12 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
 #pragma unroll
         for (int k = 0; k < TC * 8 / NT; ++k) {
             const int i = threadIdx.x + k * NT, tok = i >> 3, word = i & 7;
-            if (tok < NG * 8) {
+            if (tok < ng * 8) {
                 const int64_t r = min(b0 + tok, b1 - 1) - a.row0;
                 cp16(xd + i, a.xq + r * a.K + (int64_t) h * 128 + word * 16);
             }
         }
-        if (threadIdx.x < NG * 8) {
+        if (threadIdx.x < ng * 8) {
             const int64_t r = min(b0 + (int) threadIdx.x, b1 - 1) - a.row0;
             cp16(sbuf + (h & 1) * TC + threadIdx.x, a.xd + r * (a.K / 32) + (int64_t) h * 4);
         }
@@ -231,6 +239,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                 for (int h8 = 0; h8 < 2; ++h8) st[f][h8] = D::step(sp[f][h8], ib, t, hd[f][h8]);
 #pragma unroll
             for (int j = 0; j < NG; ++j) {
+                if (j >= ng) break;
                 const uint32_t bl = xw[(j * 8 + g) * 32 + i * 8 + t], bh = xw[(j * 8 + g) * 32 + i * 8 + 4 + t];
                 const float x0 = xs[(j * 8 + 2 * t) * 4 + i], x1 = xs[(j * 8 + 2 * t + 1) * 4 + i];
 #pragma unroll
@@ -287,44 +296,56 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
         }
 }
 
-template<int TY, bool GLU>
-__global__ void __launch_bounds__(NT) own_kernel(const KArgs a) {
+template<int TY, bool GLU, int CF>
+__global__ void __launch_bounds__(Cfg<CF>::NT) own_kernel(const KArgs a) {
+    constexpr int NW = Cfg<CF>::NW, TC = Cfg<CF>::TC;
     extern __shared__ uint4 smem[];
+    __shared__ int next;
     const int n_rt = (a.w_rows + (GLU ? NW * 16 : NW * 32) - 1) / (GLU ? NW * 16 : NW * 32);
-    const int tt = blockIdx.x / n_rt, rt = blockIdx.x % n_rt;
-    int lo = 0, hi = a.n;   // the expert whose token tiles hold tt
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) / 2;
-        if (a.tiles[mid] <= tt) lo = mid;
-        else hi = mid;
+    for (;;) {
+        if (a.persist && threadIdx.x == 0) next = atomicAdd(a.counter, 1);
+        if (a.persist) __syncthreads();
+        const int id = a.persist ? next : (int) blockIdx.x;   // (thread 0 writes the next one after the tile's own barriers)
+        if (id >= a.total) break;
+        const int tt = id / n_rt, rt = id % n_rt;
+        int lo = 0, hi = a.n;   // the expert whose token tiles hold tt
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (a.tiles[mid] <= tt) lo = mid;
+            else hi = mid;
+        }
+        const int e = lo, b1 = a.bounds[e + 1], b0 = a.bounds[e] + (tt - a.tiles[e]) * TC;
+        tile_body<TY, GLU, CF>(a, smem, e, rt, b0, b1, (min(b1 - b0, TC) + 7) / 8);
+        if (!a.persist) break;
+        __syncthreads();
     }
-    const int e = lo, b1 = a.bounds[e + 1], b0 = a.bounds[e] + (tt - a.tiles[e]) * TC;
-    const int ntok = b1 - b0;
-    if (ntok <= 8) tile_body<TY, GLU, 1>(a, smem, e, rt, b0, b1);
-    else if (ntok <= 16) tile_body<TY, GLU, 2>(a, smem, e, rt, b0, b1);
-    else if (ntok <= 32) tile_body<TY, GLU, 4>(a, smem, e, rt, b0, b1);
-    else tile_body<TY, GLU, 8>(a, smem, e, rt, b0, b1);
 }
 
-template<int TY, bool GLU>
-void launch_t(const KArgs& a, unsigned grid, cudaStream_t s) {
+template<int TY, bool GLU, int CF>
+void launch_c(const KArgs& a, unsigned grid, cudaStream_t s) {
     static bool once = false;
     if (!once) {
-        ck(cudaFuncSetAttribute(own_kernel<TY, GLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) Lay<TY>::smem),
+        ck(cudaFuncSetAttribute(own_kernel<TY, GLU, CF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) Lay<TY, CF>::smem),
            "shared memory size");
         once = true;
     }
-    own_kernel<TY, GLU><<<grid, NT, Lay<TY>::smem, s>>>(a);
+    own_kernel<TY, GLU, CF><<<grid, Cfg<CF>::NT, Lay<TY, CF>::smem, s>>>(a);
     ck(cudaGetLastError(), GLU ? "gate_up" : "down");
+}
+template<int TY, bool GLU>
+void launch_t(const KArgs& a, unsigned grid, bool coarse, cudaStream_t s) {
+    if (coarse) launch_c<TY, GLU, 1>(a, grid, s);
+    else launch_c<TY, GLU, 0>(a, grid, s);
 }
 
 template<bool GLU>
-void launch(int type, const KArgs& a, unsigned grid, cudaStream_t s) {
+void launch(int type, const KArgs& a, unsigned grid, bool coarse, cudaStream_t s) {
     switch (type) {
-        case 16: launch_t<16, GLU>(a, grid, s); break;
-        case 17: launch_t<17, GLU>(a, grid, s); break;
-        case 18: launch_t<18, GLU>(a, grid, s); break;
-        case 39: launch_t<39, GLU>(a, grid, s); break;
+        case 16: launch_t<16, GLU>(a, grid, coarse, s); break;
+        case 17: launch_t<17, GLU>(a, grid, coarse, s); break;
+        case 18: launch_t<18, GLU>(a, grid, coarse, s); break;
+        case 22: launch_t<22, GLU>(a, grid, coarse, s); break;
+        case 39: launch_t<39, GLU>(a, grid, coarse, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
             std::exit(1);
@@ -349,7 +370,7 @@ bool built() {
     }();
     return ok;
 }
-bool supported(int t) { return built() && (t == 16 || t == 17 || t == 18 || t == 39); }
+bool supported(int t) { return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39); }
 #endif
 
 bool usable(int t, int64_t rows, int64_t cols) {
@@ -360,9 +381,9 @@ size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) c
 
 void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
-    const int64_t n = rows * (cols / 32);
-    quant_kernel<<<(unsigned) ((n + 127) / 128), 128, 0, (cudaStream_t) stream>>>(
-        x, ids, (uint32_t*) xq, (float*) ((uint8_t*) xq + rows * cols), (int) (cols / 32), ld, n);
+    const int64_t n = rows * (cols / 128) * 32;   // threads
+    quant_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        x, ids, (uint32_t*) xq, (float*) ((uint8_t*) xq + rows * cols), (int) cols, ld, rows);
     ck(cudaGetLastError(), "quantize");
 }
 
@@ -382,39 +403,70 @@ void Context::down(const Set&, int, int64_t, int64_t, size_t, void*) {
 }
 #else
 namespace {
-// the set's tile table on the device; -> the number of token tiles
-int plan(const Set& s, int32_t*& tiles, int& cap, cudaStream_t st) {
-    if (s.n > 1024) {
-        std::fprintf(stderr, "prefill own: a set of %d experts (at most 1024)\n", s.n);
-        std::exit(1);
-    }
-    if (tiles == nullptr) {
-        cap = 1025;
-        ck(cudaMalloc(&tiles, (size_t) cap * sizeof(int32_t)), "tile table");
-    }
-    int total = 0;
-    for (int e = 0; e < s.n; ++e) total += (s.host_bounds[e + 1] - s.host_bounds[e] + TC - 1) / TC;
-    if (total > 0) {
-        tiles_kernel<<<1, 256, 0, st>>>(s.bounds, tiles, s.n);
-        ck(cudaGetLastError(), "tiles");
-    }
-    return total;
-}
 void check_ptr(const Set& s, int type, size_t off) {
     if ((((uintptr_t) s.w + off) | s.stride) % align_of(type) != 0 || (uintptr_t) s.xq % 16 != 0) {
         std::fprintf(stderr, "prefill own: a matrix of type %d or its activations are not aligned\n", type);
         std::exit(1);
     }
 }
+int sm_count() {
+    static const int n = [] {
+        int dev = 0;
+        cudaDeviceProp p{};
+        cudaGetDevice(&dev);
+        cudaGetDeviceProperties(&p, dev);
+        return std::max(1, p.multiProcessorCount);
+    }();
+    return n;
+}
+// The tile shape for the set, its tile table on the device, the launch.  rows_w: the matrix's rows a tile of 16-row
+// fragments covers twice over (gate/up: 16 a warp; down: 32 a warp).
+template<bool GLU>
+void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
+    if (s.n > 1024) {
+        std::fprintf(stderr, "prefill own: a set of %d experts (at most 1024)\n", s.n);
+        std::exit(1);
+    }
+    if (tiles == nullptr) ck(cudaMalloc(&tiles, (size_t) 1027 * sizeof(int32_t)), "tile table");
+    // coarse tiles when they still fill the GPU and the experts have rows to share a decode (measured: experts of
+    // ~6 rows 7% faster fine, of 100+ rows 15-20% faster coarse).  STRATA_PROMPT_OWN_COARSE=<tiles>: from how many
+    // coarse tiles whatever the rows; 0 = always, a huge number = never
+    static const long coarse_env = [] {
+        const char* v = getenv("STRATA_PROMPT_OWN_COARSE");
+        return v != nullptr ? std::atol(v) : -1L;
+    }();
+    long nonempty = 0, rows_all = 0;
+    for (int e = 0; e < s.n; ++e) {
+        const int r = s.host_bounds[e + 1] - s.host_bounds[e];
+        nonempty += r > 0;
+        rows_all += r;
+    }
+    const auto count = [&](int tc, int rows_tile) {
+        long t = 0;
+        for (int e = 0; e < s.n; ++e) t += (s.host_bounds[e + 1] - s.host_bounds[e] + tc - 1) / tc;
+        return t * ((a.w_rows + rows_tile - 1) / rows_tile);
+    };
+    const int per_warp = GLU ? 16 : 32;
+    const long n_coarse = count(Cfg<1>::TC, Cfg<1>::NW * per_warp);
+    const bool coarse = coarse_env >= 0 ? n_coarse >= coarse_env : n_coarse >= 2L * sm_count() && rows_all >= 24 * nonempty;
+    const long total = coarse ? n_coarse : count(Cfg<0>::TC, Cfg<0>::NW * per_warp);
+    if (total <= 0) return;
+    tiles_kernel<<<1, 256, 0, st>>>(s.bounds, tiles, s.n, coarse ? Cfg<1>::TC : Cfg<0>::TC);
+    ck(cudaGetLastError(), "tiles");
+    a.tiles = tiles;
+    a.counter = tiles + s.n + 1;
+    a.total = (int) total;
+    static const bool persist = [] { const char* v = getenv("STRATA_PROMPT_OWN_PERSIST"); return v == nullptr || std::atoi(v) != 0; }();
+    a.persist = persist ? 1 : 0;
+    const long slots = (long) sm_count() * (coarse ? 1 : 2);   // (CTAs the GPU runs at once: more would only wait)
+    launch<GLU>(type, a, (unsigned) (persist ? std::min(total, slots) : total), coarse, st);
+}
 }  // namespace
 
 void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size_t up_off, float limit, void* stream) {
     if (s.n <= 0 || s.rows <= 0) return;
-    const cudaStream_t st = (cudaStream_t) stream;
     check_ptr(s, type, 0);
     check_ptr(s, type, up_off);
-    const int total = plan(s, tiles_, cap_, st);
-    if (total <= 0) return;
     KArgs a{};
     a.w = (const uint8_t*) s.w;
     a.stride = s.stride;
@@ -422,7 +474,6 @@ void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_embd);
     a.bounds = s.bounds;
-    a.tiles = tiles_;
     a.dst = s.dst;
     a.ld = s.ld;
     a.n = s.n;
@@ -430,23 +481,18 @@ void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size
     a.w_rows = (int) n_ff;
     a.K = (int) n_embd;
     a.limit = limit;
-    const int n_rt = (int) ((n_ff + NW * 16 - 1) / (NW * 16));
-    launch<true>(type, a, (unsigned) total * (unsigned) n_rt, st);
+    run<true>(s, type, a, tiles_, (cudaStream_t) stream);
 }
 
 void Context::down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t down_off, void* stream) {
     if (s.n <= 0 || s.rows <= 0) return;
-    const cudaStream_t st = (cudaStream_t) stream;
     check_ptr(s, type, down_off);
-    const int total = plan(s, tiles_, cap_, st);
-    if (total <= 0) return;
     KArgs a{};
     a.w = (const uint8_t*) s.w + down_off;
     a.stride = s.stride;
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_ff);
     a.bounds = s.bounds;
-    a.tiles = tiles_;
     a.dst = s.dst;
     a.ld = s.ld;
     a.n = s.n;
@@ -454,8 +500,7 @@ void Context::down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t 
     a.w_rows = (int) n_embd;
     a.K = (int) n_ff;
     a.limit = 0.0f;
-    const int n_rt = (int) ((n_embd + NW * 32 - 1) / (NW * 32));
-    launch<false>(type, a, (unsigned) total * (unsigned) n_rt, st);
+    run<false>(s, type, a, tiles_, (cudaStream_t) stream);
 }
 #endif
 

@@ -37,8 +37,12 @@ __device__ __forceinline__ uint32_t neg_any(uint32_t v, uint32_t m) {
     const uint32_t a = v ^ m, b = m & 0x01010101u;
     return ((a & 0x7F7F7F7Fu) + b) ^ (a & 0x80808080u);
 }
-// the i-quants' 7 stored sign bits -> 8 (the eighth makes the count even)
-__device__ __forceinline__ uint32_t signs8(uint32_t s7) { return s7 | ((uint32_t) (__popc(s7) & 1) << 7); }
+// The i-quants' signs: 7 stored bits s7 for 8 values (the eighth sign makes the count of minus signs even) -> 0xFF
+// in the bytes of the negative ones among values 4 half .. 4 half + 3.  (A 256-entry table measured the same.)
+__device__ __forceinline__ uint32_t sign_mask(uint32_t s7, int half) {
+    const uint32_t s8 = (s7 & 127u) | ((uint32_t) (__popc(s7 & 127u) & 1) << 7);
+    return nib_mask(s8 >> (4 * half));
+}
 
 __device__ __forceinline__ uint32_t rd16(const uint8_t* p) { return *(const uint16_t*) p; }
 __device__ __forceinline__ float rd_f16(const uint8_t* p) { return __half2float(*(const __half*) p); }
@@ -55,9 +59,9 @@ template<> struct Dec<16> {
         const uint32_t* grid = (const uint32_t*) iq2xxs_grid;
         const int e = t >> 1, half = t & 1;
         Step r;
-        r.lo = neg_nz(grid[2 * ((idx >> (8 * e)) & 255u) + half], nib_mask(signs8((aux >> (7 * e)) & 127u) >> (4 * half)));
+        r.lo = neg_nz(grid[2 * ((idx >> (8 * e)) & 255u) + half], sign_mask((aux >> (7 * e)) & 127u, half));
         r.hi = neg_nz(grid[2 * ((idx >> (8 * (e + 2))) & 255u) + half],
-                      nib_mask(signs8((aux >> (7 * (e + 2))) & 127u) >> (4 * half)));
+                      sign_mask((aux >> (7 * (e + 2))) & 127u, half));
         r.s = hd * (float) (2 * (int) (aux >> 28) + 1);
         r.m0 = r.m1 = 0;
         return r;
@@ -74,8 +78,29 @@ template<> struct Dec<17> {
         const uint32_t q0 = rd16(q + 2 * e), q1 = rd16(q + 2 * (e + 2)), sc = p[2 + 64 + ib];
         const uint32_t* grid = (const uint32_t*) iq2xs_grid;
         Step r;
-        r.lo = neg_nz(grid[2 * (q0 & 511u) + half], nib_mask(signs8(q0 >> 9) >> (4 * half)));
-        r.hi = neg_nz(grid[2 * (q1 & 511u) + half], nib_mask(signs8(q1 >> 9) >> (4 * half)));
+        r.lo = neg_nz(grid[2 * (q0 & 511u) + half], sign_mask(q0 >> 9, half));
+        r.hi = neg_nz(grid[2 * (q1 & 511u) + half], sign_mask(q1 >> 9, half));
+        r.s = 0.0f;
+        r.m0 = 2 * (int) (sc & 15u) + 1;
+        r.m1 = 2 * (int) (sc >> 4) + 1;
+        return r;
+    }
+};
+
+// IQ2_S: {f16 d; 32 codebook bytes (8 values each, 2 more index bits in qh); 32 sign bytes; 8 x u8 qh; 8 x u8: two
+// 4-bit scales, one a 16 values}
+template<> struct Dec<22> {
+    static constexpr int WCH = 256, CB = 82, AL = 2, SUB = 16;
+    __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p) * 0.125f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float) {
+        const uint8_t* q = p + 2 + 4 * ib;
+        const int e = t >> 1, half = t & 1;
+        const uint32_t qh = p[2 + 64 + ib], sc = p[2 + 72 + ib];
+        const uint32_t i0 = q[e] | ((qh << (8 - 2 * e)) & 0x300u), i1 = q[e + 2] | ((qh << (8 - 2 * (e + 2))) & 0x300u);
+        const uint32_t* grid = (const uint32_t*) iq2s_grid;
+        Step r;
+        r.lo = neg_nz(grid[2 * i0 + half], nib_mask((uint32_t) q[32 + e] >> (4 * half)));
+        r.hi = neg_nz(grid[2 * i1 + half], nib_mask((uint32_t) q[32 + e + 2] >> (4 * half)));
         r.s = 0.0f;
         r.m0 = 2 * (int) (sc & 15u) + 1;
         r.m1 = 2 * (int) (sc >> 4) + 1;
@@ -93,8 +118,8 @@ template<> struct Dec<18> {
         const uint32_t aux = rd16(a) | rd16(a + 2) << 16;
         const int e = t >> 1, half = t & 1;
         Step r;
-        r.lo = neg_nz(iq3xxs_grid[q[t]], nib_mask(signs8((aux >> (7 * e)) & 127u) >> (4 * half)));
-        r.hi = neg_nz(iq3xxs_grid[q[4 + t]], nib_mask(signs8((aux >> (7 * (e + 2))) & 127u) >> (4 * half)));
+        r.lo = neg_nz(iq3xxs_grid[q[t]], sign_mask((aux >> (7 * e)) & 127u, half));
+        r.hi = neg_nz(iq3xxs_grid[q[4 + t]], sign_mask((aux >> (7 * (e + 2))) & 127u, half));
         r.s = hd * (float) (2 * (int) (aux >> 28) + 1);
         r.m0 = r.m1 = 0;
         return r;

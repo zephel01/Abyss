@@ -145,7 +145,7 @@ double silu_mul(double g, double u, double limit) {
 
 // The whole case: quantize, gate/up + SwiGLU, quantize, down - each stage against the reference of its own inputs.
 // -> false on a mismatch
-bool run_case(const Case& c, const char* name, bool verbose) {
+bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 << 30) {
     const int E = c.n_embd, FF = c.n_ff, rows = c.rows(), row0 = c.bounds.front();
     const cudaStream_t s = nullptr;
     uint8_t* w = up(c.w);
@@ -190,6 +190,9 @@ bool run_case(const Case& c, const char* name, bool verbose) {
         const uint8_t* blob = c.w.data() + (size_t) e * c.stride;
         for (int b = c.bounds[(size_t) e]; b < c.bounds[(size_t) e + 1]; ++b) {
             const int r = b - row0;
+            // (a large case: the host reference for ref_rows rows spread over the set, each expert's first and last)
+            if (rows > ref_rows && r % (rows / ref_rows) != 0 && b != c.bounds[(size_t) e] && b + 1 != c.bounds[(size_t) e + 1])
+                continue;
             // the quantizer, bit for bit
             quant_ref(c.x.data() + (size_t) r * E, E, q, d);
             if (std::memcmp(q.data(), xq_h.data() + (size_t) r * E, (size_t) E) != 0 ||
@@ -322,7 +325,7 @@ Case synthetic(int gu_type, int d_type, int n_embd, int n_ff, const std::vector<
     std::normal_distribution<float> nd(0.f, 1.0f);
     c.x.resize((size_t) c.rows() * n_embd);
     for (auto& v : c.x) v = nd(rng);
-    if (c.rows() > 2) {   // a zero block, a zero row, a block of one large value
+    if (c.rows() > 2) {   // a zero stretch, a zero row, a block of one large value
         std::fill(c.x.begin() + 64, c.x.begin() + 96, 0.0f);
         std::fill(c.x.begin() + n_embd, c.x.begin() + 2 * n_embd, 0.0f);
         c.x[(size_t) 2 * n_embd + 5] = 300.0f;
@@ -353,20 +356,25 @@ bool load_dump(const char* path, Case& c) {
     return ok;
 }
 
+int bench_case(const Case& c);
 int bench(int gu_type, int d_type, int E, int FF, int n_exp, double mean_rows) {
     std::mt19937 rng(7);
     std::exponential_distribution<double> ed(1.0 / mean_rows);
     std::vector<int> counts((size_t) n_exp);
     for (auto& v : counts) v = (int) std::min(8.0 * mean_rows, ed(rng));
-    Case c = synthetic(gu_type, d_type, E, FF, counts, 0, INFINITY, rng);
+    return bench_case(synthetic(gu_type, d_type, E, FF, counts, 0, INFINITY, rng));
+}
+// kernel times of the case's set, own against MMQ (the best of 7)
+int bench_case(const Case& c) {
+    const int gu_type = c.gu_type, d_type = c.d_type, E = c.n_embd, FF = c.n_ff, n_exp = c.n_exp, row0 = c.bounds.front();
     const int rows = c.rows();
     int max_rows = 0;
-    for (int v : counts) max_rows = std::max(max_rows, v);
+    for (int e = 0; e < n_exp; ++e) max_rows = std::max(max_rows, c.bounds[(size_t) e + 1] - c.bounds[(size_t) e]);
     const cudaStream_t s = nullptr;
     uint8_t* w = up(c.w);
     int32_t* bounds = up(c.bounds);
     float* x = up(c.x);
-    uint8_t* xq = dev<uint8_t>(own::act_bytes(rows, E) * 2);
+    uint8_t* xq = dev<uint8_t>(std::max(own::act_bytes(rows, E) * 2, (size_t) rows * FF * 4));
     uint8_t* hq = dev<uint8_t>(own::act_bytes(rows, FF) * 2);
     float* gu = dev<float>((size_t) rows * 2 * FF);
     float* out = dev<float>((size_t) rows * E);
@@ -387,6 +395,7 @@ int bench(int gu_type, int d_type, int E, int FF, int n_exp, double mean_rows) {
     own::Context ctx;
     own::Set set;
     set.w = w; set.stride = c.stride; set.n = n_exp; set.bounds = bounds; set.host_bounds = c.bounds.data(); set.rows = rows;
+    set.row0 = row0;
     double o_tot = 0, m_tot = 0;
     o_tot += time("own quantize x", [&] { own::quantize(x, nullptr, xq, E, E, rows, s); });
     o_tot += time("own gate/up+swiglu", [&] { set.xq = xq; set.dst = gu; set.ld = 2 * FF; ctx.gate_up(set, gu_type, FF, E, c.up_off, INFINITY, s); });
@@ -394,21 +403,26 @@ int bench(int gu_type, int d_type, int E, int FF, int n_exp, double mean_rows) {
     o_tot += time("own down", [&] { set.xq = hq; set.dst = out; set.ld = E; ctx.down(set, d_type, E, FF, c.down_off, s); });
 #if defined(STRATA_TEST_HAVE_MMQ)
     namespace mmq = strata::prefill::mmq;
-    if (mmq::built() && mmq::supported(gu_type) && mmq::supported(d_type) && mmq::glu_supported(gu_type, FF)) {
+    if (mmq::built() && mmq::supported(gu_type) && mmq::supported(d_type)) {
+        const bool glu = mmq::glu_supported(gu_type, FF);
         mmq::Context mc;
-        const int64_t n_ids = rows + mmq::ids_pad(max_rows);
+        const int64_t n_ids = rows + mmq::ids_pad(max_rows) + row0;
         int32_t* ids = dev<int32_t>((size_t) n_ids);
         mmq::iota(ids, n_ids, s);
         uint8_t* mxq = dev<uint8_t>(mmq::q8_bytes(rows, E));
         uint8_t* mhq = dev<uint8_t>(mmq::q8_bytes(rows, FF));
         float* xs = dev<float>((size_t) rows + 512);
         mmq::Product p;
-        p.w = w; p.type = gu_type; p.w_rows = 2 * FF; p.w_cols = E; p.expert_bytes = c.stride; p.n = n_exp; p.xq = mxq;
-        p.bounds = bounds; p.ids = ids; p.total_rows = rows; p.max_rows = max_rows; p.dst = gu; p.ld_dst = 2 * FF; p.y_scale = xs;
+        p.w = w; p.type = gu_type; p.w_rows = 2 * FF; p.w_cols = E; p.expert_bytes = c.stride; p.n = n_exp;
+        p.xq = mxq - (size_t) row0 * mmq::q8_block_bytes();
+        p.bounds = bounds; p.ids = ids; p.total_rows = rows; p.max_rows = max_rows; p.dst = gu - (size_t) row0 * 2 * FF;
+        p.ld_dst = 2 * FF; p.y_scale = xs - row0;
         mmq::Product d = p;
-        d.w = w + c.down_off; d.type = d_type; d.w_rows = E; d.w_cols = FF; d.xq = mhq; d.dst = out; d.ld_dst = E;
+        d.w = w + c.down_off; d.type = d_type; d.w_rows = E; d.w_cols = FF; d.xq = mhq - (size_t) row0 * mmq::q8_block_bytes();
+        d.dst = out - (size_t) row0 * E; d.ld_dst = E;
         m_tot += time("mmq quantize x", [&] { mmq::quantize(x, nullptr, mxq, gu_type, E, E, rows, s, xs); });
-        m_tot += time("mmq gate/up+swiglu", [&] { mc.run_glu(p, INFINITY, s); });
+        if (glu) m_tot += time("mmq gate/up+swiglu", [&] { mc.run_glu(p, INFINITY, s); });
+        else m_tot += time("mmq gate/up, swiglu", [&] { mc.run(p, s); mmq::swiglu(gu, (float*) xq, rows, FF, false, s); });
         m_tot += time("mmq quantize h", [&] { mmq::quantize(gu, nullptr, mhq, d_type, FF, 2 * FF, rows, s, xs); });
         m_tot += time("mmq down", [&] { mc.run(d, s); });
         std::printf("  total: own %.3f ms, mmq %.3f ms (own / mmq = %.3f)\n", o_tot, m_tot, o_tot / m_tot);
@@ -427,9 +441,11 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "--bench") {
         if (argc >= 8) return bench(std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]), std::atoi(argv[5]),
                                     std::atoi(argv[6]), std::atof(argv[7]));
-        bench(qt::IQ2_XXS, qt::IQ3_XXS, 4096, 2048, 288, 114);
-        bench(qt::IQ2_XS, qt::IQ3_XXS, 4096, 2048, 288, 114);
-        bench(qt::MXFP4, qt::MXFP4, 4096, 2048, 288, 114);
+        for (double mean : {6.0, 114.0, 910.0}) {
+            bench(qt::IQ2_XXS, qt::IQ3_XXS, 4096, 2048, mean > 500 ? 96 : 288, mean);
+            bench(qt::IQ2_XS, qt::IQ3_XXS, 4096, 2048, mean > 500 ? 96 : 288, mean);
+            bench(qt::MXFP4, qt::MXFP4, 4096, 2048, mean > 500 ? 96 : 288, mean);
+        }
         return 0;
     }
     if (argc >= 3 && std::string(argv[1]) == "--dump") {
@@ -446,12 +462,13 @@ int main(int argc, char** argv) {
                 std::printf("  not covered by the own kernels - skipped\n");
                 continue;
             }
-            if (!run_case(c, "real tensors", true)) ++bad;
+            if (!run_case(c, "real tensors", true, 64)) ++bad;
+            bench_case(c);
         }
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ3_XXS, qt::MXFP4};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {

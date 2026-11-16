@@ -864,6 +864,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // gate/up one on the product's rows before the SwiGLU); the light kernels, the CPU and the iGPU rows do not take
     // them (their staged experts all go over PCIe), and the fused SwiGLU product is off for them
     bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false;
+    std::map<std::string, int> own_n, mmq_n;   // the layers' products by kernel
     bool v41_eng_tok = false;
     size_t gstride = 0;
     std::string why;
@@ -965,6 +966,12 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                            std::to_string(Ly.d_type) + ") ";
             }
             gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type));
+            if (!Ly.exl3 && int8_layer(Ly, g)) {
+                const std::string gu = std::string(strata::qt::type_name(Ly.gu_type)) +
+                                       (Ly.mixed() ? std::string("+") + strata::qt::type_name(Ly.up_type) : std::string());
+                ++(own_gate_up(Ly, g) ? own_n : mmq_n)["gate/up " + gu];
+                ++(own_down(Ly, g) ? own_n : mmq_n)[std::string("down ") + strata::qt::type_name(Ly.d_type)];
+            }
         } else {
             has_dense = true;
             deq_ok(Ly.ffn_gate, "ffn_gate", il);
@@ -999,6 +1006,14 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         S->v41_eng_gemm = has_dsa && eng_env && !v41_eng_tok;
     }
     S->max_pools = (int) std::max<int64_t>(1, max_ctx_ / g.idx_kpool);
+    if (!own_n.empty()) {   // (which kernels multiply the prompt's experts; MMQ alone prints nothing)
+        std::string line;
+        for (const auto& kv : own_n) line += " " + kv.first + " x" + std::to_string(kv.second);
+        line += " | MMQ:";
+        for (const auto& kv : mmq_n) line += " " + kv.first + " x" + std::to_string(kv.second);
+        std::fprintf(stderr, "glm prefill: CUDA%d experts on the own int8 GEMM (layers):%s%s\n", dev_, line.c_str(),
+                     mmq_n.empty() ? " none" : "");
+    }
     S->sub_env = prefill_sub_env();
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
     S->gstride = gstride;
