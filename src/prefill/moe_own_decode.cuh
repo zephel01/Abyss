@@ -337,6 +337,58 @@ template<> struct Dec<12> {
     }
 };
 
+// Q6_K: 256 values: {128 bytes ql; 64 bytes qh; 16 x int8 scales (one a 16 values); f16 d}.  A value is
+// d sc (q - 32), q = 4 bits of ql | 2 bits of qh << 4.  In each half (128 values) block ib takes the low (ib < 2) or
+// high nibbles of ql[32 (ib & 1) ..] and bits 2 ib of qh[0 .. 31].
+// A chunk is a half: the header (the 16 scales and d: 18 bytes), the half's 64 bytes of ql and - a second data range
+// - its 32 bytes of qh.
+template<> struct Dec<14> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 16;
+    static constexpr int HDR = 18, RB = 105, CB2 = 32;
+    __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 210 + 192; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 210 + (size_t) (c & 1) * 64; }
+    __device__ static __forceinline__ size_t dat2(int c) { return (size_t) (c >> 1) * 210 + 128 + (size_t) (c & 1) * 32; }
+    __device__ static __forceinline__ float head(const uint8_t* ph) { return rd_f16(ph + 16); }
+    __device__ static __forceinline__ uint32_t word(const uint8_t* ql, const uint8_t* qh, int ib) {
+        const uint32_t l = rd16(ql) | rd16(ql + 2) << 16, h = rd16(qh) | rd16(qh + 2) << 16;
+        const uint32_t v = ((l >> (4 * (ib >> 1))) & 0x0F0F0F0Fu) | (((h >> (2 * ib)) & 0x03030303u) << 4);   // 0..63
+        return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;                                              // - 32
+    }
+    __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float,
+                                                  const uint8_t* pd2) {
+        const uint8_t* sc = ph + 8 * (c & 1) + 2 * ib;
+        Step r;
+        r.lo = word(pd + 32 * (ib & 1) + 4 * t, pd2 + 4 * t, ib);
+        r.hi = word(pd + 32 * (ib & 1) + 16 + 4 * t, pd2 + 16 + 4 * t, ib);
+        r.s = 0.0f;
+        r.m0 = (int) (int8_t) sc[0];
+        r.m1 = (int) (int8_t) sc[1];
+        r.o = 0.0f;
+        return r;
+    }
+};
+
+// Q8_0: 32 values a block: {f16 d; 32 x int8}.  A chunk is four blocks.
+template<> struct Dec<8> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 136, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 34 * ib;
+        const uint8_t* q = b + 2 + 4 * t;
+        Step r;
+        r.lo = rd16(q) | rd16(q + 2) << 16;
+        r.hi = rd16(q + 16) | rd16(q + 18) << 16;
+        r.s = rd_f16(b);
+        r.m0 = r.m1 = 0;
+        r.o = 0.0f;
+        return r;
+    }
+};
+
 // A chunk's bytes in its row: one range (chunk c at c * CB), or - a Dec with HDR - a header range and a data range
 template<int TY, typename = void> struct Rng {
     static constexpr int HDR = 0, RB = Dec<TY>::CB;
@@ -350,6 +402,15 @@ template<int TY> struct Rng<TY, decltype((void) Dec<TY>::HDR)> {
     static constexpr int HDR = Dec<TY>::HDR, RB = Dec<TY>::RB;
     __device__ static __forceinline__ size_t hdr(int c) { return Dec<TY>::hdr(c); }
     __device__ static __forceinline__ size_t dat(int c) { return Dec<TY>::dat(c); }
+};
+// (a Dec with CB2: a second data range a chunk, dat2(c))
+template<int TY, typename = void> struct Rng2 {
+    static constexpr int CB2 = 0;
+    __device__ static __forceinline__ size_t dat2(int) { return 0; }
+};
+template<int TY> struct Rng2<TY, decltype((void) Dec<TY>::CB2)> {
+    static constexpr int CB2 = Dec<TY>::CB2;
+    __device__ static __forceinline__ size_t dat2(int c) { return Dec<TY>::dat2(c); }
 };
 
 }  // namespace strata::prefill::own

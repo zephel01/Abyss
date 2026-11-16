@@ -71,6 +71,9 @@ void random_rows(int type, uint8_t* dst, int64_t rows, int64_t cols, std::mt1993
         } else if (type == qt::IQ1_M) {   // (the f16 scale's nibbles on top of the four scale words)
             const uint16_t d = qt::fp32_to_fp16(sc(rng));
             for (int k = 0; k < 4; ++k) p[48 + 2 * k + 1] = (uint8_t) ((p[48 + 2 * k + 1] & 0x0F) | (((d >> (4 * k)) & 0xF) << 4));
+        } else if (type == qt::Q6_K) {   // (d last)
+            const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.02f);
+            std::memcpy(p + 208, &d, 2);
         } else if (type == qt::Q4_K) {   // (d and dmin)
             const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.1f), dm = qt::fp32_to_fp16(sc(rng) * 0.3f);
             std::memcpy(p, &d, 2);
@@ -489,7 +492,7 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K, qt::Q6_K, qt::Q8_0};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {

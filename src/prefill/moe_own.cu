@@ -89,12 +89,14 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
 
 #if !defined(__HIPCC__)
 // ---------------------------------------------------------------- the tile plan
-// Two tile shapes.  Fine: 4 warps (64 gate/up or 128 down rows), 64 tokens - two CTAs an SM, more and smaller tiles:
-// a small set still fills the GPU.  Coarse: 8 warps, 128 tokens - the weights are decoded once for twice the tokens
-// (a set of many rows an expert: ~10% less time).
+// Tile shapes.  Fine (0): 4 warps (64 gate/up or 128 down rows), 64 tokens - two CTAs an SM, more and smaller tiles:
+// a small set still fills the GPU.  Coarse (1): 8 warps, 128 tokens - the weights are decoded once for twice the
+// tokens (a set of many rows an expert: ~10% less time).  Wide (2): 8 warps, 64 tokens - the types whose raw chunk is
+// large (Q6_K, Q8_0: ~10 16-byte words a row and chunk): two fine CTAs or a coarse one do not fit an SM's shared
+// memory, a wide one does - their only shape.
 template<int CF> struct Cfg {
-    static constexpr int NW = CF ? 8 : 4;       // warps a CTA
-    static constexpr int TC = CF ? 128 : 64;    // tokens a tile
+    static constexpr int NW = CF ? 8 : 4;               // warps a CTA
+    static constexpr int TC = CF == 1 ? 128 : 64;       // tokens a tile
     static constexpr int NT = NW * 32;
 };
 
@@ -184,10 +186,13 @@ __device__ __forceinline__ void mma16(int c[4], uint32_t a0, uint32_t a1, uint32
 #endif
 }
 
+constexpr size_t kSmemSM = 102400, kSmemCTA = 101376;   // (an SM's shared memory and what one CTA may take: 100 KB cards)
 // 16-byte words a slot holds (a chunk from any offset its alignment allows), and a CTA's shared memory
 template<int TY, int CF> struct Lay {
     static constexpr int WH = Rng<TY>::HDR > 0 ? (16 - Dec<TY>::AL + Rng<TY>::HDR + 15) / 16 : 0;   // the header's words
-    static constexpr int WS = WH + (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
+    static constexpr int WD = (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;                              // the data's
+    static constexpr int W2 = Rng2<TY>::CB2 > 0 ? (16 - Dec<TY>::AL + Rng2<TY>::CB2 + 15) / 16 : 0;      // the second data range's
+    static constexpr int WS = WH + WD + W2;
     static constexpr int BUF = 2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<CF>::TC;   // 16-byte words
     static constexpr size_t smem = (size_t) BUF * 16 + (size_t) Dec<TY>::GW * 4;   // (+ the codebook)
 };
@@ -199,7 +204,7 @@ template<int TY, bool GLU, int CF>
 __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, int rt, int b0, int b1, int ng) {
     typedef Dec<TY> D;
     constexpr int NW = Cfg<CF>::NW, TC = Cfg<CF>::TC, NT = Cfg<CF>::NT, NG = TC / 8;
-    constexpr int WS = Lay<TY, CF>::WS, WH = Lay<TY, CF>::WH, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
+    constexpr int WS = Lay<TY, CF>::WS, WH = Lay<TY, CF>::WH, WD = Lay<TY, CF>::WD, W2 = Lay<TY, CF>::W2, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     uint4* wbuf = smem;                       // [2][NT slots][WS]
     uint4* xbuf = wbuf + 2 * NT * WS;         // [2][TC][8]
@@ -234,7 +239,14 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
         const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
         const int last = (int) (((src & 15) + D::CB - 1) / 16);   // (no word past the chunk: it may be past the pool)
 #pragma unroll
-        for (int k = 0; k < WS - WH; ++k) cp16(dst + WH + k, p + 16 * min(k, last));
+        for (int k = 0; k < WD; ++k) cp16(dst + WH + k, p + 16 * min(k, last));
+        if constexpr (W2 > 0) {
+            const uintptr_t src2 = (uintptr_t) (my_slot + Rng2<TY>::dat2(c));
+            const uint8_t* p2 = (const uint8_t*) (src2 & ~(uintptr_t) 15);
+            const int last2 = (int) (((src2 & 15) + Rng2<TY>::CB2 - 1) / 16);
+#pragma unroll
+            for (int k = 0; k < W2; ++k) cp16(dst + WH + WD + k, p2 + 16 * min(k, last2));
+        }
     };
     const auto issue_x = [&](int h) {
         uint4* xd = xbuf + (h & 1) * TC * 8;
@@ -277,6 +289,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     cp_commit();
     const uint8_t* sp[2][2];
     const uint8_t* hp[2][2] = {};   // (the chunk's header, the types that have one)
+    const uint8_t* sp2[2][2] = {};  // (its second data range)
     float hd[2][2];
     for (int h = 0; h < n_h; ++h) {
         cp_wait_all();
@@ -292,6 +305,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                 for (int h8 = 0; h8 < 2; ++h8) {
                     const uint8_t* slot = (const uint8_t*) (wbuf + ((c & 1) * NT + soff[f][h8]) * WS);
                     sp[f][h8] = slot + WH * 16 + ((uintptr_t) (rowp[f][h8] + Rng<TY>::dat(c)) & 15);
+                    if constexpr (W2 > 0) sp2[f][h8] = slot + (WH + WD) * 16 + ((uintptr_t) (rowp[f][h8] + Rng2<TY>::dat2(c)) & 15);
                     if constexpr (WH > 0) {
                         hp[f][h8] = slot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::hdr(c)) & 15);
                         hd[f][h8] = D::head(hp[f][h8]);
@@ -311,7 +325,8 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
             for (int f = 0; f < 2; ++f)
 #pragma unroll
                 for (int h8 = 0; h8 < 2; ++h8) {
-                    if constexpr (WH > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8]);
+                    if constexpr (W2 > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8], sp2[f][h8]);
+                    else if constexpr (WH > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8]);
                     else st[i][f][h8] = D::step(sp[f][h8], (h % HPW) * SPH + i, t, hd[f][h8], grid);
                 }
 #pragma unroll
@@ -416,8 +431,12 @@ __global__ void __launch_bounds__(Cfg<CF>::NT) own_kernel(const KArgs a) {
     tile_body<TY, GLU, CF>(a, smem, e, rt, b0, b1, (min(b1 - b0, a.tc) + 7) / 8);
 }
 
+// the type takes the wide shape only: two fine CTAs do not fit an SM
+template<int TY> struct Wide { static constexpr bool on = 2 * Lay<TY, 0>::smem > kSmemSM; };
+
 template<int TY, bool GLU, int CF>
 void launch_c(const KArgs& a, unsigned grid, cudaStream_t s) {
+    static_assert(Lay<TY, CF>::smem <= kSmemCTA, "the shape does not fit a CTA's shared memory");
     static bool once = false;
     if (!once) {
         ck(cudaFuncSetAttribute(own_kernel<TY, GLU, CF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) Lay<TY, CF>::smem),
@@ -428,25 +447,31 @@ void launch_c(const KArgs& a, unsigned grid, cudaStream_t s) {
     ck(cudaGetLastError(), GLU ? "gate_up" : "down");
 }
 template<int TY, bool GLU>
-void launch_t(const KArgs& a, unsigned grid, bool coarse, cudaStream_t s) {
-    if (coarse) launch_c<TY, GLU, 1>(a, grid, s);
-    else launch_c<TY, GLU, 0>(a, grid, s);
+void launch_t(const KArgs& a, unsigned grid, int shape, cudaStream_t s) {
+    if constexpr (Wide<TY>::on) {   // (a large raw chunk: the wide shape only)
+        launch_c<TY, GLU, 2>(a, grid, s);
+    } else {
+        if (shape == 1) launch_c<TY, GLU, 1>(a, grid, s);
+        else launch_c<TY, GLU, 0>(a, grid, s);
+    }
 }
 
 template<bool GLU>
-void launch(int type, const KArgs& a, unsigned grid, bool coarse, cudaStream_t s) {
+void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) {
     switch (type) {
-        case 16: launch_t<16, GLU>(a, grid, coarse, s); break;
-        case 17: launch_t<17, GLU>(a, grid, coarse, s); break;
-        case 18: launch_t<18, GLU>(a, grid, coarse, s); break;
-        case 22: launch_t<22, GLU>(a, grid, coarse, s); break;
-        case 19: launch_t<19, GLU>(a, grid, coarse, s); break;
-        case 29: launch_t<29, GLU>(a, grid, coarse, s); break;
-        case 20: launch_t<20, GLU>(a, grid, coarse, s); break;
-        case 42: launch_t<42, GLU>(a, grid, coarse, s); break;
-        case 23: launch_t<23, GLU>(a, grid, coarse, s); break;
-        case 12: launch_t<12, GLU>(a, grid, coarse, s); break;
-        case 39: launch_t<39, GLU>(a, grid, coarse, s); break;
+        case 16: launch_t<16, GLU>(a, grid, shape, s); break;
+        case 17: launch_t<17, GLU>(a, grid, shape, s); break;
+        case 18: launch_t<18, GLU>(a, grid, shape, s); break;
+        case 22: launch_t<22, GLU>(a, grid, shape, s); break;
+        case 19: launch_t<19, GLU>(a, grid, shape, s); break;
+        case 29: launch_t<29, GLU>(a, grid, shape, s); break;
+        case 20: launch_t<20, GLU>(a, grid, shape, s); break;
+        case 42: launch_t<42, GLU>(a, grid, shape, s); break;
+        case 23: launch_t<23, GLU>(a, grid, shape, s); break;
+        case 12: launch_t<12, GLU>(a, grid, shape, s); break;
+        case 14: launch_t<14, GLU>(a, grid, shape, s); break;
+        case 8: launch_t<8, GLU>(a, grid, shape, s); break;
+        case 39: launch_t<39, GLU>(a, grid, shape, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
             std::exit(1);
@@ -454,6 +479,24 @@ void launch(int type, const KArgs& a, unsigned grid, bool coarse, cudaStream_t s
 }
 
 int align_of(int type) { return type == 39 ? 1 : 2; }
+bool wide_type(int type) {
+    switch (type) {
+        case 16: return Wide<16>::on;
+        case 17: return Wide<17>::on;
+        case 18: return Wide<18>::on;
+        case 22: return Wide<22>::on;
+        case 19: return Wide<19>::on;
+        case 29: return Wide<29>::on;
+        case 20: return Wide<20>::on;
+        case 42: return Wide<42>::on;
+        case 23: return Wide<23>::on;
+        case 12: return Wide<12>::on;
+        case 14: return Wide<14>::on;
+        case 8: return Wide<8>::on;
+        case 39: return Wide<39>::on;
+        default: return false;
+    }
+}
 #endif   // !__HIPCC__
 
 }  // namespace
@@ -472,13 +515,13 @@ bool built() {
     return ok;
 }
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8);
 }
 #endif
 
 bool usable(int t, int64_t rows, int64_t cols) {
     // (a chunk of the type's blocks: 256 values, 128 for the 32- and 64-value block types)
-    const int64_t chunk = (t == 39 || t == 20 || t == 42) ? 128 : 256;   // (IQ4_XS: 256-value blocks)
+    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 8) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 
@@ -569,8 +612,9 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
         }
         return t;
     };
+    const bool wide = wide_type(type);   // (launch_t: the wide shape - 8 warps, 64 tokens, one CTA an SM)
     const auto count = [&](int tc, bool crs) {
-        const int rows_tile = (crs ? Cfg<1>::NW : Cfg<0>::NW) * per_warp;
+        const int rows_tile = (crs || wide ? Cfg<1>::NW : Cfg<0>::NW) * per_warp;
         long g = 0;
         return token_tiles(tc, g) * ((a.w_rows + rows_tile - 1) / rows_tile);
     };
@@ -578,12 +622,12 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
     if (tc == 0) {
         const long sms = sm_count();
         double best = 1e300;
-        for (int c = 8; c <= 128; c += 8) {
+        for (int c = 8; c <= (wide ? Cfg<2>::TC : Cfg<1>::TC); c += 8) {
             const bool crs = c > Cfg<0>::TC;
             long groups = 0;
             const long tt = token_tiles(c, groups);
             if (tt <= 0) break;
-            const long tiles = count(c, crs), slots = crs ? sms : 2 * sms;
+            const long tiles = count(c, crs), slots = crs || wide ? sms : 2 * sms;
             const double rounds = tiles <= slots ? 1.0 : tiles <= 2 * slots ? 2.0 : (double) tiles / (double) slots;
             // (a coarse tile: twice the warps of a fine one on the SM, the same time)
             const double est = rounds * (6.0 + (double) groups / (double) tt);
@@ -594,6 +638,7 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
         }
         if (tc == 0) return;
     }
+    if (wide) tc = std::min(tc, Cfg<2>::TC);
     const bool coarse = tc > Cfg<0>::TC;
     const long total = count(tc, coarse);
     if (total <= 0) return;
@@ -607,7 +652,7 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
         ck(cudaGetLastError(), "tiles");
         a.tiles = tiles;
     }
-    launch<GLU>(type, a, (unsigned) total, coarse, st);
+    launch<GLU>(type, a, (unsigned) total, coarse ? 1 : 0, st);
     if (stats_on()) {
         Stats& t = stats();
         ++t.launches;
