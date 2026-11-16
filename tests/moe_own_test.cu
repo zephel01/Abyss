@@ -71,6 +71,10 @@ void random_rows(int type, uint8_t* dst, int64_t rows, int64_t cols, std::mt1993
         } else if (type == qt::IQ1_M) {   // (the f16 scale's nibbles on top of the four scale words)
             const uint16_t d = qt::fp32_to_fp16(sc(rng));
             for (int k = 0; k < 4; ++k) p[48 + 2 * k + 1] = (uint8_t) ((p[48 + 2 * k + 1] & 0x0F) | (((d >> (4 * k)) & 0xF) << 4));
+        } else if (type == qt::Q4_K) {   // (d and dmin)
+            const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.1f), dm = qt::fp32_to_fp16(sc(rng) * 0.3f);
+            std::memcpy(p, &d, 2);
+            std::memcpy(p + 2, &dm, 2);
         } else {   // (the others: an fp16 scale first)
             const uint16_t d = qt::fp32_to_fp16(sc(rng));
             std::memcpy(p, &d, 2);
@@ -301,7 +305,9 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
             // from the int8 one; the reference above is what the own kernel is held to)
             // (IQ1_S: on random blocks MMQ's result is ~1% of the norm away, or not finite; real IQ1_S tensors are
             // compared with --dump)
-            const bool fp4 = c.gu_type == qt::MXFP4 || c.d_type == qt::MXFP4 || c.gu_type == qt::IQ1_S || c.d_type == qt::IQ1_S;
+            // (Q4_K the same: the types whose MMQ product takes the activations' block sums)
+            const bool fp4 = c.gu_type == qt::MXFP4 || c.d_type == qt::MXFP4 || c.gu_type == qt::IQ1_S || c.d_type == qt::IQ1_S ||
+                             c.gu_type == qt::Q4_K || c.d_type == qt::Q4_K;
             if (!fp4 && (!(eh < 2e-2) || !(ed < 5e-2))) {
                 std::printf("%-28s FAIL  vs MMQ: h differs %.2e of its norm, the output %.2e\n", name, eh, ed);
                 ok = false;
@@ -483,7 +489,7 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {

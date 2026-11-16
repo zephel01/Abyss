@@ -75,7 +75,16 @@ __global__ void quant_kernel(const float* __restrict__ x, const int32_t* __restr
     // t of the GEMM reads its two words of all four blocks in two 16-byte loads)
     const int wd = lane & 7, bi = lane >> 3;
     q[(r * cols + (int64_t) c * 128) / 4 + (wd & 3) * 8 + bi * 2 + (wd >> 2)] = w;
-    if ((lane & 7) == 0) d[r * (cols / 32) + c * 4 + (lane >> 3)] = amax / 127.0f;
+    // the block's scale, and - a second plane - its sum of activations as rounded (the K-quants' offsets)
+    int si = (int) (int8_t) (w & 255) + (int) (int8_t) ((w >> 8) & 255) + (int) (int8_t) ((w >> 16) & 255) + (int) (int8_t) (w >> 24);
+    si += __shfl_xor_sync(0xFFFFFFFFu, si, 1);
+    si += __shfl_xor_sync(0xFFFFFFFFu, si, 2);
+    si += __shfl_xor_sync(0xFFFFFFFFu, si, 4);
+    if ((lane & 7) == 0) {
+        const int64_t nb = cols / 32;
+        d[r * nb + c * 4 + (lane >> 3)] = amax / 127.0f;
+        d[rows * nb + r * nb + c * 4 + (lane >> 3)] = (amax / 127.0f) * (float) si;
+    }
 }
 
 #if !defined(__HIPCC__)
@@ -114,6 +123,7 @@ struct KArgs {
     size_t up_off;          // gate/up: the up matrix after the gate matrix
     const uint8_t* xq;      // activations: int8 [rows][K]
     const float* xd;        // their scales [rows][K / 32]
+    const float* xsum;      // their block sums (scale x the sum of the int8), the same shape
     const int32_t* bounds;
     const int32_t* tiles;   // the tile table on the device, or null: itiles
     int32_t itiles[kInline + 1];
@@ -178,7 +188,7 @@ __device__ __forceinline__ void mma16(int c[4], uint32_t a0, uint32_t a1, uint32
 template<int TY, int CF> struct Lay {
     static constexpr int WH = Rng<TY>::HDR > 0 ? (16 - Dec<TY>::AL + Rng<TY>::HDR + 15) / 16 : 0;   // the header's words
     static constexpr int WS = WH + (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;
-    static constexpr int BUF = 2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + 2 * Cfg<CF>::TC;   // 16-byte words
+    static constexpr int BUF = 2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<CF>::TC;   // 16-byte words
     static constexpr size_t smem = (size_t) BUF * 16 + (size_t) Dec<TY>::GW * 4;   // (+ the codebook)
 };
 
@@ -194,6 +204,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     uint4* wbuf = smem;                       // [2][NT slots][WS]
     uint4* xbuf = wbuf + 2 * NT * WS;         // [2][TC][8]
     uint4* sbuf = xbuf + 2 * TC * 8;          // [2][TC]
+    uint4* ubuf = sbuf + 2 * TC;              // [2][TC]: the block sums (the types that need them)
 #if defined(OWN_GRID_GLOBAL)
     const uint32_t* grid = D::table();
 #else
@@ -238,6 +249,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
         if (threadIdx.x < ng * 8) {
             const int64_t r = min(b0 + (int) threadIdx.x, b1 - 1) - a.row0;
             cp16(sbuf + (h & 1) * TC + threadIdx.x, a.xd + r * (a.K / 32) + (int64_t) h * 4);
+            if constexpr (Sums<TY>::on) cp16(ubuf + (h & 1) * TC + threadIdx.x, a.xsum + r * (a.K / 32) + (int64_t) h * 4);
         }
     };
 
@@ -307,6 +319,13 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
             if (j >= ng) break;
             const uint4 b01 = xw[(j * 8 + g) * 8 + t * 2], b23 = xw[(j * 8 + g) * 8 + t * 2 + 1];
             const uint4 s0 = xs[j * 8 + 2 * t], s1 = xs[j * 8 + 2 * t + 1];
+            uint4 u0 = {}, u1 = {};
+            if constexpr (Sums<TY>::on) {
+                u0 = ubuf[(h & 1) * TC + j * 8 + 2 * t];
+                u1 = ubuf[(h & 1) * TC + j * 8 + 2 * t + 1];
+            }
+            const float ua[4] = {__uint_as_float(u0.x), __uint_as_float(u0.y), __uint_as_float(u0.z), __uint_as_float(u0.w)};
+            const float ub[4] = {__uint_as_float(u1.x), __uint_as_float(u1.y), __uint_as_float(u1.z), __uint_as_float(u1.w)};
             const uint32_t bw[8] = {b01.x, b01.y, b01.z, b01.w, b23.x, b23.y, b23.z, b23.w};
             const float xa[4] = {__uint_as_float(s0.x), __uint_as_float(s0.y), __uint_as_float(s0.z), __uint_as_float(s0.w)};
             const float xb[4] = {__uint_as_float(s1.x), __uint_as_float(s1.y), __uint_as_float(s1.z), __uint_as_float(s1.w)};
@@ -337,6 +356,12 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                     acc[f][j][1] = fmaf(v[1], x1, acc[f][j][1]);
                     acc[f][j][2] = fmaf(v[2], x0, acc[f][j][2]);
                     acc[f][j][3] = fmaf(v[3], x1, acc[f][j][3]);
+                    if constexpr (Sums<TY>::on) {   // (the rows' offsets x the tokens' block sums)
+                        acc[f][j][0] = fmaf(-st[i][f][0].o, ua[i], acc[f][j][0]);
+                        acc[f][j][1] = fmaf(-st[i][f][0].o, ub[i], acc[f][j][1]);
+                        acc[f][j][2] = fmaf(-st[i][f][1].o, ua[i], acc[f][j][2]);
+                        acc[f][j][3] = fmaf(-st[i][f][1].o, ub[i], acc[f][j][3]);
+                    }
                 }
             }
         }
@@ -420,6 +445,7 @@ void launch(int type, const KArgs& a, unsigned grid, bool coarse, cudaStream_t s
         case 20: launch_t<20, GLU>(a, grid, coarse, s); break;
         case 42: launch_t<42, GLU>(a, grid, coarse, s); break;
         case 23: launch_t<23, GLU>(a, grid, coarse, s); break;
+        case 12: launch_t<12, GLU>(a, grid, coarse, s); break;
         case 39: launch_t<39, GLU>(a, grid, coarse, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
@@ -446,7 +472,7 @@ bool built() {
     return ok;
 }
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12);
 }
 #endif
 
@@ -456,7 +482,7 @@ bool usable(int t, int64_t rows, int64_t cols) {
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 
-size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * 4; }
+size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * 8; }
 
 void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
@@ -604,6 +630,7 @@ void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size
     a.up_off = up_off;
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_embd);
+    a.xsum = a.xd + s.rows * (n_embd / 32);
     a.bounds = s.bounds;
     a.dst = s.dst;
     a.ld = s.ld;
@@ -623,6 +650,7 @@ void Context::down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t 
     a.stride = s.stride;
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_ff);
+    a.xsum = a.xd + s.rows * (n_ff / 32);
     a.bounds = s.bounds;
     a.dst = s.dst;
     a.ld = s.ld;

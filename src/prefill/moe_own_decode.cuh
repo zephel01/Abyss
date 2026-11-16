@@ -27,6 +27,7 @@ struct Step {
     uint32_t lo, hi;   // int8 x 4 each
     float s;           // SUB 32: the values' scale
     int m0, m1;        // SUB 16: lo's and hi's integer multipliers (the float scale is the chunk's head)
+    float o;           // a Dec with SUMS: the values are s q - o (the kernel subtracts o x the activations' sum)
 };
 
 // bits 0-3 of n -> 0xFF in bytes 0-3
@@ -300,12 +301,51 @@ template<> struct Dec<23> {
     }
 };
 
+// Q4_K: 256 values: {f16 d; f16 dmin; 12 bytes: eight 6-bit scales and eight 6-bit mins; 128 bytes: a pair of 32-value
+// blocks shares 32 bytes, the first block in the low nibbles, the second in the high ones}.  A value is
+// d sc q - dmin m, q in 0..15: the int8 is q, and the kernel takes dmin m times the block's sum of activations off
+// (SUMS).  A chunk is half of it, as IQ4_XS: the 16-byte header and the half's 64 bytes.
+template<> struct Dec<12> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 32;
+    static constexpr int HDR = 16, RB = 72;
+    static constexpr bool SUMS = true;
+    __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 144; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 144 + 16 + (size_t) (c & 1) * 64; }
+    __device__ static __forceinline__ float head(const uint8_t* ph) { return rd_f16(ph); }
+    __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float hd) {
+        const int j = (c & 1) * 4 + ib;   // the block in its 256
+        const uint8_t* sc = ph + 4;
+        uint32_t scale, mn;
+        if (j < 4) {
+            scale = sc[j] & 63u;
+            mn = sc[j + 4] & 63u;
+        } else {
+            scale = (sc[j + 4] & 15u) | ((uint32_t) (sc[j - 4] >> 6) << 4);
+            mn = (uint32_t) (sc[j + 4] >> 4) | ((uint32_t) (sc[j] >> 6) << 4);
+        }
+        const uint8_t* q = pd + 32 * (ib >> 1) + 4 * t;
+        const int sh = 4 * (ib & 1);
+        Step r;
+        r.lo = ((rd16(q) | rd16(q + 2) << 16) >> sh) & 0x0F0F0F0Fu;
+        r.hi = ((rd16(q + 16) | rd16(q + 18) << 16) >> sh) & 0x0F0F0F0Fu;
+        r.s = hd * (float) scale;
+        r.m0 = r.m1 = 0;
+        r.o = rd_f16(ph + 2) * (float) mn;
+        return r;
+    }
+};
+
 // A chunk's bytes in its row: one range (chunk c at c * CB), or - a Dec with HDR - a header range and a data range
 template<int TY, typename = void> struct Rng {
     static constexpr int HDR = 0, RB = Dec<TY>::CB;
     __device__ static __forceinline__ size_t hdr(int) { return 0; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) c * Dec<TY>::CB; }
 };
+// (a Dec with SUMS needs the activations' block sums)
+template<int TY, typename = void> struct Sums { static constexpr bool on = false; };
+template<int TY> struct Sums<TY, decltype((void) Dec<TY>::SUMS)> { static constexpr bool on = Dec<TY>::SUMS; };
 template<int TY> struct Rng<TY, decltype((void) Dec<TY>::HDR)> {
     static constexpr int HDR = Dec<TY>::HDR, RB = Dec<TY>::RB;
     __device__ static __forceinline__ size_t hdr(int c) { return Dec<TY>::hdr(c); }
