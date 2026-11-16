@@ -7,6 +7,31 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.160 - 2026-11-16
+
+Language profiles against stray scripts in answers, and the #48 follow-up. Without a profile the outputs are
+unchanged (6-config md5 the same).
+
+- Language profiles (`"lang": "ja-en"` in a request, or `STRATA_LANG` for the server default): tokens of scripts the
+  profile does not allow get -inf at the sampler, before greedy, sampling, every draft/verify window (n-gram, MTP /
+  NextN, DSpark) and the draft heads. Profiles: `ja-en`, `zh-en`, `ko-en`, `en`, experimental `zh-Hans-en` /
+  `zh-Hant-en`. By default only the answer is limited (`"lang_think": true` / `STRATA_LANG_THINK` also limits the
+  thinking). `ja-en` keeps every JIS X 0213 kanji, so Japanese words are never cut; Greek stays allowed for formulas.
+  Special, stop, think and tool tokens are never banned. Qwen3.8 UD-IQ3_XXS, 40 Japanese medical/explainer questions
+  x 3 seeds with thinking: answers with Chinese mixed in 10/120 (8.3%) -> 0/120, same time. Per-tokenizer class
+  tables ship in `data/token_classes/` (built on the fly if the vocabulary differs).
+- OpenAI `logit_bias` on `/v1/chat/completions` (whole output).
+- Mirror (`STRATA_GLM_MIRROR`): an overlay pack opens its shards through links named `overlay-NNNNN-of-NNNNN.gguf`;
+  the mirror is now also looked up by the link target's file name, so a copy of the original shards on a second
+  drive is found (#48).
+- Docs: two M.2 drives on a 16 GB GPU + 64 GB RAM (#48, docs/SSD2): -43% SSD wait, +25% decode; deepseek41: the Q5_K
+  dense overlay on a 16 GB card at 507,904 context (decode 15.4 -> 17.4 tok/s, 469K prompt 1,720 -> 629 s).
+- CI: windows-build and arm-build also run on `ci-*` branches, so a release is built everywhere before its tag.
+
+Known limits of the language profiles: byte-fallback tokens that continue an earlier token are not judged; Chinese-only
+words written with kanji shared with Japanese (e.g. 啤酒) are not stopped; `lang` cannot yet be set in the config
+file's `sampling` block or the Chat settings.
+
 ## v1.3.159 - 2026-11-16
 
 Fixes the two builds v1.3.158 broke (the engine's outputs are unchanged):
