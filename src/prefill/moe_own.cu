@@ -503,17 +503,25 @@ bool wide_type(int type) {
 
 #if defined(__HIPCC__)
 bool built() { return false; }
+bool tuned_device() { return false; }
 bool supported(int) { return false; }
 #else
-bool built() {
-    static const bool ok = [] {
-        int dev = 0;
+namespace {
+// the current device's compute capability major * 10 + minor (cached a device: a box may hold different cards)
+int device_cc() {
+    static int cc[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+    if (cc[dev] == 0) {
         cudaDeviceProp p{};
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        return p.major >= 8;   // (int8 mma.sync and cp.async)
-    }();
-    return ok;
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 0;
+        cc[dev] = p.major * 10 + p.minor;
+    }
+    return cc[dev];
 }
+}  // namespace
+bool tuned_device() { return device_cc() == 120; }
+bool built() { return device_cc() >= 80; }   // (int8 mma.sync and cp.async)
 bool supported(int t) {
     return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8);
 }

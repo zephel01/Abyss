@@ -18,6 +18,9 @@ namespace strata::prefill::own {
 
 /// This build and the current device have the kernels (CUDA sm_80+; a HIP build has none yet).
 bool built();
+/// The current device is one the kernels were measured against MMQ on (sm_120: RTX 5090 class): the prompt path's
+/// default types apply there.
+bool tuned_device();
 /// The kernels read weights of this ggml type.
 bool supported(int ggml_type);
 /// supported(type) and a [rows, cols] matrix of it fits the kernels' tiles (cols a multiple of 256 - of 128 for the
