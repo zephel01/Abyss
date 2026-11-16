@@ -245,6 +245,28 @@ class ServerEnv(unittest.TestCase):
             S.apply_server_env({})
 
 
+class ServerEnvLang(unittest.TestCase):
+    def test_the_language_profile_from_a_config_reaches_the_server(self):   # #50
+        from serve import lang_ban
+        keys = S.SERVER_ENV_TEXT
+        saved = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            with mock.patch("builtins.print") as said:
+                S.apply_server_env({"env": {"STRATA_LANG": "ja-en", "STRATA_LANG_THINK": "1"}})
+            self.assertEqual(lang_ban.default_profile(), "ja-en")
+            self.assertTrue(lang_ban.default_think())
+            told = " ".join(str(c.args[0]) for c in said.call_args_list)
+            self.assertNotIn("STRATA_LANG", told)        # text, not checked as a number
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class StatusBehindTheKey(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

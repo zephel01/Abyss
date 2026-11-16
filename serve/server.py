@@ -3548,6 +3548,9 @@ SERVER_ENV_LATE = ("STRATA_GLM_THINK_RESERVE", "STRATA_ENGINE_WRAP_S", "STRATA_E
 # every one of them is a number: a value that is not one is dropped here, with a line, instead of a float() / int() at
 # shutdown or in a request (`STRATA_ENGINE_QUIT_S=50s` ended the server with a traceback)
 SERVER_ENV_INT = ("STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_GLM_THINK_RESERVE")
+# ... and the language profile's defaults (serve/lang_ban.py reads them per request): text, not numbers, so they are
+# copied from the config's "env" but not checked as numbers (#50: STRATA_LANG in a config's "env" went to the engine only)
+SERVER_ENV_TEXT = ("STRATA_LANG", "STRATA_LANG_THINK")
 
 
 def clean_server_env() -> list[str]:
@@ -3572,7 +3575,7 @@ def apply_server_env(cfg: dict) -> None:
     """The config's "env" entries this server reads itself (`--env` puts every setting there; the rest go to the
     engine): in effect before it starts."""
     global ENGINE_STALL_S
-    for k in SERVER_ENV + SERVER_ENV_LATE:
+    for k in SERVER_ENV + SERVER_ENV_LATE + SERVER_ENV_TEXT:
         v = (cfg.get("env") or {}).get(k)
         if v is not None:
             os.environ[k] = str(v)
