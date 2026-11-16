@@ -6540,6 +6540,12 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                // a STOP that came while this window ran (a stop string, a client gone, the server's loop check):
+                // the window is dropped - nothing committed, nothing emitted - so the session ends at what the server
+                // was sent (all outputs but the last, x, as after any window) and the next turn's prompt extends it
+                // instead of falling back to an older checkpoint (Strata's idea).  Not the first window: it holds the
+                // prompt's last token.
+                if (!first_window && stop_req.load()) { finish = "cancel"; break; }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
