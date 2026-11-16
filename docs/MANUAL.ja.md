@@ -781,6 +781,33 @@ SwiGLU FFN（5120 → 17408）でエキスパートはなく、下書きは Next
 - **まだないもの:** 複数 GPU へのレイヤー分割、AMD（コンパイルは通る。未検証）、AMD での画像。Qwen3.8-Flash-Next は画像を
   断ります。MoE の qwen35（Ornith）も同じ画像の経路を通りますが未検証です（変換器ファイルは試していない）。
 
+## Qwen3.5-9B QSA
+
+自宅で学習した QSA indexer を足した Qwen3.5-9B です（indexer の形は higa2515 の Qwen3.8-27B-QSA と同じ。
+[設定項目](#設定項目)の `STRATA_Q35_QSA` を参照）。ファイルは `Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf`（BETA）。
+full attention の 8 層のうち 3 層は dense のまま、ほかの 7 層は 4,099 セルを超えると indexer が選んだ上位 1,024 個の
+4 セルブロックと自分のブロックだけに attention します。これはファイルのメタデータに書いてあります: 3 層の
+`attention.compress_ratios` が 0（indexer テンソルもない）、`attention.indexer.top_k` が 4096。エンジンはこの 2 つを
+読みます（v1.3.160 の次のコミットから。v1.3.157〜160 はこのファイルを全部 dense で動かす）。起動時の行の最後に
+`dense attention layers: 3` と出ます。
+
+```bash
+.venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf --out pack
+build-cuda/strata --glm-pack pack --max-context 131072 --prefill auto
+```
+
+- **メモリ**（RTX 5090、MTP の下書きあり、ファイル全体を VRAM に置く）: GPU メモリの最大は文脈 32K / 64K / 128K で
+  11.2 / 12.4 / 14.9 GB。そのうち 4 GB はプロンプト経路のバッファ（VRAM の空きが少ないと小さくなる）。ホストの RAM は 7.0 GB。11 GB に制限しても（`STRATA_GLM_VRAM_GB=11`）
+  128K の文脈は動く: 最大 10.7 GB、FFN のうち 0.77 GB を RAM に置き、decode 245 tok/s。
+- **速度**（RTX 5090、128K のチャットのプロンプト + 256 トークン、MTP の下書きあり、各 2 回。dense は同じファイルに
+  `STRATA_Q35_QSA=0`）: decode 132 → 240 tok/s（1.81 倍）、プロンプト 6,018 → 5,546 tok/s（−8%）。
+- **品質**（teacher-forced。学習に入れていない 128K のサンプル 8 本の最後の 1,024 トークン。同じファイルの dense と nll を比べる）:
+  コード +0.6 / +1.0%、英語 −0.1 / +1.2%、日本語 +0.9 / +3.1%、エージェントの記録 +0.6 / +2.8%。平均 KL は agent を除いて
+  0.032（含めて 0.042）。125K のニードル（秘密 3 つ + 関数の値、thinking あり）: 4/4。
+- 制限は 27B の QSA ファイルと同じです: CUDA だけ（AMD では dense）、`--kv` と画像入りのリクエストでは dense。
+  `STRATA_Q35_QSA=0` でファイルを dense で動かせます。
+- このファイルは llama.cpp では読み込めません（`wrong number of tensors`。qwen35 の読み込みが indexer テンソルを知らないため）。
+
 ## Laguna-S-2.1
 
 v1.3.140 から、エンジンは poolside の [Laguna-S-2.1](https://huggingface.co/unsloth/Laguna-S-2.1-GGUF)（`laguna`、118B の
@@ -1065,7 +1092,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_Q4X_PLE_PREFETCH` | on | Qwen3.8-Flash-Next で MTP ドラフターを使うとき: 検証窓の PLE 表の行（1 トークン 16 回の SSD 読み）を、ドラフターがそのトークンを出した時点で行キャッシュに先読みする（窓が使う 1 下書き分前、v1.3.87）。RTX 5090、ISTA IQ3_S: 窓の行の待ち 0.8〜1.1 ms → 0.1〜0.25 ms、ドラフターあり +3%。`0` で窓の開始時に読む |
 | `STRATA_Q4X_HC_FUSE` | on（NVIDIA）、off（HIP） | Qwen3.8-Flash-Next: 1 トークンの hyper-connection の混合（97 回）を 5 回ではなく 2 回の起動で行う。結果は同じビット（v1.3.86。`hc4_fused_parity` で確認）。RTX 5090、ISTA IQ3_S: 混合 2.98 → 2.21 ms/トークン、1 トークンずつの経路 +8%。v1.3.87 から MTP の検証窓も（1 窓 97 回の混合が 2 列で 2.6 → 1.8 ms、5 列で 5.5 → 2.6 ms。ドラフターあり +8%）。`0` で 5 回の起動、`2` でトークンは融合・窓は 5 回（比較用） |
 | `STRATA_Q4X_GDN_FUSE` | on（NVIDIA）、off（HIP） | Qwen3.8-Flash-Next: delta-net 層の中間（q / k の L2 norm とゲート、再帰、ゲート付き出力 norm とその q8_1）を 4 回ではなく 1 回の起動で行う。1 トークンずつの経路と MTP の検証窓の両方（窓はゲートの後の 3 回を 1 回に）。結果は同じビット（`gdn_core_parity`）。RTX 5090: 36 層で単体 0.44 → 0.33 ms/トークン、decode は約 +1%（bench の揺れの範囲）。`0` で別々の起動 |
-| `STRATA_Q35_QSA` | GGUF に QSA indexer があれば on | QSA indexer テンソル（`attention.indexer.*`、例: higa2515/Qwen3.8-27B-QSA-GGUF）を持つ dense の qwen35 GGUF: 2,051 セルを超えると、各 full-attention 層は indexer が選んだ上位 512 個の 4 セルブロックと自分のブロックだけに attention する（プロンプト・decode・MTP 検証窓すべて。KV は全部保持。層数・ヘッド数は GGUF から読む）。`0` = 通常ファイルと同じ dense attention（この機能以前と同じ出力）、`2` = indexer のキーは作るが attention は dense のまま（テスト用）。`--kv` で KV を量子化したとき、AMD、画像入りのリクエストでは dense。 |
+| `STRATA_Q35_QSA` | GGUF に QSA indexer があれば on | QSA indexer テンソル（`attention.indexer.*`、例: higa2515/Qwen3.8-27B-QSA-GGUF）を持つ dense の qwen35 GGUF: top_k + 3 セルを超えると、各 full-attention 層は indexer が選んだ上位 top_k / 4 個の 4 セルブロックと自分のブロックだけに attention する（top_k は `attention.indexer.top_k`。27B のファイルは 2048 = 512 ブロック。プロンプト・decode・MTP 検証窓すべて。KV は全部保持。層数・ヘッド数は GGUF から読む）。`attention.compress_ratios` が 0 の attention 層は dense のまま。`0` = 通常ファイルと同じ dense attention（この機能以前と同じ出力）、`2` = indexer のキーは作るが attention は dense のまま（テスト用）。`--kv` で KV を量子化したとき、AMD、画像入りのリクエストでは dense。 |
+| `STRATA_Q35_QSA_DENSE_LAYERS` | 未設定 | 上の QSA 経路のテスト用: ファイルに indexer があっても dense のままにする attention 層をカンマ区切りで書く（例: `3,31`。同じファイルのまま、その層の indexer は使わない）。出荷するファイルはメタデータで指定する: attention 層の `attention.compress_ratios` が 0 = その層は dense（Qwen3.5-9B QSA は 3 層をこの形で dense にしている。[Qwen3.5-9B QSA](#qwen35-9b-qsa)）。未設定: ファイルの ratios のまま。 |
 | `STRATA_Q35_QSA_PICK` | 未設定 | 上の QSA 経路のテスト用（通常は使わない）: `recent` は indexer の選択の代わりに直近 512 ブロック（スライディング窓）、`first` は先頭のブロックを使う。 |
 | `STRATA_Q4X_QSA_BATCH` | on（NVIDIA）、off（HIP） | Qwen3.8-Flash-Next のプロンプト: QSA 層の attention のうち、先頭 2,051 セルより後の行を 64 行まとめて 1 回の起動で行う（各行は自分の選んだセルを KV キャッシュから直接読む）。従来は 1 行ごとにセルのコピーと attention の起動。サブバッチの indexer キーも 1 行 1 回ではなく 2 回の起動で追加する。結果は同じビット（`qsa_rows_parity` で両方を確認）。RTX 5090、ISTA IQ3_S: QSA 段 2,000 → 346 ms（bench のプロンプト 12,353 トークン）、8K プロンプト 1,555 → 2,360 tok/s（+52%）、32K 1,710 → 3,015 tok/s（+76%）、2K +5%。`0` で 1 行ずつ |
 | `STRATA_Q4X_QSA_DECODE` | on（NVIDIA）、off（HIP） | Qwen3.8-Flash-Next の decode: QSA 層の attention（1 トークンずつの経路と MTP の検証窓）で、セルのコピー + attn_decode をやめ、KV キャッシュから直接読み、1 ブロックで数ヘッドを処理する（窓は列をまとめて 1 回の起動、選択も 1 回、indexer キーは 2 回の起動）。結果は同じビット（`qsa_rows_parity`）。RTX 5090、1 層 2,051 セル: 1 トークン 22 → 18 us、4 列の窓 88 → 24 us、8 列 177 → 34 us。--bench の decode（ドラフターあり）126.9 / 128.9 → 131.0 / 131.3 tok/s（約 +2.6%、bench の揺れの範囲内）。`STRATA_Q35_ROWS_HPW`（1 ブロックのヘッド数: 1 / 2 / 3 / 4 / 6。既定は 1 行で 2、5 行まで 4、それ以上 6）は調整用。`0` で従来の起動 |

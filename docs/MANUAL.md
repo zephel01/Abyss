@@ -835,6 +835,32 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
 - **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images on AMD; Qwen3.8-Flash-Next refuses
   images; the MoE qwen35 models (Ornith) take the same image path but are untested (no projector file tried).
 
+## Qwen3.5-9B QSA
+
+Qwen3.5-9B with a QSA indexer trained at home (the same indexer form as higa2515's Qwen3.8-27B-QSA, see
+`STRATA_Q35_QSA` in [Settings](#settings)): `Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf`
+(BETA). Of the 8 full-attention layers, layer 3 stays dense and the other 7 attend, past 4,099 cells, to the
+indexer's 1,024 best 4-cell blocks plus the query's own block. The file says it in its metadata: `attention.compress_ratios`
+is 0 on layer 3 (it has no indexer tensors) and `attention.indexer.top_k` is 4096. The engine reads both (from the
+commit after v1.3.160; v1.3.157-160 run such a file all dense); the start-up line ends with `dense attention layers: 3`.
+
+```bash
+.venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf --out pack
+build-cuda/strata --glm-pack pack --max-context 131072 --prefill auto
+```
+
+- **Memory** (RTX 5090, MTP drafts on, the whole file in VRAM): peak GPU memory 11.2 / 12.4 / 14.9 GB at a 32K / 64K /
+  128K context, 4 GB of it the prompt path's buffer (smaller when less VRAM is free); host RAM 7.0 GB. Capped at 11 GB (`STRATA_GLM_VRAM_GB=11`) a 128K context
+  still runs: 10.7 GB peak, 0.77 GB of the FFN in RAM, decode 245 tok/s.
+- **Speed** (RTX 5090, 128K chat prompt + 256 tokens, MTP drafts on, 2 runs each, the same file with `STRATA_Q35_QSA=0`
+  as dense): decode 132 -> 240 tok/s (1.81x), prompt 6,018 -> 5,546 tok/s (-8%).
+- **Quality** (teacher-forced, the last 1,024 tokens of 8 held-out 128K samples, nll against dense on the same file):
+  code +0.6 / +1.0%, English -0.1 / +1.2%, Japanese +0.9 / +3.1%, agent transcripts +0.6 / +2.8%; mean KL 0.032
+  without the agent samples (0.042 with them). Needle at 125K (3 secrets + a function's value, thinking on): 4/4.
+- Same limits as the 27B QSA files: CUDA only (dense on AMD), dense with `--kv` and for requests with pictures.
+  `STRATA_Q35_QSA=0` runs the file dense.
+- The file does not load in llama.cpp (`wrong number of tensors`: the indexer tensors are not in its qwen35 loader).
+
 ## Laguna-S-2.1
 
 From v1.3.140 the engine runs poolside's [Laguna-S-2.1](https://huggingface.co/unsloth/Laguna-S-2.1-GGUF) (`laguna`, a
@@ -1126,7 +1152,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_Q4X_PLE_PREFETCH` | on | Qwen3.8-Flash-Next with the MTP drafter: each verify window's PLE table rows (16 SSD reads a token) are read into the row cache as soon as the drafter knows the token, a draft step before the window needs them (v1.3.87). RTX 5090, ISTA IQ3_S: the window's wait for its rows 0.8-1.1 ms -> 0.1-0.25 ms, drafter on +3%. `0`: read when the window starts |
 | `STRATA_Q4X_HC_FUSE` | on (NVIDIA), off (HIP) | Qwen3.8-Flash-Next: a token's hyper-connection mixes (97 a token) in two launches instead of five, the same bits (v1.3.86; `hc4_fused_parity` checks it). RTX 5090, ISTA IQ3_S: the mixes 2.98 -> 2.21 ms a token, token by token +8%. The MTP verify windows too from v1.3.87 (a window's 97 mixes 2.6 -> 1.8 ms at 2 columns, 5.5 -> 2.6 ms at 5; drafter on +8%). `0`: five launches; `2`: tokens fused, windows five (for A/B) |
 | `STRATA_Q4X_GDN_FUSE` | on (NVIDIA), off (HIP) | Qwen3.8-Flash-Next: a delta-net layer's middle (the q / k L2 norm and the gates, the recurrence, the gated output norm and its q8_1) in one launch instead of four, token by token and in the MTP verify windows (there after the gates: three launches into one); the same bits (`gdn_core_parity`). RTX 5090: 36 layers 0.44 -> 0.33 ms a token alone, about +1% decode (within the bench's drift). `0`: the separate launches |
-| `STRATA_Q35_QSA` | on when the GGUF has QSA indexers | Dense qwen35 GGUFs with QSA indexer tensors (`attention.indexer.*`, e.g. higa2515/Qwen3.8-27B-QSA-GGUF; layer and head counts are read from the GGUF): past 2,051 cells each full-attention layer attends to the indexer's 512 best 4-cell blocks plus the query's own block (prompt, decode and MTP verify windows; all KV is kept). `0` = dense attention as on a normal file (the same output as before this feature); `2` = the indexer keys are still built but attention stays dense (a test control). Off with `--kv` quantized KV, on AMD, and for requests with images (dense there). |
+| `STRATA_Q35_QSA` | on when the GGUF has QSA indexers | Dense qwen35 GGUFs with QSA indexer tensors (`attention.indexer.*`, e.g. higa2515/Qwen3.8-27B-QSA-GGUF; layer and head counts are read from the GGUF): past top_k + 3 cells each full-attention layer attends to the indexer's top_k / 4 best 4-cell blocks plus the query's own block (top_k from `attention.indexer.top_k`: 2048 = 512 blocks on the 27B file; prompt, decode and MTP verify windows; all KV is kept); an attention layer whose `attention.compress_ratios` entry is 0 stays dense. `0` = dense attention as on a normal file (the same output as before this feature); `2` = the indexer keys are still built but attention stays dense (a test control). Off with `--kv` quantized KV, on AMD, and for requests with images (dense there). |
+| `STRATA_Q35_QSA_DENSE_LAYERS` | unset | Test control for the QSA path above: a comma list of attention layers (e.g. `3,31`) that stay dense although the file has indexers for them (the same file, those layers' indexers unused). A shipping file says it in its metadata instead: `attention.compress_ratios` 0 on an attention layer = that layer dense (Qwen3.5-9B QSA keeps layer 3 dense this way, [Qwen3.5-9B QSA](#qwen35-9b-qsa)). Unset: the file's ratios as they are. |
 | `STRATA_Q35_QSA_PICK` | unset | Test control for the QSA path above, not for use: `recent` replaces the indexer's choice with the newest 512 blocks (a sliding window), `first` with the oldest ones. |
 | `STRATA_Q4X_QSA_BATCH` | on (NVIDIA), off (HIP) | Qwen3.8-Flash-Next prompts: the QSA layers' attention for the rows past the first 2,051 cells runs 64 rows a launch, each over its own selected cells read in place, instead of a cell copy and an attention launch a row; the indexer keys of a sub-batch go in two launches instead of one a row. The same bits (`qsa_rows_parity` checks both). RTX 5090, ISTA IQ3_S: the QSA stage 2,000 -> 346 ms over the bench's 12,353 prompt tokens; 8K prompt 1,555 -> 2,360 tok/s (+52%), 32K 1,710 -> 3,015 (+76%), 2K +5%. `0`: a row at a time |
 | `STRATA_Q4X_QSA_DECODE` | on (NVIDIA), off (HIP) | Qwen3.8-Flash-Next decode: the QSA layers' attention token by token and in the MTP verify windows reads its cells in place, a few query heads a block, instead of a cell copy and attn_decode (a window's columns in one launch, one selection call for them, its indexer keys in two launches). The same bits (`qsa_rows_parity`). RTX 5090, 2,051 cells a layer: a token 22 -> 18 us, a 4-column window 88 -> 24 us, 8 columns 177 -> 34 us; --bench decode (drafter on) 126.9 / 128.9 -> 131.0 / 131.3 tok/s (about +2.6%, inside the bench's drift). `STRATA_Q35_ROWS_HPW` (query heads a block: 1, 2, 3, 4 or 6; default 2 for one row, 4 up to 5, else 6) is for tuning. `0`: the old launches |
