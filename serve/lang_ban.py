@@ -143,7 +143,7 @@ def register(engine, s: dict | None) -> str | None:
         try:
             cmd(f"BIAS {name} {sp}", "BIASOK", timeout=120.0)
         except ValueError as e:
-            raise ValueError(f"the engine refused the logit bias set: {e} (an engine before v1.3.158 has no BIAS)") \
-                from None
+            raise ValueError(f"the engine refused the logit bias set: {e} "
+                             "(an engine older than the language profiles has no BIAS)") from None
         reg[1].add(name)
     return name
