@@ -144,6 +144,11 @@ struct Glm5Geometry {
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
     bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
 
+    // arch 2 (qwen35 / qwen35moe / qwen4exp / laguna): the GGUF's end tokens - tokenizer.ggml.eot_token_id, then
+    // eos_token_id, eom_token_id - the turn's end list when neither --eos-ids nor the server's stop_ids give one
+    // (GLM's ids are ordinary pieces of Qwen's 248K vocab and out of Laguna's)
+    std::vector<int64_t> eog;
+
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
 

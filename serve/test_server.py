@@ -533,6 +533,10 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([x for x in self.keys(temperature=0.7, _think_close=[271]) if x.startswith("think_close=")])
         self.assertFalse([x for x in self.keys(temperature=0.7, _think_end=151668, _think_close=[])
                           if x.startswith("think_close=")])
+        # the tool-argument tags (GLM's <arg_value> </arg_value>); an empty list says the vocabulary has none
+        self.assertIn("arg_ids=154849,154850", self.keys(temperature=0, _arg_ids=[154849, 154850]))
+        self.assertIn("arg_ids=", self.keys(temperature=0, _arg_ids=[]))
+        self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("arg_ids")])
         from serve.server import question_language
         self.assertEqual(question_language("寝坊した上司への謝罪メールの件名を提案してください。"), "Japanese")
         self.assertEqual(question_language("请用中文解释三省两指南。"), "Chinese")

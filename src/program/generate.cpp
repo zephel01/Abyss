@@ -280,6 +280,7 @@ struct Options {
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     bool eos_given = false;    ///< --stop-eos or --eos-ids appeared: the glm path stops only when asked (defaults are qwen's)
+    bool eos_ids_set = false;  ///< --eos-ids appeared (the glm path's bare --stop-eos stops on the model's own ends)
     std::vector<int64_t> eos_ids = {248044, 248046};
     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
@@ -1533,10 +1534,14 @@ static int glm_pack_generate(const Options& o) {
     sp.temperature = o.temperature;
     sp.seed = o.seed;
 
-    // deepseek4: <｜end▁of▁sentence｜> (1) is its only end-of-generation token
+    // deepseek4: <｜end▁of▁sentence｜> (1) is its only end-of-generation token; qwen35 / qwen4exp / laguna: the GGUF's
+    // eot / eos / eom (Glm5Geometry::eog - GLM's ids are ordinary pieces of Qwen's vocab and out of Laguna's).  A bare
+    // --stop-eos stops on these too (its qwen defaults are another vocabulary's ids for GLM and deepseek4)
     const std::vector<int64_t> glm_eos = model.geometry().dsv4() ? std::vector<int64_t>{1}
-                                                                 : std::vector<int64_t>{154820, 154827, 154829};
-    const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
+                                         : model.geometry().arch == 2 && !model.geometry().eog.empty()
+                                             ? model.geometry().eog
+                                             : std::vector<int64_t>{154820, 154827, 154829};
+    const std::vector<int64_t>& eos = o.eos_ids_set ? o.eos_ids : glm_eos;
     const bool stop_on_eos = o.eos_given || o.stop_eos || o.serve;
 
     // ---- stdin on its own thread (the qwen serve's pattern): a STOP line must reach a request that is
@@ -1631,6 +1636,11 @@ static int glm_pack_generate(const Options& o) {
     // this request stops on these instead of the engine's list (GLM's on the glm path: Qwen3.8 and Ornith there
     // stopped at ordinary pieces of their vocabulary, and the answer's loop guard ended a turn with a byte token)
     std::vector<int64_t> req_stop_ids;
+    // GEN key arg_ids=<open>,<close>: the template's single-token tool-argument tags (GLM's <arg_value> /
+    // </arg_value>) as the server's tokenizer has them; arg_ids= (empty): none - the answer-loop guard's argument
+    // landing is off.  No key: GLM's own ids on GLM, none on the other families (they are ordinary tokens there)
+    bool req_arg_set = false;
+    int64_t req_arg_open = -2, req_arg_close = -2;
     // GEN key spec=0: this request token by token - no drafter, no verify windows (--bench compares a greedy answer
     // with and without them: greedy speculation must give the same tokens)
     bool req_spec = true;
@@ -1988,12 +1998,14 @@ static int glm_pack_generate(const Options& o) {
                 // where the answer stands: inside a tool call's argument value, the place a loop must be closed for
                 // an agent to go on (GLM's single-token tags)
                 // (deepseek4 has no single-token argument tags: its turn ends with <｜end▁of▁sentence｜>, 1)
-                const bool ds4 = model.geometry().dsv4();
-                const int kArgValue = ds4 ? -2 : 154849, kArgValueEnd = ds4 ? -2 : 154850;
-                int kUser = ds4 ? 1 : 154827;   // (the server's turn end when its list has no GLM <|user|>)
-                if (!req_stop_ids.empty() &&
-                    std::find(req_stop_ids.begin(), req_stop_ids.end(), (int64_t) kUser) == req_stop_ids.end())
-                    kUser = (int) req_stop_ids.front();
+                // (qwen35 / laguna: none - 154849 / 154850 are a Cyrillic and a Hangul piece of Qwen's vocab; the
+                // server's arg_ids= key gives a template's own)
+                const bool ds4 = model.geometry().dsv4(), glm = model.geometry().arch == 0;
+                const int kArgValue = req_arg_set ? (int) req_arg_open : glm ? 154849 : -2;
+                const int kArgValueEnd = req_arg_set ? (int) req_arg_close : glm ? 154850 : -2;
+                int kUser = ds4 ? 1 : 154827;   // (this request's turn end when its end list has no GLM <|user|>)
+                if (!stops.empty() && std::find(stops.begin(), stops.end(), (int64_t) kUser) == stops.end())
+                    kUser = (int) stops.front();
                 if (tok == kArgValue) in_arg = true;
                 if (tok == kArgValueEnd) in_arg = false;
                 if (const int per = looping(loop_w_answer)) {
@@ -2997,6 +3009,8 @@ static int glm_pack_generate(const Options& o) {
             req_ws_ids.clear();
             req_end_ids.clear();
             req_stop_ids.clear();
+            req_arg_set = false;
+            req_arg_open = req_arg_close = -2;
             req_think_close.clear();
             req_spec = true;
             req_ns = req_sess = 0;
@@ -3032,6 +3046,16 @@ static int glm_pack_generate(const Options& o) {
                     for (int64_t x : c) if (x >= 0 && c.size() <= 96) req_think_close.push_back((int32_t) x);
                 }
                 else if (k == "end_ids") { std::string e; parse_i64_list(v.c_str(), req_end_ids, e); }
+                else if (k == "arg_ids") {
+                    std::vector<int64_t> a;
+                    std::string e;
+                    req_arg_set = true;   // (empty or unusable: no argument tags)
+                    if (!v.empty() && parse_i64_list(v.c_str(), a, e) && a.size() == 2 && a[0] >= 0 && a[0] < n_vocab &&
+                        a[1] >= 0 && a[1] < n_vocab) {
+                        req_arg_open = a[0];
+                        req_arg_close = a[1];
+                    }
+                }
                 else if (k == "stop_ids") {
                     std::string e;
                     if (!parse_i64_list(v.c_str(), req_stop_ids, e)) req_stop_ids.clear();
@@ -3418,6 +3442,7 @@ int main(int argc, char** argv) {
             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
             o.stop_eos = true;
             o.eos_given = true;
+            o.eos_ids_set = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;

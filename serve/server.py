@@ -592,6 +592,11 @@ class StrataEngine:
             v = sampling.get("_" + k)
             if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{1,16}", v):
                 think += f" {k}={v}"
+        # the template's single-token tool-argument tags (GLM's <arg_value> </arg_value>), where the answer-loop guard
+        # closes a looping argument; empty: this vocabulary has none (the engine's GLM ids are other tokens here)
+        aid = sampling.get("_arg_ids")
+        if aid is not None:
+            think += " arg_ids=" + ",".join(str(int(i)) for i in aid)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
         if isinstance(tune, dict):
@@ -1378,6 +1383,10 @@ class Service:
         # (as the engine gets them: the template's turn end first - the answer-loop guard ends a turn with it)
         turn_end = (_special_ids(IM_END) + _special_ids("</assistant>"))[:1]
         self.stop_order = turn_end + sorted(self.stop_ids - set(turn_end))
+        # the tool call's argument tags as one token each (GLM-5.3), else none: the engine's loop guard closes a looping
+        # argument with the second (GEN key arg_ids=)
+        arg_open, arg_close = _special_ids("<arg_value>"), _special_ids("</arg_value>")
+        self.arg_ids = arg_open + arg_close if arg_open and arg_close else []
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
@@ -2028,7 +2037,8 @@ class Service:
                 if thinking and parser.state == "reasoning":
                     closed_by = "unclosed"
                 # the turn's end tokens, for the engine to stop on (an engine that knows the key; else its own list)
-                base = {**(sampling or {}), "_stop_ids": self.stop_order} if self.stop_ids else dict(sampling or {})
+                base = {**(sampling or {}), "_stop_ids": self.stop_order, "_arg_ids": self.arg_ids} \
+                    if self.stop_ids else dict(sampling or {})
 
                 def engine_sampling(done: int, reasoning: bool) -> dict:
                     """The sampling keys for an engine run that starts `done` tokens into the answer, inside the

@@ -555,12 +555,26 @@ std::string expert_counts_path(const std::string& pack_dir) {
 
 // ================================ geometry ================================
 
+// arch 2's end tokens from the tokenizer metadata (Glm5Geometry::eog): eot first (the turn end), then eos, eom
+static bool eog_from_gguf(const strata::GgufFile& g, Glm5Geometry& out) {
+    out.eog.clear();
+    for (const char* k : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eos_token_id", "tokenizer.ggml.eom_token_id"}) {
+        const auto* v = g.get(k);
+        if (v == nullptr || !v->is_num()) continue;
+        const int64_t id = (int64_t) v->num();
+        if (id >= 0 && id < out.n_vocab && std::find(out.eog.begin(), out.eog.end(), id) == out.eog.end())
+            out.eog.push_back(id);
+    }
+    return true;
+}
+
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     if (g.get("deepseek4.block_count")) return from_gguf_dsv4(g, out, err);
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
-    if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count")) return from_gguf_qwen35(g, out, err);
-    if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err);
-    if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err);
+    if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count"))
+        return from_gguf_qwen35(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err) && eog_from_gguf(g, out);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";

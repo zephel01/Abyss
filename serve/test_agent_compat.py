@@ -181,6 +181,8 @@ class AnswerRoom(Base):
         self.ask(max_tokens=100)
         self.assertEqual(self.engine.runs[-1]["_stop_ids"], self.svc.stop_order)
         self.assertEqual(set(self.svc.stop_order), self.svc.stop_ids)
+        # the tool-argument tags go along as well: the vocabulary's own single tokens, else none (arg_ids= empty)
+        self.assertEqual(self.engine.runs[-1]["_arg_ids"], self.svc.arg_ids)
 
 
 class ClosedByGuard(Base):
