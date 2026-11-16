@@ -7,6 +7,16 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.159 - 2026-11-16
+
+Fixes the two builds v1.3.158 broke (the engine's outputs are unchanged):
+
+- Windows (MSVC): the own AVX2 dot products used `_cvtsh_ss` / `_cvtss_sh`, which MSVC does not have; they now use the
+  vector F16C intrinsics (same instructions, same bits).
+- aarch64 CI: own_dot_test compared the own dot products with ggml-cpu bit for bit, but ggml-cpu's NEON code sums in
+  another order. Off x86 the test now checks values (same activations into both, within 2e-4 of sum |w x|); on x86
+  it stays bit for bit. aarch64 keeps ggml-cpu's NEON dots as the default (`STRATA_CPU_GGML`).
+
 ## v1.3.158 - 2026-11-16 (beta)
 
 Beta: the first step of building and running Abyss without llama.cpp. Abyss is a fork of Project Maya (from Strata)
