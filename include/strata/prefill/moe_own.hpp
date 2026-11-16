@@ -40,6 +40,8 @@ size_t act_bytes(int64_t rows, int64_t cols, bool sums = false);
 bool act_natural_order();
 /// The type's products read the activations' block sums: quantize its activations with `sums`.
 bool needs_sums(int ggml_type);
+/// (tests: false = the kernels that read a matrix on a multiple of 2 only, also for one on a multiple of 4)
+void test_align4(bool on);
 /// Row i of the output is row ids[i] of x (row i when ids is null); x has `ld` floats a row.  xq: 16-byte aligned.
 void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld, int64_t rows, void* stream,
               bool sums = false);

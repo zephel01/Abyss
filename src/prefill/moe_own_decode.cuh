@@ -50,6 +50,12 @@ __device__ __forceinline__ uint32_t sign_mask(uint32_t s7, int half) {
 
 __device__ __forceinline__ uint32_t rd16(const uint8_t* p) { return *(const uint16_t*) p; }
 __device__ __forceinline__ float rd_f16(const uint8_t* p) { return __half2float(*(const __half*) p); }
+__device__ __forceinline__ uint32_t rd32(const uint8_t* p) { return rd16(p) | rd16(p + 2) << 16; }   // (p even)
+// (A4: p is a multiple of 4 - one load.  The kernels of the 4-aligned matrices: Dec<112>, Dec<113>.)
+template<bool A4> __device__ __forceinline__ uint32_t rd32x(const uint8_t* p) {
+    if constexpr (A4) return *(const uint32_t*) p;
+    else return rd32(p);
+}
 
 template<int TY> struct Dec;
 
@@ -283,6 +289,7 @@ template<> struct Dec<23> {
     __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
     static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 32;
     static constexpr int HDR = 8, RB = 68;   // (header bytes; row bytes a chunk)
+    static constexpr bool FOUR = true;
     __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 136; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 136 + 8 + (size_t) (c & 1) * 64; }
     __device__ static __forceinline__ float head(const uint8_t* ph) { return rd_f16(ph); }
@@ -300,17 +307,32 @@ template<> struct Dec<23> {
         r.m0 = r.m1 = 0;
         return r;
     }
+    // the half's four blocks at once: the header's scale bits read once
+    __device__ static __forceinline__ void steps4(const uint8_t* pd, const uint8_t* ph, int c, int t, float hd, Step* out) {
+        const int n = c & 1;
+        const uint32_t sh = rd16(ph + 2) >> (8 * n), sl = rd16(ph + 4 + 2 * n);   // this half's 4 x 2 high bits, 4 x 4 low bits
+#pragma unroll
+        for (int ib = 0; ib < 4; ++ib) {
+            const int ls = (int) (((sl >> (4 * ib)) & 15u) | (((sh >> (2 * ib)) & 3u) << 4));
+            const uint32_t v = rd32(pd + 16 * ib + 4 * t);
+            out[ib].lo = iq4_bytes(v);
+            out[ib].hi = iq4_bytes(v >> 4);
+            out[ib].s = hd * (float) (ls - 32);
+            out[ib].m0 = out[ib].m1 = 0;
+        }
+    }
 };
 
 // Q4_K: 256 values: {f16 d; f16 dmin; 12 bytes: eight 6-bit scales and eight 6-bit mins; 128 bytes: a pair of 32-value
 // blocks shares 32 bytes, the first block in the low nibbles, the second in the high ones}.  A value is
 // d sc q - dmin m, q in 0..15: the int8 is q, and the kernel takes dmin m times the block's sum of activations off
 // (SUMS).  A chunk is half of it, as IQ4_XS: the 16-byte header and the half's 64 bytes.
-template<> struct Dec<12> {
+template<bool A4> struct DecQ4K {
     static constexpr int GW = 0;
     __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
     static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 32;
     static constexpr int HDR = 16, RB = 72;
+    static constexpr bool FOUR = true;
     static constexpr bool SUMS = true;
     __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 144; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 144 + 16 + (size_t) (c & 1) * 64; }
@@ -336,7 +358,34 @@ template<> struct Dec<12> {
         r.o = rd_f16(ph + 2) * (float) mn;
         return r;
     }
+    // the half's four blocks at once: a pair of blocks shares its bytes (low / high nibbles) - read once; the 12
+    // scale bytes as three words
+    __device__ static __forceinline__ void steps4(const uint8_t* pd, const uint8_t* ph, int c, int t, float hd, Step* out) {
+        const uint32_t s0 = rd32x<A4>(ph + 4), s1 = rd32x<A4>(ph + 8), s2 = rd32x<A4>(ph + 12);   // scale bytes 0-3, 4-7, 8-11
+        const float dmin = rd_f16(ph + 2);
+        const bool second = (c & 1) != 0;
+#pragma unroll
+        for (int pr = 0; pr < 2; ++pr) {
+            const uint32_t lo = rd32x<A4>(pd + 32 * pr + 4 * t), hi = rd32x<A4>(pd + 32 * pr + 16 + 4 * t);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int ib = 2 * pr + k;   // (block j = 4 (c & 1) + ib of the 256)
+                const uint32_t b0 = (s0 >> (8 * ib)) & 255u, b1 = (s1 >> (8 * ib)) & 255u, b2 = (s2 >> (8 * ib)) & 255u;
+                // j < 4: scale = sc[j] & 63, min = sc[j + 4] & 63;  else: scale = sc[j + 4] & 15 | sc[j - 4] >> 6 << 4,
+                // min = sc[j + 4] >> 4 | sc[j] >> 6 << 4   (sc[j - 4] = b0, sc[j] = b1, sc[j + 4] = b2 there)
+                const uint32_t scale = second ? (b2 & 15u) | ((b0 >> 6) << 4) : b0 & 63u;
+                const uint32_t mn = second ? (b2 >> 4) | ((b1 >> 6) << 4) : b1 & 63u;
+                out[ib].lo = (lo >> (4 * k)) & 0x0F0F0F0Fu;
+                out[ib].hi = (hi >> (4 * k)) & 0x0F0F0F0Fu;
+                out[ib].s = hd * (float) scale;
+                out[ib].m0 = out[ib].m1 = 0;
+                out[ib].o = dmin * (float) mn;
+            }
+        }
+    }
 };
+template<> struct Dec<12> : DecQ4K<false> {};
+template<> struct Dec<112> : DecQ4K<true> {};   // (every row and chunk on a multiple of 4: the block is 144 bytes)
 
 // Q6_K: 256 values: {128 bytes ql; 64 bytes qh; 16 x int8 scales (one a 16 values); f16 d}.  A value is
 // d sc (q - 32), q = 4 bits of ql | 2 bits of qh << 4.  In each half (128 values) block ib takes the low (ib < 2) or
@@ -348,6 +397,7 @@ template<> struct Dec<14> {
     __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
     static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 16;
     static constexpr int HDR = 18, RB = 105, CB2 = 32;
+    static constexpr bool FOUR = true;
     __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 210 + 192; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 210 + (size_t) (c & 1) * 64; }
     __device__ static __forceinline__ size_t dat2(int c) { return (size_t) (c >> 1) * 210 + 128 + (size_t) (c & 1) * 32; }
@@ -368,6 +418,30 @@ template<> struct Dec<14> {
         r.m1 = (int) (int8_t) sc[1];
         r.o = 0.0f;
         return r;
+    }
+    // the half's four blocks at once: ql's two byte sets (blocks 0 / 2 and 1 / 3) and qh's one read once
+    __device__ static __forceinline__ void steps4(const uint8_t* pd, const uint8_t* ph, int c, int t, float, const uint8_t* pd2,
+                                                  Step* out) {
+        const uint32_t h_lo = rd32(pd2 + 4 * t), h_hi = rd32(pd2 + 16 + 4 * t);
+        const uint8_t* sc = ph + 8 * (c & 1);
+        const uint32_t sa = rd32(sc), sb = rd32(sc + 4);   // the half's eight int8 scales
+#pragma unroll
+        for (int pr = 0; pr < 2; ++pr) {   // (blocks pr and pr + 2: the low and the high nibbles of ql[32 pr ..])
+            const uint32_t l_lo = rd32(pd + 32 * pr + 4 * t), l_hi = rd32(pd + 32 * pr + 16 + 4 * t);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int ib = pr + 2 * k;
+                const uint32_t ss = ib < 2 ? sa >> (16 * ib) : sb >> (16 * (ib - 2));
+                const uint32_t v0 = ((l_lo >> (4 * k)) & 0x0F0F0F0Fu) | (((h_lo >> (2 * ib)) & 0x03030303u) << 4);
+                const uint32_t v1 = ((l_hi >> (4 * k)) & 0x0F0F0F0Fu) | (((h_hi >> (2 * ib)) & 0x03030303u) << 4);
+                out[ib].lo = ((v0 | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+                out[ib].hi = ((v1 | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+                out[ib].s = 0.0f;
+                out[ib].m0 = (int) (int8_t) (ss & 255u);
+                out[ib].m1 = (int) (int8_t) ((ss >> 8) & 255u);
+                out[ib].o = 0.0f;
+            }
+        }
     }
 };
 
@@ -450,7 +524,6 @@ template<> struct Dec<21> {
 
 // bytes of v (0-127) minus k (a byte value repeated), a byte at a time
 __device__ __forceinline__ uint32_t sub8(uint32_t v, uint32_t k) { return ((v | 0x80808080u) - k) ^ 0x80808080u; }
-__device__ __forceinline__ uint32_t rd32(const uint8_t* p) { return rd16(p) | rd16(p + 2) << 16; }   // (p even)
 
 // Q4_0: 32 values a block: {f16 d; 16 bytes: value i in byte i's low nibble, value 16 + i in its high nibble}, a value
 // is d (q - 8).  A chunk is four blocks.
@@ -514,11 +587,12 @@ template<> struct Dec<6> {
 // Q5_K: 256 values: {f16 d; f16 dmin; 12 bytes of scales and mins as Q4_K's; 32 bytes qh; 128 bytes as Q4_K's}: a
 // value is d sc q - dmin m, q = the nibble | qh's bit (the block's number) of the value's byte << 4.  A chunk is half
 // of it: the 48-byte header (d, dmin, scales, qh - both halves bring it) and the half's 64 bytes.
-template<> struct Dec<13> {
+template<bool A4> struct DecQ5K {
     static constexpr int GW = 0;
     __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
     static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 32;
     static constexpr int HDR = 48, RB = 88;
+    static constexpr bool FOUR = true;
     static constexpr bool SUMS = true;
     __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 176; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 176 + 48 + (size_t) (c & 1) * 64; }
@@ -545,7 +619,36 @@ template<> struct Dec<13> {
         r.o = rd_f16(ph + 2) * (float) mn;
         return r;
     }
+    // the half's four blocks at once: a pair of blocks shares its bytes (low / high nibbles) - read once; the 12
+    // scale bytes as three words; qh's bytes read once for the four
+    __device__ static __forceinline__ void steps4(const uint8_t* pd, const uint8_t* ph, int c, int t, float hd, Step* out) {
+        const uint32_t s0 = rd32x<A4>(ph + 4), s1 = rd32x<A4>(ph + 8), s2 = rd32x<A4>(ph + 12);   // scale bytes 0-3, 4-7, 8-11
+        const float dmin = rd_f16(ph + 2);
+        const bool second = (c & 1) != 0;
+        const uint32_t qh_lo = rd32x<A4>(ph + 16 + 4 * t), qh_hi = rd32x<A4>(ph + 32 + 4 * t);
+        const int j0 = second ? 4 : 0;
+#pragma unroll
+        for (int pr = 0; pr < 2; ++pr) {
+            const uint32_t lo = rd32x<A4>(pd + 32 * pr + 4 * t), hi = rd32x<A4>(pd + 32 * pr + 16 + 4 * t);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int ib = 2 * pr + k;   // (block j = 4 (c & 1) + ib of the 256)
+                const uint32_t b0 = (s0 >> (8 * ib)) & 255u, b1 = (s1 >> (8 * ib)) & 255u, b2 = (s2 >> (8 * ib)) & 255u;
+                // j < 4: scale = sc[j] & 63, min = sc[j + 4] & 63;  else: scale = sc[j + 4] & 15 | sc[j - 4] >> 6 << 4,
+                // min = sc[j + 4] >> 4 | sc[j] >> 6 << 4   (sc[j - 4] = b0, sc[j] = b1, sc[j + 4] = b2 there)
+                const uint32_t scale = second ? (b2 & 15u) | ((b0 >> 6) << 4) : b0 & 63u;
+                const uint32_t mn = second ? (b2 >> 4) | ((b1 >> 6) << 4) : b1 & 63u;
+                out[ib].lo = ((lo >> (4 * k)) & 0x0F0F0F0Fu) | (((qh_lo >> (j0 + ib)) & 0x01010101u) << 4);
+                out[ib].hi = ((hi >> (4 * k)) & 0x0F0F0F0Fu) | (((qh_hi >> (j0 + ib)) & 0x01010101u) << 4);
+                out[ib].s = hd * (float) scale;
+                out[ib].m0 = out[ib].m1 = 0;
+                out[ib].o = dmin * (float) mn;
+            }
+        }
+    }
 };
+template<> struct Dec<13> : DecQ5K<false> {};
+template<> struct Dec<113> : DecQ5K<true> {};   // (every row and chunk on a multiple of 4: the block is 176 bytes)
 
 // Q3_K: 256 values: {32 bytes hmask; 64 bytes qs; 12 bytes: sixteen 6-bit scales (one a 16 values); f16 d}.  In half
 // n block j takes bits 2 j of qs[32 n ..] and bit 4 n + j of hmask[0 .. 31]: a value is d (sc - 32) (q - (hmask ?
@@ -612,6 +715,9 @@ template<> struct Dec<10> {
         return r;
     }
 };
+// (a Dec with FOUR: steps4 decodes the half chunk's four blocks at once, sharing their loads)
+template<int TY, typename = void> struct Four { static constexpr bool on = false; };
+template<int TY> struct Four<TY, decltype((void) Dec<TY>::FOUR)> { static constexpr bool on = Dec<TY>::FOUR; };
 // (a Dec with OFS16: an offset a 16 values, Step::o for lo and Step::o2 for hi)
 template<int TY, typename = void> struct Ofs16 { static constexpr bool on = false; };
 template<int TY> struct Ofs16<TY, decltype((void) Dec<TY>::OFS16)> { static constexpr bool on = Dec<TY>::OFS16; };

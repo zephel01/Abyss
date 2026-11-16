@@ -111,9 +111,12 @@ template<int CF> struct Cfg {
 // tiles[e] = token tiles (of tc tokens) of experts < e (n + 1 entries); n <= 1024.  (A set of up to kInline experts
 // carries the table in the launch's arguments instead: no extra launch for the many small sets of a short prompt.)
 constexpr int kInline = 64;
-__global__ void tiles_kernel(const int32_t* __restrict__ bounds, int32_t* __restrict__ tiles, int n, int tc) {
+// The token tiles of r tokens: tc a tile, and the last one takes what is left up to the shape's tmax - 2,048 tokens are
+// 17 tiles of 120 (the last 128), not 16 of 128: with 20 row tiles that is 340 tiles, two full rounds of 170 SMs.
+__host__ __device__ inline int tok_tiles(int r, int tc, int tmax) { return r <= 0 ? 0 : max(1, (r - (tmax - tc) + tc - 1) / tc); }
+__global__ void tiles_kernel(const int32_t* __restrict__ bounds, int32_t* __restrict__ tiles, int n, int tc, int tmax) {
     __shared__ int a[1025], b[1025];
-    for (int i = threadIdx.x; i <= n; i += blockDim.x) a[i] = i == 0 ? 0 : (bounds[i] - bounds[i - 1] + tc - 1) / tc;
+    for (int i = threadIdx.x; i <= n; i += blockDim.x) a[i] = i == 0 ? 0 : tok_tiles(bounds[i] - bounds[i - 1], tc, tmax);
     __syncthreads();
     int* src = a;
     int* dst = b;
@@ -140,7 +143,10 @@ struct KArgs {
     float* dst;
     int64_t ld;
     int n, row0, w_rows, K;
+    int order;              // 1: an expert's tiles by row tile, then token tile (0: the other way, an A/B)
     int tc;                 // tokens a tile in this launch (a multiple of 8, at most the shape's TC)
+    int al4;                // the matrix (its experts, both of gate / up) starts on a multiple of 4
+    int tmax;               // the shape's TC: an expert's last tile holds up to this many (tok_tiles)
     float limit;
 };
 
@@ -203,7 +209,13 @@ template<int TY, int CF> struct Lay {
     static constexpr int WD = (16 - Dec<TY>::AL + Dec<TY>::CB + 15) / 16;                              // the data's
     static constexpr int W2 = Rng2<TY>::CB2 > 0 ? (16 - Dec<TY>::AL + Rng2<TY>::CB2 + 15) / 16 : 0;      // the second data range's
     static constexpr int WS = WH + WD + W2;
-    static constexpr int BUF = 2 * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<CF>::TC;   // 16-byte words
+    // One weight buffer instead of two (W1): the types whose raw chunk is large - two buffers of the coarse shape's
+    // 256 rows do not fit a CTA's shared memory (Q5_K, Q6_K, Q8_0, IQ3_S, Q3_K).  The half chunk's steps are decoded
+    // into registers before its token groups run, so the next chunk's bytes come into the same buffer under the groups
+    // (one more barrier a chunk) - instead of a narrower tile.
+    static constexpr bool W1 = (size_t) (2 * Cfg<1>::NT * WS + 2 * Cfg<1>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<1>::TC) * 16 +
+                               (size_t) Dec<TY>::GW * 4 > kSmemCTA;
+    static constexpr int BUF = (W1 ? 1 : 2) * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<CF>::TC;   // 16-byte words
     static constexpr size_t smem = (size_t) BUF * 16 + (size_t) Dec<TY>::GW * 4;   // (+ the codebook)
 };
 
@@ -214,10 +226,14 @@ template<int TY, bool GLU, int CF>
 __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, int rt, int b0, int b1, int ng) {
     typedef Dec<TY> D;
     constexpr int NW = Cfg<CF>::NW, TC = Cfg<CF>::TC, NT = Cfg<CF>::NT, NG = TC / 8;
+    constexpr bool W1 = Lay<TY, CF>::W1;
+    constexpr int WB = W1 ? 1 : 2;   // weight buffers
     constexpr int WS = Lay<TY, CF>::WS, WH = Lay<TY, CF>::WH, WD = Lay<TY, CF>::WD, W2 = Lay<TY, CF>::W2, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
-    uint4* wbuf = smem;                       // [2][NT slots][WS]
-    uint4* xbuf = wbuf + 2 * NT * WS;         // [2][TC][8]
+    constexpr int WSD = WS - WH;              // a slot's data words (the header's are in hbuf)
+    uint4* wbuf = smem;                       // [WB][NT slots][WSD]
+    uint4* hbuf = wbuf + WB * NT * WSD;       // [WB][NT slots][WH]: the 256-value blocks' headers, one a block (both its half chunks)
+    uint4* xbuf = hbuf + WB * NT * WH;        // [2][TC][8]
     uint4* sbuf = xbuf + 2 * TC * 8;          // [2][TC]
     uint4* ubuf = sbuf + 2 * TC;              // [2][TC]: the block sums (the types that need them)
 #if defined(OWN_GRID_GLOBAL)
@@ -237,25 +253,31 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     };
     const uint8_t* my_slot = slot_row(threadIdx.x);
     const auto issue_w = [&](int c) {   // this thread's slot: the 16-byte words around its row's chunk c
-        uint4* dst = wbuf + ((c & 1) * NT + threadIdx.x) * WS;
-        if constexpr (WH > 0) {   // (the chunk's header range first)
-            const uintptr_t src = (uintptr_t) (my_slot + Rng<TY>::hdr(c));
-            const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
-            const int last = (int) (((src & 15) + Rng<TY>::HDR - 1) / 16);
+        uint4* dst = wbuf + ((W1 ? 0 : (c & 1)) * NT + threadIdx.x) * WSD;
+        if constexpr (WH > 0) {   // (the block's header with its first half chunk)
+            if ((c & 1) == 0) {
+                uint4* hdst = hbuf + ((W1 ? 0 : ((c >> 1) & 1)) * NT + threadIdx.x) * WH;
+                const uintptr_t src = (uintptr_t) (my_slot + Rng<TY>::hdr(c));
+                const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
+                const int last = (int) (((src & 15) + Rng<TY>::HDR - 1) / 16);
 #pragma unroll
-            for (int k = 0; k < WH; ++k) cp16(dst + k, p + 16 * min(k, last));
+                for (int k = 0; k < WH; ++k)
+                    if (k <= last) cp16(hdst + k, p + 16 * k);   // (only the words the range touches: none past it, no copy twice)
+            }
         }
         const uintptr_t src = (uintptr_t) (my_slot + Rng<TY>::dat(c));
         const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
         const int last = (int) (((src & 15) + D::CB - 1) / 16);   // (no word past the chunk: it may be past the pool)
 #pragma unroll
-        for (int k = 0; k < WD; ++k) cp16(dst + WH + k, p + 16 * min(k, last));
+        for (int k = 0; k < WD; ++k)
+            if (k <= last) cp16(dst + k, p + 16 * k);
         if constexpr (W2 > 0) {
             const uintptr_t src2 = (uintptr_t) (my_slot + Rng2<TY>::dat2(c));
             const uint8_t* p2 = (const uint8_t*) (src2 & ~(uintptr_t) 15);
             const int last2 = (int) (((src2 & 15) + Rng2<TY>::CB2 - 1) / 16);
 #pragma unroll
-            for (int k = 0; k < W2; ++k) cp16(dst + WH + WD + k, p2 + 16 * min(k, last2));
+            for (int k = 0; k < W2; ++k)
+                if (k <= last2) cp16(dst + WD + k, p2 + 16 * k);
         }
     };
     const auto issue_x = [&](int h) {
@@ -306,18 +328,19 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
         __syncthreads();   // half chunk h (and its weights) landed for every thread; h - 1 is done by all
         const int c = h / HPW;
         if (h + 1 < n_h) issue_x(h + 1);
-        if (h % HPW == 0 && c + 1 < n_wc) issue_w(c + 1);
+        if (!W1 && h % HPW == 0 && c + 1 < n_wc) issue_w(c + 1);
         cp_commit();
         if (h % HPW == 0) {
 #pragma unroll
             for (int f = 0; f < 2; ++f)
 #pragma unroll
                 for (int h8 = 0; h8 < 2; ++h8) {
-                    const uint8_t* slot = (const uint8_t*) (wbuf + ((c & 1) * NT + soff[f][h8]) * WS);
-                    sp[f][h8] = slot + WH * 16 + ((uintptr_t) (rowp[f][h8] + Rng<TY>::dat(c)) & 15);
-                    if constexpr (W2 > 0) sp2[f][h8] = slot + (WH + WD) * 16 + ((uintptr_t) (rowp[f][h8] + Rng2<TY>::dat2(c)) & 15);
+                    const uint8_t* slot = (const uint8_t*) (wbuf + ((W1 ? 0 : (c & 1)) * NT + soff[f][h8]) * WSD);
+                    sp[f][h8] = slot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::dat(c)) & 15);
+                    if constexpr (W2 > 0) sp2[f][h8] = slot + WD * 16 + ((uintptr_t) (rowp[f][h8] + Rng2<TY>::dat2(c)) & 15);
                     if constexpr (WH > 0) {
-                        hp[f][h8] = slot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::hdr(c)) & 15);
+                        const uint8_t* hslot = (const uint8_t*) (hbuf + ((W1 ? 0 : ((c >> 1) & 1)) * NT + soff[f][h8]) * WH);
+                        hp[f][h8] = hslot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::hdr(c)) & 15);
                         hd[f][h8] = D::head(hp[f][h8]);
                     } else {
                         hd[f][h8] = D::head(sp[f][h8]);
@@ -329,16 +352,34 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
         // the half chunk's four steps decoded, then a token group at a time: its activation words and scales for the
         // four steps come in four 16-byte loads (the kernel's time goes with its loads)
         Step st[SPH][2][2];
-#pragma unroll
-        for (int i = 0; i < SPH; ++i)
+        if constexpr (Four<TY>::on) {   // (the half's four blocks at once, their shared bytes read once)
 #pragma unroll
             for (int f = 0; f < 2; ++f)
 #pragma unroll
                 for (int h8 = 0; h8 < 2; ++h8) {
-                    if constexpr (W2 > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8], sp2[f][h8]);
-                    else if constexpr (WH > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8]);
-                    else st[i][f][h8] = D::step(sp[f][h8], (h % HPW) * SPH + i, t, hd[f][h8], grid);
+                    Step four[SPH];
+                    if constexpr (W2 > 0) D::steps4(sp[f][h8], hp[f][h8], c, t, hd[f][h8], sp2[f][h8], four);
+                    else D::steps4(sp[f][h8], hp[f][h8], c, t, hd[f][h8], four);
+#pragma unroll
+                    for (int i = 0; i < SPH; ++i) st[i][f][h8] = four[i];
                 }
+        } else {
+#pragma unroll
+            for (int i = 0; i < SPH; ++i)
+#pragma unroll
+                for (int f = 0; f < 2; ++f)
+#pragma unroll
+                    for (int h8 = 0; h8 < 2; ++h8) {
+                        if constexpr (W2 > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8], sp2[f][h8]);
+                        else if constexpr (WH > 0) st[i][f][h8] = D::step_h(sp[f][h8], hp[f][h8], h / HPW, (h % HPW) * SPH + i, t, hd[f][h8]);
+                        else st[i][f][h8] = D::step(sp[f][h8], (h % HPW) * SPH + i, t, hd[f][h8], grid);
+                    }
+        }
+        if (W1 && h % HPW == HPW - 1 && c + 1 < n_wc) {
+            __syncthreads();   // every thread has decoded this chunk: its buffer takes the next one, under the groups
+            issue_w(c + 1);
+            cp_commit();
+        }
 #pragma unroll
         for (int j = 0; j < NG; ++j) {
             if (j >= ng) break;
@@ -412,7 +453,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     }
 
     // the write-back: acc[f][j][k] is row (k < 2 ? g : g + 8) of fragment f, token j * 8 + 2 t + (k & 1)
-    const int ntok = min(b1 - b0, a.tc);   // (the rest of the expert is other tiles)
+    const int ntok = b1 - b0;   // (b1: the tile's end)
 #pragma unroll
     for (int j = 0; j < NG; ++j)
 #pragma unroll
@@ -448,16 +489,25 @@ __global__ void __launch_bounds__(Cfg<CF>::NT) own_kernel(const KArgs a) {
         __syncthreads();
     }
     const int n_rt = (a.w_rows + (GLU ? NW * 16 : NW * 32) - 1) / (GLU ? NW * 16 : NW * 32);
-    const int tt = blockIdx.x / n_rt, rt = blockIdx.x % n_rt;
     const auto tile_at = [&](int i) { return a.tiles != nullptr ? a.tiles[i] : a.itiles[i]; };
-    int lo = 0, hi = a.n;   // the expert whose token tiles hold tt
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) / 2;
-        if (tile_at(mid) <= tt) lo = mid;
-        else hi = mid;
+    int lo = 0, hi = a.n;   // the expert whose tiles hold this one
+    {
+        const int tt0 = blockIdx.x / n_rt;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (tile_at(mid) <= tt0) lo = mid;
+            else hi = mid;
+        }
     }
-    const int e = lo, b1 = a.bounds[e + 1], b0 = a.bounds[e] + (tt - tile_at(e)) * a.tc;
-    tile_body<TY, GLU, CF>(a, smem, e, rt, b0, b1, (min(b1 - b0, a.tc) + 7) / 8);
+    // An expert's tiles in the order row tile, then token tile: the CTAs that run together share weight rows (a dense
+    // layer: 170 CTAs on 170 different row tiles pulled 125 MB of 4-bit weights through the 100 MB L2 for every
+    // token tile - the weight copies ran at the memory's bandwidth).  The tokens' activations are the smaller side.
+    const int e = lo, b1 = a.bounds[e + 1];
+    const int local = (int) blockIdx.x - tile_at(e) * n_rt, ntt = tile_at(e + 1) - tile_at(e);
+    const int rt = a.order ? local / ntt : local % n_rt, ttl = a.order ? local % ntt : local / n_rt;
+    const int b0 = a.bounds[e] + ttl * a.tc;
+    const int ntok = ttl == ntt - 1 ? b1 - b0 : a.tc;   // (the expert's last tile: the rest, at most the shape's TC)
+    tile_body<TY, GLU, CF>(a, smem, e, rt, b0, b0 + ntok, (ntok + 7) / 8);
 }
 
 // the type takes the wide shape only: two fine CTAs do not fit an SM
@@ -567,16 +617,22 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
     }
     const uint32_t* grid = gridb;
     const int n_rt = (a.w_rows + (GLU ? HNW * 16 : HNW * 32) - 1) / (GLU ? HNW * 16 : HNW * 32);
-    const int tt = blockIdx.x / n_rt, rt = blockIdx.x % n_rt;
     const auto tile_at = [&](int i) { return a.tiles != nullptr ? a.tiles[i] : a.itiles[i]; };
     int lo = 0, hi_e = a.n;
-    while (hi_e - lo > 1) {
-        const int mid = (lo + hi_e) / 2;
-        if (tile_at(mid) <= tt) lo = mid;
-        else hi_e = mid;
+    {
+        const int tt0 = blockIdx.x / n_rt;
+        while (hi_e - lo > 1) {
+            const int mid = (lo + hi_e) / 2;
+            if (tile_at(mid) <= tt0) lo = mid;
+            else hi_e = mid;
+        }
     }
-    const int e = lo, b1 = a.bounds[e + 1], b0 = a.bounds[e] + (tt - tile_at(e)) * a.tc;
-    const int ntok = min(b1 - b0, a.tc), ng = (ntok + 15) / 16;
+    // (an expert's tiles in the order row tile, then token tile - see the NVIDIA kernel)
+    const int e = lo;
+    const int local = (int) blockIdx.x - tile_at(e) * n_rt, ntt = tile_at(e + 1) - tile_at(e);
+    const int rt = a.order ? local / ntt : local % n_rt, ttl = a.order ? local % ntt : local / n_rt;
+    const int b0 = a.bounds[e] + ttl * a.tc;
+    const int ntok = ttl == ntt - 1 ? a.bounds[e + 1] - b0 : a.tc, ng = (ntok + 15) / 16, b1 = b0 + ntok;   // (the last tile: the rest)
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, r = lane & 15, hi = lane >> 4;
     const uint8_t* we = a.w + (size_t) e * a.stride;
     const size_t row_bytes = (size_t) (a.K / D::WCH) * Rng<TY>::RB;
@@ -618,7 +674,9 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
         const int c = h / HPW;
         if (h % HPW == 0) {
             uint4* dst = wbuf + threadIdx.x * WS;
-            if constexpr (WH > 0) copy_range(dst, my_slot + Rng<TY>::hdr(c), Rng<TY>::HDR, WH);
+            if constexpr (WH > 0) {
+                if ((c & 1) == 0) copy_range(dst, my_slot + Rng<TY>::hdr(c), Rng<TY>::HDR, WH);   // (the block's header once)
+            }
             copy_range(dst + WH, my_slot + Rng<TY>::dat(c), D::CB, WD);
             if constexpr (W2 > 0) copy_range(dst + WH + WD, my_slot + Rng2<TY>::dat2(c), Rng2<TY>::CB2, W2);
         }
@@ -772,14 +830,19 @@ void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) 
         case 20: launch_t<20, GLU>(a, grid, shape, s); break;
         case 42: launch_t<42, GLU>(a, grid, shape, s); break;
         case 23: launch_t<23, GLU>(a, grid, shape, s); break;
+#if defined(__HIPCC__)
         case 12: launch_t<12, GLU>(a, grid, shape, s); break;
+        case 13: launch_t<13, GLU>(a, grid, shape, s); break;
+#else   // (the matrix on a multiple of 4: the decode's 4-byte loads are one load each, Q5_K -3%)
+        case 12: a.al4 ? launch_t<112, GLU>(a, grid, shape, s) : launch_t<12, GLU>(a, grid, shape, s); break;
+        case 13: a.al4 ? launch_t<113, GLU>(a, grid, shape, s) : launch_t<13, GLU>(a, grid, shape, s); break;
+#endif
         case 14: launch_t<14, GLU>(a, grid, shape, s); break;
         case 8: launch_t<8, GLU>(a, grid, shape, s); break;
         case 40: launch_t<40, GLU>(a, grid, shape, s); break;
         case 2: launch_t<2, GLU>(a, grid, shape, s); break;
         case 3: launch_t<3, GLU>(a, grid, shape, s); break;
         case 6: launch_t<6, GLU>(a, grid, shape, s); break;
-        case 13: launch_t<13, GLU>(a, grid, shape, s); break;
         case 11: launch_t<11, GLU>(a, grid, shape, s); break;
         case 10: launch_t<10, GLU>(a, grid, shape, s); break;
         case 21: launch_t<21, GLU>(a, grid, shape, s); break;
@@ -957,6 +1020,7 @@ Context::~Context() {
 }
 
 namespace {
+bool& align4() { static bool on = true; return on; }
 void check_ptr(const Set& s, int type, size_t off) {
     if ((((uintptr_t) s.w + off) | s.stride) % align_of(type) != 0 || (uintptr_t) s.xq % 16 != 0) {
         std::fprintf(stderr, "prefill own: a matrix of type %d or its activations are not aligned\n", type);
@@ -999,18 +1063,24 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
         rows_all += r;
     }
     const int per_warp = GLU ? 16 : 32;
+    const bool wide = wide_type(type);   // (launch_t: the wide shape - 8 warps, 64 tokens, one CTA an SM)
+#if defined(__HIPCC__)
+    const auto tmax_of = [&](int) { return HTC; };
+#else
+    const auto tmax_of = [&](int tc) { return tc > Cfg<0>::TC ? Cfg<1>::TC : Cfg<0>::TC; };   // (the tile's shape's)
+#endif
     // token tiles of tc tokens, and their token groups
     const auto token_tiles = [&](int tc, long& groups) {
         long t = 0;
         groups = 0;
         for (int e = 0; e < s.n; ++e) {
             const int r = s.host_bounds[e + 1] - s.host_bounds[e];
-            t += (r + tc - 1) / tc;
-            groups += (long) (r / tc) * (tc / 8) + (r % tc + 7) / 8;
+            const int n = tok_tiles(r, tc, tmax_of(tc));
+            t += n;
+            if (n > 0) groups += (long) (n - 1) * (tc / 8) + (r - (n - 1) * tc + 7) / 8;
         }
         return t;
     };
-    const bool wide = wide_type(type);   // (launch_t: the wide shape - 8 warps, 64 tokens, one CTA an SM)
     const auto count = [&](int tc, bool crs) {
         const int rows_tile = (crs || wide ? Cfg<1>::NW : Cfg<0>::NW) * per_warp;
         long g = 0;
@@ -1049,12 +1119,27 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
     const long total = count(tc, coarse);
     if (total <= 0) return;
     a.tc = tc;
+    a.tmax = tmax_of(tc);
+    // the tiles' order (own_kernel): row tiles outside when an expert's weights are more than the L2 holds well
+    // (64 MB) and well over its activations (4 x) - a dense gate/up of 2 x 17,408 rows: 100 MB, +9%.  Everything else ran
+    // the same or faster with the token tiles outside (a dense down, the projections, the experts' sets - measured,
+    // tests/moe_own_test --bench with 1 expert of exactly 512 to 4,096 rows).
+    {
+        int max_rows = 0;
+        for (int e = 0; e < s.n; ++e) max_rows = std::max(max_rows, s.host_bounds[e + 1] - s.host_bounds[e]);
+        // (bytes a 256 values, about: the choice's threshold only)
+        const int b256 = type == 16 ? 66 : type == 17 ? 74 : type == 22 ? 82 : type == 18 ? 98 : type == 19 ? 50 : type == 29 ? 56 :
+                         type == 14 ? 210 : type == 8 ? 272 : type == 13 || type == 6 ? 176 : type == 3 ? 160 : type == 11 || type == 21 ? 110 :
+                         type == 10 ? 84 : 140;
+        const int64_t w_bytes = (int64_t) a.w_rows * (GLU ? 2 : 1) * (a.K / 256) * b256, x_bytes = (int64_t) max_rows * a.K;
+        a.order = w_bytes > ((int64_t) 64 << 20) && w_bytes > 4 * x_bytes ? 1 : 0;
+    }
     if (s.n <= kInline) {
         a.tiles = nullptr;
         a.itiles[0] = 0;
-        for (int e = 0; e < s.n; ++e) a.itiles[e + 1] = a.itiles[e] + (s.host_bounds[e + 1] - s.host_bounds[e] + tc - 1) / tc;
+        for (int e = 0; e < s.n; ++e) a.itiles[e + 1] = a.itiles[e] + tok_tiles(s.host_bounds[e + 1] - s.host_bounds[e], tc, a.tmax);
     } else {
-        tiles_kernel<<<1, 256, 0, st>>>(s.bounds, tiles, s.n, tc);
+        tiles_kernel<<<1, 256, 0, st>>>(s.bounds, tiles, s.n, tc, a.tmax);
         ck(cudaGetLastError(), "tiles");
         a.tiles = tiles;
     }
@@ -1071,6 +1156,8 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
 }
 }  // namespace
 
+void test_align4(bool on) { align4() = on; }
+
 void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size_t up_off, float limit, void* stream) {
     if (s.n <= 0 || s.rows <= 0) return;
     check_ptr(s, type, 0);
@@ -1079,6 +1166,7 @@ void Context::gate_up(const Set& s, int type, int64_t n_ff, int64_t n_embd, size
     a.w = (const uint8_t*) s.w;
     a.stride = s.stride;
     a.up_off = (ptrdiff_t) up_off;
+    a.al4 = align4() && (((uintptr_t) s.w | s.stride | up_off) & 3) == 0;
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_embd);
     a.xsum = a.xd + s.rows * (n_embd / 32);
@@ -1099,6 +1187,7 @@ void Context::down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t 
     KArgs a{};
     a.w = (const uint8_t*) s.w + down_off;
     a.stride = s.stride;
+    a.al4 = align4() && (((uintptr_t) a.w | s.stride) & 3) == 0;
     a.xq = (const uint8_t*) s.xq;
     a.xd = (const float*) ((const uint8_t*) s.xq + s.rows * n_ff);
     a.xsum = a.xd + s.rows * (n_ff / 32);

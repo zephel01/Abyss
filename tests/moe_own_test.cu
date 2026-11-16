@@ -399,9 +399,9 @@ bool load_dump(const char* path, Case& c) {
 int bench_case(const Case& c);
 int bench(int gu_type, int d_type, int E, int FF, int n_exp, double mean_rows) {
     std::mt19937 rng(7);
-    std::exponential_distribution<double> ed(1.0 / mean_rows);
+    std::exponential_distribution<double> ed(1.0 / std::fabs(mean_rows));
     std::vector<int> counts((size_t) n_exp);
-    for (auto& v : counts) v = (int) std::min(8.0 * mean_rows, ed(rng));
+    for (auto& v : counts) v = mean_rows < 0 ? (int) -mean_rows : (int) std::min(8.0 * mean_rows, ed(rng));   // (< 0: exactly that many)
     return bench_case(synthetic(gu_type, d_type, E, FF, counts, 0, INFINITY, rng));
 }
 // kernel times of the case's set, own against MMQ (the best of 7)
@@ -525,6 +525,22 @@ int main(int argc, char** argv) {
     // K a multiple of 128 only (Qwen3.8's experts: n_ff 640), the types of 32- and 64-value blocks on the down side
     if (!run_case(synthetic(qt::IQ2_S, qt::IQ4_NL, 1024, 640, {0, 3, 9, 20, 70, 131, 1, 64}, 2, INFINITY, rng), "iq2_s/iq4_nl 1024x640", true)) ++bad;
     if (!run_case(synthetic(qt::IQ3_XXS, qt::Q2_0, 1024, 640, {5, 70, 140}, 0, 10.0f, rng), "iq3_xxs/q2_0 1024x640", true)) ++bad;
+    // the Q4_K and Q5_K kernels of a matrix on a multiple of 2 only (the ones above ran the 4-aligned kernels)
+    strata::prefill::own::test_align4(false);
+    for (int t : {qt::Q4_K, qt::Q5_K}) {
+        char name[64];
+        std::snprintf(name, sizeof name, "%s/%s 1024x512, 2-aligned kernels", qt::type_name(t), qt::type_name(t));
+        if (!run_case(synthetic(t, t, 1024, 512, {0, 3, 9, 20, 70, 131, 1, 64, 0, 8}, 5, INFINITY, rng), name, true)) ++bad;
+    }
+    strata::prefill::own::test_align4(true);
+    // an expert's last token tile takes the rest (136 = 128 + 8, 250 = 2 x 120 + 10, 121): few experts, many rows
+    for (int t : {qt::IQ2_XXS, qt::Q4_K, qt::Q6_K, qt::Q3_K}) {
+        char name[64];
+        std::snprintf(name, sizeof name, "%s/%s 1024x512, last tiles", qt::type_name(t), qt::type_name(t));
+        if (!run_case(synthetic(t, t, 1024, 512, {136, 250, 121}, 0, INFINITY, rng), name, true)) ++bad;
+        std::snprintf(name, sizeof name, "%s/%s 2048x256, one expert of 2040", qt::type_name(t), qt::type_name(t));
+        if (!run_case(synthetic(t, t, 2048, 256, {2040}, 0, INFINITY, rng), name, true)) ++bad;
+    }
     std::printf(bad ? "moe_own_test: %d FAILED\n" : "moe_own_test: all passed\n", bad);
     return bad ? 1 : 0;
 }
