@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/kernels/exl3.hpp"
 #if defined(STRATA_USE_HIP)
@@ -6524,6 +6525,7 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 }
 
 void argmax(const float* x, int n, int* out, cudaStream_t s) {
+    strata::kernels::bias_apply(const_cast<float*>(x), 1, n, n, s);   // (the request's banned tokens; none: no-op)
     argmax_kernel<<<1, 1024, 0, s>>>(x, n, out);
     launch_check("argmax");
 }
@@ -6605,6 +6607,7 @@ void argmax_mb(const float* x, int n, int* out, void* scratch, cudaStream_t s) {
         argmax(x, n, out, s);
         return;
     }
+    strata::kernels::bias_apply(const_cast<float*>(x), 1, n, n, s);
     float* pv = (float*) scratch;
     int* pi = (int*) (pv + kAmBlocks);
     unsigned int* ticket = (unsigned int*) (pi + kAmBlocks);

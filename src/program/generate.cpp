@@ -30,6 +30,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -1644,6 +1645,14 @@ static int glm_pack_generate(const Options& o) {
     // GEN key spec=0: this request token by token - no drafter, no verify windows (--bench compares a greedy answer
     // with and without them: greedy speculation must give the same tokens)
     bool req_spec = true;
+    // LOGIT BIASES (token_ban.hpp): BIAS <name> <id:value,...> registers a set (the server's language profile, a
+    // request's logit_bias); GEN keys bias=<name> (the whole output) and bias_answer=<name> (from the end of the
+    // reasoning on - the profile's default "answer only"; the server sends the union with bias= there).  No key: no
+    // set, nothing runs (the picks are bit-identical).
+    std::map<std::string, std::shared_ptr<strata::kernels::BiasSet>> bias_sets;
+    std::deque<std::string> bias_order;   // registration order: the oldest is dropped past 64 sets
+    const strata::kernels::BiasSet* req_bias = nullptr;
+    const strata::kernels::BiasSet* req_bias_ans = nullptr;
     uint64_t snap_img_hash = 1469598103934665603ull;
     const auto img_hash = [&](size_t len) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a over the positions and rows inside [0, len)
@@ -1784,6 +1793,12 @@ static int glm_pack_generate(const Options& o) {
         stop_req.store(false);
         model.force_next(-1);
         bool in_think = req_think_end >= 0;
+        // this request's bias set: bias= from the start, bias_answer= once the reasoning has closed (at once when no
+        // reasoning block is open); off again when the request ends, whichever way
+        struct BiasScope {
+            ~BiasScope() { strata::kernels::bias_activate(nullptr); }
+        } bias_scope;
+        strata::kernels::bias_activate(in_think || req_bias_ans == nullptr ? req_bias : req_bias_ans);
         bool ans_guard = false;   // the answer has had only whitespace since the reasoning closed (end guard armed)
         const std::vector<int64_t>& stops = req_stop_ids.empty() ? eos : req_stop_ids;   // (this request's end list)
         const std::vector<int64_t>& guard_ids = req_end_ids.empty() ? stops : req_end_ids;
@@ -2060,6 +2075,7 @@ static int glm_pack_generate(const Options& o) {
             } else if (in_think && tok == req_think_end) {
                 in_think = false;
                 think_closing = false;
+                if (req_bias_ans != nullptr) strata::kernels::bias_activate(req_bias_ans);   // the answer's set
                 gen_hist.clear();
                 if (req_end_guard) {   // the answer's first tokens: an end there is guarded (once)
                     model.end_guard(&guard_ids, -1);
@@ -2890,6 +2906,28 @@ static int glm_pack_generate(const Options& o) {
         // VLEND / VRECLAIM (between requests): the on-demand vision encoder is about to start on the first GPU - the
         // expert pool's tail is emptied and freed for it ("VLENT <bytes>") - and has ended ("VRECLAIMED"; an ERR while
         // its memory is not free yet: try again)
+        if (cmd == "BIAS") {   // BIAS <name> <id:value,...>: a logit-bias set for GEN's bias= / bias_answer= keys
+            std::string name, spec, extra, why;
+            ss >> name >> spec;
+            std::shared_ptr<strata::kernels::BiasSet> set;
+            if (name.empty() || spec.empty() || (ss >> extra))
+                why = "malformed BIAS line (BIAS <name> <id:value,...>)";
+            else
+                set = strata::kernels::bias_parse(spec, (int) n_vocab, why);
+            if (set == nullptr) {
+                std::printf("ERR %s\n", why.c_str());
+            } else {
+                if (bias_sets.find(name) == bias_sets.end()) bias_order.push_back(name);
+                bias_sets[name] = set;
+                while (bias_order.size() > 64) {
+                    bias_sets.erase(bias_order.front());
+                    bias_order.pop_front();
+                }
+                std::printf("BIASOK %s %zu\n", name.c_str(), set->ids.size());
+            }
+            std::fflush(stdout);
+            continue;
+        }
         if (cmd == "VLEND") {
             size_t lent = 0;
             if (model.vision_lend(lent, err)) std::printf("VLENT %zu\n", lent);
@@ -3036,6 +3074,8 @@ static int glm_pack_generate(const Options& o) {
             req_arg_open = req_arg_close = -2;
             req_think_close.clear();
             req_spec = true;
+            req_bias = req_bias_ans = nullptr;
+            std::string bias_err;
             req_ns = req_sess = 0;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
@@ -3089,11 +3129,21 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }
                 else if (k == "spec") { req_spec = std::atoi(v.c_str()) != 0; }
+                else if (k == "bias" || k == "bias_answer") {
+                    const auto it = bias_sets.find(v);
+                    if (it == bias_sets.end()) bias_err = "unknown bias set '" + v + "' (send BIAS first)";
+                    else (k == "bias" ? req_bias : req_bias_ans) = it->second.get();
+                }
                 // the conversation's namespace (the API key it came with) and session hint, the server's: a slot of
                 // another namespace is never taken back for this request (conv_slots.hpp)
                 else if (k == "slot_ns") { req_ns = std::strtoull(v.c_str(), nullptr, 16); }
                 else if (k == "slot_sess") { req_sess = std::strtoull(v.c_str(), nullptr, 16); }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
+            }
+            if (!bias_err.empty()) {
+                std::printf("ERR %s\n", bias_err.c_str());
+                std::fflush(stdout);
+                continue;
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;

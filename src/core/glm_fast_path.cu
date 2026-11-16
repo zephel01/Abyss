@@ -20,6 +20,7 @@
 #include "strata/core/knobs.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/pdl.hpp"
@@ -8248,6 +8249,10 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             cudaSetDevice(TL->dev_);
             if (!glmfast::wait_event(TL->fast_->ev_done, "glm spec token", err)) return false;
             y = TL->fast_->tok_h[0];
+            if (strata::kernels::bias_banned(y)) {   // (enqueued before the bias set switched on)
+                y = TL->bias_repick(y, nullptr, sp, err);
+                if (y < 0) return false;
+            }
         } else {
             y = TL->fast_sample(sp, err);   // the tail group's last part holds the logits
             if (y < 0) return false;

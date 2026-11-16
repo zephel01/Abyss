@@ -1,0 +1,17 @@
+{
+ "deepseek4": {
+  "fingerprint": "359d1b3e32f3adfbf6369b41",
+  "vocab": 129280,
+  "file": "deepseek4.u16.gz"
+ },
+ "glm5": {
+  "fingerprint": "3cd18d0c0458f9b9e1bd58a4",
+  "vocab": 154880,
+  "file": "glm5.u16.gz"
+ },
+ "qwen35": {
+  "fingerprint": "de44908726de74009ab1fc60",
+  "vocab": 248320,
+  "file": "qwen35.u16.gz"
+ }
+}

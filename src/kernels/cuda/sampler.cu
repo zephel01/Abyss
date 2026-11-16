@@ -14,6 +14,7 @@
 // `sampler_kernel` runs the sampled chain as `top_k` block-argmax rounds followed by the top_p / temperature /
 // draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/token_ban.hpp"
 
 #include <cuda_runtime.h>
 
@@ -445,6 +446,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                      p.penalty_last_n, (const void*) history, history_len);
         std::exit(1);
     }
+    // the request's banned tokens / logit_bias, in place (token_ban.hpp; none active: nothing runs)
+    bias_apply(const_cast<float*>(logits), n_tokens, n_vocab, n_vocab, stream);
     const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;

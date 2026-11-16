@@ -230,6 +230,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/quantize_act.cu
                           src/kernels/cuda/rope.cu
                           src/kernels/cuda/sampler.cu
+                          src/kernels/cuda/token_ban.cu
                           src/kernels/cuda/s2_gemv_q8.cu
     src/kernels/cuda/s2_expert_grouped.cu
                           src/kernels/cuda/shared_expert.cu
@@ -481,9 +482,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                 -include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hip_compat/cuda_runtime.h
                 -x hip ${CMAKE_CURRENT_SOURCE_DIR}/src/igpu/igpu_lane.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/igpu/igpu_fused.cu
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/exl3.cu ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/exl3_legacy.cu
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/token_ban.cu
                 -o "${_strata_igpu_so}"
         DEPENDS src/igpu/igpu_lane.cpp src/igpu/igpu_fused.cu src/igpu/igpu_fused.h src/kernels/cuda/glm_fast.cu include/strata/kernels/glm_fast.hpp
                 src/kernels/cuda/exl3.cu src/kernels/cuda/exl3_legacy.cu include/strata/kernels/exl3.hpp
+                src/kernels/cuda/token_ban.cu include/strata/kernels/token_ban.hpp
                 include/strata/igpu/igpu_lane.h
         COMMENT "Building the iGPU lane (libabyss_igpu.so, ${_strata_igpu_archs})"
         VERBATIM)
