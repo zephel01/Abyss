@@ -379,14 +379,18 @@ size_t act_bytes(int64_t rows, int64_t cols) {
 }
 // The prompt's experts on Strata's own int8 tensor-core GEMM instead of MMQ, a weight type at a time.
 // STRATA_PROMPT_MMQ=1: MMQ for every type (the old path).  STRATA_PROMPT_OWN_TYPES=all | <type id>,..: the types the
-// own GEMM takes, instead of the default list (the types measured not slower than MMQ on every model and length).
+// own GEMM takes, instead of the default list (kOwnDefaultTypes: the types measured not slower than MMQ on every
+// model and length; a build without MMQ: all the covered ones).
+// (2026-11-16, RTX 5090: no type yet - see worklog/2026-11-16_no-llamacpp.md section 7 for the measurements)
+static const char* const kOwnDefaultTypes = "";
 bool own_type(int type) {
 #if defined(STRATA_MOE_OWN)
     static const std::vector<int> on = [] {
         std::vector<int> v;
         if (const char* m = getenv("STRATA_PROMPT_MMQ"); m != nullptr && std::atoi(m) != 0) return v;
         const char* e = getenv("STRATA_PROMPT_OWN_TYPES");
-        const std::string list = e != nullptr ? e : "";
+        // (a build without MMQ: every type the own GEMM covers - the other choice there is the FP16 path)
+        const std::string list = e != nullptr ? e : mmq::built() ? kOwnDefaultTypes : "all";
         if (list == "all") {
             for (int t = 0; t < 64; ++t)
                 if (own::supported(t)) v.push_back(t);
