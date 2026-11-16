@@ -546,7 +546,7 @@ bool supported(int t) {
 // (slower in small launches), IQ1_M (no model here to measure with; MMQ has no IQ1_M: the layer takes the FP16 path).
 static const char* const kDefaultTypes = "16,17,18,22,19,20,42";
 
-bool type_on(int type, bool mmq_built) {
+bool type_on(int type, bool mmq_built, bool dense) {
     // (the lists once; which one applies follows the current device)
     static const auto parse = [](const std::string& list) {
         std::vector<int> v;
@@ -567,7 +567,8 @@ bool type_on(int type, bool mmq_built) {
     static const std::vector<int> from_env = parse(env != nullptr ? env : ""), all = parse("all"), tuned = parse(kDefaultTypes);
     if (mmq_only || !supported(type)) return false;
     // (a build without MMQ: every type the own GEMM covers - the other choice there is the FP16 path)
-    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() ? tuned : from_env;
+    // (the default list was measured on the experts' products: a dense layer's follow it once they are measured too)
+    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() && !dense ? tuned : from_env;
     return std::find(on.begin(), on.end(), type) != on.end();
 }
 

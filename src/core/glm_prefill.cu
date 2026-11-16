@@ -65,6 +65,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <thread>
@@ -507,6 +508,7 @@ struct Glm5Model::PrefillState {
     std::unique_ptr<mmq::Context> mq;
 #if defined(STRATA_MOE_OWN)
     std::unique_ptr<own::Context> oq;   // the own prompt GEMM (moe_own.hpp)
+    std::set<int> dense_own_said;       // (the dense FFN type triples already announced)
 #endif
     uint8_t* arena = nullptr;
     size_t arena_bytes = 0;
@@ -776,7 +778,9 @@ void Glm5Model::prefill_settle(double pinned_share) {
 // prompt path decodes each such expert to FP16 once and multiplies it by cuBLAS (run_blas_dq) - the idea of Strata
 // 0.2.4's gfx12 i-quant tiles and Maya's DS4_FAT_ROWS (a prompt expert's weights decoded once, not once per row tile)
 static bool mmq_layer(int gu, int d) { return mmq::supported(gu) && mmq::supported(d); }
-// the own GEMM takes this layer's gate/up product (one type for both, no NVFP4 second-level scale) / its down product
+// the own GEMM takes this layer's gate/up product with the SwiGLU fused (one type for both, no NVFP4 second-level
+// scale) / its gate and up products apart (two types, or NVFP4: the experts' scales go between the products and the
+// SwiGLU, as on the MMQ path) / its down product (NVFP4's down scale is in the route weights: any kernel)
 template <class L> static bool own_gate_up(const L& Ly, const Glm5Geometry& g) {
 #if defined(STRATA_MOE_OWN)
     return Ly.nv_scale == nullptr && !Ly.mixed() && own_type(Ly.gu_type) && own::usable(Ly.gu_type, g.n_ff_exp, g.n_embd);
@@ -785,18 +789,37 @@ template <class L> static bool own_gate_up(const L& Ly, const Glm5Geometry& g) {
     return false;
 #endif
 }
-template <class L> static bool own_down(const L& Ly, const Glm5Geometry& g) {
+template <class L> static bool own_gu_split(const L& Ly, const Glm5Geometry& g) {
 #if defined(STRATA_MOE_OWN)
-    return Ly.nv_scale == nullptr && own_type(Ly.d_type) && own::usable(Ly.d_type, g.n_embd, g.n_ff_exp);
+    return (Ly.nv_scale != nullptr || Ly.mixed()) && own_type(Ly.gu_type) && own::usable(Ly.gu_type, g.n_ff_exp, g.n_embd) &&
+           own_type(Ly.up_type) && own::usable(Ly.up_type, g.n_ff_exp, g.n_embd);
 #else
     (void) Ly; (void) g;
     return false;
 #endif
 }
+template <class L> static bool own_down(const L& Ly, const Glm5Geometry& g) {
+#if defined(STRATA_MOE_OWN)
+    return own_type(Ly.d_type) && own::usable(Ly.d_type, g.n_embd, g.n_ff_exp);
+#else
+    (void) Ly; (void) g;
+    return false;
+#endif
+}
+// a dense product (one [rows, cols] matrix, the tokens as one "expert"'s rows) on the own GEMM / on either int8 path
+static bool own_dense(int type, int64_t rows, int64_t cols) {
+#if defined(STRATA_MOE_OWN)
+    return own::type_on(type, mmq::built(), true) && own::usable(type, rows, cols);
+#else
+    (void) type; (void) rows; (void) cols;
+    return false;
+#endif
+}
+static bool int8_dense(int type, int64_t rows, int64_t cols) { return mmq::supported(type) || own_dense(type, rows, cols); }
 // the layer's experts are multiplied quantized on the int8 tensor cores: each product by MMQ or by the own GEMM
 // (a build without MMQ, STRATA_MMQ=OFF: the own GEMM alone; the layers it does not cover take the FP16 path)
 template <class L> static bool int8_layer(const L& Ly, const Glm5Geometry& g) {
-    return ((mmq::supported(Ly.gu_type) && mmq::supported(Ly.up_type)) || own_gate_up(Ly, g)) &&
+    return ((mmq::supported(Ly.gu_type) && mmq::supported(Ly.up_type)) || own_gate_up(Ly, g) || own_gu_split(Ly, g)) &&
            (mmq::supported(Ly.d_type) || own_down(Ly, g));
 }
 static bool deq_expert_type(int t) {
@@ -952,7 +975,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             if (!Ly.exl3 && int8_layer(Ly, g)) {
                 const std::string gu = std::string(strata::qt::type_name(Ly.gu_type)) +
                                        (Ly.mixed() ? std::string("+") + strata::qt::type_name(Ly.up_type) : std::string());
-                ++(own_gate_up(Ly, g) ? own_n : mmq_n)["gate/up " + gu];
+                ++(own_gate_up(Ly, g) || own_gu_split(Ly, g) ? own_n : mmq_n)["gate/up " + gu];
                 ++(own_down(Ly, g) ? own_n : mmq_n)[std::string("down ") + strata::qt::type_name(Ly.d_type)];
             }
         } else {
@@ -1349,7 +1372,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         if (proj_mmq && g.n_embd % 512 == 0) {
             const int rows = 2048;
             const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
-            const size_t b_hq = al(mmq::q8_bytes(rows, kmax)), b_io = al(((size_t) rows + kIdsPad) * sizeof(int32_t));
+            const size_t b_hq = al(act_bytes(rows, kmax)), b_io = al(((size_t) rows + kIdsPad) * sizeof(int32_t));
             void* d = nullptr;
             if (cudaMalloc(&d, b_hq + b_io + 256) != cudaSuccess) {
                 cudaGetLastError();
@@ -1416,12 +1439,17 @@ bool Glm5Model::prefill_setup_own(std::string& err) {
     const int64_t E = g_.n_embd, FF = g_.n_ff_dense;
     // (a layer with a matrix MMQ lacks - IQ1_M, BF16 in unsloth's IQ1 / IQ2_S / IQ3_XXS / BF16 files - runs the FP16
     // products instead (the FFN branch checks its three types); the buffers exist when any layer takes MMQ)
-    const bool dims_ok = mmq::built() && E % 512 == 0 && FF % 512 == 0;
+#if defined(STRATA_MOE_OWN)
+    const bool any_int8 = mmq::built() || own::built();
+#else
+    const bool any_int8 = mmq::built();
+#endif
+    const bool dims_ok = any_int8 && E % 512 == 0 && FF % 512 == 0;
     bool types_ok = false;
     for (int il = l0_; il < l1_ && dims_ok && !types_ok; ++il) {
         const auto& Ly = fast_->L[(size_t) il];
-        types_ok = !Ly.moe && mmq::supported(Ly.ffn_gate.type) && mmq::supported(Ly.ffn_up.type) &&
-                   mmq::supported(Ly.ffn_down.type);
+        types_ok = !Ly.moe && int8_dense(Ly.ffn_gate.type, FF, E) && int8_dense(Ly.ffn_up.type, FF, E) &&
+                   int8_dense(Ly.ffn_down.type, E, FF);
     }
     if (mmq_env && types_ok) {
         // (no more than the chunk: a small card's 1024-token chunks left half of 2048 rows' 322 MB unused)
@@ -1431,8 +1459,8 @@ bool Glm5Model::prefill_setup_own(std::string& err) {
             return std::max(256, std::min(r, (int) (S->T + 255) / 256 * 256));
         }();
         const auto al = [](size_t b) { return (b + 255) / 256 * 256; };
-        const size_t b_gu = al((size_t) rows * 2 * FF * sizeof(float)), b_xq = al(mmq::q8_bytes(rows, E)),
-                     b_hq = al(mmq::q8_bytes(rows, FF)), b_io = al(((size_t) rows + kIdsPad) * sizeof(int32_t)),
+        const size_t b_gu = al((size_t) rows * 2 * FF * sizeof(float)), b_xq = al(act_bytes(rows, E)),
+                     b_hq = al(act_bytes(rows, FF)), b_io = al(((size_t) rows + kIdsPad) * sizeof(int32_t)),
                      b_bd = 256;
         void* d = nullptr;
         if (cudaMalloc(&d, b_gu + b_xq + b_hq + b_io + b_bd) != cudaSuccess) {
@@ -2573,7 +2601,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // Y[t][N] = X[t][Kd] (F32 rows, contiguous) . W[N][Kd]^T through MMQ (the weights as stored, X as q8_1) - the dense
     // qwen35's projections, where its FFN buffers exist (prefill_setup_own); false: not taken (the caller's FP16 GEMM)
     const auto mmq_gemm = [&](const WSlot& w, int N, int Kd, const float* X, float* Y, int Tn) -> bool {
-        if (S->dq == nullptr || !mmq::supported(w.type) || Kd % 512 != 0 || N % 128 != 0 ||
+        if (S->dq == nullptr || !int8_dense(w.type, N, Kd) || Kd % 512 != 0 || N % 128 != 0 ||
             Kd > (S->dq_kmax > 0 ? S->dq_kmax : (int64_t) g.n_ff_dense) ||
             w.q == nullptr)
             return false;
@@ -2581,6 +2609,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const int tn = std::min(S->dq_rows, Tn - t0);
             const int32_t hb[2] = {0, tn};
             cudaMemcpyAsync(S->dq_bounds, hb, sizeof hb, cudaMemcpyHostToDevice, s);
+#if defined(STRATA_MOE_OWN)
+            if (own_dense(w.type, N, Kd)) {
+                own::quantize(X + (size_t) t0 * Kd, nullptr, S->dq_hq, Kd, Kd, tn, s, own::needs_sums(w.type));
+                own::Set os;
+                os.w = w.q;
+                os.stride = 0;
+                os.n = 1;
+                os.bounds = S->dq_bounds;
+                os.host_bounds = hb;
+                os.row0 = 0;
+                os.rows = tn;
+                os.xq = S->dq_hq;
+                os.dst = Y + (size_t) t0 * N;
+                os.ld = N;
+                S->oq->down(os, w.type, N, Kd, 0, s);
+                continue;
+            }
+#endif
             mmq::quantize(X + (size_t) t0 * Kd, nullptr, S->dq_hq, w.type, Kd, Kd, tn, s);
             mmq::Product p;
             p.w = w.q;
@@ -3684,12 +3730,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         WSlot dffn[3] = {Ly.ffn_gate, Ly.ffn_up, Ly.ffn_down};
         const bool dram = !Ly.moe && q35d_prompt_ram(il);
         if (dram && !q35d_stage(il, s, dffn, err)) return false;
-        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr && mmq::supported(dffn[0].type) &&
-            mmq::supported(dffn[1].type) && mmq::supported(dffn[2].type)) {
+        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr && int8_dense(dffn[0].type, g.n_ff_dense, E) &&
+            int8_dense(dffn[1].type, g.n_ff_dense, E) && int8_dense(dffn[2].type, E, g.n_ff_dense)) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
             // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into
-            // S->ffn - the experts' MMQ path with one "expert" whose rows are the tokens
+            // S->ffn - the experts' int8 path with one "expert" whose rows are the tokens.  Each product on MMQ or on
+            // the own GEMM (own_dense: gate and up of one type there in one launch with the SwiGLU)
             const int64_t FF = g.n_ff_dense;
+            const bool og = own_dense(dffn[0].type, FF, E), ou = own_dense(dffn[1].type, FF, E),
+                       od = own_dense(dffn[2].type, E, FF);
+            if ((og || ou || od) && S->dense_own_said.insert(dffn[0].type * 10000 + dffn[1].type * 100 + dffn[2].type).second)
+                std::fprintf(stderr, "glm prefill: CUDA%d dense FFN %s / %s / %s (layer %d on): own int8 GEMM for%s%s%s\n", dev_,
+                             strata::qt::type_name(dffn[0].type), strata::qt::type_name(dffn[1].type),
+                             strata::qt::type_name(dffn[2].type), il, og ? " gate" : "", ou ? " up" : "", od ? " down" : "");
             for (int t0 = 0; t0 < T; t0 += S->dq_rows) {
                 const int tn = std::min(S->dq_rows, T - t0);
                 const int32_t hb[2] = {0, tn};
@@ -3705,19 +3758,65 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 p.max_rows = tn;
                 p.ld_dst = 2 * FF;
                 p.w_rows = FF;
-                p.w = dffn[0].q;
-                p.type = dffn[0].type;
-                p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
-                p.dst = S->dq_gu;
-                mmq::quantize(xt, nullptr, S->dq_xq, p.type, E, E, tn, s);
-                S->mq->run(p, s);
-                if (dffn[1].type != dffn[0].type) mmq::quantize(xt, nullptr, S->dq_xq, dffn[1].type, E, E, tn, s);
-                p.w = dffn[1].q;
-                p.type = dffn[1].type;
-                p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
-                p.dst = S->dq_gu + FF;
-                S->mq->run(p, s);
-                gb::swiglu_rows(S->dq_gu, S->dq_gu, tn, (int) FF, g.swiglu_shexp, s, (int) (2 * FF));
+#if defined(STRATA_MOE_OWN)
+                own::Set os;
+                os.stride = 0;
+                os.n = 1;
+                os.bounds = S->dq_bounds;
+                os.host_bounds = hb;
+                os.row0 = 0;
+                os.rows = tn;
+                os.xq = S->dq_xq;
+                os.ld = 2 * FF;
+                const bool sums_x = (og && own::needs_sums(dffn[0].type)) || (ou && own::needs_sums(dffn[1].type));
+#endif
+                bool fused = false;
+#if defined(STRATA_MOE_OWN)
+                if (og && ou && dffn[0].type == dffn[1].type) {   // gate, up and the SwiGLU in one launch
+                    own::quantize(xt, nullptr, S->dq_xq, E, E, tn, s, sums_x);
+                    os.w = dffn[0].q;
+                    os.dst = S->dq_gu;
+                    S->oq->gate_up(os, dffn[0].type, FF, E,
+                                   (size_t) ((const uint8_t*) dffn[1].q - (const uint8_t*) dffn[0].q), g.swiglu_shexp, s);
+                    fused = true;
+                }
+#endif
+                if (!fused) {
+                    for (int role = 0; role < 2; ++role) {   // gate, then up: each into its half of the GU rows
+                        const bool own_r = role == 0 ? og : ou;
+#if defined(STRATA_MOE_OWN)
+                        if (own_r) {
+                            if (role == 0 || !og) own::quantize(xt, nullptr, S->dq_xq, E, E, tn, s, sums_x);
+                            os.w = dffn[role].q;
+                            os.dst = S->dq_gu + role * FF;
+                            S->oq->down(os, dffn[role].type, FF, E, 0, s);
+                            continue;
+                        }
+#endif
+                        (void) own_r;
+                        // (x in MMQ's form for this type: after an own product, or another MMQ type's)
+                        if (role == 0 || og || dffn[1].type != dffn[0].type)
+                            mmq::quantize(xt, nullptr, S->dq_xq, dffn[role].type, E, E, tn, s);
+                        p.w = dffn[role].q;
+                        p.type = dffn[role].type;
+                        p.expert_bytes = mmq::matrix_bytes(p.type, FF, E);
+                        p.dst = S->dq_gu + role * FF;
+                        S->mq->run(p, s);
+                    }
+                    gb::swiglu_rows(S->dq_gu, S->dq_gu, tn, (int) FF, g.swiglu_shexp, s, (int) (2 * FF));
+                }
+#if defined(STRATA_MOE_OWN)
+                if (od) {
+                    own::quantize(S->dq_gu, nullptr, S->dq_hq, FF, 2 * FF, tn, s, own::needs_sums(dffn[2].type));
+                    os.w = dffn[2].q;
+                    os.xq = S->dq_hq;
+                    os.dst = S->ffn + (size_t) t0 * E;
+                    os.ld = E;
+                    S->oq->down(os, dffn[2].type, E, FF, 0, s);
+                    continue;
+                }
+#endif
+                (void) od;
                 mmq::quantize(S->dq_gu, nullptr, S->dq_hq, dffn[2].type, FF, 2 * FF, tn, s);
                 mmq::Product d = p;
                 d.w = dffn[2].q;
@@ -4288,12 +4387,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl && !Ly.mixed();
         // the own GEMM, a product at a time: gate/up with the SwiGLU, down (each reads activations in its own form)
 #if defined(STRATA_MOE_OWN)
-        const bool own_gu = own_gate_up(Ly, g), own_dn = own_down(Ly, g);
+        const bool own_gu = own_gate_up(Ly, g), own_dn = own_down(Ly, g), own_split = own_gu_split(Ly, g);
         static const char* own_dump = getenv("STRATA_PROMPT_OWN_DUMP");
         static const int own_dump_layer = getenv("STRATA_PROMPT_OWN_DUMP_LAYER") ? std::atoi(getenv("STRATA_PROMPT_OWN_DUMP_LAYER")) : -1;
         static bool own_dumped = false;
 #else
-        const bool own_gu = false, own_dn = false;
+        const bool own_gu = false, own_dn = false, own_split = false;
 #endif
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
@@ -4352,7 +4451,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     os.host_bounds = hb + i0;
                     os.row0 = a;
                     os.rows = nrows;
-                    if (own_gu) own::quantize(S->x, M.row_tok + r0 + a, M.Xq, E, E, nrows, s, own::needs_sums(Ly.gu_type));
+                    if (own_gu || own_split)
+                        own::quantize(S->x, M.row_tok + r0 + a, M.Xq, E, E, nrows, s,
+                                      own::needs_sums(Ly.gu_type) || own::needs_sums(Ly.up_type));
                     else
 #endif
                     mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s, M.Xs);
@@ -4381,6 +4482,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         os.dst = GU;
                         os.ld = 2 * nff;
                         S->oq->gate_up(os, Ly.gu_type, nff, E, mmq::matrix_bytes(Ly.gu_type, nff, E), g.swiglu_exp, s);
+#endif
+                    } else if (own_split) {
+#if defined(STRATA_MOE_OWN)
+                        // gate and up apart (two types, or NVFP4's scales before the SwiGLU): each into its half of the
+                        // GU rows, as the MMQ path below
+                        os.xq = M.Xq;
+                        os.ld = 2 * nff;
+                        os.dst = GU;
+                        S->oq->down(os, Ly.gu_type, nff, E, 0, s);
+                        os.dst = GU + nff;
+                        S->oq->down(os, Ly.up_type, nff, E, Ly.mixed() ? Ly.gu_bytes : mmq::matrix_bytes(Ly.gu_type, nff, E), s);
+                        if (nvl)
+                            gb::nv_scale_rows(GU, M.ids, M.pos, T * K, r0 + a, r0 + a + nrows, 2 * nff, 2 * nff,
+                                              Ly.nv_scale, s);
+                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
 #endif
                     } else if (glu) {
                         S->mq->run_glu(gu, g.swiglu_exp, s);   // (h in each row's first n_ff floats, as below)

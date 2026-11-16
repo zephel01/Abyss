@@ -24,6 +24,9 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#if defined(STRATA_MOE_OWN)
+#include "strata/prefill/moe_own.hpp"
+#endif
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -290,6 +293,9 @@ struct Prefill::Impl {
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
+#if defined(STRATA_MOE_OWN)
+    std::unique_ptr<strata::prefill::own::Context> own_ctx;
+#endif
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
@@ -711,7 +717,15 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
     // its K/V stay close to what the drafter computes itself; STRATA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
     static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v && v[0] == '1'; }();
-    const bool q8 = !f16_only && mmq::built() && mmq::supported(kQ8_0);
+    // (the same products on Strata's own int8 GEMM where it is on for Q8_0 - STRATA_PROMPT_OWN_TYPES, or a build
+    // without MMQ: q8_own)
+#if defined(STRATA_MOE_OWN)
+    const bool q8_own = !f16_only && own::type_on(kQ8_0, mmq::built(), true) && own::usable(kQ8_0, Nn, Nn) &&
+                        own::usable(kQ8_0, KV, Nn);   // (every product's shape below)
+#else
+    const bool q8_own = false;
+#endif
+    const bool q8 = q8_own || (!f16_only && mmq::built() && mmq::supported(kQ8_0));
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
     const int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
@@ -747,13 +761,25 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     s.idx_dim = g.idx_key_dim;
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
-        if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+        if (!m.mmq_ctx && mmq::built()) m.mmq_ctx = std::make_unique<mmq::Context>();
         mmq::iota(ident, B * g.hc + mmq::ids_pad(B * g.hc), m.cs);
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
                     int64_t k, int slot) {
         if (!q8) { m.gemm.native(x16, kQ8_0, w, y, rows, n_out, k); return; }
+#if defined(STRATA_MOE_OWN)
+        if (q8_own) {
+            if (!m.own_ctx) m.own_ctx = std::make_unique<own::Context>();
+            own::quantize(x, nullptr, xq, k, k, rows, m.cs);
+            const int32_t hb[2] = {0, (int32_t) rows};
+            own::Set os;
+            os.w = w; os.stride = 0; os.n = 1; os.bounds = bnd + 2 * slot; os.host_bounds = hb; os.row0 = 0; os.rows = rows;
+            os.xq = xq; os.dst = y; os.ld = n_out;
+            m.own_ctx->down(os, kQ8_0, n_out, k, 0, m.cs);
+            return;
+        }
+#endif
         mmq::quantize(x, nullptr, xq, kQ8_0, k, k, rows, m.cs);
         mmq::Product p;
         p.w = w; p.type = kQ8_0; p.w_rows = n_out; p.w_cols = k; p.expert_bytes = mmq::matrix_bytes(kQ8_0, n_out, k);
