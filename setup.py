@@ -480,6 +480,11 @@ def ggml_libs_flag() -> list:
     """The CMake option for the engine build: no ggml libraries (STRATA_GGML=OFF) where the own CPU dot products are
     the ones it runs and were checked - Linux x86-64.  Windows (MSVC builds) and aarch64 (ggml-cpu's NEON dots stay
     the faster ones on the DGX Spark) keep building them for now."""
+    want = os.environ.get("STRATA_GGML_BUILD", "").strip().lower()
+    if want in ("off", "0", "no"):     # testers on Windows / aarch64 / HIP (beta, v1.3.158)
+        return ["-DSTRATA_GGML=OFF"]
+    if want in ("on", "1", "yes"):
+        return []
     return ["-DSTRATA_GGML=OFF"] if sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64") else []
 
 

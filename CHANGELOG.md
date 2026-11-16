@@ -7,6 +7,32 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.158 - 2026-11-16 (beta)
+
+Beta: the first step of building and running Abyss without llama.cpp. Abyss is a fork of Project Maya (from Strata)
+and has so far taken parts of llama.cpp/ggml at build time: ggml's CPU dot products for the CPU experts, ggml.h's
+type table, gguf-py in the pack tools, ggml-cuda's MMQ kernels for the GPU prompt path and mtmd for pictures. This
+release replaces the first three with Abyss's own code, keeping compatibility: the same GGUF files load and the
+outputs are bit-identical. It is a beta because the new build is checked on Linux x86-64 + CUDA only; Windows,
+aarch64 (DGX Spark) and HIP keep the old build by default until someone has tried it (reports welcome).
+
+- Own GGUF type table (`include/strata/qtypes.hpp`, ids equal to the GGUF ids) in place of ggml.h in the engine.
+- Own CPU expert dot products for all 22 GGUF types the engine reads (AVX-512, AVX2 and a portable build): bit for bit
+  the same as ggml-cpu's (own_dot_test, 33,000 cases), CPU expert speed -8% .. +4% (one thread, per expert).
+  `STRATA_CPU_GGML=1`: ggml-cpu's again (builds with ggml). On aarch64 ggml-cpu's NEON dots stay the default where
+  linked (`STRATA_CPU_GGML=0`: the own ones).
+- Own GGUF reader/writer for the tools (`tools/gguf_io.py`): iq_pack, nextn_pack, mtp_pack, mtp_rt, requant_dense,
+  dense_overlay and exl3_pack --check no longer need gguf-py; pack outputs are byte-identical (SHA-256 on GLM Maya-S-v2,
+  V4.1 JA256, Ornith-35B/122B, Qwen3.5-9B). Requantizing (requant_dense, dense_overlay, nextn_pack with a type change)
+  still uses libggml's quantizer.
+- Setup fetches llama.cpp's source only for what still needs it - the GPU prompt path's MMQ kernels and pictures - and
+  says why. Linux x86-64 CUDA builds use `-DSTRATA_GGML=OFF` (no ggml libraries linked). `STRATA_GGML_BUILD=off` /
+  `on` chooses at build time elsewhere (beta on Windows, aarch64, HIP).
+- CI: Python jobs run without gguf-py; a gguf-oracle job keeps the byte check; a cpu-no-llamacpp job builds and tests
+  with nothing fetched.
+- Outputs: deterministic md5 the same on all six regression configs (Ornith-35B, Ornith-122B, Qwen3.8 UD, GLM-5.3, V4,
+  V4.1 JA). Next: Abyss's own MMQ replacement (GPU prompt path, CUDA then HIP), then pictures.
+
 ## v1.3.157 - 2026-11-16
 
 - Qwen3.8-27B with QSA (Qwen Sparse Attention; e.g. higa2515/Qwen3.8-27B-QSA-GGUF, indexers on the 16 full-attention
