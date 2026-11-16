@@ -92,6 +92,17 @@ block (UD-IQ1_S, UD-IQ1_M, UD-IQ2_XXS, UD-IQ2_XS, UD-IQ2_S) it also fetches unsl
 (`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, 1.4 GB). It then asks whether to set up images (unsloth's `mmproj-F16.gguf`, 0.93 GB,
 and the `strata-vision` build; `--no-vision` skips it).
 
+Qwen3.5-9B QSA, a small dense model with a QSA indexer (zephel01's, BETA; [Qwen3.5-9B QSA](#qwen35-9b-qsa)): the whole
+file goes on one GPU of 11 GB or more, which holds a context up to 128K (measured with the VRAM capped at 11 GB). The setup
+stops on a smaller GPU before downloading anything. Q4_K_M (5.9 GB) is the default, `--quant Q8_0` (9.9 GB) the other
+file (its memory is not measured: the setup counts its extra 4 GB on top). Each file has its own NextN drafter; there are
+no images (the file has no image projector):
+
+```sh
+./setup-deepseek.sh --model qwen35-9b-qsa --download-model                    # Qwen3.5-9B-QSA-Q4_K_M (5.9 GB), 64K context
+./setup-deepseek.sh --model qwen35-9b-qsa --context 131072 --download-model   # the same, 128K context
+```
+
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
 card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
 off for the V4 sizes, which run faster without it on a discrete GPU):
@@ -838,14 +849,15 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
 ## Qwen3.5-9B QSA
 
 Qwen3.5-9B with a QSA indexer trained at home (the same indexer form as higa2515's Qwen3.8-27B-QSA, see
-`STRATA_Q35_QSA` in [Settings](#settings)): `Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf`
-(BETA). Of the 8 full-attention layers, layer 3 stays dense and the other 7 attend, past 4,099 cells, to the
+`STRATA_Q35_QSA` in [Settings](#settings)): [zephel01/Qwen3.5-9B-QSA-GGUF](https://huggingface.co/zephel01/Qwen3.5-9B-QSA-GGUF),
+`Qwen3.5-9B-QSA-Q4_K_M.gguf` or `Qwen3.5-9B-QSA-Q8_0.gguf` (BETA). From v1.3.163
+`./setup-deepseek.sh --model qwen35-9b-qsa` installs it ([Setup in one command](#setup-in-one-command)). Of the 8 full-attention layers, layer 3 stays dense and the other 7 attend, past 4,099 cells, to the
 indexer's 1,024 best 4-cell blocks plus the query's own block. The file says it in its metadata: `attention.compress_ratios`
 is 0 on layer 3 (it has no indexer tensors) and `attention.indexer.top_k` is 4096. The engine reads both (from the
 commit after v1.3.160; v1.3.157-160 run such a file all dense); the start-up line ends with `dense attention layers: 3`.
 
 ```bash
-.venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf --out pack
+.venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-Q4_K_M.gguf --out pack
 build-cuda/strata --glm-pack pack --max-context 131072 --prefill auto
 ```
 

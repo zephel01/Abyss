@@ -11,6 +11,7 @@
     ./setup-deepseek.sh --model ornith35     Ornith-1.5-35B-A3B, the official Q4_K_M for an 8-16 GB GPU + 32 GB RAM
     ./setup-deepseek.sh --model laguna       Laguna-S-2.1 (poolside, 118B-A8B), unsloth's UD-IQ4_XS for a 16-32 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for an 8 GB+ GPU (FFN partly in RAM under ~20 GB)
+    ./setup-deepseek.sh --model qwen35-9b-qsa  Qwen3.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
                                              16G64G (the default) or 24G64G
@@ -86,6 +87,16 @@ DENSE27_PICKS = ("UD-IQ2_XXS", "UD-IQ3_XXS", "UD-Q4_K_XL", "UD-Q6_K", "Q8_0")
 # unsloth's separate NextN block for the files without one, and the image encoder's weights (Qwen3.8-27B reads images)
 DENSE27_MTP = "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
 DENSE27_MMPROJ = "mmproj-F16.gguf"
+# Qwen3.5-9B QSA (zephel01's, BETA, v1.3.162): the GPU size each context needs.  Measured on an RTX 5090, Q4_K_M, MTP
+# drafts on (bench/train9b/results.md, 2026-11-17): with no cap the engine peaks at 11.17 / 12.40 / 14.86 GB at 32K / 64K /
+# 128K, 4 GB of it the prompt path's buffer, which it sizes from the free VRAM; capped with STRATA_GLM_VRAM_GB=15 a 128K
+# context peaks at 11.65 GB, capped at 11 GB at 10.68 GB (0.77 GB of the FFN in RAM), at the same speed (decode 245
+# tok/s).  So the table is that 11 GB cap, for every context up to 128K; longer ones are not measured.  Q8_0 is not
+# measured for memory: it is taken to need its file size more (+4.0 GB, as dense_shift does for any other file)
+QSA9_VRAM = {131072: 11.0}
+QSA9_QUANTS = {"Q4_K_M": (5.85, True), "Q8_0": (9.86, True)}   # (GB; each file carries its NextN block, blk.32)
+# TODO: Ornith-1.5-9B-QSA (the same architecture and indexer, MIT): zephel01/Ornith-1.5-9B-QSA-GGUF, an entry like
+# "qwen35-9b-qsa" once its files are on Hugging Face and their memory is measured (not selectable before that)
 # the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
 # is a fixed set, the config's model_name, the config name's prefix, the env the model's measurements were made with,
 # the experts' size in GB at the default quant (for the RAM line)
@@ -149,7 +160,18 @@ MODELS = {
                    "prefix": "qwen38-27b", "title": "Qwen3.8-27B", "env": {}, "gb": 18, "pack_args": [],
                    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
                    "vram_ctx": DENSE27_VRAM, "ffn_gb": DENSE27_FFN_GB, "ram_min": DENSE27_RAM_GB,
-                   "small_gpu": DENSE27_SMALL},
+                   "small_gpu": DENSE27_SMALL, "gpu_min": 8},
+    # Qwen3.5-9B QSA (a dense qwen35 like the 27B, with a QSA indexer trained at home; BETA): zephel01's GGUFs, one file
+    # a quant at the repo's top level, each with its NextN drafter.  The engine reads the QSA layers from the file (7
+    # of 8 attention layers, layer 3 dense: compress_ratios 0) from v1.3.162; no env.  Text only: the file has no
+    # image projector.  Whole file in one GPU (QSA9_VRAM above); 2026-11-17, RTX 5090, 128K prompt: decode 240 tok/s
+    # (132 dense)
+    "qwen35-9b-qsa": {"repo": "zephel01/Qwen3.5-9B-QSA-GGUF", "quant": "Q4_K_M", "quants": tuple(QSA9_QUANTS),
+                      "quant_gb": QSA9_QUANTS, "picks": tuple(QSA9_QUANTS), "folder": "",
+                      "prefix_tmpl": "Qwen3.5-9B-QSA-{q}.", "model_name": "qwen3.5-9b-qsa", "prefix": "qwen35-9b-qsa",
+                      "title": "Qwen3.5-9B QSA", "env": {}, "gb": 6, "pack_args": [],
+                      "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+                      "vram_ctx": QSA9_VRAM, "gpu_min": 11},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -667,11 +689,14 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
         return sctx
     if ctx is None:
         gb = (model.get("quant_gb") or {}).get(quant, (model["gb"],))[0]
-        S.fail(f"{model['title']} needs a GPU with 8 GB or more: the {quant} file (~{gb:.0f} GB) runs "
-               f"from VRAM, its FFN partly from RAM, and this GPU has {vram:.0f} GB (the GPU size a context needs all "
-               f"in VRAM: {table}; ~{ffn_gb:.0f} GB less with the FFN in RAM)",
-               "a GPU with 8 GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or Ornith-1.5-35B-A3B "
-               "(--model ornith35) run from VRAM + RAM")
+        least = model.get("gpu_min", 8)
+        S.fail(f"{model['title']} needs a GPU with {least} GB or more: the {quant} file (~{gb:.0f} GB) runs "
+               + (f"from VRAM, its FFN partly from RAM, and this GPU has {vram:.0f} GB (the GPU size a context needs "
+                  f"all in VRAM: {table}; ~{ffn_gb:.0f} GB less with the FFN in RAM)" if model.get("ffn_gb") else
+                  f"from VRAM, and this GPU has {vram:.0f} GB (the GPU size a context needs: {table}; less is not "
+                  "measured)"),
+               f"a GPU with {least} GB or more; on a smaller one, Qwen3.8-Flash-Next (--model qwen38) or "
+               "Ornith-1.5-35B-A3B (--model ornith35) run from VRAM + RAM")
     S.ok(f"{model['title']}: the whole file in VRAM - this {vram:.0f} GB GPU holds a {ctx // 1024}K context "
          f"(the GPU size a context needs: {table})")
     n = dense_need(key, a.context, quant)
@@ -809,10 +834,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa: Q4_K_M (default) or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1015,7 +1040,8 @@ def main() -> int:
              else " (Ornith drafts with its own NextN block from the shards)" if a.model in ("ornith", "ornith35")
              else " (Qwen3.8 drafts with its own MTP block from the shards)" if a.model == "qwen38"
              else (" (Qwen3.8-27B drafts with unsloth's separate NextN block, MTP/)" if mtp else
-                   " (Qwen3.8-27B drafts with its own NextN block from the file)") if a.model == "qwen38-27b" else ""))
+                   " (Qwen3.8-27B drafts with its own NextN block from the file)") if a.model == "qwen38-27b"
+             else " (Qwen3.5-9B QSA drafts with its own NextN block from the file)" if a.model == "qwen35-9b-qsa" else ""))
     if a.model == "qwen38":
         dflash_step(a, data, cfg, gpus)
     if a.model == "qwen38-27b":

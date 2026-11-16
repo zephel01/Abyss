@@ -95,7 +95,7 @@ class PickQuant(unittest.TestCase):
         self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
 
     def test_models_without_pc_sizes(self):
-        for key in ("v41", "ornith35", "qwen35", "qwen38-27b"):
+        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
     def test_no_gpu(self):
@@ -502,6 +502,88 @@ class DenseOtherFiles(unittest.TestCase):
                 Path(dst).write_bytes(b"y" * 100)
             with mock.patch.object(A.S, "download", side_effect=bad), self.assertRaises(SystemExit):
                 A.side_file(a, "unsloth/Qwen3.8-27B-GGUF", A.DENSE27_MTP, Path(d), "block")
+
+
+class Qwen35NineBQsa(unittest.TestCase):
+    """--model qwen35-9b-qsa (zephel01's Qwen3.5-9B QSA, the whole file in one GPU): zephel01's repo, Q4_K_M by default,
+    each file with its NextN block (no MTP/ side file), the measured 11 GB for every context up to 128K, a stop under it
+    (before any download or build), text only."""
+    KEY = "qwen35-9b-qsa"
+
+    def check(self, vram, context=65536, quant=None):
+        a = Namespace(context=context)
+        said = []
+        cards = [{"index": 0, "name": "GPU", "vram_gb": vram}]
+        with mock.patch.object(A.S, "say", side_effect=lambda *x: said.append(" ".join(map(str, x)))):
+            try:
+                got = A.dense_gpu_check(a, self.KEY, cards, "cuda", False, 32.0, quant=quant)
+            except SystemExit:
+                got = "stopped"
+        return got, "\n".join(said)
+
+    def test_the_entry(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual((m["repo"], m["quant"], m["quants"]), ("zephel01/Qwen3.5-9B-QSA-GGUF", "Q4_K_M", ("Q4_K_M", "Q8_0")))
+        self.assertTrue(all(nx for _, nx in m["quant_gb"].values()))   # (no separate NextN block to fetch)
+        self.assertNotIn("ffn_gb", m)                                  # (not measured with the FFN in RAM by design)
+        self.assertEqual(m["env"], {})                                 # (the engine reads the QSA layers from the file)
+
+    def test_the_context_a_gpu_holds(self):
+        f = A.dense_context
+        self.assertEqual(f(self.KEY, 11.99, 131072), 131072)          # (a 12 GB card: 128K, measured with an 11 GB cap)
+        self.assertEqual(f(self.KEY, 10.75, 65536), 65536)            # (an 11 GB card)
+        self.assertIsNone(f(self.KEY, 9.99, 8192))                    # (10 GB: not measured)
+        self.assertEqual(f(self.KEY, 31.84, 262144), 131072)          # (longer than measured: 128K)
+        self.assertAlmostEqual(A.dense_need(self.KEY, 32768, "Q8_0"), 11.0 + 9.86 - 5.85)
+        self.assertEqual(f(self.KEY, 15.92, 131072, "Q8_0"), 131072)
+        self.assertIsNone(f(self.KEY, 11.99, 8192, "Q8_0"))
+
+    def test_the_setup_check(self):
+        got, said = self.check(11.99)
+        self.assertEqual(got, 65536)
+        self.assertIn("the whole file in VRAM", said)
+        got, said = self.check(11.99, context=131072)
+        self.assertEqual(got, 131072)
+        got, said = self.check(31.84, context=262144)
+        self.assertEqual(got, 131072)
+        got, said = self.check(7.99)
+        self.assertEqual(got, "stopped")
+        self.assertIn("needs a GPU with 11 GB or more", said)
+        self.assertNotIn("FFN", said)
+        self.assertEqual(self.check(11.99, quant="Q8_0")[0], "stopped")
+
+    def test_the_pc_size_proposal(self):
+        self.assertEqual(A.dense_pick(self.KEY, 31.84), "Q8_0")
+        self.assertEqual(A.dense_pick(self.KEY, 11.99), "Q4_K_M")
+        self.assertIsNone(A.dense_pick(self.KEY, 7.99))
+        a = Namespace(quant=None, yes=True, name=None)
+        with mock.patch.object(A.S, "ram_gb", return_value=32.0), mock.patch.object(A.S, "say"):
+            got = A.choose_quant(a, self.KEY, [{"index": 0, "name": "GPU", "vram_gb": 31.84}])
+        self.assertEqual(got, "Q4_K_M")   # (--yes: the default stays)
+
+    def test_the_file_and_the_config(self):
+        m = A.MODELS[self.KEY]
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "Qwen3.5-9B-QSA-Q4_K_M.gguf", "Qwen3.5-9B-QSA-Q8_0.gguf", "README.md", ".gitattributes")]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        for q in m["quants"]:
+            with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+                got = A.quant_files(q, m["repo"], m["folder"], m["prefix_tmpl"].format(q=q))
+            self.assertEqual([g[0] for g in got], [f"Qwen3.5-9B-QSA-{q}.gguf"])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("qwen35-9b-qsa-q4_k_m", Path(d) / "pack", 131072, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("Qwen3.5-9B QSA", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "qwen3.5-9b-qsa")
+        self.assertEqual(got["args"][got["args"].index("--max-context") + 1], "131072")
+        self.assertNotIn("env", got)
+        self.assertNotIn("vision", got)
+
+    def test_no_placeholder_for_files_not_out_yet(self):
+        self.assertFalse(any("Ornith-1.5-9B" in str(m.get("repo", "")) for m in A.MODELS.values()))
 
 
 class TestVariants(unittest.TestCase):

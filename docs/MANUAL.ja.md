@@ -89,6 +89,17 @@ UD-IQ2_XXS、UD-IQ2_XS、UD-IQ2_S）では、unsloth の別ファイル（`MTP/m
 そのあと画像を使えるようにするかを聞く（unsloth の `mmproj-F16.gguf` 0.93 GB と `strata-vision` のビルド。
 `--no-vision` で飛ばす）。
 
+QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BETA。[Qwen3.5-9B QSA](#qwen35-9b-qsa)）は、ファイル全体を
+11 GB 以上の GPU 1 枚に載せる。その GPU で 128K までの文脈が動く（VRAM を 11 GB に制限して計測）。それより小さい GPU では
+何もダウンロードする前に止まる。既定は Q4_K_M（5.9 GB）、もう 1 つは `--quant Q8_0`（9.9 GB。メモリは未計測で、
+セットアップは差の 4 GB を足して数える）。どちらのファイルにも NextN の下書き層が入っている。画像は使えない
+（画像の変換器のファイルがない）:
+
+```sh
+./setup-deepseek.sh --model qwen35-9b-qsa --download-model                    # Qwen3.5-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
+./setup-deepseek.sh --model qwen35-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
+```
+
 zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
 から、モデルカードを測ったときの値にする。Qwen3.8 はシャードにある MTP 層で下書きする。V4 の自作版は単体 GPU では DSpark
 なしのほうが速いので、DSpark は入れない）:
@@ -784,7 +795,9 @@ SwiGLU FFN（5120 → 17408）でエキスパートはなく、下書きは Next
 ## Qwen3.5-9B QSA
 
 自宅で学習した QSA indexer を足した Qwen3.5-9B です（indexer の形は higa2515 の Qwen3.8-27B-QSA と同じ。
-[設定項目](#設定項目)の `STRATA_Q35_QSA` を参照）。ファイルは `Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf`（BETA）。
+[設定項目](#設定項目)の `STRATA_Q35_QSA` を参照）。ファイルは [zephel01/Qwen3.5-9B-QSA-GGUF](https://huggingface.co/zephel01/Qwen3.5-9B-QSA-GGUF)
+の `Qwen3.5-9B-QSA-Q4_K_M.gguf` と `Qwen3.5-9B-QSA-Q8_0.gguf`（BETA）。v1.3.163 から
+`./setup-deepseek.sh --model qwen35-9b-qsa` で入れられます（[まとめてセットアップ](#まとめてセットアップ)）。
 full attention の 8 層のうち 3 層は dense のまま、ほかの 7 層は 4,099 セルを超えると indexer が選んだ上位 1,024 個の
 4 セルブロックと自分のブロックだけに attention します。これはファイルのメタデータに書いてあります: 3 層の
 `attention.compress_ratios` が 0（indexer テンソルもない）、`attention.indexer.top_k` が 4096。エンジンはこの 2 つを
@@ -792,7 +805,7 @@ full attention の 8 層のうち 3 層は dense のまま、ほかの 7 層は 
 `dense attention layers: 3` と出ます。
 
 ```bash
-.venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-d3-k4096-Q4_K_M.gguf --out pack
+.venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-Q4_K_M.gguf --out pack
 build-cuda/strata --glm-pack pack --max-context 131072 --prefill auto
 ```
 
