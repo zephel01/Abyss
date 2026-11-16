@@ -28,6 +28,7 @@ struct Step {
     float s;           // SUB 32: the values' scale
     int m0, m1;        // SUB 16: lo's and hi's integer multipliers (the float scale is the chunk's head)
     float o;           // a Dec with SUMS: the values are s q - o (the kernel subtracts o x the activations' sum)
+    float s2, o2;      // a Dec with FS16: hi's scale (s is lo's); with OFS16: hi's offset (o is lo's)
 };
 
 // bits 0-3 of n -> 0xFF in bytes 0-3
@@ -416,15 +417,204 @@ template<> struct Dec<40> {
         Step r;
         r.lo = fp4_bytes((v0 >> sh) & 0x0F0F0F0Fu);
         r.hi = fp4_bytes((v1 >> sh) & 0x0F0F0F0Fu);
-        r.s = ue4m3_half(b[s0]);       // lo's scale
-        r.o = ue4m3_half(b[s0 + 1]);   // hi's scale (FS16 reads it here)
+        r.s = ue4m3_half(b[s0]);        // lo's scale
+        r.s2 = ue4m3_half(b[s0 + 1]);   // hi's
         r.m0 = r.m1 = 0;
         return r;
     }
 };
-// (a Dec with FS16: two float scales a step, Step::s for lo and Step::o for hi)
+// (a Dec with FS16: two float scales a step, Step::s for lo and Step::s2 for hi)
 template<int TY, typename = void> struct Fs16 { static constexpr bool on = false; };
 template<int TY> struct Fs16<TY, decltype((void) Dec<TY>::FS16)> { static constexpr bool on = Dec<TY>::FS16; };
+
+// IQ3_S: {f16 d; 64 codebook bytes (4 values each; a ninth index bit in qh); 8 x u8 qh; 32 sign bytes (one a 8
+// values); 4 x u8: two 4-bit scales, one a 32 values}: a value is d (2 s + 1) x the codebook value x its sign.
+template<> struct Dec<21> {
+    static constexpr int GW = 512;
+    __device__ static __forceinline__ const uint32_t* table() { return iq3s_grid; }
+    static constexpr int WCH = 256, CB = 110, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t* p) { return rd_f16(p); }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float hd, const uint32_t* grid) {
+        const uint8_t* q = p + 2 + 8 * ib;
+        const uint32_t qh = p[2 + 64 + ib], sc = p[2 + 104 + (ib >> 1)];
+        const uint32_t sg = (uint32_t) p[2 + 72 + 4 * ib + (t >> 1)] >> (4 * (t & 1));         // values 4 t .. 's signs
+        const uint32_t sg2 = (uint32_t) p[2 + 72 + 4 * ib + 2 + (t >> 1)] >> (4 * (t & 1));    // values 16 + 4 t .. 's
+        Step r;
+        r.lo = neg_nz(grid[q[t] | (((qh >> t) & 1u) << 8)], nib_mask(sg));
+        r.hi = neg_nz(grid[q[4 + t] | (((qh >> (4 + t)) & 1u) << 8)], nib_mask(sg2));
+        r.s = hd * (float) (2 * (int) ((sc >> (4 * (ib & 1))) & 15u) + 1);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
+// bytes of v (0-127) minus k (a byte value repeated), a byte at a time
+__device__ __forceinline__ uint32_t sub8(uint32_t v, uint32_t k) { return ((v | 0x80808080u) - k) ^ 0x80808080u; }
+__device__ __forceinline__ uint32_t rd32(const uint8_t* p) { return rd16(p) | rd16(p + 2) << 16; }   // (p even)
+
+// Q4_0: 32 values a block: {f16 d; 16 bytes: value i in byte i's low nibble, value 16 + i in its high nibble}, a value
+// is d (q - 8).  A chunk is four blocks.
+template<> struct Dec<2> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 72, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 18 * ib;
+        const uint32_t v = rd32(b + 2 + 4 * t);
+        Step r;
+        r.lo = sub8(v & 0x0F0F0F0Fu, 0x08080808u);
+        r.hi = sub8((v >> 4) & 0x0F0F0F0Fu, 0x08080808u);
+        r.s = rd_f16(b);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
+// Q4_1: {f16 d; f16 m; 16 bytes as Q4_0's}, a value is d q + m: the int8 is q, the offset - m (SUMS).
+template<> struct Dec<3> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 80, AL = 2, SUB = 32;
+    static constexpr bool SUMS = true;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 20 * ib;
+        const uint32_t v = rd32(b + 4 + 4 * t);
+        Step r;
+        r.lo = v & 0x0F0F0F0Fu;
+        r.hi = (v >> 4) & 0x0F0F0F0Fu;
+        r.s = rd_f16(b);
+        r.m0 = r.m1 = 0;
+        r.o = -rd_f16(b + 2);
+        return r;
+    }
+};
+
+// Q5_0: {f16 d; u32 qh; 16 bytes}: value i is byte i's low nibble | qh's bit i << 4, value 16 + i its high nibble |
+// qh's bit 16 + i << 4; a value is d (q - 16).
+template<> struct Dec<6> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 88, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        const uint8_t* b = p + 22 * ib;
+        const uint32_t qh = rd32(b + 2), v = rd32(b + 6 + 4 * t);
+        const uint32_t h0 = (nib_mask(qh >> (4 * t)) & 0x01010101u) << 4, h1 = (nib_mask(qh >> (16 + 4 * t)) & 0x01010101u) << 4;
+        Step r;
+        r.lo = sub8((v & 0x0F0F0F0Fu) | h0, 0x10101010u);
+        r.hi = sub8(((v >> 4) & 0x0F0F0F0Fu) | h1, 0x10101010u);
+        r.s = rd_f16(b);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
+// Q5_K: 256 values: {f16 d; f16 dmin; 12 bytes of scales and mins as Q4_K's; 32 bytes qh; 128 bytes as Q4_K's}: a
+// value is d sc q - dmin m, q = the nibble | qh's bit (the block's number) of the value's byte << 4.  A chunk is half
+// of it: the 48-byte header (d, dmin, scales, qh - both halves bring it) and the half's 64 bytes.
+template<> struct Dec<13> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 64, AL = 2, SUB = 32;
+    static constexpr int HDR = 48, RB = 88;
+    static constexpr bool SUMS = true;
+    __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 176; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 176 + 48 + (size_t) (c & 1) * 64; }
+    __device__ static __forceinline__ float head(const uint8_t* ph) { return rd_f16(ph); }
+    __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float hd) {
+        const int j = (c & 1) * 4 + ib;   // the block in its 256
+        const uint8_t* sc = ph + 4;
+        uint32_t scale, mn;
+        if (j < 4) {
+            scale = sc[j] & 63u;
+            mn = sc[j + 4] & 63u;
+        } else {
+            scale = (sc[j + 4] & 15u) | ((uint32_t) (sc[j - 4] >> 6) << 4);
+            mn = (uint32_t) (sc[j + 4] >> 4) | ((uint32_t) (sc[j] >> 6) << 4);
+        }
+        const uint8_t* q = pd + 32 * (ib >> 1) + 4 * t;
+        const uint8_t* qh = ph + 16 + 4 * t;
+        const int sh = 4 * (ib & 1);
+        Step r;
+        r.lo = ((rd32(q) >> sh) & 0x0F0F0F0Fu) | (((rd32(qh) >> j) & 0x01010101u) << 4);
+        r.hi = ((rd32(q + 16) >> sh) & 0x0F0F0F0Fu) | (((rd32(qh + 16) >> j) & 0x01010101u) << 4);
+        r.s = hd * (float) scale;
+        r.m0 = r.m1 = 0;
+        r.o = rd_f16(ph + 2) * (float) mn;
+        return r;
+    }
+};
+
+// Q3_K: 256 values: {32 bytes hmask; 64 bytes qs; 12 bytes: sixteen 6-bit scales (one a 16 values); f16 d}.  In half
+// n block j takes bits 2 j of qs[32 n ..] and bit 4 n + j of hmask[0 .. 31]: a value is d (sc - 32) (q - (hmask ?
+// 0 : 4)).  A chunk is a half: the header (scales and d: 14 bytes), the half's 32 bytes of qs, hmask (a second range).
+template<> struct Dec<11> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 32, AL = 2, SUB = 16;
+    static constexpr int HDR = 14, RB = 55, CB2 = 32;
+    __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 110 + 96; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 110 + 32 + (size_t) (c & 1) * 32; }
+    __device__ static __forceinline__ size_t dat2(int c) { return (size_t) (c >> 1) * 110; }
+    __device__ static __forceinline__ float head(const uint8_t* ph) { return rd_f16(ph + 12); }
+    __device__ static __forceinline__ int scale6(const uint8_t* sc, int is) {   // scale is of the 16
+        const uint32_t us = is < 4  ? (sc[is] & 15u) | ((sc[is + 8] & 3u) << 4)
+                          : is < 8  ? (sc[is] & 15u) | (((uint32_t) (sc[is + 4] >> 2) & 3u) << 4)
+                          : is < 12 ? (uint32_t) (sc[is - 8] >> 4) | (((uint32_t) (sc[is] >> 4) & 3u) << 4)
+                                    : (uint32_t) (sc[is - 8] >> 4) | (((uint32_t) (sc[is - 4] >> 6) & 3u) << 4);
+        return (int) us - 32;
+    }
+    __device__ static __forceinline__ uint32_t word(const uint8_t* q, const uint8_t* hm, int j, int bit) {
+        const uint32_t u = ((rd32(q) >> (2 * j)) & 0x03030303u) | (((rd32(hm) >> bit) & 0x01010101u) << 2);   // 0..7
+        return sub8(u, 0x04040404u);
+    }
+    __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float,
+                                                  const uint8_t* pd2) {
+        const int n = c & 1;
+        Step r;
+        r.lo = word(pd + 4 * t, pd2 + 4 * t, ib, 4 * n + ib);
+        r.hi = word(pd + 16 + 4 * t, pd2 + 16 + 4 * t, ib, 4 * n + ib);
+        r.s = 0.0f;
+        r.m0 = scale6(ph, 8 * n + 2 * ib);
+        r.m1 = scale6(ph, 8 * n + 2 * ib + 1);
+        return r;
+    }
+};
+
+// Q2_K: 256 values: {16 bytes: a 4-bit scale and a 4-bit min a 16 values; 64 bytes qs; f16 d; f16 dmin}.  In half n
+// block j takes bits 2 j of qs[32 n ..]: a value is d sc q - dmin m, q in 0..3.  Two float scales and two offsets a
+// step (FS16, OFS16: the kernel gets each 16 values' sum of activations from a product with ones).
+// A chunk is a half: the header (the 16 scale bytes), the half's 32 bytes of qs, d and dmin (a second range).
+template<> struct Dec<10> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 32, AL = 2, SUB = 16;
+    static constexpr int HDR = 16, RB = 42, CB2 = 4;
+    static constexpr bool FS16 = true, OFS16 = true;
+    __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 84; }
+    __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 84 + 16 + (size_t) (c & 1) * 32; }
+    __device__ static __forceinline__ size_t dat2(int c) { return (size_t) (c >> 1) * 84 + 80; }
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float,
+                                                  const uint8_t* pd2) {
+        const uint32_t s0 = ph[8 * (c & 1) + 2 * ib], s1 = ph[8 * (c & 1) + 2 * ib + 1];
+        const float d = rd_f16(pd2), dmin = rd_f16(pd2 + 2);
+        Step r;
+        r.lo = (rd32(pd + 4 * t) >> (2 * ib)) & 0x03030303u;
+        r.hi = (rd32(pd + 16 + 4 * t) >> (2 * ib)) & 0x03030303u;
+        r.s = d * (float) (s0 & 15u);
+        r.s2 = d * (float) (s1 & 15u);
+        r.o = dmin * (float) (s0 >> 4);
+        r.o2 = dmin * (float) (s1 >> 4);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+// (a Dec with OFS16: an offset a 16 values, Step::o for lo and Step::o2 for hi)
+template<int TY, typename = void> struct Ofs16 { static constexpr bool on = false; };
+template<int TY> struct Ofs16<TY, decltype((void) Dec<TY>::OFS16)> { static constexpr bool on = Dec<TY>::OFS16; };
 
 // A chunk's bytes in its row: one range (chunk c at c * CB), or - a Dec with HDR - a header range and a data range
 template<int TY, typename = void> struct Rng {

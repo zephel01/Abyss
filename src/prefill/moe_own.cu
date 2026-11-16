@@ -358,6 +358,11 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
             for (int i = 0; i < SPH; ++i) {
                 const uint32_t bl = bw[2 * i], bh = bw[2 * i + 1];
                 const float x0 = xa[i], x1 = xb[i];
+                int ol[4] = {0, 0, 0, 0}, oh[4] = {0, 0, 0, 0};   // (OFS16: the tokens' sums of each 16 activations)
+                if constexpr (Ofs16<TY>::on) {
+                    mma16(ol, 0x01010101u, 0x01010101u, bl);
+                    mma16(oh, 0x01010101u, 0x01010101u, bh);
+                }
 #pragma unroll
                 for (int f = 0; f < 2; ++f) {
                     float v[4];
@@ -372,10 +377,16 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                         int cl[4], ch[4];
                         mma16(cl, st[i][f][0].lo, st[i][f][1].lo, bl);
                         mma16(ch, st[i][f][0].hi, st[i][f][1].hi, bh);
-                        v[0] = fmaf((float) cl[0], st[i][f][0].s, (float) ch[0] * st[i][f][0].o);
-                        v[1] = fmaf((float) cl[1], st[i][f][0].s, (float) ch[1] * st[i][f][0].o);
-                        v[2] = fmaf((float) cl[2], st[i][f][1].s, (float) ch[2] * st[i][f][1].o);
-                        v[3] = fmaf((float) cl[3], st[i][f][1].s, (float) ch[3] * st[i][f][1].o);
+                        v[0] = fmaf((float) cl[0], st[i][f][0].s, (float) ch[0] * st[i][f][0].s2);
+                        v[1] = fmaf((float) cl[1], st[i][f][0].s, (float) ch[1] * st[i][f][0].s2);
+                        v[2] = fmaf((float) cl[2], st[i][f][1].s, (float) ch[2] * st[i][f][1].s2);
+                        v[3] = fmaf((float) cl[3], st[i][f][1].s, (float) ch[3] * st[i][f][1].s2);
+                        if constexpr (Ofs16<TY>::on) {   // (the offsets x each 16 values' sum of activations)
+                            v[0] -= fmaf(st[i][f][0].o, (float) ol[0], st[i][f][0].o2 * (float) oh[0]);
+                            v[1] -= fmaf(st[i][f][0].o, (float) ol[1], st[i][f][0].o2 * (float) oh[1]);
+                            v[2] -= fmaf(st[i][f][1].o, (float) ol[2], st[i][f][1].o2 * (float) oh[2]);
+                            v[3] -= fmaf(st[i][f][1].o, (float) ol[3], st[i][f][1].o2 * (float) oh[3]);
+                        }
                     } else {
                         int cl[4], ch[4];
                         mma16(cl, st[i][f][0].lo, st[i][f][1].lo, bl);
@@ -450,11 +461,14 @@ __global__ void __launch_bounds__(Cfg<CF>::NT) own_kernel(const KArgs a) {
 }
 
 // the type takes the wide shape only: two fine CTAs do not fit an SM
-template<int TY> struct Wide { static constexpr bool on = 2 * Lay<TY, 0>::smem > kSmemSM; };
+template<int TY> struct Wide {
+    static constexpr bool on = 2 * Lay<TY, 0>::smem > kSmemSM;
+    // (two fine CTAs fit, a coarse one does not: Q3_K - the fine shape only)
+    static constexpr bool fine_only = !on && Lay<TY, 1>::smem > kSmemCTA;
+};
 
 template<int TY, bool GLU, int CF>
 void launch_c(const KArgs& a, unsigned grid, cudaStream_t s) {
-    static_assert(Lay<TY, CF>::smem <= kSmemCTA, "the shape does not fit a CTA's shared memory");
     static bool once = false;
     if (!once) {
         ck(cudaFuncSetAttribute(own_kernel<TY, GLU, CF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) Lay<TY, CF>::smem),
@@ -468,6 +482,8 @@ template<int TY, bool GLU>
 void launch_t(const KArgs& a, unsigned grid, int shape, cudaStream_t s) {
     if constexpr (Wide<TY>::on) {   // (a large raw chunk: the wide shape only)
         launch_c<TY, GLU, 2>(a, grid, s);
+    } else if constexpr (Wide<TY>::fine_only) {
+        launch_c<TY, GLU, 0>(a, grid, s);
     } else {
         if (shape == 1) launch_c<TY, GLU, 1>(a, grid, s);
         else launch_c<TY, GLU, 0>(a, grid, s);
@@ -543,7 +559,7 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
     __shared__ __align__(16) uint4 xbuf[HTC * 8];           // the tokens' 128 int8 of the half chunk
     __shared__ __align__(16) uint4 sbuf[HTC], ubuf[HTC];    // their four scales, their four block sums
     __shared__ __align__(16) float scl[HNW][2][SPH][2][16]; // a wave's rows' scales: [fragment][step][first / second 16][OW_POS(row)]
-    __shared__ __align__(16) float ofs[HNW][2][SPH][16];    // their offsets (SUMS types)
+    __shared__ __align__(16) float ofs[HNW][2][SPH][2][16]; // their offsets (SUMS, OFS16 types)
     __shared__ __align__(16) uint32_t gridb[HLay<TY>::GW];
     {
         const uint32_t* src = D::table();
@@ -654,7 +670,7 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
                     float s0, s1;   // the first and the second 16 values' scales
                     if constexpr (Fs16<TY>::on) {
                         s0 = st[0].s;
-                        s1 = st[0].o;
+                        s1 = st[0].s2;
                     } else if constexpr (D::SUB == 16) {
                         s0 = (float) st[0].m0 * hd[f];
                         s1 = (float) st[0].m1 * hd[f];
@@ -663,7 +679,8 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
                     }
                     scl[wp][f][i][0][OW_POS(r)] = s0;
                     scl[wp][f][i][1][OW_POS(r)] = s1;
-                    if constexpr (Sums<TY>::on) ofs[wp][f][i][OW_POS(r)] = st[0].o;
+                    if constexpr (Sums<TY>::on || Ofs16<TY>::on) ofs[wp][f][i][0][OW_POS(r)] = st[0].o;
+                    if constexpr (Ofs16<TY>::on) ofs[wp][f][i][1][OW_POS(r)] = st[0].o2;
                 }
             }
         __syncwarp();
@@ -693,11 +710,18 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
 #pragma unroll
                         for (int k = 0; k < 8; ++k)
                             v[k] = fmaf((float) d0[k], scl[wp][f][i][0][8 * hi + k], (float) d1[k] * scl[wp][f][i][1][8 * hi + k]);
+                        if constexpr (Ofs16<TY>::on) {   // (the offsets x each 16 values' sum of activations: a product with ones)
+                            const uint4 ones = make_uint4(0x01010101u, 0x01010101u, 0x01010101u, 0x01010101u);
+                            const ow_i8 o0 = wmma(ones, b_lo, z, hi), o1 = wmma(ones, b_hi, z, hi);
+#pragma unroll
+                            for (int k = 0; k < 8; ++k)
+                                v[k] -= fmaf(ofs[wp][f][i][0][8 * hi + k], (float) o0[k], ofs[wp][f][i][1][8 * hi + k] * (float) o1[k]);
+                        }
                     }
 #pragma unroll
                     for (int k = 0; k < 8; ++k) {
                         acc[f][j][k] = fmaf(v[k], xs[i], acc[f][j][k]);
-                        if constexpr (Sums<TY>::on) acc[f][j][k] = fmaf(-ofs[wp][f][i][8 * hi + k], us[i], acc[f][j][k]);
+                        if constexpr (Sums<TY>::on) acc[f][j][k] = fmaf(-ofs[wp][f][i][0][8 * hi + k], us[i], acc[f][j][k]);
                     }
                 }
             }
@@ -728,7 +752,7 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
         }
 }
 
-template<int TY> struct Wide { static constexpr bool on = false; };   // (one shape here)
+template<int TY> struct Wide { static constexpr bool on = false, fine_only = true; };   // (one shape here)
 template<int TY, bool GLU>
 void launch_t(const KArgs& a, unsigned grid, int, cudaStream_t s) {
     own_kernel<TY, GLU><<<grid, HNT, 0, s>>>(a);
@@ -752,6 +776,13 @@ void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) 
         case 14: launch_t<14, GLU>(a, grid, shape, s); break;
         case 8: launch_t<8, GLU>(a, grid, shape, s); break;
         case 40: launch_t<40, GLU>(a, grid, shape, s); break;
+        case 2: launch_t<2, GLU>(a, grid, shape, s); break;
+        case 3: launch_t<3, GLU>(a, grid, shape, s); break;
+        case 6: launch_t<6, GLU>(a, grid, shape, s); break;
+        case 13: launch_t<13, GLU>(a, grid, shape, s); break;
+        case 11: launch_t<11, GLU>(a, grid, shape, s); break;
+        case 10: launch_t<10, GLU>(a, grid, shape, s); break;
+        case 21: launch_t<21, GLU>(a, grid, shape, s); break;
         case 39: launch_t<39, GLU>(a, grid, shape, s); break;
         default:
             std::fprintf(stderr, "prefill own: type %d is not covered\n", type);
@@ -775,7 +806,40 @@ bool wide_type(int type) {
         case 14: return Wide<14>::on;
         case 8: return Wide<8>::on;
         case 40: return Wide<40>::on;
+        case 2: return Wide<2>::on;
+        case 3: return Wide<3>::on;
+        case 6: return Wide<6>::on;
+        case 13: return Wide<13>::on;
+        case 11: return Wide<11>::on;
+        case 10: return Wide<10>::on;
+        case 21: return Wide<21>::on;
         case 39: return Wide<39>::on;
+        default: return false;
+    }
+}
+bool fine_only_type(int type) {
+    switch (type) {
+        case 16: return Wide<16>::fine_only;
+        case 17: return Wide<17>::fine_only;
+        case 18: return Wide<18>::fine_only;
+        case 22: return Wide<22>::fine_only;
+        case 19: return Wide<19>::fine_only;
+        case 29: return Wide<29>::fine_only;
+        case 20: return Wide<20>::fine_only;
+        case 42: return Wide<42>::fine_only;
+        case 23: return Wide<23>::fine_only;
+        case 12: return Wide<12>::fine_only;
+        case 14: return Wide<14>::fine_only;
+        case 8: return Wide<8>::fine_only;
+        case 40: return Wide<40>::fine_only;
+        case 2: return Wide<2>::fine_only;
+        case 3: return Wide<3>::fine_only;
+        case 6: return Wide<6>::fine_only;
+        case 13: return Wide<13>::fine_only;
+        case 11: return Wide<11>::fine_only;
+        case 10: return Wide<10>::fine_only;
+        case 21: return Wide<21>::fine_only;
+        case 39: return Wide<39>::fine_only;
         default: return false;
     }
 }
@@ -795,7 +859,7 @@ bool built() {
 }
 bool tuned_device() { return false; }   // (no AMD card is measured against MMQ yet: MMQ stays the default)
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6 || t == 13 || t == 11 || t == 10 || t == 21);
 }
 #else
 namespace {
@@ -815,7 +879,7 @@ int device_cc() {
 bool tuned_device() { return device_cc() == 120; }
 bool built() { return device_cc() >= 80; }   // (int8 mma.sync and cp.async)
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6 || t == 13 || t == 11 || t == 10 || t == 21);
 }
 #endif
 
@@ -823,7 +887,8 @@ bool supported(int t) {
 // measured on (tuned_device(): sm_120, the RTX 5090; any other GPU keeps MMQ until it is measured).
 // 2026-11-17, RTX 5090 (worklog/2026-11-16_no-llamacpp.md section 8): IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ2_S 22,
 // IQ1_S 19, IQ4_NL 20, Q2_0 42.  Not in it: MXFP4 and NVFP4 (MMQ multiplies in FP4 there), IQ4_XS, Q4_K, Q6_K, Q8_0
-// (slower in small launches), IQ1_M (no model here to measure with; MMQ has no IQ1_M: the layer takes the FP16 path).
+// (slower in small launches), IQ1_M (no model here to measure with; MMQ has no IQ1_M: the layer takes the FP16 path),
+// Q4_0 / Q4_1 / Q5_0 (faster in the kernel bench, no model run yet), Q5_K, Q3_K, Q2_K, IQ3_S (slower).
 static const char* const kDefaultTypes = "16,17,18,22,19,20,42";
 
 bool type_on(int type, bool mmq_built, bool dense) {
@@ -847,21 +912,23 @@ bool type_on(int type, bool mmq_built, bool dense) {
     static const std::vector<int> from_env = parse(env != nullptr ? env : ""), all = parse("all"), tuned = parse(kDefaultTypes);
     if (mmq_only || !supported(type)) return false;
     // (a build without MMQ: every type the own GEMM covers - the other choice there is the FP16 path)
-    // (the default list was measured on the experts' products: a dense layer's follow it once they are measured too)
-    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() && !dense ? tuned : from_env;
+    // (a dense layer's products follow the same list: measured on Qwen3.8-27B UD-IQ2_XXS and UD-IQ3_XXS, +2.4-8.1% at
+    // 4K-128K, KL 0.00083 -> 0.00075)
+    (void) dense;
+    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() ? tuned : from_env;
     return std::find(on.begin(), on.end(), type) != on.end();
 }
 
 bool usable(int t, int64_t rows, int64_t cols) {
     // (a chunk of the type's blocks: 256 values, 128 for the 32- and 64-value block types)
-    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 8 || t == 40) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
+    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 
 size_t act_bytes(int64_t rows, int64_t cols, bool sums) {
     return (size_t) rows * (size_t) cols + (size_t) rows * (size_t) (cols / 32) * (sums ? 8 : 4);
 }
-bool needs_sums(int t) { return t == 12; }
+bool needs_sums(int t) { return t == 12 || t == 13 || t == 3; }
 bool act_natural_order() {
 #if defined(__HIPCC__)
     return true;
@@ -956,7 +1023,7 @@ void run(const Set& s, int type, KArgs& a, int32_t*& tiles, cudaStream_t st) {
 #if defined(__HIPCC__)
         const int c_step = 16, c_max = HTC;   // (one shape; a token group is 16)
 #else
-        const int c_step = 8, c_max = wide ? Cfg<2>::TC : Cfg<1>::TC;
+        const int c_step = 8, c_max = wide || fine_only_type(type) ? Cfg<2>::TC : Cfg<1>::TC;
 #endif
         for (int c = c_step; c <= c_max; c += c_step) {
             const bool crs = c > Cfg<0>::TC;

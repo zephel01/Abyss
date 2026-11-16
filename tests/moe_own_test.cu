@@ -76,7 +76,18 @@ void random_rows(int type, uint8_t* dst, int64_t rows, int64_t cols, std::mt1993
         } else if (type == qt::Q6_K) {   // (d last)
             const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.02f);
             std::memcpy(p + 208, &d, 2);
-        } else if (type == qt::Q4_K) {   // (d and dmin)
+        } else if (type == qt::Q3_K) {   // (d last)
+            const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.05f);
+            std::memcpy(p + 108, &d, 2);
+        } else if (type == qt::Q2_K) {   // (d and dmin last)
+            const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.1f), dm = qt::fp32_to_fp16(sc(rng) * 0.3f);
+            std::memcpy(p + 80, &d, 2);
+            std::memcpy(p + 82, &dm, 2);
+        } else if (type == qt::Q4_1) {   // (d and m)
+            const uint16_t d = qt::fp32_to_fp16(sc(rng)), m = qt::fp32_to_fp16(sc(rng) * (byte(rng) & 1 ? -4.0f : 4.0f));
+            std::memcpy(p, &d, 2);
+            std::memcpy(p + 2, &m, 2);
+        } else if (type == qt::Q4_K || type == qt::Q5_K) {   // (d and dmin)
             const uint16_t d = qt::fp32_to_fp16(sc(rng) * 0.1f), dm = qt::fp32_to_fp16(sc(rng) * 0.3f);
             std::memcpy(p, &d, 2);
             std::memcpy(p + 2, &dm, 2);
@@ -313,7 +324,9 @@ bool run_case(const Case& c, const char* name, bool verbose, int ref_rows = 1 <<
             // compared with --dump)
             // (Q4_K the same: the types whose MMQ product takes the activations' block sums)
             const bool fp4 = c.gu_type == qt::MXFP4 || c.d_type == qt::MXFP4 || c.gu_type == qt::IQ1_S || c.d_type == qt::IQ1_S ||
-                             c.gu_type == qt::Q4_K || c.d_type == qt::Q4_K || c.gu_type == qt::NVFP4 || c.d_type == qt::NVFP4;
+                             c.gu_type == qt::Q4_K || c.d_type == qt::Q4_K || c.gu_type == qt::NVFP4 || c.d_type == qt::NVFP4 ||
+                             c.gu_type == qt::Q5_K || c.d_type == qt::Q5_K || c.gu_type == qt::Q2_K || c.d_type == qt::Q2_K ||
+                             c.gu_type == qt::Q4_1 || c.d_type == qt::Q4_1;
             if (!fp4 && (!(eh < 2e-2) || !(ed < 5e-2))) {
                 std::printf("%-28s FAIL  vs MMQ: h differs %.2e of its norm, the output %.2e\n", name, eh, ed);
                 ok = false;
@@ -495,7 +508,8 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     std::mt19937 rng(20261116);
-    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K, qt::Q6_K, qt::Q8_0, qt::NVFP4};
+    const int types[] = {qt::IQ2_XXS, qt::IQ2_XS, qt::IQ2_S, qt::IQ3_XXS, qt::MXFP4, qt::IQ1_S, qt::IQ1_M, qt::IQ4_NL, qt::Q2_0, qt::IQ4_XS, qt::Q4_K, qt::Q6_K, qt::Q8_0, qt::NVFP4,
+                         qt::Q4_0, qt::Q4_1, qt::Q5_0, qt::Q5_K, qt::Q3_K, qt::Q2_K, qt::IQ3_S};
     int bad = 0;
     for (int gt : types)
         for (int dt : types) {

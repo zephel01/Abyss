@@ -24,7 +24,7 @@ bool tuned_device();
 /// The prompt path gives products of this type to the own GEMM instead of MMQ: STRATA_PROMPT_MMQ=1 - none;
 /// STRATA_PROMPT_OWN_TYPES=all | <type id>,.. - those; otherwise the default list on a tuned device (none elsewhere), and
 /// every covered type in a build without MMQ (`mmq_built` false).
-/// `dense`: a dense layer's product (not an expert's): the default list does not apply to it yet.
+/// `dense`: a dense layer's product (not an expert's); the same list applies.
 bool type_on(int ggml_type, bool mmq_built, bool dense = false);
 /// The kernels read weights of this ggml type.
 bool supported(int ggml_type);

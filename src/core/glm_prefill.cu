@@ -377,7 +377,7 @@ size_t act_bytes(int64_t rows, int64_t cols) {
 #if defined(STRATA_MOE_OWN)
     // (the block sums' plane only where a type that reads them is on: the buffers - and with them the chunk plan -
     // stay as MMQ's otherwise)
-    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols, own_type(12)));
+    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols, own_type(12) || own_type(13) || own_type(3)));
 #endif
     return n;
 }
