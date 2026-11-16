@@ -6,7 +6,7 @@ name: windows-build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "ci-*"]   # ci-*: a release candidate runs every build before the tag
     tags: ["v*"]
   workflow_dispatch:
 
