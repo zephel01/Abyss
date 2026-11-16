@@ -56,6 +56,8 @@ ROOT = Path(__file__).resolve().parent.parent
 WIN = os.name == "nt"
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
+sys.path.insert(0, str(ROOT / "tools"))
+import prebuilt as P  # noqa: E402  the prebuilt CUDA engine (no toolkit / compiler needed)
 
 REPO = "unsloth/DeepSeek-V4-Flash-0731-GGUF"
 # Qwen3.8-27B UD-Q4_K_XL, the whole file in VRAM: the GPU size (GB, as the card reports it) each context needs.  RTX 5090
@@ -346,6 +348,48 @@ def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
           quiet=True)
     S.ok(f"engine: {exe}")
     return exe
+
+
+def find_nvcc(nvcc_arg: str | None = None) -> str | None:
+    """The nvcc build_engine would take, when it is there."""
+    c = nvcc_arg or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    return c if Path(c).exists() else None
+
+
+def use_prebuilt(a, gpus) -> bool:
+    """The prebuilt engine (tools/prebuilt.py): --prebuilt, or no nvcc / C++ compiler here.  Checks what it needs -
+    an archive for this OS and these GPUs, the NVIDIA driver - and stops with the reason when it cannot be used."""
+    compiler = S.find_vcvars() is not None if WIN else shutil.which("g++") is not None
+    if not P.want_prebuilt(a.prebuilt, find_nvcc(a.nvcc), compiler):
+        return False
+    how = "install the CUDA toolkit (12.8 or newer for RTX 50) and a C++ compiler to compile the engine"
+    if P.asset_name() is None:
+        S.fail("nvcc (the CUDA toolkit) was not found, and no prebuilt engine is made for this OS / CPU "
+               "(Windows x64 and Linux x64)", how)
+    bad = P.unsupported(g["arch"] for g in gpus)
+    if bad:
+        S.fail(("" if a.prebuilt else "nvcc (the CUDA toolkit) was not found, and ") + "the prebuilt engine has no code "
+               "for compute capability " + ", ".join(f"{x // 10}.{x % 10}" for x in bad) + " (sm_" +
+               ", sm_".join(str(x) for x in P.ARCHS) + ": RTX 30 / 40 / 50)", how)
+    verdict, msg = P.driver_verdict(P.driver_version())
+    if verdict == "stop":
+        S.fail(msg)
+    (S.warn if verdict == "warn" else S.ok)(msg)
+    S.ok("the engine: the prebuilt one from the GitHub release (" + ("--prebuilt" if a.prebuilt else
+         "no CUDA toolkit / C++ compiler here") + ")")
+    return True
+
+
+def prebuilt_engine(gpus) -> Path:
+    """The prebuilt engine into build/ (abyss.py's install_prebuilt: the same stamp, so ./abyss.sh knows it)."""
+    import abyss as M   # noqa: E402  (constants and functions only)
+    M.select_build_backend("cuda")
+    meta = M.read_json(M.STAMP)
+    if M.EXE.exists() and meta.get("prebuilt") == P.version():
+        S.ok(f"prebuilt engine {meta['prebuilt']} already here: {M.EXE}")
+        return M.EXE
+    M.install_prebuilt(S.source_hash(S.ENGINE_SOURCES), [g["index"] for g in gpus])
+    return M.EXE
 
 
 def hip_engine(a):
@@ -805,6 +849,10 @@ def vision_27b_step(a, repo: str, mdir: Path, gguf: Path, cfg: Path, gpus, backe
         S.ok("images: NVIDIA only for now - the model reads text only")
         return
     import abyss as M   # noqa: E402  (its vision build: llama.cpp's mtmd with tools/vision)
+    if getattr(a, "_prebuilt", False) and not M.VEXE.exists():
+        S.ok("images: not with the prebuilt engine yet (the vision encoder is compiled: the CUDA toolkit) - the model "
+             "reads text only")
+        return
     if conf.get("vision") and Path(conf["vision"].get("exe", "")).exists() and Path(conf["vision"].get("mmproj", "")).exists():
         S.ok(f"images: {conf['vision']['mmproj']} (already set up)")
         return
@@ -854,6 +902,9 @@ def main() -> int:
     ap.add_argument("--arch", help="the CUDA architecture to compile for (default: the GPU's; 120a on RTX 50)")
     ap.add_argument("--nvcc", help="the CUDA compiler to build with (default: nvcc on PATH, else /usr/local/cuda); a V100 "
                                    "needs a CUDA 12 one, e.g. /usr/local/cuda-12.9/bin/nvcc")
+    ap.add_argument("--prebuilt", action="store_true", help="download the prebuilt engine from the GitHub release "
+                    "instead of compiling it (taken by itself when nvcc or the C++ compiler is missing; RTX 30 / 40 / "
+                    "50, NVIDIA driver 580+, 610+ recommended)")
     ap.add_argument("--download-model", action="store_true", help="download the model without asking")
     ap.add_argument("--yes", action="store_true", help="the defaults for every question (the download still needs --download-model)")
     ap.add_argument("--rewrite-config", action="store_true", help="write abyss-<name>.json again")
@@ -905,6 +956,7 @@ def main() -> int:
         gpus = [found[i] for i in want]
     for g in gpus if backend == "cuda" else []:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
+    a._prebuilt = backend == "cuda" and use_prebuilt(a, gpus)
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
     # a model that runs all in VRAM (Qwen3.8-27B): one GPU that holds it, and the context it holds - checked first
@@ -947,11 +999,13 @@ def main() -> int:
 
     S.step(2, "Python packages and llama.cpp's source")
     S.pip_install(S.PY_PACKAGES, ", ".join(S.PY_PACKAGES))
-    why = S.llama_cpp_reasons(gpu_engine=True)   # (images fetch it in their own step)
+    why = S.llama_cpp_reasons(gpu_engine=not a._prebuilt)   # (images fetch it in their own step)
     S.ok(f"llama.cpp: {S.get_llama_cpp(why)} ({'; '.join(why)})" if why else "llama.cpp's source: not needed")
 
     S.step(3, "the engine")
-    if backend == "cuda":
+    if backend == "cuda" and a._prebuilt:
+        prebuilt_engine(gpus)
+    elif backend == "cuda":
         build_engine(a.arch, gpus, a.nvcc)
 
     S.step(4, f"the model: {repo} {quant}")

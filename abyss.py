@@ -94,6 +94,7 @@ sys.path.insert(0, str(HERE / "tools"))
 import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./abyss.sh --calibrate)
+import prebuilt as P  # noqa: E402  the prebuilt CUDA engine from the GitHub release (no toolkit / compiler needed)
 # where a token's time goes, the bottleneck and its advice: shared with Abyss Terminal (tools/bench_rules.py)
 from bench_rules import (BENCH_ADVICE, BENCH_ADVICE_HIP, GAP_LINE, SPEC_LINE, STAT_LINE, _mean, advice,  # noqa: E402,F401
                          bench_records, bench_verdict, lane_name as log_lane_name)
@@ -956,7 +957,19 @@ def check_pc(a) -> dict:
     nvcc, nv = find_nvcc(archs, a.nvcc)
     lo, hi = nvcc_range(archs)
     want = f"CUDA {lo[0]}.{lo[1]} or newer" + (f" but older than {hi[0]}.0 (CUDA 13 dropped Volta)" if hi else "")
-    if nvcc is None:
+    prebuilt = prebuilt_choice(a, archs, nvcc, nv, lo, hi)
+    if prebuilt:
+        verdict, msg = P.driver_verdict(P.driver_version())
+        if verdict == "stop":
+            problems.append((msg, "then run " + ME + " again"))
+        elif verdict == "warn":
+            warn(msg)
+        else:
+            ok(msg)
+        ok("the engine: the prebuilt one is downloaded in step 4 (CUDA " + P.CUDA + ", sm_" +
+           ", sm_".join(str(x) for x in P.ARCHS) + ") - " + ("--prebuilt" if a.prebuilt else
+           "no CUDA toolkit / C++ compiler to compile it here") + "; nothing to install")
+    elif nvcc is None:
         problems.append((f"the CUDA toolkit (nvcc) is not installed; these GPUs need {want}", toolkit_hint(archs)))
     elif nv is None:
         problems.append((f"{nvcc} does not say its version (nvcc --version)", "pass the toolkit's nvcc with --nvcc"))
@@ -969,14 +982,18 @@ def check_pc(a) -> dict:
 
     drv = min(S.driver_major(g) for g in chosen)
     need_drv = 580 if nv and nv >= (13, 0) else 525
-    if drv < need_drv:
+    if prebuilt:
+        pass                                           # (checked above, for the prebuilt engine's CUDA 13.3)
+    elif drv < need_drv:
         problems.append((f"the NVIDIA driver {chosen[0]['driver']} is too old: {need_drv} or newer is needed",
                          ("" if WIN else "Ubuntu: sudo ubuntu-drivers install, then restart; or ") +
                          "https://www.nvidia.com/drivers"))
     else:
         ok(f"NVIDIA driver {chosen[0]['driver']}")
 
-    if WIN:
+    if prebuilt:
+        pass                                           # (no compiler needed)
+    elif WIN:
         vcvars = S.find_vcvars()
         if vcvars is None:
             problems.append(("the C++ compiler (Visual Studio 2022 Build Tools, 'Desktop development with C++') is "
@@ -1034,8 +1051,38 @@ def check_pc(a) -> dict:
         fail("something Maya needs is missing (above)",
              f"install it and run {ME} again - this script installs nothing system-wide")
     select_build_backend("cuda")
+    a._prebuilt = prebuilt
     return {"backend": "cuda", "gpus": chosen, "archs": archs, "nvcc": nvcc,
-            "vcvars": str(S.find_vcvars()) if WIN else None}
+            "vcvars": str(S.find_vcvars()) if WIN else None, "prebuilt": prebuilt}
+
+
+def compiler_found(host_compiler: str | None = None) -> bool:
+    """A C++ compiler nvcc can use: Visual Studio's Build Tools on Windows, g++ (or --host-compiler) elsewhere."""
+    if WIN:
+        return S.find_vcvars() is not None
+    return shutil.which(host_compiler or "g++") is not None
+
+
+def prebuilt_choice(a, archs, nvcc, nv, lo, hi) -> bool:
+    """The prebuilt engine instead of compiling: --prebuilt, or no usable toolkit / compiler here - when an archive is
+    built for this OS and these GPUs (else the setup lists what to install, as before).  A toolkit that is there
+    keeps compiling the default."""
+    usable_nvcc = nvcc if (nv is not None and nv >= lo and (hi is None or nv < hi)) else None
+    if not P.want_prebuilt(getattr(a, "prebuilt", False), usable_nvcc, compiler_found(getattr(a, "host_compiler", None))):
+        return False
+    why = None
+    if P.asset_name() is None:
+        why = f"no prebuilt engine is made for {platform.system()} {platform.machine()} (Windows x64 and Linux x64)"
+    elif P.unsupported(archs):
+        why = ("no prebuilt engine is made for compute capability " + ", ".join(
+            f"{x // 10}.{x % 10}" for x in P.unsupported(archs)) + " (it carries sm_" +
+            ", sm_".join(str(x) for x in P.ARCHS) + ": RTX 30 / 40 / 50)")
+    if why is None:
+        return True
+    if getattr(a, "prebuilt", False):
+        fail(why, "install the CUDA toolkit and a C++ compiler to compile the engine (run without --prebuilt)")
+    say(f"  ({why}: the engine is compiled here)")
+    return False
 
 
 # ------------------------------------------------------------------------------------------------ 2. choices
@@ -1182,7 +1229,7 @@ def tools_step(a) -> Path:
     llama_ok = S.is_llama_cpp(llama)
     if a.llama_dir and not llama_ok:
         fail(f"{llama} is not a llama.cpp checkout (its ggml/ folder is missing)")
-    why = S.llama_cpp_reasons(gpu_engine=True)
+    why = S.llama_cpp_reasons(gpu_engine=not getattr(a, "_prebuilt", False))
     downloads = []
     if need:
         downloads.append("Python packages from PyPI into .venv: " + ", ".join(need) + " (roughly 50-100 MB)")
@@ -1441,8 +1488,14 @@ def build_step(a, pc, llama: Path) -> dict:
             ok(f"HIP engine already compiled: {EXE}")
             return meta
         return compile_engine_hip(pc, llama, src)
+    if pc.get("prebuilt"):
+        if (EXE.exists() and not a.rebuild and meta.get("prebuilt") == P.version()
+                and set(pc["archs"]) <= set(meta.get("archs", []))):
+            ok(f"prebuilt engine {meta['prebuilt']} already here: {EXE}")
+            return meta
+        return install_prebuilt(src, [g["index"] for g in pc["gpus"]])
     if (EXE.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
-            and (not a.nvcc or a.nvcc == meta.get("nvcc"))
+            and not meta.get("prebuilt") and (not a.nvcc or a.nvcc == meta.get("nvcc"))
             and (not a.host_compiler or a.host_compiler == meta.get("host_compiler"))):
         ok(f"engine already compiled for " + ", ".join(f"sm_{x}" for x in meta["archs"]) + f": {EXE}")
         return meta
@@ -1451,13 +1504,42 @@ def build_step(a, pc, llama: Path) -> dict:
     return compile_engine(pc["archs"], [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src)
 
 
+def install_prebuilt(src: str, gpu_ids, soft=False) -> dict | None:
+    """The prebuilt engine (tools/prebuilt.py) into build/, and its stamp; soft: a failure warns and returns None."""
+    say(f"  The prebuilt engine for this checkout (v{P.version()}) from the GitHub release: CUDA {P.CUDA}, "
+        "the CUDA libraries it needs beside it ...")
+    try:
+        man = P.install(BUILD, log=say, download=lambda url, dst, what: S.download(url, dst, what))
+    except (RuntimeError, OSError, ValueError, SystemExit) as e:
+        msg = f"the prebuilt engine could not be installed: {e}"
+        if soft:
+            warn(msg + "; starting the engine there before")
+            return None
+        fail(msg, "check the internet connection and run it again, or install the CUDA toolkit and a C++ compiler "
+                  "to compile it")
+    if man.get("version") and man["version"] != P.version():
+        warn(f"the release has the engine of v{man['version']}, this checkout is v{P.version()}: an update "
+             f"({ME} after git pull) takes the matching one once it is released")
+    meta = {"src": src, **P.stamp_fields(man), "gpu_ids": list(gpu_ids), "nvcc": None, "host_compiler": None,
+            "lib_dirs": [str(BUILD)], "date": time.strftime("%Y-%m-%d %H:%M")}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"prebuilt engine {meta['prebuilt']} (sm_" + ", sm_".join(str(x) for x in meta["archs"]) + f"): {EXE}")
+    return meta
+
+
 def refresh_engine(cfg: dict) -> None:
-    """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed."""
+    """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed (a prebuilt
+    engine: the release's of the new version)."""
     meta = read_json(STAMP)
     if not meta or Path(cfg["exe"]).resolve() != EXE.resolve():
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src:
+        return
+    if meta.get("prebuilt") and cfg.get("backend", "cuda") == "cuda":
+        if meta["prebuilt"] != P.version():
+            say("  The engine's source changed (an update): the prebuilt engine of this version ...")
+            install_prebuilt(src, meta.get("gpu_ids") or [0], soft=True)
         return
     if cfg.get("backend") == "hip":
         root = Path(meta.get("rocm") or "/opt/rocm")
@@ -1840,6 +1922,10 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     step(7, "images (the vision encoder)")
     if pc.get("backend") == "hip":
         ok("HIP port: text only; vision is not enabled")
+        return None
+    if pc.get("prebuilt") and not VEXE.exists():
+        ok("images: not with the prebuilt engine yet (the vision encoder is compiled: the CUDA toolkit) - the model "
+           "reads text only")
         return None
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
@@ -3501,6 +3587,9 @@ def main() -> int:
                                             "than your CUDA accepts)")
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
+    ap.add_argument("--prebuilt", action="store_true", help="download the prebuilt engine from the GitHub release "
+                    "instead of compiling it (taken by itself when the CUDA toolkit or the C++ compiler is missing; "
+                    "RTX 30 / 40 / 50, NVIDIA driver 580+, 610+ recommended)")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
     ap.add_argument("--report", action="store_true", help="write abyss-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "

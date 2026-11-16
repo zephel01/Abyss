@@ -158,6 +158,27 @@ zephel01 のファイルを知らせるだけ。`--quant` を付ければいつ�
 | `--rewrite-config` | `abyss-<名前>.json` を書き直す（なければ既存のものを残す。書いてあった DSpark ドラフトモデルはそのまま使う） |
 | `--dspark`, `--no-dspark` | DeepSeek の DSpark ドラフトモデル（6.9 GB、`../Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF` へ）をダウンロードして設定でオンにする / 設定でオフにする（ファイルは残す）。GPU 1 枚のときだけ |
 | `--tools-only` | Abyss-tools だけを作る / 更新する |
+| `--prebuilt` | エンジンをコンパイルせず、ビルド済みのものをダウンロードする（`nvcc` か C++ コンパイラが無いときは自動でこちらになる。下を参照） |
+
+
+### コンパイラ無しで: ビルド済みエンジン（試行中）
+
+CUDA ツールキット（`nvcc`）か C++ コンパイラ（Windows は Visual Studio Build Tools、Linux は g++）が無いとき、
+セットアップ（`./setup-deepseek.sh`、`setup-deepseek.bat`、`./abyss.sh`、`START-ABYSS.bat`）はエンジンをコンパイルせず、
+GitHub Actions でビルドしたものをダウンロードする。ツールキットがあっても `--prebuilt` でこちらを選べる。
+ツールキットがあれば、これまでどおりコンパイルする。
+
+| | |
+| --- | --- |
+| アーカイブ | `abyss-engine-cuda-linux-x64.tar.gz`、`abyss-engine-cuda-windows-x64.zip`。このバージョンの GitHub リリース（無ければ最新のリリース）から取り、リリースの `SHA256SUMS` で確かめて `build/` に展開する |
+| GPU | RTX 30（sm_86）、RTX 40（sm_89）、RTX 50（sm_120a）を 1 本のバイナリで。ほかの GPU（V100、RTX 20、A100、H100、DGX Spark）はこれまでどおりコンパイルする |
+| NVIDIA ドライバ | **580 以上が必須**（CUDA の minor version compatibility で CUDA 13.x が動く。セットアップは警告を出す。未検証）。**610 以上を推奨**（CUDA 13.3 のブランチ R610、Linux は 610.43.02）。580 未満ならセットアップは止まり、ドライバのページ https://www.nvidia.com/drivers を示す |
+| 中身 | エンジンと `abyss_gpu_tune`、それが読み込む NVIDIA の CUDA ライブラリ（cuBLAS、cuBLASLt。Linux は CUDA ランタイムも）を手を加えずに同梱。[CUDA EULA](https://docs.nvidia.com/cuda/eula/index.html#attachment-a) に従って配布 |
+| Linux | Ubuntu 22.04 以降（glibc 2.35）。エンジンは横に置いたライブラリを読む |
+| まだ無いもの | 画像エンコーダ（`strata-vision`）はコンパイルが要る。ビルド済みエンジンでは、モデルはテキストだけを読む |
+
+`ABYSS_PREBUILT_URL` で、`SHA256SUMS` とアーカイブを置いた別の場所（URL、`file://`、パス）を指定できる。
+手で展開した CI の artifact を試すときなど。
 
 以下の節は、同じことを手で行う手順。
 

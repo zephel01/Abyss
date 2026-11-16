@@ -134,6 +134,7 @@ the PC-size file that fits this PC's VRAM + RAM (`this PC: 16 GB GPU + 62 GB RAM
 | Memory | VRAM + RAM of about the file's size keeps every expert in memory (less works, reading from the SSD) |
 | Disk | an NVMe SSD with the space below (the faster, the better when the model does not fit in memory) |
 | Toolchain | CUDA 13.x (`nvcc`; 12.9 for a V100), g++, Python 3.10+; ROCm 10 on Linux, AMD's ROCm SDK 7.14 on Windows (`hipcc`, HIP 7.14 or newer) for the iGPU lane on an AMD APU or for an AMD build - ROCm 7.0-7.2 fail with current drivers; with Visual Studio 2026 (MSVC 14.51) setup patches one SDK header line for `'isgreater' cannot overload` ([docs/amd](docs/amd/README.md#windows)) |
+| No compiler (trial) | without `nvcc` or a C++ compiler the setup downloads the prebuilt engine (Windows x64 / Linux x64, RTX 30 / 40 / 50); NVIDIA driver 580 or newer required, 610 or newer recommended ([MANUAL](docs/MANUAL.md#no-compiler-the-prebuilt-engine-trial)) |
 | ARM / DGX Spark | aarch64 + sm_121 (GB10), CUDA 12.9 or newer (DGX OS ships CUDA 13); no x86 kernels: the Q2_0-expert packs (the canonical DeepSeek V4 pack) need AVX and do not run there, the native packs (`--native`, `iq_pack.py --fast`) do ([DGX Spark](docs/DGX-SPARK.md)) |
 
 ### Disk space

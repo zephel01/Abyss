@@ -162,6 +162,27 @@ so it can be run again at any time:
 | `--rewrite-config` | write `abyss-<name>.json` again (otherwise an existing one is kept; a DSpark drafter it named stays on) |
 | `--dspark`, `--no-dspark` | download DeepSeek's DSpark drafter (6.9 GB, to `../Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF`) and turn it on in the config; turn it off (the file stays). One GPU only |
 | `--tools-only` | only create / update Abyss-tools |
+| `--prebuilt` | download the prebuilt engine instead of compiling it (taken by itself when `nvcc` or the C++ compiler is missing; see below) |
+
+
+### No compiler: the prebuilt engine (trial)
+
+Without the CUDA toolkit (`nvcc`) or the C++ compiler (Visual Studio Build Tools on Windows, g++ on Linux) the setups
+(`./setup-deepseek.sh`, `setup-deepseek.bat`, `./abyss.sh`, `START-ABYSS.bat`) download the engine built by GitHub
+Actions instead of compiling it; `--prebuilt` asks for it with a toolkit there too.  A toolkit that is there keeps
+compiling, as before.
+
+| | |
+| --- | --- |
+| Archives | `abyss-engine-cuda-linux-x64.tar.gz`, `abyss-engine-cuda-windows-x64.zip` on the GitHub release of this version (else the latest), checked against the release's `SHA256SUMS`, unpacked into `build/` |
+| GPUs | RTX 30 (sm_86), RTX 40 (sm_89), RTX 50 (sm_120a) in one binary. Other GPUs (V100, RTX 20, A100, H100, DGX Spark) still compile |
+| NVIDIA driver | **580 or newer required** (CUDA 13.x runs there under CUDA's minor version compatibility; the setup warns, untested); **610 or newer recommended** (CUDA 13.3's branch R610, Linux 610.43.02). Below 580 the setup stops and names the driver page, https://www.nvidia.com/drivers |
+| Inside | the engine and `abyss_gpu_tune`, and the NVIDIA CUDA libraries they load, unmodified (cuBLAS, cuBLASLt; the CUDA runtime on Linux), distributed under the [CUDA EULA](https://docs.nvidia.com/cuda/eula/index.html#attachment-a) |
+| Linux | Ubuntu 22.04 or newer (glibc 2.35); the engine finds the libraries beside it |
+| Not yet | the image encoder (`strata-vision`) is still compiled: with the prebuilt engine the models read text only |
+
+`ABYSS_PREBUILT_URL` points the setup at another folder (a URL, `file://` or a path) holding `SHA256SUMS` and the
+archives, e.g. a CI artifact unpacked by hand.
 
 The sections below are the same steps by hand.
 
