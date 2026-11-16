@@ -378,6 +378,35 @@ in the browser, `--gpu 0` picks the GPU.
   distributions let only root read: `sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj` (until the next
   boot) shows it; an AMD APU falls back to its own power table.
 
+### Keeping the answer in one language (`lang`)
+
+A model asked in Japanese sometimes drops a Chinese word into the answer ("误って", "这样的"): the Chinese token was the
+most likely one. `"lang": "<profile>"` in a request (`/v1/chat/completions` or `/v1/messages`) bans, at the sampler,
+every token written in a script the profile does not allow - such a token can never be picked, in a plain token, a
+sampled one or a draft (MTP, DSpark, n-gram windows). The weights are not touched; without `lang` the output is
+bit-identical to before.
+
+| Profile | The answer may use |
+|---|---|
+| `ja-en` | Latin, Kana, the Han characters of JIS X 0213 (Japanese kanji), Greek letters |
+| `zh-en` | Latin, every Han character, Greek letters (no Kana, no Hangul) |
+| `ko-en` | Latin, Hangul, Greek letters (no Han, no Kana) |
+| `en` | Latin and Greek letters only |
+| `zh-Hans-en`, `zh-Hant-en` | experimental: `zh-en` without the Big5-only / GB2312-only Han characters |
+
+Digits, punctuation, symbols, spaces, emoji and code are allowed in every profile; special tokens (`<think>`,
+`<tool_call>`, the turn's end) are never banned. `"lang": "off"` turns a server default off for one request.
+
+- **Answer only, by default.** The reasoning is left alone (a model may think in another language and still answer in
+  yours); `"lang_think": true` applies the profile to the reasoning too.
+- **Server default:** `STRATA_LANG=ja-en` (and `STRATA_LANG_THINK=1`) in the config's `env` or the shell applies it to
+  every request that does not say otherwise.
+- **`logit_bias`** (OpenAI's: `{"<token id>": -100..100}`, -100 bans) is supported too, for the whole output.
+- **How it is measured:** on 1.3 MB of correct Japanese text on disk, `ja-en` needed a banned token 2 times in 200K
+  tokens (two kaomoji with a Cyrillic / Arabic letter); Japanese words such as 両性具有 are not affected, because no
+  Han character in JIS X 0213 is banned. The per-tokenizer class tables are in `data/token_classes/`, made by
+  `tools/token_classes.py` (which also measures a profile on your own text: `side-effects`).
+
 ### Abyss Terminal (`./abyss.sh --terminal`)
 
 A terminal UI for the server - this PC's or another's - that you open and close without stopping the model.
@@ -1063,6 +1092,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_THINK_BRIDGE` | (a sentence) | (server) what a reasoning block closed by the thinking budget or the loop guard says just before its `</think>`: that the thinking stops here and the answer follows in the question's language (a bare `</think>` mid-thought let Qwen3.8 go on thinking in English in the answer, issue #36); another text replaces it, `0` = a bare `</think>` as before |
 | `STRATA_ANSWER_ROOM` | 1 | (server) the answer room: with thinking on, a reasoning block still open when a quarter of the max tokens is left (at least `STRATA_GLM_THINK_RESERVE`, 1024, at most half) is closed the way the thinking budget closes it (the bridge, then `</think>`), so a capped request ends with an answer instead of an empty `length` - with the run config's `thinking_budget` or without it (before, only with it); `usage` says `reasoning_closed_by: "answer_room"`. `0` = off |
 | `STRATA_SOFT_END` | 16 | (server) an end-of-turn token (`<|im_end|>`, GLM's `<|observation|>`, DeepSeek's end of sentence, ...) inside the reasoning or an open tool call is kept as text and the answer goes on, at most this many times a request (a file written by a tool call that quotes a chat template); `0` = such a token always ends the turn |
+| `STRATA_LANG` | (none) | (server) the default language profile of every request (`ja-en`, `zh-en`, `ko-en`, `en`; see "Keeping the answer in one language"): tokens of the other scripts are banned in the answer; a request's own `"lang"` wins, `off` = none |
+| `STRATA_LANG_THINK` | 0 | (server) `1` = the language profile applies to the reasoning as well (the default: the answer only) |
 | `STRATA_TOOL_NONE_NOTE` | 1 | (server) `tool_choice: "none"` in a conversation that holds tool calls: a last user turn asks for a prose answer (a call the model writes anyway is never sent, as a call or as markup); `0` = no note |
 | `STRATA_ENGINE_STALL_S` | 90 | (server) an engine silent that long with no CPU, disk or GPU work is ended and started again by the next request; `0` off |
 | `STRATA_ENGINE_START_S` | 1800 | (server) the most a start may take before READY (a model loading from the SSD takes minutes); past it the engine is ended and the start fails with a line; `0` no limit (v1.3.78) |

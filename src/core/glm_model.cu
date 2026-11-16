@@ -23,6 +23,7 @@
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/glm_ffn.hpp"
 #include "strata/kernels/glm_hc.hpp"
@@ -1532,7 +1533,8 @@ int32_t Glm5Model::end_guard_pick(int32_t sampled) {
 
 int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
     // the fast path already ran the greedy argmax on the device at the end of the forward
-    if (fast_ != nullptr && sp.greedy && last_tok_ >= 0) return last_tok_;
+    if (fast_ != nullptr && sp.greedy && last_tok_ >= 0)   // (re-picked when made before the bias set switched on)
+        return strata::kernels::bias_banned(last_tok_) ? bias_repick(last_tok_, nullptr, sp, err) : last_tok_;
     if (next_port_ != nullptr) {   // (qwen4exp's split: sampled on the last part)
         const int tok = next_port_->sample(sp, err);
         cudaSetDevice(dev_);
