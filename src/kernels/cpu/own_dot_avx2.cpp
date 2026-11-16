@@ -16,7 +16,8 @@ inline float hsum(__m256 x) {
     r = _mm_add_ss(r, _mm_movehdup_ps(r));
     return _mm_cvtss_f32(r);
 }
-inline float f16(ggml_half h) { return _cvtsh_ss((unsigned short) h); }
+inline float f16(ggml_half h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) (unsigned short) h))); }   // (_cvtsh_ss: not in MSVC)
+inline uint16_t f2h(float f) { return (uint16_t) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(f), 0), 0); }   // (_cvtss_sh: not in MSVC)
 // signed bytes x . signed bytes y -> 8 int32 lanes (4 bytes each); |x| <= 127
 inline __m256i sdot(__m256i x, __m256i y) {
     return _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(x, x), _mm256_sign_epi8(y, x)), _mm256_set1_epi16(1));
@@ -578,12 +579,12 @@ void q8_0(const float* x, void* dst, int64_t n) {
         const __m256i i0 = rnd(_mm256_mul_ps(v0, m)), i1 = rnd(_mm256_mul_ps(v1, m)), i2 = rnd(_mm256_mul_ps(v2, m)),
                       i3 = rnd(_mm256_mul_ps(v3, m));
         _mm256_storeu_si256((__m256i*) (o + (Q81 ? 4 : 2)), pack32(i0, i1, i2, i3));
-        const uint16_t dh = _cvtss_sh(d, 0);
+        const uint16_t dh = f2h(d);
         std::memcpy(o, &dh, 2);
         if (Q81) {
             const __m256i s4 = _mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3));
             const int sum = hsum_i(s4);
-            const uint16_t sh = _cvtss_sh(d * (float) sum, 0);
+            const uint16_t sh = f2h(d * (float) sum);
             std::memcpy(o + 2, &sh, 2);
         }
     }

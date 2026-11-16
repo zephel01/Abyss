@@ -55,6 +55,7 @@ from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTempl
                             anthropic_to_messages, effort_kwargs, effort_level, images_of, openai_to_messages,
                             v41_images_as_text)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve import lang_ban  # noqa: E402
 from serve.update import Updater  # noqa: E402
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
@@ -618,6 +619,12 @@ class StrataEngine:
         aid = sampling.get("_arg_ids")
         if aid is not None:
             think += " arg_ids=" + ",".join(str(int(i)) for i in aid)
+        # the language profile / logit_bias sets (serve/lang_ban.py, registered with BIAS first): bias= applies to the
+        # whole output, bias_answer= from the end of the reasoning on
+        for k in ("bias", "bias_answer"):
+            v = sampling.get("_" + k)
+            if isinstance(v, str) and re.fullmatch(r"[0-9a-z]{1,40}", v):
+                think += f" {k}={v}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
         if isinstance(tune, dict):
@@ -1432,6 +1439,11 @@ class Service:
         self.ws_ids = sorted({i for w in ("\n", "\n\n", "\n\n\n", " ", "  ", " \n", "\n ", " \n\n")
                               for i in tokenizer.encode(w, parse_special=False)[:1]
                               if len(tokenizer.encode(w, parse_special=False)) == 1})
+        # the answer's language profile / logit_bias (serve/lang_ban.py): never the ids the server stops, thinks or
+        # closes a tool argument on; None: this tokenizer has no vocabulary to classify (the tests' byte tokenizer)
+        self.lang_ban = lang_ban.LangBan(tokenizer, keep_ids=set(self.stop_ids) | set(self.arg_ids) |
+                                         ({self.think_end_id} if self.think_end_id is not None else set())) \
+            if getattr(tokenizer, "tokens", None) and hasattr(tokenizer, "token_bytes") else None
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -1445,6 +1457,28 @@ class Service:
             except OSError as e:
                 print(f"[abyss] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def check_lang(self, req: dict) -> None:
+        """A request's lang / lang_think / logit_bias, checked before anything runs (ValueError -> 400)."""
+        if any(req.get(k) is not None for k in ("lang", "lang_think", "logit_bias")) or lang_ban.default_profile():
+            if self.lang_ban is None:
+                if any(req.get(k) is not None for k in ("lang", "logit_bias")):
+                    raise ValueError("lang / logit_bias need the model's tokenizer (vocab.json)")
+                return
+            lang_ban.check_request(req, self.lang_ban.n_vocab)
+
+    def bias_keys(self, sampling: dict) -> dict:
+        """The engine's bias sets for this request (registered with the engine first): {"_bias": .., "_bias_answer": ..}
+        - the caller holds the FIFO."""
+        if self.lang_ban is None:
+            return {}
+        whole, answer = self.lang_ban.sets(sampling or {})
+        out = {}
+        if whole:
+            out["_bias"] = lang_ban.register(self.engine, whole)
+        if answer:
+            out["_bias_answer"] = lang_ban.register(self.engine, answer)
+        return out
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -2060,6 +2094,7 @@ class Service:
                 # the turn's end tokens, for the engine to stop on (an engine that knows the key; else its own list)
                 base = {**(sampling or {}), "_stop_ids": self.stop_order, "_arg_ids": self.arg_ids} \
                     if self.stop_ids else dict(sampling or {})
+                base.update(self.bias_keys(sampling))   # the language profile / logit_bias (lang_ban.py)
 
                 def engine_sampling(done: int, reasoning: bool) -> dict:
                     """The sampling keys for an engine run that starts `done` tokens into the answer, inside the
@@ -3347,6 +3382,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            svc.check_lang(req)
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             req["_slot_ns"], req["_slot_sess"] = slot_hint(self.headers, req, svc.api_key)
             messages, tools, kw = openai_to_messages(req)
@@ -3450,6 +3486,7 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
+            svc.check_lang(req)
             req["_api"] = "anthropic"
             req["_slot_ns"], req["_slot_sess"] = slot_hint(self.headers, req, svc.api_key)
             messages, tools, kw = anthropic_to_messages(req)

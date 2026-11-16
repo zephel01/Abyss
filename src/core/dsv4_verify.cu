@@ -36,6 +36,7 @@
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -97,6 +98,7 @@ struct VerifyBuf {
     // a sampled window's draws (verify_sample): all T columns in one sampler launch at column 0 into tok_h[32..],
     // row t with counter c0 + t - the same Philox draws the column-at-a-time path made (sp.counter + 1 a column)
     uint64_t samp_c0 = 0;
+    uint64_t samp_gen = 0;   // the bias set's generation the draws were made under (token_ban.hpp)
     bool samp_ok = false;
     int* tok_in_h = nullptr;                  // the window's tokens, host-mapped for the embedding kernel
     int* tok_in_d = nullptr;
@@ -3158,6 +3160,8 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
     if (sp.greedy) {
         // the end-of-turn guard reads the sampler's row (end_guard_pick): the column's row there, as a sampled pick
         // leaves it - else the guard saw another position's logits and let the pick stand
+        if (strata::kernels::bias_banned(V->tok_h[i]))   // (a window from before the bias set switched on)
+            return bias_repick(V->tok_h[i], V->logits + (size_t) i * g_.n_vocab, sp, err);
         if (guard_ids_ != nullptr) {
             cudaSetDevice(tail->dev_);
             cudaMemcpyAsync(tail->sc_ + tail->sc_logits, V->logits + (size_t) i * g_.n_vocab,
@@ -3186,9 +3190,11 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
             cudaSetDevice(dev_);
             if (!ok) return -1;
             V->samp_c0 = sp.counter;
+            V->samp_gen = strata::kernels::bias_generation();
             V->samp_ok = true;
         }
-        if (V->samp_ok && sp.counter == V->samp_c0 + (uint64_t) i) {
+        if (V->samp_ok && sp.counter == V->samp_c0 + (uint64_t) i &&
+            V->samp_gen == strata::kernels::bias_generation()) {   // (else: drawn before the bias set changed)
             // STRATA_GLM_SAMPLE_COLS_CHECK=1: each column drawn the old way as well (the same logits, the same counter)
             // and compared - a test, not for use (it is the old cost plus the new)
             static const bool chk = [] { const char* v = getenv("STRATA_GLM_SAMPLE_COLS_CHECK"); return v && v[0] == '1'; }();
@@ -3221,6 +3227,20 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
     return tok;
 }
 
+
+int Glm5Model::bias_repick(int tok, const float* row, strata::kernels::SamplerParams& sp, std::string& err) {
+    if (!strata::kernels::bias_banned(tok)) return tok;
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    if (tail->fast_ == nullptr) return tok;   // (the reference path picks after the switch: never stale)
+    cudaSetDevice(tail->dev_);
+    if (row != nullptr && row != tail->sc_ + tail->sc_logits)
+        cudaMemcpyAsync(tail->sc_ + tail->sc_logits, row, (size_t) g_.n_vocab * sizeof(float),
+                        cudaMemcpyDeviceToDevice, tail->fast_->cs);
+    const int t = tail->fast_sample(sp, err);   // sample_tokens applies the set (greedy: the masked argmax)
+    cudaSetDevice(dev_);
+    return t;
+}
 
 // ---------------------------------------------------------------- a later part's side of the window requests
 // (qwen4exp's splits: part_port.hpp.)  The columns' rows from `in`, this part's layers (verify_part_q4x hands them on

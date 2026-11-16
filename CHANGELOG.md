@@ -7,6 +7,67 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.160 - 2026-11-16
+
+Language profiles against stray scripts in answers, and the #48 follow-up. Without a profile the outputs are
+unchanged (6-config md5 the same).
+
+- Language profiles (`"lang": "ja-en"` in a request, or `STRATA_LANG` for the server default): tokens of scripts the
+  profile does not allow get -inf at the sampler, before greedy, sampling, every draft/verify window (n-gram, MTP /
+  NextN, DSpark) and the draft heads. Profiles: `ja-en`, `zh-en`, `ko-en`, `en`, experimental `zh-Hans-en` /
+  `zh-Hant-en`. By default only the answer is limited (`"lang_think": true` / `STRATA_LANG_THINK` also limits the
+  thinking). `ja-en` keeps every JIS X 0213 kanji, so Japanese words are never cut; Greek stays allowed for formulas.
+  Special, stop, think and tool tokens are never banned. Qwen3.8 UD-IQ3_XXS, 40 Japanese medical/explainer questions
+  x 3 seeds with thinking: answers with Chinese mixed in 10/120 (8.3%) -> 0/120, same time. Per-tokenizer class
+  tables ship in `data/token_classes/` (built on the fly if the vocabulary differs).
+- OpenAI `logit_bias` on `/v1/chat/completions` (whole output).
+- Mirror (`STRATA_GLM_MIRROR`): an overlay pack opens its shards through links named `overlay-NNNNN-of-NNNNN.gguf`;
+  the mirror is now also looked up by the link target's file name, so a copy of the original shards on a second
+  drive is found (#48).
+- Docs: two M.2 drives on a 16 GB GPU + 64 GB RAM (#48, docs/SSD2): -43% SSD wait, +25% decode; deepseek41: the Q5_K
+  dense overlay on a 16 GB card at 507,904 context (decode 15.4 -> 17.4 tok/s, 469K prompt 1,720 -> 629 s).
+- CI: windows-build and arm-build also run on `ci-*` branches, so a release is built everywhere before its tag.
+
+Known limits of the language profiles: byte-fallback tokens that continue an earlier token are not judged; Chinese-only
+words written with kanji shared with Japanese (e.g. 啤酒) are not stopped; `lang` cannot yet be set in the config
+file's `sampling` block or the Chat settings.
+
+## v1.3.159 - 2026-11-16
+
+Fixes the two builds v1.3.158 broke (the engine's outputs are unchanged):
+
+- Windows (MSVC): the own AVX2 dot products used `_cvtsh_ss` / `_cvtss_sh`, which MSVC does not have; they now use the
+  vector F16C intrinsics (same instructions, same bits).
+- aarch64 CI: own_dot_test compared the own dot products with ggml-cpu bit for bit, but ggml-cpu's NEON code sums in
+  another order. Off x86 the test now checks values (same activations into both, within 2e-4 of sum |w x|); on x86
+  it stays bit for bit. aarch64 keeps ggml-cpu's NEON dots as the default (`STRATA_CPU_GGML`).
+
+## v1.3.158 - 2026-11-16 (beta)
+
+Beta: the first step of building and running Abyss without llama.cpp. Abyss is a fork of Project Maya (from Strata)
+and has so far taken parts of llama.cpp/ggml at build time: ggml's CPU dot products for the CPU experts, ggml.h's
+type table, gguf-py in the pack tools, ggml-cuda's MMQ kernels for the GPU prompt path and mtmd for pictures. This
+release replaces the first three with Abyss's own code, keeping compatibility: the same GGUF files load and the
+outputs are bit-identical. It is a beta because the new build is checked on Linux x86-64 + CUDA only; Windows,
+aarch64 (DGX Spark) and HIP keep the old build by default until someone has tried it (reports welcome).
+
+- Own GGUF type table (`include/strata/qtypes.hpp`, ids equal to the GGUF ids) in place of ggml.h in the engine.
+- Own CPU expert dot products for all 22 GGUF types the engine reads (AVX-512, AVX2 and a portable build): bit for bit
+  the same as ggml-cpu's (own_dot_test, 33,000 cases), CPU expert speed -8% .. +4% (one thread, per expert).
+  `STRATA_CPU_GGML=1`: ggml-cpu's again (builds with ggml). On aarch64 ggml-cpu's NEON dots stay the default where
+  linked (`STRATA_CPU_GGML=0`: the own ones).
+- Own GGUF reader/writer for the tools (`tools/gguf_io.py`): iq_pack, nextn_pack, mtp_pack, mtp_rt, requant_dense,
+  dense_overlay and exl3_pack --check no longer need gguf-py; pack outputs are byte-identical (SHA-256 on GLM Maya-S-v2,
+  V4.1 JA256, Ornith-35B/122B, Qwen3.5-9B). Requantizing (requant_dense, dense_overlay, nextn_pack with a type change)
+  still uses libggml's quantizer.
+- Setup fetches llama.cpp's source only for what still needs it - the GPU prompt path's MMQ kernels and pictures - and
+  says why. Linux x86-64 CUDA builds use `-DSTRATA_GGML=OFF` (no ggml libraries linked). `STRATA_GGML_BUILD=off` /
+  `on` chooses at build time elsewhere (beta on Windows, aarch64, HIP).
+- CI: Python jobs run without gguf-py; a gguf-oracle job keeps the byte check; a cpu-no-llamacpp job builds and tests
+  with nothing fetched.
+- Outputs: deterministic md5 the same on all six regression configs (Ornith-35B, Ornith-122B, Qwen3.8 UD, GLM-5.3, V4,
+  V4.1 JA). Next: Abyss's own MMQ replacement (GPU prompt path, CUDA then HIP), then pictures.
+
 ## v1.3.157 - 2026-11-16
 
 - Qwen3.8-27B with QSA (Qwen Sparse Attention; e.g. higa2515/Qwen3.8-27B-QSA-GGUF, indexers on the 16 full-attention

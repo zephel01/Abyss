@@ -378,6 +378,35 @@ in the browser, `--gpu 0` picks the GPU.
   distributions let only root read: `sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj` (until the next
   boot) shows it; an AMD APU falls back to its own power table.
 
+### Keeping the answer in one language (`lang`)
+
+A model asked in Japanese sometimes drops a Chinese word into the answer ("误って", "这样的"): the Chinese token was the
+most likely one. `"lang": "<profile>"` in a request (`/v1/chat/completions` or `/v1/messages`) bans, at the sampler,
+every token written in a script the profile does not allow - such a token can never be picked, in a plain token, a
+sampled one or a draft (MTP, DSpark, n-gram windows). The weights are not touched; without `lang` the output is
+bit-identical to before.
+
+| Profile | The answer may use |
+|---|---|
+| `ja-en` | Latin, Kana, the Han characters of JIS X 0213 (Japanese kanji), Greek letters |
+| `zh-en` | Latin, every Han character, Greek letters (no Kana, no Hangul) |
+| `ko-en` | Latin, Hangul, Greek letters (no Han, no Kana) |
+| `en` | Latin and Greek letters only |
+| `zh-Hans-en`, `zh-Hant-en` | experimental: `zh-en` without the Big5-only / GB2312-only Han characters |
+
+Digits, punctuation, symbols, spaces, emoji and code are allowed in every profile; special tokens (`<think>`,
+`<tool_call>`, the turn's end) are never banned. `"lang": "off"` turns a server default off for one request.
+
+- **Answer only, by default.** The reasoning is left alone (a model may think in another language and still answer in
+  yours); `"lang_think": true` applies the profile to the reasoning too.
+- **Server default:** `STRATA_LANG=ja-en` (and `STRATA_LANG_THINK=1`) in the config's `env` or the shell applies it to
+  every request that does not say otherwise.
+- **`logit_bias`** (OpenAI's: `{"<token id>": -100..100}`, -100 bans) is supported too, for the whole output.
+- **How it is measured:** on 1.3 MB of correct Japanese text on disk, `ja-en` needed a banned token 2 times in 200K
+  tokens (two kaomoji with a Cyrillic / Arabic letter); Japanese words such as 両性具有 are not affected, because no
+  Han character in JIS X 0213 is banned. The per-tokenizer class tables are in `data/token_classes/`, made by
+  `tools/token_classes.py` (which also measures a profile on your own text: `side-effects`).
+
 ### Abyss Terminal (`./abyss.sh --terminal`)
 
 A terminal UI for the server - this PC's or another's - that you open and close without stopping the model.
@@ -1063,6 +1092,8 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_THINK_BRIDGE` | (a sentence) | (server) what a reasoning block closed by the thinking budget or the loop guard says just before its `</think>`: that the thinking stops here and the answer follows in the question's language (a bare `</think>` mid-thought let Qwen3.8 go on thinking in English in the answer, issue #36); another text replaces it, `0` = a bare `</think>` as before |
 | `STRATA_ANSWER_ROOM` | 1 | (server) the answer room: with thinking on, a reasoning block still open when a quarter of the max tokens is left (at least `STRATA_GLM_THINK_RESERVE`, 1024, at most half) is closed the way the thinking budget closes it (the bridge, then `</think>`), so a capped request ends with an answer instead of an empty `length` - with the run config's `thinking_budget` or without it (before, only with it); `usage` says `reasoning_closed_by: "answer_room"`. `0` = off |
 | `STRATA_SOFT_END` | 16 | (server) an end-of-turn token (`<|im_end|>`, GLM's `<|observation|>`, DeepSeek's end of sentence, ...) inside the reasoning or an open tool call is kept as text and the answer goes on, at most this many times a request (a file written by a tool call that quotes a chat template); `0` = such a token always ends the turn |
+| `STRATA_LANG` | (none) | (server) the default language profile of every request (`ja-en`, `zh-en`, `ko-en`, `en`; see "Keeping the answer in one language"): tokens of the other scripts are banned in the answer; a request's own `"lang"` wins, `off` = none |
+| `STRATA_LANG_THINK` | 0 | (server) `1` = the language profile applies to the reasoning as well (the default: the answer only) |
 | `STRATA_TOOL_NONE_NOTE` | 1 | (server) `tool_choice: "none"` in a conversation that holds tool calls: a last user turn asks for a prose answer (a call the model writes anyway is never sent, as a call or as markup); `0` = no note |
 | `STRATA_ENGINE_STALL_S` | 90 | (server) an engine silent that long with no CPU, disk or GPU work is ended and started again by the next request; `0` off |
 | `STRATA_ENGINE_START_S` | 1800 | (server) the most a start may take before READY (a model loading from the SSD takes minutes); past it the engine is ended and the start fails with a line; `0` no limit (v1.3.78) |
@@ -1138,6 +1169,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_CPU_MT` | on | CPU experts shared by several tokens (prompts, verify windows) decode each weight row once for all of them, bit-identical to ggml's dot (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers where `STRATA_GLM_CPU_1T` says, v1.3.41); `0` off |
 | `STRATA_GLM_CPU_1T` | on | cheaper one-token rows on the CPU lane, bit-identical to ggml's dot: on an AVX-512 CPU with VNNI and VBMI (Zen 4 / Ice Lake and later) IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS with the grid looked up in registers (v1.3.41; a Ryzen AI Max+ 395's 16 threads, a DeepSeek V4 expert 109 -> 90 us, decode without the iGPU lane +3-9%; `STRATA_NO_IQ512_VBMI=1` only these off), else IQ3_S / IQ3_XXS in AVX2; `0` off |
 | `STRATA_CPU_GGML` | off (on where the own dots have no SIMD build - aarch64 - and the build has ggml) | `1`: the CPU experts use ggml-cpu's dot products and activation quantizers again, as before the own ones (no-ggml work, branch no-ggml); only in a build with `STRATA_GGML=ON`.  `0`: the own ones on aarch64 too.  The own ones give the same bits (own_dot_test checks every type against ggml-cpu) |
+| `STRATA_GGML_BUILD` | unset (Linux x86-64: no ggml libraries; Windows, aarch64, HIP: with them) | build time, read by `./abyss.sh build` / setup: `off` builds the engine with `-DSTRATA_GGML=OFF` (own CPU dot products and GGUF type table, no ggml libraries; beta on Windows, aarch64 and HIP - reports welcome), `on` keeps the ggml libraries. The GPU prompt path's MMQ kernels still come from llama.cpp's source |
 | `STRATA_GLM_VRAM_EVICT` | counts | `lru`: the VRAM tier's refill evicts the least recently used expert (for cache studies) |
 | `STRATA_GLM_DISK_READERS` | off | prompts read SSD-held experts with this many threads (try it on a DRAM-less NVMe; DeepSeek V4.1: `8`, a 1K-token prompt 33 -> 27 s) |
 | `STRATA_GLM_DISK_PAR` | off | `1`: while answering, the experts a token misses are read from the SSD by a pool of their own with one thread for every chunk of an expert (3 parts x `STRATA_GLM_READ_CHUNKS` (8) = 24, the calling thread included), so an expert's chunks are all in flight at once instead of 9 threads taking them in about three rounds; `<n>` (2-64): that many threads. Only the order of the reads changes - the answers are the same. The threads wait inside the reads; between misses they spin `STRATA_GLM_DISK_PAR_SPIN_US` (50) µs and then sleep. With `STRATA_GLM_TIMING=1` the engine prints its disk reads (the rate while waiting, and the mean / p50 / p90 / p99 of the waits for one expert) either way, for an A/B. Not measured yet (fio on a 6.7 GB/s NVMe: 9 x 424 KB reads at once 4.64 GB/s, 24 at once 5.10 GB/s) |

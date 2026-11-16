@@ -1402,6 +1402,8 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
              f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
              f"-DCMAKE_HIP_COMPILER={clang.as_posix()}", f"-DCMAKE_PREFIX_PATH={root.as_posix()}",
              f"-DSTRATA_GGML_DIR={llama.as_posix()}"]
+    if os.environ.get("STRATA_GGML_BUILD", "").strip().lower() in ("off", "0", "no"):
+        conf.append("-DSTRATA_GGML=OFF")   # beta: HIP without the ggml libraries (MMQ still from llama.cpp)
     conf += S.cmake_fresh(BUILD, conf)   # (another ROCm than build-hip/ was configured with: S.cmake_fresh)
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")

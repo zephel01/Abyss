@@ -266,6 +266,10 @@ public:
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
     int sample_token(strata::kernels::SamplerParams& sp, std::string& err);
+    /// A pick `tok` made from logits the request's bias set (token_ban.hpp) did not yet apply to - a verify window or
+    /// a pipelined token computed before the set switched on: when the set bans it, the same row (`row`: device
+    /// logits on the tail's GPU; nullptr: the tail's sampler row) is picked again with the set.  Otherwise `tok`.
+    int bias_repick(int tok, const float* row, strata::kernels::SamplerParams& sp, std::string& err);
     /// Zeroes R, every KDA state and every DSA cache: the next `forward` starts a fresh sequence.
     void reset();
 

@@ -39,7 +39,24 @@ no tail skip. Medians of 2 sequences x 3 rounds, one and two drives alternating 
 - The output does not change (the same file is read).
 - The larger the SSD wait, the more it helps: the less RAM, the bigger the gain.
 - Drive 2 is a USB4 enclosure at about half drive 1's speed, so it takes about 40% of the reads. Two M.2 drives of
-  similar speed would split them in half and cut the wait further (not measured yet - reports welcome).
+  similar speed split them about in half and cut the wait further - see the next table.
+
+**Two M.2 drives of similar speed** (reported in [#48](https://github.com/zephel01/Abyss/issues/48), 2026-11-16): the same
+UD-IQ2_XXS, `--max-context 507904`, tail skip 4 / disk 1, `RAM_GB=44`, v1.3.154, HIP. RX 9070 16 GB (Gen5 x16), Ryzen 7
+7800X3D, 64 GB. Drive 1: Crucial T500 2 TB (PCIe 4.0, CPU-attached M.2, also the OS disk). Drive 2: Samsung 990 PRO 1 TB
+(PCIe 4.0, **chipset** M.2, a 400 GB partition), shards 1-5.
+
+| GPU + RAM | A token (1 → 2 drives) | Speed | SSD wait a token | Read from drive 2 | Start-up fill |
+| --- | --- | --- | --- | --- | --- |
+| 16 GB + 64 GB | 81.3 → 65.1 ms | **+25%** | 38.9 → 22.3 ms (**−43%**) | ~45% (53.5% with the Q5_K dense overlay) | 4.5 → 9.7 GB/s |
+
+- Prompts 2K / 8K: 59 / 79 → 108 / 142 tok/s.
+- Earlier on the same PC (v1.3.129, 32K): V4.1 UD-IQ1_M SSD wait 36.8 → 20.1 ms (−45%), decode 13.5 → 17.0 tok/s;
+  GLM-5.3-Flash 32G96G 73.0 → 39.9 ms (−45%), 7.7 → 11.2 tok/s.
+- A chipset M.2 slot was enough for drive 2 here (nothing else busy on the chipset), even as a partition of a disk
+  shared with another OS.
+- An overlay pack (`tools/dense_overlay.py`) opens the shards through links named `overlay-NNNNN-of-NNNNN.gguf`; from
+  v1.3.160 the mirror is also found by the original shards' names, so one copy on drive 2 serves both packs.
 - The drops when the SSD has a slow spell (they happen now and then) got smaller too.
 
 ## How to use it
