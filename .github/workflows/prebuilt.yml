@@ -67,11 +67,13 @@ jobs:
         run: |
           set -euo pipefail
           d="pkg/$PKG"; mkdir -p "$d"
-          cp build/strata build/abyss_gpu_tune "$d/"
+          cp build/abyss build/abyss_gpu_tune "$d/"
+          # the engine's old name (v1.3.164: strata became abyss), a link
+          ln -s abyss "$d/strata"
           # the engine finds its libraries beside it (its own binaries only: NVIDIA's files stay unmodified)
-          patchelf --set-rpath '$ORIGIN' "$d/strata" "$d/abyss_gpu_tune"
+          patchelf --set-rpath '$ORIGIN' "$d/abyss" "$d/abyss_gpu_tune"
           # every library they load from the toolkit, by its soname, as a plain file
-          for lib in $(LD_LIBRARY_PATH="$CUDA_HOME/lib64" ldd build/strata build/abyss_gpu_tune | awk '/=>/ {print $3}' | grep "^$CUDA_HOME\|^/usr/local/cuda" | sort -u); do
+          for lib in $(LD_LIBRARY_PATH="$CUDA_HOME/lib64" ldd build/abyss build/abyss_gpu_tune | awk '/=>/ {print $3}' | grep "^$CUDA_HOME\|^/usr/local/cuda" | sort -u); do
             cp -L "$lib" "$d/$(basename "$lib")"
           done
           ls -la "$d"
@@ -93,10 +95,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir t && tar -C t -xzf "$PKG.tar.gz"
-          env -i PATH=/usr/bin:/bin ldd "t/$PKG/strata" | tee ldd.txt
+          env -i PATH=/usr/bin:/bin ldd "t/$PKG/abyss" | tee ldd.txt
           ! grep -q "not found" ldd.txt
           ! grep -q "/usr/local/cuda" ldd.txt
-          env -i PATH=/usr/bin:/bin "t/$PKG/strata" --help > /dev/null
+          env -i PATH=/usr/bin:/bin "t/$PKG/abyss" --help > /dev/null
+          env -i PATH=/usr/bin:/bin "t/$PKG/strata" --help > /dev/null   # (the old name, a link)
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PKG }}
@@ -157,7 +160,7 @@ jobs:
         shell: pwsh
         run: |
           $d = "pkg\$env:PKG"; New-Item -ItemType Directory -Force $d | Out-Null
-          $exe = Get-ChildItem -Path build -Recurse -Filter strata.exe | Select-Object -First 1
+          $exe = Get-ChildItem -Path build -Recurse -Filter abyss.exe | Select-Object -First 1
           $tune = Get-ChildItem -Path build -Recurse -Filter abyss_gpu_tune.exe | Select-Object -First 1
           Copy-Item $exe.FullName, $tune.FullName $d
           # the DLLs they load from the toolkit (dumpbin), and what those load from it in turn (cuBLAS -> cuBLASLt)
@@ -195,8 +198,8 @@ jobs:
           7z x "$env:PKG.zip" -ot | Out-Null
           $env:PATH = "C:\Windows\System32;C:\Windows"
           Remove-Item Env:CUDA_PATH -ErrorAction SilentlyContinue
-          & "t\$env:PKG\strata.exe" --help > $null
-          if ($LASTEXITCODE -ne 0) { Write-Error "strata --help exited $LASTEXITCODE"; exit 1 }
+          & "t\$env:PKG\abyss.exe" --help > $null
+          if ($LASTEXITCODE -ne 0) { Write-Error "abyss --help exited $LASTEXITCODE"; exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PKG }}
@@ -242,6 +245,7 @@ jobs:
           `abyss-engine-cuda-linux-x64.tar.gz` / `abyss-engine-cuda-windows-x64.zip`, CUDA 13.3, RTX 30 / 40 / 50 (sm_86, sm_89, sm_120a).
           NVIDIA driver: **580 or newer required** (CUDA minor version compatibility), **610 or newer recommended** (CUDA 13.3's branch). SHA-256: `SHA256SUMS`.
           Trial: checked on an RTX 5090 under Linux (same output as a local build); Windows and RTX 30 / 40 not yet run on a GPU here - reports welcome. Images (strata-vision) need a local build.
+          The engine program is now `abyss` (`abyss.exe`); `strata` stays as an alias for now (a link in the Linux archive).
           EOF
             gh release edit "$tag" --notes-file body.md
           fi

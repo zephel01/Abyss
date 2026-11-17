@@ -231,7 +231,7 @@ On the machine above, `rocminfo` lists the R9700 (gfx1201), the Radeon 8060S (gf
 
 - Setup finds the GPUs in the KFD topology and picks the one with the most VRAM. Use `--gpu N` to pick another; the
   numbers are those of `amd-smi list`'s `GPU:` lines.
-- The engine is built in `build-hip/strata`, which takes 10-20 minutes the first time. With ROCm's `hipcc` present,
+- The engine is built in `build-hip/abyss`, which takes 10-20 minutes the first time. With ROCm's `hipcc` present,
   the iGPU lane's `build-hip/libabyss_igpu.so` is built with it.
 - The config gets `"backend": "hip"`, `"gpu"` (the HIP numbers), `"gpu_pci"` (the PCI addresses) and `"lib_dirs"`
   (ROCm's `lib`).

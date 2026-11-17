@@ -54,7 +54,7 @@ What the first run does (each step is skipped when it is already done):
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
      Maya-S24, Maya-M or Maya-L; or turboderp's EXL3 quant, experimental)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
-  4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
+  4. compiles the engine (`build/abyss`, or `build-hip/abyss`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
@@ -104,7 +104,7 @@ ME = "START-ABYSS.bat" if WIN else "./abyss.sh"      # how this is started, for 
 UPDATE_EXIT = 75                                   # the server's exit after the dashboard updated Maya (serve/update.py)
 ROOT = S.ROOT
 BUILD = ROOT / "build"
-EXE = BUILD / ("strata.exe" if WIN else "strata")
+EXE = BUILD / (S.ENGINE + (".exe" if WIN else ""))  # build/abyss (v1.3.164; build/strata stays as an alias)
 STAMP = BUILD / "MAYA-BUILD.json"                  # what the engine in build/ was compiled from and for
 VBUILD = ROOT / "build-vision"
 VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the image encoder (llama.cpp's mtmd)
@@ -486,7 +486,7 @@ def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
     global BUILD, EXE, STAMP
     BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
-    EXE = BUILD / ("strata.exe" if WIN else "strata")
+    EXE = BUILD / (S.ENGINE + (".exe" if WIN else ""))
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -2341,7 +2341,7 @@ def gpu_tune(a) -> int:
         if subprocess.run([cmake, "--build", str(build_dir), "--target", "abyss_gpu_tune", "-j", str(os.cpu_count() or 4)]
                           ).returncode != 0 or not tool.exists():
             fail("abyss_gpu_tune did not compile", f"{ME} --setup --rebuild compiles the engine again")
-    if not WIN and subprocess.run(["pgrep", "-x", "strata"], capture_output=True).returncode == 0:
+    if not WIN and subprocess.run(["pgrep", "-x", "abyss|strata"], capture_output=True).returncode == 0:
         fail("an engine is running: it would share the GPU with the measurement", f"stop it first ({ME} stop)")
     if a.gpus or a.gpu is not None:
         gpus = [int(g) for g in str(a.gpus or a.gpu).split(",") if g.strip().isdigit()]
@@ -2419,6 +2419,8 @@ def gpu_tune(a) -> int:
 def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
+    if S.migrate_config_exe(cfg_path):                # (v1.3.164: build/strata -> build/abyss, once it is there)
+        ok(f"{cfg_path.name}: the engine is now {read_json(cfg_path)['exe']}")
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []

@@ -679,6 +679,43 @@ def driver_major(gpu):
 
 
 ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml")
+# The engine program: `abyss` (abyss.exe) from v1.3.164; the build keeps `strata` beside it as an alias
+# (cmake/engine_alias.cmake), so configs and scripts that name the old file still start it.
+ENGINE = "abyss"
+OLD_ENGINE = "strata"
+
+
+def engine_path(build: Path) -> Path:
+    """The engine in a build folder."""
+    return build / (ENGINE + (".exe" if WIN else ""))
+
+
+def engine_exe_now(exe: str) -> str:
+    """A config's engine path with the program's new name when that file is there (<build>/strata -> <build>/abyss);
+    unchanged otherwise - an engine not yet rebuilt, or any other program."""
+    p = Path(str(exe or ""))
+    if p.stem != OLD_ENGINE or p.suffix.lower() not in ("", ".exe"):
+        return exe
+    for new in (p.with_name(ENGINE + p.suffix), p.with_name(ENGINE + ".exe") if WIN else None):
+        if new is not None and new.is_file():
+            return str(new)
+    return exe
+
+
+def migrate_config_exe(cfg_path: Path) -> bool:
+    """Rewrite a run config's "exe" from the old program name to the new one (engine_exe_now); True when it did."""
+    try:
+        cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict) or not cfg.get("exe"):
+        return False
+    new = engine_exe_now(cfg["exe"])
+    if new == cfg["exe"]:
+        return False
+    cfg["exe"] = new
+    Path(cfg_path).write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
+    return True
 
 
 def source_hash(parts) -> str:

@@ -57,7 +57,7 @@ DGX OS には NVIDIA のドライバーと CUDA 13（`/usr/local/cuda`）が入�
      -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF \
      -DSTRATA_GGML_DIR="$PWD/third_party/llama.cpp"
    cmake --build build-cuda --target strata abyss_gpu_tune -j"$(nproc)"
-   ./build-cuda/strata --help > /dev/null && echo OK
+   ./build-cuda/abyss --help > /dev/null && echo OK
    ```
 
    `./setup.sh`（インストーラー）にも ARM 用の直しは入っていますが、本物の Spark ではまだ動かしていません。
@@ -78,7 +78,7 @@ DGX OS には NVIDIA のドライバーと CUDA 13（`/usr/local/cuda`）が入�
 
    ```json
    {
-    "exe": "build-cuda/strata",
+    "exe": "build-cuda/abyss",
     "args": ["--glm-pack", "/home/you/models/q38-16g64g/pack-fast", "--max-context", "32768", "--prefill", "auto"],
     "tokenizer": "/home/you/models/q38-16g64g/pack-fast/tokenizer",
     "model_name": "qwen3.8-flash-next-16g64g",

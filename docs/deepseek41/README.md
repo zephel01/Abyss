@@ -204,7 +204,7 @@ other V4.1 GGUF, build the engine (the manual's
 
 ```json
 {
- "exe": "<Abyss>/build/strata",
+ "exe": "<Abyss>/build/abyss",
  "args": ["--glm-pack", "<dir>/pack", "--max-context", "65536", "--prefill", "auto"],
  "cwd": "<Abyss>",
  "tokenizer": "<dir>/pack/tokenizer",

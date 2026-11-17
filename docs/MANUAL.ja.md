@@ -197,7 +197,7 @@ C=3cf03257f219afbe7334045ff7c6a06ac68c627d
 curl -L -o /tmp/llama.zip https://github.com/ggml-org/llama.cpp/archive/$C.zip
 unzip -q /tmp/llama.zip -d third_party && mv third_party/llama.cpp-$C third_party/llama.cpp
 
-# エンジン: build/strata
+# エンジン: build/abyss（v1.3.164 から。横の build/strata は旧名で、当面は別名として残す）
 .venv/bin/cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM=$PWD/.venv/bin/ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
@@ -306,7 +306,7 @@ LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
 
 ```json
 {
- "exe": "/home/you/llm/apps/Abyss/build/strata",
+ "exe": "/home/you/llm/apps/Abyss/build/abyss",
  "args": ["--glm-pack", "/home/you/llm/apps/Abyss-data/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q2_K_XL/pack-dsv4",
           "--max-context", "65536", "--prefill", "auto"],
  "cwd": "/home/you/llm/apps/Abyss",
@@ -592,7 +592,7 @@ Radeon 8060S（gfx1151）。
 - **セットアップ:** `./setup-deepseek.sh --backend hip`（NVIDIA の GPU がなければ自動で HIP を選ぶ）。Linux では
   `/opt/rocm`（または `/opt/rocm/core-10.0`）の ROCm 10 を使う。HIP 7.14 以降が要り、ROCm 7.0〜7.2 では止まる。この
   2 つはいまのドライバと組み合わせると失敗するため（issue #1、#8。`ABYSS_OLD_ROCM=1` でそれでもビルドできる）。
-  エンジンは `build-hip/strata` にビルドされ、設定に `"backend": "hip"` が入る。別の ROCm に切り替えたら、
+  エンジンは `build-hip/abyss` にビルドされ、設定に `"backend": "hip"` が入る。別の ROCm に切り替えたら、
   `ROCM_PATH` を付けてもう一度実行する。その ROCm でエンジンを最初からビルドし直す（v1.3.44）。Windows で
   Visual Studio の MSVC が 14.50 以降なら、セットアップが ROCm SDK の `__clang_hip_runtime_wrapper.h` の include を
   1 行移す（「'isgreater' cannot overload」への LLVM の修正。issue #43。元は `.abyss-orig` として残る）。
@@ -827,7 +827,7 @@ full attention の 8 層のうち 3 層は dense のまま、ほかの 7 層は 
 
 ```bash
 .venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-Q4_K_M.gguf --out pack
-build-cuda/strata --glm-pack pack --max-context 131072 --prefill auto
+build-cuda/abyss --glm-pack pack --max-context 131072 --prefill auto
 ```
 
 - **メモリ**（RTX 5090、MTP の下書きあり、ファイル全体を VRAM に置く）: GPU メモリの最大は文脈 32K / 64K / 128K で

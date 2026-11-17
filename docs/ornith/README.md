@@ -56,7 +56,7 @@ write a config next to the others:
 
 ```json
 {
- "exe": "<Abyss>/build/strata",
+ "exe": "<Abyss>/build/abyss",
  "args": ["--glm-pack", "<dir>/UD-Q4_K_XL/pack", "--max-context", "65536", "--prefill", "auto"],
  "cwd": "<Abyss>",
  "tokenizer": "<dir>/UD-Q4_K_XL/pack/tokenizer",
@@ -69,7 +69,7 @@ write a config next to the others:
 }
 ```
 
-(an AMD card: `"exe": "<Abyss>/build-hip/strata"`, `"backend": "hip"`, `"lib_dirs": ["/opt/rocm/lib"]` and the
+(an AMD card: `"exe": "<Abyss>/build-hip/abyss"`, `"backend": "hip"`, `"lib_dirs": ["/opt/rocm/lib"]` and the
 `GPU_MAX_HW_QUEUES` / `HIP_VISIBLE_DEVICES` entries of [docs/amd](../amd/README.md)). The sampling defaults are the
 model card's. Then:
 

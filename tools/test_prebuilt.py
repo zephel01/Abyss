@@ -101,7 +101,7 @@ class Pieces(unittest.TestCase):
 
 class Install(unittest.TestCase):
     NAME = "abyss-engine-cuda-linux-x64.tar.gz"
-    FILES = {"strata": b"\x7fELF engine", "abyss_gpu_tune": b"tune", "libcublas.so.13": b"lib",
+    FILES = {"abyss": b"\x7fELF engine", "abyss_gpu_tune": b"tune", "libcublas.so.13": b"lib",
              "PREBUILT.json": json.dumps({"version": "1.3.999", "archs": [86, 89, 120], "cuda": "13.3"}).encode()}
 
     def setUp(self):
@@ -121,10 +121,12 @@ class Install(unittest.TestCase):
         build.mkdir()
         (build / "strata").write_bytes(b"old engine")
         man = self.run_install(release(self.d, self.NAME, self.FILES))
-        self.assertEqual((build / "strata").read_bytes(), b"\x7fELF engine")
+        self.assertEqual((build / "abyss").read_bytes(), b"\x7fELF engine")
+        if os.name != "nt":                      # the old name: a link to the new engine, not the old file
+            self.assertEqual(os.readlink(build / "strata"), "abyss")
         self.assertEqual((build / "libcublas.so.13").read_bytes(), b"lib")
         if os.name != "nt":
-            self.assertTrue(os.access(build / "strata", os.X_OK))
+            self.assertTrue(os.access(build / "abyss", os.X_OK))
         self.assertEqual(man["version"], "1.3.999")
         self.assertEqual(len(man["sha256"]), 64)
         self.assertFalse((build / ".prebuilt-download").exists())
@@ -139,15 +141,16 @@ class Install(unittest.TestCase):
 
     def test_windows_zip(self):
         name = "abyss-engine-cuda-windows-x64.zip"
-        files = {"strata.exe": b"MZ engine", "cublasLt64_13.dll": b"dll", "PREBUILT.json": b"{}"}
+        files = {"abyss.exe": b"MZ engine", "cublasLt64_13.dll": b"dll", "PREBUILT.json": b"{}"}
         self.run_install(release(self.d, name, files), name)
-        self.assertEqual((self.d / "build" / "strata.exe").read_bytes(), b"MZ engine")
+        self.assertEqual((self.d / "build" / "abyss.exe").read_bytes(), b"MZ engine")
+        self.assertFalse((self.d / "build" / "strata.exe").exists())   # (no second copy unless one was there)
 
     def test_wrong_sha_is_refused_and_deleted(self):
         rel = release(self.d, self.NAME, self.FILES, sha="0" * 64)
         with self.assertRaisesRegex(RuntimeError, "SHA-256"):
             self.run_install(rel)
-        self.assertFalse((self.d / "build" / "strata").exists())
+        self.assertFalse((self.d / "build" / "abyss").exists())
         self.assertFalse((self.d / "build" / ".prebuilt-download" / self.NAME).exists())
 
     def test_missing_from_the_release(self):
@@ -160,15 +163,37 @@ class Install(unittest.TestCase):
     def test_unsafe_paths_refused(self):
         rel = self.d / "release"
         rel.mkdir()
-        make_tar(rel / self.NAME, {"../../evil": b"x", "strata": b"e"}, top="")
+        make_tar(rel / self.NAME, {"../../evil": b"x", "abyss": b"e"}, top="")
         (rel / P.SUMS).write_text(hashlib.sha256((rel / self.NAME).read_bytes()).hexdigest() + f"  {self.NAME}\n")
         with self.assertRaisesRegex(ValueError, "unsafe"):
             self.run_install(rel)
         self.assertFalse((self.d / "evil").exists())
 
     def test_no_engine_in_it(self):
-        with self.assertRaisesRegex(RuntimeError, "has no strata"):
+        with self.assertRaisesRegex(RuntimeError, "has no abyss"):
             self.run_install(release(self.d, self.NAME, {"README": b"x"}))
+
+
+class EngineName(unittest.TestCase):
+    """v1.3.164: the engine is `abyss`; a config naming <build>/strata is moved to <build>/abyss once that is there."""
+    def test_config_rewritten_when_the_new_file_is_there(self):
+        import setup as S
+        with tempfile.TemporaryDirectory() as d:
+            b = Path(d) / "build-cuda"
+            b.mkdir()
+            ext = ".exe" if os.name == "nt" else ""
+            cfg = Path(d) / "abyss-x.json"
+            cfg.write_text(json.dumps({"exe": str(b / ("strata" + ext)), "args": ["--glm-pack", "p"]}))
+            self.assertFalse(S.migrate_config_exe(cfg))              # not rebuilt yet: the old path stays
+            self.assertEqual(json.loads(cfg.read_text())["exe"], str(b / ("strata" + ext)))
+            (b / ("abyss" + ext)).write_bytes(b"engine")
+            self.assertTrue(S.migrate_config_exe(cfg))
+            got = json.loads(cfg.read_text())
+            self.assertEqual(got["exe"], str(b / ("abyss" + ext)))
+            self.assertEqual(got["args"], ["--glm-pack", "p"])
+            self.assertFalse(S.migrate_config_exe(cfg))              # once
+            self.assertEqual(S.engine_exe_now("/usr/bin/strata-gguf"), "/usr/bin/strata-gguf")
+            self.assertEqual(S.engine_path(b).name, "abyss" + ext)
 
 
 class Setups(unittest.TestCase):

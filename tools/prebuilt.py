@@ -5,8 +5,9 @@ RTX 30 (sm_86), RTX 40 (sm_89) and RTX 50 (sm_120a) in one binary - the CUDA run
 run time, and the engine's per-GPU choices (moe_own's tuned_device, mv_tune, PDL) ask the device, not the build -
 and packs it with the CUDA libraries it loads (cuBLAS, cuBLASLt; cudart on Linux) into one archive a platform:
 
-    abyss-engine-cuda-linux-x64.tar.gz      strata, abyss_gpu_tune, libcudart / libcublas / libcublasLt .so
-    abyss-engine-cuda-windows-x64.zip       strata.exe, abyss_gpu_tune.exe, cublas64 / cublasLt64 .dll
+    abyss-engine-cuda-linux-x64.tar.gz      abyss (+ strata, a link to it), abyss_gpu_tune, libcudart / libcublas /
+                                            libcublasLt .so
+    abyss-engine-cuda-windows-x64.zip       abyss.exe, abyss_gpu_tune.exe, cublas64 / cublasLt64 .dll
     SHA256SUMS                              one "<sha256>  <name>" line per archive
 
 attached to the release of each tag.  The setups (abyss.py through ./abyss.sh / START-ABYSS.bat, and
@@ -249,9 +250,21 @@ def install(dest: Path, ver: str | None = None, repo: str = REPO, log=print, dow
         manifest = json.loads((dest / MANIFEST).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         manifest = {}
-    exe = dest / ("strata.exe" if name.endswith(".zip") else "strata")
+    exe = dest / ("abyss.exe" if name.endswith(".zip") else "abyss")
     if not exe.exists():
         raise RuntimeError(f"{name} has no {exe.name}")
+    # the old name (v1.3.164: strata became abyss) for configs and scripts that still start it: the tar.gz carries a
+    # link; on Windows a strata.exe left from a build gets this engine (the zip does not carry a second copy)
+    alias = exe.with_name("strata" + exe.suffix)
+    try:
+        if exe.suffix == ".exe":
+            if alias.exists():
+                shutil.copy2(exe, alias)
+        elif not (alias.is_symlink() and os.readlink(alias) == exe.name):
+            alias.unlink(missing_ok=True)       # (an engine compiled before under the old name)
+            os.symlink(exe.name, alias)
+    except OSError as e:                         # (a strata.exe still running keeps the old one)
+        log(f"  (could not update {alias.name}, the engine's old name: {e})")
     if os.name != "nt":
         for p in (exe, dest / "abyss_gpu_tune"):
             if p.exists():

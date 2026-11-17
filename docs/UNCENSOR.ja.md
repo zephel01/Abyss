@@ -73,7 +73,7 @@ SSD 上のルーティングされるエキスパートには触らないので�
 
 ```json
 {
- "exe": "/home/you/llm/apps/Abyss/build/strata",
+ "exe": "/home/you/llm/apps/Abyss/build/abyss",
  "args": ["--glm-pack", "...", "--max-context", "65536"],
  "uncensor": "/home/you/llm/apps/Abyss-data/abl/dsv41-iq2xxs.abl",
  ...
@@ -138,7 +138,7 @@ KL 0、CPU レーンの件数も同じ）。**オンでも遅くなりません�
 **2. 作る。**
 
 ```sh
-build/strata --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
+build/abyss --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
   --abl-gen 32 --abl-rank 3 --abl-range 0.3,0.9 --abl-candidates 9
 ```
 
@@ -225,7 +225,7 @@ example prompt 2
 
 ```sh
 .venv/bin/python -I tools/abl_prompts.py --pack <pack> --out prompts.txt --cyber 30 --extra-harmful my.txt
-build/strata --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
+build/abyss --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
   --abl-gen 32 --abl-rank 4 --abl-range 0.3,0.9 --abl-candidates 9 --abl-max-kl 1.0
 ```
 

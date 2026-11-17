@@ -70,10 +70,10 @@ jobs:
         # no GPU here: only that the binary loads (CUDA's DLLs on PATH) and prints its usage (exit 0)
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path build -Recurse -Filter strata.exe | Select-Object -First 1
+          $exe = Get-ChildItem -Path build -Recurse -Filter abyss.exe | Select-Object -First 1
           & $exe.FullName --help > $null
           if ($LASTEXITCODE -ne 0) {
             # (-1073741515 = 0xC0000135, a DLL not found: list what the binary loads)
             dumpbin /dependents $exe.FullName
-            Write-Error "strata --help exited $LASTEXITCODE"; exit 1
+            Write-Error "abyss --help exited $LASTEXITCODE"; exit 1
           }

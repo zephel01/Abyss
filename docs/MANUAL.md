@@ -201,7 +201,7 @@ C=3cf03257f219afbe7334045ff7c6a06ac68c627d
 curl -L -o /tmp/llama.zip https://github.com/ggml-org/llama.cpp/archive/$C.zip
 unzip -q /tmp/llama.zip -d third_party && mv third_party/llama.cpp-$C third_party/llama.cpp
 
-# the engine: build/strata
+# the engine: build/abyss (v1.3.164; build/strata beside it is the old name, kept as an alias for now)
 .venv/bin/cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM=$PWD/.venv/bin/ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
@@ -311,7 +311,7 @@ A config file (any name; `strata-dsv4.json` here) in the Abyss folder:
 
 ```json
 {
- "exe": "/home/you/llm/apps/Abyss/build/strata",
+ "exe": "/home/you/llm/apps/Abyss/build/abyss",
  "args": ["--glm-pack", "/home/you/llm/apps/Abyss-data/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q2_K_XL/pack-dsv4",
           "--max-context", "65536", "--prefill", "auto"],
  "cwd": "/home/you/llm/apps/Abyss",
@@ -622,7 +622,7 @@ the Ryzen AI Max's Radeon 8060S (gfx1151).
 - **Setup:** `./setup-deepseek.sh --backend hip` (chosen by itself when there is no NVIDIA GPU). On Linux it uses ROCm 10
   in `/opt/rocm` (or `/opt/rocm/core-10.0`). It needs HIP 7.14 or newer and stops on ROCm 7.0-7.2, which fail with
   current drivers (issues #1 and #8; `ABYSS_OLD_ROCM=1` builds with one anyway). The engine is built in
-  `build-hip/strata`, and the config gets `"backend": "hip"`. After switching to another ROCm, run it again (with
+  `build-hip/abyss`, and the config gets `"backend": "hip"`. After switching to another ROCm, run it again (with
   `ROCM_PATH`): it builds the engine from scratch for that ROCm (v1.3.44). On Windows with Visual Studio's MSVC 14.50
   or newer, setup moves one include line in the ROCm SDK's `__clang_hip_runtime_wrapper.h` (LLVM's fix for
   "'isgreater' cannot overload", issue #43; the original is kept as `.abyss-orig`); `ABYSS_NO_ROCM_HEADER_FIX=1`
@@ -879,7 +879,7 @@ commit after v1.3.160; v1.3.157-160 run such a file all dense); the start-up lin
 
 ```bash
 .venv/bin/python tools/iq_pack.py --gguf Qwen3.5-9B-QSA-Q4_K_M.gguf --out pack
-build-cuda/strata --glm-pack pack --max-context 131072 --prefill auto
+build-cuda/abyss --glm-pack pack --max-context 131072 --prefill auto
 ```
 
 - **Memory** (RTX 5090, MTP drafts on, the whole file in VRAM): peak GPU memory 11.2 / 12.4 / 14.9 GB at a 32K / 64K /

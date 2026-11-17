@@ -100,4 +100,4 @@ jobs:
         run: cmake --build build --target strata abyss_gpu_tune -j4
       - name: The engine starts
         # no GPU here: only that the binary loads on aarch64 and prints its usage (exit 0)
-        run: LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/targets/sbsa-linux/lib" ./build/strata --help > /dev/null
+        run: LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/targets/sbsa-linux/lib" ./build/abyss --help > /dev/null && ./build/strata --help > /dev/null

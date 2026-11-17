@@ -61,7 +61,7 @@ Abyss の設定ファイルについては、このページにまとめてい�
 │   ├── abyss-dsv4-q2_k_xl.shared-settings.json   チャット画面の共有設定（あれば）
 │   ├── maya-<モデル>.json                   ★ 設定ファイル（GLM-5.3-Flash、./abyss.sh が書き出す）
 │   ├── run-maya-<モデル>.sh                 　 その起動スクリプト
-│   └── build/strata                         エンジン（AMD は build-hip/strata）
+│   └── build/abyss                         エンジン（AMD は build-hip/abyss）
 ├── Abyss-data/models/...                   モデルのファイルと pack（数十〜数百 GB）
 └── Abyss-tools/
     ├── abyss.sh                            起動・停止・状態確認（start | stop | restart | status | log | models）
@@ -124,7 +124,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 
 ```json
 {
- "exe": "/home/you/llm/apps/Abyss/build-hip/strata",
+ "exe": "/home/you/llm/apps/Abyss/build-hip/abyss",
  "args": ["--glm-pack", "/home/you/llm/apps/Abyss-data/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q2_K_XL/pack",
           "--max-context", "65536", "--prefill", "auto"],
  "cwd": "/home/you/llm/apps/Abyss",
@@ -147,7 +147,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 
 | 項目 | 意味 | 例 |
 | --- | --- | --- |
-| `exe` | エンジンの場所 | `".../Abyss/build/strata"`（AMD は `build-hip/strata`） |
+| `exe` | エンジンの場所 | `".../Abyss/build/abyss"`（AMD は `build-hip/abyss`） |
 | `args` | エンジンに渡すオプション。`--glm-pack` に pack のフォルダー、`--max-context` にコンテキスト長（トークン数）、`--prefill auto` はプロンプトをまとめて読む大きさ | 上の実例 |
 | `cwd` | エンジンを動かすフォルダー | Abyss フォルダー |
 | `tokenizer` | pack の中の `tokenizer` フォルダー（チャットテンプレートが入っている） | `".../pack/tokenizer"` |

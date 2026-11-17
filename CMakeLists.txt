@@ -459,6 +459,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  # the program is `abyss` (abyss.exe) from v1.3.164; the target keeps its name (--target strata), and `strata` stays
+  # beside it as an alias for configs and scripts that name the old file (cmake/engine_alias.cmake)
+  set_target_properties(strata PROPERTIES OUTPUT_NAME abyss)
+  add_custom_command(TARGET strata POST_BUILD
+                     COMMAND ${CMAKE_COMMAND} -DENGINE=$<TARGET_FILE:strata> -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/engine_alias.cmake
+                     VERBATIM)
   # abyss --gpu-tune: the per-GPU kernel choices measured on this GPU without a model (src/program/gpu_tune.cpp)
   add_executable(abyss_gpu_tune src/program/gpu_tune.cpp)
   target_include_directories(abyss_gpu_tune PRIVATE ${_strata_gpu_include_directories})

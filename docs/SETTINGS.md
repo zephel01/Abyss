@@ -61,7 +61,7 @@ With the clone in `~/llm/apps/Abyss`. Setup makes `Abyss-data` and `Abyss-tools`
 │   ├── abyss-dsv4-q2_k_xl.shared-settings.json   the Chat page's shared settings (if any)
 │   ├── maya-<model>.json                   * a config file (GLM-5.3-Flash, written by ./abyss.sh)
 │   ├── run-maya-<model>.sh                   its start script
-│   └── build/strata                        the engine (AMD: build-hip/strata)
+│   └── build/abyss                        the engine (AMD: build-hip/abyss)
 ├── Abyss-data/models/...                   the model files and packs (tens to hundreds of GB)
 └── Abyss-tools/
     ├── abyss.sh                            start | stop | restart | status | log | models
@@ -125,7 +125,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 
 ```json
 {
- "exe": "/home/you/llm/apps/Abyss/build-hip/strata",
+ "exe": "/home/you/llm/apps/Abyss/build-hip/abyss",
  "args": ["--glm-pack", "/home/you/llm/apps/Abyss-data/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q2_K_XL/pack",
           "--max-context", "65536", "--prefill", "auto"],
  "cwd": "/home/you/llm/apps/Abyss",
@@ -148,7 +148,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 
 | Key | Meaning | Example |
 | --- | --- | --- |
-| `exe` | the engine | `".../Abyss/build/strata"` (AMD: `build-hip/strata`) |
+| `exe` | the engine | `".../Abyss/build/abyss"` (AMD: `build-hip/abyss`) |
 | `args` | the engine's options: `--glm-pack` the pack folder, `--max-context` the context in tokens, `--prefill auto` how much of a prompt is read at once | the example above |
 | `cwd` | the folder the engine runs in | the Abyss folder |
 | `tokenizer` | the pack's `tokenizer` folder (it holds the chat template) | `".../pack/tokenizer"` |

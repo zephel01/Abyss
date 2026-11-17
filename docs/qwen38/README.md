@@ -45,7 +45,7 @@ lane. NVIDIA runs it too: an RTX 5090 from v1.3.83 and a DGX Spark from v1.3.113
 
    ```json
    {
-    "exe": "build-hip/strata",
+    "exe": "build-hip/abyss",
     "args": ["--glm-pack", "/path/to/IQ3_XXS/pack-fast", "--max-context", "32768", "--prefill", "auto"],
     "tokenizer": "/path/to/IQ3_XXS/pack-fast/tokenizer",
     "model_name": "qwen3.8-flash-next-uncensored-iq3_xxs",
@@ -59,7 +59,7 @@ lane. NVIDIA runs it too: an RTX 5090 from v1.3.83 and a DGX Spark from v1.3.113
    }
    ```
 
-   On NVIDIA: `"exe": "build/strata"` and `"backend": "cuda"` (the rest the same).
+   On NVIDIA: `"exe": "build/abyss"` and `"backend": "cuda"` (the rest the same).
 
    Start it with `.venv/bin/python serve/server.py --engine strata --config abyss-<name>.json --port 8082` (the
    `--port` on the command line is the one used).

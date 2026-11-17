@@ -34,7 +34,7 @@ class HipSetupTests(unittest.TestCase):
         for ctx in (
             patch.object(maya, "ROOT", self.root),
             patch.object(maya, "BUILD", self.root / "build"),
-            patch.object(maya, "EXE", self.root / "build/strata"),
+            patch.object(maya, "EXE", self.root / "build/abyss"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
             patch.object(maya, "WIN", False),
             patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
@@ -74,7 +74,7 @@ class HipSetupTests(unittest.TestCase):
         self.a.gpu = None
         pc = maya.check_pc(self.a)
         self.assertEqual(pc["gpus"], [self.gpus[1]])
-        self.assertEqual(maya.EXE, self.root / "build-hip/strata")
+        self.assertEqual(maya.EXE, self.root / "build-hip/abyss")
 
     def test_rejects_unsupported_card_and_bad_gpu_lists(self):
         self.a.gpu = 2
@@ -113,7 +113,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["gpu"], [0])
         self.assertEqual(cfg["env"]["STRATA_GLM_SPLIT"], "0")
         self.assertEqual(cfg["env"]["STRATA_GLM_RESERVE_MB"], "4096")
-        self.assertEqual(cfg["exe"], str(self.root / "build-hip/strata"))
+        self.assertEqual(cfg["exe"], str(self.root / "build-hip/abyss"))
         self.assertNotIn("vision", cfg)
         self.assertNotIn("gpu_pci", cfg)            # (GPUs listed without PCI addresses)
 
@@ -297,7 +297,7 @@ class HipSetupTests(unittest.TestCase):
         call, text = self.run_bench(self.installed_config(gpu=[1, 0]))
         self.assertEqual(maya.BUILD, self.root / "build-hip")
         self.assertEqual(maya.STAMP, self.root / "build-hip/MAYA-BUILD.json")
-        self.assertEqual(call.args[0][:2], [str(self.root / "build-hip/strata"), "--serve"])
+        self.assertEqual(call.args[0][:2], [str(self.root / "build-hip/abyss"), "--serve"])
         self.assertEqual(call.args[0][-2:], ["--layer-split", "auto"])
         env = call.kwargs["env"]
         self.assertEqual(env["HIP_VISIBLE_DEVICES"], "1,0")
@@ -314,7 +314,7 @@ class HipSetupTests(unittest.TestCase):
         with patch.object(maya, "refresh_engine") as refresh:
             self.run_bench(self.installed_config())
         refresh.assert_called_once()
-        self.assertEqual(refresh.call_args.args[0]["exe"], str(self.root / "build-hip/strata"))
+        self.assertEqual(refresh.call_args.args[0]["exe"], str(self.root / "build-hip/abyss"))
 
     def test_bench_cuda_command_and_env_unchanged(self):
         path = self.installed_config(backend="cuda", gpu=[1, 0])
@@ -637,7 +637,7 @@ class WindowsHipSetupTests(unittest.TestCase):
         for ctx in (
             patch.object(maya, "ROOT", self.root),
             patch.object(maya, "BUILD", self.root / "build"),
-            patch.object(maya, "EXE", self.root / "build/strata.exe"),
+            patch.object(maya, "EXE", self.root / "build/abyss.exe"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
             patch.object(maya, "WIN", True),
             patch.object(maya.S, "amd_gpus", return_value=[self.apu]),
@@ -739,7 +739,7 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertEqual(pc["gpus"], [self.apu])
         self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
         self.assertEqual(pc["rocm_bin"], str(self.rocm.resolve() / "bin"))
-        self.assertEqual(maya.EXE, self.root / "build-hip/strata.exe")
+        self.assertEqual(maya.EXE, self.root / "build-hip/abyss.exe")
 
     def test_check_without_rocm_says_the_pip_command(self):
         with patch.object(maya, "windows_rocm", return_value=(None, None)), \
@@ -851,7 +851,7 @@ class WindowsHipSetupTests(unittest.TestCase):
                               self.root / "data", None)
         cfg = json.loads(p.read_text())
         self.assertEqual(p.name, "maya-maya-l-hip.json")
-        self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/strata.exe")))
+        self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/abyss.exe")))
         self.assertEqual(cfg["lib_dirs"], [str(self.rocm / "bin")])
         self.assertNotIn("gpu_pci", cfg)            # Windows: hipInfo's numbers, as before
         env = cfg["env"]

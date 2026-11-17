@@ -15,7 +15,7 @@ STRATA_GLM_EXPERT_HELPER_GIB=13 \
 STRATA_DS4_SPEC=0 \
 STRATA_GLM_NO_SPEC=1 \
 STRATA_GLM_KDA_GRAPH=0 \
-./build/strata --serve --glm-pack /path/to/pack --layer-split 0 --spec 0
+./build/abyss --serve --glm-pack /path/to/pack --layer-split 0 --spec 0
 ```
 
 `STRATA_GLM_EXPERT_HELPER` is the helper's index in the visible GPU list. Zero disables the feature; the helper must be a separate visible GPU. `STRATA_GLM_EXPERT_HELPER_GIB` is its expert-pool budget in GiB (default 13, accepted range 0.25–128). The helper also keeps 512 MiB free for its small buffers and runtime allocations. A budget that cannot fit disables the helper instead of failing the model load or request.

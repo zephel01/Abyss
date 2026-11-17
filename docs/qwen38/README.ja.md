@@ -46,7 +46,7 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
 
    ```json
    {
-    "exe": "build-hip/strata",
+    "exe": "build-hip/abyss",
     "args": ["--glm-pack", "/path/to/IQ3_XXS/pack-fast", "--max-context", "32768", "--prefill", "auto"],
     "tokenizer": "/path/to/IQ3_XXS/pack-fast/tokenizer",
     "model_name": "qwen3.8-flash-next-uncensored-iq3_xxs",
@@ -60,7 +60,7 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
    }
    ```
 
-   NVIDIA では `"exe": "build/strata"`、`"backend": "cuda"` にします（ほかは同じ）。
+   NVIDIA では `"exe": "build/abyss"`、`"backend": "cuda"` にします（ほかは同じ）。
 
    起動は `.venv/bin/python serve/server.py --engine strata --config abyss-<名前>.json --port 8082` です（実際に使われる
    ポートはコマンドラインの `--port` です）。

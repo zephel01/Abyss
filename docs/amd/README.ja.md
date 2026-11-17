@@ -237,7 +237,7 @@ ls /opt/rocm/lib/rocblas/library | grep -c gfx1201  # 0 なら amdrocm10.0-gfx12
 
 - セットアップは KFD のトポロジーから GPU を見つけ、VRAM が一番大きい GPU を選びます。`--gpu N` で番号を指定する
   こともできます。番号は `amd-smi list` の `GPU:` と同じです。
-- エンジンは `build-hip/strata` にビルドされます。初回は 10〜20 分かかります。ROCm に `hipcc` があれば、iGPU
+- エンジンは `build-hip/abyss` にビルドされます。初回は 10〜20 分かかります。ROCm に `hipcc` があれば、iGPU
   レーンの `build-hip/libabyss_igpu.so` も一緒にビルドされます。
 - 設定ファイルには `"backend": "hip"`、`"gpu"`（HIP の番号）、`"gpu_pci"`（PCI アドレス）、`"lib_dirs"`（ROCm の
   `lib`）が入ります。

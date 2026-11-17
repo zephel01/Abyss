@@ -27,7 +27,7 @@ What it does:
   1. checks the PC: an NVIDIA GPU, nvcc, RAM
   2. Python packages into .venv; llama.cpp's source at the pinned commit (third_party/llama.cpp) - for the GPU
      engine's prompt MMQ kernels, which still compile ggml-cuda's sources, and for images (llama.cpp's mtmd)
-  3. compiles the engine (build/strata) for the GPU - arch 120a on RTX 50, whose MXFP4 kernels need it
+  3. compiles the engine (build/abyss) for the GPU - arch 120a on RTX 50, whose MXFP4 kernels need it
   4. the model: unsloth's DeepSeek-V4-Flash-0731-GGUF quant into <data>/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/<quant>
      (--model v41: zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF, 132G or 139G)
      (asks first, or --download-model), every file checked against Hugging Face's SHA-256
@@ -320,7 +320,7 @@ def venv_bin(name: str, windows: bool | None = None) -> Path:
 
 
 def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
-    exe = ROOT / "build" / "strata"
+    exe = S.engine_path(ROOT / "build")
     cmake = venv_bin("cmake")
     ninja = venv_bin("ninja")
     cc = cuda_archs(arch, gpus)
@@ -393,7 +393,7 @@ def prebuilt_engine(gpus) -> Path:
 
 
 def hip_engine(a):
-    """AMD (--backend hip): the GPU check, ROCm and the engine (build-hip/strata) by abyss.py's HIP helpers (Maya's
+    """AMD (--backend hip): the GPU check, ROCm and the engine (build-hip/abyss) by abyss.py's HIP helpers (Maya's
     installer: gfx1100, gfx1201, gfx1151; system ROCm 7 on Linux).  Returns (gpus, the config's extra fields)."""
     import argparse as _ap
     sys.path.insert(0, str(ROOT))
@@ -445,6 +445,8 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
         # ... with the libraries of the engine just checked or compiled: after a switch to another ROCm (setup again
         # with ROCM_PATH) the old one's lib first in LD_LIBRARY_PATH would load its runtime into the new engine - ROCm 7
         # and 10 share the sonames (libamdhip64.so.7, libhsa-runtime64.so.1) and the engine has no RUNPATH
+        if S.migrate_config_exe(cfg):              # (v1.3.164: build/strata -> build/abyss, once it is there)
+            S.ok(f"{cfg.name}: the engine is now {json.loads(cfg.read_text(encoding='utf-8'))['exe']}")
         kept = json.loads(cfg.read_text(encoding="utf-8"))
         if (extra or {}).get("lib_dirs") and kept.get("lib_dirs") != extra["lib_dirs"]:
             kept["lib_dirs"] = extra["lib_dirs"]
@@ -452,7 +454,7 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             S.ok(f"{cfg.name}: lib_dirs {', '.join(extra['lib_dirs'])} (the libraries the engine was compiled with)")
     else:
         cfg.write_text(json.dumps({
-            "exe": str(ROOT / "build" / "strata"),
+            "exe": str(S.engine_path(ROOT / "build")),
             "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto"],
             "cwd": str(ROOT),
             "tokenizer": str(pack / "tokenizer"),

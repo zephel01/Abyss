@@ -121,9 +121,11 @@ cmd_stop() {
 cmd_status() {
   echo "git        : $(git log -1 --format='%h %s' | cut -c1-90)"
   git fetch -q 2>/dev/null && echo "未取得     : $(git rev-list --count HEAD..@{u} 2>/dev/null || echo '?') commits (origin)"
-  if [ -x "$ABYSS/build/strata" ]; then
+  eng="$ABYSS/build/abyss"
+  [ -x "$eng" ] || eng="$ABYSS/build/strata"   # (v1.3.163 まではこの名前)
+  if [ -x "$eng" ]; then
     arch=$(sed -n 's/^CMAKE_CUDA_ARCHITECTURES:[A-Z]*=//p' "$ABYSS/build/CMakeCache.txt" 2>/dev/null)
-    echo "engine     : $ABYSS/build/strata  [arch $arch, $(date -r "$ABYSS/build/strata" '+%Y-%m-%d %H:%M')]"
+    echo "engine     : $eng  [arch $arch, $(date -r "$eng" '+%Y-%m-%d %H:%M')]"
     if [ -z "$(ninja_dry)" ]; then echo "src        : 一致 (最新)"; else echo "src        : ソースの方が新しい -> abyss.sh build"; fi
   else
     echo "engine     : 未ビルド（Abyss の setup-deepseek.sh を実行）"
