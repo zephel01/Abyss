@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.166 - unreleased
+## v1.3.166 - 2026-11-17
 
 Ornith-1.5-9B QSA in the one-command setup (the engine is unchanged; outputs as in v1.3.165).
 
