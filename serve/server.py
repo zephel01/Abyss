@@ -1423,6 +1423,10 @@ class Service:
         self.think_budget = 0
         end = _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # <think> as one token: a template that leaves the opening to the model (MiMo-V2.6-Distill-Qwen-9B's ends the
+        # prompt at "<|im_start|>assistant\n") gets it as the answer's first token - not reasoning text (run())
+        start = _special_ids("<think>")
+        self.think_start_id = start[0] if start else None
         # Qwen's call form (<tool_call><function=NAME>...): its templates' response_template ends the reasoning at a
         # <tool_call> as well as at </think> (2026-11-07), so a call started inside the thinking is still a call
         src = getattr(template, "source", "") or ""
@@ -2091,6 +2095,11 @@ class Service:
                 in_think = think_budget > 0
                 if thinking and parser.state == "reasoning":
                     closed_by = "unclosed"
+                # the prompt does not open the reasoning (no <think> in its last tokens): the model opens it itself with
+                # its first token, which is then not text; a first token that is not <think> starts the answer itself
+                tsid = getattr(self, "think_start_id", None)
+                model_opens = (thinking and parser.state == "reasoning" and tsid is not None and not prefill
+                               and tsid not in ids[-3:])
                 # the turn's end tokens, for the engine to stop on (an engine that knows the key; else its own list)
                 base = {**(sampling or {}), "_stop_ids": self.stop_order, "_arg_ids": self.arg_ids} \
                     if self.stop_ids else dict(sampling or {})
@@ -2147,6 +2156,11 @@ class Service:
                                     raw_ids.append(t)
                                     break
                             raw_ids.append(t)
+                            if model_opens:
+                                model_opens = False
+                                if t == tsid:           # the model's own <think>: the reasoning starts after it
+                                    continue
+                                parser.state, parser.lead, closed_by = "content", True, None   # no reasoning at all
                             in_reasoning = parser.state == "reasoning"
                             text, stopped = detok.push(t), False
                             stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])

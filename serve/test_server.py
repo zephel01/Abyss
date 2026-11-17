@@ -398,6 +398,33 @@ class SpelledStopMarker(unittest.TestCase):
         self.assertEqual(self.answer("a <|b|> and x<|use"), ("a <|b|> and x<|use", "length"))
 
 
+class ModelOpensThink(unittest.TestCase):
+    """A template that leaves <think> to the model (MiMo-V2.6-Distill-Qwen-9B's ends the prompt at
+    "<|im_start|>assistant\n"): the model's own first <think> is not reasoning text, and an answer that does not start
+    with it is content.  A prompt that opens the reasoning itself keeps the old behaviour."""
+
+    class ThinkTok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+
+    def answer(self, script, prompt):
+        tok = self.ThinkTok()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out = {"reasoning": "", "content": ""}
+        for kind, v in svc.run(tok.encode(prompt, parse_special=True), True, None, 200, {}, threading.Event()):
+            if kind == "event" and v.kind in out:
+                out[v.kind] += v.text
+        return out["reasoning"], out["content"]
+
+    def test_model_written_think(self):
+        self.assertEqual(self.answer("<think>plan</think>Tokyo.", "<|im_start|>assistant\n"), ("plan", "Tokyo."))
+
+    def test_no_think_is_content(self):
+        self.assertEqual(self.answer("Tokyo.", "<|im_start|>assistant\n"), ("", "Tokyo."))
+
+    def test_prompt_opened_think(self):
+        self.assertEqual(self.answer("plan</think>Tokyo.", "<|im_start|>assistant\n<think>\n"), ("plan", "Tokyo."))
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""
