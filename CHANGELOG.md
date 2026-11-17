@@ -7,6 +7,17 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.163 - 2026-11-17
+
+Qwen3.5-9B QSA in the one-command setup (the engine is unchanged; outputs as in v1.3.162).
+
+- `./setup-deepseek.sh --model qwen35-9b-qsa` (Windows: `setup-deepseek.bat --model qwen35-9b-qsa`) downloads
+  zephel01/Qwen3.5-9B-QSA-GGUF (Q4_K_M by default, `--quant Q8_0`), checks its SHA-256, packs it and writes the config.
+  The whole file runs in VRAM: an 11 GB+ GPU holds a 128K context (measured with the GPU capped at 11 GB: peak
+  10.68 GB, same speed); Q8_0 is counted at +4.0 GB (its larger file; not measured). A smaller GPU stops before the
+  download. Contexts above 128K are capped at 128K (not measured). Drafts use the file's own NextN block; text only.
+- The "not enough VRAM" message names each model's own minimum (the FFN-in-RAM advice only for Qwen3.8-27B).
+
 ## v1.3.162 - 2026-11-17
 
 Qwen3.5-9B with QSA (sparse attention for long prompts), and a server settings fix (#50).
