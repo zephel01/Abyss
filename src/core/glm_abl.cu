@@ -12,8 +12,9 @@
 //          a residual that never holds the direction (Arditi et al.'s directional ablation).  The sites are
 //          abl_out() / abl_res(); the CPU lane's answer is then added before the next read (no hc3 fusion, no
 //          deferral), so the FFN output is complete when it is edited.
-// Files: "ABL1" | "ABL2", int32 n_embd, rank, layers, float32 Q [n_embd][rank] row-major, strengths [layers][2], and
-// (ABL2) a float32 embedding strength.
+// Files: "ABL1" | "ABL2" | "ABL3", int32 n_embd, rank, layers, float32 Q [n_embd][rank] row-major, (ABL3) float32
+// scale[rank] - each direction's own factor on top of the layer's strength -, strengths [layers][2], and (ABL2 / ABL3)
+// a float32 embedding strength.  ABL3 is an ABL2 edit whose directions are taken out by different amounts.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -21,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -73,21 +75,31 @@ bool Glm5Model::abl_load(const std::string& path, std::string& err) {
     int32_t hd[3];
     std::vector<float> q, s;
     float emb = 0.0f;
-    bool ok = std::fread(magic, 1, 4, f) == 4 && (std::memcmp(magic, "ABL1", 4) == 0 || std::memcmp(magic, "ABL2", 4) == 0) &&
+    bool ok = std::fread(magic, 1, 4, f) == 4 &&
+              (std::memcmp(magic, "ABL1", 4) == 0 || std::memcmp(magic, "ABL2", 4) == 0 || std::memcmp(magic, "ABL3", 4) == 0) &&
               std::fread(hd, 4, 3, f) == 3 && hd[0] == (int32_t) g.n_embd && hd[1] >= 1 && hd[1] <= 4 && hd[2] >= 1 &&
               hd[2] <= 1024;
-    const bool full = ok && magic[3] == '2';
+    const bool full = ok && magic[3] != '1', per_dir = ok && magic[3] == '3';
+    std::vector<float> ds;   // ABL3: each direction's own scale
     if (ok) {
         q.resize((size_t) hd[0] * hd[1]);
         s.resize((size_t) hd[2] * 2);
-        ok = std::fread(q.data(), 4, q.size(), f) == q.size() && std::fread(s.data(), 4, s.size(), f) == s.size() &&
-             (!full || std::fread(&emb, 4, 1, f) == 1);
+        ds.assign((size_t) hd[1], 1.0f);
+        ok = std::fread(q.data(), 4, q.size(), f) == q.size() &&
+             (!per_dir || std::fread(ds.data(), 4, ds.size(), f) == ds.size()) &&
+             std::fread(s.data(), 4, s.size(), f) == s.size() && (!full || std::fread(&emb, 4, 1, f) == 1);
+        for (float c : ds) ok = ok && c >= 0.0f && c <= 16.0f;
     }
     std::fclose(f);
     if (!ok) {
-        err = "abl: " + path + " is not an ABL1 / ABL2 file for n_embd " + std::to_string(g.n_embd);
+        err = "abl: " + path + " is not an ABL1 / ABL2 / ABL3 file for n_embd " + std::to_string(g.n_embd);
         return false;
     }
+    // ABL3: w - s * sum_j c_j q_j (q_j . w) is the same projection with column j of Q times sqrt(c_j) (the kernel takes
+    // any Q: its two products with Q give c_j); ABL1 / ABL2 files are uploaded as they are
+    if (per_dir)
+        for (size_t i = 0; i < (size_t) hd[0]; ++i)
+            for (int j = 0; j < hd[1]; ++j) q[i * (size_t) hd[1] + (size_t) j] *= std::sqrt(ds[(size_t) j]);
     if (!abl_set(q, hd[1], s, emb, err)) return false;
     for (Glm5Model* m = this; m != nullptr && m->fast_ != nullptr; m = m->split_next_.get()) m->fast_->abl_full = full;
     int na = 0, nf = 0;
@@ -96,9 +108,9 @@ bool Glm5Model::abl_load(const std::string& path, std::string& err) {
         nf += s[(size_t) l * 2 + 1] != 0.0f;
     }
     if (full)
-        std::fprintf(stderr, "glm fast: uncensored (%s): the refusal direction (rank %d) out of every residual write - "
+        std::fprintf(stderr, "glm fast: uncensored (%s): the refusal direction (rank %d%s) out of every residual write - "
                              "the embedding%s, the attention outputs of %d layers, the FFN outputs of %d\n",
-                     path.c_str(), hd[1], emb != 0.0f ? "" : " (not)", na, nf);
+                     path.c_str(), hd[1], per_dir ? ", a scale a direction" : "", emb != 0.0f ? "" : " (not)", na, nf);
     else
         std::fprintf(stderr, "glm fast: refusal-direction edit at run time (%s): rank %d, attention outputs of %d layers, "
                              "shared-expert outputs of %d\n", path.c_str(), hd[1], na, nf);

@@ -346,6 +346,7 @@ struct Options {
     float abl_smax = 2.0f;     ///< --abl-smax S: the profile's strongest peak
     std::string abl_profile;   ///< --abl-profile DI,P,W,SA,SF,F: write this profile (no search)
     std::string abl_dump;      ///< --abl-dump F: every measured prompt's capture to F (H then B), then stop
+    std::vector<float> abl_dir_scales;   ///< --abl-dir-scales C1,..: each written direction's own scale (an ABL3 file)
 };
 
 void usage() {
@@ -437,6 +438,7 @@ void usage() {
                  "                       --abl-search N: N trials of a per-layer strength profile (a bump over the\n"
                  "                       depth, an interpolated direction) - the fewest refusals, then the least KL on\n"
                  "                       the T lines' text; --abl-target G, --abl-smax S (2), --abl-profile DI,P,W,SA,SF,F\n"
+                 "                       --abl-dir-scales C1,..: each written direction's own scale (an ABL3 file)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -1145,6 +1147,25 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
     };
     const auto t0 = std::chrono::steady_clock::now();
     const auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    // the file: ABL2, or ABL3 with --abl-dir-scales (each direction's own scale after Q; one a written direction)
+    const auto write_abl = [&](std::FILE* f, const std::vector<float>& q, int rank, const std::vector<float>& st, float emb) {
+        const bool per_dir = !o.abl_dir_scales.empty();
+        if (per_dir && o.abl_dir_scales.size() != (size_t) rank) {
+            std::fprintf(stderr, "abl build: --abl-dir-scales gives %zu scales for the %d directions written\n",
+                         o.abl_dir_scales.size(), rank);
+            std::fclose(f);
+            return false;
+        }
+        const int32_t hd[3] = {(int32_t) E, rank, (int32_t) L};
+        std::fwrite(per_dir ? "ABL3" : "ABL2", 1, 4, f);
+        std::fwrite(hd, 4, 3, f);
+        std::fwrite(q.data(), sizeof(float), q.size(), f);
+        if (per_dir) std::fwrite(o.abl_dir_scales.data(), sizeof(float), o.abl_dir_scales.size(), f);
+        std::fwrite(st.data(), sizeof(float), st.size(), f);
+        std::fwrite(&emb, sizeof(float), 1, f);
+        std::fclose(f);
+        return true;
+    };
     const size_t slots = (size_t) L + 1;
     std::vector<float> dirs(slots * E);
     if (!o.abl_dirs.empty()) {   // (an earlier build's directions: the candidates only)
@@ -1533,13 +1554,7 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
         make(bx, q, s, emb);
         std::FILE* f = std::fopen(o.abl_build.c_str(), "wb");
         if (f == nullptr) { std::fprintf(stderr, "abl build: cannot write %s\n", o.abl_build.c_str()); return 1; }
-        const int32_t hd[3] = {(int32_t) E, 1, (int32_t) L};
-        std::fwrite("ABL2", 1, 4, f);
-        std::fwrite(hd, 4, 3, f);
-        std::fwrite(q.data(), sizeof(float), q.size(), f);
-        std::fwrite(s.data(), sizeof(float), s.size(), f);
-        std::fwrite(&emb, sizeof(float), 1, f);
-        std::fclose(f);
+        if (!write_abl(f, q, 1, s, emb)) return 2;
         std::printf("ABL chose dir %.2f peak %.1f width %.1f attn %.3f ffn %.3f floor %.3f (refused %d of %d, text KL %.5f, "
                     "harmless KL %.4f; --abl-profile %.4f,%.3f,%.3f,%.4f,%.4f,%.4f) -> %s\n", bx.di, bx.p, bx.w, bx.sa, bx.sf,
                     bx.f, br.g, nH, br.tkl, br.bkl, bx.di, bx.p, bx.w, bx.sa, bx.sf, bx.f, o.abl_build.c_str());
@@ -1614,14 +1629,7 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
     model.abl_clear();
     std::FILE* f = std::fopen(o.abl_build.c_str(), "wb");
     if (f == nullptr) { std::fprintf(stderr, "abl build: cannot write %s\n", o.abl_build.c_str()); return 1; }
-    const int32_t hd[3] = {(int32_t) E, rank, (int32_t) L};
-    const float emb = o.abl_scale;
-    std::fwrite("ABL2", 1, 4, f);
-    std::fwrite(hd, 4, 3, f);
-    std::fwrite(Q.data(), sizeof(float), Q.size(), f);
-    std::fwrite(strengths.data(), sizeof(float), strengths.size(), f);
-    std::fwrite(&emb, sizeof(float), 1, f);
-    std::fclose(f);
+    if (!write_abl(f, Q, rank, strengths, o.abl_scale)) return 2;
     std::string names;
     for (int l : layers) names += (names.empty() ? "" : "+") + std::to_string(l);
     std::printf("ABL chose layer %s (rank %d, scale %.2f: refusal mass %.4f, harmless KL %.4f) -> %s%s\n", names.c_str(), rank,
@@ -3765,6 +3773,18 @@ int main(int argc, char** argv) {
         else if (a == "--abl-smax") o.abl_smax = std::max(0.1f, (float) std::atof(next("--abl-smax")));
         else if (a == "--abl-profile") o.abl_profile = next("--abl-profile");
         else if (a == "--abl-dump") o.abl_dump = next("--abl-dump");
+        else if (a == "--abl-dir-scales") {
+            std::string v = next("--abl-dir-scales");
+            for (size_t p0 = 0; p0 <= v.size();) {
+                const size_t p1 = std::min(v.find(',', p0), v.size());
+                o.abl_dir_scales.push_back((float) std::atof(v.substr(p0, p1 - p0).c_str()));
+                p0 = p1 + 1;
+            }
+            if (o.abl_dir_scales.empty() || o.abl_dir_scales.size() > 4) {
+                std::fprintf(stderr, "--abl-dir-scales: 1 to 4 scales, C1,C2,..\n");
+                std::exit(2);
+            }
+        }
         else if (a == "--abl-range") {
             const char* v = next("--abl-range");
             if (std::sscanf(v, "%lf,%lf", &o.abl_lo, &o.abl_hi) != 2 || o.abl_lo < 0.0 || o.abl_hi > 1.0 || o.abl_lo > o.abl_hi) {

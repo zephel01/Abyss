@@ -151,6 +151,9 @@ What it does:
 | `--abl-rank N` | 1 | also try the best N directions together (1-4) |
 | `--abl-scale S` | 1 | strength: 1 takes the component out, above 1 over-projects |
 | `--abl-dirs F` | – | reuse an earlier build's `.dirs`: skips the measurement, ~10 minutes to try other settings |
+| `--abl-dir-scales C1,..` | – | each written direction's own scale on top of the layer strengths (an ABL3 file, one scale a direction) |
+| `--abl-search N` | 0 | experimental: N trials of a per-layer strength profile instead of one strength (needs `T` lines - `abl_prompts.py --text` - and `--abl-gen`). On V4 0731 and GLM-5.3 it did not beat the uniform pick on held-out prompts |
+| `--abl-dump F` | – | write every measured prompt's captured residuals to F and stop (for per-category directions) |
 
 The log, one line a candidate (V4 0731, abridged):
 
@@ -284,12 +287,15 @@ and orcarouter's Qwen3.8-Flash-Next-Uncensored.
 Little-endian:
 
 ```
-char[4]  "ABL1" | "ABL2"
+char[4]  "ABL1" | "ABL2" | "ABL3"
 int32    n_embd, rank, layers
 float32  Q[n_embd][rank]          row-major, orthonormal columns
+float32  scale[rank]              ABL3 only: each direction's own factor
 float32  strength[layers][2]      per layer: ABL1 attention, shared expert / ABL2 attention, whole FFN
-float32  embedding strength       ABL2 only
+float32  embedding strength       ABL2 / ABL3
 ```
 
 ABL1 edits the attention and the shared expert's outputs (an abliteration's own edit); ABL2 edits every residual
-write. A file whose `n_embd` differs from the model's is refused at start.
+write; ABL3 is ABL2 with a scale a direction - a write w becomes w - s · Σ c_j q_j (q_jᵀ w), so a second direction
+(for example the medical / legal / financial advice refusals') can be taken out less than the first.  ABL1 and ABL2
+files load as before. A file whose `n_embd` differs from the model's is refused at start.

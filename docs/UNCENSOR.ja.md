@@ -162,6 +162,9 @@ build/abyss --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-pro
 | `--abl-rank N` | 1 | 上位 N 本の方向を組み合わせたものも試す（1〜4） |
 | `--abl-scale S` | 1 | 強さ。1 で成分をちょうど取り除き、1 より上は引きすぎる |
 | `--abl-dirs F` | – | 前回の `.dirs` を使い回す。測定を飛ばすので、別の設定を 10 分ほどで試せる |
+| `--abl-dir-scales C1,..` | – | 書き出す方向ごとの係数（層の強さに掛かる）。ABL3 のファイルになる。方向 1 本に 1 つ |
+| `--abl-search N` | 0 | 試験的: 一律の強さの代わりに、層ごとの強さの形を N 回試す（`T` 行（`abl_prompts.py --text`）と `--abl-gen` が必要）。V4 0731 と GLM-5.3 では、held-out の問題で一律の選び方を上回らなかった |
+| `--abl-dump F` | – | 測定した各プロンプトの残差を F に書いて終わる（カテゴリ別の方向用） |
 
 ログは候補ごとに 1 行です（V4 0731、抜粋）:
 
@@ -309,12 +312,15 @@ UD-IQ1_S での結果:
 リトルエンディアンです。
 
 ```
-char[4]  "ABL1" | "ABL2"
+char[4]  "ABL1" | "ABL2" | "ABL3"
 int32    n_embd, rank, layers
 float32  Q[n_embd][rank]          行優先、列が正規直交
+float32  scale[rank]              ABL3 のみ: 方向ごとの係数
 float32  strength[layers][2]      層ごと: ABL1 は attention と共有エキスパート、ABL2 は attention と FFN 全体
-float32  埋め込みの強さ            ABL2 のみ
+float32  埋め込みの強さ            ABL2 / ABL3
 ```
 
 ABL1 は attention と共有エキスパートの出力を編集します（abliteration 自身の編集）。ABL2 は残差への書き込みすべてを編集します。
+ABL3 は ABL2 に方向ごとの係数を足したものです。書き込み w は w - s · Σ c_j q_j (q_jᵀ w) になるので、2 本目の方向（たとえば医療・法律・金融の助言の拒否の方向）を 1 本目より弱く外せます。
+ABL1 と ABL2 のファイルは、これまでどおり読み込めます。
 `n_embd` がモデルと違うファイルは、起動時に読み込みを断ります。
