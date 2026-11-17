@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.168 - 2026-11-17
+
+MiMo-V2.6-Distill-Qwen-9B in the one-command setup, with Qwen3.5-9B's NextN block as its drafter; the server reads a
+`<think>` the model writes itself (the engine is unchanged; outputs as in v1.3.167).
+
+- Server: a chat template that leaves `<think>` to the model (MiMo v2.6's ends the prompt at `<|im_start|>assistant\n`)
+  had `reasoning_content` start with the text `<think>`, and a client sending the turn back got `<think><think>` in the
+  prompt. When the prompt's last tokens do not open the reasoning, the answer's first token is now checked: `<think>` is
+  dropped, anything else starts the answer as content. Templates that open `<think>` themselves (Qwen, Ornith, GLM,
+  Laguna, DeepSeek) are unchanged.
+- `./setup-deepseek.sh --model mimo-9b` (Windows: `setup-deepseek.bat --model mimo-9b`) downloads
+  bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF (Q4_K_M by default, `--quant Q8_0`), checks its SHA-256, packs it and writes
+  the config (sampling from the GGUF: temperature 0.6, top_p 0.95, top_k 20). Same shapes and GPU peaks as Qwen3.5-9B, so
+  Qwen3.5-9B QSA's GPU table: an 11 GB+ GPU for up to 128K (a VRAM cap was not measured on MiMo). Text only.
+- The files have no NextN block. Qwen3.5-9B's own block (blk.32 of its Q4_K_M, 0.16 GB) drafts for MiMo: the setup
+  fetches it into `MTP/` beside the GGUF, where the engine takes it by itself; when it cannot, MiMo runs with n-gram
+  drafts only.
+- RTX 5090, Q4_K_M, chat prompt + 256 tokens, 2 runs each (identical): decode 217 / 186 tok/s at 4K / 32K with n-gram
+  drafts, 273 / 228 with the borrowed block (76-78% accepted), Qwen3.5-9B with its own 313 / 247 (83-87%); prompts
+  7,900-9,100 tok/s for all three. 128K: decode 117.5 / 126.0 tok/s, prompt 6,322 / 6,156. GPU peaks 11.17 GB at 32K,
+  14.27 GB at 128K (15.11 with the block).
+
 ## v1.3.167 - 2026-11-17
 
 GLM-5.3-Flash: the verify window with n-gram drafts is pipelined and on by default on NVIDIA cards with 24 GB or more.

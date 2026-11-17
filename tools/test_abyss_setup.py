@@ -11,6 +11,7 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.error
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
@@ -95,7 +96,7 @@ class PickQuant(unittest.TestCase):
         self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
 
     def test_models_without_pc_sizes(self):
-        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa"):
+        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa", "mimo-9b"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
     def test_no_gpu(self):
@@ -618,6 +619,78 @@ class OrnithNineBQsa(Qwen35NineBQsa):
         self.assertEqual(got["args"][got["args"].index("--max-context") + 1], "131072")
         self.assertNotIn("env", got)
         self.assertNotIn("vision", got)
+
+
+class MimoNineB(Qwen35NineBQsa):
+    """--model mimo-9b (bartowski's MiMo-V2.6-Distill-Qwen-9B GGUFs): the checks of Qwen3.5-9B QSA (same shapes, same
+    VRAM table) with bartowski's repo and file names, and Qwen3.5-9B's NextN block borrowed into MTP/ - or no draft
+    block, without stopping, when its repo does not have it"""
+    KEY = "mimo-9b"
+
+    def test_the_entry(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual((m["repo"], m["quant"], m["quants"]),
+                         ("bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF", "Q4_K_M", ("Q4_K_M", "Q8_0")))
+        self.assertEqual(m["env"], {})
+        self.assertEqual(m["vram_ctx"], A.MODELS["qwen35-9b-qsa"]["vram_ctx"])
+        self.assertEqual(m["gpu_min"], 11)
+        self.assertEqual(m["sampling"], {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+
+    def test_the_context_a_gpu_holds(self):
+        f = A.dense_context
+        self.assertEqual(f(self.KEY, 11.99, 131072), 131072)
+        self.assertIsNone(f(self.KEY, 9.99, 8192))
+        self.assertAlmostEqual(A.dense_need(self.KEY, 32768, "Q8_0"), 11.0 + 9.55 - 5.84)
+        self.assertEqual(f(self.KEY, 15.92, 131072, "Q8_0"), 131072)
+        self.assertIsNone(f(self.KEY, 11.99, 8192, "Q8_0"))
+
+    def test_the_file_and_the_config(self):
+        m = A.MODELS[self.KEY]
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "MiMo-V2.6-Distill-Qwen-9B-Q4_K_M.gguf", "MiMo-V2.6-Distill-Qwen-9B-Q4_K_L.gguf",
+            "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", "MiMo-V2.6-Distill-Qwen-9B-imatrix.gguf",
+            "mmproj-MiMo-V2.6-Distill-Qwen-9B-f16.gguf", "README.md")]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        for q in m["quants"]:
+            with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+                got = A.quant_files(q, m["repo"], m["folder"], m["prefix_tmpl"].format(q=q))
+            self.assertEqual([g[0] for g in got], [f"MiMo-V2.6-Distill-Qwen-9B-{q}.gguf"])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("mimo-9b-q4_k_m", Path(d) / "pack", 131072, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("MiMo-V2.6-Distill-Qwen-9B", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "mimo-v2.6-distill-qwen-9b")
+        self.assertEqual(got["sampling"], {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+        self.assertNotIn("env", got)
+
+    def test_the_borrowed_draft_block(self):
+        body = b"block"
+        sha = hashlib.sha256(body).hexdigest()
+        items = [{"type": "file", "path": A.MIMO9_MTP, "size": len(body), "lfs": {"oid": sha}}]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        a = Namespace(download_model=True, yes=True)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A.S, "say"), mock.patch.object(A.S, "ok"), \
+                mock.patch.object(A.urllib.request, "urlopen", return_value=R()), \
+                mock.patch.object(A.S, "download", side_effect=lambda url, dst, name: Path(dst).write_bytes(body)) as dl:
+            got = A.borrowed_mtp(a, A.MIMO9_MTP_REPO, A.MIMO9_MTP, Path(d), "MiMo")
+            self.assertEqual(got, Path(d) / "MTP" / A.MIMO9_MTP)       # (where the engine takes it by itself)
+            self.assertIn(A.MIMO9_MTP_REPO, dl.call_args[0][0])
+            self.assertEqual(got.read_bytes(), body)
+
+    def test_no_draft_block_does_not_stop(self):
+        said = []
+        a = Namespace(download_model=True, yes=True)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A.S, "ok", side_effect=lambda *x: said.append(x[0])), \
+                mock.patch.object(A.urllib.request, "urlopen", side_effect=urllib.error.HTTPError("u", 404, "nf", {}, None)):
+            got = A.borrowed_mtp(a, A.MIMO9_MTP_REPO, A.MIMO9_MTP, Path(d), "MiMo")
+        self.assertIsNone(got)
+        self.assertIn("runs without it", said[-1])
 
 
 class TestVariants(unittest.TestCase):

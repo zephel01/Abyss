@@ -13,6 +13,7 @@
     ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for an 8 GB+ GPU (FFN partly in RAM under ~20 GB)
     ./setup-deepseek.sh --model qwen35-9b-qsa  Qwen3.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model ornith-9b-qsa  Ornith-1.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
+    ./setup-deepseek.sh --model mimo-9b     MiMo-V2.6-Distill-Qwen-9B (dense, bartowski's Q4_K_M) for an 11 GB+ GPU
     ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
                                              16G64G (the default) or 24G64G
@@ -101,6 +102,18 @@ QSA9_QUANTS = {"Q4_K_M": (5.85, True), "Q8_0": (9.86, True)}   # (GB; each file 
 # Ornith-1.5-9B QSA ("ornith-9b-qsa") has the same shapes, indexer layout and uncapped peaks (GPU 11.17 / 12.40 / 14.86 GB at
 # 32K / 64K / 128K) as Qwen3.5-9B QSA, so it uses QSA9_VRAM / gpu_min 11 from Qwen3.5-9B QSA's capped run (a VRAM cap was not
 # measured on Ornith itself).  Files: Q4_K_M 5,853,504,192 bytes, Q8_0 9,859,474,112 bytes
+# MiMo-V2.6-Distill-Qwen-9B ("mimo-9b", v1.3.168): Xiaomi's SFT of Qwen3.5-9B (MIT), bartowski's GGUFs.  Same shapes as
+# Qwen3.5-9B, no NextN block in the files.  Measured on an RTX 5090, Q4_K_M, no cap (bench/mimo9b/results.md,
+# 2026-11-17): GPU peaks 11.17 / 14.27 GB at 32K / 128K (15.11 GB at 128K with the borrowed draft block) - the same
+# as Qwen3.5-9B's (11.33 GB at 32K), so the table is QSA9_VRAM (Qwen3.5-9B's 11 GB cap at 128K; a cap was not measured
+# on MiMo itself).  Q8_0 is not measured: dense_shift adds its size.  Files: Q4_K_M 5,841,049,120 bytes, Q8_0
+# 9,545,979,424 bytes
+MIMO9_QUANTS = {"Q4_K_M": (5.84, True), "Q8_0": (9.55, True)}
+# the draft block: Qwen3.5-9B's own NextN block (blk.32 of Qwen's Q4_K_M, 0.16 GB, Apache-2.0) drafts for MiMo with 76-78%
+# accepted (decode 217 -> 273 tok/s at 4K, 186 -> 228 at 32K; without it MiMo drafts with n-grams only).  Fetched into
+# MTP/ beside the GGUF, where the engine takes it by itself; when the repo does not have it (yet), MiMo runs without it
+MIMO9_MTP_REPO = "zephel01/MiMo-V2.6-Distill-Qwen-9B-MTP-GGUF"
+MIMO9_MTP = "mtp-Qwen3.5-9B-Q4_K_M.gguf"
 # the models this setup installs: the repo, its default quant (a folder of the repo), the quants it offers when the repo
 # is a fixed set, the config's model_name, the config name's prefix, the env the model's measurements were made with,
 # the experts' size in GB at the default quant (for the RAM line)
@@ -186,6 +199,15 @@ MODELS = {
                       "title": "Ornith-1.5-9B QSA", "env": {}, "gb": 6, "pack_args": [],
                       "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
                       "vram_ctx": QSA9_VRAM, "gpu_min": 11},
+    # MiMo-V2.6-Distill-Qwen-9B (v1.3.168): bartowski's GGUFs, one file a quant at the repo's top level; the chat template
+    # (MiMo v2.6's: the model opens <think> itself) and the sampling (temperature 0.6, top_p 0.95, top_k 20) are the
+    # GGUF's.  Drafts with Qwen3.5-9B's NextN block (MIMO9_MTP) when it can be fetched.  Text only
+    "mimo-9b": {"repo": "bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF", "quant": "Q4_K_M", "quants": tuple(MIMO9_QUANTS),
+                "quant_gb": MIMO9_QUANTS, "picks": tuple(MIMO9_QUANTS), "folder": "",
+                "prefix_tmpl": "MiMo-V2.6-Distill-Qwen-9B-{q}.", "model_name": "mimo-v2.6-distill-qwen-9b",
+                "prefix": "mimo-9b", "title": "MiMo-V2.6-Distill-Qwen-9B", "env": {}, "gb": 6, "pack_args": [],
+                "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+                "vram_ctx": QSA9_VRAM, "gpu_min": 11},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -850,6 +872,39 @@ def side_file(a, repo: str, path: str, mdir: Path, what: str) -> Path:
     return dst
 
 
+def borrowed_mtp(a, repo: str, fname: str, mdir: Path, title: str) -> Path | None:
+    """A draft block from another repo (MiMo-9B borrows Qwen3.5-9B's NextN block): into MTP/ beside the GGUF, where the
+    engine takes it by itself (size and SHA-256 from Hugging Face's file list, checked like the model's files).  None,
+    with a note, when the repo does not have it or cannot be read: the model then runs without it (n-gram drafts)."""
+    dst = mdir / "MTP" / fname
+    try:
+        req = urllib.request.Request(HF_TREE.format(repo=repo, folder=""), headers={"User-Agent": "abyss-setup"})
+        items = json.load(urllib.request.urlopen(req, timeout=60))
+        got = [(int(i["size"]), (i.get("lfs") or {}).get("oid", "")) for i in items
+               if i.get("type") == "file" and i.get("path") == fname]
+    except (OSError, ValueError):
+        got = []
+    if not got:
+        if dst.exists():
+            S.ok(f"draft block: {dst} (already here; {repo} cannot be read now)")
+            return dst
+        S.ok(f"draft block: not available ({repo}/{fname} cannot be read) - {title} runs without it "
+             "(n-gram drafts only: ~20-25% slower decode); setup again fetches it once it is there")
+        return None
+    size, sha = got[0]
+    if not dst.exists() or dst.stat().st_size != size:
+        S.say(f"  the draft block: {repo}/{fname}, {size / 1e9:.2f} GB")
+        if not a.download_model and S.ask("  Download it now?", ["y", "n"], "y", a.yes) != "y":
+            S.ok(f"draft block: not downloaded - {title} runs without it (setup again asks)")
+            return None
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        S.download(HF_FILE.format(repo=repo, path=fname), dst, dst.name)
+    if dst.stat().st_size != size or (sha and not verified(dst, sha)):
+        S.fail(f"{dst.name} does not match Hugging Face's size / SHA-256", "delete it and run again")
+    S.ok(f"draft block: MTP/{fname} checked")
+    return dst
+
+
 def vision_27b_step(a, repo: str, mdir: Path, gguf: Path, cfg: Path, gpus, backend: str, resident: bool = False) -> None:
     """Qwen3.8-27B reads images: unsloth's mmproj-F16.gguf (0.93 GB) and strata-vision (llama.cpp's image library,
     built once like ./abyss.sh's for GLM-5.3-Flash) - asked, default yes; the config's "vision" entry names them (the
@@ -896,10 +951,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa: Q4_K_M (default) or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b: Q4_K_M (default) or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1044,6 +1099,8 @@ def main() -> int:
     mtp = None
     if (model.get("quant_gb") or {}).get(quant, (0, True))[1] is False:
         mtp = side_file(a, repo, DENSE27_MTP, mdir, "the NextN draft block (this file has none)")
+    if a.model == "mimo-9b":
+        mtp = borrowed_mtp(a, MIMO9_MTP_REPO, MIMO9_MTP, mdir, model["title"])
 
     S.step(5, "the pack")
     pack = mdir / ("pack-dsv4" if a.model == "v4" else "pack")
@@ -1110,7 +1167,9 @@ def main() -> int:
              else (" (Qwen3.8-27B drafts with unsloth's separate NextN block, MTP/)" if mtp else
                    " (Qwen3.8-27B drafts with its own NextN block from the file)") if a.model == "qwen38-27b"
              else " (Qwen3.5-9B QSA drafts with its own NextN block from the file)" if a.model == "qwen35-9b-qsa"
-             else " (Ornith-1.5-9B QSA drafts with its own NextN block from the file)" if a.model == "ornith-9b-qsa" else ""))
+             else " (Ornith-1.5-9B QSA drafts with its own NextN block from the file)" if a.model == "ornith-9b-qsa"
+             else (" (MiMo-V2.6-Distill-Qwen-9B drafts with Qwen3.5-9B's NextN block, MTP/)" if mtp else
+                   " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model == "mimo-9b" else ""))
     if a.model == "qwen38":
         dflash_step(a, data, cfg, gpus)
     if a.model == "qwen38-27b":

@@ -103,7 +103,13 @@ no images (the file has no image projector). `--model ornith-9b-qsa` is the same
 ./setup-deepseek.sh --model qwen35-9b-qsa --context 131072 --download-model   # the same, 128K context
 ./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M (5.9 GB), 64K context
 ./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # the same, 128K context
+./setup-deepseek.sh --model mimo-9b --download-model                          # MiMo-V2.6-Distill-Qwen-9B-Q4_K_M (5.8 GB), 64K context
 ```
+
+`--model mimo-9b` (v1.3.168) installs Xiaomi's [MiMo-V2.6-Distill-Qwen-9B](#mimo-v26-distill-qwen-9b) from bartowski's GGUFs
+(Q4_K_M 5.8 GB by default, `--quant Q8_0` 9.5 GB), with the same GPU table as Qwen3.5-9B QSA (same shapes, same peaks; a VRAM cap
+was not measured on MiMo). Its files have no NextN block: the setup also fetches Qwen3.5-9B's (0.16 GB) into `MTP/` beside the
+GGUF when it can, and without it MiMo drafts with n-grams only (~20-25% slower decode).
 
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
 card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
@@ -911,6 +917,31 @@ file's own NextN block. Everything in [Qwen3.5-9B QSA](#qwen35-9b-qsa) applies (
 - **Quality**: KL against dense at 128K 0.141 (Q4_K_M; Qwen3.5-9B QSA 0.032). The quant-only KL is 0.318 against Qwen's 0.072, the
   same ratio (0.44): Ornith itself is more sensitive at 128K. Needle at 125K: 4/4.
 - The file does not load in llama.cpp (the indexer tensors), as with Qwen3.5-9B QSA.
+
+## MiMo-V2.6-Distill-Qwen-9B
+
+Xiaomi's [MiMo-V2.6-Distill-Qwen-9B](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B) (an SFT of Qwen3.5-9B, MIT;
+the same architecture, shapes and tokenizer) runs from [bartowski's GGUFs](https://huggingface.co/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF)
+on the dense qwen35 path. From v1.3.168 `./setup-deepseek.sh --model mimo-9b` installs it (Q4_K_M by default, or Q8_0;
+the sampling is the GGUF's: temperature 0.6, top_p 0.95, top_k 20). Text only.
+
+- **Chat template**: MiMo v2.6's. It ends the prompt at `<|im_start|>assistant\n` and the model opens `<think>` itself; from
+  v1.3.168 the server takes that first `<think>` as the start of the reasoning (before, `reasoning_content` began with the text
+  `<think>`). Tool calls (`<tool_call><function=...>`) come back as `tool_calls`, also streamed; `enable_thinking: false` works.
+- **Drafts**: the files have no NextN block. Qwen3.5-9B's own block drafts for MiMo: 76-78% of drafts accepted (Qwen3.5-9B
+  with its own block: 83-87%). The engine takes a GGUF holding only that block from `MTP/` beside the model's GGUF (the setup
+  puts it there), or from `STRATA_GLM_MTP_GGUF=<file>`.
+- **Speed** (RTX 5090, Q4_K_M, chat prompt + 256 tokens, 2 runs each, the same outputs in both):
+
+  | | 4K decode | 32K decode | 4K / 32K prompt |
+  |---|---|---|---|
+  | MiMo, no draft block (n-gram drafts) | 217 tok/s | 186 tok/s | 8,335 / 9,031 tok/s |
+  | MiMo with Qwen3.5-9B's block | 273 tok/s | 228 tok/s | 7,914 / 8,688 tok/s |
+  | Qwen3.5-9B Q4_K_M with its own block | 313 tok/s | 247 tok/s | 7,879 / 8,740 tok/s |
+
+  At a 128K prompt: decode 117.5 tok/s without the block, 126.0 with it; prompt 6,322 / 6,156 tok/s.
+- **Memory** (uncapped): peak GPU memory 11.17 GB at a 32K context, 14.27 GB at 128K (15.11 GB with the draft block); host RAM 7.1 GB.
+  The same as Qwen3.5-9B's, so the setup uses Qwen3.5-9B QSA's GPU table (11 GB for up to 128K, measured with that cap on Qwen).
 
 ## Laguna-S-2.1
 

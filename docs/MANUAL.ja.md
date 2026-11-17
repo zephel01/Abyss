@@ -100,7 +100,13 @@ QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BET
 ./setup-deepseek.sh --model qwen35-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
 ./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
 ./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
+./setup-deepseek.sh --model mimo-9b --download-model                          # MiMo-V2.6-Distill-Qwen-9B-Q4_K_M（5.8 GB）、文脈 64K
 ```
+
+`--model mimo-9b`（v1.3.168）は Xiaomi の [MiMo-V2.6-Distill-Qwen-9B](#mimo-v26-distill-qwen-9b) を bartowski の GGUF から入れます
+（既定は Q4_K_M 5.8 GB、`--quant Q8_0` で 9.5 GB）。GPU の表は Qwen3.5-9B QSA と同じです（形も最大値も同じ。MiMo では VRAM を制限した
+計測はしていません）。ファイルに NextN ブロックがないので、取れるときは Qwen3.5-9B のもの（0.16 GB）を GGUF の横の `MTP/` に
+取ってきます。ないときは n-gram の下書きだけで動きます（生成が 20〜25% ほど遅い）。
 
 zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
 から、モデルカードを測ったときの値にする。Qwen3.8 はシャードにある MTP 層で下書きする。V4 の自作版は単体 GPU では DSpark
@@ -859,6 +865,32 @@ Qwen3.5-9B と同じ。3 層は dense、top_k 4096）。ファイルは [zephel0
 - **品質**: 128K での dense との KL は 0.141（Q4_K_M。Qwen3.5-9B QSA は 0.032）。量子化だけの KL は 0.318 で Qwen の 0.072 に対し、
   比は同じ（0.44）。Ornith 自体が 128K で敏感なモデルです。125K のニードル: 4/4。
 - このファイルは llama.cpp では読み込めません（indexer テンソルのため。Qwen3.5-9B QSA と同じ）。
+
+## MiMo-V2.6-Distill-Qwen-9B
+
+Xiaomi の [MiMo-V2.6-Distill-Qwen-9B](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B)（Qwen3.5-9B の SFT、MIT。構造・形・
+トークナイザは同じ）を、[bartowski の GGUF](https://huggingface.co/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF) から dense の qwen35 経路で動かします。
+v1.3.168 から `./setup-deepseek.sh --model mimo-9b` で入れられます（既定は Q4_K_M、ほかに Q8_0。サンプリングは GGUF の値:
+temperature 0.6、top_p 0.95、top_k 20）。文字だけです。
+
+- **チャットテンプレート**: MiMo v2.6 のもの。プロンプトは `<|im_start|>assistant\n` で終わり、`<think>` はモデル自身が書きます。
+  v1.3.168 から、サーバーはこの最初の `<think>` を reasoning の始まりとして扱います（それまでは `reasoning_content` の先頭に
+  `<think>` の文字が入っていました）。ツール呼び出し（`<tool_call><function=...>`）は `tool_calls` で返り、ストリーミングでも
+  返ります。`enable_thinking: false` も使えます。
+- **下書き**: ファイルに NextN ブロックはありません。Qwen3.5-9B 自身のブロックが MiMo の下書きに使え、採用率は 76〜78%
+  （Qwen3.5-9B 自身のファイルでは 83〜87%）。そのブロックだけを入れた GGUF を、モデルの GGUF の横の `MTP/` に置けば
+  エンジンが自分で使います（セットアップがそこに置きます）。`STRATA_GLM_MTP_GGUF=<ファイル>` でも指定できます。
+- **速度**（RTX 5090、Q4_K_M、チャットのプロンプト + 256 トークン、各 2 回。2 回とも同じ出力）:
+
+  | | 4K 生成 | 32K 生成 | 4K / 32K プロンプト |
+  |---|---|---|---|
+  | MiMo、下書きブロックなし（n-gram の下書き） | 217 tok/s | 186 tok/s | 8,335 / 9,031 tok/s |
+  | MiMo + Qwen3.5-9B のブロック | 273 tok/s | 228 tok/s | 7,914 / 8,688 tok/s |
+  | Qwen3.5-9B Q4_K_M（自分のブロック） | 313 tok/s | 247 tok/s | 7,879 / 8,740 tok/s |
+
+  128K のプロンプトでは、生成がブロックなし 117.5 tok/s、あり 126.0、プロンプトは 6,322 / 6,156 tok/s。
+- **メモリ**（制限なし）: GPU メモリの最大は文脈 32K で 11.17 GB、128K で 14.27 GB（下書きブロックありで 15.11 GB）。ホストの RAM は 7.1 GB。
+  Qwen3.5-9B と同じなので、セットアップは Qwen3.5-9B QSA の GPU の表（128K まで 11 GB。Qwen で制限して計測）を使います。
 
 ## Laguna-S-2.1
 
