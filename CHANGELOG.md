@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.165 - 2026-11-17
+
+More weight types on Abyss's own int8 tensor-core prompt GEMM (in place of llama.cpp's MMQ) on the RTX 5090 (sm_120).
+Prompts are as fast or faster; KL is unchanged (within run-to-run spread).
+
+- Now on by default for IQ4_XS, Q4_K, Q5_K and Q6_K experts, and for IQ4_XS, Q4_K, Q5_K and Q4_0 dense layers (with
+  the v1.3.161 types). Q8_0, a dense layer's Q6_K, MXFP4 / NVFP4 and the types not yet measured in a model (IQ3_S,
+  Q3_K, Q2_K, Q4_1, Q5_0) stay on MMQ. `STRATA_PROMPT_MMQ=1` = the old path; `STRATA_PROMPT_OWN_TYPES` picks types.
+- Prompt speed, MMQ -> own (tok/s, median of 3): Qwen3.8-27B L-Q4_0 4K 3,255 -> 3,632 (+11.6%), 32K 3,095 -> 3,393
+  (+9.7%), 128K 2,206 -> 2,340 (+6.1%); UD-Q4_K_XL 4K 3,104 -> 3,181 (+2.5%), 128K 2,130 -> 2,149; UD-Q6_K +0.4% to
+  0%; Ornith-35B 4K 8,068 -> 8,325 (+3.2%), 128K 5,941 -> 5,975; Ornith-122B the same (981 -> 979 at 4K, 2,317 ->
+  2,318 at 128K). The kernel's tile order also changes GLM / V4 / V4.1 prompts: 4K -0.1% to -0.7% (within spread),
+  16K and longer +0.3% to +5% (V4.1 JA256 128K 4,257 -> 4,476).
+- KL vs the token path (MMQ / own): Qwen3.8-27B UD-Q4_K_XL 0.0030 / 0.0004, Ornith-35B 0.0090 / 0.0108, Ornith-122B
+  0.0041 / 0.0036. Outputs: Ornith-35B and Ornith-122B change (another summation order); Qwen3.8, GLM, V4 and V4.1
+  are as in v1.3.164; with `STRATA_PROMPT_MMQ=1` all as before.
+
 ## v1.3.164 - 2026-11-17
 
 The engine program is renamed to `abyss`, and a prebuilt CUDA engine is attached to the release (trial). Outputs as in
