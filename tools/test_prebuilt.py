@@ -131,6 +131,11 @@ class Install(unittest.TestCase):
         self.assertFalse((build / ".prebuilt-unpack").exists())
         st = P.stamp_fields(man)
         self.assertEqual((st["prebuilt"], st["archs"], st["cuda"]), ("1.3.999", [86, 89, 120], "13.3"))
+        # installed for this checkout: not downloaded again, even when the release is an older version
+        with mock.patch.object(P, "version", return_value="1.4.0"):
+            self.assertTrue(P.current({**st, "prebuilt_for": "1.4.0"}))
+            self.assertFalse(P.current({**st, "prebuilt_for": "1.3.999"}))
+            self.assertFalse(P.current({"src": "x"}))          # a compiled engine
 
     def test_windows_zip(self):
         name = "abyss-engine-cuda-windows-x64.zip"

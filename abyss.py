@@ -1489,7 +1489,7 @@ def build_step(a, pc, llama: Path) -> dict:
             return meta
         return compile_engine_hip(pc, llama, src)
     if pc.get("prebuilt"):
-        if (EXE.exists() and not a.rebuild and meta.get("prebuilt") == P.version()
+        if (EXE.exists() and not a.rebuild and P.current(meta)
                 and set(pc["archs"]) <= set(meta.get("archs", []))):
             ok(f"prebuilt engine {meta['prebuilt']} already here: {EXE}")
             return meta
@@ -1518,8 +1518,8 @@ def install_prebuilt(src: str, gpu_ids, soft=False) -> dict | None:
         fail(msg, "check the internet connection and run it again, or install the CUDA toolkit and a C++ compiler "
                   "to compile it")
     if man.get("version") and man["version"] != P.version():
-        warn(f"the release has the engine of v{man['version']}, this checkout is v{P.version()}: an update "
-             f"({ME} after git pull) takes the matching one once it is released")
+        warn(f"the newest release with a prebuilt engine is v{man['version']}, this checkout is v{P.version()}: it runs "
+             "the engine of that release; after the next git pull the setup (and ./abyss.sh at a start) takes the matching one")
     meta = {"src": src, **P.stamp_fields(man), "gpu_ids": list(gpu_ids), "nvcc": None, "host_compiler": None,
             "lib_dirs": [str(BUILD)], "date": time.strftime("%Y-%m-%d %H:%M")}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
@@ -1537,7 +1537,7 @@ def refresh_engine(cfg: dict) -> None:
     if meta.get("src") == src:
         return
     if meta.get("prebuilt") and cfg.get("backend", "cuda") == "cuda":
-        if meta["prebuilt"] != P.version():
+        if not P.current(meta):
             say("  The engine's source changed (an update): the prebuilt engine of this version ...")
             install_prebuilt(src, meta.get("gpu_ids") or [0], soft=True)
         return

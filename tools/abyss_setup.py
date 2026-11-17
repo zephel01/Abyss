@@ -385,7 +385,7 @@ def prebuilt_engine(gpus) -> Path:
     import abyss as M   # noqa: E402  (constants and functions only)
     M.select_build_backend("cuda")
     meta = M.read_json(M.STAMP)
-    if M.EXE.exists() and meta.get("prebuilt") == P.version():
+    if M.EXE.exists() and P.current(meta):
         S.ok(f"prebuilt engine {meta['prebuilt']} already here: {M.EXE}")
         return M.EXE
     M.install_prebuilt(S.source_hash(S.ENGINE_SOURCES), [g["index"] for g in gpus])

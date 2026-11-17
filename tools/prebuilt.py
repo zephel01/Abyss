@@ -260,8 +260,15 @@ def install(dest: Path, ver: str | None = None, repo: str = REPO, log=print, dow
     return {**manifest, "sha256": sha, "asset": f"{base}/{name}"}
 
 
+def current(meta: dict) -> bool:
+    """The build stamp's prebuilt engine was installed for this checkout's version (the release's own version may be
+    older: the latest release, when this version has none yet) - nothing to download again."""
+    return bool(meta.get("prebuilt")) and (meta.get("prebuilt_for") or meta.get("prebuilt")) == version()
+
+
 def stamp_fields(manifest: dict) -> dict:
-    """What a setup records in its build stamp for a prebuilt engine."""
-    return {"prebuilt": manifest.get("version") or "?", "prebuilt_sha256": manifest.get("sha256"),
+    """What a setup records in its build stamp for a prebuilt engine ("prebuilt_for": the checkout's version then)."""
+    return {"prebuilt": manifest.get("version") or "?", "prebuilt_for": version(),
+            "prebuilt_sha256": manifest.get("sha256"),
             "prebuilt_asset": manifest.get("asset"), "cuda": manifest.get("cuda", CUDA),
             "archs": [int(str(a).rstrip("a")) for a in manifest.get("archs") or ARCHS]}
