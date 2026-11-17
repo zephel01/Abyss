@@ -95,7 +95,7 @@ class PickQuant(unittest.TestCase):
         self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
 
     def test_models_without_pc_sizes(self):
-        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa"):
+        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
     def test_no_gpu(self):
@@ -582,8 +582,42 @@ class Qwen35NineBQsa(unittest.TestCase):
         self.assertNotIn("env", got)
         self.assertNotIn("vision", got)
 
-    def test_no_placeholder_for_files_not_out_yet(self):
-        self.assertFalse(any("Ornith-1.5-9B" in str(m.get("repo", "")) for m in A.MODELS.values()))
+
+
+class OrnithNineBQsa(Qwen35NineBQsa):
+    """--model ornith-9b-qsa (zephel01's Ornith-1.5-9B QSA): every check of Qwen3.5-9B QSA again (same shapes, same VRAM
+    table), with Ornith's repo, file names and model name"""
+    KEY = "ornith-9b-qsa"
+
+    def test_the_entry(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual((m["repo"], m["quant"], m["quants"]), ("zephel01/Ornith-1.5-9B-QSA-GGUF", "Q4_K_M", ("Q4_K_M", "Q8_0")))
+        self.assertTrue(all(nx for _, nx in m["quant_gb"].values()))
+        self.assertEqual(m["env"], {})
+        self.assertEqual(m["vram_ctx"], A.MODELS["qwen35-9b-qsa"]["vram_ctx"])
+        self.assertEqual(m["gpu_min"], A.MODELS["qwen35-9b-qsa"]["gpu_min"])
+        self.assertEqual(m["sampling"], {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+
+    def test_the_file_and_the_config(self):
+        m = A.MODELS[self.KEY]
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "Ornith-1.5-9B-QSA-Q4_K_M.gguf", "Ornith-1.5-9B-QSA-Q8_0.gguf", "README.md", ".gitattributes")]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        for q in m["quants"]:
+            with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+                got = A.quant_files(q, m["repo"], m["folder"], m["prefix_tmpl"].format(q=q))
+            self.assertEqual([g[0] for g in got], [f"Ornith-1.5-9B-QSA-{q}.gguf"])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("ornith-9b-qsa-q4_k_m", Path(d) / "pack", 131072, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("Ornith-1.5-9B QSA", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "ornith-1.5-9b-qsa")
+        self.assertEqual(got["args"][got["args"].index("--max-context") + 1], "131072")
+        self.assertNotIn("env", got)
+        self.assertNotIn("vision", got)
 
 
 class TestVariants(unittest.TestCase):

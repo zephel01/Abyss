@@ -93,11 +93,13 @@ QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BET
 11 GB 以上の GPU 1 枚に載せる。その GPU で 128K までの文脈が動く（VRAM を 11 GB に制限して計測）。それより小さい GPU では
 何もダウンロードする前に止まる。既定は Q4_K_M（5.9 GB）、もう 1 つは `--quant Q8_0`（9.9 GB。メモリは未計測で、
 セットアップは差の 4 GB を足して数える）。どちらのファイルにも NextN の下書き層が入っている。画像は使えない
-（画像の変換器のファイルがない）:
+（画像の変換器のファイルがない）。`--model ornith-9b-qsa` は同じものの Ornith-1.5-9B 版（zephel01/Ornith-1.5-9B-QSA-GGUF、[Ornith-1.5-9B QSA](#ornith-15-9b-qsa)）で、GPU の表も同じです:
 
 ```sh
 ./setup-deepseek.sh --model qwen35-9b-qsa --download-model                    # Qwen3.5-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
 ./setup-deepseek.sh --model qwen35-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
+./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
+./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
 ```
 
 zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
@@ -841,6 +843,22 @@ build-cuda/abyss --glm-pack pack --max-context 131072 --prefill auto
 - 制限は 27B の QSA ファイルと同じです: CUDA だけ（AMD では dense）、`--kv` と画像入りのリクエストでは dense。
   `STRATA_Q35_QSA=0` でファイルを dense で動かせます。
 - このファイルは llama.cpp では読み込めません（`wrong number of tensors`。qwen35 の読み込みが indexer テンソルを知らないため）。
+
+## Ornith-1.5-9B QSA
+
+同じ QSA indexer を [ornith-ai/Ornith-1.5-9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B) に載せたものです（構造・形・トークナイザは
+Qwen3.5-9B と同じ。3 層は dense、top_k 4096）。ファイルは [zephel01/Ornith-1.5-9B-QSA-GGUF](https://huggingface.co/zephel01/Ornith-1.5-9B-QSA-GGUF)
+の `Ornith-1.5-9B-QSA-Q4_K_M.gguf`（5.9 GB、既定）と `Ornith-1.5-9B-QSA-Q8_0.gguf`（9.9 GB）（BETA）。v1.3.166 から
+`./setup-deepseek.sh --model ornith-9b-qsa` で入れられます。GGUF には Ornith 自身のチャットテンプレートが入っています。文字だけで、
+下書きはファイル自身の NextN ブロックです。[Qwen3.5-9B QSA](#qwen35-9b-qsa) に書いたことはそのまま当てはまります（同じエンジンの経路、同じ制限）。
+
+- **メモリ**（RTX 5090、制限なし）: GPU メモリの最大は 32K / 64K / 128K で 11.2 / 12.4 / 14.9 GB。Qwen3.5-9B QSA と同じです。
+  VRAM を制限した計測は Ornith では行っていません。形も最大値も同じなので、セットアップは Qwen3.5-9B QSA の表（11 GB の GPU、128K の文脈）を使います。
+- **速度**（128K のプロンプト、Q4_K_M、MTP の下書きあり。dense は同じファイルに `STRATA_Q35_QSA=0`）: decode 138.1 → 214.8 tok/s
+  （1.56 倍。MTP の採用率は dense 86.6% → QSA 82.8%、プロンプト 1 本）、プロンプト −7.9%。
+- **品質**: 128K での dense との KL は 0.141（Q4_K_M。Qwen3.5-9B QSA は 0.032）。量子化だけの KL は 0.318 で Qwen の 0.072 に対し、
+  比は同じ（0.44）。Ornith 自体が 128K で敏感なモデルです。125K のニードル: 4/4。
+- このファイルは llama.cpp では読み込めません（indexer テンソルのため。Qwen3.5-9B QSA と同じ）。
 
 ## Laguna-S-2.1
 

@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.166 - unreleased
+
+Ornith-1.5-9B QSA in the one-command setup (the engine is unchanged; outputs as in v1.3.165).
+
+- `./setup-deepseek.sh --model ornith-9b-qsa` (Windows: `setup-deepseek.bat --model ornith-9b-qsa`) downloads
+  zephel01/Ornith-1.5-9B-QSA-GGUF (Q4_K_M by default, `--quant Q8_0`), checks its SHA-256, packs it and writes the config.
+  Same architecture, shapes and QSA layout as Qwen3.5-9B QSA (layer 3 dense, top_k 4096), so the same GPU table: an 11 GB+
+  GPU holds a 128K context (that table is Qwen3.5-9B QSA's capped run; on Ornith the uncapped peaks, 11.2 / 12.4 / 14.9 GB at
+  32K / 64K / 128K, are identical, a cap was not measured). A smaller GPU stops before the download. Drafts use the file's
+  own NextN block; text only.
+- Q4_K_M at a 128K prompt on the RTX 5090: decode 138.1 -> 214.8 tok/s (1.56x dense attention on the same file; MTP
+  acceptance 86.6% -> 82.8%, one prompt), prompt -7.9%; KL against dense 0.141 (Qwen3.5-9B QSA 0.032; quant-only KL 0.318 vs
+  0.072, the same ratio: Ornith is more sensitive at 128K); needle at 125K 4/4. llama.cpp cannot load the file.
+
 ## v1.3.165 - 2026-11-17
 
 More weight types on Abyss's own int8 tensor-core prompt GEMM (in place of llama.cpp's MMQ) on the RTX 5090 (sm_120).

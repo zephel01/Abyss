@@ -96,11 +96,13 @@ Qwen3.5-9B QSA, a small dense model with a QSA indexer (zephel01's, BETA; [Qwen3
 file goes on one GPU of 11 GB or more, which holds a context up to 128K (measured with the VRAM capped at 11 GB). The setup
 stops on a smaller GPU before downloading anything. Q4_K_M (5.9 GB) is the default, `--quant Q8_0` (9.9 GB) the other
 file (its memory is not measured: the setup counts its extra 4 GB on top). Each file has its own NextN drafter; there are
-no images (the file has no image projector):
+no images (the file has no image projector). `--model ornith-9b-qsa` is the same with Ornith-1.5-9B's weights (zephel01/Ornith-1.5-9B-QSA-GGUF, [Ornith-1.5-9B QSA](#ornith-15-9b-qsa)), with the same GPU table:
 
 ```sh
 ./setup-deepseek.sh --model qwen35-9b-qsa --download-model                    # Qwen3.5-9B-QSA-Q4_K_M (5.9 GB), 64K context
 ./setup-deepseek.sh --model qwen35-9b-qsa --context 131072 --download-model   # the same, 128K context
+./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M (5.9 GB), 64K context
+./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # the same, 128K context
 ```
 
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
@@ -893,6 +895,22 @@ build-cuda/abyss --glm-pack pack --max-context 131072 --prefill auto
 - Same limits as the 27B QSA files: CUDA only (dense on AMD), dense with `--kv` and for requests with pictures.
   `STRATA_Q35_QSA=0` runs the file dense.
 - The file does not load in llama.cpp (`wrong number of tensors`: the indexer tensors are not in its qwen35 loader).
+
+## Ornith-1.5-9B QSA
+
+The same QSA indexer on [ornith-ai/Ornith-1.5-9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B) (same architecture, shapes and
+tokenizer as Qwen3.5-9B; layer 3 dense, top_k 4096): [zephel01/Ornith-1.5-9B-QSA-GGUF](https://huggingface.co/zephel01/Ornith-1.5-9B-QSA-GGUF),
+`Ornith-1.5-9B-QSA-Q4_K_M.gguf` (5.9 GB, default) or `Ornith-1.5-9B-QSA-Q8_0.gguf` (9.9 GB) (BETA). From v1.3.166
+`./setup-deepseek.sh --model ornith-9b-qsa` installs it. The GGUF carries Ornith's own chat template. Text only; drafts come from the
+file's own NextN block. Everything in [Qwen3.5-9B QSA](#qwen35-9b-qsa) applies (same engine path, same limits).
+
+- **Memory** (RTX 5090, uncapped): peak GPU memory 11.2 / 12.4 / 14.9 GB at 32K / 64K / 128K, the same as Qwen3.5-9B QSA. A VRAM
+  cap was not measured on Ornith; the setup uses Qwen3.5-9B QSA's table (an 11 GB GPU, 128K context), as the shapes and peaks are the same.
+- **Speed** (128K prompt, Q4_K_M, MTP drafts on, the same file with `STRATA_Q35_QSA=0` as dense): decode 138.1 -> 214.8 tok/s
+  (1.56x; MTP acceptance 86.6% -> 82.8% with QSA, one prompt), prompt -7.9%.
+- **Quality**: KL against dense at 128K 0.141 (Q4_K_M; Qwen3.5-9B QSA 0.032). The quant-only KL is 0.318 against Qwen's 0.072, the
+  same ratio (0.44): Ornith itself is more sensitive at 128K. Needle at 125K: 4/4.
+- The file does not load in llama.cpp (the indexer tensors), as with Qwen3.5-9B QSA.
 
 ## Laguna-S-2.1
 
