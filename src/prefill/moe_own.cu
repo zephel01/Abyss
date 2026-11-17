@@ -213,9 +213,23 @@ template<int TY, int CF> struct Lay {
     // 256 rows do not fit a CTA's shared memory (Q5_K, Q6_K, Q8_0, IQ3_S, Q3_K).  The half chunk's steps are decoded
     // into registers before its token groups run, so the next chunk's bytes come into the same buffer under the groups
     // (one more barrier a chunk) - instead of a narrower tile.
-    static constexpr bool W1 = (size_t) (2 * Cfg<1>::NT * WS + 2 * Cfg<1>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<1>::TC) * 16 +
-                               (size_t) Dec<TY>::GW * 4 > kSmemCTA;
-    static constexpr int BUF = (W1 ? 1 : 2) * Cfg<CF>::NT * WS + 2 * Cfg<CF>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<CF>::TC;   // 16-byte words
+    // A slot's stride is an odd number of 16-byte words (WSS the data's, WHS the header's): shared memory has 32
+    // banks of 4 bytes, and a warp's eight rows read their slots at once - with a stride of 8 words (IQ3_S, Q6_K)
+    // the eight land in one bank and the load takes eight turns; odd strides spread them over eight banks.
+    // IQ3_S on a matrix whose rows are 16-byte multiples: gate/up 0.758 -> 0.55 ms (tests/moe_own_test --bench).
+    // The odd stride is not taken where its extra word costs the type a shape: two fine CTAs an SM (IQ2_S, whose
+    // codebook is 8 KB: 102,400 bytes for two, exactly the SM's), or the second weight buffer.
+    static constexpr size_t bytes(int nt, int tc, int slot, bool w1) {   // a CTA's shared memory with that slot stride
+        return (size_t) ((w1 ? 1 : 2) * nt * slot + 2 * tc * 8 + (Sums<TY>::on ? 4 : 2) * tc) * 16 + (size_t) Dec<TY>::GW * 4;
+    }
+    static constexpr int kEven = WS, kOdd = ((WS - WH) | 1) + (WH > 0 ? (WH | 1) : 0);
+    static constexpr bool w1_even = bytes(Cfg<1>::NT, Cfg<1>::TC, kEven, false) > kSmemCTA,
+                          w1_odd = bytes(Cfg<1>::NT, Cfg<1>::TC, kOdd, false) > kSmemCTA;
+    static constexpr bool odd = !(w1_odd && !w1_even) &&
+                                !(2 * bytes(Cfg<0>::NT, Cfg<0>::TC, kOdd, w1_odd) > kSmemSM && 2 * bytes(Cfg<0>::NT, Cfg<0>::TC, kEven, w1_even) <= kSmemSM);
+    static constexpr int WSS = odd ? ((WS - WH) | 1) : WS - WH, WHS = WH > 0 ? (odd ? (WH | 1) : WH) : 0;
+    static constexpr bool W1 = odd ? w1_odd : w1_even;
+    static constexpr int BUF = (W1 ? 1 : 2) * Cfg<CF>::NT * (WSS + WHS) + 2 * Cfg<CF>::TC * 8 + (Sums<TY>::on ? 4 : 2) * Cfg<CF>::TC;   // 16-byte words
     static constexpr size_t smem = (size_t) BUF * 16 + (size_t) Dec<TY>::GW * 4;   // (+ the codebook)
 };
 
@@ -230,10 +244,10 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
     constexpr int WB = W1 ? 1 : 2;   // weight buffers
     constexpr int WS = Lay<TY, CF>::WS, WH = Lay<TY, CF>::WH, WD = Lay<TY, CF>::WD, W2 = Lay<TY, CF>::W2, HPW = D::WCH / 128, SPH = 4;   // (half chunks a weight chunk; steps a half chunk)
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
-    constexpr int WSD = WS - WH;              // a slot's data words (the header's are in hbuf)
+    constexpr int WSD = Lay<TY, CF>::WSS, WHS = Lay<TY, CF>::WHS;   // a slot's data words and its header's (in hbuf), as strides
     uint4* wbuf = smem;                       // [WB][NT slots][WSD]
     uint4* hbuf = wbuf + WB * NT * WSD;       // [WB][NT slots][WH]: the 256-value blocks' headers, one a block (both its half chunks)
-    uint4* xbuf = hbuf + WB * NT * WH;        // [2][TC][8]
+    uint4* xbuf = hbuf + WB * NT * WHS;       // [2][TC][8]
     uint4* sbuf = xbuf + 2 * TC * 8;          // [2][TC]
     uint4* ubuf = sbuf + 2 * TC;              // [2][TC]: the block sums (the types that need them)
 #if defined(OWN_GRID_GLOBAL)
@@ -256,7 +270,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
         uint4* dst = wbuf + ((W1 ? 0 : (c & 1)) * NT + threadIdx.x) * WSD;
         if constexpr (WH > 0) {   // (the block's header with its first half chunk)
             if ((c & 1) == 0) {
-                uint4* hdst = hbuf + ((W1 ? 0 : ((c >> 1) & 1)) * NT + threadIdx.x) * WH;
+                uint4* hdst = hbuf + ((W1 ? 0 : ((c >> 1) & 1)) * NT + threadIdx.x) * WHS;
                 const uintptr_t src = (uintptr_t) (my_slot + Rng<TY>::hdr(c));
                 const uint8_t* p = (const uint8_t*) (src & ~(uintptr_t) 15);
                 const int last = (int) (((src & 15) + Rng<TY>::HDR - 1) / 16);
@@ -339,7 +353,7 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                     sp[f][h8] = slot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::dat(c)) & 15);
                     if constexpr (W2 > 0) sp2[f][h8] = slot + WD * 16 + ((uintptr_t) (rowp[f][h8] + Rng2<TY>::dat2(c)) & 15);
                     if constexpr (WH > 0) {
-                        const uint8_t* hslot = (const uint8_t*) (hbuf + ((W1 ? 0 : ((c >> 1) & 1)) * NT + soff[f][h8]) * WH);
+                        const uint8_t* hslot = (const uint8_t*) (hbuf + ((W1 ? 0 : ((c >> 1) & 1)) * NT + soff[f][h8]) * WHS);
                         hp[f][h8] = hslot + ((uintptr_t) (rowp[f][h8] + Rng<TY>::hdr(c)) & 15);
                         hd[f][h8] = D::head(hp[f][h8]);
                     } else {
@@ -422,12 +436,6 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                         v[1] = fmaf((float) cl[1], st[i][f][0].s, (float) ch[1] * st[i][f][0].s2);
                         v[2] = fmaf((float) cl[2], st[i][f][1].s, (float) ch[2] * st[i][f][1].s2);
                         v[3] = fmaf((float) cl[3], st[i][f][1].s, (float) ch[3] * st[i][f][1].s2);
-                        if constexpr (Ofs16<TY>::on) {   // (the offsets x each 16 values' sum of activations)
-                            v[0] -= fmaf(st[i][f][0].o, (float) ol[0], st[i][f][0].o2 * (float) oh[0]);
-                            v[1] -= fmaf(st[i][f][0].o, (float) ol[1], st[i][f][0].o2 * (float) oh[1]);
-                            v[2] -= fmaf(st[i][f][1].o, (float) ol[2], st[i][f][1].o2 * (float) oh[2]);
-                            v[3] -= fmaf(st[i][f][1].o, (float) ol[3], st[i][f][1].o2 * (float) oh[3]);
-                        }
                     } else {
                         int cl[4], ch[4];
                         mma16(cl, st[i][f][0].lo, st[i][f][1].lo, bl);
@@ -436,6 +444,12 @@ __device__ __forceinline__ void tile_body(const KArgs& a, uint4* smem, int e, in
                         v[1] = (float) (cl[1] * st[i][f][0].m0 + ch[1] * st[i][f][0].m1) * hd[f][0];
                         v[2] = (float) (cl[2] * st[i][f][1].m0 + ch[2] * st[i][f][1].m1) * hd[f][1];
                         v[3] = (float) (cl[3] * st[i][f][1].m0 + ch[3] * st[i][f][1].m1) * hd[f][1];
+                    }
+                    if constexpr (Ofs16<TY>::on) {   // (the offsets x each 16 values' sum of activations)
+                        v[0] -= fmaf(st[i][f][0].o, (float) ol[0], st[i][f][0].o2 * (float) oh[0]);
+                        v[1] -= fmaf(st[i][f][0].o, (float) ol[1], st[i][f][0].o2 * (float) oh[1]);
+                        v[2] -= fmaf(st[i][f][1].o, (float) ol[2], st[i][f][1].o2 * (float) oh[2]);
+                        v[3] -= fmaf(st[i][f][1].o, (float) ol[3], st[i][f][1].o2 * (float) oh[3]);
                     }
                     acc[f][j][0] = fmaf(v[0], x0, acc[f][j][0]);
                     acc[f][j][1] = fmaf(v[1], x1, acc[f][j][1]);
@@ -516,6 +530,12 @@ template<int TY> struct Wide {
     // (two fine CTAs fit, a coarse one does not: Q3_K - the fine shape only)
     static constexpr bool fine_only = !on && Lay<TY, 1>::smem > kSmemCTA;
 };
+// (the shapes the measurements were made with: two fine CTAs an SM and the coarse shape for the types of the default
+// list - a layout change that drops one shows here, not as a slower prompt)
+#define STRATA_OWN_BOTH(TY) static_assert(!Wide<TY>::on && !Wide<TY>::fine_only, "own GEMM: type " #TY " lost a tile shape")
+STRATA_OWN_BOTH(16); STRATA_OWN_BOTH(17); STRATA_OWN_BOTH(18); STRATA_OWN_BOTH(22); STRATA_OWN_BOTH(19); STRATA_OWN_BOTH(20);
+STRATA_OWN_BOTH(42); STRATA_OWN_BOTH(23); STRATA_OWN_BOTH(12); STRATA_OWN_BOTH(13); STRATA_OWN_BOTH(14);
+#undef STRATA_OWN_BOTH
 
 template<int TY, bool GLU, int CF>
 void launch_c(const KArgs& a, unsigned grid, cudaStream_t s) {
@@ -768,13 +788,13 @@ __global__ void __launch_bounds__(HNT) own_kernel(const KArgs a) {
 #pragma unroll
                         for (int k = 0; k < 8; ++k)
                             v[k] = fmaf((float) d0[k], scl[wp][f][i][0][8 * hi + k], (float) d1[k] * scl[wp][f][i][1][8 * hi + k]);
-                        if constexpr (Ofs16<TY>::on) {   // (the offsets x each 16 values' sum of activations: a product with ones)
-                            const uint4 ones = make_uint4(0x01010101u, 0x01010101u, 0x01010101u, 0x01010101u);
-                            const ow_i8 o0 = wmma(ones, b_lo, z, hi), o1 = wmma(ones, b_hi, z, hi);
+                    }
+                    if constexpr (Ofs16<TY>::on) {   // (the offsets x each 16 values' sum of activations: a product with ones)
+                        const uint4 ones = make_uint4(0x01010101u, 0x01010101u, 0x01010101u, 0x01010101u);
+                        const ow_i8 o0 = wmma(ones, b_lo, z, hi), o1 = wmma(ones, b_hi, z, hi);
 #pragma unroll
-                            for (int k = 0; k < 8; ++k)
-                                v[k] -= fmaf(ofs[wp][f][i][0][8 * hi + k], (float) o0[k], ofs[wp][f][i][1][8 * hi + k] * (float) o1[k]);
-                        }
+                        for (int k = 0; k < 8; ++k)
+                            v[k] -= fmaf(ofs[wp][f][i][0][8 * hi + k], (float) o0[k], ofs[wp][f][i][1][8 * hi + k] * (float) o1[k]);
                     }
 #pragma unroll
                     for (int k = 0; k < 8; ++k) {
@@ -946,13 +966,19 @@ bool supported(int t) {
 }
 #endif
 
-// The default list: the types measured not slower than MMQ on every model and prompt length, on the GPUs they were
+// The default lists: the types measured not slower than MMQ on every model and prompt length, on the GPUs they were
 // measured on (tuned_device(): sm_120, the RTX 5090; any other GPU keeps MMQ until it is measured).
-// 2026-11-17, RTX 5090 (worklog/2026-11-16_no-llamacpp.md section 8): IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ2_S 22,
-// IQ1_S 19, IQ4_NL 20, Q2_0 42.  Not in it: MXFP4 and NVFP4 (MMQ multiplies in FP4 there), IQ4_XS, Q4_K, Q6_K, Q8_0
-// (slower in small launches), IQ1_M (no model here to measure with; MMQ has no IQ1_M: the layer takes the FP16 path),
-// Q4_0 / Q4_1 / Q5_0 (faster in the kernel bench, no model run yet), Q5_K, Q3_K, Q2_K, IQ3_S (slower).
-static const char* const kDefaultTypes = "16,17,18,22,19,20,42";
+// RTX 5090 (worklog/2026-11-16_no-llamacpp.md sections 8 and 11):
+//   2026-11-16: IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ2_S 22, IQ1_S 19, IQ4_NL 20, Q2_0 42 - experts and dense layers.
+//   2026-11-17: IQ4_XS 23, Q4_K 12, Q5_K 13 - experts and dense layers (Qwen3.8-27B UD-Q4_K_XL, Ornith-35B,
+//   Ornith-122B at 4K-128K); Q6_K 14 - experts only (Ornith-35B's down matrices; a dense layer's Q6_K is 3% of the
+//   prompt slower on Qwen3.8-27B UD-Q6_K: its two multiplies a 32 values); Q4_0 2 - dense layers only (Qwen3.8-27B
+//   L-Q4_0 +9-11%; no model with Q4_0 experts here).
+// In neither: MXFP4 and NVFP4 (MMQ multiplies in FP4 there), IQ1_M (no model here to measure with; MMQ has no IQ1_M:
+// the layer takes the FP16 path), Q4_1 / Q5_0, Q3_K, Q2_K, IQ3_S (faster in the kernel bench, no model run yet),
+// Q8_0 (Qwen3.8-27B Q8_0 -5%).
+static const char* const kDefaultTypes = "16,17,18,22,19,20,42,23,12,13,14";
+static const char* const kDefaultDense = "16,17,18,22,19,20,42,23,12,13,2";
 
 bool type_on(int type, bool mmq_built, bool dense) {
     // (the lists once; which one applies follows the current device)
@@ -972,13 +998,12 @@ bool type_on(int type, bool mmq_built, bool dense) {
     };
     static const bool mmq_only = [] { const char* m = getenv("STRATA_PROMPT_MMQ"); return m != nullptr && std::atoi(m) != 0; }();
     static const char* const env = getenv("STRATA_PROMPT_OWN_TYPES");
-    static const std::vector<int> from_env = parse(env != nullptr ? env : ""), all = parse("all"), tuned = parse(kDefaultTypes);
+    static const std::vector<int> from_env = parse(env != nullptr ? env : ""), all = parse("all"), tuned = parse(kDefaultTypes),
+                                  tuned_dense = parse(kDefaultDense);
     if (mmq_only || !supported(type)) return false;
     // (a build without MMQ: every type the own GEMM covers - the other choice there is the FP16 path)
-    // (a dense layer's products follow the same list: measured on Qwen3.8-27B UD-IQ2_XXS and UD-IQ3_XXS, +2.4-8.1% at
-    // 4K-128K, KL 0.00083 -> 0.00075)
-    (void) dense;
-    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() ? tuned : from_env;
+    // (a dense layer's products - one matrix, the tokens as one "expert" - have their own list)
+    const std::vector<int>& on = env != nullptr ? from_env : !mmq_built ? all : tuned_device() ? (dense ? tuned_dense : tuned) : from_env;
     return std::find(on.begin(), on.end(), type) != on.end();
 }
 

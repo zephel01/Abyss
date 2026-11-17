@@ -372,12 +372,18 @@ int moe_window_rows(size_t T, const Glm5Geometry& g) {
 // the MoE runs on the WHOLE chunk (every expert's weights are read once per chunk); the shared expert in sub-batches
 // the experts' quantized activations: MMQ's form or the own GEMM's (moe_own.hpp), whichever is larger
 bool own_type(int type);
+// the model has a product that reads the activations' block sums (Q4_K, Q5_K, Q4_1 on the own GEMM): set by the prompt
+// path's setup before its buffers are sized (V4.1 Compact has none: its chunk plan and md5 stay)
+static bool& own_sums_model() {
+    static bool on = false;
+    return on;
+}
 size_t act_bytes(int64_t rows, int64_t cols) {
     size_t n = mmq::q8_bytes(rows, cols);
 #if defined(STRATA_MOE_OWN)
-    // (the block sums' plane only where a type that reads them is on: the buffers - and with them the chunk plan -
-    // stay as MMQ's otherwise)
-    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols, own_type(12) || own_type(13) || own_type(3)));
+    // (the block sums' plane only where the model has a matrix of a type that reads them on the own GEMM
+    // (own_sums_model): the buffers - and with them the chunk plan - stay as MMQ's otherwise)
+    if (cols % 128 == 0) n = std::max(n, own::act_bytes(rows, cols, own_sums_model()));
 #endif
     return n;
 }
@@ -871,6 +877,19 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // them (their staged experts all go over PCIe), and the fused SwiGLU product is off for them
     bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false;
     std::map<std::string, int> own_n, mmq_n;   // the layers' products by kernel
+#if defined(STRATA_MOE_OWN)
+    {   // own_sums_model: an expert matrix of a sums type, or dense products (a dense layer's FFN and the projections
+        // that share its buffers - any of their types may be one; STRATA_GLM_Q35_PROJ_MMQ the same)
+        const auto st = [](int t) { return own::needs_sums(t) && own_type(t); };
+        bool on = false, dense = getenv("STRATA_GLM_Q35_PROJ_MMQ") != nullptr;
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (!Ly.moe) dense = true;
+            else on = on || st(Ly.gu_type) || st(Ly.up_type) || st(Ly.d_type);
+        }
+        own_sums_model() = on || (dense && (own_type(12) || own_type(13) || own_type(3)));
+    }
+#endif
     bool v41_eng_tok = false;
     size_t gstride = 0;
     std::string why;

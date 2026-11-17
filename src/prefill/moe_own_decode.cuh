@@ -656,8 +656,13 @@ template<> struct Dec<113> : DecQ5K<true> {};   // (every row and chunk on a mul
 template<> struct Dec<11> {
     static constexpr int GW = 0;
     __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
-    static constexpr int WCH = 128, CB = 32, AL = 2, SUB = 16;
+    // The value is d x m x q: q 3 bits (-4..3), m the 6-bit scale of its 16 values (-32..31).  -m x q fits an int8
+    // (-128..124), so the weights go to the multiply with their scale inside - one multiply a 32 values with the
+    // step's scale -d, the same integer sums as two multiplies a 16 values times m (this ran 4-7% slower than MMQ
+    // on a dense layer that way).
+    static constexpr int WCH = 128, CB = 32, AL = 2, SUB = 32;
     static constexpr int HDR = 14, RB = 55, CB2 = 32;
+    static constexpr bool FOUR = true;
     __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 110 + 96; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 110 + 32 + (size_t) (c & 1) * 32; }
     __device__ static __forceinline__ size_t dat2(int c) { return (size_t) (c >> 1) * 110; }
@@ -669,20 +674,49 @@ template<> struct Dec<11> {
                                     : (uint32_t) (sc[is - 8] >> 4) | (((uint32_t) (sc[is - 4] >> 6) & 3u) << 4);
         return (int) us - 32;
     }
-    __device__ static __forceinline__ uint32_t word(const uint8_t* q, const uint8_t* hm, int j, int bit) {
-        const uint32_t u = ((rd32(q) >> (2 * j)) & 0x03030303u) | (((rd32(hm) >> bit) & 0x01010101u) << 2);   // 0..7
-        return sub8(u, 0x04040404u);
+    // four values u (0..7, a byte each) as -m x (u - 4), bytes mod 256
+    __device__ static __forceinline__ uint32_t scaled(uint32_t u, int m) {
+        const uint32_t k = (uint32_t) (-m) & 255u;
+        const uint32_t pe = ((u & 0x00FF00FFu) * k) & 0x00FF00FFu, po = (((u >> 8) & 0x00FF00FFu) * k) & 0x00FF00FFu;   // (u k <= 1785: no carry between the 16-bit lanes)
+        return add8(pe | (po << 8), ((uint32_t) (4 * m) & 255u) * 0x01010101u);
+    }
+    __device__ static __forceinline__ uint32_t bits3(uint32_t q, uint32_t hm, int j, int bit) {
+        return ((q >> (2 * j)) & 0x03030303u) | (((hm >> bit) & 0x01010101u) << 2);
     }
     __device__ static __forceinline__ Step step_h(const uint8_t* pd, const uint8_t* ph, int c, int ib, int t, float,
                                                   const uint8_t* pd2) {
         const int n = c & 1;
         Step r;
-        r.lo = word(pd + 4 * t, pd2 + 4 * t, ib, 4 * n + ib);
-        r.hi = word(pd + 16 + 4 * t, pd2 + 16 + 4 * t, ib, 4 * n + ib);
-        r.s = 0.0f;
-        r.m0 = scale6(ph, 8 * n + 2 * ib);
-        r.m1 = scale6(ph, 8 * n + 2 * ib + 1);
+        r.lo = scaled(bits3(rd32(pd + 4 * t), rd32(pd2 + 4 * t), ib, 4 * n + ib), scale6(ph, 8 * n + 2 * ib));
+        r.hi = scaled(bits3(rd32(pd + 16 + 4 * t), rd32(pd2 + 16 + 4 * t), ib, 4 * n + ib), scale6(ph, 8 * n + 2 * ib + 1));
+        r.s = -rd_f16(ph + 12);
+        r.m0 = r.m1 = 0;
         return r;
+    }
+    // the half's four blocks at once: its 2-bit bytes and the high-bit bytes are the same four words for the four
+    // blocks; the 12 scale bytes as three words
+    __device__ static __forceinline__ void steps4(const uint8_t* pd, const uint8_t* ph, int c, int t, float hd, const uint8_t* pd2,
+                                                  Step* out) {
+        const int n = c & 1;
+        const uint32_t ql = rd32(pd + 4 * t), qh = rd32(pd + 16 + 4 * t), hl = rd32(pd2 + 4 * t), hh = rd32(pd2 + 16 + 4 * t);
+        const uint32_t w[3] = {rd32(ph), rd32(ph + 4), rd32(ph + 8)};
+        // scale is = 8 n + is0 (is0 0..7): its low 4 bits in byte is0 (the low nibble, n = 1: the high), its high 2
+        // in byte 8 + is0 % 4 at bit 2 (is0 / 4) + 4 n   (scale6, by cases)
+#pragma unroll
+        for (int ib = 0; ib < 4; ++ib) {
+            int m[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int is0 = 2 * ib + e;
+                const uint32_t lo4 = ((w[is0 >> 2] >> (8 * (is0 & 3))) >> (4 * n)) & 15u;
+                const uint32_t hi2 = ((w[2] >> (8 * (is0 & 3))) >> (2 * (is0 >> 2) + 4 * n)) & 3u;
+                m[e] = (int) (lo4 | (hi2 << 4)) - 32;
+            }
+            out[ib].lo = scaled(bits3(ql, hl, ib, 4 * n + ib), m[0]);
+            out[ib].hi = scaled(bits3(qh, hh, ib, 4 * n + ib), m[1]);
+            out[ib].s = -hd;
+            out[ib].m0 = out[ib].m1 = 0;
+        }
     }
 };
 
@@ -693,9 +727,12 @@ template<> struct Dec<11> {
 template<> struct Dec<10> {
     static constexpr int GW = 0;
     __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
-    static constexpr int WCH = 128, CB = 32, AL = 2, SUB = 16;
+    // The 4-bit scale of a 16 values goes into the int8 weights (q x scale <= 45): one multiply a 32 values with the
+    // step's scale d.  The offsets stay a 16 values (OFS16).
+    static constexpr int WCH = 128, CB = 32, AL = 2, SUB = 32;
     static constexpr int HDR = 16, RB = 42, CB2 = 4;
-    static constexpr bool FS16 = true, OFS16 = true;
+    static constexpr bool OFS16 = true;
+    static constexpr bool FOUR = true;
     __device__ static __forceinline__ size_t hdr(int c) { return (size_t) (c >> 1) * 84; }
     __device__ static __forceinline__ size_t dat(int c) { return (size_t) (c >> 1) * 84 + 16 + (size_t) (c & 1) * 32; }
     __device__ static __forceinline__ size_t dat2(int c) { return (size_t) (c >> 1) * 84 + 80; }
@@ -705,14 +742,34 @@ template<> struct Dec<10> {
         const uint32_t s0 = ph[8 * (c & 1) + 2 * ib], s1 = ph[8 * (c & 1) + 2 * ib + 1];
         const float d = rd_f16(pd2), dmin = rd_f16(pd2 + 2);
         Step r;
-        r.lo = (rd32(pd + 4 * t) >> (2 * ib)) & 0x03030303u;
-        r.hi = (rd32(pd + 16 + 4 * t) >> (2 * ib)) & 0x03030303u;
-        r.s = d * (float) (s0 & 15u);
-        r.s2 = d * (float) (s1 & 15u);
+        r.lo = ((rd32(pd + 4 * t) >> (2 * ib)) & 0x03030303u) * (s0 & 15u);
+        r.hi = ((rd32(pd + 16 + 4 * t) >> (2 * ib)) & 0x03030303u) * (s1 & 15u);
+        r.s = d;
+        r.s2 = 0.0f;
         r.o = dmin * (float) (s0 >> 4);
         r.o2 = dmin * (float) (s1 >> 4);
         r.m0 = r.m1 = 0;
         return r;
+    }
+    // the half's four blocks at once: its two data words, its eight scale bytes and d, dmin read once
+    __device__ static __forceinline__ void steps4(const uint8_t* pd, const uint8_t* ph, int c, int t, float, const uint8_t* pd2,
+                                                  Step* out) {
+        const int n = c & 1;
+        const uint32_t sa = rd32(ph + 8 * n), sb = rd32(ph + 8 * n + 4);
+        const float d = rd_f16(pd2), dmin = rd_f16(pd2 + 2);
+        const uint32_t ql = rd32(pd + 4 * t), qh = rd32(pd + 16 + 4 * t);
+#pragma unroll
+        for (int ib = 0; ib < 4; ++ib) {
+            const uint32_t ss = (ib < 2 ? sa : sb) >> (16 * (ib & 1));
+            const uint32_t s0 = ss & 255u, s1 = (ss >> 8) & 255u;
+            out[ib].lo = ((ql >> (2 * ib)) & 0x03030303u) * (s0 & 15u);
+            out[ib].hi = ((qh >> (2 * ib)) & 0x03030303u) * (s1 & 15u);
+            out[ib].s = d;
+            out[ib].s2 = 0.0f;
+            out[ib].o = dmin * (float) (s0 >> 4);
+            out[ib].o2 = dmin * (float) (s1 >> 4);
+            out[ib].m0 = out[ib].m1 = 0;
+        }
     }
 };
 // (a Dec with FOUR: steps4 decodes the half chunk's four blocks at once, sharing their loads)
