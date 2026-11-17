@@ -7,7 +7,10 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.164 - unreleased
+## v1.3.164 - 2026-11-17
+
+The engine program is renamed to `abyss`, and a prebuilt CUDA engine is attached to the release (trial). Outputs as in
+v1.3.163 (same md5).
 
 - **The engine is now `abyss`** (`abyss.exe` on Windows); `strata` stays beside it as an alias for now, so configs and
   scripts that name `build/strata` keep working. The setup and `./abyss.sh` point a config at `abyss` once that file is
