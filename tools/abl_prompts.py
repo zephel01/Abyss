@@ -1,7 +1,7 @@
 """The prompts the engine's --abl-build measures and checks (uncensoring at run time), as token ids.
 
 usage: abl_prompts.py --pack <pack dir> --out <prompts.txt> [--data <safety datasets>] [--train N] [--check N]
-                      [--exclude FILE ...]
+                      [--exclude FILE ...] [--text FILE ... [--text-tokens N]]
   Harmful: an even mix of AdvBench, MaliciousInstruct, ForbiddenQuestions, SimpleSafetyTests, JailbreakBench's harmful
   behaviors and XSTest's unsafe prompts (AdvBench alone left the softer refusals - piracy, medicine, fraud - in GLM;
   --harmful advbench for AdvBench only).  Harmless: JailbreakBench's benign behaviors and XSTest's safe
@@ -93,6 +93,10 @@ def main() -> int:
                     help="your own harmful prompts (one a line, # comments, or JSON lines with a \"prompt\"), forced "
                          "into the harmful mix as --cyber's are: for a category still refused after a build")
     ap.add_argument("--extra-n", type=int, default=0, help="take at most N of --extra-harmful (0: all that fit)")
+    ap.add_argument("--text", nargs="*", default=[], metavar="FILE",
+                    help="neutral texts (plain UTF-8) as T lines: --abl-search's quality guard, the KL on them against "
+                         "the unedited model (use other texts than the ones the file is checked with afterwards)")
+    ap.add_argument("--text-tokens", type=int, default=192, help="the first N tokens of each --text (the first 16 unscored)")
     a = ap.parse_args()
     data = pathlib.Path(a.data)
     exclude = set()
@@ -163,13 +167,15 @@ def main() -> int:
             for t in texts:
                 f.write(f"{kind} {ids(t)}\n")
         f.write("R " + ",".join(str(i) for i in refusal) + "\n")
+        for t in a.text:   # (raw text, no chat template: the score path's kind of KL)
+            f.write("T " + ",".join(str(i) for i in tok.encode(pathlib.Path(t).read_text(encoding="utf-8"))[:a.text_tokens]) + "\n")
         words = []   # one W line a word: its tokens, looked for as a run anywhere in an answer's opening
         for w in WORDS:
             t = tok.encode(w, parse_special=False)
             if t and t not in words:
                 words.append(t)
                 f.write("W " + ",".join(str(i) for i in t) + "\n")
-    print(f"{a.out}: {a.train} + {a.check} harmful, {a.train} + {a.check} harmless, {len(refusal)} refusal tokens "
+    print(f"{a.out}: {a.train} + {a.check} harmful, {a.train} + {a.check} harmless, {len(refusal)} refusal tokens, {len(a.text)} texts "
           f"({', '.join(repr(tok.decode([i])) for i in refusal)}), {len(words)} refusal words")
     return 0
 

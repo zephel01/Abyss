@@ -86,6 +86,7 @@
 #include <mutex>
 #include <charconv>
 #include <cmath>
+#include <random>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
@@ -340,6 +341,11 @@ struct Options {
     int abl_rank = 1;          ///< --abl-rank: also try the best N candidates' directions together (1..4)
     float abl_scale = 1.0f;    ///< --abl-scale: the edit's strength (1 takes the component out; above 1 over-projects)
     double abl_lo = 0.2, abl_hi = 0.8;   ///< --abl-range LO,HI: the candidates' depth (fractions of the layers)
+    int abl_search = 0;        ///< --abl-search N: N trials of a per-layer strength profile (0: the candidates' pick)
+    int abl_target = -1;       ///< --abl-target G: the check answers still refusing a profile may leave (-1: the best candidate's)
+    float abl_smax = 2.0f;     ///< --abl-smax S: the profile's strongest peak
+    std::string abl_profile;   ///< --abl-profile DI,P,W,SA,SF,F: write this profile (no search)
+    std::string abl_dump;      ///< --abl-dump F: every measured prompt's capture to F (H then B), then stop
 };
 
 void usage() {
@@ -428,6 +434,9 @@ void usage() {
                  "                       --abl-range LO,HI (0.2,0.8) their depth, --abl-scale S (1) the strength,\n"
                  "                       --abl-rank N (1) the best N together too, --abl-dirs F an earlier OUT.dirs,\n"
                  "                       --abl-gen N: judge refusals by the W words in N greedy answer tokens\n"
+                 "                       --abl-search N: N trials of a per-layer strength profile (a bump over the\n"
+                 "                       depth, an interpolated direction) - the fewest refusals, then the least KL on\n"
+                 "                       the T lines' text; --abl-target G, --abl-smax S (2), --abl-profile DI,P,W,SA,SF,F\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -1070,6 +1079,7 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
     std::vector<std::vector<int32_t>> H, B, Hc, Bc;
     std::vector<int32_t> R;
     std::vector<std::vector<int32_t>> W;   // the refusal words (token runs) --abl-gen looks for
+    std::vector<std::vector<int32_t>> T;   // neutral texts: --abl-search's quality guard (the text KL)
     {
         std::ifstream in(o.abl_prompts);
         if (!in) { std::fprintf(stderr, "abl build: cannot read --abl-prompts %s\n", o.abl_prompts.c_str()); return 2; }
@@ -1089,6 +1099,7 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
                 case 'b': Bc.push_back(t); break;
                 case 'R': R = t; break;
                 case 'W': W.push_back(t); break;
+                case 'T': T.push_back(t); break;
                 default: break;
             }
         }
@@ -1150,6 +1161,8 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
     if (!model.abl_capture(true, err)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
     std::vector<double> mh(slots * E, 0.0), mb(slots * E, 0.0);
     std::vector<float> cap;
+    std::FILE* dumpf = o.abl_dump.empty() ? nullptr : std::fopen(o.abl_dump.c_str(), "wb");
+    if (!o.abl_dump.empty() && dumpf == nullptr) { std::fprintf(stderr, "abl build: cannot write %s\n", o.abl_dump.c_str()); return 1; }
     for (int cls = 0; cls < 2; ++cls) {
         const auto& set = cls == 0 ? H : B;
         auto& m = cls == 0 ? mh : mb;
@@ -1159,12 +1172,14 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
                 return 1;
             }
             for (size_t k = 0; k < m.size(); ++k) m[k] += cap[k];
+            if (dumpf) std::fwrite(cap.data(), sizeof(float), m.size(), dumpf);   // (one prompt: slots x n_embd)
             std::fprintf(stderr, "abl build: measured %s %zu / %zu (%.0f s)\n", cls == 0 ? "harmful" : "harmless", i + 1,
                          set.size(), secs());
         }
         for (double& v : m) v /= (double) set.size();
     }
     model.abl_capture(false, err);
+    if (dumpf) std::fclose(dumpf);
     // the harmless means' span (every slot's, Gram-Schmidt): the residual's large shared part - its massive-activation
     // channels among it.  A direction with a component there takes a slice of those huge values out of every write
     // and breaks the model (a random unit direction cost KL 0.12 on MiniMax); each slot's d_l is made orthogonal to
@@ -1218,6 +1233,11 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
     for (size_t l = 0; l < slots; ++l)
         std::fprintf(stderr, "%s%zu:%.3f(%.2f)", l % 8 ? " " : "\n  ", l, dnorm[l] / std::max(rnorm[l], 1e-12), kept[l]);
     std::fprintf(stderr, "\n");
+    if (!o.abl_dump.empty()) {
+        std::printf("ABL dumped %zu + %zu prompts' captures (%zu x %zu floats each) -> %s\n", H.size(), B.size(), slots, E,
+                    o.abl_dump.c_str());
+        return 0;
+    }
     }
     // ---- 2. the check prompts unedited, then each candidate
     std::vector<std::vector<float>> base(Bc.size());
@@ -1299,6 +1319,231 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
         std::printf("ABL unedited: a refusal word in the first %d tokens of %d of %zu harmful check answers (%.0f s)\n",
                     o.abl_gen, g0, Hc.size(), secs());
         std::fflush(stdout);
+    }
+    // ---- --abl-search N / --abl-profile: one direction, a strength a layer (instead of one strength everywhere)
+    // A profile: the direction at a fractional slot DI (the two slots' unit directions mixed, renormalized; both are
+    // orthogonal to the harmless means, so the mix is too), and a raised-cosine bump over the depth - peak at layer P,
+    // half-width W, a floor F (a share of the peak everywhere) - with its own peak for the attention outputs (SA) and the
+    // FFN outputs (SF); the embedding takes SA * F.  F = 1 and SA = SF = S is the candidates' uniform edit.
+    // A trial: the harmful check answers (a refusal first or a refusal word in --abl-gen tokens; stopped once more than
+    // the target refuse), then the harmless check prompts' first-token KL and refusals, then the KL on the T lines'
+    // text against the unedited model (the quality guard: chat first-token KL overstates the cost).  The order: within
+    // the target (--abl-target, else the best uniform candidate's count), the least text KL; outside, the fewest refusals.
+    // The search: the candidates' uniform edits, then quasi-random profiles, then steps around the best (a 1+1 ES).
+    if (o.abl_search > 0 || !o.abl_profile.empty()) {
+        if (o.abl_gen <= 0) { std::fprintf(stderr, "abl build: --abl-search / --abl-profile need --abl-gen N\n"); return 2; }
+        constexpr size_t kSkip = 16;   // (a text's first tokens unscored, as kl.py's)
+        std::vector<std::vector<float>> tref;
+        const auto text_kl = [&](double& kl, bool make_ref) -> bool {
+            size_t row = 0;
+            kl = 0.0;
+            for (const auto& t : T) {
+                model.reset();
+                for (size_t i = 0; i + 1 < t.size(); ++i) {
+                    if (!model.forward({t[i]}, lg, err)) return false;
+                    if (i + 1 <= kSkip) continue;
+                    log_softmax(lg);
+                    if (make_ref) tref.emplace_back(lg.begin(), lg.begin() + (long) V);
+                    else {
+                        const auto& r = tref[row];
+                        double k = 0.0;
+                        for (size_t v = 0; v < V; ++v) k += std::exp((double) r[v]) * ((double) r[v] - lg[v]);
+                        kl += k;
+                    }
+                    ++row;
+                }
+            }
+            if (row > 0) kl /= (double) row;
+            return true;
+        };
+        if (!T.empty()) {
+            double z = 0.0;
+            if (!text_kl(z, true)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            std::printf("ABL text guard: %zu texts, %zu scored tokens (%.0f s)\n", T.size(), tref.size(), secs());
+        } else std::printf("ABL text guard: no T lines - the harmless check prompts' first-token KL orders the trials\n");
+        struct Prm { double di, p, w, sa, sf, f; };
+        const double dlo = std::round(o.abl_lo * L), dhi = std::round(o.abl_hi * L), smax = o.abl_smax;
+        const Prm lo{dlo, 0.0, 2.0, 0.0, 0.0, 0.0}, hi{dhi, (double) (L - 1), (double) L, smax, smax, 1.0};
+        const auto clampp = [&](Prm x) {
+            x.di = std::clamp(x.di, lo.di, hi.di); x.p = std::clamp(x.p, lo.p, hi.p); x.w = std::clamp(x.w, lo.w, hi.w);
+            x.sa = std::clamp(x.sa, lo.sa, hi.sa); x.sf = std::clamp(x.sf, lo.sf, hi.sf); x.f = std::clamp(x.f, lo.f, hi.f);
+            return x;
+        };
+        const auto make = [&](const Prm& x, std::vector<float>& q, std::vector<float>& s, float& emb) {
+            const int i0 = std::clamp((int) std::floor(x.di), 0, L), i1 = std::min(i0 + 1, L);
+            const double t = std::clamp(x.di - i0, 0.0, 1.0);
+            std::vector<double> d(E);
+            for (size_t k = 0; k < E; ++k) d[k] = (1.0 - t) * dirs[(size_t) i0 * E + k] + t * dirs[(size_t) i1 * E + k];
+            const double n = std::sqrt(std::inner_product(d.begin(), d.end(), d.begin(), 0.0));
+            q.resize(E);
+            for (size_t k = 0; k < E; ++k) q[k] = (float) (d[k] / std::max(n, 1e-12));
+            s.assign((size_t) L * 2, 0.0f);
+            for (int l = 0; l < L; ++l) {
+                const double u = std::fabs(l - x.p) / x.w;
+                const double b = u < 1.0 ? 0.5 * (1.0 + std::cos(M_PI * u)) : 0.0;
+                const double m = x.f + (1.0 - x.f) * b;
+                s[(size_t) l * 2] = (float) (x.sa * m);
+                s[(size_t) l * 2 + 1] = (float) (x.sf * m);
+            }
+            emb = (float) (x.sa * x.f);
+        };
+        struct Out { int g = 0, btop = 0; double ref = 0.0, bkl = 0.0, tkl = 0.0; bool full = false; };
+        const auto trial = [&](const Prm& x, int cap, Out& r) -> bool {
+            std::vector<float> q, s;
+            float emb = 0.0f;
+            make(x, q, s, emb);
+            if (!model.abl_set(q, 1, s, emb, err)) return false;
+            model.abl_enable(true);
+            r = Out{};
+            for (size_t i = 0; i < Hc.size(); ++i) {
+                if (!run(Hc[i])) return false;
+                log_softmax(lg);
+                r.ref += refusal(lg);
+                const size_t am = (size_t) (std::max_element(lg.begin(), lg.begin() + (long) V) - lg.begin());
+                const bool first = std::find(R.begin(), R.end(), (int32_t) am) != R.end();
+                const int gr = gen_refuses();
+                if (gr < 0) return false;
+                r.g += first || gr > 0;
+                if (r.g > cap) {   // (worse than the target already: the rest is not needed to place it)
+                    r.ref /= (double) (i + 1);
+                    return true;
+                }
+            }
+            r.ref /= (double) Hc.size();
+            for (size_t i = 0; i < Bc.size(); ++i) {
+                if (!run(Bc[i])) return false;
+                log_softmax(lg);
+                double k = 0.0;
+                for (size_t v = 0; v < V; ++v) k += std::exp((double) base[i][v]) * ((double) base[i][v] - lg[v]);
+                r.bkl += k;
+                const size_t am = (size_t) (std::max_element(lg.begin(), lg.begin() + (long) V) - lg.begin());
+                r.btop += std::find(R.begin(), R.end(), (int32_t) am) != R.end();
+            }
+            r.bkl /= (double) Bc.size();
+            if (!T.empty() && !text_kl(r.tkl, false)) return false;
+            r.full = true;
+            return true;
+        };
+        int tgt = o.abl_target;
+        const auto qual = [&](const Out& r) { return T.empty() ? r.bkl : r.tkl; };
+        const auto better2 = [&](const Out& a, const Out& b) {
+            const bool fa = a.full && a.g <= tgt, fb = b.full && b.g <= tgt;
+            if (fa != fb) return fa;
+            if (fa) return qual(a) < qual(b);
+            if (a.g != b.g) return a.g < b.g;
+            if (a.full != b.full) return a.full;
+            return a.ref < b.ref;
+        };
+        std::vector<std::pair<Prm, Out>> all;
+        std::FILE* tf = std::fopen((o.abl_build + ".trials").c_str(), "w");
+        if (tf) std::fprintf(tf, "# n kind di p w sa sf f | refused/%zu full refusal_mass harmless_kl harmless_refusal_first text_kl\n",
+                             Hc.size());
+        const auto log_trial = [&](const char* kind, const Prm& x, const Out& r) {
+            const int n = (int) all.size();
+            std::printf("ABL trial %d %s: dir %.2f peak %.1f width %.1f attn %.3f ffn %.3f floor %.3f -> refused %d of %zu%s, "
+                        "refusal mass %.4f", n, kind, x.di, x.p, x.w, x.sa, x.sf, x.f, r.g, Hc.size(), r.full ? "" : "+",
+                        std::exp(r.ref));
+            if (r.full)
+                std::printf(", harmless KL %.4f (a refusal first %d of %zu), text KL %.5f", r.bkl, r.btop, Bc.size(), r.tkl);
+            std::printf(" (%.0f s)\n", secs());
+            std::fflush(stdout);
+            if (tf) {
+                std::fprintf(tf, "%d %s %.4f %.3f %.3f %.4f %.4f %.4f | %d %d %.6f %.6f %d %.6f\n", n, kind, x.di, x.p, x.w,
+                             x.sa, x.sf, x.f, r.g, r.full ? 1 : 0, std::exp(r.ref), r.bkl, r.btop, r.tkl);
+                std::fflush(tf);
+            }
+        };
+        const auto eval = [&](const char* kind, const Prm& x0, int cap) -> bool {
+            const Prm x = clampp(x0);
+            Out r;
+            if (!trial(x, cap, r)) return false;
+            all.push_back({x, r});
+            log_trial(kind, x, r);
+            return true;
+        };
+        const auto best_i = [&] {
+            size_t b = 0;
+            for (size_t i = 1; i < all.size(); ++i)
+                if (better2(all[i].second, all[b].second)) b = i;
+            return b;
+        };
+        const int nH = (int) Hc.size();
+        if (!o.abl_profile.empty()) {
+            Prm x{};
+            if (std::sscanf(o.abl_profile.c_str(), "%lf,%lf,%lf,%lf,%lf,%lf", &x.di, &x.p, &x.w, &x.sa, &x.sf, &x.f) != 6) {
+                std::fprintf(stderr, "abl build: --abl-profile DI,P,W,SA,SF,F\n");
+                return 2;
+            }
+            x.w = std::max(x.w, 1e-3);   // (no clamping to the search box: a profile is written as given)
+            Out r;
+            if (!trial(x, nH, r)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            all.push_back({x, r});
+            log_trial("given", x, r);
+        } else {
+            // 0. every strength 0 (the edit loaded, nothing taken out): the run-to-run floor of the measures
+            if (!eval("zero", Prm{lo.di, 0.0, 2.0, 0.0, 0.0, 0.0}, nH)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            // 1. the candidates' uniform edits (the old pick's choices, measured the same way)
+            for (int l : cand)
+                if (!eval("uniform", Prm{(double) l, 0.0, (double) L, o.abl_scale, o.abl_scale, 1.0}, nH)) {
+                    std::fprintf(stderr, "abl build: %s\n", err.c_str());
+                    return 1;
+                }
+            if (tgt < 0) {
+                tgt = nH;
+                for (const auto& a : all) tgt = std::min(tgt, a.second.g);
+            }
+            std::printf("ABL search: target %d of %d refusing at most; %d trials\n", tgt, nH, o.abl_search);
+            std::fflush(stdout);
+            const int cap = tgt + 2;
+            // 2. quasi-random profiles (a Halton sequence over the box), a quarter of the trials
+            const auto halton = [](int i, int b) {
+                double f = 1.0, r = 0.0;
+                for (int k = i; k > 0; k /= b) { f /= b; r += f * (k % b); }
+                return r;
+            };
+            const int n0 = std::max(4, o.abl_search / 4);
+            int done = 0;
+            for (int i = 1; i <= n0 && done < o.abl_search; ++i, ++done) {
+                const Prm x{lo.di + (hi.di - lo.di) * halton(i, 2), lo.p + (hi.p - lo.p) * halton(i, 3),
+                            lo.w + (hi.w - lo.w) * halton(i, 5), lo.sa + (hi.sa - lo.sa) * halton(i, 7),
+                            lo.sf + (hi.sf - lo.sf) * halton(i, 11), lo.f + (hi.f - lo.f) * halton(i, 13)};
+                if (!eval("random", x, cap)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            }
+            // 3. steps around the best: Gaussian, a share of each range; wider after a better one, narrower after misses
+            std::mt19937_64 rng(0x5eed1234ULL);
+            std::normal_distribution<double> nd(0.0, 1.0);
+            double sig = 0.15;
+            int miss = 0;
+            for (; done < o.abl_search; ++done) {
+                const Prm c = all[best_i()].first;
+                const Prm x{c.di + sig * (hi.di - lo.di) * nd(rng), c.p + sig * (hi.p - lo.p) * nd(rng),
+                            c.w + sig * (hi.w - lo.w) * nd(rng), c.sa + sig * (hi.sa - lo.sa) * nd(rng),
+                            c.sf + sig * (hi.sf - lo.sf) * nd(rng), c.f + sig * (hi.f - lo.f) * nd(rng)};
+                const size_t b0 = best_i();
+                if (!eval("step", x, cap)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+                if (best_i() != b0) { sig = std::min(0.3, sig * 1.3); miss = 0; }
+                else if (++miss >= 4) { sig = std::max(0.02, sig * 0.7); miss = 0; }
+            }
+        }
+        if (tf) std::fclose(tf);
+        const auto& [bx, br] = all[best_i()];
+        model.abl_clear();
+        std::vector<float> q, s;
+        float emb = 0.0f;
+        make(bx, q, s, emb);
+        std::FILE* f = std::fopen(o.abl_build.c_str(), "wb");
+        if (f == nullptr) { std::fprintf(stderr, "abl build: cannot write %s\n", o.abl_build.c_str()); return 1; }
+        const int32_t hd[3] = {(int32_t) E, 1, (int32_t) L};
+        std::fwrite("ABL2", 1, 4, f);
+        std::fwrite(hd, 4, 3, f);
+        std::fwrite(q.data(), sizeof(float), q.size(), f);
+        std::fwrite(s.data(), sizeof(float), s.size(), f);
+        std::fwrite(&emb, sizeof(float), 1, f);
+        std::fclose(f);
+        std::printf("ABL chose dir %.2f peak %.1f width %.1f attn %.3f ffn %.3f floor %.3f (refused %d of %d, text KL %.5f, "
+                    "harmless KL %.4f; --abl-profile %.4f,%.3f,%.3f,%.4f,%.4f,%.4f) -> %s\n", bx.di, bx.p, bx.w, bx.sa, bx.sf,
+                    bx.f, br.g, nH, br.tkl, br.bkl, bx.di, bx.p, bx.w, bx.sa, bx.sf, bx.f, o.abl_build.c_str());
+        return 0;
     }
     std::vector<std::pair<int, Res>> tried;
     for (int l : cand) {
@@ -3515,6 +3760,11 @@ int main(int argc, char** argv) {
         else if (a == "--abl-gen") o.abl_gen = std::max(0, std::min(256, std::atoi(next("--abl-gen"))));
         else if (a == "--abl-rank") o.abl_rank = std::min(4, std::max(1, std::atoi(next("--abl-rank"))));
         else if (a == "--abl-scale") o.abl_scale = (float) std::atof(next("--abl-scale"));
+        else if (a == "--abl-search") o.abl_search = std::max(0, std::atoi(next("--abl-search")));
+        else if (a == "--abl-target") o.abl_target = std::atoi(next("--abl-target"));
+        else if (a == "--abl-smax") o.abl_smax = std::max(0.1f, (float) std::atof(next("--abl-smax")));
+        else if (a == "--abl-profile") o.abl_profile = next("--abl-profile");
+        else if (a == "--abl-dump") o.abl_dump = next("--abl-dump");
         else if (a == "--abl-range") {
             const char* v = next("--abl-range");
             if (std::sscanf(v, "%lf,%lf", &o.abl_lo, &o.abl_hi) != 2 || o.abl_lo < 0.0 || o.abl_hi > 1.0 || o.abl_lo > o.abl_hi) {
