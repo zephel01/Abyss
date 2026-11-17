@@ -3,7 +3,7 @@
 # GPU's own code, and the engine's per-GPU choices ask the device at run time.  Each archive carries the engine, the
 # GPU tuner and the CUDA libraries they load (NVIDIA's CUDA EULA, Attachment A: cudart, cuBLAS / cuBLASLt may be
 # distributed with an application, unmodified), and SHA256SUMS lists them.
-# Trial: the archives are workflow artifacts.  The release step (attach to a tag's release) is written but off.
+# Branches: the archives are workflow artifacts.  Tags: also attached to the tag's release (the release job).
 name: prebuilt
 
 on:
@@ -208,8 +208,8 @@ jobs:
 
   release:
     # attach both archives and SHA256SUMS to the tag's release (the setups download them from there).
-    # OFF for the trial: remove `false &&` once the archives were checked on real GPUs
-    if: false && startsWith(github.ref, 'refs/tags/v')
+    # on from v1.3.164 (checked on an RTX 5090 under Linux; Windows and RTX 30 / 40 not yet run on a GPU: marked trial)
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux-x64, windows-x64]
     runs-on: ubuntu-latest
     permissions:
@@ -241,6 +241,7 @@ jobs:
           **Prebuilt engine** (no CUDA toolkit or compiler needed; the setups take it when nvcc is missing, or with `--prebuilt`):
           `abyss-engine-cuda-linux-x64.tar.gz` / `abyss-engine-cuda-windows-x64.zip`, CUDA 13.3, RTX 30 / 40 / 50 (sm_86, sm_89, sm_120a).
           NVIDIA driver: **580 or newer required** (CUDA minor version compatibility), **610 or newer recommended** (CUDA 13.3's branch). SHA-256: `SHA256SUMS`.
+          Trial: checked on an RTX 5090 under Linux (same output as a local build); Windows and RTX 30 / 40 not yet run on a GPU here - reports welcome. Images (strata-vision) need a local build.
           EOF
             gh release edit "$tag" --notes-file body.md
           fi
