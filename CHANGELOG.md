@@ -7,6 +7,33 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.167 - 2026-11-17
+
+GLM-5.3-Flash: the verify window with n-gram drafts is pipelined and on by default on NVIDIA cards with 24 GB or more.
+
+- The window (`STRATA_GLM_WINDOW=2`, opt-in since v1.3.145) now runs pipelined, as V4.1's (v1.3.146): the columns in two
+  groups on their own streams, so the GPU runs one group's attention while the CPU lane computes the other group's
+  RAM-tier experts. The same tokens as without the window.
+- On by default when the VRAM budget is 24 GB or more (`STRATA_GLM_VRAM_GB` when set, else the card's memory); off below
+  24 GB, as before. DGX Spark keeps its NextN window (`1`); AMD stays off. `STRATA_GLM_WINDOW=0` gives the old decode,
+  `STRATA_GLM_WINDOW_PIPE=0` the old batched window. The engine prints its choice on stderr (`glm window: default ...`).
+- RTX 5090 (Gen4 x4, 123 GB RAM, iGPU off), GLM-5.3-Flash Maya-S-v2 IQ2_XXS, RAM tier 60 GB, 512 tokens, median of 3,
+  window off -> on:
+
+  | VRAM | edit task | swe-bench text | prose (p4k) | prose (rail) |
+  |---|---|---|---|---|
+  | 32 GB | 44.2 -> 56.8 tok/s (+28.5%) | 46.7 -> 52.2 (+11.9%) | 51.4 -> 51.3 (-0.2%) | 60.3 -> 59.0 (-2.2%, inside the runs' spread) |
+  | 24 GB (`STRATA_GLM_VRAM_GB=24`) | 26.2 -> 30.3 (+15.7%) | 28.8 -> 29.9 (+3.8%) | 34.2 -> 34.5 (+0.7%) | 40.5 -> 40.7 (+0.5%) |
+  | 16 GB (`STRATA_GLM_VRAM_GB=16`) | 15.0 -> 14.8 (-0.9%) | 17.1 -> 16.1 (-5.3%) | 21.4 -> 21.2 (-1.1%) | 24.3 -> 24.4 (+0.4%) |
+
+  At 16 GB the window's buffers take expert slots (VRAM hits 27 -> 23% on swe-bench text, more disk reads), hence the
+  24 GB line.
+- Outputs: deterministic-mode md5 unchanged for all six regression configs (GLM p4k 1f34019e60 with the window on at
+  32 GB and off at 16 GB; edit 764e8340e3 window off / on / batched); the window check (46 windows) and the rewind check
+  show 0 differences.
+- Not measured: Windows CUDA (the same 24 GB rule applies) and GLM-5.3 models other than Flash that share its
+  architecture.
+
 ## v1.3.166 - 2026-11-17
 
 Ornith-1.5-9B QSA in the one-command setup (the engine is unchanged; outputs as in v1.3.165).

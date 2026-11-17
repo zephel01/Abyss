@@ -1477,8 +1477,9 @@ static int glm_pack_generate(const Options& o) {
     const int64_t n_vocab = model.geometry().n_vocab;
     // (measured default, v1.3.145, RTX 5090 + 123 GB, 4K-class prompt + 512, median of 3 vs one draft a window: V4 0731
     // edit +20.9%, swe-bench +11.9%, prose +0.5 / -1.7%; V4.1 JA256 swe-bench +1.9%, edit -0.3%, prose -0.6 / -1.0% -
-    // off there; GLM-5.3-Flash edit +9.3%, swe-bench -2.8%, prose -0.3 / -1.9% - its window stays opt-in,
-    // STRATA_GLM_WINDOW=2)
+    // off there; GLM-5.3-Flash edit +9.3%, swe-bench -2.8%, prose -0.3 / -1.9% with the batched window - since
+    // v1.3.167 its window is pipelined and on by default on a discrete NVIDIA card with a VRAM budget of 24 GB or
+    // more, STRATA_GLM_WINDOW=2)
     const bool ds_v4 = model.geometry().dsv4() && !model.geometry().v41;
     const bool glm53 = model.geometry().arch == 0 && !model.geometry().v41;
     // (V4.1 1017 too since its window is pipelined - dsv4_verify.cu verify_part_v41, 2026-11-14: JA256 against one

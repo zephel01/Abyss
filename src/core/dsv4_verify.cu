@@ -258,7 +258,7 @@ const Glm5Model* Glm5Model::verify_tail() const {
 
 // STRATA_GLM_WINDOW_PIPE (default 1): GLM-5.3's verify window pipelined (verify_part_glm: the columns in two groups on
 // their own streams, one group's attention while the host computes the other's RAM-tier experts - the same tokens);
-// 0: the batched window on one stream, as before v1.3.161
+// 0: the batched window on one stream (the opt-in STRATA_GLM_WINDOW=2 window of v1.3.145 - v1.3.166)
 static bool glm_window_pipe() {
     static const bool on = [] {
         const char* v = getenv("STRATA_GLM_WINDOW_PIPE");
@@ -2446,31 +2446,59 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
 
 // ---------------------------------------------------------------- glm5-next (GLM-5.3-Flash): the batched window
 // STRATA_GLM_WINDOW: verify windows on one part - the speculative decode's NextN drafter (the model's own
-// blk.<n_layers>) or the n-gram drafts. Default: on for a CUDA integrated GPU with unified memory (DGX Spark / GB10:
-// +14-16% decode, the same tokens) with the NextN drafter; off elsewhere - on a discrete card + RAM tier (RTX 5090)
-// the NextN drafter's windows were break-even or slower (the CPU lane's share), and the n-gram's (=2, v1.3.145) pay on
-// an edit task (+9.3%) but cost 0.3-2.8% on prose and swe-bench text (the window's buffers take expert slots, its
-// columns crowd the tiers), so they are opt-in.  =1: the window with the NextN drafter; =2: with the n-gram drafts
-// only (the block not loaded); =0: off.  Exactness: every kernel of a
+// blk.<n_layers>) or the n-gram drafts.  =1: the window with the NextN drafter; =2: with the n-gram drafts only (the
+// block not loaded); =0: off (the token path).  Default:
+//  - 1 on a CUDA integrated GPU with unified memory (DGX Spark / GB10: +14-16% decode, the same tokens);
+//  - 2 on a discrete NVIDIA card (Linux and Windows) whose VRAM budget - STRATA_GLM_VRAM_GB when set, else the card's
+//    total memory - is 24 GB or more (v1.3.167, the window pipelined: STRATA_GLM_WINDOW_PIPE).  Measured on an RTX 5090
+//    + RAM tier (GLM-5.3-Flash Maya-S-v2 IQ2_XXS, RAM 60 GB, 512 tokens, median of 3) against =0, edit / swe-bench text
+//    / prose p4k / prose rail: 32 GB +28.5 / +11.9 / -0.2 / -2.2% (rail's runs overlap), 24 GB +15.7 / +3.8 / +0.7 /
+//    +0.5%; at 16 GB swe-bench text -5.3% (the window's buffers take expert slots: VRAM hits 27 -> 23%, more disk
+//    reads), so 0 below 24 GB;
+//  - 0 on HIP (not measured there).
+// On a discrete card the NextN drafter's windows (=1) were break-even or slower (the CPU lane's share).  Before
+// v1.3.167 the discrete default was 0 and =2 (v1.3.145, then the batched window) opt-in.  Exactness: every kernel of a
 // column is the token path's (hc, kda_prep /
 // kda_rec, dsa_prep / score / select / mla, swiglu_q8, hc_post, head_prep, the routes and experts' kernels) except the
 // dense GEMVs, which are mvn_mv - mv()'s sums a column, the weights read once (STRATA_GLM_MVN_CHECK shows it) - and the
 // column-batched experts (STRATA_DS4_WIN_COLS_CHECK).
+#if !defined(STRATA_USE_HIP)
+// the discrete default: 2 when the VRAM budget is a 24 GB-class card or more (a "24 GB" card reports ~23.99 GiB, so
+// the line is at 23 GiB), else 0
+static int glm_window_discrete(int dev) {
+    double gib = 0.0;
+    const char* vg = getenv("STRATA_GLM_VRAM_GB");
+    if (vg != nullptr && vg[0] != 0) gib = std::atof(vg);
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        const double total = (double) prop.totalGlobalMem / 1073741824.0;
+        gib = gib > 0.0 ? std::min(gib, total) : total;
+    } else {
+        cudaGetLastError();
+    }
+    const int mode = gib >= 23.0 ? 2 : 0;
+    std::fprintf(stderr, "glm window: default %s (VRAM budget %.1f GB; on from 24 GB - STRATA_GLM_WINDOW=0/2 forces)\n",
+                 mode != 0 ? "on, pipelined n-gram windows" : "off", gib);
+    return mode;
+}
+#endif
 static int glm_window_mode() {
     static const int mode = [] {
         const char* v = getenv("STRATA_GLM_WINDOW");
         if (v != nullptr) return std::atoi(v) == 2 ? 2 : std::atoi(v) != 0 ? 1 : 0;
-#if defined(STRATA_USE_HIP) || defined(_WIN32)
+#if defined(STRATA_USE_HIP)
         return 0;
 #else
-        const char* uv = getenv("STRATA_GLM_UMA");   // (the unified-memory policy off: the discrete defaults)
-        if (uv != nullptr && std::atoi(uv) == 0) return 0;
         int integrated = 0, dev = 0;   // (the model's device is current when the load asks)
         if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
             cudaGetLastError();
             return 0;
         }
-        return integrated != 0 ? 1 : 0;
+#if !defined(_WIN32)
+        const char* uv = getenv("STRATA_GLM_UMA");   // (the unified-memory policy off: the discrete defaults)
+        if (integrated != 0 && !(uv != nullptr && std::atoi(uv) == 0)) return 1;
+#endif
+        return glm_window_discrete(dev);
 #endif
     }();
     return mode;
