@@ -235,6 +235,75 @@ class DSparkStep(unittest.TestCase):
         self.assertFalse(self.dst.with_name("drafter.gguf.sha256").exists())
 
 
+class DFlash27Step(unittest.TestCase):
+    """dflash27_step (Qwen3.8-27B's DFlash 2 drafter) against a config in a temporary folder, the drafter 'downloaded'
+    from a local file: on by default where it fits, --no-dflash takes it out, --dflash sets it up where it does not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.data = d / "Abyss-data"
+        self.cfg = d / "abyss-qwen38-27b-test.json"
+        self.cfg.write_text(json.dumps({"exe": "abyss", "env": {"STRATA_LANG": "ja-en"}}), encoding="utf-8")
+        src = d / "src" / "drafter27.gguf"
+        src.parent.mkdir()
+        src.write_bytes(b"GGUF dflash" * 100)
+        sha = hashlib.sha256(src.read_bytes()).hexdigest()
+        self.patches = [mock.patch.object(A, "DSPARK_URL", str(src.parent) + "/{file}"),
+                        mock.patch.object(A, "DFLASH27_FILE", ("drafter27.gguf", src.stat().st_size, sha))]
+        for pt in self.patches:
+            pt.start()
+        self.gpu = [{"index": 0, "vram_gb": 32.0}]
+        self.dst = self.data / "models" / A.DFLASH27_REPO / "drafter27.gguf"
+
+    def tearDown(self):
+        for pt in self.patches:
+            pt.stop()
+        self.tmp.cleanup()
+
+    def run_step(self, fits=True, gpus=None, **kw):
+        a = Namespace(dflash=kw.get("dflash", False), no_dflash=kw.get("no_dflash", False), yes=True)
+        A.dflash27_step(a, self.data, self.cfg, gpus or self.gpu, fits)
+        return json.loads(self.cfg.read_text(encoding="utf-8"))["env"]
+
+    def test_on_by_default_where_it_fits(self):
+        env = self.run_step()
+        self.assertEqual(env["STRATA_Q35_DFLASH"], str(self.dst))
+        self.assertEqual(env["STRATA_LANG"], "ja-en")   # the rest of the env stays
+        self.assertTrue(self.dst.with_name("drafter27.gguf.sha256").exists())
+
+    def test_off_where_it_does_not_fit_unless_dflash(self):
+        self.assertNotIn("STRATA_Q35_DFLASH", self.run_step(fits=False))
+        self.assertFalse(self.dst.exists())
+        self.assertEqual(self.run_step(fits=False, dflash=True)["STRATA_Q35_DFLASH"], str(self.dst))
+
+    def test_no_dflash_skips_it_and_takes_it_out(self):
+        self.assertNotIn("STRATA_Q35_DFLASH", self.run_step(no_dflash=True))
+        self.assertFalse(self.dst.exists())
+        self.run_step()
+        env = self.run_step(no_dflash=True)
+        self.assertNotIn("STRATA_Q35_DFLASH", env)
+        self.assertTrue(self.dst.exists())   # the file stays
+
+    def test_not_with_a_layer_split(self):
+        env = self.run_step(gpus=self.gpu * 2)
+        self.assertNotIn("STRATA_Q35_DFLASH", env)
+        self.assertFalse(self.dst.exists())
+
+    def test_a_wrong_file_stops(self):
+        with mock.patch.object(A, "DFLASH27_FILE", ("drafter27.gguf", 1100, "0" * 64)):
+            with self.assertRaises(SystemExit):
+                self.run_step()
+        self.assertFalse(self.dst.with_name("drafter27.gguf.sha256").exists())
+
+    PINNED = A.DFLASH27_FILE   # (read before setUp patches it)
+
+    def test_the_pinned_file(self):
+        name, size, sha = self.PINNED
+        self.assertEqual((name, size), ("Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1143006816))
+        self.assertTrue(sha.startswith("1a25c568") and len(sha) == 64)
+
+
 class ToolkitSwitch(unittest.TestCase):
     """Setup again after a switch to another ROCm / CUDA toolkit (issue #1: ROCm 7.0 -> 10)."""
 

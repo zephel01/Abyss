@@ -25,6 +25,8 @@
      UD-Q2_K_XL and names zephel01's file for this size)
     ./setup-deepseek.sh --dspark             also DeepSeek's DSpark drafter (6.9 GB): faster answers (--no-dspark: off)
     ./setup-deepseek.sh --model qwen38 --dflash   also the DFlash 2 drafter (0.65 GB): faster code (--no-dflash: off)
+    ./setup-deepseek.sh --model qwen38-27b   sets up Qwen3.8-27B's DFlash 2 drafter (1.14 GB) too where it fits in VRAM
+                                             (a 24 GB+ GPU at UD-Q4_K_XL): faster code / reasoning (--no-dflash: off)
 
 What it does:
 
@@ -299,6 +301,15 @@ DFLASH_REPO = "nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF"
 DFLASH_REV = "cbe1b23f1466458b9d839f6cbaef7d3b52d8cc9b"
 DFLASH_FILE = ("Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf", 652101056,
                "5e7163abcbee4f348adced14c0f545fa4f2c5a1fdfd4d0a914b176e1c866ac9e")
+# Qwen3.8-27B's DFlash 2 block drafter (v1.3.171, on by default where it fits): z-lab's Q4_K_M GGUF (5 layers over the
+# target's layers 6/20/34/48/62; Apache-2.0), pinned to the commit it was measured with.  The engine loads it from the
+# config's STRATA_Q35_DFLASH (src/core/dflash2.cu, ~1.4 GB of VRAM) beside the NextN block and drops it when the FFN
+# would not all fit in VRAM beside it
+DFLASH27_REPO = "z-lab/Qwen3.8-27B-DFlash2-GGUF"
+DFLASH27_REV = "2d9571f8ce46e151f61c6499c99dee6079e1d610"
+DFLASH27_FILE = ("Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1143006816,
+                 "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd")
+DFLASH27_GB = 1.4   # (its VRAM: weights, context ring, the draft's buffers - 1.33 GB + the pending rows, measured)
 TOOL_TEMPLATES = ROOT / "ops" / "abyss-tools"
 MANAGED = ("abyss.sh", "common.sh")        # replaced when the template changes (the old one kept as .bak)
 ONCE = ("README.md",)                      # written only when missing: the user's own notes go there
@@ -636,6 +647,47 @@ def dflash_step(a, data: Path, cfg: Path, gpus) -> None:
         S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
     env["STRATA_Q4X_DFLASH"] = str(dst)
     save(f"DFlash 2 drafter on in {cfg.name} (STRATA_Q4X_DFLASH)")
+
+
+def dflash27_step(a, data: Path, cfg: Path, gpus, fits: bool) -> None:
+    """Qwen3.8-27B's DFlash 2 drafter, on by default where the whole file and the drafter fit in one GPU's VRAM: the
+    file downloaded (SHA-256 checked) and named in the config's env; --no-dflash takes it out (the file stays),
+    --dflash sets it up on a smaller GPU too (the engine drops it there unless STRATA_Q35_DFLASH_KEEP=1)."""
+    conf = json.loads(cfg.read_text(encoding="utf-8"))
+    env = conf.setdefault("env", {})
+    have = env.get("STRATA_Q35_DFLASH") or None
+
+    def save(what: str) -> None:
+        cfg.write_text(json.dumps(conf, indent=1) + "\n", encoding="utf-8")
+        S.ok(what)
+
+    if a.no_dflash or (have and len(gpus) > 1):   # (the engine runs it on one device only)
+        if have:
+            del env["STRATA_Q35_DFLASH"]
+            save(f"DFlash 2 drafter off in {cfg.name} (the file stays: {have})")
+        else:
+            S.ok("DFlash 2 drafter: off (--no-dflash)")
+        return
+    if len(gpus) > 1:
+        S.ok("DFlash 2 drafter: not with a layer split")
+        return
+    if have and Path(have).exists():
+        S.ok(f"DFlash 2 drafter: on ({have})")
+        return
+    if not a.dflash and not fits:
+        S.ok(f"DFlash 2 drafter: off - the model and the drafter (~{DFLASH27_GB} GB) do not both fit in this GPU's VRAM "
+             "(--dflash sets it up anyway; the engine then drops it while the model's FFN does not fit beside it)")
+        return
+    name, size, sha = DFLASH27_FILE
+    dst = data / "models" / DFLASH27_REPO / name
+    S.say("  z-lab's DFlash 2 drafter proposes up to 7 tokens a step beside the NextN block (the answers are still the")
+    S.say("  model's own): code +15-21%, reasoning +13-16% on an RTX 5090; ~1.4 GB of VRAM (--no-dflash: off)")
+    S.say(f"  {name}, {size / 1e9:.2f} GB -> {dst.parent}")
+    S.download(DSPARK_URL.format(repo=DFLASH27_REPO, rev=DFLASH27_REV, file=name), dst, name)
+    if not verified(dst, sha):
+        S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
+    env["STRATA_Q35_DFLASH"] = str(dst)
+    save(f"DFlash 2 drafter on in {cfg.name} (STRATA_Q35_DFLASH)")
 
 
 def make_tools(tools: Path) -> None:
@@ -1022,8 +1074,10 @@ def main() -> int:
     ap.add_argument("--no-dspark", action="store_true", help="turn the DSpark drafter off in the config (the file stays)")
     ap.add_argument("--dflash", action="store_true", help="(qwen38) download the DFlash 2 drafter (0.65 GB) and turn it on "
                     "in the config instead of the MTP layer: faster code and lists, slower prose (docs/MANUAL.md, "
-                    "Qwen3.8-Flash-Next); one GPU")
-    ap.add_argument("--no-dflash", action="store_true", help="turn the DFlash 2 drafter off in the config (the file stays)")
+                    "Qwen3.8-Flash-Next); one GPU.  (qwen38-27b) set up its DFlash 2 drafter (1.14 GB) also where it does "
+                    "not fit in VRAM beside the model (it is set up by default where it fits)")
+    ap.add_argument("--no-dflash", action="store_true", help="turn the DFlash 2 drafter off in the config (the file stays); "
+                    "qwen38-27b: do not set it up")
     ap.add_argument("--tools-only", action="store_true", help="only create / update the Abyss-tools folder")
     a = ap.parse_args()
     if a.dspark and a.no_dspark:
@@ -1039,8 +1093,8 @@ def main() -> int:
         ap.error(f"--model {a.model} has the quants {', '.join(model['quants'])}")
     if a.dspark and a.model != "v4":
         ap.error("--dspark: the DSpark drafter is set up for DeepSeek V4 only (V4.1: docs/deepseek41/README.md)")
-    if (a.dflash or a.no_dflash) and a.model != "qwen38":
-        ap.error("--dflash: the DFlash 2 drafter is Qwen3.8-Flash-Next's (--model qwen38)")
+    if (a.dflash or a.no_dflash) and a.model not in ("qwen38", "qwen38-27b"):
+        ap.error("--dflash: the DFlash 2 drafters are Qwen3.8-Flash-Next's and Qwen3.8-27B's (--model qwen38 / qwen38-27b)")
     data = Path(a.data_dir).expanduser().resolve()
 
     S.step(1, "the PC")
@@ -1216,6 +1270,10 @@ def main() -> int:
         need = dense_need(a.model, ctx, quant)
         resident = bool(gpus) and need is not None and (gpus[0].get("vram_gb") or 0.0) - need >= 1.5
         vision_27b_step(a, repo, mdir, mdir / Path(files[0][0]).name, cfg, gpus, backend, resident)
+        # (the drafter: on where the whole file, its context and the drafter fit - an NVIDIA GPU; dflash2.cu is CUDA)
+        fits = (resident and backend == "cuda" and
+                (gpus[0].get("vram_gb") or 0.0) - need >= 1.5 + DFLASH27_GB)
+        dflash27_step(a, data, cfg, gpus, fits)
 
     S.step(8, "Abyss-tools")
     make_tools(tools)

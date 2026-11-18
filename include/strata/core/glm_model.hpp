@@ -640,6 +640,7 @@ public:
     // chunk's T = n rows: its last 2048 kept)
     void dflash_capture(int il, const float* R, int n, size_t rs, bool prompt, cudaStream_t s);
     bool dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
+    bool dflash_flush(cudaStream_t s);
     void dflash_settle();
     void dflash_window(int64_t p0, int T);
     bool dflash_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
@@ -912,6 +913,7 @@ public:
     // the NextN chain otherwise (the decode picks a step's drafter by their measured rates)
     bool dfl_pick_ = true;
     bool dflash_with_mtp() const { return dfl_ != nullptr && q35_mtp_on(); }
+    bool dflash_cjk(int32_t t) const;   // (a piece with kana / CJK ideographs, from the drafter's vocab)
     int dflash_max() const;   // (drafts a step at most: the GGUF's block_size - 1, or STRATA_Q35_DFLASH_N)
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     /// Speculative sampling (spec_sampling.hpp; qwen35's NextN drafter on one part): with a request's sampler set,

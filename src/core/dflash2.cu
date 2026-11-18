@@ -33,6 +33,7 @@
 
 #include "strata/qtypes.hpp"
 
+#include <functional>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #if !defined(STRATA_USE_HIP)
@@ -99,6 +100,14 @@ struct DflState {
     // features: the token's / the window's columns ([kVerifyMax][5 E]) and a prompt chunk's last rows ([kRing][5 E])
     float *feat = nullptr, *feat_p = nullptr;
     void* featq = nullptr;
+    // the dense target's decode rows waiting for their commit ([kCh][5 E]): one pass when a draft needs them or the
+    // buffer is full, not a pass a step (Qwen3.8-27B ja at 128K: the steps' own commits cost 1.1% with the NextN
+    // block drafting nearly every step)
+    float* pend = nullptr;
+    std::vector<uint8_t> cjk;   // (the dense target's vocab: 1 a piece with kana / CJK ideographs / CJK punctuation)
+    int pend_n = 0;
+    int64_t pend_p0 = 0;
+    bool from_pend = false;
     float *gpre = nullptr, *gv = nullptr, *kk = nullptr, *vv = nullptr;   // the commit's pass
     void* gq = nullptr;
     // the draft
@@ -629,6 +638,58 @@ bool dmm(DflState* D, const WSlot& w, int n_in, int n_out, const float* x, const
 
 }  // namespace
 
+// the GGUF's tokenizer.ggml.tokens in full (the reader keeps 64 items of an array)
+static bool dfl_vocab(const std::string& path, std::vector<std::string>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    bool ok = false;
+    const auto rd = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
+    const auto rstr = [&](std::string* to) {
+        uint64_t n = 0;
+        if (!rd(&n, 8) || n > (1u << 24)) return false;
+        if (to == nullptr) return std::fseek(f, (long) n, SEEK_CUR) == 0;
+        to->resize((size_t) n);
+        return n == 0 || rd(&(*to)[0], (size_t) n);
+    };
+    static const int sz[13] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    std::function<bool(uint32_t, bool)> skip = [&](uint32_t t, bool keep) -> bool {
+        if (t == 8) return rstr(nullptr);
+        if (t == 9) {
+            uint32_t et = 0;
+            uint64_t n = 0;
+            if (!rd(&et, 4) || !rd(&n, 8) || n > (1u << 24) || et > 12) return false;
+            if (keep && et == 8) {
+                out.resize((size_t) n);
+                for (uint64_t i = 0; i < n; ++i)
+                    if (!rstr(&out[(size_t) i])) return false;
+                return true;
+            }
+            for (uint64_t i = 0; i < n; ++i)
+                if (!skip(et, false)) return false;
+            return true;
+        }
+        if (t > 12) return false;
+        return std::fseek(f, sz[t], SEEK_CUR) == 0;
+    };
+    uint32_t magic = 0, ver = 0;
+    uint64_t nt = 0, nk = 0;
+    if (rd(&magic, 4) && rd(&ver, 4) && rd(&nt, 8) && rd(&nk, 8) && magic == 0x46554747u && ver >= 2) {
+        for (uint64_t k = 0; k < nk; ++k) {
+            std::string key;
+            uint32_t t = 0;
+            if (!rstr(&key) || !rd(&t, 4)) break;
+            const bool want = key == "tokenizer.ggml.tokens";
+            if (!skip(t, want)) break;
+            if (want) {
+                ok = !out.empty();
+                break;
+            }
+        }
+    }
+    std::fclose(f);
+    return ok;
+}
+
 bool Glm5Model::dflash_load(std::string& err) {
     (void) err;
     const Glm5Geometry& g = g_;
@@ -684,6 +745,37 @@ bool Glm5Model::dflash_load(std::string& err) {
     if (dense) {   // (the decode cuts the width by the walk's confidences against the measured window times)
         D->n_max = std::min(kNbMax - 1, std::max(1, (int) num("dflash.block_size", 8) - 1));
         D->p_min = 0.0f;
+        // the CJK pieces (the decode tries DFlash 2 seldom on CJK prose): the byte-level pieces back to bytes (the
+        // printable bytes stand for themselves, the rest for 256 + their rank), then a UTF-8 lead E3 with 80-83
+        // (U+3000-30FF: CJK punctuation, kana) or E4-E9 (U+4000-9FFF: the ideographs)
+        std::vector<std::string> vocab;
+        if (dfl_vocab(path, vocab) && (int) vocab.size() == V) {
+            int map[512];
+            for (int& x : map) x = -1;
+            for (int b = 0, n = 0; b < 256; ++b) {
+                const bool self = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174;
+                map[self ? b : 256 + n++] = b;
+            }
+            D->cjk.assign((size_t) V, 0);
+            std::vector<int> by;
+            for (int t = 0; t < V; ++t) {
+                const std::string& str = vocab[(size_t) t];
+                by.clear();
+                for (size_t i = 0; i < str.size();) {   // (UTF-8 to code points, each one byte)
+                    const unsigned c = (unsigned char) str[i];
+                    int cp = c, len = 1;
+                    if (c >= 0xC0 && c < 0xE0 && i + 1 < str.size()) { cp = ((c & 0x1F) << 6) | (str[i + 1] & 0x3F); len = 2; }
+                    else if (c >= 0xE0 && i + 2 < str.size()) { cp = ((c & 0x0F) << 12) | ((str[i + 1] & 0x3F) << 6) | (str[i + 2] & 0x3F); len = 3; }
+                    i += (size_t) len;
+                    by.push_back(cp < 512 ? map[cp] : -1);
+                }
+                for (size_t i = 0; i + 1 < by.size(); ++i)
+                    if ((by[i] == 0xE3 && by[i + 1] >= 0x80 && by[i + 1] <= 0x83) || (by[i] >= 0xE4 && by[i] <= 0xE9 && by[i + 1] >= 0x80)) {
+                        D->cjk[(size_t) t] = 1;
+                        break;
+                    }
+            }
+        }
     }
     if (const char* v = getenv("STRATA_Q4X_DFLASH_MASK")) D->mask = std::atoi(v);
     if (D->mask < 0 || D->mask >= V) return refuse("the mask token id");
@@ -789,6 +881,10 @@ bool Glm5Model::dflash_load(std::string& err) {
     const size_t FE = (size_t) kL * E, NB = (size_t) kNbMax;
     fb(D->feat, (size_t) kVerifyMax * FE);
     fb(D->feat_p, (size_t) kRing * FE);
+    {   // (STRATA_Q35_DFLASH_LAZY=0: a commit a step, the old way)
+        const char* lv = std::getenv("STRATA_Q35_DFLASH_LAZY");
+        if (D->dense && (lv == nullptr || std::atoi(lv) != 0)) fb(D->pend, (size_t) kCh * FE);
+    }
     bb(D->featq, (size_t) kCh * FE / 32 * kQ8);
     fb(D->gpre, (size_t) kCh * E);
     fb(D->gv, (size_t) kCh * E);
@@ -865,7 +961,17 @@ bool Glm5Model::dflash_load(std::string& err) {
                          "%.2f GB on CUDA%d\n",
                  path, kL, D->cap[0], D->cap[1], D->cap[2], D->cap[3], D->cap[4], D->n_max, D->p_min,
                  (double) D->bytes / 1073741824.0, dev_);
+    if (dense) {
+        size_t nc = 0;
+        for (uint8_t x : D->cjk) nc += x;
+        std::fprintf(stderr, "dflash: %zu CJK pieces in its vocab (the decode tries it seldom on CJK prose)\n", nc);
+    }
     return true;
+}
+
+bool Glm5Model::dflash_cjk(int32_t t) const {
+    const auto* D = (const DflState*) dfl_;
+    return D != nullptr && t >= 0 && (size_t) t < D->cjk.size() && D->cjk[(size_t) t] != 0;
 }
 
 int Glm5Model::dflash_max() const {
@@ -942,6 +1048,7 @@ void Glm5Model::dflash_forget() {
     auto* D = (DflState*) dfl_;
     if (D == nullptr) return;
     D->win_p0 = -1;
+    D->pend_n = 0;
     D->ctx_lo = D->ctx_end = pos_;
 }
 
@@ -973,11 +1080,25 @@ bool Glm5Model::dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
     if (D == nullptr || n <= 0) return true;
     const int E = g_.n_embd, KVD = kNKV * kHD;
     const size_t FE = (size_t) kL * E;
+    if (D->pend != nullptr && !D->from_pend) {
+        if (prompt) {   // (the rows before the chunk's first)
+            if (!dflash_flush(s)) return false;
+        } else {        // (the step's rows behind the waiting ones; a gap or a full buffer commits those first)
+            if (D->pend_n > 0 && (p0 != D->pend_p0 + D->pend_n || D->pend_n + n > kCh) && !dflash_flush(s)) return false;
+            if (n <= kCh) {
+                if (D->pend_n == 0) D->pend_p0 = p0;
+                cudaMemcpyAsync(D->pend + (size_t) D->pend_n * FE, D->feat, (size_t) n * FE * sizeof(float),
+                                cudaMemcpyDeviceToDevice, s);
+                D->pend_n += n;
+                return true;
+            }
+        }
+    }
     if (n > kRing) {
         p0 += n - kRing;
         n = kRing;
     }
-    const float* feat = prompt ? D->feat_p : D->feat;
+    const float* feat = D->from_pend ? D->pend : prompt ? D->feat_p : D->feat;
     for (int c0 = 0; c0 < n; c0 += kCh) {
         const int m = std::min(kCh, n - c0);
         const float* fr = feat + (size_t) c0 * FE;
@@ -1014,6 +1135,18 @@ bool Glm5Model::dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
     return true;
 }
 
+// the waiting decode rows' commit (before a draft reads the context, before a prompt chunk's rows)
+bool Glm5Model::dflash_flush(cudaStream_t s) {
+    auto* D = (DflState*) dfl_;
+    if (D == nullptr || D->pend_n == 0) return true;
+    const int n = D->pend_n;
+    D->pend_n = 0;
+    D->from_pend = true;
+    const bool ok = dflash_commit(D->pend_p0, n, false, s);
+    D->from_pend = false;
+    return ok;
+}
+
 void Glm5Model::dflash_settle() {
     auto* D = (DflState*) dfl_;
     if (D == nullptr || D->win_p0 < 0) return;
@@ -1048,6 +1181,7 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     } range;
 #endif
     dflash_settle();
+    if (!dflash_flush(s)) { err = "dflash: the context commit"; return false; }
     const int64_t pos = pos_;
     const int E = g.n_embd, V = g.n_vocab, NB = D->nb, KVD = kNKV * kHD, G2 = 4 * (E / kGrp), kFF = D->ff;
     const size_t q8e = (size_t) (E / 32) * kQ8;

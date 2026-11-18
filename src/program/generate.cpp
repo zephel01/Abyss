@@ -2506,11 +2506,17 @@ static int glm_pack_generate(const Options& o) {
             int rate_cnt[3] = {0, 0, 0};
             constexpr int kRateN = 16;
             double rate_ring[3][kRateN][2] = {};
-            // the pick: an incumbent and, every 24 of its steps (64 when one is clearly ahead), a trial of the other for
-            // 8 steps - its tokens a ms against the incumbent's last 8 steps right before it (the same stretch of
-            // text, so the content's own difficulty cancels); rho, a running mean of log(DFlash 2 / NextN) over those
-            // pairs, names the incumbent
-            int inc = 2, trial = 0, trial_done = 0, inc_cnt = 0, rho_n = 0;
+            // the pick: an incumbent (DFlash 2 first: code +7% against the NextN block first, reasoning -6%) and a trial of the other for 8 steps - its tokens a ms
+            // against the incumbent's last 8 steps right before it (the same stretch of text, so the content's own
+            // difficulty cancels); rho, a running mean of log(DFlash 2 / NextN) over those pairs, names the incumbent.
+            // The first trial after 8 steps, then every 24 << back steps: back counts the trials in a row the other
+            // clearly lost (its log ratio below -0.1; up to 4: every 384), anything else starts it over (Japanese
+            // prose, where DFlash 2 seldom pays).  A trial's first step is not measured (the waiting context rows'
+            // commit, dflash2.cu's pend).  While a third or more of the answer's recent pieces are CJK (kana,
+            // ideographs: Japanese prose, where DFlash 2 lost 2.7-3.6% on Qwen3.8-27B and its trials still ~1%) the
+            // NextN block drafts and nothing is tried
+            int inc = 2, trial = 0, trial_done = 0, inc_cnt = 0, rho_n = 0, back = 0;
+            double cjk_sh = 0.0;   // (the share of CJK pieces among the steps' tokens: the mean of the first 16, then of weight 1/16)
             int64_t since_trial = 0;
             double rho = 0.0, tr_t = 0.0, tr_m = 0.0, inc_ring[8][2] = {};
             const int rep_max = copy ? copy_k : d_max;
@@ -2779,36 +2785,46 @@ static int glm_pack_generate(const Options& o) {
                             use = dfl_force == 1 ? 2 : 1;
                         } else {
                             ++dfl_steps;
+                            cjk_sh += ((model.dflash_cjk(tok) ? 1.0 : 0.0) - cjk_sh) / (double) std::min<int64_t>(dfl_steps, 16);
                             // (the answer's first 16 steps, untimed: the NextN block's, the cheaper drafter)
                             use = 1;
                             if (d_timed) {
-                                if (trial != 0 && trial_done >= 8) {   // (the trial's end: the pair into rho)
+                                if (trial != 0 && trial_done >= 9) {   // (the trial's end: the pair into rho)
                                     double it = 0.0, im = 0.0;
                                     for (int i = 0; i < std::min(inc_cnt, 8); ++i) { it += inc_ring[i][0]; im += inc_ring[i][1]; }
+                                    double cl = 0.0;   // (the challenger's log ratio: < -0.1 a clear loss)
                                     if (it > 0.0 && im > 0.0 && tr_t > 0.0 && tr_m > 0.0) {
-                                        const double dd = (trial == 2 ? 1.0 : -1.0) * std::log((tr_t / tr_m) / (it / im));
+                                        cl = std::log((tr_t / tr_m) / (it / im));
+                                        const double dd = (trial == 2 ? 1.0 : -1.0) * cl;
                                         rho = rho_n == 0 ? dd : 0.7 * rho + 0.3 * dd;
                                         ++rho_n;
                                     }
+                                    const int was = inc;
                                     inc = rho >= 0.0 ? 2 : 1;
+                                    back = inc != was || cl > -0.1 ? 0 : std::min(back + 1, 4);
                                     trial = 0;
                                     since_trial = 0;
                                     inc_cnt = 0;
                                 }
-                                if (trial == 0 && since_trial >= (rho_n == 0 ? 8 : std::fabs(rho) > 0.2 ? 64 : 24)) {
+                                if (trial == 0 && since_trial >= (rho_n == 0 ? 8 : 24 << back)) {
                                     trial = inc == 1 ? 2 : 1;
                                     trial_done = 0;
                                     tr_t = tr_m = 0.0;
                                 }
                                 use = trial != 0 ? trial : inc;
+                                if (cjk_sh > 0.33) {   // (CJK prose: the NextN block, no trials; the pick resumes after)
+                                    use = 1;
+                                    trial = 0;
+                                    since_trial = 0;
+                                }
                             }
                         }
                         model.dfl_pick_ = use == 2;
                         static const bool dfl_trace = std::getenv("STRATA_Q35_DFLASH_TRACE") != nullptr;
                         if (dfl_trace)
-                            std::fprintf(stderr, "dfl pick %lld: %d timed %d rates %.3f(%d) / %.3f(%d) rho %.3f(%d) trial %d\n",
+                            std::fprintf(stderr, "dfl pick %lld: %d timed %d rates %.3f(%d) / %.3f(%d) rho %.3f(%d) trial %d cjk %.2f\n",
                                          (long long) dfl_steps, use, (int) d_timed, dfl_rate, rate_cnt[2], mtp_rate,
-                                         rate_cnt[1], rho, rho_n, trial);
+                                         rate_cnt[1], rho, rho_n, trial, cjk_sh);
                         (use == 2 ? dfl_last : mtp_last) = dfl_steps;
                     }
                 }
@@ -2888,9 +2904,11 @@ static int glm_pack_generate(const Options& o) {
                     // its last 16 steps' tokens over their time; a re-measure starts it over, so the other drafter's value is
                     // never older than its last trial (the content changes: prose, a list, code)
                     double& x = use == 2 ? dfl_rate : mtp_rate;
-                    if (trial != 0 && use == trial) {
-                        tr_t += toks;
-                        tr_m += ms;
+                    if (trial != 0 && use == trial) {   // (its first step left out: the waiting rows' commit, a cold start)
+                        if (trial_done > 0) {
+                            tr_t += toks;
+                            tr_m += ms;
+                        }
                         ++trial_done;
                     } else if (use == inc) {
                         inc_ring[inc_cnt & 7][0] = toks;
