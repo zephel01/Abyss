@@ -19,6 +19,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   without drafts (checked against no-draft sampling on 3,500 short answers), more drafts stay. RTX 5090, Qwen3.8-27B
   UD-Q4_K_XL: temperature 1.0 +1.5-2.5% tok/s, 0.6 -0.5% (noise level), so off by default. Greedy, seeded and default
   requests are bit-identical to v1.3.169.
+- Engine: a sampled request without a seed gets a fresh seed on the GLM / DeepSeek / Qwen pack path. Before, every
+  such request drew from the engine's seed 0 and counter 0, so the same prompt gave the same answer every time
+  (regenerate changed nothing). Requests with `seed` and greedy requests are unchanged.
 
 ## v1.3.169 - 2026-11-18
 

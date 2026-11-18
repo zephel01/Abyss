@@ -31,6 +31,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/spec_sampling.hpp"
+#include "strata/program/request_seed.hpp"
 #include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -116,6 +117,7 @@ struct Options {
     int64_t max_context = 4096;
     bool greedy = true;
     uint64_t seed = 0;
+    bool seed_given = false;          // --seed was on the command line
     int top_k = 20;
     float top_p = 0.95f;
     float temperature = 1.0f;
@@ -3191,6 +3193,13 @@ static int glm_pack_generate(const Options& o) {
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            // no seed= on the line: a fresh seed for this request (request_seed.hpp: they all drew from --seed's 0 and
+            // counter 0 - the same answer every time), unless the engine was started with --seed
+            {
+                static uint64_t fresh_n = 0;
+                rq.seed = strata::program::request_seed(req_seeded, rq.seed, o.seed_given, o.seed, fresh_n,
+                                                        strata::program::request_seed_now());
+            }
             // the CPU lane for this request: what it names, else what the engine started with
             model.set_pcie_share(req_pcie >= 0.0 && req_pcie <= 1.0 ? req_pcie : -1.0);
             model.set_cpu_lane_threads(req_threads > 0 ? req_threads : 0);
@@ -3402,7 +3411,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
         else if (a == "--greedy") o.greedy = true;
-        else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
+        else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.seed_given = true; o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
