@@ -2882,7 +2882,6 @@ static int glm_pack_generate(const Options& o) {
                 std::fprintf(stderr, "spec sampling: %lld windows, %lld drafts judged, %lld kept (%.0f%%)\n",
                              (long long) ss_win, (long long) ss_cols, (long long) ss_kept,
                              100.0 * (double) ss_kept / (double) std::max<int64_t>(1, ss_cols));
-=======
             if (copy)
                 std::fprintf(stderr, "q35 copy: up to %d drafts; the repeats' windows by drafts 1..%d:%s; ms a step by "
                                      "columns 1..%d:%s; shares right a position (short / long matches):%s /%s; the "
