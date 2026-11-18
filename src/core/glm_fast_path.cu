@@ -770,7 +770,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     for (int il = l0_; il < lt_; ++il) {
         const bool is_mtp = il == mtp_il_;
         auto& Ly = F->L[(size_t) il];
-        const std::string P = "blk." + std::to_string(il) + ".";
+        const std::string P = "blk." + std::to_string(g.phys(il)) + ".";   // (SenseNova-Loop: a second visit's weights)
         const auto f32 = [&](const char* n) -> const float* {
             auto it = w_.find(P + n);
             if (it == w_.end()) { missing += P + n + " (f32) "; return nullptr; }

@@ -125,6 +125,19 @@ struct Glm5Geometry {
     // past 2,051 cells a query attends to the indexer's 512 best 4-cell blocks and its own block.  STRATA_Q35_QSA=0:
     // the indexers are not used (the dense model, the same tokens as the file without them)
     bool qsa27 = false;
+    // ---- sensenova_loop (SenseNova-Loop-9B): the dense qwen35 with a looped block - n_layers counts the layer VISITS
+    // (56); the second visit of the loop [loop_lo, loop_lo + loop_shift) owns no tensors and reads layer il - loop_shift's
+    // weights (phys), with its own delta-net states and KV cache rows.  Inside the loop the residual is two streams
+    // with an mHC router on every sublayer (blk.N.mhc_{attn,ffn}.{weight,bias}: 8 logits from the flat streams' rms
+    // -> 2 pre gates (sigmoid), 2 post gates (2 sigmoid), a 2x2 mix made doubly stochastic by Sinkhorn); mhc_kind 1
+    // enters (both streams = the residual), 4 stays, 2 leaves (the mean of the two streams), 0 a plain layer.
+    // q35_yarn: YaRN on the attention's RoPE (rope.scaling.type yarn: yarn_factor over yarn_orig_ctx)
+    bool loop = false;
+    int loop_lo = 0, loop_shift = 0;
+    std::vector<int> mhc_kind;
+    bool q35_yarn = false;
+    int phys(int il) const { return loop && il >= loop_lo && il < loop_lo + loop_shift ? il - loop_shift : il; }
+    int kind(int il) const { return il >= 0 && il < (int) mhc_kind.size() ? mhc_kind[(size_t) il] : 0; }
     static bool from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
     // ---- laguna (poolside Laguna-S-2.1, llama.cpp src/models/laguna.cpp; src/core/qwen35_fast_path.cu's laguna
     // branches, kernels/laguna_fast.hpp): arch stays 2 with laguna set - every layer attention (no delta-net), head_dim
@@ -725,6 +738,7 @@ public:
     bool q4x_mix5(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
                   const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);
     bool fast_q4x_layers(int64_t p, std::string& err);
+    bool fast_loop_layers(int64_t p, std::string& err);   // sensenova_loop (qwen35_fast_path.cu)
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed
     // caches are append-only by position - a row is written exactly when it becomes visible - so the position alone

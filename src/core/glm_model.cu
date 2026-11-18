@@ -572,7 +572,7 @@ static bool eog_from_gguf(const strata::GgufFile& g, Glm5Geometry& out) {
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     if (g.get("deepseek4.block_count")) return from_gguf_dsv4(g, out, err);
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
-    if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count"))
+    if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count") || g.get("sensenova_loop.block_count"))
         return from_gguf_qwen35(g, out, err) && eog_from_gguf(g, out);
     if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err) && eog_from_gguf(g, out);
     if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err) && eog_from_gguf(g, out);
@@ -696,7 +696,8 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
 bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     // (the dense qwen35 - Qwen3.8-27B: the same hparams without the experts, feed_forward_length the FFN's width)
     const bool dense = g.get("qwen35moe.block_count") == nullptr;
-    const std::string p = dense ? "qwen35." : "qwen35moe.";
+    const bool loop = g.get("sensenova_loop.block_count") != nullptr;
+    const std::string p = loop ? "sensenova_loop." : dense ? "qwen35." : "qwen35moe.";
     const auto num = [&](const std::string& key, double def) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -778,6 +779,50 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
     }
     out.indexer_full.assign((size_t) out.n_layers, 1);
     out.comp_ratio.assign((size_t) out.n_layers, 0);
+    {   // YaRN on the attention's RoPE (SenseNova-Loop: factor 2 over 262,144); the plain qwen35 files carry none
+        const auto* st = g.get(p + "rope.scaling.type");
+        const double f = num("rope.scaling.factor", 1.0);
+        if (st != nullptr && st->type == strata::MetaType::STRING && st->s == "yarn" && f > 1.0) {
+            out.q35_yarn = true;
+            out.yarn_factor = (float) f;
+            out.yarn_orig_ctx = (int) num("rope.scaling.original_context_length", 262144);
+            out.yarn_beta_fast = (float) num("rope.scaling.yarn_beta_fast", 32.0);
+            out.yarn_beta_slow = (float) num("rope.scaling.yarn_beta_slow", 1.0);
+        }
+    }
+    if (loop) {   // the looped block: the mHC layer kinds, the second visit's weights the first's
+        const auto* ks = g.get(p + "mhc.layer_kinds");
+        if ((int) num("mhc.streams", 0) != 2 || ks == nullptr || ks->type != strata::MetaType::ARRAY ||
+            ks->items.size() < (size_t) out.n_layers) {
+            err = "sensenova_loop: mhc.streams 2 and mhc.layer_kinds (one per layer visit) expected";
+            return false;
+        }
+        out.loop = true;
+        out.mhc_kind.assign((size_t) out.n_layers, 0);
+        std::vector<int> enters;
+        for (int il = 0; il < out.n_layers; ++il) {
+            const int k = (int) ks->items[(size_t) il].u;
+            if (k != 0 && k != 1 && k != 2 && k != 4) {
+                err = "sensenova_loop: mhc layer kind " + std::to_string(k) + " at layer " + std::to_string(il) + " (0 / 1 / 2 / 4 known)";
+                return false;
+            }
+            out.mhc_kind[(size_t) il] = k;
+            if (k == 1) enters.push_back(il);
+        }
+        // two visits of one block: kinds 1, 4.., 2 twice back to back (layer kinds the same per visit)
+        bool ok = enters.size() == 2 && enters[1] > enters[0];
+        const int sh = ok ? enters[1] - enters[0] : 0;
+        for (int il = enters.empty() ? 0 : enters[0]; ok && il < enters[0] + sh; ++il)
+            ok = il + sh < out.n_layers && out.mhc_kind[(size_t) il] == out.mhc_kind[(size_t) (il + sh)] &&
+                 out.mhc_kind[(size_t) il] != 0 && out.is_recr(il) == out.is_recr(il + sh) &&
+                 (out.mhc_kind[(size_t) il] == 2) == (il == enters[0] + sh - 1);
+        if (!ok) {
+            err = "sensenova_loop: mhc.layer_kinds is not one block visited twice (the layout this runner takes)";
+            return false;
+        }
+        out.loop_lo = enters[1];
+        out.loop_shift = sh;
+    }
     // QSA (Qwen3.8-27B-QSA): the indexer's geometry, and compress_ratios 4 on the attention layers
     if (dense && g.get(p + "attention.indexer.head_count") != nullptr) {
         const char* qe = getenv("STRATA_Q35_QSA");
@@ -2328,6 +2373,13 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
     std::vector<int> bounds, devs;
     Glm5Geometry pg = g_;
     if (!glm_pack_geometry(pack_dir, pg)) pg = g_;
+    if (pg.loop) {   // sensenova_loop: the two mHC streams do not cross a part boundary yet - one device (9B)
+        if (n_dev > 1 && !spec.empty() && spec != "auto")
+            std::fprintf(stderr, "sensenova_loop: a layer split is not supported - running on one device\n");
+        int d0 = 0;
+        if (const char* dv = getenv("STRATA_GLM_DEVS"); dv != nullptr && ints(dv, devs) && !devs.empty()) d0 = devs[0];
+        return load_pack(pack_dir, max_ctx, err, d0);
+    }
     if (const char* dv = getenv("STRATA_GLM_DEVS"); dv != nullptr && !ints(dv, devs)) {
         err = std::string("STRATA_GLM_DEVS: not a device list: ") + dv;
         return false;

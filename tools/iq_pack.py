@@ -155,7 +155,8 @@ LAGUNA_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_out
                     "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                     "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                     "token_embd.weight", "output.weight")
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna")   # unsloth spells glm5-next without the hyphen
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
+                 "sensenova_loop")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -632,6 +633,11 @@ def main() -> int:
     if arch not in ARCHITECTURES:
         print("general.architecture is %r; the packer knows %s" % (arch, " and ".join(ARCHITECTURES)))
         return 1
+    # sensenova_loop (SenseNova-Loop-9B): a dense qwen35 whose looped block is stored once (blk.28-51 have no tensors)
+    # plus F32 mHC routers - packed exactly as a dense qwen35, its keys under the file's own prefix
+    loop_prefix = None
+    if arch == "sensenova_loop":
+        loop_prefix, arch = "sensenova_loop.", "qwen35"
     if arch == "deepseek4":
         prefix = "deepseek4."
         print("deepseek4: packing for the Glm5Model runner's deepseek4 path (quantized dense served natively)")
@@ -650,7 +656,7 @@ def main() -> int:
         print("laguna: packing for the Glm5Model runner's qwen35moe path, laguna layers (every dense tensor served as "
               "stored)")
     if arch in ("qwen35moe", "qwen35"):
-        prefix = arch + "."
+        prefix = loop_prefix or arch + "."
         print("%s: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)" % arch)
     block_count = None
     trunk = None

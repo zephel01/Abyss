@@ -48,7 +48,7 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     auto& Ly = F->L[(size_t) il];
-    const std::string P = "blk." + std::to_string(il) + ".";
+    const std::string P = "blk." + std::to_string(g.phys(il)) + ".";   // (SenseNova-Loop: a second visit's weights)
     const auto f32 = [&](const char* n) -> const float* {
         auto it = w_.find(P + n);
         if (it == w_.end()) { missing += P + n + " (f32) "; return nullptr; }
@@ -88,6 +88,12 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     } else {
         Ly.attn_norm = f32("attn_norm.weight");
         Ly.post_norm = f32(g.laguna ? "ffn_norm.weight" : "post_attention_norm.weight");   // (laguna: pre-norms only)
+        if (g.loop && g.kind(il) != 0) {   // SenseNova-Loop: the mHC routers (the first visit's on a second visit)
+            Ly.mhc_w[0] = f32("mhc_attn.weight");
+            Ly.mhc_b[0] = f32("mhc_attn.bias");
+            Ly.mhc_w[1] = f32("mhc_ffn.weight");
+            Ly.mhc_b[1] = f32("mhc_ffn.bias");
+        }
     }
     if (g.laguna) {   // every layer attention: q (no gate half), k, v, the per-head gate, out; q / k norms
         const int H = g.lag_heads[(size_t) il];
@@ -244,6 +250,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
     const size_t HE = (size_t) g.hc * E, LR = (size_t) g.hc_lr;
+    if (g.loop) bytes += al(E * 4) + 2 * al(64);   // (sensenova_loop: the second stream, the routers' gates)
     if (g.q4x)   // the hyper-connections' activations
         bytes += al(HE * 4) + al(HE / 32 * 36) + al(LR * 4) + al(LR / 32 * 36) + al(HE * 4) + 2 * al(64);
     const bool mtp = mtp_il_ >= 0;
@@ -307,6 +314,20 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         lk::rope_freqs(g.n_rot_swa, g.rope_base_swa, 1.0, g.yarn_orig_ctx, 0.0, 0.0, fs, F->lag_mscale_swa);
         cudaMemcpy(F->lag_freq, fr, (size_t) g.n_rot / 2 * 8, cudaMemcpyHostToDevice);
         cudaMemcpy(F->lag_freq_swa, fs, (size_t) g.n_rot_swa / 2 * 8, cudaMemcpyHostToDevice);
+    }
+    if (g.loop) {
+        F->mhc_s1 = (float*) take(E * 4);
+        F->mhc_pk[0] = (float*) take(64);
+        F->mhc_pk[1] = (float*) take(64);
+    }
+    if (g.q35_yarn) {   // YaRN on the attention's RoPE: the pair frequencies and the cos / sin factor (rope_freqs)
+        double fr[128];
+        float ms = 1.0f;
+        strata::kernels::lag::rope_freqs(g.n_rot, g.rope_base, 1.0 / g.yarn_factor, g.yarn_orig_ctx, g.yarn_beta_fast,
+                                         g.yarn_beta_slow, fr, ms);
+        float ff[128];
+        for (int i = 0; i < g.n_rot / 2 && i < 128; ++i) ff[i] = (float) fr[i];
+        q35::set_rope_yarn(ff, g.n_rot / 2, ms);
     }
     if (g.q4x) {
         F->q4_xn = (float*) take(HE * 4);
@@ -1781,6 +1802,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     q35_dump_pos = p;
     if (g.q4x) return fast_q4x_layers(p, err);
+    if (g.loop) return fast_loop_layers(p, err);
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -1829,6 +1851,72 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         q35_dump(s, "result_norm", l1_ - 1, F->head_x, g.n_embd);
     }
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen35moe: ") + cudaGetErrorString(e); return false; } }
+    return true;
+}
+
+// sensenova_loop's layers: fast_qwen35_layers' plain layers, and inside the looped block two residual streams (state_
+// and mhc_s1) read and written by the mHC routers (q35::mhc2_rows): a sublayer reads pre0 s0 + pre1 s1 (normed), its
+// output is merged into both streams by the router's post gates and Sinkhorn mix - the FFN's at the next layer's start,
+// where a leaving layer's streams collapse to their mean and an entering layer copies the residual into both
+bool Glm5Model::fast_loop_layers(int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    const int E = g.n_embd;
+    if (F->prof_on) F->mark("start");
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        const int k = g.kind(il), kp = il > l0_ ? g.kind(il - 1) : 0;
+        const float* y = il == l0_ ? nullptr : F->ffn;
+        if (k == 0 && kp == 0) {
+            gf::rms_q8(state_, y, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
+        } else {
+            const int op = y == nullptr ? 0 : kp == 0 ? 1 : kp == 2 ? 3 : 2;
+            q35::mhc2_rows(state_, F->mhc_s1, E, E, 1, y, op, F->mhc_pk[1], k == 1, k != 0 ? Ly.mhc_w[0] : nullptr,
+                           Ly.mhc_b[0], g.sinkhorn_iters, Ly.attn_norm, g.norm_eps, F->x, nullptr, F->mhc_pk[0], s);
+            gf::quantize_q8_1(F->x, F->xq, E, s);
+        }
+        abl_cap(il, state_, 1, s);
+        if (F->prof_on) F->mark("q35_norm");
+        if (dumps) {
+            if (il > l0_) q35_dump(s, "l_out", il - 1, state_, E);
+            else q35_dump(s, "inp_embd", il, state_, E);
+            q35_dump(s, k != 0 ? "mhc_attn_norm" : "attn_norm", il, F->x, E);
+        }
+        if (Ly.recr) {
+            if (!fast_qwen35_gdn(il, err)) return false;
+        } else {
+            if (!fast_qwen35_attn(il, p, err)) return false;
+        }
+        abl_out(il, 0, F->mixer, 1, E, s);
+        if (k == 0) {
+            gf::rms_q8(state_, F->mixer, Ly.post_norm, g.norm_eps, E, F->x, F->xq, s);
+        } else {
+            q35::mhc2_rows(state_, F->mhc_s1, E, E, 1, F->mixer, 2, F->mhc_pk[0], false, Ly.mhc_w[1], Ly.mhc_b[1],
+                           g.sinkhorn_iters, Ly.post_norm, g.norm_eps, F->x, nullptr, F->mhc_pk[1], s);
+            gf::quantize_q8_1(F->x, F->xq, E, s);
+        }
+        if (F->prof_on) F->mark("q35_norm");
+        if (dumps) {
+            q35_dump(s, k != 0 ? "mhc_attn_merged" : "attn_residual", il, state_, E);
+            q35_dump(s, k != 0 ? "mhc_ffn_norm" : "attn_post_norm", il, F->x, E);
+        }
+        if (!fast_dense_ffn(il, err)) return false;
+        abl_out(il, 1, F->ffn, 1, E, s);
+        if (dumps) q35_dump(s, "ffn_out", il, F->ffn, E);
+    }
+    // the head (the last layer is a plain one): R += the last FFN, x = rms(R) * output_norm
+    const auto nw = w_.find("output_norm.weight");
+    if (nw == w_.end()) { err = "sensenova_loop: output_norm.weight"; return false; }
+    gf::rms_q8(state_, F->ffn, nw->second, g.norm_eps, E, F->head_x, F->head_xq, s);
+    if (l1_ == g.n_layers) abl_cap(g.n_layers, state_, 1, s);
+    if (F->prof_on) F->mark("q35_head");
+    if (dumps) {
+        q35_dump(s, "l_out", l1_ - 1, state_, E);
+        q35_dump(s, "result_norm", l1_ - 1, F->head_x, E);
+    }
+    { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("sensenova_loop: ") + cudaGetErrorString(e); return false; } }
     return true;
 }
 

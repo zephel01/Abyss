@@ -101,12 +101,17 @@ QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BET
 ./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
 ./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
 ./setup-deepseek.sh --model mimo-9b --download-model                          # MiMo-V2.6-Distill-Qwen-9B-Q4_K_M（5.8 GB）、文脈 64K
+./setup-deepseek.sh --model sensenova-loop-9b --download-model                # SenseNova-Loop-9B-Q4_K_M（5.6 GB）、文脈 64K
 ```
 
 `--model mimo-9b`（v1.3.168）は Xiaomi の [MiMo-V2.6-Distill-Qwen-9B](#mimo-v26-distill-qwen-9b) を bartowski の GGUF から入れます
 （既定は Q4_K_M 5.8 GB、`--quant Q8_0` で 9.5 GB）。GPU の表は Qwen3.5-9B QSA と同じです（形も最大値も同じ。MiMo では VRAM を制限した
 計測はしていません）。ファイルに NextN ブロックがないので、取れるときは Qwen3.5-9B のもの（0.16 GB）を GGUF の横の `MTP/` に
 取ってきます。ないときは n-gram の下書きだけで動きます（生成が 20〜25% ほど遅い）。
+
+`--model sensenova-loop-9b`（v1.3.169）は [SenseNova-Loop-9B](#sensenova-loop-9b) を guideboardlabs の GGUF から入れます（既定は Q4_K_M 5.6 GB、
+`--quant Q3_K_M` で 4.6 GB、`Q4_0` で 5.3 GB、`Q8_0` で 9.5 GB）。各ファイルは Hugging Face の SHA-256 で確かめます。GPU の表は
+このモデル自身のもの（制限して計測）: 文脈 32K で 10 GB、64K で 12 GB、128K で 14 GB。GPU 1 枚で動きます。下書きブロックはなく、n-gram の下書きを使います。
 
 zephel01 のほかの GGUF は PC の大きさごとに 1 つのリポジトリで、`--quant` で大きさを選ぶ（設定の RAM の枠は、この PC の RAM
 から、モデルカードを測ったときの値にする。Qwen3.8 はシャードにある MTP 層で下書きする。V4 の自作版は単体 GPU では DSpark
@@ -891,6 +896,48 @@ temperature 0.6、top_p 0.95、top_k 20）。文字だけです。
   128K のプロンプトでは、生成がブロックなし 117.5 tok/s、あり 126.0、プロンプトは 6,322 / 6,156 tok/s。
 - **メモリ**（制限なし）: GPU メモリの最大は文脈 32K で 11.17 GB、128K で 14.27 GB（下書きブロックありで 15.11 GB）。ホストの RAM は 7.1 GB。
   Qwen3.5-9B と同じなので、セットアップは Qwen3.5-9B QSA の GPU の表（128K まで 11 GB。Qwen で制限して計測）を使います。
+
+## SenseNova-Loop-9B
+
+SenseNova-Loop-9B（Apache-2.0）は、ループする Qwen3.5-9B です。32 ブロックを 56 層として回し（1 周目のすぐあとにブロック 4〜27 を
+もう一度通る）、ループ部分の残差を 2 本の流れの mHC（サブ層ごとの小さなルーター: 入力ゲート 2 つ、出力ゲート 2 つ、Sinkhorn で
+二重確率にした 2x2 の混合）で運びます。v1.3.169 から、[guideboardlabs の GGUF](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-GGUF)
+（llama.cpp の arch は `sensenova_loop`）を dense の qwen35 経路で動かせます。`./setup-deepseek.sh --model sensenova-loop-9b` で入れられます
+（既定は Q4_K_M、ほかに Q3_K_M / Q4_0 / Q8_0。サンプリングは GGUF の値: temperature 1.0、top_p 0.95）。文字だけです。
+
+- **動き方**: 2 周目は 1 周目の重みを読みますが、KV の行と線形 attention の状態は自分のものを持ちます（56 層それぞれ別）。
+  RoPE はファイルどおり YaRN（262,144 の 2 倍）。GPU 1 枚で動きます（層の分割はまだ）。FFN は VRAM に置きます。
+  NextN ブロックはないので、n-gram の下書きを使います。
+- **参照との比較**（モデル自身の llama.cpp fork、GuideboardLabs/llama.cpp-sensenova-loop、CUDA。教師強制の log-softmax で
+  KL(fork || Abyss)）:
+
+  | | en | ja | zh | code | 5K の code（プロンプト経路） |
+  |---|---|---|---|---|---|
+  | Q4_K_M | 0.0091 | 0.0093 | 0.0060 | 0.0050 | 0.0080 |
+  | Q3_K_M / Q4_0 / Q8_0 | 0.0027 / 0.0012 / 0.0010 | 0.0042 / 0.0013 / 0.0011 | | 0.0011 / 0.0002 / 0.0004 | 0.0031 / 0.0015 / 0.0017 |
+
+  Q4_K_M の値は、このエンジンがどの Q4_K_M ファイルでも出す水準です（plain な Qwen3.5-9B Q4_K_M と llama.cpp の比較で 0.0085）。
+  6K の日本語文書では 0.131 で、ほぼすべてが数字の表の中の 10 か所ほどから来ます。同じ所で fork 自身の CPU と CUDA を比べると
+  0.265 です（位置ごとの中央値は 0.0014、Abyss は 0.0012）。
+- **速度**（RTX 5090、チャットのプロンプト + 256 トークン greedy、n-gram の下書き。各 2 回、同じ出力）:
+
+  | | 4K 生成 | 32K 生成 | 128K 生成 | 4K / 32K / 128K プロンプト |
+  |---|---|---|---|---|
+  | Q4_K_M | 102.3 tok/s | 96.6 tok/s | 62.6 tok/s | 5,120 / 5,045 / 3,553 tok/s |
+  | Q4_K_M、下書きなし | 100.1 | 90.1 | | |
+  | Q4_0 | 120.3 | 101.1 | | 5,525 / 5,542 |
+  | Q3_K_M | 109.3 | 98.1 | | 4,604 / 4,545 |
+  | Q8_0 | 80.1 | 75.4 | | 5,285 / 5,138 |
+
+  Qwen3.5-9B の 32 層に対して 56 層あるので、速さは Qwen3.5-9B のおよそ半分です。
+- **メモリ**（Q4_K_M）: 制限なしでは GPU メモリの最大が 8K / 32K / 64K / 128K で 10.2 / 12.0 / 13.8 / 17.3 GB。増える分の大半は
+  プロンプト経路のバッファで、エンジンは空いている VRAM から大きさを決めます。`STRATA_GLM_VRAM_GB` で 10 / 12 / 14 GB に制限すると、
+  32K / 64K / 128K で 8.4 / 10.2 / 13.8 GB になり、生成の速さは同じです（プロンプトは最大 8% 遅くなります）。ホストの RAM は 6.9 GB。
+- **日本語**: 8 問（説明、ビジネスメール、コード、助言、歴史、算数、翻訳、物語）はすべて日本語で答えます。考える部分はおもに英語です。
+  一部の回答に中国語の語が少し混じります（气也没有、量子比特、持续、最后一次。8 問中 3 問。`STRATA_LANG=ja-en` では 2 問で、
+  日本語でも使う文字は文字の種類で絞る設定では止められません）。英単語（"consideration"）も 1 つ混じりました。上の KL から、
+  これは移植ではなくモデル自身の癖です。
+- 決定的モード（`STRATA_DETERMINISTIC=1`）では、何度動かしても同じ出力になります。
 
 ## Laguna-S-2.1
 

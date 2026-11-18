@@ -104,12 +104,17 @@ no images (the file has no image projector). `--model ornith-9b-qsa` is the same
 ./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M (5.9 GB), 64K context
 ./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # the same, 128K context
 ./setup-deepseek.sh --model mimo-9b --download-model                          # MiMo-V2.6-Distill-Qwen-9B-Q4_K_M (5.8 GB), 64K context
+./setup-deepseek.sh --model sensenova-loop-9b --download-model                # SenseNova-Loop-9B-Q4_K_M (5.6 GB), 64K context
 ```
 
 `--model mimo-9b` (v1.3.168) installs Xiaomi's [MiMo-V2.6-Distill-Qwen-9B](#mimo-v26-distill-qwen-9b) from bartowski's GGUFs
 (Q4_K_M 5.8 GB by default, `--quant Q8_0` 9.5 GB), with the same GPU table as Qwen3.5-9B QSA (same shapes, same peaks; a VRAM cap
 was not measured on MiMo). Its files have no NextN block: the setup also fetches Qwen3.5-9B's (0.16 GB) into `MTP/` beside the
 GGUF when it can, and without it MiMo drafts with n-grams only (~20-25% slower decode).
+
+`--model sensenova-loop-9b` (v1.3.169) installs [SenseNova-Loop-9B](#sensenova-loop-9b) from guideboardlabs' GGUFs (Q4_K_M 5.6 GB
+by default; `--quant Q3_K_M` 4.6 GB, `Q4_0` 5.3 GB, `Q8_0` 9.5 GB), each file checked against Hugging Face's SHA-256. Its GPU table
+is its own (measured capped): 10 GB for a 32K context, 12 GB for 64K, 14 GB for 128K; one GPU. No draft block: n-gram drafts.
 
 zephel01's other GGUFs, one repo per PC size: `--quant` names the size (the RAM tier in the config is the one the model
 card was measured with, from this PC's RAM; Qwen3.8 drafts with the MTP block in its shards; the DSpark drafter is left
@@ -942,6 +947,49 @@ the sampling is the GGUF's: temperature 0.6, top_p 0.95, top_k 20). Text only.
   At a 128K prompt: decode 117.5 tok/s without the block, 126.0 with it; prompt 6,322 / 6,156 tok/s.
 - **Memory** (uncapped): peak GPU memory 11.17 GB at a 32K context, 14.27 GB at 128K (15.11 GB with the draft block); host RAM 7.1 GB.
   The same as Qwen3.5-9B's, so the setup uses Qwen3.5-9B QSA's GPU table (11 GB for up to 128K, measured with that cap on Qwen).
+
+## SenseNova-Loop-9B
+
+SenseNova-Loop-9B (Apache-2.0) is a looped Qwen3.5-9B: its 32 blocks run as 56 layers - blocks 4-27 a second time right
+after the first pass - and two-stream mHC (a small router per sublayer: two input gates, two output gates and a 2x2 mix
+made doubly stochastic by Sinkhorn) carries the residual through the looped part. From v1.3.169 the engine runs
+[guideboardlabs' GGUFs](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-GGUF) (llama.cpp arch `sensenova_loop`) on the
+dense qwen35 path, and `./setup-deepseek.sh --model sensenova-loop-9b` installs them (Q4_K_M by default, or Q3_K_M / Q4_0 / Q8_0;
+the sampling is the GGUF's: temperature 1.0, top_p 0.95). Text only.
+
+- **How it runs**: the second pass reads the first pass's weights but keeps its own KV rows and linear-attention state
+  (each of the 56 layers has its own). RoPE has YaRN (factor 2 over 262,144) as in the file. One GPU (no layer split yet);
+  the FFN stays in VRAM. No NextN block: n-gram drafts.
+- **Against the reference** (the model's own llama.cpp fork, GuideboardLabs/llama.cpp-sensenova-loop, CUDA; teacher-forced
+  log-softmax, KL(fork || Abyss)):
+
+  | | en | ja | zh | code | 5K code (prompt path) |
+  |---|---|---|---|---|---|
+  | Q4_K_M | 0.0091 | 0.0093 | 0.0060 | 0.0050 | 0.0080 |
+  | Q3_K_M / Q4_0 / Q8_0 | 0.0027 / 0.0012 / 0.0010 | 0.0042 / 0.0013 / 0.0011 | | 0.0011 / 0.0002 / 0.0004 | 0.0031 / 0.0015 / 0.0017 |
+
+  Q4_K_M's level is the engine's on any Q4_K_M file (plain Qwen3.5-9B Q4_K_M against llama.cpp: 0.0085). A 6K Japanese
+  document scores 0.131, almost all of it from ~10 positions in a table of numbers; the fork itself on its CPU against its
+  CUDA run gives 0.265 there (median per position 0.0014; Abyss 0.0012).
+- **Speed** (RTX 5090, chat prompt + 256 greedy tokens, n-gram drafts; 2 runs, the same outputs):
+
+  | | 4K decode | 32K decode | 128K decode | 4K / 32K / 128K prompt |
+  |---|---|---|---|---|
+  | Q4_K_M | 102.3 tok/s | 96.6 tok/s | 62.6 tok/s | 5,120 / 5,045 / 3,553 tok/s |
+  | Q4_K_M, no drafts | 100.1 | 90.1 | | |
+  | Q4_0 | 120.3 | 101.1 | | 5,525 / 5,542 |
+  | Q3_K_M | 109.3 | 98.1 | | 4,604 / 4,545 |
+  | Q8_0 | 80.1 | 75.4 | | 5,285 / 5,138 |
+
+  56 layers against Qwen3.5-9B's 32: about half Qwen3.5-9B's speed.
+- **Memory** (Q4_K_M): with no cap peak GPU memory 10.2 / 12.0 / 13.8 / 17.3 GB at 8K / 32K / 64K / 128K, most of the
+  growth the prompt path's buffer, which the engine sizes from the free VRAM. Capped with `STRATA_GLM_VRAM_GB` at 10 / 12 / 14
+  GB: 8.4 / 10.2 / 13.8 GB at 32K / 64K / 128K, at the same decode speed (prompts up to 8% slower). Host RAM 6.9 GB.
+- **Japanese**: 8 prompts (explanation, business mail, code, advice, history, arithmetic, translation, a story) are all
+  answered in Japanese; the reasoning is mostly English. A few Chinese words slip into some answers (气也没有, 量子比特, 持续,
+  最后一次: 3 of 8; 2 of 8 with `STRATA_LANG=ja-en`, which cannot ban characters Japanese also uses), and one English word
+  ("consideration"). The KL above says this is the model, not the port.
+- Deterministic (`STRATA_DETERMINISTIC=1`): the same output in repeated runs.
 
 ## Laguna-S-2.1
 

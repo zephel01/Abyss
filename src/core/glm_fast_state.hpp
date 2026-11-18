@@ -431,6 +431,9 @@ struct Glm5Model::FastState {
             const float* norm = nullptr;                            // the grouped norm's gamma [hc][n_embd]
             WSlot down, up, inject;                                 // hc*n_embd -> hc_lr, hc_lr -> hc*n_embd, -> hc
         } hc4[2];
+        // ---- sensenova_loop: the mHC routers ([0] the attention's, [1] the FFN's): 8 x 2 n_embd weights, 8 biases (F32)
+        const float* mhc_w[2] = {nullptr, nullptr};
+        const float* mhc_b[2] = {nullptr, nullptr};
         // qwen4exp's QSA indexer (an attention layer): k_proj / q_proj (BF16), their norms, and the block keys -
         // the raw tail, the spare slot's key, the pooled keys (normed, rotated; the old path's indexer_key_append)
         WSlot q4_ik, q4_iq;
@@ -487,6 +490,10 @@ struct Glm5Model::FastState {
     float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};
     void *q4_xnq = nullptr, *q4_loq = nullptr;
     float* q4_sc = nullptr;   // (q35::hc4_fused's stream scales)
+    // ---- sensenova_loop's decode: the second residual stream, the routers' gates ([0] the attention's, [1] the FFN's:
+    // post 2, mix 4 a router)
+    float* mhc_s1 = nullptr;
+    float* mhc_pk[2] = {nullptr, nullptr};
     const float* q4_head[1] = {nullptr};                         // output_hc_norm
     // qwen4exp's per-layer embedding (layer 1, qwen35_fast_path.cu q4x_ple_*): the table on the SSD, the tokens by
     // position (the n-gram hash reads the two before), the gathered rows (pinned / device / q8_1), the projections,

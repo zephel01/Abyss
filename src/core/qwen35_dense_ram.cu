@@ -183,7 +183,8 @@ struct Glm5Model::Q35dRam {
 };
 
 bool Glm5Model::q35d_defer_on() const {
-    if (!g_.q35_dense() || !fast_mode_) return false;
+    // (sensenova_loop: a looped block's layers share their weights - every FFN stays in VRAM)
+    if (!g_.q35_dense() || !fast_mode_ || g_.loop) return false;
     const char* v = getenv("STRATA_Q35D_RAM");
     return v == nullptr || std::atoi(v) != 0;
 }

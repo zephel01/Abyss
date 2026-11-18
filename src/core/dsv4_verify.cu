@@ -1693,9 +1693,19 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
     int qa = 0;   // (the QSA layers so far: their raw keys' rows in q4_rawk)
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        for (int t = 0; t < T; ++t)
-            gf::rms_q8(Rt(t), il == l0_ ? nullptr : V->ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, (int) E,
-                       V->x + (size_t) t * E, (uint8_t*) V->xq + (size_t) t * q8e, s);
+        const int mk = g.kind(il), mkp = il > l0_ ? g.kind(il - 1) : 0;
+        if (mk != 0 || mkp != 0) {   // sensenova_loop's mHC block (fast_loop_layers): stream 1 is each column's pair half
+            const float* y = il == l0_ ? nullptr : V->ffn;
+            const int op = y == nullptr ? 0 : mkp == 0 ? 1 : mkp == 2 ? 3 : 2;
+            q35::mhc2_rows(V->R, V->R + E, (int) (2 * E), (int) E, T, y, op, V->comb + (size_t) 8 * T, mk == 1,
+                           mk != 0 ? Ly.mhc_w[0] : nullptr, Ly.mhc_b[0], g.sinkhorn_iters, Ly.attn_norm, g.norm_eps,
+                           V->x, nullptr, V->comb, s);
+            gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
+        } else {
+            for (int t = 0; t < T; ++t)
+                gf::rms_q8(Rt(t), il == l0_ ? nullptr : V->ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, (int) E,
+                           V->x + (size_t) t * E, (uint8_t*) V->xq + (size_t) t * q8e, s);
+        }
         mark(0);
         if (Ly.recr) {
             float* qkv = V->q35_qkv + (size_t) li * TM * C;
@@ -1805,9 +1815,16 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
         }
         mark(1);
         abl_out(il, 0, V->mixer, T, (int) E, s);
-        for (int t = 0; t < T; ++t)
-            gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, (int) E, V->x + (size_t) t * E,
-                       (uint8_t*) V->xq + (size_t) t * q8e, s);
+        if (mk != 0) {
+            q35::mhc2_rows(V->R, V->R + E, (int) (2 * E), (int) E, T, V->mixer, 2, V->comb, false, Ly.mhc_w[1],
+                           Ly.mhc_b[1], g.sinkhorn_iters, Ly.post_norm, g.norm_eps, V->x, nullptr,
+                           V->comb + (size_t) 8 * T, s);
+            gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
+        } else {
+            for (int t = 0; t < T; ++t)
+                gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, (int) E, V->x + (size_t) t * E,
+                           (uint8_t*) V->xq + (size_t) t * q8e, s);
+        }
         mark(2);
         if (!Ly.moe) {   // the dense qwen35 (Qwen3.8-27B): fast_dense_ffn over the columns
             // the first FF rows (all of them, or a split layer's GPU part; the CPU's in RAM, qwen35_dense_ram.cu)

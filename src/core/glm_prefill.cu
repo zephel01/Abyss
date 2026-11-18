@@ -3336,6 +3336,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 q4_mix(il, 0, il == l0_ ? nullptr : S->ffn, S->post, S->pre, false);
             }
             if (dfl_ != nullptr) dflash_capture(il, S->R, T, (size_t) g.hc * E, true, s);   // DFlash 2's features
+        } else if (g.loop && (g.kind(il) != 0 || (il > l0_ && g.kind(il - 1) != 0))) {
+            // sensenova_loop's mHC block: R's first two streams (fast_loop_layers' state_ and mhc_s1), the routers'
+            // gates in comb's rows ([0, 8T) the attention's, [8T, 16T) the FFN's)
+            const int k = g.kind(il), kp = il > l0_ ? g.kind(il - 1) : 0;
+            const float* y = il == l0_ ? nullptr : S->ffn;
+            const int op = y == nullptr ? 0 : kp == 0 ? 1 : kp == 2 ? 3 : 2;
+            q35::mhc2_rows(S->R, S->R + E, 4 * E, E, T, y, op, S->comb + (size_t) 8 * T, k == 1,
+                           k != 0 ? Ly.mhc_w[0] : nullptr, Ly.mhc_b[0], g.sinkhorn_iters, Ly.attn_norm, g.norm_eps, S->x,
+                           S->x16, S->comb, s);
         } else if (g.qwen35()) {
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
@@ -3698,6 +3707,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_fn8, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm, S->pre, S->pre2);
         else if (g.q4x)
             q4_mix(il, 1, S->mixer, S->pre, S->post, false);
+        else if (g.loop && g.kind(il) != 0)   // (sensenova_loop: the attention's merge, the FFN's router)
+            q35::mhc2_rows(S->R, S->R + E, 4 * E, E, T, S->mixer, 2, S->comb, false, Ly.mhc_w[1], Ly.mhc_b[1],
+                           g.sinkhorn_iters, Ly.post_norm, g.norm_eps, S->x, S->x16, S->comb + (size_t) 8 * T, s);
         else if (g.qwen35())
             q35::add_rms_rows(S->R, 4 * E, S->mixer, Ly.post_norm, g.norm_eps, T, E, S->x, S->x16, s);
         else

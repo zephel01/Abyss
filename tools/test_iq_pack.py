@@ -239,3 +239,30 @@ class CompatibilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SensenovaLoopTests(unittest.TestCase):
+    """sensenova_loop (SenseNova-Loop-9B): packed as a dense qwen35 under the file's own key prefix; its F32 mHC routers
+    stay in the pack as stored."""
+
+    def test_loop_file_packs_as_qwen35(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            source = root / "model.gguf"
+            writer = G.Writer(source, "sensenova_loop")
+            writer.add_uint32("sensenova_loop.block_count", 4)
+            values = np.linspace(-1, 1, 256, dtype=np.float32).reshape(2, 128)
+            add(writer, "blk.0.attn_qkv.weight", values, Q.Q8_0)
+            add(writer, "blk.1.mhc_attn.weight", values, Q.F32)
+            add(writer, "blk.1.mhc_attn.bias", values[0], Q.F32)
+            writer.write()
+            out = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack", "--gguf", str(source), "--out", str(root / "pack")]), \
+                    patch.object(iq_pack.subprocess, "run"), contextlib.redirect_stdout(out):
+                self.assertEqual(iq_pack.main(), 0)
+            self.assertIn("qwen35: packing", out.getvalue())
+            self.assertIn("block_count 4 -> trunk layers 0..3", out.getvalue())
+            _, rows = iq_pack.read_index(root / "pack" / "index.txt")
+            for name in ("blk.0.attn_qkv.weight", "blk.1.mhc_attn.weight", "blk.1.mhc_attn.bias"):
+                self.assertIn(name, rows)
+            self.assertEqual(rows["blk.1.mhc_attn.weight"][9], "0")   # (F32, as stored)

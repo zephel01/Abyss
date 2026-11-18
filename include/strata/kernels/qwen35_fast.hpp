@@ -182,4 +182,20 @@ void dffn_wait(const void* ans, unsigned int seq, float* out, int n, cudaStream_
 // ... the answer as cols rows of n floats into out's rows ld floats apart (the split head's CPU rows)
 void dffn_wait_cols(const void* ans, unsigned int seq, float* out, int n, int cols, size_t ld, cudaStream_t s);
 
+
+// ---- sensenova_loop (SenseNova-Loop-9B)
+/// YaRN on the attention's RoPE, for every prologue above on this device: theta_i = p * freq[i] (half = n_rot / 2 pair
+/// frequencies, laguna's rope_freqs), cos / sin times mscale.  freq null: off (theta_i = p * base^(-2 i / n_rot)).
+void set_rope_yarn(const float* freq, int half, float mscale);
+/// The two residual streams of the mHC block, T rows: stream 0 at s0 + t * ld, stream 1 at s1 + t * ld (n floats each).
+/// First the last sublayer's output y ([T][n]) goes in by op: 0 nothing, 1 s0 += y (a plain layer's), 2 the merge
+/// (s0, s1) = (m00 s0 + m01 s1 + post0 y, m10 s0 + m11 s1 + post1 y) with the gates pk_in ([T][8] from the router
+/// that read this sublayer's input), 3 that merge then leaving: s0 = the mean of the two.  enter: then s1 = s0.
+/// Then the read: with a router (w [8][2n], bias [8], sink Sinkhorn iterations) pk_out [T][8] = (post0, post1, m00,
+/// m01, m10, m11, pre0, pre1) and the branch pre0 s0 + pre1 s1; without (w null) the branch is s0.  x = rms(branch) *
+/// nw (eps), x16 (may be null) its FP16.
+void mhc2_rows(float* s0, float* s1, int ld, int n, int T, const float* y, int op, const float* pk_in, bool enter,
+               const float* w, const float* bias, int sink, const float* nw, float eps, float* x, void* x16,
+               float* pk_out, cudaStream_t s);
+
 }  // namespace strata::kernels::q35

@@ -96,7 +96,8 @@ class PickQuant(unittest.TestCase):
         self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
 
     def test_models_without_pc_sizes(self):
-        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa", "mimo-9b"):
+        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa", "mimo-9b",
+                    "sensenova-loop-9b"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
     def test_no_gpu(self):
@@ -617,6 +618,77 @@ class OrnithNineBQsa(Qwen35NineBQsa):
             self.assertIn("Ornith-1.5-9B QSA", run.read_text(encoding="utf-8"))
         self.assertEqual(got["model_name"], "ornith-1.5-9b-qsa")
         self.assertEqual(got["args"][got["args"].index("--max-context") + 1], "131072")
+        self.assertNotIn("env", got)
+        self.assertNotIn("vision", got)
+
+
+class SensenovaLoopNineB(unittest.TestCase):
+    """--model sensenova-loop-9b (guideboardlabs' SenseNova-Loop-9B GGUFs, the whole file in one GPU): its own VRAM table
+    (the capped runs: 10 / 12 / 14 GB for 32K / 64K / 128K), four files, the GGUF's sampling, n-gram drafts, text only."""
+    KEY = "sensenova-loop-9b"
+
+    def check(self, vram, context=65536, quant=None):
+        a = Namespace(context=context)
+        said = []
+        cards = [{"index": 0, "name": "GPU", "vram_gb": vram}]
+        with mock.patch.object(A.S, "say", side_effect=lambda *x: said.append(" ".join(map(str, x)))):
+            try:
+                got = A.dense_gpu_check(a, self.KEY, cards, "cuda", False, 32.0, quant=quant)
+            except SystemExit:
+                got = "stopped"
+        return got, "\n".join(said)
+
+    def test_the_entry(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual((m["repo"], m["quant"], m["quants"]),
+                         ("guideboardlabs/SenseNova-Loop-9B-GGUF", "Q4_K_M", ("Q3_K_M", "Q4_0", "Q4_K_M", "Q8_0")))
+        self.assertTrue(all(nx for _, nx in m["quant_gb"].values()))   # (no draft block to fetch: none exists)
+        self.assertEqual(m["env"], {})
+        self.assertEqual(m["sampling"], {"temperature": 1.0, "top_p": 0.95})
+        self.assertEqual(m["gpu_min"], 10)
+        self.assertNotIn("ffn_gb", m)
+
+    def test_the_context_a_gpu_holds(self):
+        f = A.dense_context
+        self.assertEqual(f(self.KEY, 9.6, 32768), 32768)              # (a 10 GB card: 32K, measured with a 10 GB cap)
+        self.assertEqual(f(self.KEY, 11.99, 131072), 65536)           # (12 GB: 64K)
+        self.assertEqual(f(self.KEY, 15.92, 131072), 131072)          # (16 GB: 128K)
+        self.assertEqual(f(self.KEY, 31.84, 262144), 131072)          # (longer than measured: 128K)
+        self.assertIsNone(f(self.KEY, 7.99, 8192))
+        self.assertAlmostEqual(A.dense_need(self.KEY, 131072, "Q8_0"), 14.0 + 9.54 - 5.63)
+        self.assertEqual(f(self.KEY, 11.99, 32768, "Q3_K_M"), 32768)
+
+    def test_the_setup_check(self):
+        self.assertEqual(self.check(11.99)[0], 65536)
+        self.assertEqual(self.check(15.92, context=131072)[0], 131072)
+        got, said = self.check(7.99)
+        self.assertEqual(got, "stopped")
+        self.assertIn("needs a GPU with 10 GB or more", said)
+
+    def test_the_pc_size_proposal(self):
+        self.assertEqual(A.dense_pick(self.KEY, 31.84), "Q8_0")
+        self.assertEqual(A.dense_pick(self.KEY, 9.6), "Q4_K_M")
+
+    def test_the_file_and_the_config(self):
+        m = A.MODELS[self.KEY]
+        sizes = {"Q3_K_M": 4642406752, "Q4_0": 5325947232, "Q4_K_M": 5628723552, "Q8_0": 9540092256}
+        items = [{"type": "file", "path": f"SenseNova-Loop-9B-{q}.gguf", "size": n, "lfs": {"oid": q.lower()}}
+                 for q, n in sizes.items()] + [{"type": "file", "path": p, "size": 1} for p in ("README.md", ".gitattributes")]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        for q in m["quants"]:
+            with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+                got = A.quant_files(q, m["repo"], m["folder"], m["prefix_tmpl"].format(q=q))
+            self.assertEqual(got, [(f"SenseNova-Loop-9B-{q}.gguf", sizes[q], q.lower())])
+            self.assertAlmostEqual(m["quant_gb"][q][0], sizes[q] / 1e9, places=2)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("sensenova-loop-9b-q4_k_m", Path(d) / "pack", 65536, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("SenseNova-Loop-9B", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "sensenova-loop-9b")
+        self.assertEqual(got["sampling"], {"temperature": 1.0, "top_p": 0.95})
         self.assertNotIn("env", got)
         self.assertNotIn("vision", got)
 

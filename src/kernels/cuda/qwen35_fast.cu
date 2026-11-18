@@ -42,6 +42,24 @@ constexpr int kD = 256;       // head_dim
 constexpr int kChunk = 256;   // attention positions a block
 constexpr int kWarps = 4;     // ... its warps
 constexpr int kMinChunks = 130;   // the chunks a row and head attn_split's scratch always holds
+// YaRN on the attention's RoPE (set_rope_yarn; SenseNova-Loop): theta_i = p * c_yarn_freq[i], cos / sin times c_yarn_ms.
+// The RoPE kernels take it as a template flag (Y): a run-time branch changed how the plain RoPE compiled, and with it
+// every other model's outputs; Y false is the plain theta_i = p * base^(-2 i / n_rot), compiled as before
+__constant__ float c_yarn_freq[128];
+__constant__ float c_yarn_ms;
+static bool g_yarn = false;   // (host: set_rope_yarn's; the launches pick Y by it)
+template <bool Y>
+__device__ __forceinline__ void rope_cs(float pr, float rope_base, int i, int n_rot, float& c, float& sn) {
+    if constexpr (Y) {
+        const float theta = pr * c_yarn_freq[i];
+        c = cosf(theta) * c_yarn_ms;
+        sn = sinf(theta) * c_yarn_ms;
+    } else {
+        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
+        c = cosf(theta);
+        sn = sinf(theta);
+    }
+}
 
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : log1pf(expf(x)); }   // (ggml's)
@@ -218,6 +236,7 @@ __global__ void attn_gate_kernel(float* __restrict__ o, const float* __restrict_
 }
 
 // block b < n_head: q head b (its q half of q_full); b >= n_head: KV head b - n_head.  256 threads, one a dim
+template <bool Y>
 __global__ void __launch_bounds__(kD) attn_prep_kernel(const float* __restrict__ qf, const float* __restrict__ k,
                                                        const float* __restrict__ v, const float* __restrict__ q_norm,
                                                        const float* __restrict__ k_norm, float eps, int n_head,
@@ -242,8 +261,8 @@ __global__ void __launch_bounds__(kD) attn_prep_kernel(const float* __restrict__
         const int i = d < half ? d : d - half;
         // (an image request: the pair's M-RoPE stream position from the cell's (t, h, w), mrope.hpp; else the cell)
         const float pr = mtab != nullptr ? (float) mrope_pos(mtab, (int) p, i) : (float) p;
-        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
-        const float c = cosf(theta), s = sinf(theta);
+        float c, s;
+        rope_cs<Y>(pr, rope_base, i, n_rot, c, s);
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * s : x0 * s + x1 * c;
     }
@@ -921,6 +940,7 @@ __global__ void __launch_bounds__(S) gdn_mid_kernel(float* __restrict__ state, f
 }
 #endif
 // attn_prep_kernel over rows: grid (n_head + n_head_kv, T), row t at position p0 + t
+template <bool Y>
 __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restrict__ qf, const float* __restrict__ k,
                                                             const float* __restrict__ v, const float* __restrict__ q_norm,
                                                             const float* __restrict__ k_norm, float eps, int n_head,
@@ -948,8 +968,8 @@ __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restr
         const int i = d < half ? d : d - half;
         // (an image request: the pair's M-RoPE stream position from the cell's (t, h, w), mrope.hpp; else the cell)
         const float pr = mtab != nullptr ? (float) mrope_pos(mtab, (int) p, i) : (float) p;
-        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
-        const float c = cosf(theta), sn = sinf(theta);
+        float c, sn;
+        rope_cs<Y>(pr, rope_base, i, n_rot, c, sn);
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * sn : x0 * sn + x1 * c;
     }
@@ -963,7 +983,7 @@ __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restr
 }
 // attn_prep_rows_kernel for a q4_0 cache: the same norms and RoPE, then q, k and v rotated by H; k and v go to the
 // cache rows as q4_0 (kQ4Row bytes a row).  T 1 at p0 = p is attn_prep's token.  n_head 0: the K / V blocks alone
-template <int KV>
+template <int KV, bool Y>
 __global__ void __launch_bounds__(kD) attn_prep_q4_kernel(const float* __restrict__ qf, const float* __restrict__ k,
                                                           const float* __restrict__ v, const float* __restrict__ q_norm,
                                                           const float* __restrict__ k_norm, float eps, int n_head,
@@ -991,8 +1011,8 @@ __global__ void __launch_bounds__(kD) attn_prep_q4_kernel(const float* __restric
         const int i = d < half ? d : d - half;
         // (an image request: the pair's M-RoPE stream position from the cell's (t, h, w), mrope.hpp; else the cell)
         const float pr = mtab != nullptr ? (float) mrope_pos(mtab, (int) p, i) : (float) p;
-        const float theta = pr * powf(rope_base, -2.0f * (float) i / (float) n_rot);
-        const float c = cosf(theta), sn = sinf(theta);
+        float c, sn;
+        rope_cs<Y>(pr, rope_base, i, n_rot, c, sn);
         const float x0 = sv[i], x1 = sv[i + half];
         y = d < half ? x0 * c - x1 * sn : x0 * sn + x1 * c;
     }
@@ -2349,13 +2369,14 @@ void attn_prep(const float* q_full, const float* k, const float* v, const float*
     }
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
-            attn_prep_q4_kernel<K()><<<dim3((unsigned) (n_head + n_head_kv), 1), kD, 0, s>>>(
+            (g_yarn ? attn_prep_q4_kernel<K(), true> : attn_prep_q4_kernel<K(), false>)
+                <<<dim3((unsigned) (n_head + n_head_kv), 1), kD, 0, s>>>(
                 q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, (int64_t) p, kc, vc, q, mrope_table());
         });
         check("attn_prep");
         return;
     }
-    pdl_launch(attn_prep_kernel, n_head + n_head_kv, kD, 0, s, q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot,
+    pdl_launch(g_yarn ? attn_prep_kernel<true> : attn_prep_kernel<false>, n_head + n_head_kv, kD, 0, s, q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot,
                                                        rope_base, p, kc, vc, q, mrope_table());
     check("attn_prep");
 }
@@ -2647,13 +2668,15 @@ void attn_prep_rows(const float* q_full, const float* k, const float* v, const f
     }
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
-            attn_prep_q4_kernel<K()><<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
+            (g_yarn ? attn_prep_q4_kernel<K(), true> : attn_prep_q4_kernel<K(), false>)
+                <<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
                 q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q, mrope_table());
         });
         check("attn_prep_rows");
         return;
     }
-    attn_prep_rows_kernel<<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
+    (g_yarn ? attn_prep_rows_kernel<true> : attn_prep_rows_kernel<false>)
+        <<<dim3((unsigned) (n_head + n_head_kv), (unsigned) T), kD, 0, s>>>(
         q_full, k, v, q_norm, k_norm, eps, n_head, n_head_kv, n_rot, rope_base, p0, kc, vc, q, mrope_table());
     check("attn_prep_rows");
 }
@@ -2810,14 +2833,16 @@ void attn_kv_rows(const float* k, const float* v, const float* k_norm, float eps
     if (T <= 0 || head_dim != kD) return;
     if (kv != 0) {
         kv_switch(kv, [&](auto K) {
-            attn_prep_q4_kernel<K()><<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(
+            (g_yarn ? attn_prep_q4_kernel<K(), true> : attn_prep_q4_kernel<K(), false>)
+                <<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(
                 k, k, v, k_norm, k_norm, eps, 0, n_head_kv, n_rot, rope_base, p0, kc, vc, nullptr, mrope_table());
         });
         check("attn_kv_rows");
         return;
     }
     // n_head 0: every block a KV head (the q blocks come first in attn_prep_rows_kernel's numbering)
-    attn_prep_rows_kernel<<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(k, k, v, k_norm, k_norm, eps, 0,
+    (g_yarn ? attn_prep_rows_kernel<true> : attn_prep_rows_kernel<false>)
+        <<<dim3((unsigned) n_head_kv, (unsigned) T), kD, 0, s>>>(k, k, v, k_norm, k_norm, eps, 0,
                                                                                 n_head_kv, n_rot, rope_base, p0, kc, vc,
                                                                                 nullptr, mrope_table());
     check("attn_kv_rows");
@@ -2883,6 +2908,163 @@ void dffn_wait(const void* ans, unsigned int seq, float* out, int n, cudaStream_
     const int blocks = std::max(1, std::min(32, (n + 1023) / 1024));
     dffn_wait_kernel<<<blocks, 256, 0, s>>>((const unsigned int*) ans, seq, out, n, add ? 1 : 0);
     check("dffn_wait");
+}
+
+
+// ---- sensenova_loop's two residual streams (qwen35_fast.hpp: mhc2_rows).  One block of kMhcT threads a row; a thread
+// keeps its kMhcV columns of both streams in registers.  The router's math: ss = |s0|^2 + |s1|^2 over the 2n flat
+// values, l[k] = (w[k] . [s0 | s1]) / sqrt(ss / 2n + 1e-6) + bias[k]; pre = sigmoid(l0, l1), post = 2 sigmoid(l2, l3),
+// the mix exp(Sinkhorn(l4..l7)) - rows then columns, in log space, sink iterations - the branch pre0 s0 + pre1 s1.
+namespace {
+constexpr int kMhcT = 512;
+constexpr int kMhcV = 16;   // n <= kMhcT * kMhcV (8,192)
+
+__device__ __forceinline__ void mhc_block_sums(float* v, int m, float (*sh)[kMhcT / 32]) {
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    for (int k = 0; k < m; ++k) {
+        const float r = warp_sum(v[k]);
+        if (lane == 0) sh[k][wid] = r;
+    }
+    __syncthreads();
+    for (int k = 0; k < m; ++k) {
+        float r = 0.0f;
+        for (int j = 0; j < kMhcT / 32; ++j) r += sh[k][j];
+        v[k] = r;
+    }
+    __syncthreads();
+}
+
+__global__ void __launch_bounds__(kMhcT) mhc2_rows_kernel(float* __restrict__ s0, float* __restrict__ s1, int ld, int n,
+                                                          const float* __restrict__ y, int op,
+                                                          const float* __restrict__ pk_in, int enter,
+                                                          const float* __restrict__ w, const float* __restrict__ bias,
+                                                          int sink, const float* __restrict__ nw, float eps,
+                                                          float* __restrict__ x, uint16_t* __restrict__ x16,
+                                                          float* __restrict__ pk_out) {
+    __shared__ float sh[9][kMhcT / 32];
+    __shared__ float gates[8];
+    const int t = blockIdx.x;
+    float* a = s0 + (size_t) t * ld;
+    float* b = s1 + (size_t) t * ld;
+    const float* yr = y != nullptr ? y + (size_t) t * n : nullptr;
+    float va[kMhcV], vb[kMhcV];
+    float m00 = 0, m01 = 0, m10 = 0, m11 = 0, p0 = 0, p1 = 0;
+    if (op >= 2) {
+        const float* pk = pk_in + (size_t) t * 8;
+        p0 = pk[0]; p1 = pk[1]; m00 = pk[2]; m01 = pk[3]; m10 = pk[4]; m11 = pk[5];
+    }
+    const bool keep_b = op != 3;   // (leaving: stream 1 is done with)
+#pragma unroll
+    for (int j = 0; j < kMhcV; ++j) {
+        const int i = threadIdx.x + j * kMhcT;
+        float u = 0.0f, v = 0.0f;
+        if (i < n) {
+            u = a[i];
+            if (op == 1) {
+                u += yr[i];
+            } else if (op >= 2) {
+                const float bv = b[i], yv = yr[i];
+                const float na = m00 * u + m01 * bv + p0 * yv;
+                const float nb = m10 * u + m11 * bv + p1 * yv;
+                u = op == 3 ? 0.5f * (na + nb) : na;
+                v = nb;
+            } else if (!enter) {
+                v = b[i];
+            }
+            if (enter) v = u;
+            if (op != 0) a[i] = u;
+            if ((op >= 2 && keep_b) || enter) b[i] = v;
+        }
+        va[j] = u;
+        vb[j] = v;
+    }
+    float acc[9];
+    if (w != nullptr) {   // the router
+        for (int k = 0; k < 9; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kMhcV; ++j) {
+            const int i = threadIdx.x + j * kMhcT;
+            if (i >= n) continue;
+            acc[8] += va[j] * va[j] + vb[j] * vb[j];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) acc[k] += w[(size_t) k * 2 * n + i] * va[j] + w[(size_t) k * 2 * n + n + i] * vb[j];
+        }
+        mhc_block_sums(acc, 9, sh);
+        if (threadIdx.x == 0) {
+            const float r = rsqrtf(acc[8] / (2.0f * (float) n) + 1e-6f);
+            float l[8];
+            for (int k = 0; k < 8; ++k) l[k] = acc[k] * r + bias[k];
+            gates[0] = 1.0f / (1.0f + expf(-l[0]));
+            gates[1] = 1.0f / (1.0f + expf(-l[1]));
+            gates[2] = 2.0f / (1.0f + expf(-l[2]));
+            gates[3] = 2.0f / (1.0f + expf(-l[3]));
+            float m[2][2] = {{l[4], l[5]}, {l[6], l[7]}};
+            for (int it = 0; it < sink; ++it) {
+                for (int rr = 0; rr < 2; ++rr) {
+                    const float mx = fmaxf(m[rr][0], m[rr][1]);
+                    const float lse = mx + logf(expf(m[rr][0] - mx) + expf(m[rr][1] - mx));
+                    m[rr][0] -= lse;
+                    m[rr][1] -= lse;
+                }
+                for (int c = 0; c < 2; ++c) {
+                    const float mx = fmaxf(m[0][c], m[1][c]);
+                    const float lse = mx + logf(expf(m[0][c] - mx) + expf(m[1][c] - mx));
+                    m[0][c] -= lse;
+                    m[1][c] -= lse;
+                }
+            }
+            gates[4] = expf(m[0][0]);
+            gates[5] = expf(m[0][1]);
+            gates[6] = expf(m[1][0]);
+            gates[7] = expf(m[1][1]);
+            float* po = pk_out + (size_t) t * 8;
+            po[0] = gates[2]; po[1] = gates[3];
+            po[2] = gates[4]; po[3] = gates[5]; po[4] = gates[6]; po[5] = gates[7];
+            po[6] = gates[0]; po[7] = gates[1];
+        }
+        __syncthreads();
+        const float g0 = gates[0], g1 = gates[1];
+#pragma unroll
+        for (int j = 0; j < kMhcV; ++j) va[j] = g0 * va[j] + g1 * vb[j];
+    }
+    // x = rms(branch) * nw (the branch: the routed mix, else stream 0)
+    float ss[1] = {0.0f};
+#pragma unroll
+    for (int j = 0; j < kMhcV; ++j) ss[0] += va[j] * va[j];
+    mhc_block_sums(ss, 1, sh);
+    const float inv = rsqrtf(ss[0] / (float) n + eps);
+#pragma unroll
+    for (int j = 0; j < kMhcV; ++j) {
+        const int i = threadIdx.x + j * kMhcT;
+        if (i >= n) continue;
+        const float o = va[j] * inv * nw[i];
+        x[(size_t) t * n + i] = o;
+        if (x16 != nullptr) x16[(size_t) t * n + i] = f2h(o);
+    }
+}
+}  // namespace
+
+void mhc2_rows(float* s0, float* s1, int ld, int n, int T, const float* y, int op, const float* pk_in, bool enter,
+               const float* w, const float* bias, int sink, const float* nw, float eps, float* x, void* x16,
+               float* pk_out, cudaStream_t s) {
+    if (T <= 0) return;
+    if (n > kMhcT * kMhcV) {
+        std::fprintf(stderr, "qwen35 mhc2_rows: n_embd %d > %d\n", n, kMhcT * kMhcV);
+        return;
+    }
+    mhc2_rows_kernel<<<T, kMhcT, 0, s>>>(s0, s1, ld, n, y, op, pk_in, enter ? 1 : 0, w, bias, sink, nw, eps, x,
+                                         (uint16_t*) x16, pk_out);
+    check("mhc2_rows");
+}
+
+void set_rope_yarn(const float* freq, int half, float mscale) {
+    const int on = freq != nullptr && half > 0 && half <= 128 ? 1 : 0;
+    if (on) {
+        cudaMemcpyToSymbol(c_yarn_freq, freq, (size_t) half * sizeof(float));
+        cudaMemcpyToSymbol(c_yarn_ms, &mscale, sizeof(float));
+    }
+    g_yarn = on != 0;
+    check("set_rope_yarn");
 }
 
 }  // namespace strata::kernels::q35
