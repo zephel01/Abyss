@@ -3348,6 +3348,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         } else if (g.qwen35()) {
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
+            if (dfl_ != nullptr) dflash_capture(il, S->R, T, (size_t) 4 * E, true, s);   // DFlash 2's features (27B)
         } else {
             hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_fn8, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
             if (dsp_ != nullptr && il > l0_) dspark_capture_rows(il - 1, S->R, T, s);   // DSpark's features

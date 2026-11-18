@@ -2023,6 +2023,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the dense qwen35: no experts, so no pool, tiers, lanes or service thread - every weight is in the dense
         // arena; the prompt path gets a region of its own
         if (!prefill_setup_own(err)) return false;
+        // DFlash 2 (STRATA_Q35_DFLASH, Qwen3.8-27B's z-lab drafter): its weights before q35d_place sizes what of the
+        // trunk's FFN stays in VRAM
+        if (!dflash_load(err)) return false;
         if (!q35d_place(err)) return false;   // (the trunk's FFN: VRAM as far as it goes, the rest in RAM)
         strata::kernels::q35::attn_prompt_groups_tc(true);   // (its 6-head groups' prompt attention on tensor cores)
         size_t free_b = 0, total_b = 0;

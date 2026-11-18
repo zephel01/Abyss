@@ -1889,6 +1889,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         // the residual R (state_) takes the last FFN's output, then x = rms(R) * attn_norm (and its q8_1)
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         abl_cap(il, state_, 1, s);
+        if (dfl_ != nullptr) dflash_capture(il, state_, 1, 0, false, s);   // (DFlash 2's features: the 27B's)
         if (F->prof_on) F->mark("q35_norm");
         if (dumps) {
             if (il > l0_) q35_dump(s, "l_out", il - 1, state_, g.n_embd);

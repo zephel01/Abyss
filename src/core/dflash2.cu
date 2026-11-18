@@ -19,11 +19,17 @@
 // The context follows the sequence as DSpark's does: the token path, the verify window (the kept columns, at
 // spec_rewind) and the prompt path (a chunk's last kRing rows) leave their features, dflash_commit turns them into
 // ring rows.
+// The dense qwen35 (Qwen3.8-27B, 2026-11-18): STRATA_Q35_DFLASH=<z-lab's Qwen3.8-27B-DFlash2 GGUF> - the same layers at
+// the target's width (5120, ff 17408, Q4_K / Q6_K weights, a Q4_K selector, RoPE base 1e7, mask token from the GGUF),
+// the features the one residual entering layers 6/20/34/48/62 (token path, verify window, prompt chunks), up to 7
+// drafts a step with no confidence floor (the decode cuts the width, generate.cpp), the products on MMQ (dmm), and the
+// NextN block kept beside it (dfl_pick_: the decode picks a step's drafter).
 #include "glm_fast_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include "strata/qtypes.hpp"
 
@@ -53,8 +59,8 @@ constexpr size_t kQ8 = 36;     // bytes of a q8_1 block (32 values)
 constexpr int kL = 5;          // drafter layers = feature layers
 constexpr int kRing = 2048;    // the context window (the GGUF's sliding_window), positions mod kRing
 constexpr int kCh = 256;       // the commit's rows a pass
-constexpr int kHD = 128, kNH = 32, kNKV = 8, kFF = 7680, kRank = 256, kTopK = 16, kGrp = 16;
-constexpr int kNbMax = 6;      // y + 5 masks
+constexpr int kHD = 128, kNH = 32, kNKV = 8, kRank = 256, kTopK = 16, kGrp = 16;
+constexpr int kNbMax = 8;      // y + 7 masks (the GGUF's block_size; Flash-Next's default 5 drafts, the 27B's 7)
 constexpr int kTkCh = 64;      // the top-k's chunks a row
 constexpr int kQ8_0 = 8, kF32 = 0;
 
@@ -78,7 +84,17 @@ struct DflState {
     const uint8_t *sel_pred = nullptr, *sel_succ = nullptr;   // Q8_0 rows [V][256]
     float *enc_norm = nullptr, *out_norm = nullptr, *emb_mask = nullptr;
     int cap[kL] = {6, 16, 26, 36, 46};
-    int n_max = 5, nb = 6, mask = 248077;
+    int n_max = 5, nb = 6, mask = 248077, ff = 7680, sel_type = 8;
+    bool dense = false;   // the dense qwen35 target (Qwen3.8-27B): one residual stream, not qwen4exp's 4
+    // the dense target's drafter: its products (and the head's) on the int8 tensor cores (MMQ) instead of mvn - at 8
+    // columns mvn's Q4_K / Q8_0 dot products were compute-bound (the head 1.54 ms for 1.35 GB, gate / up 0.6 TB/s);
+    // the drafts are only proposals (the verify window decides), so another sum order changes nothing kept.
+    // STRATA_Q35_DFLASH_MMQ=0: mvn as Flash-Next's
+    std::unique_ptr<strata::prefill::mmq::Context> mq;
+    void* mq_x = nullptr;              // the q8_1 activations
+    int32_t *mq_ids = nullptr, *mq_bounds = nullptr;   // the identity; {0, r} at 2 r
+    bool warm = false;                 // (a first draft ran outside the graph: MMQ's scratch pool allocated)
+    bool primed = false;               // (dflash_reset's warm-up drafts ran)
     float p_min = 0.9f, eps = 1e-6f, rope_base = 10000.0f;   // (0.9: list +4%, code even against 0.75 on an RTX 5090)
     // features: the token's / the window's columns ([kVerifyMax][5 E]) and a prompt chunk's last rows ([kRing][5 E])
     float *feat = nullptr, *feat_p = nullptr;
@@ -160,7 +176,7 @@ __device__ __forceinline__ void q81_store_warp(float v, Q81* dst, int lane) {
 
 // y[row] = rms(x[row]) * w (rows ldx / ldy floats apart; 256 threads, E a multiple of 256, <= 256 kRmsPer), and the
 // row as q8_1 blocks into yq (E / 32 blocks a row; null: none) - a warp's 32 values a block
-constexpr int kRmsPer = 16;
+constexpr int kRmsPer = 32;
 __global__ void __launch_bounds__(256) k_rms(const float* __restrict__ x, int ldx, const float* __restrict__ w,
                                              float eps, int E, float* __restrict__ y, int ldy, Q81* __restrict__ yq) {
     __shared__ float sh[32];
@@ -462,14 +478,38 @@ __device__ __forceinline__ float q8_0_at(const uint8_t* row, int r) {
     const float d = __half2float(*reinterpret_cast<const __half*>(b));
     return d * (float) (int8_t) b[2 + (r & 31)];
 }
+// value r (< 256) of a Q4_K row of one super-block (the 27B drafter's selector): d, dmin (FP16), 12 bytes of 6-bit
+// scales / mins for the 8 sub-blocks of 32, then 128 bytes of nibbles - sub-blocks 2c / 2c + 1 the low / high nibbles
+// of bytes 32c .. 32c + 31; the value d sc q - dmin m
+__device__ __forceinline__ float q4_k_at(const uint8_t* row, int r) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(row));
+    const float dm = __half2float(*reinterpret_cast<const __half*>(row + 2));
+    const uint8_t* sc = row + 4;
+    const uint8_t* qs = row + 16;
+    const int j = r >> 5, l = r & 31;
+    int a, m;
+    if (j < 4) {
+        a = sc[j] & 63;
+        m = sc[j + 4] & 63;
+    } else {
+        a = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+        m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+    }
+    const uint8_t b = qs[(j >> 1) * 32 + l];
+    const int q = (j & 1) ? (b >> 4) : (b & 0xF);
+    return d * (float) a * (float) q - dm * (float) m;
+}
+__device__ __forceinline__ float sel_at(const uint8_t* row, int r, int type) {
+    return type == 12 ? q4_k_at(row, r) : q8_0_at(row, r);
+}
 
 // the greedy walk (one block of 256): rows 1 .. nb - 1 (tv / ti / gate index r = row - 1), each row's top kTopK out
 // of its chunks' candidates, the selector's scores, the pick and its confidence; stops below p_min.  out: n, then the
 // tokens; conf: the picks' confidences
 __global__ void __launch_bounds__(256) k_select(const float* __restrict__ tv, const int* __restrict__ ti, int n_cand,
                                                 const float* __restrict__ gate, const uint8_t* __restrict__ pred,
-                                                const uint8_t* __restrict__ succ, const int* __restrict__ y, int rows,
-                                                float p_min, int* __restrict__ out, float* __restrict__ conf) {
+                                                const uint8_t* __restrict__ succ, int sel_type, const int* __restrict__ y,
+                                                int rows, float p_min, int* __restrict__ out, float* __restrict__ conf) {
     __shared__ float cv[kTkCh * kTopK];
     __shared__ int ci[kTkCh * kTopK];
     __shared__ float pg[kRank];
@@ -479,7 +519,7 @@ __global__ void __launch_bounds__(256) k_select(const float* __restrict__ tv, co
     __shared__ int bi[8];
     __shared__ int prev, stop;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    const size_t rb = (size_t) (kRank / 32) * 34;
+    const size_t rb = sel_type == 12 ? (size_t) (kRank / 256) * 144 : (size_t) (kRank / 32) * 34;
     if (threadIdx.x == 0) {
         prev = y[0];
         stop = 0;
@@ -494,7 +534,7 @@ __global__ void __launch_bounds__(256) k_select(const float* __restrict__ tv, co
         }
         // pred[prev] . gate_r
         for (int i = threadIdx.x; i < kRank; i += blockDim.x)
-            pg[i] = q8_0_at(pred + (size_t) prev * rb, i) * gate[(size_t) r * kRank + i];
+            pg[i] = sel_at(pred + (size_t) prev * rb, i, sel_type) * gate[(size_t) r * kRank + i];
         __syncthreads();
         for (int k = 0; k < kTopK; ++k) {
             float v = -INFINITY;
@@ -523,7 +563,7 @@ __global__ void __launch_bounds__(256) k_select(const float* __restrict__ tv, co
         for (int c = 2 * wp; c < 2 * wp + 2; ++c) {
             const uint8_t* srow = succ + (size_t) top_i[c] * rb;
             float s = 0.0f;
-            for (int i = lane; i < kRank; i += 32) s += q8_0_at(srow, i) * pg[i];
+            for (int i = lane; i < kRank; i += 32) s += sel_at(srow, i, sel_type) * pg[i];
             s = warp_sum(s);
             if (lane == 0) score[c] = top_v[c] + s;
         }
@@ -560,22 +600,53 @@ void rms_rows(const float* x, int ldx, const float* w, float eps, int E, int row
     k_rms<<<rows, 256, 0, s>>>(x, ldx, w, eps, E, y, ldy, (Q81*) yq);
 }
 
+// y[rows][n_out] = x[rows][n_in] . W^T: MMQ when the state has it (the weight's type covered), else mvn on xq
+bool dmm(DflState* D, const WSlot& w, int n_in, int n_out, const float* x, const void* xq, float* y, int rows,
+         cudaStream_t s) {
+    namespace mmq = strata::prefill::mmq;
+    if (D->mq && mmq::supported(w.type) && n_in % 512 == 0 && n_out % 128 == 0) {
+        mmq::quantize(x, nullptr, D->mq_x, w.type, n_in, n_in, rows, s);
+        mmq::Product p;
+        p.w = w.q;
+        p.type = w.type;
+        p.w_rows = n_out;
+        p.w_cols = n_in;
+        p.expert_bytes = mmq::matrix_bytes(w.type, n_out, n_in);
+        p.n = 1;
+        p.xq = D->mq_x;
+        p.bounds = D->mq_bounds + 2 * rows;
+        p.ids = D->mq_ids;
+        p.total_rows = rows;
+        p.max_rows = rows;
+        p.dst = y;
+        p.ld_dst = n_out;
+        D->mq->run(p, s);
+        return true;
+    }
+    gf::MvJob j = {w.q, xq, x, y, nullptr, 1.0f, w.type, n_in, n_out};
+    return gf::mvn(&j, 1, rows, s);
+}
+
 }  // namespace
 
 bool Glm5Model::dflash_load(std::string& err) {
     (void) err;
-    const char* path = getenv("STRATA_Q4X_DFLASH");
-    if (path == nullptr || !path[0]) return true;
     const Glm5Geometry& g = g_;
+    // Flash-Next's (STRATA_Q4X_DFLASH) or the dense qwen35's (STRATA_Q35_DFLASH: Qwen3.8-27B's z-lab DFlash 2)
+    const char* path = getenv(g.q35_dense() ? "STRATA_Q35_DFLASH" : "STRATA_Q4X_DFLASH");
+    if (path == nullptr || !path[0]) return true;
     const auto refuse = [&](const std::string& why) {
         std::fprintf(stderr, "dflash: not loaded - %s\n", why.c_str());
         dflash_destroy();
         return true;   // the target runs on without the drafter
     };
-    if (!g.q4x || n_parts_ != 1 || l0_ != 0 || l1_ != g.n_layers || g.hc != 4)
-        return refuse("Qwen3.8-Flash-Next (qwen4exp) on one device only (no split)");
+    const bool dense = g.q35_dense() && !g.loop && !g.laguna;
+    if (!(g.q4x && g.hc == 4) && !dense)
+        return refuse("Qwen3.8-Flash-Next (qwen4exp) or a dense qwen35 (Qwen3.8-27B) only");
+    if (n_parts_ != 1 || l0_ != 0 || l1_ != g.n_layers) return refuse("one device only (no split)");
     auto* D = new DflState();
     dfl_ = D;
+    D->dense = dense;
     try {
         D->gguf = std::make_unique<strata::GgufFile>(path);
     } catch (const std::exception& e) {
@@ -597,19 +668,28 @@ bool Glm5Model::dflash_load(std::string& err) {
     D->eps = (float) num("dflash.attention.layer_norm_rms_epsilon", 1e-6);
     D->rope_base = (float) num("dflash.rope.freq_base", 10000.0);
     const int E = g.n_embd, V = g.n_vocab;
+    D->ff = (int) num("dflash.feed_forward_length", 0);
+    const int kFF = D->ff;
     if (!layers_ok || (int) num("dflash.block_count", 0) != kL || (int) num("dflash.embedding_length", 0) != E ||
-        (int) num("dflash.feed_forward_length", 0) != kFF || (int) num("dflash.attention.head_count", 0) != kNH ||
+        kFF <= 0 || kFF % 256 != 0 || (int) num("dflash.attention.head_count", 0) != kNH ||
         (int) num("dflash.attention.head_count_kv", 0) != kNKV || (int) num("dflash.attention.key_length", 0) != kHD ||
         (int) num("dflash.attention.value_length", 0) != kHD || (int) num("dflash.conv_kernel_size", 0) != 2 ||
         (int) num("dflash.conv_group_size", 0) != kGrp || (int) num("dflash.selector_rank", 0) != kRank ||
         (int) num("dflash.selector_top_k", 0) != kTopK || (int) num("dflash.attention.sliding_window", 0) != kRing ||
         E % (kGrp * 32) != 0 || E % 256 != 0 || E > 256 * kRmsPer)
         return refuse("the drafter's layout (5 layers over 5 target layers, the target's width, 32 / 8 heads of 128, "
-                      "ff 7680, a 2-tap conv in groups of 16, selector rank 256 top-16, a 2048-row window)");
+                      "an ff of 256s, a 2-tap conv in groups of 16, selector rank 256 top-16, a 2048-row window)");
+    if (const int bs = (int) num("dflash.block_size", 0); bs >= 2) D->n_max = std::min(D->n_max, bs - 1);
+    D->mask = (int) num("tokenizer.ggml.mask_token_id", (double) D->mask);
+    if (dense) {   // (the decode cuts the width by the walk's confidences against the measured window times)
+        D->n_max = std::min(kNbMax - 1, std::max(1, (int) num("dflash.block_size", 8) - 1));
+        D->p_min = 0.0f;
+    }
     if (const char* v = getenv("STRATA_Q4X_DFLASH_MASK")) D->mask = std::atoi(v);
     if (D->mask < 0 || D->mask >= V) return refuse("the mask token id");
-    if (const char* v = getenv("STRATA_Q4X_DFLASH_N")) D->n_max = std::max(1, std::min(kNbMax - 1, std::atoi(v)));
-    if (const char* v = getenv("STRATA_Q4X_DFLASH_PMIN")) D->p_min = (float) std::atof(v);
+    if (const char* v = getenv(dense ? "STRATA_Q35_DFLASH_N" : "STRATA_Q4X_DFLASH_N"))
+        D->n_max = std::max(1, std::min(kNbMax - 1, std::atoi(v)));
+    if (const char* v = getenv(dense ? "STRATA_Q35_DFLASH_PMIN" : "STRATA_Q4X_DFLASH_PMIN")) D->p_min = (float) std::atof(v);
     D->nb = D->n_max + 1;
     std::string why;
     const auto find = [&](const std::string& n, int type, std::initializer_list<uint64_t> shape) -> const strata::TensorInfo* {
@@ -629,14 +709,22 @@ bool Glm5Model::dflash_load(std::string& err) {
         D->bytes += bytes;
         return p;
     };
+    // a projection: Flash-Next's are Q8_0, the 27B drafter's Q4_K / Q6_K - any type mvn serves
     const auto raw = [&](const std::string& n, int64_t n_in, int64_t n_out, WSlot& w) {
-        const strata::TensorInfo* t = find(n, kQ8_0, {(uint64_t) n_in, (uint64_t) n_out});
+        const strata::TensorInfo* t0 = G.find(n);
+        const int ty = t0 != nullptr ? (int) t0->type : kQ8_0;
+        if (t0 != nullptr && (!gf::mvn_supported(ty) || ty == kF32 || ty == gf::kTypeBF16)) {
+            if (why.empty()) why = n + ": a type the drafter's kernels do not serve";
+            ok = false;
+            return;
+        }
+        const strata::TensorInfo* t = find(n, ty, {(uint64_t) n_in, (uint64_t) n_out});
         if (t == nullptr) { ok = false; return; }
-        const size_t bytes = gf::row_bytes(kQ8_0, n_in) * (size_t) n_out;
+        const size_t bytes = gf::row_bytes(ty, n_in) * (size_t) n_out;
         void* p = dev(bytes);
         if (p == nullptr) return;
         ok = cudaMemcpy(p, G.tensor_data(*t), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-        w = WSlot{nullptr, kQ8_0, p, n_in, n_out};
+        w = WSlot{nullptr, ty, p, n_in, n_out};
     };
     const auto f32 = [&](const std::string& n, std::initializer_list<uint64_t> shape) -> float* {
         const strata::TensorInfo* t = find(n, kF32, shape);
@@ -673,17 +761,18 @@ bool Glm5Model::dflash_load(std::string& err) {
     raw("selector_hidden.weight", E, kRank, D->sel_h);
     D->enc_norm = f32("enc.output_norm.weight", {uE});
     D->out_norm = f32("output_norm.weight", {uE});
+    if (const strata::TensorInfo* t0 = G.find("selector_predecessor.weight")) D->sel_type = (int) t0->type;
+    if (D->sel_type != kQ8_0 && D->sel_type != 12) return refuse("the selector's rows are neither Q8_0 nor Q4_K");
     for (int which = 0; which < 2 && ok; ++which) {
         const char* n = which == 0 ? "selector_predecessor.weight" : "selector_successor.weight";
-        const strata::TensorInfo* t = find(n, kQ8_0, {(uint64_t) kRank, (uint64_t) V});
+        const strata::TensorInfo* t = find(n, D->sel_type, {(uint64_t) kRank, (uint64_t) V});
         if (t == nullptr) { ok = false; break; }
-        const size_t bytes = gf::row_bytes(kQ8_0, kRank) * (size_t) V;
+        const size_t bytes = gf::row_bytes(D->sel_type, kRank) * (size_t) V;
         void* p = dev(bytes);
         if (p != nullptr) ok = cudaMemcpy(p, G.tensor_data(*t), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
         (which == 0 ? D->sel_pred : D->sel_succ) = (const uint8_t*) p;
     }
     if (!ok) return refuse(why.empty() ? "the weights did not upload (VRAM?)" : why);
-    if (!gf::mvn_supported(kQ8_0)) return refuse("the Q8_0 kernels");
     if (ws_map_.find("output.weight") == ws_map_.end()) return refuse("the target's output.weight");
     // the mask token's embedding, once
     const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
@@ -734,6 +823,26 @@ bool Glm5Model::dflash_load(std::string& err) {
     if (const char* v = getenv("STRATA_Q4X_DFLASH_GRAPH")) D->graph_on = std::atoi(v) != 0;
     D->res_d = (int*) dev(16 * sizeof(int));
     fb(D->res_conf_d, 16);
+    if (ok && dense && strata::prefill::mmq::built()) {
+        const char* v = getenv("STRATA_Q35_DFLASH_MMQ");
+        if (v == nullptr || std::atoi(v) != 0) {
+            namespace mmq = strata::prefill::mmq;
+            D->mq_x = dev(mmq::q8_bytes(kCh, (int64_t) FE) + 4096);
+            D->mq_ids = (int32_t*) dev((size_t) mmq::ids_pad(kCh) * sizeof(int32_t));
+            D->mq_bounds = (int32_t*) dev((size_t) 2 * (kCh + 1) * sizeof(int32_t));
+            if (ok) {
+                std::vector<int32_t> b((size_t) 2 * (kCh + 1));
+                for (int r = 0; r <= kCh; ++r) {
+                    b[(size_t) 2 * r] = 0;
+                    b[(size_t) 2 * r + 1] = r;
+                }
+                ok = cudaMemcpy(D->mq_bounds, b.data(), b.size() * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess;
+                mmq::iota(D->mq_ids, mmq::ids_pad(kCh), nullptr);
+                ok = ok && cudaDeviceSynchronize() == cudaSuccess;
+                D->mq = std::make_unique<mmq::Context>();
+            }
+        }
+    }
     if (!ok) return refuse("the buffers did not allocate (VRAM?)");
     ok = cudaHostAlloc((void**) &D->y_h, 64, cudaHostAllocMapped) == cudaSuccess &&
          cudaHostGetDevicePointer((void**) &D->y_d, D->y_h, 0) == cudaSuccess &&
@@ -757,6 +866,11 @@ bool Glm5Model::dflash_load(std::string& err) {
                  path, kL, D->cap[0], D->cap[1], D->cap[2], D->cap[3], D->cap[4], D->n_max, D->p_min,
                  (double) D->bytes / 1073741824.0, dev_);
     return true;
+}
+
+int Glm5Model::dflash_max() const {
+    const auto* D = (const DflState*) dfl_;
+    return D != nullptr ? D->n_max : 0;
 }
 
 void Glm5Model::dflash_destroy() {
@@ -786,6 +900,31 @@ void Glm5Model::dflash_reset() {
     auto* D = (DflState*) dfl_;
     if (D == nullptr) return;
     D->win_p0 = -1;
+    // the dense target: the draft's first runs (MMQ's scratch, the graph's capture: tens of ms) before the prompt, not
+    // inside the answer - two throwaway drafts with no context, their counts taken back
+    if (D->dense && !D->primed && fast_ != nullptr) {
+        D->primed = true;
+        const int64_t lo = D->ctx_lo, end = D->ctx_end;
+        D->ctx_lo = D->ctx_end = -1;   // (no context rows: n_ctx 0)
+        int32_t dr[kNbMax];
+        float cf[kNbMax];
+        std::string e;
+        const uint64_t n0 = D->drafts, d0 = D->drafted;
+        uint64_t h0[kNbMax + 1];
+        std::memcpy(h0, D->hist, sizeof h0);
+        const double ms0 = D->ms_draft;
+        for (int i = 0; i < 2; ++i)
+            if (!dflash_draft(0, dr, cf, e)) {
+                std::fprintf(stderr, "dflash: the warm-up draft failed (%s)\n", e.c_str());
+                break;
+            }
+        D->drafts = n0;
+        D->drafted = d0;
+        std::memcpy(D->hist, h0, sizeof h0);
+        D->ms_draft = ms0;
+        D->ctx_lo = lo;
+        D->ctx_end = end;
+    }
     // a restored snapshot (pos_ inside the context): the ring rows of the positions before it that no later position
     // wrote over are still this sequence's
     if (pos_ > D->ctx_lo && pos_ <= D->ctx_end) {
@@ -813,6 +952,14 @@ void Glm5Model::dflash_capture(int il, const float* R, int n, size_t rs, bool pr
     if (k < 0) return;
     const int E = g_.n_embd;
     const size_t FE = (size_t) kL * E;
+    if (D->dense) {   // (one stream: its rows as they are; rs 0 = one row)
+        const int m = prompt ? std::min(n, kRing) : std::min(n, (int) kVerifyMax);
+        const float* src = prompt ? R + (size_t) (n - m) * rs : R;
+        cudaMemcpy2DAsync(prompt ? D->feat_p + (size_t) k * E : D->feat + (size_t) k * E, FE * sizeof(float), src,
+                          (rs > 0 ? rs : (size_t) E) * sizeof(float), (size_t) E * sizeof(float), (size_t) m,
+                          cudaMemcpyDeviceToDevice, s);
+        return;
+    }
     if (prompt) {
         const int m = std::min(n, kRing);
         ds::stream_mean(R + (size_t) (n - m) * rs, m, rs, E, D->feat_p + (size_t) k * E, FE, s);
@@ -834,16 +981,22 @@ bool Glm5Model::dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
     for (int c0 = 0; c0 < n; c0 += kCh) {
         const int m = std::min(kCh, n - c0);
         const float* fr = feat + (size_t) c0 * FE;
-        gf::quantize_q8_1(fr, D->featq, (int) (m * FE), s);
-        gf::MvJob j = {D->fc.q, D->featq, fr, D->gpre, nullptr, 1.0f, D->fc.type, (int) FE, E};
-        if (!gf::mvn(&j, 1, m, s)) return false;
+        if (!D->mq) gf::quantize_q8_1(fr, D->featq, (int) (m * FE), s);
+        if (!dmm(D, D->fc, (int) FE, E, fr, D->featq, D->gpre, m, s)) return false;
         rms_rows(D->gpre, E, D->enc_norm, D->eps, E, m, D->gv, E, D->gq, s);
-        gf::MvJob jk[kL], jv[kL];
-        for (int l = 0; l < kL; ++l) {
-            jk[l] = {D->L[l].k.q, D->gq, D->gv, D->kk + (size_t) l * kCh * KVD, nullptr, 1.0f, kQ8_0, E, KVD};
-            jv[l] = {D->L[l].v.q, D->gq, D->gv, D->vv + (size_t) l * kCh * KVD, nullptr, 1.0f, kQ8_0, E, KVD};
+        if (D->mq) {
+            for (int l = 0; l < kL; ++l)
+                if (!dmm(D, D->L[l].k, E, KVD, D->gv, D->gq, D->kk + (size_t) l * kCh * KVD, m, s) ||
+                    !dmm(D, D->L[l].v, E, KVD, D->gv, D->gq, D->vv + (size_t) l * kCh * KVD, m, s))
+                    return false;
+        } else {
+            gf::MvJob jk[kL], jv[kL];
+            for (int l = 0; l < kL; ++l) {
+                jk[l] = {D->L[l].k.q, D->gq, D->gv, D->kk + (size_t) l * kCh * KVD, nullptr, 1.0f, D->L[l].k.type, E, KVD};
+                jv[l] = {D->L[l].v.q, D->gq, D->gv, D->vv + (size_t) l * kCh * KVD, nullptr, 1.0f, D->L[l].v.type, E, KVD};
+            }
+            if (!gf::mvn(jk, kL, m, s) || !gf::mvn(jv, kL, m, s)) return false;
         }
-        if (!gf::mvn(jk, kL, m, s) || !gf::mvn(jv, kL, m, s)) return false;
         k_rope_tab<<<(m * (kHD / 2) + 127) / 128, 128, 0, s>>>((long long) (p0 + c0), nullptr, m, D->rope_base,
                                                                 D->rope_c);
         for (int l = 0; l < kL; ++l) {
@@ -879,7 +1032,7 @@ void Glm5Model::dflash_window(int64_t p0, int T) {
 
 bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
     auto* D = (DflState*) dfl_;
-    for (int k = 0; k < 5; ++k) {
+    for (int k = 0; k < kNbMax - 1; ++k) {   // (the callers' arrays hold kVerifyMax - 1 = 7)
         drafts[k] = -1;
         conf[k] = -1.0f;   // (the decode's threshold for this drafter is 0: a slot without a draft must stay below)
     }
@@ -896,7 +1049,7 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
 #endif
     dflash_settle();
     const int64_t pos = pos_;
-    const int E = g.n_embd, V = g.n_vocab, NB = D->nb, KVD = kNKV * kHD, G2 = 4 * (E / kGrp);
+    const int E = g.n_embd, V = g.n_vocab, NB = D->nb, KVD = kNKV * kHD, G2 = 4 * (E / kGrp), kFF = D->ff;
     const size_t q8e = (size_t) (E / 32) * kQ8;
     int64_t lo = std::max<int64_t>(D->ctx_lo, pos - kRing);
     int n_ctx = D->ctx_end == pos ? (int) (pos - lo) : 0;
@@ -932,32 +1085,36 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
         const DflLayer& Ly = D->L[l];
         // ---- attention
         rms_rows(D->x, E, Ly.attn_norm, D->eps, E, NB, D->xn, E, D->xnq, s);
-        gf::MvJob jd = {Ly.acp.q, D->xnq, D->xn, D->dyn, nullptr, 1.0f, kQ8_0, E, G2};
-        if (!gf::mvn(&jd, 1, NB, s)) { err = "dflash: attn_conv_proj"; return false; }
+        if (!dmm(D, Ly.acp, E, G2, D->xn, D->xnq, D->dyn, NB, s)) { err = "dflash: attn_conv_proj"; return false; }
         k_conv<<<cg, 256, 0, s>>>(D->xn, D->dyn, G2, 0, E / kGrp, kGrp, Ly.acb, E, D->xc, nullptr, (Q81*) D->xcq);
-        gf::MvJob j[3] = {{Ly.q.q, D->xcq, D->xc, D->q, nullptr, 1.0f, kQ8_0, E, kNH * kHD},
-                          {Ly.k.q, D->xcq, D->xc, D->kb, nullptr, 1.0f, kQ8_0, E, KVD},
-                          {Ly.v.q, D->xcq, D->xc, D->vb, nullptr, 1.0f, kQ8_0, E, KVD}};
-        if (!gf::mvn(j, 3, NB, s)) { err = "dflash: q / k / v"; return false; }
+        gf::MvJob j[3] = {{Ly.q.q, D->xcq, D->xc, D->q, nullptr, 1.0f, Ly.q.type, E, kNH * kHD},
+                          {Ly.k.q, D->xcq, D->xc, D->kb, nullptr, 1.0f, Ly.k.type, E, KVD},
+                          {Ly.v.q, D->xcq, D->xc, D->vb, nullptr, 1.0f, Ly.v.type, E, KVD}};
+        if (D->mq) {
+            if (!dmm(D, Ly.q, E, kNH * kHD, D->xc, D->xcq, D->q, NB, s) || !dmm(D, Ly.k, E, KVD, D->xc, D->xcq, D->kb, NB, s) ||
+                !dmm(D, Ly.v, E, KVD, D->xc, D->xcq, D->vb, NB, s)) { err = "dflash: q / k / v"; return false; }
+        } else if (!gf::mvn(j, 3, NB, s)) { err = "dflash: q / k / v"; return false; }
         k_norm_rope<<<dim3(kNH + kNKV, NB), kHD, 0, s>>>(D->q, kNH * kHD, Ly.q_norm, D->eps, (long long) pos, D->rope_d,
                                                          nullptr, 0, 0, kNH, D->kb, KVD, Ly.k_norm);
         k_attn<<<dim3(kNKV, NB), kAttT, D->att_smem, s>>>(D->q, Ly.rk, Ly.rv, D->par_d, kRing, D->kb, D->vb, NB,
                                                       scale, D->o, (Q81*) D->oq);
-        gf::MvJob jo = {Ly.o.q, D->oq, D->o, D->a, nullptr, 1.0f, kQ8_0, kNH * kHD, E};
-        if (!gf::mvn(&jo, 1, NB, s)) { err = "dflash: attn_output"; return false; }
+        if (!dmm(D, Ly.o, kNH * kHD, E, D->o, D->oq, D->a, NB, s)) { err = "dflash: attn_output"; return false; }
         k_conv<<<cg, 256, 0, s>>>(D->a, D->dyn, G2, 2 * (E / kGrp), E / kGrp, kGrp, Ly.acb + 2 * (size_t) E, E, nullptr,
                                   D->x, nullptr);
         // ---- the FFN
         rms_rows(D->x, E, Ly.ffn_norm, D->eps, E, NB, D->xn, E, D->xnq, s);
-        gf::MvJob jf = {Ly.fcp.q, D->xnq, D->xn, D->dyn, nullptr, 1.0f, kQ8_0, E, G2};
-        if (!gf::mvn(&jf, 1, NB, s)) { err = "dflash: ffn_conv_proj"; return false; }
+        if (!dmm(D, Ly.fcp, E, G2, D->xn, D->xnq, D->dyn, NB, s)) { err = "dflash: ffn_conv_proj"; return false; }
         k_conv<<<cg, 256, 0, s>>>(D->xn, D->dyn, G2, 0, E / kGrp, kGrp, Ly.fcb, E, D->xc, nullptr, (Q81*) D->xcq);
-        gf::MvJob ju[2] = {{Ly.gate.q, D->xcq, D->xc, D->gt, nullptr, 1.0f, kQ8_0, E, kFF},
-                           {Ly.up.q, D->xcq, D->xc, D->up, nullptr, 1.0f, kQ8_0, E, kFF}};
-        if (!gf::mvn(ju, 2, NB, s)) { err = "dflash: ffn gate / up"; return false; }
+        gf::MvJob ju[2] = {{Ly.gate.q, D->xcq, D->xc, D->gt, nullptr, 1.0f, Ly.gate.type, E, kFF},
+                           {Ly.up.q, D->xcq, D->xc, D->up, nullptr, 1.0f, Ly.up.type, E, kFF}};
+        if (D->mq) {
+            if (!dmm(D, Ly.gate, E, kFF, D->xc, D->xcq, D->gt, NB, s) || !dmm(D, Ly.up, E, kFF, D->xc, D->xcq, D->up, NB, s)) {
+                err = "dflash: ffn gate / up";
+                return false;
+            }
+        } else if (!gf::mvn(ju, 2, NB, s)) { err = "dflash: ffn gate / up"; return false; }
         k_swiglu<<<(NB * kFF + 255) / 256, 256, 0, s>>>(D->gt, D->up, NB * kFF, (Q81*) D->gq2);
-        gf::MvJob jn = {Ly.down.q, D->gq2, D->gt, D->f, nullptr, 1.0f, kQ8_0, kFF, E};
-        if (!gf::mvn(&jn, 1, NB, s)) { err = "dflash: ffn_down"; return false; }
+        if (!dmm(D, Ly.down, kFF, E, D->gt, D->gq2, D->f, NB, s)) { err = "dflash: ffn_down"; return false; }
         k_conv<<<cg, 256, 0, s>>>(D->f, D->dyn, G2, 2 * (E / kGrp), E / kGrp, kGrp, Ly.fcb + 2 * (size_t) E, E, nullptr,
                                   D->x, nullptr);
     }
@@ -966,7 +1123,11 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, D->hnq, D->hn, D->logits, nullptr, 1.0f, ow.type, E, V};
     if (ow.type == 0) o.w = ow.f32;
-    if (gf::mvn_supported(ow.type)) {
+    if (q35d_head_split()) {   // (the dense qwen35 on a small card: the head's last rows on the CPU - no graph)
+        if (!q35d_head(D->hnq, R, D->logits, s, err, D->hn)) return false;
+    } else if (D->mq && ow.type != 0 && strata::prefill::mmq::supported(ow.type)) {
+        if (!dmm(D, ow, E, V, D->hn, D->hnq, D->logits, R, s)) { err = "dflash: output head"; return false; }
+    } else if (gf::mvn_supported(ow.type)) {
         if (!gf::mvn(&o, 1, R, s)) { err = "dflash: output head"; return false; }
     } else {
         for (int i = 0; i < R; ++i) {
@@ -977,18 +1138,25 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
             if (!gf::mv(&ot, 1, s)) { err = "dflash: output head (type " + std::to_string(ow.type) + ")"; return false; }
         }
     }
-    gf::MvJob js = {D->sel_h.q, D->hnq, D->hn, D->gate, nullptr, 1.0f, kQ8_0, E, kRank};
-    if (!gf::mvn(&js, 1, R, s)) { err = "dflash: selector_hidden"; return false; }
+    if (!dmm(D, D->sel_h, E, kRank, D->hn, D->hnq, D->gate, R, s)) { err = "dflash: selector_hidden"; return false; }
     const int chunk = (V + kTkCh - 1) / kTkCh;
     k_topk_part<<<dim3(kTkCh, R), 256, (size_t) chunk * sizeof(float), s>>>(D->logits, V, chunk, D->tk_v, D->tk_i);
-    k_select<<<1, 256, 0, s>>>(D->tk_v, D->tk_i, kTkCh * kTopK, D->gate, D->sel_pred, D->sel_succ, D->y_d, R, D->p_min,
+    k_select<<<1, 256, 0, s>>>(D->tk_v, D->tk_i, kTkCh * kTopK, D->gate, D->sel_pred, D->sel_succ, D->sel_type, D->y_d, R,
+                               D->p_min,
                                D->res_d, D->res_conf_d);
     cudaMemcpyAsync(D->res_h, D->res_d, (size_t) (1 + R) * sizeof(int), cudaMemcpyDeviceToHost, s);
     cudaMemcpyAsync(D->res_conf_h, D->res_conf_d, (size_t) R * sizeof(float), cudaMemcpyDeviceToHost, s);
     return true;
     };
     bool launched = false;
-    if (D->graph_on && D->gexec == nullptr) {   // (the first draft: its kernels captured once)
+    if (q35d_head_split()) {   // (the CPU's head rows: launched one by one - a graph captured before the split goes)
+        D->graph_on = false;
+        if (D->gexec) cudaGraphExecDestroy(D->gexec);
+        D->gexec = nullptr;
+    }
+    if (D->graph_on && D->gexec == nullptr && D->mq && !D->warm) {   // (MMQ's scratch: allocated outside a capture)
+        D->warm = true;
+    } else if (D->graph_on && D->gexec == nullptr) {   // (the first draft: its kernels captured once)
         cudaGraph_t gr = nullptr;
         bool okc = cudaStreamBeginCapture(D->gs, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
         const bool enq = okc && enqueue(D->gs);
@@ -1010,7 +1178,7 @@ bool Glm5Model::dflash_draft(int32_t y, int32_t* drafts, float* conf, std::strin
         return false;
     }
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("dflash: ") + cudaGetErrorString(e); return false; } }
-    const int n = std::max(0, std::min(D->res_h[0], std::min(R, 5)));
+    const int n = std::max(0, std::min(D->res_h[0], R));
     for (int i = 0; i < n; ++i) {
         drafts[i] = D->res_h[1 + i];
         conf[i] = D->res_conf_h[i];

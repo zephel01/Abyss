@@ -824,7 +824,7 @@ void Glm5Model::dspark_upload() {
 }
 
 bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err) {
-    if (dfl_ != nullptr) return dflash_draft(y, drafts, conf, err);   // (Qwen3.8's DFlash 2 block)
+    if (dfl_ != nullptr && (dfl_pick_ || !q35_mtp_on())) return dflash_draft(y, drafts, conf, err);   // (DFlash 2)
     if (dsp_ == nullptr && q35_mtp_on()) return q35_mtp_draft(y, drafts, conf, err);   // (qwen35moe's NextN block)
     if (dsp_ == nullptr && next_port_ != nullptr && next_port_->mtp_on()) {   // (qwen4exp's layer: the last part)
         const bool ok = next_port_->mtp_draft(y, drafts, conf, err);

@@ -626,7 +626,8 @@ public:
     bool dspark_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
     void dspark_window(int64_t p0, int T);         // verify: its columns wait for spec_rewind's position
     void dspark_settle();                          // ... which commits the kept ones
-    // ---- DFlash 2, Qwen3.8-Flash-Next's block drafter (src/core/dflash2.cu, STRATA_Q4X_DFLASH=<its GGUF>): the same
+    // ---- DFlash 2, Qwen3.8-Flash-Next's block drafter (src/core/dflash2.cu, STRATA_Q4X_DFLASH=<its GGUF>; the dense
+    // qwen35's - Qwen3.8-27B - with STRATA_Q35_DFLASH): the same
     // hooks as DSpark's (dspark_settle / dspark_window / dspark_reset / dspark_draft call these when it is loaded)
     void* dfl_ = nullptr;
     bool dflash_load(std::string& err);
@@ -907,6 +908,11 @@ public:
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
     bool dspark_ready() const { return dsp_ != nullptr || dfl_ != nullptr || chain_mtp_on(); }
     bool dflash_on() const { return dfl_ != nullptr; }   // DFlash2 (dflash2.cu): its walk applied the threshold
+    // the dense qwen35 with both drafters (DFlash 2 and its NextN block): dspark_draft runs DFlash 2 while this is set,
+    // the NextN chain otherwise (the decode picks a step's drafter by their measured rates)
+    bool dfl_pick_ = true;
+    bool dflash_with_mtp() const { return dfl_ != nullptr && q35_mtp_on(); }
+    int dflash_max() const;   // (drafts a step at most: the GGUF's block_size - 1, or STRATA_Q35_DFLASH_N)
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     /// Speculative sampling (spec_sampling.hpp; qwen35's NextN drafter on one part): with a request's sampler set,
     /// the next dspark_draft SAMPLES its drafts from the drafter's distribution under that sampler (draws keyed by

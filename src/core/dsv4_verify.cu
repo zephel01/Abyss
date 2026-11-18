@@ -1717,6 +1717,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
         } else {
             norm_cols(il == l0_ ? nullptr : V->ffn, Ly.attn_norm, V->x, V->xq);
+            if (dfl_ != nullptr) dflash_capture(il, Rt(0), T, (size_t) 2 * E, false, s);   // (DFlash 2: the 27B's)
         }
         mark(0);
         if (Ly.recr) {

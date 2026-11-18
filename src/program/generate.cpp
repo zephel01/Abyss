@@ -2431,7 +2431,7 @@ static int glm_pack_generate(const Options& o) {
             const float d_thr = [&] {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_THR");
                 // (DFlash 2: its walk stopped at STRATA_Q4X_DFLASH_PMIN already - every draft it returns goes in)
-                return v != nullptr ? (float) std::atof(v) : model.dflash_on() ? 0.0f : model.q4x_mtp_on() ? 0.75f : model.q35_mtp_on() ? 0.5f : 0.6f;
+                return v != nullptr ? (float) std::atof(v) : model.dflash_on() && !model.q35_mtp_on() ? 0.0f : model.q4x_mtp_on() ? 0.75f : model.q35_mtp_on() ? 0.5f : 0.6f;
             }();
             static const int d_max = [] {   // STRATA_DS4_DSPARK_K: drafts a window at most (1..5)
                 const char* v = std::getenv("STRATA_DS4_DSPARK_K");
@@ -2467,7 +2467,52 @@ static int glm_pack_generate(const Options& o) {
                 const int def = strata::core::Glm5Model::kVerifyMax - 1;
                 return v != nullptr ? std::max(0, std::min(def, std::atoi(v))) : def;
             }();
-            const bool copy = copy_k > d_max && model.geometry().q35_dense() && model.q35_mtp_on() && !model.dflash_on();
+            const bool copy = copy_k > d_max && model.geometry().q35_dense() && (model.q35_mtp_on() || model.dflash_on());
+            // (DFlash 2 on the dense qwen35, 2026-11-18: STRATA_Q35_DFLASH=<z-lab's GGUF>) with the NextN block loaded too,
+            // a step's drafter is picked by their measured tokens a ms (drafting + verify time; the answer's first 16
+            // steps go to the NextN block, untimed) - see inc / trial / rho below.  DFlash 2's block holds up to dfl_max
+            // drafts (the GGUF's block_size - 1 = 7); its width is cut by the expected tokens a ms (each draft's walk
+            // confidence calibrated in dfl_cal_*, against the steps' measured times by columns; STRATA_Q35_DFLASH_CUT=0:
+            // all it returned).  Repeats (copy) go first as before
+            constexpr int kVerifyMaxDraft = strata::core::Glm5Model::kVerifyMax - 1;
+            const bool dfl_both = model.dflash_with_mtp() && model.geometry().q35_dense();
+            const bool dfl_dense = model.dflash_on() && model.geometry().q35_dense();
+            const int dfl_max = dfl_dense ? std::min(model.dflash_max(), strata::core::Glm5Model::kVerifyMax - 1) : 0;
+            static const bool dfl_cut = [] {
+                const char* v = std::getenv("STRATA_Q35_DFLASH_CUT");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            // STRATA_Q35_DFLASH_PICK: 0 the rates (default), 1 always DFlash 2, 2 always the NextN block (A/B)
+            static const int dfl_force = [] {
+                const char* v = std::getenv("STRATA_Q35_DFLASH_PICK");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            double dfl_pp[kVerifyMaxDraft];
+            for (double& x : dfl_pp) x = 0.8;
+            // DFlash 2's drafts kept by their walk's confidence (16 bins; prior: the confidence itself), the ones
+            // before them kept - what the width's cut reads a draft by
+            static double dfl_cal_h[16], dfl_cal_n[16];
+            static bool dfl_cal_init = false;
+            if (!dfl_cal_init) {
+                for (int b = 0; b < 16; ++b) {
+                    dfl_cal_h[b] = 4.0 * (b + 0.5) / 16.0;
+                    dfl_cal_n[b] = 4.0;
+                }
+                dfl_cal_init = true;
+            }
+            const auto dfl_bin = [](float p) { return std::max(0, std::min(15, (int) (p * 16.0f))); };
+            double dfl_rate = 0.0;
+            int64_t dfl_steps = 0, dfl_last = -1000, mtp_last = -1000, dfl_n = 0, mtp_n = 0, dfl_cut_n = 0;
+            int rate_cnt[3] = {0, 0, 0};
+            constexpr int kRateN = 16;
+            double rate_ring[3][kRateN][2] = {};
+            // the pick: an incumbent and, every 24 of its steps (64 when one is clearly ahead), a trial of the other for
+            // 8 steps - its tokens a ms against the incumbent's last 8 steps right before it (the same stretch of
+            // text, so the content's own difficulty cancels); rho, a running mean of log(DFlash 2 / NextN) over those
+            // pairs, names the incumbent
+            int inc = 2, trial = 0, trial_done = 0, inc_cnt = 0, rho_n = 0;
+            int64_t since_trial = 0;
+            double rho = 0.0, tr_t = 0.0, tr_m = 0.0, inc_ring[8][2] = {};
             const int rep_max = copy ? copy_k : d_max;
             constexpr int kNg = 16;   // (the repeat tables' positions: >= kVerifyMax - 1)
             NgramDrafter dr(spec_min);
@@ -2516,7 +2561,7 @@ static int glm_pack_generate(const Options& o) {
             sp.counter += 1;
             std::vector<int32_t> win;
             int64_t n_win = 0, n_one = 0, n_draft = 0, n_acc = 0;
-            int64_t n_k[6] = {0, 0, 0, 0, 0, 0};
+            int64_t n_k[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             double ms_win = 0.0, ms_one = 0.0, ms_dr = 0.0;
             const auto ms_since = [](std::chrono::steady_clock::time_point a) {
                 return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
@@ -2647,7 +2692,7 @@ static int glm_pack_generate(const Options& o) {
                     const double v = e / t_of(kk + 1);
                     if (v > best * 1.02) { best = v; bk = kk; }
                 }
-                const double base = std::max(mtp_rate, cw_n[1] > 0 ? 1.0 / cw[1] : 0.0);
+                const double base = std::max(std::max(mtp_rate, dfl_rate), cw_n[1] > 0 ? 1.0 / cw[1] : 0.0);
                 return best > base * 1.05 ? bk : 0;
             };
             // (v1.3.145) an answer's first 16 steps stay out of the cost table: right after a prompt the pool takes
@@ -2725,26 +2770,143 @@ static int glm_pack_generate(const Options& o) {
                 came.clear();
                 const auto td = std::chrono::steady_clock::now();
                 model.spec_sampling_set(nullptr);
-                if (!rep && room > 0 && model.dspark_ready()) {
-                    model.spec_sampling_set(ss_req ? &sp : nullptr);
+                // the step's drafter: 1 the NextN block (or DSpark / Flash-Next's DFlash 2), 2 the dense qwen35's DFlash 2
+                int use = 0, dret = 0;
+                if (!rep && model.dspark_ready()) {
+                    use = dfl_dense ? 2 : 1;
+                    if (dfl_both) {
+                        if (dfl_force == 1 || dfl_force == 2) {
+                            use = dfl_force == 1 ? 2 : 1;
+                        } else {
+                            ++dfl_steps;
+                            // (the answer's first 16 steps, untimed: the NextN block's, the cheaper drafter)
+                            use = 1;
+                            if (d_timed) {
+                                if (trial != 0 && trial_done >= 8) {   // (the trial's end: the pair into rho)
+                                    double it = 0.0, im = 0.0;
+                                    for (int i = 0; i < std::min(inc_cnt, 8); ++i) { it += inc_ring[i][0]; im += inc_ring[i][1]; }
+                                    if (it > 0.0 && im > 0.0 && tr_t > 0.0 && tr_m > 0.0) {
+                                        const double dd = (trial == 2 ? 1.0 : -1.0) * std::log((tr_t / tr_m) / (it / im));
+                                        rho = rho_n == 0 ? dd : 0.7 * rho + 0.3 * dd;
+                                        ++rho_n;
+                                    }
+                                    inc = rho >= 0.0 ? 2 : 1;
+                                    trial = 0;
+                                    since_trial = 0;
+                                    inc_cnt = 0;
+                                }
+                                if (trial == 0 && since_trial >= (rho_n == 0 ? 8 : std::fabs(rho) > 0.2 ? 64 : 24)) {
+                                    trial = inc == 1 ? 2 : 1;
+                                    trial_done = 0;
+                                    tr_t = tr_m = 0.0;
+                                }
+                                use = trial != 0 ? trial : inc;
+                            }
+                        }
+                        model.dfl_pick_ = use == 2;
+                        static const bool dfl_trace = std::getenv("STRATA_Q35_DFLASH_TRACE") != nullptr;
+                        if (dfl_trace)
+                            std::fprintf(stderr, "dfl pick %lld: %d timed %d rates %.3f(%d) / %.3f(%d) rho %.3f(%d) trial %d\n",
+                                         (long long) dfl_steps, use, (int) d_timed, dfl_rate, rate_cnt[2], mtp_rate,
+                                         rate_cnt[1], rho, rho_n, trial);
+                        (use == 2 ? dfl_last : mtp_last) = dfl_steps;
+                    }
+                }
+                const int room_s = use == 2 ? (int) std::min<int64_t>(dfl_max, o.max_context - p0 - 1) : room;
+                if (use != 0 && room_s > 0) {
+                    // (speculative sampling: the NextN block's drafts only - DFlash 2 has no full-vocabulary q)
+                    model.spec_sampling_set(ss_req && use == 1 ? &sp : nullptr);
                     if (!model.dspark_draft(tok, d, c, err)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
-                    if (d_chain > 0.0) {
-                        double pc = 1.0;
-                        while (k < room && (pc *= c[k]) >= d_chain) ++k;
+                    if (use == 2) {   // (its walk stopped at its threshold: every draft it returned)
+                        while (k < room_s && d[k] >= 0) ++k;
+                        dret = k;
+                        if (dfl_cut && k > 0 && cw_n[1] > 0) {   // (no single token measured yet: no cut)
+                            // the width of the most tokens a ms expected; the drafting is spent either way
+                            const auto t_of = [&](int c2) {
+                                if (cw_n[c2] > 0) return cw[c2];
+                                int m1 = 0, m2 = 0;
+                                for (int x = c2 - 1; x >= 1 && m2 == 0; --x)
+                                    if (cw_n[x] > 0) { if (m1 == 0) m1 = x; else m2 = x; }
+                                const double sl = m2 > 0 ? std::max(0.5, (cw[m1] - cw[m2]) / (double) (m1 - m2)) : 0.5;
+                                return cw[m1] + sl * (double) (c2 - m1);
+                            };
+                            double best = 1.0 / cw[1], e = 1.0, q = 1.0;
+                            int bk = 0;
+                            for (int kk = 1; kk <= k; ++kk) {
+                                const int b = dfl_bin(c[kk - 1]);
+                                q *= dfl_cal_h[b] / dfl_cal_n[b];
+                                e += q;
+                                const double v = e / t_of(kk + 1);
+                                if (v > best * (bk == 0 ? 1.0 : 1.02)) { best = v; bk = kk; }
+                            }
+                            // every 16th: a width measured fewer than 3 times
+                            if ((++dfl_cut_n & 15) == 0)
+                                for (int c2 = 2; c2 <= k + 1; ++c2)
+                                    if (cw_n[c2] < 3) { bk = c2 - 1; break; }
+                            k = bk;
+                        }
+                        ++dfl_n;
                     } else {
-                        while (k < room && c[k] >= d_thr) ++k;
+                        if (d_chain > 0.0) {
+                            double pc = 1.0;
+                            while (k < room_s && (pc *= c[k]) >= d_chain) ++k;
+                        } else {
+                            while (k < room_s && c[k] >= d_thr) ++k;
+                        }
+                        if (dfl_both) ++mtp_n;
                     }
-                    dk = room;
-                    if (d_cost) {
-                        double a[5];
-                        for (int i = 0; i < room; ++i) a[i] = cal_h[cal_bin(c[i])] / cal_n[cal_bin(c[i])];
-                        k = cost_pick(a, room, k);
+                    dk = use == 2 ? 0 : room_s;   // (DFlash 2's confidences stay out of the NextN calibration)
+                    if (d_cost && use != 2) {
+                        double a[8];
+                        for (int i = 0; i < room_s; ++i) a[i] = cal_h[cal_bin(c[i])] / cal_n[cal_bin(c[i])];
+                        k = cost_pick(a, room_s, k);
                     }
                     ms_dr += ms_since(td);
                 }
+                // DFlash 2's drafts against what the step produced: the share right a position
+                const auto dfl_learn = [&]() {
+                    for (int i = 0; i < dret && i < (int) came.size(); ++i) {
+                        const bool hit = came[(size_t) i] == d[i];
+                        dfl_pp[i] = 0.95 * dfl_pp[i] + 0.05 * (hit ? 1.0 : 0.0);
+                        const int b = dfl_bin(c[i]);
+                        dfl_cal_h[b] = 0.995 * dfl_cal_h[b] + (hit ? 1.0 : 0.0);
+                        dfl_cal_n[b] = 0.995 * dfl_cal_n[b] + 1.0;
+                        if (!hit) break;
+                    }
+                };
+                const auto rate_add = [&](double toks, double ms) {
+                    const double r = toks / ms;
+                    if (!dfl_both) {   // (copy's NextN rate alone: the running mean as before)
+                        double& x = use == 2 ? dfl_rate : mtp_rate;
+                        x = x > 0.0 ? 0.9 * x + 0.1 * r : r;
+                        return;
+                    }
+                    if (!d_timed) return;
+                    // its last 16 steps' tokens over their time; a re-measure starts it over, so the other drafter's value is
+                    // never older than its last trial (the content changes: prose, a list, code)
+                    double& x = use == 2 ? dfl_rate : mtp_rate;
+                    if (trial != 0 && use == trial) {
+                        tr_t += toks;
+                        tr_m += ms;
+                        ++trial_done;
+                    } else if (use == inc) {
+                        inc_ring[inc_cnt & 7][0] = toks;
+                        inc_ring[inc_cnt & 7][1] = ms;
+                        ++inc_cnt;
+                        ++since_trial;
+                    }
+                    auto& rg = rate_ring[use];
+                    rg[rate_cnt[use] % kRateN][0] = toks;
+                    rg[rate_cnt[use] % kRateN][1] = ms;
+                    ++rate_cnt[use];
+                    const int n = std::min(rate_cnt[use], kRateN);
+                    double tt = 0.0, tm = 0.0;
+                    for (int i = 0; i < n; ++i) { tt += rg[i][0]; tm += rg[i][1]; }
+                    x = tt / tm;
+                };
                 // the drafter's drafts against what the step produced: a draft reached (the ones before kept) and
                 // kept or not, in its confidence's bin
                 const auto cal_learn = [&]() {
@@ -2756,7 +2918,7 @@ static int glm_pack_generate(const Options& o) {
                         if (!hit) break;
                     }
                 };
-                if (!rep) ++n_k[k];
+                if (!rep) ++n_k[std::min(k, 7)];
                 const auto tw = std::chrono::steady_clock::now();
                 if (k == 0) {
                     ++n_one;
@@ -2777,11 +2939,12 @@ static int glm_pack_generate(const Options& o) {
                     came.push_back(tok);
                     ng_learn();
                     cal_learn();
+                    dfl_learn();
                     if (d_timed) cw_add(1, m1);
-                    if (copy && dk > 0 && d_timed) {   // (a drafter's step that kept no draft: one token)
-                        const double r = 1.0 / std::max(1e-3, ms_since(td));
-                        mtp_rate = mtp_rate > 0.0 ? 0.9 * mtp_rate + 0.1 * r : r;
-                    }
+                    // (a drafter's step that kept no draft: one token; with both drafters every step counts - the two
+                    // rates are compared, not set against the window table)
+                    if ((copy || dfl_both) && use != 0 && (d_timed || dfl_both))   // (rate_add: the timed ones)
+                        rate_add(1.0, std::max(1e-3, ms_since(td)));
                     continue;
                 }
                 win.assign(1, (int32_t) tok);
@@ -2842,11 +3005,10 @@ static int glm_pack_generate(const Options& o) {
                 model.spec_rewind(p0 + kept);
                 ng_learn();
                 cal_learn();
+                dfl_learn();
                 const double mw = ms_since(tw);
-                if (copy && !rep && d_timed) {   // (the drafter's step: its tokens over its drafting + window time)
-                    const double r = (double) came.size() / std::max(1e-3, ms_since(td));
-                    mtp_rate = mtp_rate > 0.0 ? 0.9 * mtp_rate + 0.1 * r : r;
-                }
+                if ((copy || dfl_both) && !rep && use != 0 && (d_timed || dfl_both))   // (its tokens over its drafting + window time)
+                    rate_add((double) came.size(), std::max(1e-3, ms_since(td)));
                 ms_win += mw;
                 if (d_timed) cw_add(k + 1, mw);
                 // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
@@ -2894,6 +3056,12 @@ static int glm_pack_generate(const Options& o) {
                              [&] { std::string r; char b[16]; for (int i = 0; i < rep_max; ++i) { std::snprintf(b, sizeof b, " %.2f", ng_tab[0][i]); r += b; } return r; }().c_str(),
                              [&] { std::string r; char b[16]; for (int i = 0; i < rep_max; ++i) { std::snprintf(b, sizeof b, " %.2f", ng_tab[1][i]); r += b; } return r; }().c_str(),
                              mtp_rate);
+            if (dfl_dense)
+                std::fprintf(stderr, "q35 dflash: up to %d drafts; %lld DFlash 2 steps, %lld NextN steps; rates %.3f / %.3f "
+                                     "tokens a ms; drafts kept 6 / 7: %lld %lld; shares right a position:%s\n",
+                             dfl_max, (long long) dfl_n, (long long) mtp_n, dfl_rate, mtp_rate, (long long) n_k[6],
+                             (long long) n_k[7],
+                             [&] { std::string r; char b[16]; for (int i = 0; i < dfl_max; ++i) { std::snprintf(b, sizeof b, " %.2f", dfl_pp[i]); r += b; } r += "; kept by confidence bin:"; for (int i = 0; i < 16; ++i) { std::snprintf(b, sizeof b, " %.2f", dfl_cal_h[i] / dfl_cal_n[i]); r += b; } return r; }().c_str());
             if (d_cost)
                 std::fprintf(stderr, "ds4 spec cost: ms a step by columns 1..6: %.1f %.1f %.1f %.1f %.1f %.1f (%d %d %d %d "
                                      "%d %d steps); the drafter's confidence bins kept: %.2f %.2f %.2f %.2f %.2f %.2f "
