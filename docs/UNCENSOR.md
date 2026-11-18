@@ -298,4 +298,5 @@ float32  embedding strength       ABL2 / ABL3
 ABL1 edits the attention and the shared expert's outputs (an abliteration's own edit); ABL2 edits every residual
 write; ABL3 is ABL2 with a scale a direction - a write w becomes w - s · Σ c_j q_j (q_jᵀ w), so a second direction
 (for example the medical / legal / financial advice refusals') can be taken out less than the first.  ABL1 and ABL2
-files load as before. A file whose `n_embd` differs from the model's is refused at start.
+files load as before; ABL3 needs v1.3.170 or later (an older engine refuses the file at start). A file whose
+`n_embd` differs from the model's is refused at start.
