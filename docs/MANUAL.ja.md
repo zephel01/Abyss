@@ -87,7 +87,11 @@ v1.3.142 からは 8 GB の GPU でも動く（8K）。8 GB 未満の GPU では
 のうち GPU にすべて載る最大のものを示し、既定は UD-Q4_K_XL のまま。NextN ブロックのないファイル（UD-IQ1_S、UD-IQ1_M、
 UD-IQ2_XXS、UD-IQ2_XS、UD-IQ2_S）では、unsloth の別ファイル（`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`、1.4 GB）も取ってくる。
 そのあと画像を使えるようにするかを聞く（unsloth の `mmproj-F16.gguf` 0.93 GB と `strata-vision` のビルド。
-`--no-vision` で飛ばす）。
+`--no-vision` で飛ばす）。v1.3.171 から、ファイル・コンテキスト・下書き役が NVIDIA の GPU 1 枚の VRAM に収まるとき
+（UD-Q4_K_XL なら 24 GB 以上）は、z-lab の DFlash 2 下書き役
+（[z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) の Q4_K_M、1.14 GB。Hugging Face の
+SHA-256 で確認）も取ってきて、設定に書く（`STRATA_Q35_DFLASH`）。`--no-dflash` で取らない（設定にあれば外す）。
+`--dflash` で小さい GPU でも入れる（[下書き役](#qwen38-27bdense)）。
 
 QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BETA。[Qwen3.5-9B QSA](#qwen35-9b-qsa)）は、ファイル全体を
 11 GB 以上の GPU 1 枚に載せる。その GPU で 128K までの文脈が動く（VRAM を 11 GB に制限して計測）。それより小さい GPU では
@@ -825,6 +829,29 @@ SwiGLU FFN（5120 → 17408）でエキスパートはなく、下書きは Next
 - **別ファイルの NextN ブロック。** blk.64 のないファイルは、横の `MTP/` にあるもの（unsloth の
   `mtp-Qwen3.8-27B-Q4_0.gguf`）を使います。`STRATA_GLM_MTP_GGUF=<ファイル>` でほかのものを指定でき（自分のブロックを
   持つファイルでも）、`STRATA_GLM_NO_MTP=1` で下書きしません。別ファイルのブロックも自分のブロックと同じくらい当たります（UD-Q4_K_XL: 133.0 対 133.4 tok/s、採用率 82% 対 83%）。下書きありの greedy の答えは下書きなしと同じです（`STRATA_DETERMINISTIC=1`、同じチャンクの大きさ）。
+- **DFlash 2 下書き役（v1.3.171）。** `STRATA_Q35_DFLASH=<ファイル>`（収まるときはセットアップが書く）で、z-lab の
+  [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) ブロック下書き役（対象の 6/20/34/48/62 層を
+  読む 5 層、Q4_K_M 1.14 GB、VRAM 約 1.4 GB）が NextN ブロックと並んで、1 ステップに最大 7 トークンを出します。
+  どちらで下書きするかはステップごとに実測の「トークン / ms」で決める（最初の 10 ステップは交互に試し、そのあとは
+  ときどきもう一方を試す）。DFlash 2 の本数は確信度と実測の窓の時間から削り、コピー下書きは従来どおり最優先。
+  答えが CJK の文章のあいだ（直近のピースの 3 分の 1 以上がかな・漢字）は NextN で下書きし、DFlash 2 は直近 256 行の
+  文脈だけを持ちます。下書きはすべて検証するので、出力は下書きなしと同じ（deterministic md5 が一致）。
+  RTX 5090、decode tok/s、3 回の中央値（ja / en / code / think: 128K コンテキスト、1,200 トークン。edit / swe-bench: 16K、512）:
+
+  | ファイル | ja | en | code | think | edit | swe-bench |
+  |---|---|---|---|---|---|---|
+  | L-Q4_0、v1.3.170 | 121.2 | 128.8 | 185.6 | 135.1 | 292.0 | 309.3 |
+  | L-Q4_0、DFlash 2 | 121.4 | 132.3 | **231.3** | **162.5** | 306.8 | 318.8 |
+  | UD-Q4_K_XL、v1.3.170 | 100.6 | 109.0 | 158.4 | 128.0 | 227.1 | 153.1 |
+  | UD-Q4_K_XL、DFlash 2 | 100.9 | 114.4 | **194.1** | **158.1** | 239.5 | **173.6** |
+
+  1 回の検証で進むトークン数: code 3.29 → 4.90（L-Q4_0）、3.47 → 5.15（UD-Q4_K_XL）。VRAM を 24 GB に制限した場合
+  （32K コンテキスト、512 トークン）: code 179.1 → 222.1 / 163.6 → 202.6、edit 290.9 → 307.1 / 229.0 → 240.5、日本語は同じ。
+  L-Q4_0 の短い英語の答えは −0.9%（132.2 → 131.0、3 回の中央値。そこでは DFlash 2 と NextN の差が数 % しかなく、
+  試すコストが出る）。ファイル全体と一緒に VRAM に
+  載る必要があります。FFN が収まらないとき（16 GB のカード: FFN がさらに 1.3 GB RAM へ押し出され −22〜−37%）は、
+  起動時にエンジンが外します（「dflash: dropped」。`STRATA_Q35_DFLASH_KEEP=1` で残す）。NVIDIA の GPU 1 枚のみ
+  （層の分割では使わない。AMD は未検証）。`STRATA_Q35_DFLASH_PICK=1` / `2`: 常に DFlash 2 / 常に NextN（比較用）。
 - **画像。** 設定に `vision` があれば（セットアップが書く）画像を読みます。OpenAI の `image_url`、Anthropic の `image`
   ブロックで渡します。画像の行はその 2 次元の格子の位置を取り（interleaved M-RoPE。区分は GGUF から読む）、画像のあとの
   文字はそこから続きます。画像 1 枚は 0.3〜0.6 秒ほど（225〜300 行）。 文字だけの要求は変わりません（前と同じトークン）。設定:
@@ -1148,6 +1175,9 @@ DGX Spark（v1.3.114）で生成が 21.0 → 22.8 tok/s になり、下書きの
 | `STRATA_DS4_DSPARK_K` | 5 | 1 回の窓の下書きの上限（1〜5） |
 | `STRATA_SPEC_SAMPLING` | オフ | （qwen35 / qwen35moe の NextN ドラフター：Qwen3.8-27B、9B の各モデル、Ornith）サンプリングの要求で投機的サンプリングを使う。ドラフターが下書きをサンプリングで引き、窓は各下書きを確率 min(1, p/q) で残し、外れたら max(0, p − q) から引き直す。出るトークンの分布は下書きなしと完全に同じで、残る下書きが増える。`1`: seed を指定しない要求、`2`: seed つきの要求（と CLI の `--seed`）も。この場合、同じ seed の答えは前と変わる。greedy には影響しない。RTX 5090、Qwen3.8-27B UD-Q4_K_XL、9 seed × 512 トークン：温度 1.0 で +1.5 / +2.5 / +1.8%（コード / 英語 / 日本語）、0.6 で −0.5%。NextN のドラフターでは効果が小さい。`STRATA_SPEC_SAMPLING_DTEMP=<f>`: ドラフターが温度の f 倍で引く（0.5 / 0.7 は良くならなかった） |
 | `STRATA_Q35_COPY_K` | 7 | （NextN の下書き役がある dense の qwen35: Qwen3.8-27B、Qwen3.5-9B、MiMo-9B）文の繰り返しから写す下書きの最大数。写す元は、直近 4 回の 3 トークン一致のうち最も長いもの、または直前 8 トークンの表。本数は実測の当たり率と窓の時間から決め、NextN より得なときだけ使います。`0` で v1.3.170 より前（最大 5）。RTX 5090、Qwen3.8-27B L-Q4_0: edit +22.7%、swe-bench +52.2%、文章 +3〜6%。出力は下書きなしと同じ |
+| `STRATA_Q35_DFLASH` | （収まるときはセットアップが書く） | Qwen3.8-27B: z-lab の DFlash 2 下書き役の GGUF（`Qwen3.8-27B-DFlash2-Q4_K_M.gguf`）。ステップごとに実測の「トークン / ms」で NextN ブロックと選び分ける。モデルの FFN が一緒に VRAM に収まらないときは起動時に外す。RTX 5090 L-Q4_0: code +24.6%、think +20.3%、日本語は同じ（[Qwen3.8-27B](#qwen38-27bdense)）。未設定: NextN ブロックだけ |
+| `STRATA_Q35_DFLASH_KEEP` | 0 | `1`: FFN が一緒に VRAM に収まらなくても DFlash 2 を残す（FFN の行が RAM に回る。16 GB のカードでは遅くなる） |
+| `STRATA_Q35_DFLASH_PICK` | 0 | `1`: 毎ステップ DFlash 2、`2`: 毎ステップ NextN（比較用）。0: 実測で選ぶ |
 | `STRATA_Q35_COPY_KEY8` | オン | （`STRATA_Q35_COPY_K` と一緒に）写す元を直前 8 トークンの表でも探す。`0` で 3 トークン一致だけ |
 | `STRATA_Q35_VERIFY_ROWS` | オン | （dense の qwen35 の検証窓）列ごとの正規化と SwiGLU を 1 回の起動でまとめて計算（値は同じ。Qwen3.8-27B の 8 列の窓で 28.1 → 24.9 ms）。`0` で列ごとに起動 |
 | `STRATA_DS4_DSPARK_CHAIN` | オフ | `<p>`: 1 つずつのしきい値の代わりに、確信度の積が p 以上の間の下書きを使う |

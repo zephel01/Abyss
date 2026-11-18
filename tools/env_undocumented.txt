@@ -215,10 +215,8 @@ STRATA_PROMPT_OWN_STATS  # src/prefill/moe_own.cu
 STRATA_PROMPT_OWN_TILE  # src/prefill/moe_own.cu
 STRATA_Q35_ATTN_CHUNK_MIN  # src/kernels/cuda/qwen35_fast.cu
 STRATA_Q35_DFLASH_CUT  # src/program/generate.cpp
-STRATA_Q35_DFLASH_KEEP  # src/core/qwen35_dense_ram.cu
 STRATA_Q35_DFLASH_LAZY  # src/core/dflash2.cu
 STRATA_Q35_DFLASH_MMQ  # src/core/dflash2.cu
-STRATA_Q35_DFLASH_PICK  # src/program/generate.cpp
 STRATA_Q35_DFLASH_TRACE  # src/program/generate.cpp
 STRATA_Q35_GDN_STEP  # src/core/qwen35_fast_path.cu
 STRATA_Q35_MTP_MIN  # src/core/qwen35_fast_path.cu

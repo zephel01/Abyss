@@ -90,7 +90,11 @@ to UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16); without it the setup names the largest o
 UD-Q6_K / Q8_0 that the GPU holds all in VRAM and keeps UD-Q4_K_XL as the default. For the files without the NextN
 block (UD-IQ1_S, UD-IQ1_M, UD-IQ2_XXS, UD-IQ2_XS, UD-IQ2_S) it also fetches unsloth's separate one
 (`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, 1.4 GB). It then asks whether to set up images (unsloth's `mmproj-F16.gguf`, 0.93 GB,
-and the `strata-vision` build; `--no-vision` skips it).
+and the `strata-vision` build; `--no-vision` skips it). From v1.3.171, where the file, its context and the drafter fit
+in one NVIDIA GPU's VRAM (UD-Q4_K_XL: a 24 GB+ GPU), it also fetches z-lab's DFlash 2 drafter
+([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) Q4_K_M, 1.14 GB, checked
+against Hugging Face's SHA-256) and names it in the config (`STRATA_Q35_DFLASH`); `--no-dflash` skips it (or takes it
+out of a config), `--dflash` sets it up on a smaller GPU too ([the drafter](#qwen38-27b-dense)).
 
 Qwen3.5-9B QSA, a small dense model with a QSA indexer (zephel01's, BETA; [Qwen3.5-9B QSA](#qwen35-9b-qsa)): the whole
 file goes on one GPU of 11 GB or more, which holds a context up to 128K (measured with the VRAM capped at 11 GB). The setup
@@ -879,6 +883,29 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
 - **The separate NextN block.** A file without blk.64 takes the one in `MTP/` beside it (unsloth's
   `mtp-Qwen3.8-27B-Q4_0.gguf`); `STRATA_GLM_MTP_GGUF=<file>` names another (also for a file that has its own),
   `STRATA_GLM_NO_MTP=1` drafts nothing. The separate block drafts as well as a file's own (UD-Q4_K_XL: 133.0 vs 133.4 tok/s, 82% vs 83% accepted), and greedy answers with drafts equal the ones without (`STRATA_DETERMINISTIC=1`, same chunk size).
+- **DFlash 2 drafter (v1.3.171).** With `STRATA_Q35_DFLASH=<file>` (the setup writes it where it fits) z-lab's
+  [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) block drafter (5 layers over the target's
+  layers 6/20/34/48/62, Q4_K_M 1.14 GB, ~1.4 GB of VRAM) proposes up to 7 tokens a step beside the NextN block; each step
+  takes the drafter of the higher measured tokens a ms (10 steps taking turns at the start, then trials of the other one),
+  DFlash 2's width is cut by its confidences against the measured window times, and copy drafts still go first. While
+  the answer is CJK prose (a third of its recent pieces kana / ideographs) the NextN block drafts and DFlash 2 keeps only
+  its newest 256 context rows. Every draft is verified: the output is the one without drafts (deterministic md5 equal).
+  RTX 5090, decode tok/s, median of 3 (ja / en / code / think: 128K context, 1,200 tokens; edit / swe-bench: 16K, 512):
+
+  | file | ja | en | code | think | edit | swe-bench |
+  |---|---|---|---|---|---|---|
+  | L-Q4_0, v1.3.170 | 121.2 | 128.8 | 185.6 | 135.1 | 292.0 | 309.3 |
+  | L-Q4_0, DFlash 2 | 121.4 | 132.3 | **231.3** | **162.5** | 306.8 | 318.8 |
+  | UD-Q4_K_XL, v1.3.170 | 100.6 | 109.0 | 158.4 | 128.0 | 227.1 | 153.1 |
+  | UD-Q4_K_XL, DFlash 2 | 100.9 | 114.4 | **194.1** | **158.1** | 239.5 | **173.6** |
+
+  Tokens a verify step: code 3.29 -> 4.90 (L-Q4_0), 3.47 -> 5.15 (UD-Q4_K_XL). VRAM capped at 24 GB (32K context, 512
+  tokens): code 179.1 -> 222.1 / 163.6 -> 202.6, edit 290.9 -> 307.1 / 229.0 -> 240.5, Japanese the same; short English
+  answers on L-Q4_0 -0.9% (132.2 -> 131.0, median of 3: DFlash 2 and the NextN block are within a few % there, and the
+  trials cost). It needs the whole file in VRAM beside
+  it: when the FFN would not fit (a 16 GB card: its rows would push 1.3 GB more FFN to RAM, -22 to -37%) the engine drops
+  it at the start ("dflash: dropped"; `STRATA_Q35_DFLASH_KEEP=1` keeps it). One NVIDIA GPU (not with a layer split; AMD
+  untested). `STRATA_Q35_DFLASH_PICK=1` / `2`: always DFlash 2 / always the NextN block (A/B).
 - **Images.** With the `vision` entry (the setup writes it) the model reads pictures: OpenAI `image_url` items and
   Anthropic `image` blocks; the picture's rows take their 2-D grid positions (interleaved M-RoPE, the sections from
   the GGUF) and the text after them continues from there. A picture takes about 0.3-0.6 s (225-300 rows). Text-only requests are unchanged (the same tokens
@@ -1209,6 +1236,9 @@ the windows, the drafts and the acceptance, and the tokens a step.
 | `STRATA_DS4_DSPARK_K` | 5 | drafts a window at most (1-5) |
 | `STRATA_SPEC_SAMPLING` | off | (qwen35 / qwen35moe NextN drafter: Qwen3.8-27B, the 9B models, Ornith) speculative sampling for sampled requests: the drafter samples its drafts and the window keeps each with probability min(1, p/q), else draws from max(0, p - q) - the tokens are distributed exactly as without drafts, and more drafts stay. `1`: requests without a seed; `2`: seeded ones (and the CLI's `--seed`) too, whose answer for a seed then changes. Greedy is never affected. RTX 5090, Qwen3.8-27B UD-Q4_K_XL, 9 seeds x 512 tokens: temperature 1.0 +1.5 / +2.5 / +1.8% (code / English / Japanese), 0.6 -0.5% - small with the NextN drafter. `STRATA_SPEC_SAMPLING_DTEMP=<f>`: the drafter draws at f x the temperature (0.5 / 0.7 measured no better) |
 | `STRATA_Q35_COPY_K` | 7 | (dense qwen35 with a NextN drafter: Qwen3.8-27B, Qwen3.5-9B, MiMo-9B) the most tokens a window copies from where the text repeats (the longest of the last 4 three-token matches, or the 8-token key table); the count is chosen from the measured hit rate and window time, and a copy window runs only when it beats the NextN rate. `0` = as before v1.3.170 (up to 5). RTX 5090, Qwen3.8-27B L-Q4_0: edit +22.7%, swe-bench +52.2%, prose +3-6%; outputs as without drafts |
+| `STRATA_Q35_DFLASH` | (the setup writes it where it fits) | Qwen3.8-27B: z-lab's DFlash 2 drafter GGUF (`Qwen3.8-27B-DFlash2-Q4_K_M.gguf`), picked step by step against the NextN block by measured tokens a ms; dropped at the start when the model's FFN would not all fit in VRAM beside it. RTX 5090 L-Q4_0: code +24.6%, think +20.3%, Japanese the same ([Qwen3.8-27B](#qwen38-27b-dense)). Unset: the NextN block alone |
+| `STRATA_Q35_DFLASH_KEEP` | 0 | `1`: keep the DFlash 2 drafter when the FFN does not all fit in VRAM beside it (FFN rows go to RAM: slower on a 16 GB card) |
+| `STRATA_Q35_DFLASH_PICK` | 0 | `1`: DFlash 2 drafts every step; `2`: the NextN block every step (A/B); 0: the measured pick |
 | `STRATA_Q35_COPY_KEY8` | on | (with `STRATA_Q35_COPY_K`) also look up the last 8 tokens in a key table for the copy source; `0` = only the three-token matches |
 | `STRATA_Q35_VERIFY_ROWS` | on | (dense qwen35 verify window) the columns' norms and SwiGLU in one launch over the columns (the same values; an 8-column window 28.1 -> 24.9 ms on Qwen3.8-27B); `0` = a launch a column |
 | `STRATA_DS4_DSPARK_CHAIN` | off | `<p>`: keep drafts while the product of their confidences stays >= p, instead of each one >= the threshold |

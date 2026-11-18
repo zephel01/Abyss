@@ -7,6 +7,39 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.171 - (draft)
+
+Qwen3.8-27B: z-lab's DFlash 2 block drafter beside the NextN block, on by default where it fits in VRAM (code +22-25%,
+reasoning +20-24% at 128K, Japanese prose unchanged); the setup fetches it. Greedy and seeded outputs are as in
+v1.3.170 (deterministic md5 equal to no drafts; the regression configs unchanged).
+
+- DFlash 2 on the dense qwen35 path: `src/core/dflash2.cu` (written for Qwen3.8-Flash-Next) now also runs z-lab's
+  [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) (5 layers over the target's layers
+  6/20/34/48/62, Q4_K / Q6_K weights, up to 7 drafts a step) with `STRATA_Q35_DFLASH=<file>`. Its products run on
+  MMQ (3.9 -> 2.2 ms a draft on an RTX 5090); ~1.4 GB of VRAM.
+  Each step takes the drafter of the higher measured tokens a ms: 10 steps taking turns at the start, then the other
+  one tried for 8 steps against the incumbent's 8 steps before (the same stretch of text), less often after a clear
+  loss. DFlash 2's width is cut by its walk confidences (calibrated as it runs) against the measured window times.
+  Copy drafts still go first. While the answer is CJK prose (a third of its recent pieces kana / ideographs, from the
+  drafter's vocab) the NextN block drafts and DFlash 2 keeps only its newest 256 context rows (it lost 2.7-3.6% on
+  Japanese prose before); its context rows are committed in one pass when it drafts, not a pass a step.
+  RTX 5090, decode tok/s, median of 3, v1.3.170 -> v1.3.171 (ja / en / code / think: 128K context, 1,200 tokens;
+  edit / swe-bench: 16K, 512 tokens):
+  L-Q4_0: ja 121.2 -> 121.4, en 128.8 -> 132.3 (+2.7%), code 185.6 -> 231.3 (+24.6%), think 135.1 -> 162.5 (+20.3%),
+  edit 292.0 -> 306.8 (+5.0%), swe-bench 309.3 -> 318.8 (+3.1%);
+  UD-Q4_K_XL: ja 100.6 -> 100.9, en 109.0 -> 114.4 (+4.9%), code 158.4 -> 194.1 (+22.5%), think 128.0 -> 158.1 (+23.5%),
+  edit 227.1 -> 239.5 (+5.5%), swe-bench 153.1 -> 173.6 (+13.4%).
+  Tokens a verify step on code 3.29 -> 4.90 / 3.47 -> 5.15. VRAM peak +1.4 GB (128K: 25.9 -> 27.3 GB on L-Q4_0).
+  VRAM capped at 24 GB (32K, 512 tokens, L-Q4_0 / UD-Q4_K_XL): code 179.1 -> 222.1 / 163.6 -> 202.6, edit 290.9 -> 307.1
+  / 229.0 -> 240.5, Japanese the same; short English answers on L-Q4_0 -0.9% (132.2 -> 131.0, median of 3).
+  Capped at 16 GB the drafter is dropped: the same output as v1.3.170, the same speed (-1.5 to +1.4%, one run each).
+  It needs the model's FFN all in VRAM beside it: otherwise (a 16 GB card) the engine drops it at the start
+  ("dflash: dropped"; `STRATA_Q35_DFLASH_KEEP=1` keeps it). One NVIDIA GPU; AMD not measured.
+- Setup: `./setup-deepseek.sh --model qwen38-27b` downloads the drafter (Q4_K_M, 1.14 GB, pinned to the measured commit,
+  checked against Hugging Face's SHA-256) and names it in the config where the file, its context and the drafter fit
+  in one NVIDIA GPU's VRAM (UD-Q4_K_XL: a 24 GB+ GPU). `--no-dflash` skips it (and takes it out of a config),
+  `--dflash` sets it up on a smaller GPU too.
+
 ## v1.3.170 - 2026-11-18
 
 QSA on AMD (issue #51), MiMo-V2.6-Distill-Qwen-9B QSA in the setup, long copy drafts on Qwen3.8-27B (edit +23%, swe-bench
