@@ -2516,6 +2516,12 @@ static int glm_pack_generate(const Options& o) {
             // ideographs: Japanese prose, where DFlash 2 lost 2.7-3.6% on Qwen3.8-27B and its trials still ~1%) the
             // NextN block drafts and nothing is tried
             int inc = 2, trial = 0, trial_done = 0, inc_cnt = 0, rho_n = 0, back = 0;
+            // the start: 10 steps taking turns (DFlash 2 first, its first step not measured), then rho from them
+            int ini_left = 10, ini_d = 0;
+            bool ini_step = false;
+            double ini[3][2] = {};
+            // a loss's size backs off the other's next trial: -0.1 one step (x2 the wait), -0.2 two, -0.3 three
+            const auto back_of = [](double l) { return l > -0.1 ? 0 : l > -0.2 ? 1 : l > -0.3 ? 2 : 3; };
             double cjk_sh = 0.0;   // (the share of CJK pieces among the steps' tokens: the mean of the first 16, then of weight 1/16)
             int64_t since_trial = 0;
             double rho = 0.0, tr_t = 0.0, tr_m = 0.0, inc_ring[8][2] = {};
@@ -2801,17 +2807,39 @@ static int glm_pack_generate(const Options& o) {
                                     }
                                     const int was = inc;
                                     inc = rho >= 0.0 ? 2 : 1;
-                                    back = inc != was || cl > -0.1 ? 0 : std::min(back + 1, 4);
+                                    back = inc != was || cl > -0.1 ? 0 : std::min(back + back_of(cl), 4);
                                     trial = 0;
                                     since_trial = 0;
                                     inc_cnt = 0;
                                 }
-                                if (trial == 0 && since_trial >= (rho_n == 0 ? 8 : 24 << back)) {
+                                ini_step = false;
+                                if (ini_left == 0 && rho_n == 0) {   // (the turns' end: their ratio names the incumbent)
+                                    if (ini[1][0] > 0.0 && ini[1][1] > 0.0 && ini[2][0] > 0.0 && ini[2][1] > 0.0) {
+                                        rho = std::log((ini[2][0] / ini[2][1]) / (ini[1][0] / ini[1][1]));
+                                        rho_n = 1;
+                                    }
+                                    inc = rho >= 0.0 ? 2 : 1;
+                                    back = back_of(-std::fabs(rho));
+                                    since_trial = 0;
+                                    inc_cnt = 0;
+                                    if (rho_n == 0) ini_left = -1;   // (nothing measured: the trials as before)
+                                }
+                                if (ini_left > 0 && cjk_sh <= 0.33) {
+                                    use = (ini_left & 1) == 0 ? 2 : 1;
+                                    --ini_left;
+                                    ini_step = true;
+                                } else if (trial == 0 && rho_n > 0 && since_trial >= (24 << back)) {
                                     trial = inc == 1 ? 2 : 1;
                                     trial_done = 0;
                                     tr_t = tr_m = 0.0;
                                 }
-                                use = trial != 0 ? trial : inc;
+                                if (!ini_step) use = trial != 0 ? trial : inc;
+                                if (ini_left < 0 && trial == 0 && rho_n == 0 && since_trial >= 8) {
+                                    trial = inc == 1 ? 2 : 1;
+                                    trial_done = 0;
+                                    tr_t = tr_m = 0.0;
+                                    use = trial;
+                                }
                                 if (cjk_sh > 0.33) {   // (CJK prose: the NextN block, no trials; the pick resumes after)
                                     use = 1;
                                     trial = 0;
@@ -2820,6 +2848,7 @@ static int glm_pack_generate(const Options& o) {
                             }
                         }
                         model.dfl_pick_ = use == 2;
+                        model.dfl_thin_ = cjk_sh > 0.33 && dfl_force == 0;
                         static const bool dfl_trace = std::getenv("STRATA_Q35_DFLASH_TRACE") != nullptr;
                         if (dfl_trace)
                             std::fprintf(stderr, "dfl pick %lld: %d timed %d rates %.3f(%d) / %.3f(%d) rho %.3f(%d) trial %d cjk %.2f\n",
@@ -2839,17 +2868,25 @@ static int glm_pack_generate(const Options& o) {
                     if (use == 2) {   // (its walk stopped at its threshold: every draft it returned)
                         while (k < room_s && d[k] >= 0) ++k;
                         dret = k;
-                        if (dfl_cut && k > 0 && cw_n[1] > 0) {   // (no single token measured yet: no cut)
-                            // the width of the most tokens a ms expected; the drafting is spent either way
+                        int any_w = 0;
+                        for (int c2 = 1; c2 <= 16 && any_w == 0; ++c2)
+                            if (cw_n[c2] > 0) any_w = c2;
+                        if (dfl_cut && k > 0 && any_w > 0) {   // (no window measured yet: no cut)
+                            // the width of the most tokens a ms expected; the drafting is spent either way.  An
+                            // unmeasured width: from the nearest measured ones (below it, else above it), 0.5 ms a
+                            // column at least
                             const auto t_of = [&](int c2) {
                                 if (cw_n[c2] > 0) return cw[c2];
                                 int m1 = 0, m2 = 0;
                                 for (int x = c2 - 1; x >= 1 && m2 == 0; --x)
                                     if (cw_n[x] > 0) { if (m1 == 0) m1 = x; else m2 = x; }
+                                if (m1 == 0)
+                                    for (int x = c2 + 1; x <= 16 && m2 == 0; ++x)
+                                        if (cw_n[x] > 0) { if (m1 == 0) m1 = x; else m2 = x; }
                                 const double sl = m2 > 0 ? std::max(0.5, (cw[m1] - cw[m2]) / (double) (m1 - m2)) : 0.5;
-                                return cw[m1] + sl * (double) (c2 - m1);
+                                return std::max(0.5 * cw[m1], cw[m1] + sl * (double) (c2 - m1));
                             };
-                            double best = 1.0 / cw[1], e = 1.0, q = 1.0;
+                            double best = 1.0 / t_of(1), e = 1.0, q = 1.0;
                             int bk = 0;
                             for (int kk = 1; kk <= k; ++kk) {
                                 const int b = dfl_bin(c[kk - 1]);
@@ -2858,9 +2895,9 @@ static int glm_pack_generate(const Options& o) {
                                 const double v = e / t_of(kk + 1);
                                 if (v > best * (bk == 0 ? 1.0 : 1.02)) { best = v; bk = kk; }
                             }
-                            // every 16th: a width measured fewer than 3 times
+                            // every 16th: a width measured fewer than 3 times (the single token's too)
                             if ((++dfl_cut_n & 15) == 0)
-                                for (int c2 = 2; c2 <= k + 1; ++c2)
+                                for (int c2 = 1; c2 <= k + 1; ++c2)
                                     if (cw_n[c2] < 3) { bk = c2 - 1; break; }
                             k = bk;
                         }
@@ -2904,7 +2941,12 @@ static int glm_pack_generate(const Options& o) {
                     // its last 16 steps' tokens over their time; a re-measure starts it over, so the other drafter's value is
                     // never older than its last trial (the content changes: prose, a list, code)
                     double& x = use == 2 ? dfl_rate : mtp_rate;
-                    if (trial != 0 && use == trial) {   // (its first step left out: the waiting rows' commit, a cold start)
+                    if (ini_step) {   // (the start's turns; DFlash 2's first step left out)
+                        if (use == 1 || ini_d++ > 0) {
+                            ini[use][0] += toks;
+                            ini[use][1] += ms;
+                        }
+                    } else if (trial != 0 && use == trial) {   // (its first step left out: the waiting rows' commit, a cold start)
                         if (trial_done > 0) {
                             tr_t += toks;
                             tr_m += ms;

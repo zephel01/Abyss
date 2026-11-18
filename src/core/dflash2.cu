@@ -105,7 +105,7 @@ struct DflState {
     // block drafting nearly every step)
     float* pend = nullptr;
     std::vector<uint8_t> cjk;   // (the dense target's vocab: 1 a piece with kana / CJK ideographs / CJK punctuation)
-    int pend_n = 0;
+    int pend_n = 0, pend_h = 0, pend_off = 0;   // (a ring: pend_h its oldest row; pend_off the commit's first row)
     int64_t pend_p0 = 0;
     bool from_pend = false;
     float *gpre = nullptr, *gv = nullptr, *kk = nullptr, *vv = nullptr;   // the commit's pass
@@ -1048,7 +1048,7 @@ void Glm5Model::dflash_forget() {
     auto* D = (DflState*) dfl_;
     if (D == nullptr) return;
     D->win_p0 = -1;
-    D->pend_n = 0;
+    D->pend_n = D->pend_h = 0;
     D->ctx_lo = D->ctx_end = pos_;
 }
 
@@ -1083,22 +1083,43 @@ bool Glm5Model::dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
     if (D->pend != nullptr && !D->from_pend) {
         if (prompt) {   // (the rows before the chunk's first)
             if (!dflash_flush(s)) return false;
-        } else {        // (the step's rows behind the waiting ones; a gap or a full buffer commits those first)
-            if (D->pend_n > 0 && (p0 != D->pend_p0 + D->pend_n || D->pend_n + n > kCh) && !dflash_flush(s)) return false;
-            if (n <= kCh) {
-                if (D->pend_n == 0) D->pend_p0 = p0;
-                cudaMemcpyAsync(D->pend + (size_t) D->pend_n * FE, D->feat, (size_t) n * FE * sizeof(float),
-                                cudaMemcpyDeviceToDevice, s);
-                D->pend_n += n;
-                return true;
+        } else if (n <= kCh) {
+            // the step's rows behind the waiting ones; a gap or a full buffer commits those first - or, while the
+            // decode thins the feed (dfl_thin_: CJK prose, the NextN block drafting), a gap drops them and a full
+            // buffer its oldest rows, so the rows kept are the newest kCh (a context that starts over from them)
+            if (D->pend_n > 0 && p0 != D->pend_p0 + D->pend_n) {
+                if (dfl_thin_) D->pend_n = D->pend_h = 0;
+                else if (!dflash_flush(s)) return false;
             }
+            if (D->pend_n + n > kCh) {
+                if (!dfl_thin_) {
+                    if (!dflash_flush(s)) return false;
+                } else {
+                    const int drop = D->pend_n + n - kCh;
+                    D->pend_h = (D->pend_h + drop) % kCh;
+                    D->pend_p0 += drop;
+                    D->pend_n -= drop;
+                }
+            }
+            if (D->pend_n == 0) {
+                D->pend_p0 = p0;
+                D->pend_h = 0;
+            }
+            for (int i = 0; i < n;) {   // (at most two pieces: the ring's end, its start)
+                const int at = (D->pend_h + D->pend_n + i) % kCh, m = std::min(n - i, kCh - at);
+                cudaMemcpyAsync(D->pend + (size_t) at * FE, D->feat + (size_t) i * FE, (size_t) m * FE * sizeof(float),
+                                cudaMemcpyDeviceToDevice, s);
+                i += m;
+            }
+            D->pend_n += n;
+            return true;
         }
     }
     if (n > kRing) {
         p0 += n - kRing;
         n = kRing;
     }
-    const float* feat = D->from_pend ? D->pend : prompt ? D->feat_p : D->feat;
+    const float* feat = D->from_pend ? D->pend + (size_t) D->pend_off * FE : prompt ? D->feat_p : D->feat;
     for (int c0 = 0; c0 < n; c0 += kCh) {
         const int m = std::min(kCh, n - c0);
         const float* fr = feat + (size_t) c0 * FE;
@@ -1139,10 +1160,13 @@ bool Glm5Model::dflash_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
 bool Glm5Model::dflash_flush(cudaStream_t s) {
     auto* D = (DflState*) dfl_;
     if (D == nullptr || D->pend_n == 0) return true;
-    const int n = D->pend_n;
-    D->pend_n = 0;
+    const int n = D->pend_n, h = D->pend_h, m = std::min(n, kCh - h);   // (the ring's end, then its start)
+    D->pend_n = D->pend_h = 0;
     D->from_pend = true;
-    const bool ok = dflash_commit(D->pend_p0, n, false, s);
+    D->pend_off = h;
+    bool ok = dflash_commit(D->pend_p0, m, false, s);
+    D->pend_off = 0;
+    if (ok && n > m) ok = dflash_commit(D->pend_p0 + m, n - m, false, s);
     D->from_pend = false;
     return ok;
 }

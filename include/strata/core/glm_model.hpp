@@ -912,6 +912,7 @@ public:
     // the dense qwen35 with both drafters (DFlash 2 and its NextN block): dspark_draft runs DFlash 2 while this is set,
     // the NextN chain otherwise (the decode picks a step's drafter by their measured rates)
     bool dfl_pick_ = true;
+    bool dfl_thin_ = false;   // (the decode: DFlash 2 not drafting for a while - keep its newest context rows, commit none)
     bool dflash_with_mtp() const { return dfl_ != nullptr && q35_mtp_on(); }
     bool dflash_cjk(int32_t t) const;   // (a piece with kana / CJK ideographs, from the drafter's vocab)
     int dflash_max() const;   // (drafts a step at most: the GGUF's block_size - 1, or STRATA_Q35_DFLASH_N)
