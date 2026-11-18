@@ -3316,12 +3316,21 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
             V->samp_ok = false;
             cudaSetDevice(tail->dev_);
             FastState* TF = tail->fast_;
-            if (TF->zero_copy) {
-                strata::kernels::sample_tokens(V->logits, V->T, (int) g_.n_vocab, nullptr, 0, sp, V->tok_hd + 32, TF->cs);
+            // speculative sampling (spec_sampling_set, this part alone): the same draws, and each column's kept list (p)
+            const bool dist = ss_on_ && ss_drafted_ && tail == this;
+            ss_win_ok_ = false;
+            int* picks = TF->zero_copy ? V->tok_hd + 32 : V->tok + 32;
+            if (dist) {
+                namespace kn = strata::kernels;
+                kn::sample_tokens_dist(V->logits, V->T, (int) g_.n_vocab, sp, picks, ss_p_ids_d_, ss_p_p_d_, ss_p_n_d_, TF->cs);
+                cudaMemcpyAsync(ss_p_n_h_, ss_p_n_d_, (size_t) V->T * sizeof(int), cudaMemcpyDeviceToHost, TF->cs);
+                cudaMemcpyAsync(ss_p_ids_h_, ss_p_ids_d_, (size_t) V->T * kn::kDistMax * sizeof(int), cudaMemcpyDeviceToHost, TF->cs);
+                cudaMemcpyAsync(ss_p_p_h_, ss_p_p_d_, (size_t) V->T * kn::kDistMax * sizeof(float), cudaMemcpyDeviceToHost, TF->cs);
             } else {
-                strata::kernels::sample_tokens(V->logits, V->T, (int) g_.n_vocab, nullptr, 0, sp, V->tok + 32, TF->cs);
-                cudaMemcpyAsync(V->tok_h + 32, V->tok + 32, (size_t) V->T * sizeof(int), cudaMemcpyDeviceToHost, TF->cs);
+                strata::kernels::sample_tokens(V->logits, V->T, (int) g_.n_vocab, nullptr, 0, sp, picks, TF->cs);
             }
+            if (!TF->zero_copy)
+                cudaMemcpyAsync(V->tok_h + 32, V->tok + 32, (size_t) V->T * sizeof(int), cudaMemcpyDeviceToHost, TF->cs);
             const bool ok = glmfast::cuda_ok(cudaStreamSynchronize(TF->cs), "glm sampler (window)", err) &&
                             TF->route_ok(err) && (!g_.v41 || tail->dsv41_engram_ok(err));
             cudaSetDevice(dev_);
@@ -3329,6 +3338,9 @@ int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::str
             V->samp_c0 = sp.counter;
             V->samp_gen = strata::kernels::bias_generation();
             V->samp_ok = true;
+            ss_win_ok_ = dist;
+            ss_win_c0_ = sp.counter;
+            ss_win_gen_ = V->samp_gen;
         }
         if (V->samp_ok && sp.counter == V->samp_c0 + (uint64_t) i &&
             V->samp_gen == strata::kernels::bias_generation()) {   // (else: drawn before the bias set changed)

@@ -22,6 +22,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/rope.hpp"
+#include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/mrope.hpp"
 
 #include "strata/qtypes.hpp"
@@ -1143,8 +1144,83 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     } else if (!gf::mv(&o, 1, s)) { err = "qwen35 mtp: the head"; return false; }
     gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
+    if (ss_on_ && ss_k_ < 5) {
+        // speculative sampling: the draft is drawn from the drafter's distribution under the request's sampler (the
+        // confidence above stays the argmax's: the window's size follows the same rule as before), and its kept list
+        // is q.  Philox under another key than the target's columns (the same counter would correlate the draws)
+        strata::kernels::SamplerParams d = ss_sp_;
+        d.seed = ss_sp_.seed ^ 0xD6E8FEB86659FD93ull;
+        d.counter = ss_sp_.counter + (uint64_t) ss_k_;
+        // STRATA_SPEC_SAMPLING_DTEMP=<f>: the drafter draws at f x the request's temperature (any q keeps the answer's
+        // distribution - the accept test uses the q drawn from - but a sharper q keeps more when the drafter is less
+        // sure than the target)
+        static const float dtemp = [] {
+            const char* v = getenv("STRATA_SPEC_SAMPLING_DTEMP");
+            const float f = v != nullptr ? (float) std::atof(v) : 1.0f;
+            return f > 0.0f && f <= 4.0f ? f : 1.0f;
+        }();
+        d.temperature = ss_sp_.temperature * dtemp;
+        strata::kernels::sample_tokens_dist(F->mtp_logits, 1, (int) g.n_vocab, d, F->mtp_tok,
+                                            ss_q_ids_d_ + (size_t) ss_k_ * strata::kernels::kDistMax,
+                                            ss_q_p_d_ + (size_t) ss_k_ * strata::kernels::kDistMax, ss_q_n_d_ + ss_k_, s);
+        ++ss_k_;
+    }
     cudaMemcpyAsync(tok_out, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToDevice, s);
     return true;
+}
+
+bool Glm5Model::ss_alloc() {
+    if (ss_q_ids_d_ != nullptr) return true;
+    const size_t qn = 5, pn = 32, w = strata::kernels::kDistMax;
+    if (cudaMalloc((void**) &ss_q_ids_d_, qn * w * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void**) &ss_q_p_d_, qn * w * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &ss_q_n_d_, qn * sizeof(int)) != cudaSuccess ||
+        cudaMallocHost((void**) &ss_q_ids_h_, qn * w * sizeof(int)) != cudaSuccess ||
+        cudaMallocHost((void**) &ss_q_p_h_, qn * w * sizeof(float)) != cudaSuccess ||
+        cudaMallocHost((void**) &ss_q_n_h_, qn * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void**) &ss_p_ids_d_, pn * w * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void**) &ss_p_p_d_, pn * w * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &ss_p_n_d_, pn * sizeof(int)) != cudaSuccess ||
+        cudaMallocHost((void**) &ss_p_ids_h_, pn * w * sizeof(int)) != cudaSuccess ||
+        cudaMallocHost((void**) &ss_p_p_h_, pn * w * sizeof(float)) != cudaSuccess ||
+        cudaMallocHost((void**) &ss_p_n_h_, pn * sizeof(int)) != cudaSuccess) {
+        cudaGetLastError();
+        ss_q_ids_d_ = nullptr;   // (what did allocate stays: a few KB)
+        return false;
+    }
+    return true;
+}
+
+void Glm5Model::spec_sampling_set(const strata::kernels::SamplerParams* sp) {
+    ss_drafted_ = false;
+    ss_win_ok_ = false;
+    // qwen35 / qwen35moe's own NextN block on one part, a sampled request (not qwen4exp's layer, not GLM's block)
+    const bool can = sp != nullptr && !sp->greedy && sp->temperature > 0.0f && g_.qwen35() && !g_.q4x &&
+                     dsp_ == nullptr && dfl_ == nullptr && next_port_ == nullptr && split_next_ == nullptr &&
+                     q35_mtp_on();
+    if (can && ss_alloc()) {
+        ss_sp_ = *sp;
+        ss_on_ = true;
+    } else {
+        ss_on_ = false;
+    }
+}
+
+bool Glm5Model::draft_dist(int k, const int*& ids, const float*& p, int& n) const {
+    if (!ss_drafted_ || k < 0 || k >= ss_k_) return false;
+    ids = ss_q_ids_h_ + (size_t) k * strata::kernels::kDistMax;
+    p = ss_q_p_h_ + (size_t) k * strata::kernels::kDistMax;
+    n = ss_q_n_h_[k];
+    return n > 0 && n <= strata::kernels::kDistMax;
+}
+
+bool Glm5Model::window_dist(int i, const int*& ids, const float*& p, int& n) const {
+    // (a bias set switched on since the window's draws - the reasoning closed inside it: its lists are stale)
+    if (!ss_win_ok_ || i < 0 || i >= 32 || ss_win_gen_ != strata::kernels::bias_generation()) return false;
+    ids = ss_p_ids_h_ + (size_t) i * strata::kernels::kDistMax;
+    p = ss_p_p_h_ + (size_t) i * strata::kernels::kDistMax;
+    n = ss_p_n_h_[i];
+    return n > 0 && n <= strata::kernels::kDistMax;
 }
 
 // the drafts after y (the token at position(), pending): up to STRATA_Q35_MTP_K (1..5, default 3) chained steps from
@@ -1205,6 +1281,8 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         F->ple->prefetch(rows, kn::PLE_N_HEADS);
     };
     if (ple_pf) ple_prefetch(0);
+    ss_k_ = 0;
+    ss_drafted_ = false;
     int n = 0;
     int toks[5];
     for (int k = 0; k < kmax; ++k) {
@@ -1223,6 +1301,12 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         }
     }
     cudaMemcpy(toks, F->q35_mt_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost);
+    if (ss_on_ && ss_k_ == n && n > 0) {   // the sampled drafts' kept lists (q)
+        cudaMemcpy(ss_q_n_h_, ss_q_n_d_, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(ss_q_ids_h_, ss_q_ids_d_, (size_t) n * strata::kernels::kDistMax * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(ss_q_p_h_, ss_q_p_d_, (size_t) n * strata::kernels::kDistMax * sizeof(float), cudaMemcpyDeviceToHost);
+        ss_drafted_ = true;
+    }
     if (!F->route_ok(err)) return false;
     for (int k = 0; k < n; ++k) drafts[k] = toks[k];
     // STRATA_GLM_WINDOW_JUNK=1 (a test of glm5-next's window): kmax random drafts, confidence 1 - windows whose drafts

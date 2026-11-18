@@ -30,6 +30,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/core/spec_sampling.hpp"
 #include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -1646,6 +1647,8 @@ static int glm_pack_generate(const Options& o) {
     // GEN key spec=0: this request token by token - no drafter, no verify windows (--bench compares a greedy answer
     // with and without them: greedy speculation must give the same tokens)
     bool req_spec = true;
+    // the request named its seed (speculative sampling keeps the old rule for it); the CLI's --seed counts as one
+    bool req_seeded = true;
     // LOGIT BIASES (token_ban.hpp): BIAS <name> <id:value,...> registers a set (the server's language profile, a
     // request's logit_bias); GEN keys bias=<name> (the whole output) and bias_answer=<name> (from the end of the
     // reasoning on - the profile's default "answer only"; the server sends the union with bias= there).  No key: no
@@ -2318,6 +2321,24 @@ static int glm_pack_generate(const Options& o) {
             // STRATA_DS4_SPEC_GATE_FRESH=0: every step counts, as before
             const bool cost_fresh = spec_fresh;
             int64_t d_step = 0;
+            // speculative sampling (spec_sampling.hpp): a sampled request (STRATA_SPEC_SAMPLING) has the NextN drafter sample
+            // its drafts and keeps each with probability min(1, p/q), else a draw from the residual max(0, p - q) -
+            // the tokens are distributed as the target's, and more drafts stay than the old "the column's own draw
+            // equals the draft".  Opt-in (2026-11-18, RTX 5090, Qwen3.8-27B UD-Q4_K_XL + its NextN block, 9 seeds x
+            // 512 tokens a cell: temperature 1.0 +1.5 / +2.5 / +1.8% tok/s code / en / ja, 0.6 -0.5 / -0.5 / -0.6% - the
+            // NextN drafter's q is not close enough to p for the large gain a block drafter sees).
+            // STRATA_SPEC_SAMPLING=1: requests without a seed; =2: seeded requests (and the CLI's --seed) too - their
+            // answer for a seed changes; 0 / unset: the old rule
+            static const int ss_env = [] {
+                const char* v = std::getenv("STRATA_SPEC_SAMPLING");
+                return v == nullptr ? 0 : std::atoi(v);
+            }();
+            const bool ss_req = (ss_env >= 2 || (ss_env == 1 && !req_seeded)) && !sp.greedy && sp.temperature > 0.0f;
+            int64_t ss_win = 0, ss_cols = 0, ss_kept = 0;
+            struct SsOff {
+                strata::core::Glm5Model& m;
+                ~SsOff() { m.spec_sampling_set(nullptr); }
+            } ss_off{model};
             for (;;) {
                 if (stop_req.load()) {
                     finish = "cancel";
@@ -2358,7 +2379,9 @@ static int glm_pack_generate(const Options& o) {
                 };
                 came.clear();
                 const auto td = std::chrono::steady_clock::now();
+                model.spec_sampling_set(nullptr);
                 if (!rep && room > 0 && model.dspark_ready()) {
+                    model.spec_sampling_set(ss_req ? &sp : nullptr);
                     if (!model.dspark_draft(tok, d, c, err)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -2429,11 +2452,26 @@ static int glm_pack_generate(const Options& o) {
                 }
                 int next = -1, kept = 1;
                 bool stopped = false;
+                const bool ss_this = !rep && model.spec_sampling_drafted();
+                ss_win += ss_this ? 1 : 0;
                 for (int i = 0; i <= k; ++i) {
                     int s2 = model.verify_sample(i, sp, err);
                     if (s2 < 0) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
+                    }
+                    const int* p_ids = nullptr;
+                    const int* q_ids = nullptr;
+                    const float* p_p = nullptr;
+                    const float* q_p = nullptr;
+                    int p_n = 0, q_n = 0;
+                    if (ss_this && i < k && model.window_dist(i, p_ids, p_p, p_n) && model.draft_dist(i, q_ids, q_p, q_n)) {
+                        bool ss_k = false;
+                        s2 = strata::core::spec_column(d[i], q_ids, q_p, q_n, p_ids, p_p, p_n,
+                                                       strata::core::spec_uniform(sp.seed, sp.counter, 1),
+                                                       strata::core::spec_uniform(sp.seed, sp.counter, 2), ss_k);
+                        ++ss_cols;
+                        ss_kept += ss_k ? 1 : 0;
                     }
                     s2 = model.forced(s2);
                     sp.counter += 1;
@@ -2488,6 +2526,10 @@ static int glm_pack_generate(const Options& o) {
                          (long long) n_k[4], (long long) n_k[5], ms_win / (double) std::max<int64_t>(1, n_win),
                          ms_one / (double) std::max<int64_t>(1, n_one), ms_dr / (double) std::max<int64_t>(1, n_dsp),
                          (double) (steps + n_acc) / (double) std::max<int64_t>(1, steps));
+            if (ss_win > 0)
+                std::fprintf(stderr, "spec sampling: %lld windows, %lld drafts judged, %lld kept (%.0f%%)\n",
+                             (long long) ss_win, (long long) ss_cols, (long long) ss_kept,
+                             100.0 * (double) ss_kept / (double) std::max<int64_t>(1, ss_cols));
             if (d_cost)
                 std::fprintf(stderr, "ds4 spec cost: ms a step by columns 1..6: %.1f %.1f %.1f %.1f %.1f %.1f (%d %d %d %d "
                                      "%d %d steps); the drafter's confidence bins kept: %.2f %.2f %.2f %.2f %.2f %.2f "
@@ -3075,6 +3117,7 @@ static int glm_pack_generate(const Options& o) {
             req_arg_open = req_arg_close = -2;
             req_think_close.clear();
             req_spec = true;
+            req_seeded = false;
             req_bias = req_bias_ans = nullptr;
             std::string bias_err;
             req_ns = req_sess = 0;
@@ -3098,7 +3141,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "top_p") { rq.top_p = (float) std::atof(v.c_str()); any_key = true; }
                 else if (k == "top_k") { rq.top_k = std::atoi(v.c_str()); any_key = true; }
                 else if (k == "min_p") { rq.min_p = (float) std::atof(v.c_str()); any_key = true; }
-                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
+                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); req_seeded = true; }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "end_guard") { req_end_guard = std::atoi(v.c_str()) != 0; }

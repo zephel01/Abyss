@@ -696,6 +696,25 @@ public:
     bool q35_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err);
     bool q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     int64_t q35_pend_pos_ = -1, q35_row_done_ = -1;
+    // speculative sampling's state (spec_sampling_set): the request's sampler, the drafts' and the window's kept
+    // lists (device, then pinned host copies; kDistMax a row)
+    strata::kernels::SamplerParams ss_sp_{};
+    bool ss_on_ = false, ss_drafted_ = false, ss_win_ok_ = false;
+    int ss_k_ = 0;
+    uint64_t ss_win_c0_ = 0, ss_win_gen_ = 0;
+    int* ss_q_ids_d_ = nullptr;
+    float* ss_q_p_d_ = nullptr;
+    int* ss_q_n_d_ = nullptr;
+    int* ss_q_ids_h_ = nullptr;
+    float* ss_q_p_h_ = nullptr;
+    int* ss_q_n_h_ = nullptr;
+    int* ss_p_ids_d_ = nullptr;
+    float* ss_p_p_d_ = nullptr;
+    int* ss_p_n_d_ = nullptr;
+    int* ss_p_ids_h_ = nullptr;
+    float* ss_p_p_h_ = nullptr;
+    int* ss_p_n_h_ = nullptr;
+    bool ss_alloc();
     // qwen4exp's draft layer (q4x_drafter.cu, STRATA_Q4X_MTP=<tools/mtp_rt.py's dir>): the same pending-row scheme, the
     // rows' input the trunk's final residual (4 streams) instead of a normed hidden
     void* q4d_ = nullptr;
@@ -889,6 +908,14 @@ public:
     bool dspark_ready() const { return dsp_ != nullptr || dfl_ != nullptr || chain_mtp_on(); }
     bool dflash_on() const { return dfl_ != nullptr; }   // DFlash2 (dflash2.cu): its walk applied the threshold
     bool dspark_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    /// Speculative sampling (spec_sampling.hpp; qwen35's NextN drafter on one part): with a request's sampler set,
+    /// the next dspark_draft SAMPLES its drafts from the drafter's distribution under that sampler (draws keyed by
+    /// sp's seed and counter, a different stream from the target's) and keeps each one's kept list (q), and the next
+    /// window's verify_sample(0) keeps every column's (p).  nullptr: off - argmax drafts and no lists, as before.
+    void spec_sampling_set(const strata::kernels::SamplerParams* sp);
+    bool spec_sampling_drafted() const { return ss_drafted_; }   // the last dspark_draft's drafts were sampled
+    bool draft_dist(int k, const int*& ids, const float*& p, int& n) const;    // draft k's q (host)
+    bool window_dist(int i, const int*& ids, const float*& p, int& n) const;   // column i's p (host)
     void dspark_upload();
     void dspark_report() const;
     bool decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,

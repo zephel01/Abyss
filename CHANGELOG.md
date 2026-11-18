@@ -13,6 +13,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   the quoted word) comes back as a JSON bool, not the string `"True"` - Qwen, GLM and DSML forms, whole and streamed.
   Models write Python's spelling with thinking off; clients failed on the type. Other words and string parameters
   stay as written.
+- Engine (opt-in): speculative sampling for sampled requests on the qwen35 / qwen35moe NextN drafter
+  (`STRATA_SPEC_SAMPLING=1` for requests without a seed, `2` for seeded ones too). The drafter samples its drafts and a
+  window keeps each with probability min(1, p/q), else draws from max(0, p - q): the tokens are distributed exactly as
+  without drafts (checked against no-draft sampling on 3,500 short answers), more drafts stay. RTX 5090, Qwen3.8-27B
+  UD-Q4_K_XL: temperature 1.0 +1.5-2.5% tok/s, 0.6 -0.5% (noise level), so off by default. Greedy, seeded and default
+  requests are bit-identical to v1.3.169.
 
 ## v1.3.169 - 2026-11-18
 

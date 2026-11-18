@@ -173,7 +173,8 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
 __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
-                               int* __restrict__ out) {
+                               int* __restrict__ out, int* __restrict__ dist_ids, float* __restrict__ dist_p,
+                               int* __restrict__ dist_n) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     const float* l = logits + (size_t) t * n_vocab;
@@ -434,12 +435,36 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         if ((double) u < cum) { pick = sel_ids[i]; break; }
     }
     if (threadIdx.x == 0) out[t] = pick;
+    // sample_tokens_dist: the distribution the pick was drawn from (kept ids in order, their probabilities)
+    if (dist_ids != nullptr) {
+        for (int i = 0; i < n_keep; ++i) {
+            dist_ids[(size_t) t * KMAX + i] = sel_ids[i];
+            dist_p[(size_t) t * KMAX + i] = (float) (exp((double) scaled(i) - (double) smx) / sum);
+        }
+        dist_n[t] = n_keep;
+    }
 }
 
 }  // namespace
 
+namespace {
+void sample_launch(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                   const SamplerParams& p, int* out, int* dist_ids, float* dist_p, int* dist_n, void* stream);
+}
+
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
+    sample_launch(logits, n_tokens, n_vocab, history, history_len, p, out, nullptr, nullptr, nullptr, stream);
+}
+
+void sample_tokens_dist(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, int* out,
+                        int* dist_ids, float* dist_p, int* dist_n, void* stream) {
+    sample_launch(logits, n_tokens, n_vocab, nullptr, 0, p, out, dist_ids, dist_p, dist_n, stream);
+}
+
+namespace {
+void sample_launch(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                   const SamplerParams& p, int* out, int* dist_ids, float* dist_p, int* dist_n, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
@@ -460,7 +485,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
         sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
+            logits, n_vocab, n_tokens, history, history_len, p, out, dist_ids, dist_p, dist_n);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -469,5 +494,6 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     }
     if (stream == nullptr) cudaDeviceSynchronize();
 }
+}  // namespace
 
 }  // namespace strata::kernels

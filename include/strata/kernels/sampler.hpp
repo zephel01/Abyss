@@ -42,6 +42,14 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+// The sampled path's draw (never greedy, no penalty history) that also returns, per row, the distribution it drew
+// from: the kept ids in order (at most 64, stride 64) in `dist_ids`, their probabilities after top_k / top_p / min_p /
+// temperature in `dist_p`, the count in `dist_n` - the p and q of speculative sampling (spec_sampling.hpp).  The
+// picks are those sample_tokens makes with the same arguments.  All device pointers.
+constexpr int kDistMax = 64;
+void sample_tokens_dist(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, int* out,
+                        int* dist_ids, float* dist_p, int* dist_n, void* stream);
+
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the
