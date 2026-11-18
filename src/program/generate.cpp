@@ -970,7 +970,8 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
-// ================================ the glm5-next pack path (M3.1) =========================//
+// ================================ the glm5-next pack path (M3.1) ================================
+//
 // The speculative decode's drafter: prompt lookup over the whole sequence (prompt + answer).  Every n-gram of the
 // history (n = min_n) maps to the position right after its latest occurrence that is not the sequence's own suffix;
 // propose() continues the latest earlier occurrence of the current suffix by up to k tokens.  swe-bench's prompts and
