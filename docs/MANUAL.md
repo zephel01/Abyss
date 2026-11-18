@@ -457,6 +457,12 @@ Digits, punctuation, symbols, spaces, emoji and code are allowed in every profil
 - **Server default:** `STRATA_LANG=ja-en` (and `STRATA_LANG_THINK=1`) in the config's `env` or the shell applies it to
   every request that does not say otherwise.
 - **`logit_bias`** (OpenAI's: `{"<token id>": -100..100}`, -100 bans) is supported too, for the whole output.
+- **DeepSeek V4 0731 and Japanese:** V4 0731 answers a Japanese question in Chinese now and then (the original weights
+  too). A profile does not stop it - the model then writes Chinese in the kanji Japanese shares - but one system line
+  does, so the server adds the system message `日本語で答えてください。` to a request that has no system message and whose
+  last user message has kana (V4 0731 only, not V4.1). Measured on 8 Japanese prompts x 6 seeds (48 answers,
+  temperature 0.6): Chinese answers 14 -> 1 (the original, UD-Q8_K_XL), 16 -> 1 (a 2-bit file); `ja-en` alone 12 / 48.
+  `STRATA_JA_SYSPROMPT=0` turns it off; a request with its own system message is left as it is.
 - **How it is measured:** on 1.3 MB of correct Japanese text on disk, `ja-en` needed a banned token 2 times in 200K
   tokens (two kaomoji with a Cyrillic / Arabic letter); Japanese words such as 両性具有 are not affected, because no
   Han character in JIS X 0213 is banned. The per-tokenizer class tables are in `data/token_classes/`, made by
@@ -1325,6 +1331,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_SOFT_END` | 16 | (server) an end-of-turn token (`<|im_end|>`, GLM's `<|observation|>`, DeepSeek's end of sentence, ...) inside the reasoning or an open tool call is kept as text and the answer goes on, at most this many times a request (a file written by a tool call that quotes a chat template); `0` = such a token always ends the turn |
 | `STRATA_LANG` | (none) | (server) the default language profile of every request (`ja-en`, `zh-en`, `ko-en`, `en`; see "Keeping the answer in one language"): tokens of the other scripts are banned in the answer; a request's own `"lang"` wins, `off` = none |
 | `STRATA_LANG_THINK` | 0 | (server) `1` = the language profile applies to the reasoning as well (the default: the answer only) |
+| `STRATA_JA_SYSPROMPT` | 1 | (server) DeepSeek V4 0731: a request without a system message whose last user message has kana gets the system message `日本語で答えてください。` (see "Keeping the answer in one language"); `0` = off |
 | `STRATA_TOOL_NONE_NOTE` | 1 | (server) `tool_choice: "none"` in a conversation that holds tool calls: a last user turn asks for a prose answer (a call the model writes anyway is never sent, as a call or as markup); `0` = no note |
 | `STRATA_ENGINE_STALL_S` | 90 | (server) an engine silent that long with no CPU, disk or GPU work is ended and started again by the next request; `0` off |
 | `STRATA_ENGINE_START_S` | 1800 | (server) the most a start may take before READY (a model loading from the SSD takes minutes); past it the engine is ended and the start fails with a line; `0` no limit (v1.3.78) |

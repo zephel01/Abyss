@@ -52,7 +52,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, ContentGuard, Event,  # noqa: E402
                             OutputParser, thinking_signature,
-                            anthropic_to_messages, effort_kwargs, effort_level, images_of, openai_to_messages,
+                            anthropic_to_messages, effort_kwargs, effort_level, images_of, ja_system_prompt,
+                            openai_to_messages,
                             v41_images_as_text)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import lang_ban  # noqa: E402
@@ -1809,6 +1810,8 @@ class Service:
         token's text inside them swapped for a sentinel (ContentGuard): that text goes back in as plain text, the
         template's own markers stay special.  v41_images (DeepSeek V4.1): each image is None in the ids, its place."""
         raw = os.environ.get("STRATA_RAW_SPECIALS") == "1"   # the old encode: every special's text a token
+        if self.template.dsv4_0731:   # V4 0731: a Japanese request without a system message gets "answer in Japanese"
+            messages = ja_system_prompt(messages)
         messages, shown = (messages, tools) if raw else self.guard.messages(messages, tools)
         # DeepSeek V4.1: every image becomes a sentinel in the text.  The GGUF templates print a message's content as it
         # is; the official one writes its own <｜deepseek_image｜> for an image block, which the path below would not take

@@ -39,6 +39,11 @@ v1.3.170 (deterministic md5 equal to no drafts; the regression configs unchanged
   checked against Hugging Face's SHA-256) and names it in the config where the file, its context and the drafter fit
   in one NVIDIA GPU's VRAM (UD-Q4_K_XL: a 24 GB+ GPU). `--no-dflash` skips it (and takes it out of a config),
   `--dflash` sets it up on a smaller GPU too.
+- Server: DeepSeek V4 0731 answers a Japanese question in Chinese now and then, the original weights too. A request
+  without a system message whose last user message has kana now gets the system message `日本語で答えてください。`
+  (V4 0731 only; V4.1 and other models unchanged). 8 Japanese prompts x 6 seeds: Chinese answers 14 -> 1 of 48 (the
+  original, UD-Q8_K_XL), 16 -> 1 (a 2-bit file); the `ja-en` language profile alone 12 of 48. `STRATA_JA_SYSPROMPT=0`
+  = old. The engine is unchanged.
 
 ## v1.3.170 - 2026-11-18
 

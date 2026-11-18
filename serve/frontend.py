@@ -76,6 +76,9 @@ class ChatTemplate:
         # 1..100, "high" when absent - the client's own value goes through (not the four levels above: its "medium"
         # was sent as "high" and "low" as none, so both thought at the template's high)
         self.v41_effort = "reasoning_effort is integer" in self.source and "effort_map" in self.source
+        # DeepSeek V4 0731 (the DSML template, not V4.1: no Engram pack, not V4.1's effort map) - the model that answers
+        # a Japanese question in Chinese without a system prompt (ja_system_prompt below)
+        self.dsv4_0731 = self.dsv4 and not dsml41 and not self.v41_effort
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -343,6 +346,30 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
     merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+
+
+# DeepSeek V4 0731 answers a Japanese question in Chinese now and then - the original weights too, the answer itself
+# right: 8 Japanese prompts x 6 seeds (temperature 0.6), Chinese answers 14 / 48 for the original (UD-Q8_K_XL) and
+# 16 / 48 for a 2-bit file; with this one system line 1 / 48 for both.  A language profile (lang ja-en) alone did not
+# do it (12 / 48: the model wrote Chinese in the kanji Japanese shares).  Measured: Abyss-tools recipes/v4-0731-zh.
+JA_SYSPROMPT = "日本語で答えてください。"
+_KANA = re.compile(r"[\u3041-\u30ff]")
+
+
+def ja_system_prompt(messages: list[dict], env: dict | None = None) -> list[dict]:
+    """A request without a system message whose last user message has kana: JA_SYSPROMPT first, as the system
+    message.  STRATA_JA_SYSPROMPT=0 (off / none / false) keeps the messages as they are.  Only for DeepSeek V4 0731
+    (the caller checks ChatTemplate.dsv4_0731)."""
+    import os
+    v = (env if env is not None else os.environ).get("STRATA_JA_SYSPROMPT", "1").strip().lower()
+    if v in ("0", "off", "none", "false", "no"):
+        return messages
+    if any(m.get("role") in ("system", "developer") for m in messages):
+        return messages
+    last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last is None or not _KANA.search(_text_of(last.get("content"))):
+        return messages
+    return [{"role": "system", "content": JA_SYSPROMPT}] + list(messages)
 
 
 # A thinking block's `signature` (the Anthropic API): what the server writes there is the block's reasoning exactly as

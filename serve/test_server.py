@@ -287,6 +287,58 @@ class V41OfficialTemplateImages(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class V4JapaneseSystemPrompt(unittest.TestCase):
+    """DeepSeek V4 0731 answers a Japanese question in Chinese without a system prompt: a Japanese request with none gets
+    JA_SYSPROMPT as its system message (V4 0731 only; STRATA_JA_SYSPROMPT=0 turns it off)."""
+
+    V4 = ("{#｜DSML｜#}{%- for m in messages -%}{%- if m['role'] == 'system' -%}[SYS]{{ m['content'] }}"
+          "{%- else -%}<｜User｜>{{ m['content'] }}{%- endif -%}{%- endfor -%}"
+          "{%- if add_generation_prompt -%}<｜Assistant｜>{%- endif -%}")
+    V41 = "{#｜DSML｜ reasoning_effort is integer effort_map #}" + V4
+    PLAIN = V4.replace("{#｜DSML｜#}", "")
+
+    def prompt(self, source, messages, env=None, dsml41=False):
+        import tempfile
+        from unittest import mock
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env or {}):
+            os.environ.pop("STRATA_JA_SYSPROMPT", None) if env is None else None
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text(source, encoding="utf-8")
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(tpl, dsml41=dsml41))
+            ids, _, _ = svc.prepare(messages, None, {})
+            return tok.decode(ids)
+
+    def test_helper(self):
+        from serve.frontend import JA_SYSPROMPT, ja_system_prompt
+        ja = [{"role": "user", "content": "富士山の高さは？"}]
+        self.assertEqual(ja_system_prompt(ja, env={}), [{"role": "system", "content": JA_SYSPROMPT}] + ja)
+        parts = [{"role": "user", "content": [{"type": "text", "text": "これは何ですか"}]}]
+        self.assertEqual(ja_system_prompt(parts, env={})[0]["content"], JA_SYSPROMPT)
+        for msgs in ([{"role": "system", "content": "be brief"}] + ja,           # the client's own system message
+                     [{"role": "developer", "content": "x"}] + ja,
+                     [{"role": "user", "content": "How tall is Mt. Fuji?"}],      # English
+                     [{"role": "user", "content": "北京是中国的首都吗"}],          # Chinese: no kana
+                     ja + [{"role": "assistant", "content": "3776 m"}, {"role": "user", "content": "and K2?"}],
+                     []):
+            with self.subTest(msgs=msgs):
+                self.assertIs(ja_system_prompt(msgs, env={}), msgs)
+        for off in ("0", "off", "false"):
+            self.assertIs(ja_system_prompt(ja, env={"STRATA_JA_SYSPROMPT": off}), ja)
+
+    def test_v4_0731_only(self):
+        from serve.frontend import JA_SYSPROMPT
+        ja = [{"role": "user", "content": "日本の三大随筆は？"}]
+        self.assertIn("[SYS]" + JA_SYSPROMPT, self.prompt(self.V4, ja))
+        self.assertNotIn("[SYS]", self.prompt(self.V4, [{"role": "user", "content": "hello"}]))
+        self.assertNotIn("[SYS]", self.prompt(self.V4, ja, env={"STRATA_JA_SYSPROMPT": "0"}))
+        self.assertNotIn("[SYS]", self.prompt(self.V41, ja))                 # V4.1's template
+        self.assertNotIn("[SYS]", self.prompt(self.V4, ja, dsml41=True))     # a V4.1 pack (engram.txt)
+        self.assertNotIn("[SYS]", self.prompt(self.PLAIN, ja))               # not DeepSeek V4
+        own = [{"role": "system", "content": "簡潔に"}] + ja
+        self.assertEqual(self.prompt(self.V4, own).count("[SYS]"), 1)
+
+
 class GlmThinkingLevels(unittest.TestCase):
     """GLM-5.x's template knows reasoning_effort low / high and is "Max" otherwise (no effort given included), and it
     always opens <think>: the server's levels map onto low / high / max, and thinking off closes the think block."""
