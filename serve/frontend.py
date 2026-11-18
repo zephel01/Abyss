@@ -634,16 +634,21 @@ def respell_dsml41(tree) -> bool:
     return changed
 
 
-def parse_dsml_calls(body: str) -> list[ToolCall]:
-    """The body of a DSML tool_calls block -> its calls, in order."""
+def parse_dsml_calls(body: str, schemas: dict | None = None) -> list[ToolCall]:
+    """The body of a DSML tool_calls block -> its calls, in order.  `schemas` (tool name -> declared tool) lets a
+    boolean parameter written `True` / `False` (or with string="true") come out as a bool."""
     import re
     calls = []
     for m in re.finditer(r'<\uff5cDSML\uff5c\s*invoke\s+name="([^"]*)"\s*>(.*?)</\uff5cDSML\uff5c\s*invoke>', body, re.S):
         args = {}
+        props = (((schemas or {}).get(m.group(1)) or {}).get("parameters") or {}).get("properties") or {}
         for pm in re.finditer(r'<\uff5cDSML\uff5c\s*parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>(.*?)'
                               r'</\uff5cDSML\uff5c\s*parameter>', m.group(2), re.S):
             value = pm.group(3)
-            if pm.group(2) == "true":
+            b = _as_bool(value, (props.get(pm.group(1)) or {}).get("type"))
+            if b is not None:
+                args[pm.group(1)] = b
+            elif pm.group(2) == "true":
                 args[pm.group(1)] = value
             else:
                 try:
@@ -656,11 +661,37 @@ def parse_dsml_calls(body: str) -> list[ToolCall]:
     return calls
 
 
+def _declared_types(declared) -> tuple:
+    """A schema "type" (one name or a list of names) as a tuple of names."""
+    if isinstance(declared, str):
+        return (declared,)
+    if isinstance(declared, (list, tuple)):
+        return tuple(t for t in declared if isinstance(t, str))
+    return ()
+
+
+def _as_bool(value, declared):
+    """`True` / `False` (Python's spelling, any case, also a JSON string "true") for a parameter the schema declares
+    boolean and not string -> the JSON bool; None otherwise.  Models write `<parameter=x>True</parameter>` with
+    thinking off, and the client got the string "True"."""
+    types = _declared_types(declared)
+    if "boolean" not in types or "string" in types or not isinstance(value, str):
+        return None
+    word = value.strip().lower()
+    if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'":
+        word = word[1:-1].strip()
+    return {"true": True, "false": False}.get(word)
+
+
 def _arg_value(value: str, declared) -> object:
     """A parameter's text as the client gets it: as written when the schema says string, else JSON-decoded when it
-    parses (numbers, booleans, objects, arrays), else as written."""
+    parses (numbers, booleans, objects, arrays), else as written.  A boolean parameter also takes `True` / `False`
+    in any case (and the quoted words)."""
     if declared == "string":
         return value
+    b = _as_bool(value, declared)
+    if b is not None:
+        return b
     try:
         return json.loads(value)
     except ValueError:
@@ -741,14 +772,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        declared = (props.get(pname) or {}).get("type")
-        if declared == "string":
-            args[pname] = value
-        else:
-            try:
-                args[pname] = json.loads(value)
-            except ValueError:
-                args[pname] = value
+        args[pname] = _arg_value(value, (props.get(pname) or {}).get("type"))
     return ToolCall(name=name, arguments=args)
 
 
@@ -864,6 +888,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.spname = None
         self.glm = False             # the call is in GLM's form (NAME<arg_key>..), not Qwen's (<function=NAME>..)
         self.vend = "</parameter>"   # what ends the value being streamed
 
@@ -940,7 +965,7 @@ class OutputParser:
                     args('"')
                     self.ss, self.sval_started = "str", True     # GLM's values are written as they are
                 else:
-                    self.ss, self.sraw = "raw", 0
+                    self.ss, self.sraw, self.spname = "raw", 0, pname
             elif self.ss == "between":
                 stripped = rest.lstrip()
                 take(len(rest) - len(stripped))
@@ -956,7 +981,7 @@ class OutputParser:
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
-                        self.ss, self.sraw = "raw", 0
+                        self.ss, self.sraw, self.spname = "raw", 0, pname
                 elif stripped.startswith("</function>"):
                     args("}")
                     take(len("</function>"))
@@ -1001,10 +1026,7 @@ class OutputParser:
                         value = value[1:]
                     if value.endswith("\n"):
                         value = value[:-1]
-                try:
-                    v = json.loads(value)
-                except ValueError:
-                    v = value
+                v = _arg_value(value, self.sdeclared.get(self.spname))
                 args(json.dumps(v, ensure_ascii=False))
                 take(end + len(self.vend))
                 self.ss, self.sraw = "between", 0
@@ -1197,7 +1219,7 @@ class OutputParser:
                     return out
                 body, self.buf = self._body_take()
                 try:
-                    calls = parse_dsml_calls(body)
+                    calls = parse_dsml_calls(body, self.schemas)
                 except ValueError:                  # a malformed block is returned as text, never a failed request
                     calls = None
                     out.append(Event("content", self._track(self.dsml_tag + body)))

@@ -7,6 +7,13 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.170 - (draft)
+
+- Server: a tool-call parameter the schema declares `boolean` (not `string`) written `True` / `False` (any case, also
+  the quoted word) comes back as a JSON bool, not the string `"True"` - Qwen, GLM and DSML forms, whole and streamed.
+  Models write Python's spelling with thinking off; clients failed on the type. Other words and string parameters
+  stay as written.
+
 ## v1.3.169 - 2026-11-18
 
 SenseNova-Loop-9B (arch `sensenova_loop`, Apache-2.0) runs on the dense qwen35 path and installs with the one-command setup.

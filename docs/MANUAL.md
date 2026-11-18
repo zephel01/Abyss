@@ -384,7 +384,8 @@ in the browser, `--gpu 0` picks the GPU.
   (a few hundred) the thinking is closed almost at once. Give thinking requests a `max_tokens` of a few thousand.
 - **Tool calls:** OpenAI `tools` / Anthropic `tools` work, including several calls in one turn. The model writes them
   in DeepSeek's DSML form; the server turns them into `tool_calls` and renders past calls and `tool` results back into
-  the prompt.
+  the prompt. A parameter the tool's schema declares `boolean` (and not `string`) also takes `True` / `False` in any
+  case, as models write them with thinking off, and comes back as a JSON `true` / `false` (every model's call form).
 - **Special-token text in messages stays text:** a `<|im_end|>`, `</think>`, `<tool_call>` or `<｜deepseek_image｜>`
   inside a message, a tool result or a tool call's arguments (pasted source code, logs) goes to the model as the
   characters it is, not as the control token; only the markers the chat template writes are tokens. A past answer's

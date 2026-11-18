@@ -204,6 +204,49 @@ class DsmlCalls(unittest.TestCase):
         self.assertIn(quoted, out41)                    # a message's own text is never respelled
 
 
+class BoolArguments(unittest.TestCase):
+    """A boolean parameter written `True` / `False` (Python's spelling, any case; models write it with thinking off)
+    or as the quoted word is a JSON bool; a string parameter, an undeclared one and other words stay as written
+    (Strata #5979's idea).  Whole and streamed, GLM, Qwen and DSML forms."""
+
+    TOOLS = [{"name": "ls", "parameters": {"type": "object", "properties": {
+        "all": {"type": "boolean"}, "long": {"type": ["boolean", "null"]}, "label": {"type": "string"},
+        "either": {"type": ["boolean", "string"]}}}}]
+
+    def check(self, text, want):
+        for pieces in (None, 1, 5):
+            ev = run(text, pieces, tools=self.TOOLS)
+            self.assertEqual([c.arguments for c in calls(ev)], [want], (pieces, text))
+            streamed = "".join(e.text for e in ev if e.kind == "tool_args")
+            self.assertEqual(json.loads(streamed), want, (pieces, text))
+
+    def test_qwen_form(self):
+        for word, want in (("True", True), ("False", False), ("TRUE", True), ("false", False), ('"true"', True),
+                           (" False ", False)):
+            self.check("<tool_call>\n<function=ls>\n<parameter=all>\n" + word + "\n</parameter>\n"
+                       "<parameter=long>\nTrue\n</parameter>\n<parameter=label>\nTrue\n</parameter>\n"
+                       "<parameter=either>\nTrue\n</parameter>\n</function>\n</tool_call>",
+                       {"all": want, "long": True, "label": "True", "either": "True"})
+
+    def test_glm_form(self):
+        self.check("<tool_call>ls\n<arg_key>all</arg_key>\n<arg_value>False</arg_value>\n<arg_key>label</arg_key>"
+                   "\n<arg_value>False</arg_value>\n</tool_call>", {"all": False, "label": "False"})
+
+    def test_other_words_and_undeclared_stay(self):
+        self.check("<tool_call>\n<function=ls>\n<parameter=all>\nyes\n</parameter>\n<parameter=other>\nTrue"
+                   "\n</parameter>\n</function>\n</tool_call>", {"all": "yes", "other": "True"})
+
+    def test_dsml(self):
+        text = ("<\uff5cDSML\uff5ctool_calls>\n<\uff5cDSML\uff5cinvoke name=\"ls\">\n"
+                "<\uff5cDSML\uff5cparameter name=\"all\" string=\"false\">True</\uff5cDSML\uff5cparameter>\n"
+                "<\uff5cDSML\uff5cparameter name=\"long\" string=\"true\">false</\uff5cDSML\uff5cparameter>\n"
+                "<\uff5cDSML\uff5cparameter name=\"label\" string=\"true\">True</\uff5cDSML\uff5cparameter>\n"
+                "</\uff5cDSML\uff5cinvoke>\n</\uff5cDSML\uff5ctool_calls>")
+        for pieces in (None, 1, 7):
+            ev = run(text, pieces, tools=self.TOOLS)
+            self.assertEqual([c.arguments for c in calls(ev)], [{"all": True, "long": False, "label": "True"}])
+
+
 class GenerationTag(unittest.TestCase):
     def test_laguna_generation_block_renders_its_body(self):
         # Laguna-S-2.1's template wraps the assistant's turn in transformers' {% generation %} marker

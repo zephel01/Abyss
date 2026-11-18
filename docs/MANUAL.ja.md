@@ -379,7 +379,8 @@ LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
   思考はほぼすぐに打ち切られる。思考させるときは `max_tokens` を数千にする。
 - **ツール呼び出し:** OpenAI の `tools`、Anthropic の `tools` が使える。1 回の応答で複数の呼び出しも可。モデルは
   DeepSeek の DSML 形式で書き、サーバーがそれを `tool_calls` に変換する。過去の呼び出しと `tool` の結果は
-  prompt に描画し直す。
+  prompt に描画し直す。ツールのスキーマで `boolean`（`string` を含まない）とされた引数は、thinking off のモデルが
+  よく書く `True` / `False`（大文字小文字は問わない）も受け付け、JSON の `true` / `false` で返す（どのモデルの形式でも）。
 - **メッセージ中の特殊トークンの文字列は文字のまま:** メッセージ、ツールの結果、ツール呼び出しの引数の中にある
   `<|im_end|>`、`</think>`、`<tool_call>`、`<｜deepseek_image｜>`（貼り付けたソースコードやログ）は、制御トークンではなく
   その文字列としてモデルに渡る。トークンになるのはチャットテンプレート自身が書く記号だけ。ただし過去の回答に含まれる
