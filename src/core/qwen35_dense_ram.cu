@@ -429,7 +429,7 @@ bool Glm5Model::q35d_place(std::string& err) {
     cudaMemGetInfo(&free_b, &total_b);
     const size_t verify_b = free_pre_verify > free_b ? free_pre_verify - free_b : 0, in_use0 = total_b - free_b;
     const size_t cap = vram_cap();
-    const size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
+    size_t used = total_b - free_b - std::min(vram_base_, total_b - free_b);
     size_t room = cap > 0 ? (cap > used ? std::min(cap - used, free_b) : 0) : free_b;
     // (the reserve: 128 MB; 320 with the kernels loaded lazily - a dense pack, generate.cpp - for those a run loads
     // after this, ~90 MB on an sm_120 build)
@@ -441,6 +441,20 @@ bool Glm5Model::q35d_place(std::string& err) {
     for (const auto& f : Q->L) {
         all += f.total();
         max_layer = std::max(max_layer, f.total());
+    }
+    // DFlash 2 (STRATA_Q35_DFLASH) only where the trunk's FFN all fits beside it: its 1.3 GB would send FFN rows to the
+    // CPU (a 16 GB card: 2.4 -> 3.7 GB of them in RAM, decode -22..-37%, 2026-11-18); STRATA_Q35_DFLASH_KEEP=1 keeps it
+    if (dfl_ != nullptr && all > room) {
+        const char* kv = getenv("STRATA_Q35_DFLASH_KEEP");
+        if (kv == nullptr || std::atoi(kv) == 0) {
+            dflash_destroy();
+            cudaMemGetInfo(&free_b, &total_b);
+            used = total_b - free_b - std::min(vram_base_, total_b - free_b);
+            room = cap > 0 ? (cap > used ? std::min(cap - used, free_b) : 0) : free_b;
+            room = room > reserve ? room - reserve : 0;
+            std::fprintf(stderr, "dflash: dropped - the FFN (%.2f GB) does not fit in VRAM beside it "
+                                 "(STRATA_Q35_DFLASH_KEEP=1 keeps it)\n", (double) all / G);
+        }
     }
     const int FF = g.n_ff_dense, E = g.n_embd;
     int gpu_cap = NL;

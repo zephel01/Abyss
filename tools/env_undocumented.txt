@@ -217,6 +217,7 @@ STRATA_Q35_ATTN_CHUNK_MIN  # src/kernels/cuda/qwen35_fast.cu
 STRATA_Q35_COPY_K  # src/program/generate.cpp
 STRATA_Q35_COPY_KEY8  # src/program/generate.cpp
 STRATA_Q35_DFLASH_CUT  # src/program/generate.cpp
+STRATA_Q35_DFLASH_KEEP  # src/core/qwen35_dense_ram.cu
 STRATA_Q35_DFLASH_MMQ  # src/core/dflash2.cu
 STRATA_Q35_DFLASH_PICK  # src/program/generate.cpp
 STRATA_Q35_DFLASH_TRACE  # src/program/generate.cpp
