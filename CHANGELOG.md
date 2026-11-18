@@ -7,8 +7,46 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.170 - (draft)
+## v1.3.170 - 2026-11-18
 
+QSA on AMD (issue #51), MiMo-V2.6-Distill-Qwen-9B QSA in the setup, long copy drafts on Qwen3.8-27B (edit +23%, swe-bench
++52%), boolean tool arguments, fresh seeds for seedless requests, ABL3 uncensor files. Greedy and seeded outputs are as in
+v1.3.169 (deterministic md5 of the regression configs unchanged).
+
+- QSA on AMD: Qwen3.5-9B QSA runs QSA on HIP too (it ran dense there); Ornith-1.5-9B QSA and Qwen3.8-27B QSA take the
+  same code (not measured on AMD).
+  The HIP build no longer turns QSA off for qwen35 GGUFs with indexers (the 4-line guard in `q27_qsa_setup`); the
+  kernels were already built for HIP. Thanks to issue #51, which removed the guard and measured it on an RX 9070 XT
+  (gfx1201, Qwen3.5-9B QSA Q4_K_M): decode at 100K 55.4 -> 78.7 tok/s, prompt 1,534 -> ~1,990 tok/s, needle 3/3 at 8K /
+  32K / 100K. Checked here on a Radeon 8060S (gfx1151, the iGPU alone, the same file, dense = `STRATA_Q35_QSA=0`, 2 runs
+  each): decode 8K 65.1 -> 65.4 tok/s, 32K 53.2 -> 57.4 (+8%), 128K 30.4 -> 48.1 (1.59x); prompt 8K -6.5%, 32K +11%,
+  128K 326 -> 509-585 tok/s. HIP's QSA against the RTX 5090's QSA (teacher-forced, 1,024 tokens): KL 0.003 / 0.010 /
+  0.053 on an 8K code, a 32K code and a 32K Japanese sample - the same as HIP's dense against the 5090's dense (0.003 /
+  0.010 / 0.059). Needle through the server at 32K / 60K / 100K: 4/4 (dense at 100K 4/4).
+  `STRATA_Q4X_QSA_DECODE` / `STRATA_Q4X_QSA_BATCH` stay off by default on HIP: they belong to Qwen3.8-Flash-Next and
+  do not change these files.
+  CUDA builds are unchanged (the removed lines were HIP-only; the CUDA object code is the same).
+- MiMo-V2.6-Distill-Qwen-9B QSA (BETA): MiMo with Qwen3.5-9B QSA's indexer grafted on.
+  `./setup-deepseek.sh --model mimo-9b-qsa` (Windows: `setup-deepseek.bat --model mimo-9b-qsa`) downloads
+  zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF (Q4_K_M 5.9 GB by default, `--quant Q8_0` 9.6 GB), checks it against Hugging
+  Face's SHA-256, puts Qwen3.5-9B's NextN block in `MTP/` as `--model mimo-9b` does, packs it and writes the config
+  (MiMo's sampling: temperature 0.6, top_p 0.95, top_k 20). Text only.
+  The files are bartowski's MiMo GGUFs byte for byte plus Qwen3.5-9B QSA's 35 indexer tensors and QSA keys (7 QSA layers,
+  layer 3 dense, top_k 4096), not retrained on MiMo. RTX 5090, 128K prompt, against the same file dense
+  (`STRATA_Q35_QSA=0`): decode 208 vs 126 tok/s (Q4_K_M), 181 vs 124 (Q8_0); prompts -8%; KL 0.124 / 0.105 on 6 held-out
+  samples (Qwen3.5-9B QSA 0.032, Ornith-1.5-9B QSA 0.141), nll +0.2% / +0.6%; needle at 125K 4/4 (Q4_K_M; Q8_0 3/4 dense
+  and QSA alike).
+  GPU table measured capped: 11 GB for a 32K context, 12 GB for 128K (at 11 GB a 128K context keeps 1.32 GB of the FFN in
+  RAM: 145 tok/s against 206 at 12 GB); Q8_0 3.7 GB more.
+- Engine: long copy drafts on the dense qwen35 (Qwen3.8-27B, Qwen3.5-9B, MiMo-9B with a NextN drafter): a window copies up
+  to 7 tokens (was 5) from where the text repeats (the longest of the last 4 three-token matches, or an 8-token key
+  table), as many as the measured hit rate and the measured window time say pay best, and only when that beats the
+  NextN rate; `STRATA_Q35_COPY_K=0` = old, `STRATA_Q35_COPY_KEY8=0` drops the key table. The verify window's norms and
+  SwiGLU run one launch over the columns (same math; an 8-column window 28.1 -> 24.9 ms on Qwen3.8-27B;
+  `STRATA_Q35_VERIFY_ROWS=0` = old). RTX 5090, greedy, median of 3, Qwen3.8-27B L-Q4_0: edit 236.1 -> 289.7 tok/s
+  (+22.7%), swe-bench 30 202.5 -> 308.3 (+52.2%), code +6.3%, en +4.2%, ja +3.3%, thinking +3.8%; UD-Q4_K_XL edit +15.6%,
+  swe +10.7%, prose +2.7-8.3%; Qwen3.5-9B edit +21.9% swe +54.4%, MiMo-9B +19.6% / +43.8%. Outputs are the same as
+  without drafts (deterministic md5, 20 pairs).
 - Server: a tool-call parameter the schema declares `boolean` (not `string`) written `True` / `False` (any case, also
   the quoted word) comes back as a JSON bool, not the string `"True"` - Qwen, GLM and DSML forms, whole and streamed.
   Models write Python's spelling with thinking off; clients failed on the type. Other words and string parameters
@@ -22,6 +60,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Engine: a sampled request without a seed gets a fresh seed on the GLM / DeepSeek / Qwen pack path. Before, every
   such request drew from the engine's seed 0 and counter 0, so the same prompt gave the same answer every time
   (regenerate changed nothing). Requests with `seed` and greedy requests are unchanged.
+- Uncensor: ABL3 files - each refusal direction carries its own scale (`--abl-build ... --abl-dir-scales C1,..`), so a
+  second direction (e.g. the medical / legal / financial advice refusals') is taken out less than the first; the V4 0731
+  UD-Q2_K_XL file built this way moves the text KL against the unedited model from 0.0116 to 0.0118 (deterministic,
+  4 texts, 1660 tokens). ABL1 / ABL2 files load as before (deterministic md5 unchanged); an older engine refuses an
+  ABL3 file at start. `--abl-build` also gains `--abl-search N` (per-layer strength profile under a text-KL guard),
+  `--abl-profile` and `--abl-dump`; `tools/abl_prompts.py --text`. Other outputs as in v1.3.169 (deterministic md5 of
+  the 6 regression configs unchanged).
 
 ## v1.3.169 - 2026-11-18
 
