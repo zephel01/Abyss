@@ -4931,7 +4931,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (may_defer && !group_landed(gi)) return gi;
                 const Group& gr = groups[gi];
                 const int b = (int) (gi % PrefillState::NG);
-                uint8_t* gdst = S->gbuf + (size_t) b * PrefillState::GE * P.stride;
+                // group buffer b starts at b x GE slots of the largest stride (gstride), whatever this layer's: at
+                // the layer's own stride a larger-stride layer's buffer 0 reached into the layer before's buffers 1-2,
+                // and its copies waited only for buffer 0's events - they overwrote experts the seed's copies (and
+                // that layer's products) had still to read (mixed-type V4 0731 files: VRAM experts with garbage,
+                // "invalid expert ID or non-finite score" a few tokens on)
+                uint8_t* gdst = S->gbuf + (size_t) b * PrefillState::GE * std::max(S->gstride, P.stride);
                 cudaStreamWaitEvent(F->copy, S->ev_free[b], 0);
                 if (S->seed_s != nullptr) cudaStreamWaitEvent(F->copy, S->ev_seed[b], 0);   // (the seed's copies out)
                 for (int j = 0; j < gr.n; ++j) {

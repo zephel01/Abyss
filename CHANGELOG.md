@@ -7,11 +7,12 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.171 - (draft)
+## v1.3.171 - 2026-11-19
 
-Qwen3.8-27B: z-lab's DFlash 2 block drafter beside the NextN block, on by default where it fits in VRAM (code +22-25%,
-reasoning +20-24% at 128K, Japanese prose unchanged); the setup fetches it. Greedy and seeded outputs are as in
-v1.3.170 (deterministic md5 equal to no drafts; the regression configs unchanged).
+DeepSeek V4 0731 / V4.1 answers no longer stop on files whose layers mix expert types (a prompt-path race), V4 0731
+answers Japanese requests in Japanese, and Qwen3.8-27B gets z-lab's DFlash 2 block drafter beside the NextN block, on
+by default where it fits in VRAM (code +22-25%, reasoning +20-24% at 128K, Japanese prose unchanged; the setup fetches
+it). Greedy and seeded outputs are as in v1.3.170 (deterministic md5 of the regression configs unchanged).
 
 - DFlash 2 on the dense qwen35 path: `src/core/dflash2.cu` (written for Qwen3.8-Flash-Next) now also runs z-lab's
   [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) (5 layers over the target's layers
@@ -44,6 +45,17 @@ v1.3.170 (deterministic md5 equal to no drafts; the regression configs unchanged
   (V4 0731 only; V4.1 and other models unchanged). 8 Japanese prompts x 6 seeds: Chinese answers 14 -> 1 of 48 (the
   original, UD-Q8_K_XL), 16 -> 1 (a 2-bit file); the `ja-en` language profile alone 12 of 48. `STRATA_JA_SYSPROMPT=0`
   = old. The engine is unchanged.
+- DeepSeek V4 0731 / V4.1: a prompt could leave a VRAM expert with garbage bytes, and the answer stopped a few tokens
+  later with "glm router: layer N decode invalid expert ID or non-finite score" (HTTP 422). Files whose MoE layers
+  mix expert types (different slot strides from layer to layer, such as the 32G96G L97 V4 0731 file) hit it, most
+  often on the second turn of a conversation. The prompt path's three staging buffers were placed at the current
+  layer's stride, so a layer with larger experts put its first buffer over the previous layer's second and third ones.
+  Its copies waited only for the first buffer, and they overwrote experts that the post-prompt seed
+  (`STRATA_GLM_SEED_TAIL`, v1.3.147) and that layer's products still had to read. The buffers now sit at the largest
+  stride for every layer. RTX 5090, Gen4 x4, L97: 24 two-turn conversations with `STRATA_GLM_PROMOTE=0`
+  24 -> 0 stops, with the defaults 9 -> 0. Speed is unchanged (4K prompt, 512 tokens, medians of 3: L97, UD-Q2_K_XL,
+  V4.1 JA256, GLM-5.3-Flash within +-1% for prompt and decode, the first 64 tokens within +-3%). The deterministic md5
+  of the regression configs is unchanged.
 
 ## v1.3.170 - 2026-11-18
 
