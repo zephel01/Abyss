@@ -1420,7 +1420,7 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
             s.assign((size_t) L * 2, 0.0f);
             for (int l = 0; l < L; ++l) {
                 const double u = std::fabs(l - x.p) / x.w;
-                const double b = u < 1.0 ? 0.5 * (1.0 + std::cos(M_PI * u)) : 0.0;
+                const double b = u < 1.0 ? 0.5 * (1.0 + std::cos(3.14159265358979323846 * u)) : 0.0;
                 const double m = x.f + (1.0 - x.f) * b;
                 s[(size_t) l * 2] = (float) (x.sa * m);
                 s[(size_t) l * 2 + 1] = (float) (x.sf * m);
