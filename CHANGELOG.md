@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.169 - 2026-11-18
+
+SenseNova-Loop-9B (arch `sensenova_loop`, Apache-2.0) runs on the dense qwen35 path and installs with the one-command setup.
+Other models' outputs are as in v1.3.168 (deterministic md5 of Qwen3.5-9B, Qwen3.5-9B QSA, MiMo-9B, Qwen3.8-27B QSA and
+Ornith-35B unchanged).
+
+- Engine: SenseNova-Loop-9B, a looped Qwen3.5-9B (32 blocks run as 56 layers; blocks 4-27 a second time) with two-stream
+  mHC around the loop. The second pass reads the first pass's weights and keeps its own KV rows and linear-attention
+  state; the mHC routers (gates + Sinkhorn mix) run in one kernel per sublayer on the token, prompt and draft-window
+  paths; RoPE with the file's YaRN (factor 2). One GPU, FFN in VRAM, n-gram drafts (no NextN block). Text only.
+  Against the model's own llama.cpp fork (KL, RTX 5090): Q4_K_M 0.005-0.009 (the engine's level on any Q4_K_M file),
+  Q3_K_M / Q4_0 / Q8_0 0.0002-0.004. Decode 102 / 97 / 63 tok/s at 4K / 32K / 128K (Q4_K_M), prompts 5,120 / 5,045 /
+  3,553 tok/s.
+- `./setup-deepseek.sh --model sensenova-loop-9b` (Windows: `setup-deepseek.bat --model sensenova-loop-9b`) downloads
+  guideboardlabs/SenseNova-Loop-9B-GGUF (Q4_K_M 5.6 GB by default; `--quant Q3_K_M`, `Q4_0` or `Q8_0`), checks each file
+  against Hugging Face's SHA-256, packs it and writes the config (sampling from the GGUF: temperature 1.0, top_p 0.95).
+  GPU table measured capped: 10 GB for a 32K context, 12 GB for 64K, 14 GB for 128K.
+- `tools/iq_pack.py` packs `sensenova_loop` GGUFs (as qwen35 under the file's key prefix; the F32 mHC routers as stored).
+
 ## v1.3.168 - 2026-11-17
 
 MiMo-V2.6-Distill-Qwen-9B in the one-command setup, with Qwen3.5-9B's NextN block as its drafter; the server reads a
