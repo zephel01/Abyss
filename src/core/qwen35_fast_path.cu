@@ -464,10 +464,6 @@ bool Glm5Model::q27_qsa_setup(std::string& err) {
                                  "attention\n");
         return true;
     }
-#if defined(STRATA_USE_HIP)
-    if (l0_ == 0) std::fprintf(stderr, "qwen35: QSA is not built for HIP yet - dense attention\n");
-    return true;
-#endif
     const int64_t ctx = std::max<int64_t>(max_ctx_, 1);
     F->q4_max_blocks = (int) (ctx / q27::kBlock + 2);
     F->q4_cap = (int) q27::cap(g.idx_top_k);
