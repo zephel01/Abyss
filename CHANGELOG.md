@@ -19,7 +19,8 @@ Ornith-35B unchanged).
   paths; RoPE with the file's YaRN (factor 2). One GPU, FFN in VRAM, n-gram drafts (no NextN block). Text only.
   Against the model's own llama.cpp fork (KL, RTX 5090): Q4_K_M 0.005-0.009 (the engine's level on any Q4_K_M file),
   Q3_K_M / Q4_0 / Q8_0 0.0002-0.004. Decode 102 / 97 / 63 tok/s at 4K / 32K / 128K (Q4_K_M), prompts 5,120 / 5,045 /
-  3,553 tok/s.
+  3,553 tok/s. Japanese answers sometimes contain a few Chinese words (3 of 8 prompts; 2 of 8 with
+  `STRATA_LANG=ja-en`); the KL above says this is the model's own habit, not the port.
 - `./setup-deepseek.sh --model sensenova-loop-9b` (Windows: `setup-deepseek.bat --model sensenova-loop-9b`) downloads
   guideboardlabs/SenseNova-Loop-9B-GGUF (Q4_K_M 5.6 GB by default; `--quant Q3_K_M`, `Q4_0` or `Q8_0`), checks each file
   against Hugging Face's SHA-256, packs it and writes the config (sampling from the GGUF: temperature 1.0, top_p 0.95).

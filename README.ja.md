@@ -73,7 +73,7 @@ Ornith でも同じです：**Ornith-1.5-9B QSA**（[zephel01 の Q4_K_M](https:
 **MiMo-V2.6-Distill-Qwen-9B**（Xiaomi による Qwen3.5-9B の SFT、[bartowski の Q4_K_M](https://huggingface.co/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF)、5.8 GB、`--model mimo-9b`、v1.3.168）：4K の生成は 217 tok/s、
 Qwen3.5-9B の NextN ブロックを下書きに使うと 273（ファイル自身には NextN ブロックがありません）。詳しくは [MANUAL](docs/MANUAL.ja.md#mimo-v26-distill-qwen-9b)。
 **SenseNova-Loop-9B**（ループする Qwen3.5-9B: 32 ブロックを 56 層として回し、ループの前後を 2 本の流れの mHC でつなぐ。[guideboardlabs の Q4_K_M](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-GGUF)、5.6 GB、`--model sensenova-loop-9b`、v1.3.169）：
-モデル自身の llama.cpp fork との KL は 0.005〜0.009、RTX 5090 で生成は 4K / 32K / 128K で 102 / 97 / 63 tok/s、32K なら 10 GB の GPU で動きます。文字だけです。詳しくは [MANUAL](docs/MANUAL.ja.md#sensenova-loop-9b)。
+モデル自身の llama.cpp fork との KL は 0.005〜0.009、RTX 5090 で生成は 4K / 32K / 128K で 102 / 97 / 63 tok/s、32K なら 10 GB の GPU で動きます。文字だけです。日本語の回答に中国語の語がときどき混じります（モデル自身の癖です）。詳しくは [MANUAL](docs/MANUAL.ja.md#sensenova-loop-9b)。
 
 **Laguna-S-2.1**（poolside の 118B MoE、[docs/laguna](docs/laguna/README.ja.md)、unsloth の UD-IQ4_XS、58 GB、`--model laguna`、v1.3.140）：RTX 5090 を 16 / 24 / 32 GB に制限、
 4K のプロンプト + 512 トークンで、生成は 42.5 / 50.9 / 60.6 tok/s（v1.3.142。v1.3.140 では 36.3 / 41.4 / 47.4。llama.cpp 32.0 / 38.1 / 43.2）、プロンプトは 859 / 1,005 / 1,174 tok/s（llama.cpp 318 / 391 / 470）。

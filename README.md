@@ -75,7 +75,7 @@ The same on Ornith: **Ornith-1.5-9B QSA** ([zephel01's Q4_K_M](https://huggingfa
 **MiMo-V2.6-Distill-Qwen-9B** (Xiaomi's SFT of Qwen3.5-9B, [bartowski's Q4_K_M](https://huggingface.co/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF), 5.8 GB, `--model mimo-9b`, v1.3.168): decode 217 tok/s at 4K,
 273 with Qwen3.5-9B's NextN block as its drafter (the files have none). Details: [MANUAL](docs/MANUAL.md#mimo-v26-distill-qwen-9b).
 **SenseNova-Loop-9B** (a looped Qwen3.5-9B: 32 blocks run as 56 layers, two-stream mHC around the loop; [guideboardlabs' Q4_K_M](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-GGUF), 5.6 GB, `--model sensenova-loop-9b`, v1.3.169):
-KL 0.005-0.009 against the model's own llama.cpp fork, decode 102 / 97 / 63 tok/s at 4K / 32K / 128K on an RTX 5090, a 10 GB GPU for 32K. Text only. Details: [MANUAL](docs/MANUAL.md#sensenova-loop-9b).
+KL 0.005-0.009 against the model's own llama.cpp fork, decode 102 / 97 / 63 tok/s at 4K / 32K / 128K on an RTX 5090, a 10 GB GPU for 32K. Text only. Japanese answers sometimes contain a few Chinese words (the model's own habit). Details: [MANUAL](docs/MANUAL.md#sensenova-loop-9b).
 
 **Laguna-S-2.1** (poolside, 118B MoE, [docs/laguna](docs/laguna/README.md), unsloth's UD-IQ4_XS, 58 GB, `--model laguna`, v1.3.140): RTX 5090 capped at 16 / 24 / 32 GB,
 4K prompt + 512 tokens: decode 42.5 / 50.9 / 60.6 tok/s (v1.3.142; 36.3 / 41.4 / 47.4 in v1.3.140) against llama.cpp's 32.0 / 38.1 / 43.2, prompts 859 / 1,005 / 1,174 tok/s against 318 / 391 / 470.
