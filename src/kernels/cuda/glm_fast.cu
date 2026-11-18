@@ -4755,11 +4755,19 @@ __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ 
 }
 // h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 1024 K (K 4: 4096, as before; K 8: 8192 - the dense
 // qwen35's 5120), one block of 1024
+// (rms_q8_rows: block b does column b - h, add, x and xq advanced by their strides; one block: rms_q8)
 template <int K>
 __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, const float* __restrict__ add,
                                                       const float* __restrict__ w, float eps, int n,
-                                                      float* __restrict__ x, block_q8_1* __restrict__ xq) {
+                                                      float* __restrict__ x, block_q8_1* __restrict__ xq,
+                                                      int64_t hs = 0, int64_t as = 0, int64_t xs = 0, int64_t qs = 0) {
     __shared__ float sred[32];
+    if (blockIdx.x > 0) {
+        h += blockIdx.x * hs;
+        if (add != nullptr) add += blockIdx.x * as;
+        x += blockIdx.x * xs;
+        xq += blockIdx.x * qs;
+    }
     const int tid = threadIdx.x, lane = tid & 31;
     float v[K];
     float ss = 0.0f;
@@ -6522,6 +6530,14 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
     if (n <= 4096) rms_q8_kernel<4><<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
     else rms_q8_kernel<8><<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
     launch_check("rms_q8");
+}
+
+void rms_q8_rows(float* h, int64_t hs, const float* add, int64_t as, const float* w, float eps, int n, float* x,
+                 int64_t xs, void* xq, int64_t qs, int rows, cudaStream_t s) {
+    if (rows < 1) return;
+    if (n <= 4096) rms_q8_kernel<4><<<rows, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq, hs, as, xs, qs);
+    else rms_q8_kernel<8><<<rows, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq, hs, as, xs, qs);
+    launch_check("rms_q8_rows");
 }
 
 void argmax(const float* x, int n, int* out, cudaStream_t s) {

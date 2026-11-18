@@ -1668,6 +1668,20 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             for (const char* ph : {"norm", "mixer", "norm2", "moe", "head"}) names.push_back("v" + std::to_string(n) + "_" + ph);
     const auto mark = [&](int ph) { if (prof) F->mark(names[(size_t) (T - 1) * 5 + ph].c_str()); };
     if (prof) F->mark("v_start");
+    // STRATA_Q35_VERIFY_ROWS (default 1): the columns' norms one rms_q8_rows launch (each block rms_q8's math) and the
+    // SwiGLU one launch over the columns (elementwise) - the same values as the launches a column, ~5 ms less on an
+    // 8-column window of Qwen3.8-27B (64 layers x 2 norms x 8 columns of ~5 us launches); 0: a launch a column
+    static const bool rows1 = [] { const char* v = getenv("STRATA_Q35_VERIFY_ROWS"); return v == nullptr || std::atoi(v) != 0; }();
+    const auto norm_cols = [&](const float* add, const float* w, float* x, void* xq) {
+        if (rows1) {
+            gf::rms_q8_rows(Rt(0), (int64_t) 2 * E, add, (int64_t) E, w, g.norm_eps, (int) E, x, (int64_t) E, xq,
+                            (int64_t) (E / 32), T, s);
+            return;
+        }
+        for (int t = 0; t < T; ++t)
+            gf::rms_q8(Rt(t), add == nullptr ? nullptr : add + (size_t) t * E, w, g.norm_eps, (int) E, x + (size_t) t * E,
+                       (uint8_t*) xq + (size_t) t * q8e, s);
+    };
     V->q35_p0 = p0;
     for (int t = 0; t < T; ++t) V->q35_toks[t] = toks[(size_t) t];
     if (q35_mtp_on() && !q35_mtp_pend_commit(toks[0], err)) return false;   // (the drafter: the last position's row)
@@ -1702,9 +1716,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                            V->x, nullptr, V->comb, s);
             gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
         } else {
-            for (int t = 0; t < T; ++t)
-                gf::rms_q8(Rt(t), il == l0_ ? nullptr : V->ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, (int) E,
-                           V->x + (size_t) t * E, (uint8_t*) V->xq + (size_t) t * q8e, s);
+            norm_cols(il == l0_ ? nullptr : V->ffn, Ly.attn_norm, V->x, V->xq);
         }
         mark(0);
         if (Ly.recr) {
@@ -1821,9 +1833,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                            V->comb + (size_t) 8 * T, s);
             gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
         } else {
-            for (int t = 0; t < T; ++t)
-                gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, (int) E, V->x + (size_t) t * E,
-                           (uint8_t*) V->xq + (size_t) t * q8e, s);
+            norm_cols(V->mixer, Ly.post_norm, V->x, V->xq);
         }
         mark(2);
         if (!Ly.moe) {   // the dense qwen35 (Qwen3.8-27B): fast_dense_ffn over the columns
@@ -1856,12 +1866,14 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                 if (!mvc(jd, 2, "dense ffn gate / up")) return false;
                 // (a BF16 / F32 down reads h as floats, kept in glm_dg - unsloth's BF16 file)
                 const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
-                for (int t = 0; t < T; ++t) {
+                // (the columns contiguous - FF floats, FF / 32 q8_1 blocks apart: one launch is the launches a column)
+                for (int t = 0; t < (rows1 ? 1 : T); ++t) {
+                    const int nn = rows1 ? T * FF : FF;
                     if (hf)
-                        gf::swiglu_f32(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                        gf::swiglu_f32(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, nn,
                                        V->glm_dg + (size_t) t * FF, s);
                     else
-                        gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                        gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, nn,
                                       (uint8_t*) V->glm_dhq + (size_t) t * hq, s);
                 }
                 gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, hf ? V->glm_dg : nullptr, V->ffn, nullptr, 1.0f,
@@ -1876,9 +1888,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
     }
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "qwen35 verify: output_norm.weight"; return false; }
-    for (int t = 0; t < T; ++t)
-        gf::rms_q8(Rt(t), V->ffn + (size_t) t * E, nw->second, g.norm_eps, (int) E, V->head_x + (size_t) t * E,
-                   (uint8_t*) V->head_xq + (size_t) t * q8e, s);
+    norm_cols(V->ffn, nw->second, V->head_x, V->head_xq);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) E, g.n_vocab};
     if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)

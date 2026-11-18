@@ -477,6 +477,10 @@ void mtp_in(const float* emb, const float* h, const float* enorm, const float* h
             cudaStream_t s);
 /// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 4096.
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
+/// rms_q8 over `rows` columns in one launch, each exactly rms_q8's: column r at h + r hs, add + r as, x + r xs (floats)
+/// and xq + r qs (q8_1 blocks)
+void rms_q8_rows(float* h, int64_t hs, const float* add, int64_t as, const float* w, float eps, int n, float* x,
+                 int64_t xs, void* xq, int64_t qs, int rows, cudaStream_t s);
 
 /// argmax over n floats -> *out (device int).  Ties: lowest index.
 void argmax(const float* x, int n, int* out, cudaStream_t s);

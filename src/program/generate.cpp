@@ -970,8 +970,7 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
-// ================================ the glm5-next pack path (M3.1) ================================
-//
+// ================================ the glm5-next pack path (M3.1) =========================//
 // The speculative decode's drafter: prompt lookup over the whole sequence (prompt + answer).  Every n-gram of the
 // history (n = min_n) maps to the position right after its latest occurrence that is not the sequence's own suffix;
 // propose() continues the latest earlier occurrence of the current suffix by up to k tokens.  swe-bench's prompts and
@@ -990,11 +989,17 @@ struct NgramDrafter {
         // the n-gram that ended one token ago becomes findable (the newest one is the suffix being matched)
         const int64_t end = (int64_t) h_.size() - 2;
         if (end + 1 >= n_) {
-            Occ& o = last_[key(end)];
+            Occ& o = last_[key(end, n_)];
             o.at[o.n++ & 3] = end + 1;
         }
+        if (key8_ && end + 1 >= kLong) last8_[key(end, kLong)] = end + 1;
     }
     bool long_mode() const { return long_; }
+    void set_long(bool on) { long_ = on; }
+    // a second table keyed on the last kLong (8) tokens, its latest occurrence (copy drafts, STRATA_Q35_COPY_KEY8):
+    // in code the trigram's 4 latest occurrences are often all short matches (indentation, "self."), while the
+    // 8-token key finds the place being copied however far back it is
+    void set_key8(bool on) { key8_ = on; }
     // up to k tokens after the chosen earlier occurrence of the current suffix; *match: how many tokens of the
     // suffix that occurrence matches (n.. 64)
     void propose(int k, std::vector<int32_t>& out, int* match = nullptr) const {
@@ -1002,7 +1007,7 @@ struct NgramDrafter {
         if (match) *match = 0;
         const int64_t end = (int64_t) h_.size() - 1;
         if (k <= 0 || end + 1 < n_) return;
-        const auto it = last_.find(key(end));
+        const auto it = last_.find(key(end, n_));
         if (it == last_.end()) return;
         const Occ& o = it->second;
         int64_t best = o.at[(o.n - 1) & 3];
@@ -1019,6 +1024,17 @@ struct NgramDrafter {
                 if (!long_) break;   // (off: the latest, its length only reported)
             }
         }
+        if (key8_ && end + 1 >= kLong) {
+            const auto i8 = last8_.find(key(end, kLong));
+            if (i8 != last8_.end()) {
+                const int64_t c = i8->second;
+                int len = 0;
+                while (len < 64 && c - 1 - len >= 0 && end - len > c - 1 - len &&
+                       h_[(size_t) (c - 1 - len)] == h_[(size_t) (end - len)])
+                    ++len;
+                if (len > best_len) { best_len = len; best = c; }
+            }
+        }
         if (match) *match = best_len;
         for (int64_t i = best; i < (int64_t) h_.size() && (int) out.size() < k; ++i) out.push_back(h_[(size_t) i]);
     }
@@ -1028,15 +1044,17 @@ private:
         int64_t at[4] = {0, 0, 0, 0};
         int n = 0;
     };
-    uint64_t key(int64_t end) const {   // the n tokens ending at `end`
+    uint64_t key(int64_t end, int n) const {   // the n tokens ending at `end`
         uint64_t x = 1469598103934665603ull;
-        for (int64_t i = end - n_ + 1; i <= end; ++i) x = (x ^ (uint64_t) (uint32_t) h_[(size_t) i]) * 1099511628211ull;
+        for (int64_t i = end - n + 1; i <= end; ++i) x = (x ^ (uint64_t) (uint32_t) h_[(size_t) i]) * 1099511628211ull;
         return x;
     }
+    static constexpr int kLong = 8;
     int n_;
-    bool long_ = false;
+    bool long_ = false, key8_ = false;
     std::vector<int32_t> h_;
     std::unordered_map<uint64_t, Occ> last_;
+    std::unordered_map<uint64_t, int64_t> last8_;
 };
 
 // A GLM-5.3-Flash pack (tools/iq_pack.py output) runs the VERIFIED runner - Glm5Model, the same
@@ -2436,11 +2454,39 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_DS4_DSPARK_NGRAM_CHAIN");
                 return v != nullptr ? std::atof(v) : 0.5;
             }();
+            // (copy drafts, 2026-11-18) the dense qwen35 (Qwen3.8-27B, MiMo 9B, Qwen3.5-9B) with its NextN drafter: a
+            // repeat's window holds up to STRATA_Q35_COPY_K drafts (default kVerifyMax - 1 = 7; 0: d_max as before) -
+            // the continuation of the longest of the 4 latest earlier matches of the text being written (an edited
+            // file, a quoted passage).  Its width: the tokens a millisecond it is expected to keep (cost_pick: the
+            // shares right a position - kept apart for matches of >= 16 tokens and shorter ones - against this
+            // process's measured step times by columns); no width beating a single token: the NextN drafter's step.
+            // Every draft is verified, so the output stays the token path's
+            static const int copy_k = [] {
+                const char* v = std::getenv("STRATA_Q35_COPY_K");
+                const int def = strata::core::Glm5Model::kVerifyMax - 1;
+                return v != nullptr ? std::max(0, std::min(def, std::atoi(v))) : def;
+            }();
+            const bool copy = copy_k > d_max && model.geometry().q35_dense() && model.q35_mtp_on() && !model.dflash_on();
+            const int rep_max = copy ? copy_k : d_max;
+            constexpr int kNg = 16;   // (the repeat tables' positions: >= kVerifyMax - 1)
             NgramDrafter dr(spec_min);
+            static const bool copy_key8 = [] {
+                const char* v = std::getenv("STRATA_Q35_COPY_KEY8");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            if (copy) {
+                dr.set_long(true);
+                dr.set_key8(copy_key8);
+            }
             for (const int64_t t : prompt) dr.push((int32_t) t);
             std::vector<int32_t> ng, came;   // the repeat's proposal; the tokens the step produced after tok
-            double ng_pp[5] = {0.8, 0.8, 0.8, 0.8, 0.8};   // the repeats' drafts: the share right at each position
-                                                            // (running means, the positions before right)
+            // the repeats' drafts: the share right at each position (running means, the positions before right); a
+            // second table for copy's long matches
+            double ng_tab[2][kNg];
+            for (auto& r : ng_tab)
+                for (double& x : r) x = 0.8;
+            double* ng_pp = ng_tab[0];
+            int64_t n_cw[kNg + 1] = {};   // copy: the repeats' windows by drafts
             int64_t n_ngw = 0, n_ngd = 0, n_nga = 0;   // the repeats' windows, drafts, accepted
             // STRATA_DS4_DSPARK_FORCE=<ids file> (debug, the drafter against bench/v41dsp/v41_probe.py --compare): the
             // single tokens are the file's (comma-separated, prompt included) at their positions - a teacher-forced
@@ -2495,9 +2541,9 @@ static int glm_pack_generate(const Options& o) {
             // and the single token is re-measured too: every 32nd cost choice goes alone when width 1 has not run
             // for 32 steps (a window-heavy run never refreshed it, so the comparison drifted)
             struct CostTab {
-                double cw[7] = {0, 0, 0, 0, 0, 0, 0};
-                int cw_n[7] = {0, 0, 0, 0, 0, 0, 0};
-                double ring[7][16] = {};
+                double cw[17] = {};   // (columns 1 .. kVerifyMax)
+                int cw_n[17] = {};
+                double ring[17][16] = {};
                 double cal_h[8], cal_n[8];
                 int64_t n_cost = 0, since1 = 0;
                 CostTab() {
@@ -2569,6 +2615,40 @@ static int glm_pack_generate(const Options& o) {
                 cw[cols] = v[n / 2];
                 ct.since1 = cols == 1 ? 0 : ct.since1 + 1;
             };
+            // copy: the width of the most tokens a millisecond expected (a: the shares right a position; a width's time
+            // cw[] when measured, else the line through the two widest measured below it - at least 0.5 ms a column),
+            // run only when it beats the NextN drafter's steps (their tokens over their drafting + window time, a
+            // running mean) and a single token by 5%; every 16th choice tries a width measured fewer than 3 times
+            double mtp_rate = 0.0;
+            int64_t n_copy_pick = 0;
+            const auto copy_pick = [&](const double* a, int kmax, int fallback) {
+                int c_lo = 0;
+                for (int c2 = 1; c2 <= kmax + 1; ++c2)
+                    if (cw_n[c2] > 0) { c_lo = c2; break; }
+                if (c_lo == 0) return fallback;   // (nothing measured yet: the shares' chain rule)
+                if ((++n_copy_pick & 15) == 0)
+                    for (int c2 = 2; c2 <= kmax + 1; ++c2)
+                        if (cw_n[c2] < 3) return c2 - 1;
+                const auto t_of = [&](int c2) {
+                    if (cw_n[c2] > 0) return cw[c2];
+                    int m1 = 0, m2 = 0;   // the widest measured below c2, the one below it
+                    for (int x = c2 - 1; x >= 1 && m2 == 0; --x)
+                        if (cw_n[x] > 0) { if (m1 == 0) m1 = x; else m2 = x; }
+                    if (m1 == 0) return cw[c_lo];
+                    const double sl = m2 > 0 ? std::max(0.5, (cw[m1] - cw[m2]) / (double) (m1 - m2)) : 0.5;
+                    return cw[m1] + sl * (double) (c2 - m1);
+                };
+                double best = 0.0, e = 1.0, q = 1.0;
+                int bk = 0;
+                for (int kk = 1; kk <= kmax; ++kk) {
+                    q *= a[kk - 1];
+                    e += q;
+                    const double v = e / t_of(kk + 1);
+                    if (v > best * 1.02) { best = v; bk = kk; }
+                }
+                const double base = std::max(mtp_rate, cw_n[1] > 0 ? 1.0 / cw[1] : 0.0);
+                return best > base * 1.05 ? bk : 0;
+            };
             // (v1.3.145) an answer's first 16 steps stay out of the cost table: right after a prompt the pool takes
             // back the experts the prompt borrowed and a step runs slower (V4.1 JA256: single tokens there 21.5 ms
             // against 17 later), and the singles a window-heavy answer takes are mostly those - the table's single
@@ -2604,29 +2684,38 @@ static int glm_pack_generate(const Options& o) {
                 const bool d_timed = !cost_fresh || ++d_step > 16;
                 const int64_t p0 = model.position();
                 const int room = (int) std::min<int64_t>(d_max, o.max_context - p0 - 1);
-                int32_t d[5];
-                float c[5];
+                const int room_rep = (int) std::min<int64_t>(rep_max, o.max_context - p0 - 1);
+                int32_t d[kNg];
+                float c[kNg];
                 int k = 0;
                 bool rep = false;   // the drafts are a repeat's (the n-gram's)
                 ng.clear();
-                if (d_ngram && room > 0) {
-                    dr.propose(room, ng);
+                if (d_ngram && room_rep > 0) {
+                    int ml = 0;
+                    dr.propose(room_rep, ng, copy ? &ml : nullptr);
+                    ng_pp = ng_tab[copy && ml >= 16 ? 1 : 0];
                     rep = !ng.empty() && ng_pp[0] >= d_ngp;
                     double pc = 1.0;
                     for (k = 0; rep && k < (int) ng.size() && (k == 0 || pc * ng_pp[k] >= d_ngc); ++k) {
                         pc *= ng_pp[k];
                         d[k] = ng[(size_t) k];
                     }
-                    if (rep && d_cost) {
+                    if (rep && d_cost && !copy) {
                         const int n = std::min<int>((int) ng.size(), 5);
                         for (int i = 0; i < n; ++i) d[i] = ng[(size_t) i];
                         k = cost_pick(ng_pp, n, k);
+                    } else if (rep && copy) {
+                        const int n = (int) ng.size();
+                        for (int i = 0; i < n; ++i) d[i] = ng[(size_t) i];
+                        k = copy_pick(ng_pp, n, k);
+                        if (k == 0) rep = false;   // (the NextN drafter's step instead)
+                        else ++n_cw[k];
                     }
                 }
                 int dk = 0;   // the drafter's drafts this step (all of them: the calibration's)
                 // the repeat's proposal against what the step produces (its accepted drafts, then the next token)
                 const auto ng_learn = [&]() {
-                    for (size_t i = 0; i < ng.size() && i < came.size() && i < 5; ++i) {
+                    for (size_t i = 0; i < ng.size() && i < came.size() && i < (size_t) kNg; ++i) {
                         const bool hit = ng[i] == came[i];
                         ng_pp[i] = 0.95 * ng_pp[i] + 0.05 * (hit ? 1.0 : 0.0);
                         if (!hit) break;
@@ -2688,6 +2777,10 @@ static int glm_pack_generate(const Options& o) {
                     ng_learn();
                     cal_learn();
                     if (d_timed) cw_add(1, m1);
+                    if (copy && dk > 0 && d_timed) {   // (a drafter's step that kept no draft: one token)
+                        const double r = 1.0 / std::max(1e-3, ms_since(td));
+                        mtp_rate = mtp_rate > 0.0 ? 0.9 * mtp_rate + 0.1 * r : r;
+                    }
                     continue;
                 }
                 win.assign(1, (int32_t) tok);
@@ -2749,6 +2842,10 @@ static int glm_pack_generate(const Options& o) {
                 ng_learn();
                 cal_learn();
                 const double mw = ms_since(tw);
+                if (copy && !rep && d_timed) {   // (the drafter's step: its tokens over its drafting + window time)
+                    const double r = (double) came.size() / std::max(1e-3, ms_since(td));
+                    mtp_rate = mtp_rate > 0.0 ? 0.9 * mtp_rate + 0.1 * r : r;
+                }
                 ms_win += mw;
                 if (d_timed) cw_add(k + 1, mw);
                 // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
@@ -2785,6 +2882,18 @@ static int glm_pack_generate(const Options& o) {
                 std::fprintf(stderr, "spec sampling: %lld windows, %lld drafts judged, %lld kept (%.0f%%)\n",
                              (long long) ss_win, (long long) ss_cols, (long long) ss_kept,
                              100.0 * (double) ss_kept / (double) std::max<int64_t>(1, ss_cols));
+=======
+            if (copy)
+                std::fprintf(stderr, "q35 copy: up to %d drafts; the repeats' windows by drafts 1..%d:%s; ms a step by "
+                                     "columns 1..%d:%s; shares right a position (short / long matches):%s /%s; the "
+                                     "NextN steps %.3f tokens a ms\n",
+                             rep_max, rep_max,
+                             [&] { std::string r; for (int i = 1; i <= rep_max; ++i) r += " " + std::to_string(n_cw[i]); return r; }().c_str(),
+                             rep_max + 1,
+                             [&] { std::string r; char b[48]; for (int i = 1; i <= rep_max + 1; ++i) { std::snprintf(b, sizeof b, " %.1f(%d)", cw[i], cw_n[i]); r += b; } return r; }().c_str(),
+                             [&] { std::string r; char b[16]; for (int i = 0; i < rep_max; ++i) { std::snprintf(b, sizeof b, " %.2f", ng_tab[0][i]); r += b; } return r; }().c_str(),
+                             [&] { std::string r; char b[16]; for (int i = 0; i < rep_max; ++i) { std::snprintf(b, sizeof b, " %.2f", ng_tab[1][i]); r += b; } return r; }().c_str(),
+                             mtp_rate);
             if (d_cost)
                 std::fprintf(stderr, "ds4 spec cost: ms a step by columns 1..6: %.1f %.1f %.1f %.1f %.1f %.1f (%d %d %d %d "
                                      "%d %d steps); the drafter's confidence bins kept: %.2f %.2f %.2f %.2f %.2f %.2f "
