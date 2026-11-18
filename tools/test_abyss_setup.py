@@ -97,7 +97,7 @@ class PickQuant(unittest.TestCase):
 
     def test_models_without_pc_sizes(self):
         for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa", "mimo-9b",
-                    "sensenova-loop-9b"):
+                    "sensenova-loop-9b", "mimo-9b-qsa"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
     def test_no_gpu(self):
@@ -763,6 +763,50 @@ class MimoNineB(Qwen35NineBQsa):
             got = A.borrowed_mtp(a, A.MIMO9_MTP_REPO, A.MIMO9_MTP, Path(d), "MiMo")
         self.assertIsNone(got)
         self.assertIn("runs without it", said[-1])
+
+
+class MimoNineBQsa(MimoNineB):
+    """--model mimo-9b-qsa (zephel01's MiMo-V2.6-Distill-Qwen-9B QSA: bartowski's files with Qwen3.5-9B QSA's indexer): the
+    checks of mimo-9b (the same VRAM table, the same borrowed draft block) with zephel01's repo and file names"""
+    KEY = "mimo-9b-qsa"
+
+    def test_the_entry(self):
+        m = A.MODELS[self.KEY]
+        self.assertEqual((m["repo"], m["quant"], m["quants"]),
+                         ("zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF", "Q4_K_M", ("Q4_K_M", "Q8_0")))
+        self.assertEqual(m["env"], {})                                 # (the engine reads the QSA layers from the file)
+        self.assertEqual(m["vram_ctx"], {32768: 11.0, 131072: 12.0})   # (measured capped; 128K at 11 GB is FFN-in-RAM slow)
+        self.assertEqual(m["gpu_min"], 11)
+        self.assertEqual(m["sampling"], A.MODELS["mimo-9b"]["sampling"])
+
+    def test_the_context_a_gpu_holds(self):
+        f = A.dense_context
+        self.assertEqual(f(self.KEY, 11.99, 131072), 131072)
+        self.assertEqual(f(self.KEY, 10.9, 131072), 32768)           # an 11 GB card: 32K, not 128K
+        self.assertIsNone(f(self.KEY, 9.99, 8192))
+        self.assertAlmostEqual(A.dense_need(self.KEY, 32768, "Q8_0"), 11.0 + 9.62 - 5.91)
+        self.assertEqual(f(self.KEY, 15.92, 131072, "Q8_0"), 131072)
+        self.assertIsNone(f(self.KEY, 11.99, 8192, "Q8_0"))
+
+    def test_the_file_and_the_config(self):
+        m = A.MODELS[self.KEY]
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "MiMo-V2.6-Distill-Qwen-9B-QSA-Q4_K_M.gguf", "MiMo-V2.6-Distill-Qwen-9B-QSA-Q8_0.gguf", "README.md",
+            "LICENSE", "LICENSE-Qwen3.5-9B")]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        for q in m["quants"]:
+            with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+                got = A.quant_files(q, m["repo"], m["folder"], m["prefix_tmpl"].format(q=q))
+            self.assertEqual([g[0] for g in got], [f"MiMo-V2.6-Distill-Qwen-9B-QSA-{q}.gguf"])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("mimo-9b-qsa-q4_k_m", Path(d) / "pack", 131072, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("MiMo-V2.6-Distill-Qwen-9B QSA", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "mimo-v2.6-distill-qwen-9b-qsa")
+        self.assertNotIn("env", got)
 
 
 class TestVariants(unittest.TestCase):

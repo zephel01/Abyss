@@ -104,6 +104,7 @@ no images (the file has no image projector). `--model ornith-9b-qsa` is the same
 ./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M (5.9 GB), 64K context
 ./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # the same, 128K context
 ./setup-deepseek.sh --model mimo-9b --download-model                          # MiMo-V2.6-Distill-Qwen-9B-Q4_K_M (5.8 GB), 64K context
+./setup-deepseek.sh --model mimo-9b-qsa --download-model                      # MiMo-V2.6-Distill-Qwen-9B-QSA-Q4_K_M (5.9 GB), 64K context
 ./setup-deepseek.sh --model sensenova-loop-9b --download-model                # SenseNova-Loop-9B-Q4_K_M (5.6 GB), 64K context
 ```
 
@@ -111,6 +112,10 @@ no images (the file has no image projector). `--model ornith-9b-qsa` is the same
 (Q4_K_M 5.8 GB by default, `--quant Q8_0` 9.5 GB), with the same GPU table as Qwen3.5-9B QSA (same shapes, same peaks; a VRAM cap
 was not measured on MiMo). Its files have no NextN block: the setup also fetches Qwen3.5-9B's (0.16 GB) into `MTP/` beside the
 GGUF when it can, and without it MiMo drafts with n-grams only (~20-25% slower decode).
+
+`--model mimo-9b-qsa` (v1.3.170, BETA) is the same with Qwen3.5-9B QSA's indexer grafted on (zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF,
+Q4_K_M 5.9 GB, `--quant Q8_0` 9.6 GB; [MiMo-V2.6-Distill-Qwen-9B QSA](#mimo-v26-distill-qwen-9b-qsa)), the same borrowed draft block.
+Its GPU table was measured capped: 11 GB for a 32K context, 12 GB for 128K (Q8_0 3.7 GB more).
 
 `--model sensenova-loop-9b` (v1.3.169) installs [SenseNova-Loop-9B](#sensenova-loop-9b) from guideboardlabs' GGUFs (Q4_K_M 5.6 GB
 by default; `--quant Q3_K_M` 4.6 GB, `Q4_0` 5.3 GB, `Q8_0` 9.5 GB), each file checked against Hugging Face's SHA-256. Its GPU table
@@ -947,6 +952,38 @@ the sampling is the GGUF's: temperature 0.6, top_p 0.95, top_k 20). Text only.
   At a 128K prompt: decode 117.5 tok/s without the block, 126.0 with it; prompt 6,322 / 6,156 tok/s.
 - **Memory** (uncapped): peak GPU memory 11.17 GB at a 32K context, 14.27 GB at 128K (15.11 GB with the draft block); host RAM 7.1 GB.
   The same as Qwen3.5-9B's, so the setup uses Qwen3.5-9B QSA's GPU table (11 GB for up to 128K, measured with that cap on Qwen).
+
+## MiMo-V2.6-Distill-Qwen-9B QSA
+
+[MiMo-V2.6-Distill-Qwen-9B](#mimo-v26-distill-qwen-9b) with [Qwen3.5-9B QSA](#qwen35-9b-qsa)'s indexer added as it is
+(BETA, zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF, Q4_K_M or Q8_0). MiMo is an SFT of Qwen3.5-9B with the same shapes, so
+the indexer trained on Qwen3.5-9B loads onto it unchanged: the same 7 QSA layers, layer 3 dense, `top_k` 4096. It was not
+trained on MiMo. MiMo's weights, keys and chat template are bartowski's files byte for byte; only the 35 indexer tensors
+and the QSA keys are added. From v1.3.170 `./setup-deepseek.sh --model mimo-9b-qsa` installs it, with the same borrowed
+draft block in `MTP/` as `--model mimo-9b`. Text only. `STRATA_Q35_QSA=0` runs the same file dense.
+
+- **Quality** (128K, teacher-forced on the last 1,024 tokens of the 8 held-out samples used for Qwen3.5-9B QSA, against
+  the same file dense): mean KL 0.124 on Q4_K_M, 0.105 on Q8_0 without the 2 agent samples (0.234 / 0.213 with them);
+  nll +0.2% / +0.6% on average. Qwen3.5-9B QSA: 0.032; Ornith-1.5-9B QSA, retrained on Ornith: 0.141. Over +2% against
+  dense: English 2 (+4.8%) and agent 3 (+2.1%) on Q4_K_M, agent 3 (+2.5%) on Q8_0.
+- **Needle at 125K** (3 planted tags + a function's value, server, thinking on): Q4_K_M 4/4 with QSA and dense; Q8_0 3/4
+  with both (the same answer: the function's value skipped the thinking and came out wrong). The tags are named
+  `BUILD_TAG_*`: MiMo declines to quote `SECRET_*` strings.
+- **Speed** (RTX 5090, 129,872-token chat prompt + 256 tokens, the borrowed draft block on, 2 runs each with the same
+  outputs):
+
+  | | decode dense | decode QSA | prompt dense / QSA |
+  |---|---|---|---|
+  | Q4_K_M | 126.4 tok/s | **208.0 tok/s** (1.65x) | 6,155 / 5,665 tok/s |
+  | Q8_0 | 124.2 tok/s | **180.7 tok/s** (1.45x) | 6,248 / 5,742 tok/s |
+
+  At 32K (QSA): 287.8 tok/s (Q4_K_M), 226.2 (Q8_0); MiMo without the indexer 227.1.
+- **Memory** (GPU peak from nvidia-smi; capped with `STRATA_GLM_VRAM_GB`): uncapped 11.67 / 15.36 GB at 32K / 128K
+  (Q4_K_M), 14.65 / 18.34 GB (Q8_0). Q4_K_M capped: 32K at 11 GB all in VRAM, 268 tok/s; 128K at 11 GB puts 1.32 GB of the
+  FFN in RAM and drops to 145 tok/s, at 12 GB 206 tok/s (peak 11.24 GB), at 13 GB all in VRAM. Q8_0 128K at 15 GB: 181
+  tok/s. Qwen3.5-9B QSA holds 128K at full speed at 11 GB; MiMo's borrowed draft block and its verify window take that
+  room. So the setup's table is 11 GB for 32K and 12 GB for 128K (Q8_0 3.7 GB more).
+- llama.cpp refuses the files (`wrong number of tensors; expected 462, got 427`).
 
 ## SenseNova-Loop-9B
 

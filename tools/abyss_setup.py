@@ -14,6 +14,7 @@
     ./setup-deepseek.sh --model qwen35-9b-qsa  Qwen3.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model ornith-9b-qsa  Ornith-1.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model mimo-9b     MiMo-V2.6-Distill-Qwen-9B (dense, bartowski's Q4_K_M) for an 11 GB+ GPU
+    ./setup-deepseek.sh --model mimo-9b-qsa  MiMo-V2.6-Distill-Qwen-9B QSA (zephel01's Q4_K_M with Qwen3.5-9B QSA's indexer) for an 11 GB+ GPU (128K: 12 GB)
     ./setup-deepseek.sh --model sensenova-loop-9b  SenseNova-Loop-9B (looped dense, guideboardlabs' Q4_K_M) for a 10 GB+ GPU
     ./setup-deepseek.sh --model qwen35       Qwen3.5-122B-A10B, zephel01's IQ3_XXS-B2 for a 16 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
@@ -115,6 +116,16 @@ MIMO9_QUANTS = {"Q4_K_M": (5.84, True), "Q8_0": (9.55, True)}
 # MTP/ beside the GGUF, where the engine takes it by itself; when the repo does not have it (yet), MiMo runs without it
 MIMO9_MTP_REPO = "zephel01/MiMo-V2.6-Distill-Qwen-9B-MTP-GGUF"
 MIMO9_MTP = "mtp-Qwen3.5-9B-Q4_K_M.gguf"
+# MiMo-V2.6-Distill-Qwen-9B QSA ("mimo-9b-qsa", BETA): bartowski's MiMo GGUFs with Qwen3.5-9B QSA's indexer added as it is
+# (the same 7 layers, layer 3 dense, top_k 4096; not trained on MiMo).  RTX 5090, borrowed draft block on (bench/mimo9b/
+# results.md, 2026-11-18): GPU peaks 11.67 / 15.36 GB at 32K / 128K uncapped (Q4_K_M).  Capped with STRATA_GLM_VRAM_GB, Q4_K_M:
+# 32K at 11 GB all in VRAM (268 tok/s); 128K at 11 GB puts 1.32 GB of FFN in RAM (145 tok/s against 208 uncapped), at 12 GB
+# one layer's last 256 rows (206 tok/s), at 13 GB none; Q8_0 128K at 15 GB 181 tok/s (= uncapped), which the +3.71 GB
+# shift (dense_shift) covers.  Unlike Qwen3.5-9B QSA (128K at the same speed at 11 GB) the borrowed draft block and its
+# verify window take the room, so the table is 11 GB for 32K, 12 GB for 128K.
+# Files: Q4_K_M 5,914,462,912 bytes, Q8_0 9,619,393,216 bytes
+MIMO9Q_VRAM = {32768: 11.0, 131072: 12.0}
+MIMO9Q_QUANTS = {"Q4_K_M": (5.91, True), "Q8_0": (9.62, True)}
 # SenseNova-Loop-9B ("sensenova-loop-9b", arch sensenova_loop): a looped Qwen3.5-9B (32 blocks run as 56 layer visits - blocks 4-27
 # once more after the first pass, each visit with its own KV rows and linear-attention state - with two-stream mHC around
 # the loop), guideboardlabs' GGUFs (Apache-2.0).  No NextN block: n-gram drafts.  Measured on an RTX 5090, Q4_K_M
@@ -218,6 +229,15 @@ MODELS = {
                 "prefix": "mimo-9b", "title": "MiMo-V2.6-Distill-Qwen-9B", "env": {}, "gb": 6, "pack_args": [],
                 "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
                 "vram_ctx": QSA9_VRAM, "gpu_min": 11},
+    # MiMo-V2.6-Distill-Qwen-9B QSA (BETA): zephel01's GGUFs, one file a quant at the repo's top level - mimo-9b's files
+    # with Qwen3.5-9B QSA's indexer grafted on.  The engine reads the QSA layers from the file (as qwen35-9b-qsa); drafts
+    # with the same borrowed block as mimo-9b; MiMo's chat template and sampling.  Text only
+    "mimo-9b-qsa": {"repo": "zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF", "quant": "Q4_K_M", "quants": tuple(MIMO9Q_QUANTS),
+                    "quant_gb": MIMO9Q_QUANTS, "picks": tuple(MIMO9Q_QUANTS), "folder": "",
+                    "prefix_tmpl": "MiMo-V2.6-Distill-Qwen-9B-QSA-{q}.", "model_name": "mimo-v2.6-distill-qwen-9b-qsa",
+                    "prefix": "mimo-9b-qsa", "title": "MiMo-V2.6-Distill-Qwen-9B QSA", "env": {}, "gb": 6,
+                    "pack_args": [], "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+                    "vram_ctx": MIMO9Q_VRAM, "gpu_min": 11},
     # SenseNova-Loop-9B: guideboardlabs' GGUFs, one file a quant at the repo's top level; the chat template and the sampling
     # (temperature 1.0, top_p 0.95: general.sampling in the GGUF) are the file's.  One GPU only (the engine runs the loop
     # on one device).  Text only
@@ -970,10 +990,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1118,7 +1138,7 @@ def main() -> int:
     mtp = None
     if (model.get("quant_gb") or {}).get(quant, (0, True))[1] is False:
         mtp = side_file(a, repo, DENSE27_MTP, mdir, "the NextN draft block (this file has none)")
-    if a.model == "mimo-9b":
+    if a.model in ("mimo-9b", "mimo-9b-qsa"):
         mtp = borrowed_mtp(a, MIMO9_MTP_REPO, MIMO9_MTP, mdir, model["title"])
 
     S.step(5, "the pack")
@@ -1188,7 +1208,7 @@ def main() -> int:
              else " (Qwen3.5-9B QSA drafts with its own NextN block from the file)" if a.model == "qwen35-9b-qsa"
              else " (Ornith-1.5-9B QSA drafts with its own NextN block from the file)" if a.model == "ornith-9b-qsa"
              else (" (MiMo-V2.6-Distill-Qwen-9B drafts with Qwen3.5-9B's NextN block, MTP/)" if mtp else
-                   " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model == "mimo-9b"
+                   " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model in ("mimo-9b", "mimo-9b-qsa")
              else " (SenseNova-Loop-9B: no draft block - n-gram drafts)" if a.model == "sensenova-loop-9b" else ""))
     if a.model == "qwen38":
         dflash_step(a, data, cfg, gpus)

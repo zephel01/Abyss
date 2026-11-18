@@ -101,6 +101,7 @@ QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BET
 ./setup-deepseek.sh --model ornith-9b-qsa --download-model                    # Ornith-1.5-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
 ./setup-deepseek.sh --model ornith-9b-qsa --context 131072 --download-model   # 同じファイルで文脈 128K
 ./setup-deepseek.sh --model mimo-9b --download-model                          # MiMo-V2.6-Distill-Qwen-9B-Q4_K_M（5.8 GB）、文脈 64K
+./setup-deepseek.sh --model mimo-9b-qsa --download-model                      # MiMo-V2.6-Distill-Qwen-9B-QSA-Q4_K_M（5.9 GB）、文脈 64K
 ./setup-deepseek.sh --model sensenova-loop-9b --download-model                # SenseNova-Loop-9B-Q4_K_M（5.6 GB）、文脈 64K
 ```
 
@@ -108,6 +109,10 @@ QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BET
 （既定は Q4_K_M 5.8 GB、`--quant Q8_0` で 9.5 GB）。GPU の表は Qwen3.5-9B QSA と同じです（形も最大値も同じ。MiMo では VRAM を制限した
 計測はしていません）。ファイルに NextN ブロックがないので、取れるときは Qwen3.5-9B のもの（0.16 GB）を GGUF の横の `MTP/` に
 取ってきます。ないときは n-gram の下書きだけで動きます（生成が 20〜25% ほど遅い）。
+
+`--model mimo-9b-qsa`（v1.3.170、BETA）は、同じものに Qwen3.5-9B QSA の indexer を移植したものです（zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF、
+Q4_K_M 5.9 GB、`--quant Q8_0` で 9.6 GB。[MiMo-V2.6-Distill-Qwen-9B QSA](#mimo-v26-distill-qwen-9b-qsa)）。下書きブロックも同じく借りたものです。
+GPU の表は制限して計測しました: 文脈 32K が 11 GB、128K が 12 GB（Q8_0 は 3.7 GB 多く）。
 
 `--model sensenova-loop-9b`（v1.3.169）は [SenseNova-Loop-9B](#sensenova-loop-9b) を guideboardlabs の GGUF から入れます（既定は Q4_K_M 5.6 GB、
 `--quant Q3_K_M` で 4.6 GB、`Q4_0` で 5.3 GB、`Q8_0` で 9.5 GB）。各ファイルは Hugging Face の SHA-256 で確かめます。GPU の表は
@@ -896,6 +901,36 @@ temperature 0.6、top_p 0.95、top_k 20）。文字だけです。
   128K のプロンプトでは、生成がブロックなし 117.5 tok/s、あり 126.0、プロンプトは 6,322 / 6,156 tok/s。
 - **メモリ**（制限なし）: GPU メモリの最大は文脈 32K で 11.17 GB、128K で 14.27 GB（下書きブロックありで 15.11 GB）。ホストの RAM は 7.1 GB。
   Qwen3.5-9B と同じなので、セットアップは Qwen3.5-9B QSA の GPU の表（128K まで 11 GB。Qwen で制限して計測）を使います。
+
+## MiMo-V2.6-Distill-Qwen-9B QSA
+
+[MiMo-V2.6-Distill-Qwen-9B](#mimo-v26-distill-qwen-9b) に [Qwen3.5-9B QSA](#qwen35-9b-qsa) の indexer をそのまま足したものです
+（BETA、zephel01/MiMo-V2.6-Distill-Qwen-9B-QSA-GGUF、Q4_K_M か Q8_0）。MiMo は Qwen3.5-9B の SFT で形が同じなので、Qwen3.5-9B で
+学習した indexer がそのまま載ります（QSA は同じ 7 層、層 3 は dense、`top_k` 4096）。MiMo では学習していません。MiMo の重み・
+キー・チャットテンプレートは bartowski のファイルのままで、足したのは indexer のテンソル 35 本と QSA のキーだけです。
+v1.3.170 から `./setup-deepseek.sh --model mimo-9b-qsa` で入れられます。下書きブロックは `--model mimo-9b` と同じく借りたものを
+`MTP/` に置きます。文字だけです。`STRATA_Q35_QSA=0` で同じファイルを dense で動かせます。
+
+- **品質**（128K。Qwen3.5-9B QSA と同じ評価用の 8 本の最後の 1,024 トークンを teacher-forced で採点し、同じファイルの dense と比べる）:
+  エージェントの 2 本を除いた KL の平均は Q4_K_M 0.124、Q8_0 0.105（2 本を含めると 0.234 / 0.213）。nll の差の平均は +0.2% / +0.6%。
+  Qwen3.5-9B QSA は 0.032、Ornith で学習し直した Ornith-1.5-9B QSA は 0.141。dense より +2% を超えたのは、Q4_K_M の英語 2（+4.8%）と
+  エージェント 3（+2.1%）、Q8_0 のエージェント 3（+2.5%）です。
+- **125K のニードル**（埋め込んだタグ 3 つ + 関数の値、サーバー経由、thinking あり）: Q4_K_M は QSA・dense とも 4/4。Q8_0 は両方 3/4 で
+  答えも同じ（関数の値を考えずに答えて外した）。タグの名前は `BUILD_TAG_*` です。`SECRET_*` だと MiMo は引用を断ります。
+- **速さ**（RTX 5090、129,872 トークンのチャットのプロンプト + 256 トークン、借りた下書きブロックあり、各 2 回で同じ出力）:
+
+  | | dense の生成 | QSA の生成 | プロンプト dense / QSA |
+  |---|---|---|---|
+  | Q4_K_M | 126.4 tok/s | **208.0 tok/s**（1.65 倍） | 6,155 / 5,665 tok/s |
+  | Q8_0 | 124.2 tok/s | **180.7 tok/s**（1.45 倍） | 6,248 / 5,742 tok/s |
+
+  32K（QSA）では 287.8 tok/s（Q4_K_M）、226.2（Q8_0）。indexer なしの MiMo は 227.1。
+- **メモリ**（GPU のピークは nvidia-smi。制限は `STRATA_GLM_VRAM_GB`）: 制限なしで 32K / 128K が 11.67 / 15.36 GB（Q4_K_M）、
+  14.65 / 18.34 GB（Q8_0）。Q4_K_M を制限すると、32K は 11 GB で全部 VRAM に載り 268 tok/s。128K は 11 GB では FFN の 1.32 GB が
+  RAM に回って 145 tok/s に下がり、12 GB で 206 tok/s（ピーク 11.24 GB）、13 GB で全部 VRAM に載ります。Q8_0 の 128K は 15 GB で
+  181 tok/s。Qwen3.5-9B QSA は 11 GB で 128K が同じ速さで動きますが、MiMo では借りた下書きブロックと検証の窓がその分を使います。
+  そのためセットアップの表は 32K が 11 GB、128K が 12 GB です（Q8_0 は 3.7 GB 多く）。
+- llama.cpp では読み込めません（`wrong number of tensors; expected 462, got 427`）。
 
 ## SenseNova-Loop-9B
 
