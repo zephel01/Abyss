@@ -57,7 +57,10 @@ whole cache); it slows most where the cache pushes weights out of VRAM (Qwen3.8-
 ## 3. Memory the context takes
 
 The KV cache (what the model keeps of the conversation) is set aside at start for the whole `--max-context`, in VRAM.
-What is left after it goes to the model's weights (the expert pool). Measured from the engine's start-up lines:
+What is left after it goes to the model's weights (the expert pool). From v1.3.176 the qwen35 family (Qwen3.8,
+Ornith, Laguna) on one CUDA GPU maps the KV only as the conversation reaches it and lends the rest to the weights
+until the KV needs it (`--kv-elastic`, the default; `--kv-elastic 0` = the fixed layout below). The table is the fixed
+layout, i.e. a full context. Measured from the engine's start-up lines:
 
 | Model | KV at 128K | KV at 256K | VRAM used before the experts, 256K |
 |---|---|---|---|
