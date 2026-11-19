@@ -3495,13 +3495,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             if (!dense_env && strata::kernels::mrope_table() == nullptr)
                                 nd = (int) std::max<int64_t>(0, std::min<int64_t>(tn, (int64_t) g.idx_top_k + 3 - pt0));
                         }
-                        // an FP16 cache: the one-pass tensor-core kernel (prompt_flash_attn); else, or with
-                        // STRATA_PROMPT_FA_OLD=1 / an explicit STRATA_Q35_PATTN, attn_prompt's kernels
+                        // an FP16 or int8 cache: the one-pass tensor-core kernel (prompt_flash_attn); else (q4_0,
+                        // k8v4), or with STRATA_PROMPT_FA_OLD=1 / an explicit STRATA_Q35_PATTN, attn_prompt's kernels
                         static const bool q35_pattn = getenv("STRATA_Q35_PATTN") != nullptr;
                         if (nd > 0 &&
-                            (q35_kv_ != 0 || q35_pattn ||
+                            ((q35_kv_ != 0 && q35_kv_ != 2) || q35_pattn ||
                              !strata::kernels::fpa::attn(B.q, Ly.kc, Ly.vc, 0, g.n_head, g.attn_head_kv, D, pt0, nd, 0,
-                                                         1.0f / std::sqrt((float) D), B.ao, s)))
+                                                         1.0f / std::sqrt((float) D), B.ao, s, q35_kv_)))
                             q35::attn_prompt(B.q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, nd,
                                              1.0f / std::sqrt((float) D), B.ao, s, q35_kv_);
                         if (q27 && nd < tn) {

@@ -16,9 +16,11 @@ namespace strata::kernels::fpa {
 /// out[t][h] = softmax(scale * q[t][h] . K[j]) V[j] over the positions j of row t (p = p0 + t): lo..p with lo =
 /// max(0, p - window + 1) (window 0: lo = 0), K / V of KV head h / (n_head / n_head_kv) read from cache row j % ring
 /// (ring 0: row j) of kc / vc ([rows][n_head_kv][head_dim] FP16).  q, out: [T][n_head][head_dim] F32.
-/// head_dim 128 or 256.  Returns false (nothing launched) where this kernel does not run: a HIP build, a device under
-/// sm_80, another head_dim, STRATA_PROMPT_FA_OLD=1 - the caller then runs its own (the old) kernel.
+/// head_dim 128 or 256.  kv: the cache format - 0 FP16, 2 int8 (qwen35_fast.hpp's --kv int8 rows: head_dim / 32 FP16
+/// scales, then head_dim int8 codes; each value enters as FP16((float) code * scale), as in the older kernels).
+/// Returns false (nothing launched) where this kernel does not run: a HIP build, a device under sm_80, another
+/// head_dim or kv, STRATA_PROMPT_FA_OLD=1 - the caller then runs its own (the old) kernel.
 bool attn(const float* q, const uint16_t* kc, const uint16_t* vc, int64_t ring, int n_head, int n_head_kv,
-          int head_dim, int64_t p0, int T, int window, float scale, float* out, cudaStream_t s);
+          int head_dim, int64_t p0, int T, int window, float scale, float* out, cudaStream_t s, int kv = 0);
 
 }  // namespace strata::kernels::fpa

@@ -52,6 +52,15 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool on) 
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(n));
 #endif
 }
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool on) {
+#if STRATA_FPA_ON != 1
+    __trap();
+#else
+    const unsigned d = (unsigned) __cvta_generic_to_shared(dst);
+    const int n = on ? 8 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(d), "l"(src), "r"(n));
+#endif
+}
 __device__ __forceinline__ void cp_async_commit() {
 #if STRATA_FPA_ON == 1
     asm volatile("cp.async.commit_group;\n" ::);
@@ -73,26 +82,35 @@ __device__ __forceinline__ uint32_t pack_h2(float lo, float hi) {
 // memory in tiles of BN (two buffers, cp.async), each warp S = Q K^T on tensor cores, the masked online softmax in
 // registers (a row's max / sum over the 4 lanes that hold it), O += P V with P from the S fragments.
 //   D 128: q's fragments in registers;  D 256: q in shared memory, its fragments loaded a tile at a time.
-template <int D, int BN, int W>
+//   F 2 (--kv int8, qwen35_fast.hpp's row: D / 32 FP16 scales, then the D int8 codes - 272 B a row at D 256): the
+//   rows' bytes stream into one staging tile (cp.async), and the block turns them into one FP16 K / V tile - each
+//   value (float) code * scale rounded to FP16, the same operands the old two-pass kernel built - before the products;
+//   the next tile's bytes load while the warps work on this one.  (A single FP16 tile: D 256's two FP16 buffers, the
+//   staging and q would pass the 99 KB a block of sm_120.)
+template <int D, int BN, int W, int F = 0>
 struct Cfg {
     static constexpr int BM = 16 * W;                      // query rows a block: a warp 16 rows of one KV group
     static constexpr int KS = D + 8;                       // a row's pitch in halves (conflict-free fragments)
     static constexpr bool QREG = D <= 128;
-    static constexpr size_t kv_bytes = (size_t) 2 * 2 * BN * KS * 2;   // K, V, two buffers
+    static constexpr int RB = D / 32 * 2 + D;              // F 2: a cache row's bytes
+    static constexpr int CB = RB % 16 == 0 ? 16 : 8;       // F 2: its cp.async pieces
+    static constexpr size_t kv_bytes = F == 2 ? (size_t) 2 * BN * KS * 2 + (size_t) 2 * BN * RB
+                                              : (size_t) 2 * 2 * BN * KS * 2;   // K, V: two buffers (F 2: one + staging)
     static constexpr size_t q_bytes = (size_t) BM * KS * 2;
     static constexpr size_t smem = QREG ? (kv_bytes > q_bytes ? kv_bytes : q_bytes) : kv_bytes + q_bytes;
 };
 
-template <int D, int BN, int W>
+template <int D, int BN, int W, int F>
 __global__ void __launch_bounds__(W * 32) fpa_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
                                                           const __half* __restrict__ vc, int64_t ring, int n_head,
                                                           int n_kv, int G, int64_t p0, int T, int window, float qscale,
                                                           float* __restrict__ out) {
-    using C = Cfg<D, BN, W>;
+    using C = Cfg<D, BN, W, F>;
     constexpr int KS = C::KS, kBM = C::BM, kWarps = W;
     extern __shared__ __align__(16) unsigned char fpa_sm[];
-    __half* sKV = reinterpret_cast<__half*>(fpa_sm);   // [buf][K, V][BN][KS]
-    __half* sQ = C::QREG ? sKV : sKV + 2 * 2 * BN * KS;  // [kBM][KS] (D 128: before the tiles, aliased)
+    __half* sKV = reinterpret_cast<__half*>(fpa_sm);   // [buf][K, V][BN][KS] (F 2: one buffer, then the staging)
+    unsigned char* sRaw = fpa_sm + (size_t) 2 * BN * KS * 2;   // F 2: [K, V][BN][RB]
+    __half* sQ = C::QREG ? sKV : reinterpret_cast<__half*>(fpa_sm + (C::kv_bytes + 15) / 16 * 16);  // [kBM][KS] (D 128: aliased)
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
     const int g = blockIdx.y;
     const int rows = T * G, rb = blockIdx.x * kBM;
@@ -155,22 +173,76 @@ __global__ void __launch_bounds__(W * 32) fpa_kernel(const float* __restrict__ q
         }
         cp_async_commit();
     };
+    // F 2: tile kt's raw rows into the staging, then (all threads, after the wait) into the FP16 tile
+    const auto load_raw = [&](int64_t kt) {
+        const unsigned char* kb = reinterpret_cast<const unsigned char*>(kc);
+        const unsigned char* vb = reinterpret_cast<const unsigned char*>(vc);
+        constexpr int NP = C::RB / C::CB;
+        for (int i = tid; i < BN * NP; i += kWarps * 32) {
+            const int row = i / NP, c = i % NP;
+            const int64_t kp = kt + row;
+            const bool on = kp >= blo && kp <= bhi;
+            const int64_t rr = on ? (ring > 0 ? kp % ring : kp) : 0;
+            const size_t off = ((size_t) rr * n_kv + g) * C::RB + (size_t) c * C::CB;
+            unsigned char* dk = sRaw + row * C::RB + c * C::CB;
+            if constexpr (C::CB == 16) {
+                cp_async16(dk, kb + off, on);
+                cp_async16(dk + BN * C::RB, vb + off, on);
+            } else {
+                cp_async8(dk, kb + off, on);
+                cp_async8(dk + BN * C::RB, vb + off, on);
+            }
+        }
+        cp_async_commit();
+    };
+    // 8 codes a step into FP16 code * scale, the bits of qwen35_fast.cu's FP16((float) code * scale): the code is
+    // exact in FP16 (0x6400 | (code + 128) is 1024 + code + 128, less 1152), and an FP16 product is the exact product
+    // rounded once to FP16 - as the F32 product (exact: 8 x 11 bits) rounded to FP16
+    const auto dequant = [&] {
+        const __half2 bias = __half2half2(__ushort_as_half((unsigned short) 0x6480));   // 1152
+        for (int i = tid; i < 2 * BN * (D / 8); i += kWarps * 32) {
+            const int kvh = i / (BN * (D / 8)), j = i % (BN * (D / 8)), row = j / (D / 8), c = j % (D / 8);
+            const unsigned char* rb = sRaw + (kvh * BN + row) * C::RB;
+            const __half2 d2 = __half2half2(reinterpret_cast<const __half*>(rb)[c >> 2]);
+            const uint2 w = *reinterpret_cast<const uint2*>(rb + D / 32 * 2 + c * 8);
+            const uint32_t x0 = w.x ^ 0x80808080u, x1 = w.y ^ 0x80808080u;
+            uint32_t pu[4] = {__byte_perm(x0, 0x64u, 0x4140), __byte_perm(x0, 0x64u, 0x4342), __byte_perm(x1, 0x64u, 0x4140),
+                              __byte_perm(x1, 0x64u, 0x4342)};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                __half2 h = __hsub2(*reinterpret_cast<__half2*>(&pu[e]), bias);
+                h = __hmul2(h, d2);
+                pu[e] = *reinterpret_cast<uint32_t*>(&h);
+            }
+            *reinterpret_cast<uint4*>(sKV + (kvh * BN + row) * KS + c * 8) = make_uint4(pu[0], pu[1], pu[2], pu[3]);
+        }
+    };
 
     float o[D / 8][4];
 #pragma unroll
     for (int n = 0; n < D / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float mA = -INFINITY, mB = -INFINITY, lA = 0.0f, lB = 0.0f;
 
-    load(kt0, 0);
+    if constexpr (F == 2) load_raw(kt0);
+    else load(kt0, 0);
     int buf = 0;
     for (int64_t kt = kt0; kt <= bhi; kt += BN, buf ^= 1) {
-        if (kt + BN <= bhi) {
-            load(kt + BN, buf ^ 1);
-            cp_async_wait<1>();
-        } else {
+        if constexpr (F == 2) {
+            buf = 0;
             cp_async_wait<0>();
+            __syncthreads();   // (the raw tile in; every warp done with the last FP16 tile)
+            dequant();
+            __syncthreads();   // (the FP16 tile ready; the staging free)
+            if (kt + BN <= bhi) load_raw(kt + BN);
+        } else {
+            if (kt + BN <= bhi) {
+                load(kt + BN, buf ^ 1);
+                cp_async_wait<1>();
+            } else {
+                cp_async_wait<0>();
+            }
+            __syncthreads();
         }
-        __syncthreads();
         const __half* sk = sKV + (size_t) buf * 2 * BN * KS;
         const __half* sv = sk + BN * KS;
         if (wact && kt <= whi && kt + BN - 1 >= wlo) {
@@ -282,14 +354,14 @@ __global__ void __launch_bounds__(W * 32) fpa_kernel(const float* __restrict__ q
     }
 }
 
-template <int D, int BN, int W>
+template <int D, int BN, int W, int F = 0>
 bool launch(int dev, const float* q, const uint16_t* kc, const uint16_t* vc, int64_t ring, int n_head, int n_kv,
             int64_t p0, int T, int window, float scale, float* out, cudaStream_t s) {
-    using C = Cfg<D, BN, W>;
+    using C = Cfg<D, BN, W, F>;
     static int oks[64] = {};   // a device's: 1 set, -1 refused
     int& ok = oks[dev];
     if (ok == 0) {
-        ok = cudaFuncSetAttribute(fpa_kernel<D, BN, W>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) C::smem) ==
+        ok = cudaFuncSetAttribute(fpa_kernel<D, BN, W, F>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) C::smem) ==
                      cudaSuccess
                  ? 1
                  : -1;
@@ -299,7 +371,7 @@ bool launch(int dev, const float* q, const uint16_t* kc, const uint16_t* vc, int
     const int G = n_head / n_kv;
     const dim3 grid((unsigned) ((T * G + C::BM - 1) / C::BM), (unsigned) n_kv);
     const float log2e = 1.4426950408889634f;
-    fpa_kernel<D, BN, W><<<grid, W * 32, C::smem, s>>>(q, reinterpret_cast<const __half*>(kc),
+    fpa_kernel<D, BN, W, F><<<grid, W * 32, C::smem, s>>>(q, reinterpret_cast<const __half*>(kc),
                                                           reinterpret_cast<const __half*>(vc), ring, n_head, n_kv, G, p0,
                                                           T, window, scale * log2e, out);
     return true;
@@ -309,17 +381,17 @@ bool launch(int dev, const float* q, const uint16_t* kc, const uint16_t* vc, int
 }  // namespace
 
 bool attn(const float* q, const uint16_t* kc, const uint16_t* vc, int64_t ring, int n_head, int n_head_kv,
-          int head_dim, int64_t p0, int T, int window, float scale, float* out, cudaStream_t s) {
+          int head_dim, int64_t p0, int T, int window, float scale, float* out, cudaStream_t s, int kv) {
 #if STRATA_FPA_ON == 0
     (void) q, (void) kc, (void) vc, (void) ring, (void) n_head, (void) n_head_kv, (void) head_dim, (void) p0, (void) T;
-    (void) window, (void) scale, (void) out, (void) s;
+    (void) window, (void) scale, (void) out, (void) s, (void) kv;
     return false;
 #else
     static const bool old = [] {
         const char* v = getenv("STRATA_PROMPT_FA_OLD");
         return v != nullptr && std::atoi(v) != 0;
     }();
-    if (old || T <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0) return false;
+    if (old || T <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0 || (kv != 0 && kv != 2)) return false;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
         cudaGetLastError();
@@ -336,6 +408,11 @@ bool attn(const float* q, const uint16_t* kc, const uint16_t* vc, int64_t ring, 
     }
     if (cc_major[dev] < 8) return false;
     // (key tiles of 32: Laguna's 60K prompt attention 0.079 ms a token against 0.097 with 64; 8 warps a block 0.076-0.079)
+    if (kv == 2) {
+        if (head_dim == 128) return launch<128, 32, 4, 2>(dev, q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, out, s);
+        if (head_dim == 256) return launch<256, 32, 4, 2>(dev, q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, out, s);
+        return false;
+    }
     if (head_dim == 128) return launch<128, 32, 4>(dev, q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, out, s);
     if (head_dim == 256) return launch<256, 32, 4>(dev, q, kc, vc, ring, n_head, n_head_kv, p0, T, window, scale, out, s);
     return false;
