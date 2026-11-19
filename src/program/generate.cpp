@@ -19,6 +19,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -5263,7 +5264,8 @@ int main(int argc, char** argv) {
                 ms.dwLength = sizeof ms;
                 if (GlobalMemoryStatusEx(&ms))
                     std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
-                                  (double) ms.ullAvailPageFile / 1073741824.0);
+                                  (double) strata::platform::available_commit(ms.ullAvailPageFile, ms.ullTotalPhys) /
+                                      1073741824.0);
 #endif
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;

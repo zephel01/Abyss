@@ -10,7 +10,7 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 ## v1.3.174 - (draft)
 
 On Linux the server now helps against systemd-oomd, which on Ubuntu desktops can end the whole terminal (engine,
-server and shell) while a big model loads. No engine change: outputs are as in v1.3.173.
+server and shell) while a big model loads. Outputs are as in v1.3.173.
 
 - Before the engine starts, when free RAM (MemAvailable) is under 0.8x the model's size and the user's slice holds
   1 GiB or more of file cache, the server drops the model files' clean cached pages (posix_fadvise DONTNEED). The
@@ -21,6 +21,16 @@ server and shell) while a big model loads. No engine change: outputs are as in v
   it on a clean stop. At the next start a marker from an engine that is gone gets one line: stopped by systemd-oomd
   (with the journal's line) or did not end cleanly. An engine the same server restarted itself is not reported.
 - `STRATA_OOMD_GUARD=0` turns both off.
+
+On Windows the RAM tier is no longer cut short by a page file that can still grow.
+
+- The RAM tier (and the engine's other free-RAM checks) counts the commit a page file can still gain by growing (a
+  system-managed page file, or one set with initial < maximum), not only what is left at its current size. With an
+  8 GB initial / 32 GB maximum page file a tier sized from free RAM came out several GB smaller, those experts read
+  from the SSD (the idea is from Strata's issue #5742). The growth is read from the page file settings in the registry
+  and each file's size, at most to the drive's free space less 1 GB; a fixed-size page file is unchanged. The warning
+  about a small page file counts the growth and asks to raise the maximum size. `STRATA_PAGEFILE_GROWTH=0` = the
+  current size only, as before.
 
 ## v1.3.173 - 2026-11-19
 

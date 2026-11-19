@@ -18,6 +18,7 @@
 #include "glm_fast_state.hpp"
 #include "shard_io.hpp"
 #include "strata/core/knobs.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/token_ban.hpp"
@@ -421,13 +422,16 @@ static std::string top_rss_procs(int n) {
 #endif
 }
 
-// the RAM free now: MemAvailable (Windows: the smaller of the free RAM and the free commit, which pinning is charged to);
-// 0 when unknown
+// the RAM free now: MemAvailable (Windows: the smaller of the free RAM and the free commit, which pinning is charged to,
+// counting what the page files can still grow - strata::platform::available_commit); 0 when unknown
 static int64_t avail_ram_now() {
 #ifdef _WIN32
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
-    return GlobalMemoryStatusEx(&ms) ? (int64_t) std::min(ms.ullAvailPhys, ms.ullAvailPageFile) : 0;
+    return GlobalMemoryStatusEx(&ms)
+               ? (int64_t) std::min<uint64_t>(ms.ullAvailPhys,
+                                              strata::platform::available_commit(ms.ullAvailPageFile, ms.ullTotalPhys))
+               : 0;
 #else
     long long kb = 0;
     if (FILE* f = std::fopen("/proc/meminfo", "r")) {
@@ -1711,17 +1715,23 @@ bool Glm5Model::fast_setup(std::string& err) {
                     // pinned RAM is charged to the commit (RAM + page file), and under WDDM so is every allocation
                     // on the card - the pool above already took its share: the smaller of the two is what can pin
                     if (GlobalMemoryStatusEx(&ms)) {
-                        avail_kb = (int64_t) (std::min(ms.ullAvailPhys, ms.ullAvailPageFile) >> 10);
+                        // a page file that can still grow (system managed, or initial < maximum) grows when the
+                        // commit runs out: that room counts too (STRATA_PAGEFILE_GROWTH=0: the current size only)
+                        const uint64_t growth = strata::platform::page_file_growth_bytes(ms.ullTotalPhys);
+                        const uint64_t commit = strata::platform::add_saturating(ms.ullAvailPageFile, growth);
+                        avail_kb = (int64_t) (std::min<uint64_t>(ms.ullAvailPhys, commit) >> 10);
                         // the commit, not the RAM, caps the tier: say so (issue #20 - a page file of 8 GB on a
                         // 128 GB PC left 27 GB of RAM free while the SSD served experts)
-                        const double G = 1073741824.0, short_gb = ((double) ms.ullAvailPhys - (double) ms.ullAvailPageFile) / G;
+                        const double G = 1073741824.0, short_gb = ((double) ms.ullAvailPhys - (double) commit) / G;
                         if (short_gb > 2.0)
                             std::fprintf(stderr, "glm fast: WARNING - Windows' commit limit (RAM + page file) caps the RAM "
-                                                 "tier %.0f GB below the free RAM (%.1f GB free, %.1f GB of commit left): "
-                                                 "those experts are read from the SSD. Enlarge the page file by at "
-                                                 "least %.0f GB (System > Advanced system settings > Performance > "
-                                                 "Virtual memory) and restart Maya\n", short_gb,
-                                         (double) ms.ullAvailPhys / G, (double) ms.ullAvailPageFile / G, short_gb + 4.0);
+                                                 "tier %.0f GB below the free RAM (%.1f GB free, %.1f GB of commit left, "
+                                                 "%.1f GB of it from the page file's growth): those experts are read "
+                                                 "from the SSD. Raise the page file's maximum size by at least %.0f GB "
+                                                 "(System > Advanced system settings > Performance > Virtual memory) "
+                                                 "and restart Abyss\n", short_gb,
+                                         (double) ms.ullAvailPhys / G, (double) commit / G, (double) growth / G,
+                                         short_gb + 4.0);
                     }
 #else
                     if (FILE* mf = std::fopen("/proc/meminfo", "r")) {

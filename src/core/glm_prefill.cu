@@ -51,6 +51,7 @@
 #endif
 
 #include "strata/qtypes.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -88,12 +89,16 @@ namespace q35 = strata::kernels::q35;
 
 namespace {
 
-// the RAM free now (MemAvailable; Windows: the smaller of free RAM and free commit), 0 when unknown
+// the RAM free now (MemAvailable; Windows: the smaller of free RAM and free commit, counting the page files' growth),
+// 0 when unknown
 int64_t avail_ram_bytes() {
 #ifdef _WIN32
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
-    return GlobalMemoryStatusEx(&ms) ? (int64_t) std::min(ms.ullAvailPhys, ms.ullAvailPageFile) : 0;
+    return GlobalMemoryStatusEx(&ms)
+               ? (int64_t) std::min<uint64_t>(ms.ullAvailPhys,
+                                              strata::platform::available_commit(ms.ullAvailPageFile, ms.ullTotalPhys))
+               : 0;
 #else
     long long kb = 0;
     if (FILE* f = std::fopen("/proc/meminfo", "r")) {
