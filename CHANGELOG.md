@@ -28,6 +28,8 @@ speed as v1.3.175.
   64K / 128K (only where the experts live changes). The 27B's KV on virtual memory alone (the FFN placed as before)
   gives the same tokens as v1.3.175; with the FFN layers moved to VRAM the rows that ran on the CPU run on the GPU,
   whose sums are in another order - other tokens, as on a card with more VRAM (the answers' facts 4/4 at every size).
+  KL against an all-VRAM reference (fixed at a small context), 32K / 64K: fixed 0.000473 / 0.000358, elastic
+  0.000464 / 0.000377 (same top token 98.9 / 99.2% and 99.2 / 98.8%).
 - Logs: one `glm elastic:` line at start (reserved, mapped, free for the weights), one for what the weights took and
   one per grow / shrink; `/v1/status` has `kv`. HIP, a split across GPUs and unified memory stay fixed and say so in
   one line. Idle conversations' KV is not moved to RAM (not part of this change).

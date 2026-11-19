@@ -20,6 +20,7 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 
+#include <chrono>
 #include <cuda_runtime.h>
 #if !defined(STRATA_USE_HIP)
 #include <cuda.h>
@@ -556,6 +557,7 @@ bool Glm5Model::kv_ensure(int64_t end, std::string& err) {
         if (w > R.mapped) need += w - R.mapped;
     }
     // the weights give back what the KV needs first
+    const auto t_ev = std::chrono::steady_clock::now();
     if (E->kv_mapped + need + E->lent() > E->kv_cap) {
         if (E->pool_on) {
             int r = E->R;
@@ -565,6 +567,7 @@ bool Glm5Model::kv_ensure(int64_t end, std::string& err) {
             return false;
         }
     }
+    const auto t_map = std::chrono::steady_clock::now();
     const int64_t t0 = E->tok;
     std::string merr;
     if (!ekv_kv_map(want, merr)) {
@@ -579,9 +582,12 @@ bool Glm5Model::kv_ensure(int64_t end, std::string& err) {
         }
     }
     ++E->grows;
+    const auto t_end = std::chrono::steady_clock::now();
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     std::fprintf(stderr, "glm elastic: CUDA%d KV %lld -> %lld tokens (%.2f of %.2f GB mapped; the weights hold %.2f GB "
-                         "of the rest)\n", dev_, (long long) t0, (long long) E->tok, (double) E->kv_mapped / G,
-                 (double) E->kv_cap / G, (double) E->lent() / G);
+                         "of the rest; %.0f ms giving back, %.0f ms mapping)\n", dev_, (long long) t0, (long long) E->tok,
+                 (double) E->kv_mapped / G, (double) E->kv_cap / G, (double) E->lent() / G, ms(t_ev, t_map),
+                 ms(t_map, t_end));
     return true;
 #endif
 }
