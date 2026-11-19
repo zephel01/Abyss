@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import uuid
 import zlib
@@ -41,6 +42,21 @@ class _GenerationTag(jinja2.ext.Extension):
         return jinja2.nodes.Scope(body, lineno=lineno)
 
 
+_PAST_THINK_DROP = re.compile(r"\{%-?\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*-?%\}")
+
+
+def keep_past_thinking(source: str) -> str:
+    """Qwen3.5-family templates from before 2026-11 (Ornith-1.5-122B, Qwen3.5-9B QSA GGUFs) render an assistant turn
+    before the last user message without its <think> block; the newer ones keep it unless preserve_thinking is false.
+    Dropped, turn 2's prompt is no longer turn 1's prompt plus the new tokens, and the delta-net layers cannot roll
+    back to where they differ: every turn read the whole conversation again (issue #52: 234K tokens, ~600 s a turn).
+    An older template gets the newer test; STRATA_KEEP_PAST_THINK=0 keeps the template as it is."""
+    if os.environ.get("STRATA_KEEP_PAST_THINK") == "0" or "preserve_thinking" in source:
+        return source
+    return _PAST_THINK_DROP.sub("{%- if preserve_thinking is undefined or preserve_thinking is true or "
+                                "loop.index0 > ns.last_query_index %}", source)
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
@@ -55,7 +71,7 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.filters["from_json"] = json.loads           # DeepSeek V4's template parses tool-call arguments
         env.globals["raise_exception"] = raise_exception
-        self.source = Path(path).read_text(encoding="utf-8")
+        self.source = keep_past_thinking(Path(path).read_text(encoding="utf-8"))
         # DeepSeek V4.1 writes <｜DSML｜ calls> (a space after the token); a V4.1 pack whose template spells V4's
         # <｜DSML｜tool_calls> (ISTA-DASLab's GSQ-RCO GGUFs) shows the model V4.1's spelling instead, so the model
         # sees the form it writes.  Only the template's own strings change, never a message's.

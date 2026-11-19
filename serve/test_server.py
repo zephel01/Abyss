@@ -590,7 +590,7 @@ class ClientShapes(unittest.TestCase):
         """Claude Code's compaction request: tool results, the user's "summarize, no tools", then a system note.  The
         note goes in after the tool results and before the words, which stay last; each turn's prompt is the start
         of the next one's (the conversation cache still matches)."""
-        from frontend import anthropic_to_messages
+        from serve.frontend import anthropic_to_messages
         call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
         turn1 = [{"role": "user", "content": "read f1"}, {"role": "system", "content": "env note"}]
         turn2 = turn1 + [call, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "R1"},
@@ -603,6 +603,32 @@ class ClientShapes(unittest.TestCase):
                          [("tool", "R1"), ("user", "files read before"), ("user", "tool list"),
                           ("user", "summarize, no tools")])
         self.assertEqual(m2[:len(m1)], m1)
+
+    def test_old_qwen35_template_keeps_past_thinking(self):
+        """Issue #52: a Qwen3.5-family template from before 2026-11 dropped the <think> of an assistant turn before
+        the last user message; turn 2 must start with turn 1's prompt and answer (STRATA_KEEP_PAST_THINK=0 = old)."""
+        import tempfile
+        from serve.frontend import ChatTemplate
+        src = ("{%- set ns = namespace(last_query_index=messages|length - 1) %}"
+               "{%- for message in messages[::-1] %}{%- if message.role == 'user' %}"
+               "{%- set ns.last_query_index = messages|length - 1 - loop.index0 %}{%- break %}{%- endif %}{%- endfor %}"
+               "{%- for message in messages %}{%- if message.role == 'assistant' %}"
+               "{%- if loop.index0 > ns.last_query_index %}"
+               "{{- '<a><think>' + message.reasoning_content + '</think>' + message.content }}"
+               "{%- else %}{{- '<a>' + message.content }}{%- endif %}"
+               "{%- else %}{{- '<' + message.role + '>' + message.content }}{%- endif %}{%- endfor %}"
+               "{%- if add_generation_prompt %}{{- '<a><think>' }}{%- endif %}")
+        with tempfile.NamedTemporaryFile("w", suffix=".jinja", delete=False) as f:
+            f.write(src)
+        self.addCleanup(os.unlink, f.name)
+        m1 = [{"role": "user", "content": "q1"}]
+        m2 = m1 + [{"role": "assistant", "content": "A1", "reasoning_content": "R1"}, {"role": "user", "content": "q2"}]
+        t = ChatTemplate(f.name)
+        self.assertTrue(t.render(m2).startswith(t.render(m1) + "R1</think>A1"))
+        os.environ["STRATA_KEEP_PAST_THINK"] = "0"
+        self.addCleanup(os.environ.pop, "STRATA_KEEP_PAST_THINK", None)
+        t = ChatTemplate(f.name)
+        self.assertFalse(t.render(m2).startswith(t.render(m1) + "R1</think>A1"))
 
     def test_openai_late_developer_and_system(self):
         status, b = self.post("/v1/chat/completions", {

@@ -9,8 +9,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## v1.3.173 - 2026-11-19
 
-Claude Code's conversation compaction no longer fails on Qwen3.8-27B with "summarization produced empty response". No
-engine change: greedy and seeded outputs are as in v1.3.172.
+Claude Code's conversation compaction no longer fails on Qwen3.8-27B with "summarization produced empty response", and
+Ornith-1.5-122B / Qwen3.5-9B QSA reuse the conversation on turn 2 again (issue #52). No engine change: greedy and
+seeded outputs are as in v1.3.172.
+
+- Older Qwen3.5-family chat templates (Ornith-1.5-122B 16G64G / 24G64G, Qwen3.5-9B QSA GGUFs; issue #52) render an
+  assistant turn before the last user message without its `<think>` block. Turn 2's prompt was then not turn 1's
+  prompt plus the new tokens, the delta-net layers cannot roll back, and every turn read the whole conversation again
+  (the reporter: 234K tokens, ~600 s a turn on an RX 9070 XT). The server now gives such a template the newer
+  templates' test (keep the block unless `preserve_thinking` is false; `STRATA_KEEP_PAST_THINK=0` = the template as it
+  is). Qwen3.5-9B QSA, RTX 5090, a 4.9K-token system message and 2 turns: turn 2 reused 0 -> 4,917 tokens (read
+  4,940 -> 358). Templates that already know `preserve_thinking` (Qwen3.8-27B) or always keep the block (Ornith-35B)
+  are unchanged.
 
 - A system message that comes right after a user message (Claude Code's notes: environment, files read before a
   compaction, deferred tools, agent types) now goes in before that user message, after the turn's tool results, so
