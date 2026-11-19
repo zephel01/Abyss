@@ -7,6 +7,29 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.172 - (draft)
+
+Server guards from the upstream review (ideas from Strata, written on Abyss's own code). No engine change: greedy and
+seeded outputs are as in v1.3.171.
+
+- A clamped max_tokens has a floor: when `fit_max_tokens` shortens a max_tokens the context cannot hold (the Anthropic
+  API by default), it now leaves at least min(1024, context / 4) tokens (`STRATA_FIT_FLOOR`; 1024 is the answer
+  room's own reserve). Fewer is a 400 `invalid_request_error` "prompt is too long: N tokens > M maximum", the Anthropic
+  API's context-overflow words, on which Claude Code compacts the conversation (OpenAI API: code
+  `context_length_exceeded`). Before, "max tokens 4096 ... answering with up to 56": the answer room cut the reasoning,
+  no answer or tool call fit, and the agent repeated the cut sentence turn after turn (Strata 33cfc83aa). A prompt
+  that leaves no room at all says the same. A request without max_tokens still gets the rest of the context.
+- Tool-call arguments read their declared type through anyOf / oneOf (nested, up to 8 levels) and type lists, not only
+  a top-level `type` (Pydantic writes Optional[X] as anyOf): an Optional[bool] `True` is a bool (was the string
+  "True"), an Optional[str] `42` / `true` stay strings (were 42 / true), a ["string", "integer"] `true` stays "true".
+  A branch with a `$ref` or no type means "no schema", read as before. Qwen, GLM and DSML forms, whole and streamed
+  (Strata 5e965ec57).
+- A stall limit on the HTTP socket (`STRATA_HTTP_STALL_S`, default 120 s, per read or write, not per request): a client
+  that sent a streaming request and stopped reading (a PC gone to sleep, a dropped VPN or NAT) filled the send buffer,
+  the write never returned and the engine's turn was held - every later request waited for good (reproduced with a
+  local socket). Now the write fails, the answer is cancelled as on a disconnect, and the queue moves on; a request
+  body that stops arriving is a 408, a silent connection is closed (Strata 99b1b27b1).
+
 ## v1.3.171 - 2026-11-19
 
 DeepSeek V4 0731 / V4.1 answers no longer stop on files whose layers mix expert types (a prompt-path race), V4 0731

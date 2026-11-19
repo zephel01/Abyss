@@ -112,6 +112,49 @@ class MaxTokens(unittest.TestCase):
         finally:
             self.svc.fit_max_tokens = None
 
+    def test_clamp_below_the_floor_is_prompt_too_long(self):
+        """Strata 33cfc83aa's idea: a max_tokens clamped below min(1024, context / 4) left no room for an answer or a
+        tool call.  It is refused in the Anthropic API's context-overflow shape, which Claude Code compacts on."""
+        import contextlib
+        import io
+        import re
+        _, _, pt0, _ = self.call("anthropic", max_tokens=1)
+        overhead = pt0 - len("hi")
+        floor = min(1024, CTX // 4)
+        for room, ok in ((floor - 1, False), (floor, True)):
+            with self.subTest(room=room):
+                text = "y" * (CTX - CTX_SLACK - overhead - room)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    s, b, pt, _ = self.call("anthropic", text=text, max_tokens=128000)
+                if ok:
+                    self.assertEqual(s, 200, b)
+                    self.assertEqual(self.engine.last_max_new, room)
+                    continue
+                self.assertEqual(s, 400, b)
+                self.assertEqual(b["type"], "error")
+                self.assertEqual(b["error"]["type"], "invalid_request_error")
+                m = re.match(r"prompt is too long: (\d+) tokens > (\d+) maximum", b["error"]["message"])
+                self.assertIsNotNone(m, b)
+                self.assertEqual(int(m.group(2)), CTX - CTX_SLACK - floor)
+                self.assertGreater(int(m.group(1)), int(m.group(2)))
+        os.environ["STRATA_FIT_FLOOR"] = "0"                # off: clamped down to what is left, as before
+        try:
+            text = "y" * (CTX - CTX_SLACK - overhead - 5)
+            with contextlib.redirect_stdout(io.StringIO()):
+                s, b, _, _ = self.call("anthropic", text=text, max_tokens=128000)
+            self.assertEqual(s, 200, b)
+            self.assertEqual(self.engine.last_max_new, 5)
+        finally:
+            del os.environ["STRATA_FIT_FLOOR"]
+
+    def test_no_room_is_prompt_too_long_too(self):
+        _, _, pt0, _ = self.call("anthropic", max_tokens=1)
+        text = "y" * (CTX - CTX_SLACK - (pt0 - len("hi")))
+        s, b, _, _ = self.call("anthropic", text=text)
+        self.assertEqual(s, 400, b)
+        self.assertTrue(b["error"]["message"].startswith("prompt is too long: "), b)
+        self.assertIn("no room to answer", b["error"]["message"])
+
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
         overhead = pt0 - len("hi")                  # the template's tokens around the user text
@@ -173,6 +216,20 @@ class FitMaxTokens(unittest.TestCase):
 
     def test_a_budget_that_fits_is_unchanged(self):
         s, b, _, ct = self.call("openai", max_tokens=50)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.last_max_new, 50)
+
+    def test_openai_below_the_floor_is_context_length_exceeded(self):
+        import contextlib
+        import io
+        _, _, pt0, _ = self.call("openai", max_tokens=1)
+        text = "y" * (CTX - CTX_SLACK - (pt0 - len("hi")) - 100)
+        with contextlib.redirect_stdout(io.StringIO()):
+            s, b, _, _ = self.call("openai", text=text, max_tokens=CTX)
+        self.assertEqual(s, 400, b)
+        self.assertEqual(b["error"]["code"], "context_length_exceeded")
+        self.assertTrue(b["error"]["message"].startswith("prompt is too long: "), b)
+        s, b, _, _ = self.call("openai", text=text, max_tokens=50)     # a budget that fits still runs
         self.assertEqual(s, 200, b)
         self.assertEqual(self.engine.last_max_new, 50)
 
@@ -1512,6 +1569,89 @@ class VisionFootprint(unittest.TestCase):
         self.cache.write_text(json.dumps({key: {"bytes": "1", "total": 100000}}))
         self.assertEqual(self.measure(0, "MEM 1000 2000 100000\n"), ((1024, 3000 + (256 << 20)), 1))
         self.assertEqual(self.measure(0, ""), ((1024, 3000 + (256 << 20)), 0))   # now from the cache
+
+
+class StallLimit(unittest.TestCase):
+    """Strata 99b1b27b1's idea: a client that sends a streaming request and stops reading filled the send buffer, the
+    write never returned and the engine's turn was held for good - every later request waited.  With a stall limit
+    (STRATA_HTTP_STALL_S) the write fails, the answer is cancelled as on a disconnect, and the next request runs.  A
+    request body that stops arriving is a 408."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.old = os.environ.get("STRATA_HTTP_STALL_S")
+        os.environ["STRATA_HTTP_STALL_S"] = "1"
+        tok = ByteTokenizer()
+        cls.engine = MockEngine(tok, "</think>\n\n" + "x" * 60000, max_context=131072)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        if cls.old is None:
+            os.environ.pop("STRATA_HTTP_STALL_S", None)
+        else:
+            os.environ["STRATA_HTTP_STALL_S"] = cls.old
+
+    def raw(self, head: bytes, body: bytes = b""):
+        import socket
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)   # a small window: the server's buffer fills soon
+        s.connect(("127.0.0.1", self.port))
+        s.sendall(head + body)
+        return s
+
+    def test_a_stream_nobody_reads_lets_the_next_request_run(self):
+        import contextlib
+        import io
+        body = json.dumps({"model": "m", "stream": True, "max_tokens": 60000,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            s = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                         b"Content-Length: %d\r\n\r\n" % len(body), body)
+            try:
+                time.sleep(0.5)                                         # the stream has started; nobody reads it
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/messages", json.dumps(
+                    {"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                    {"Content-Type": "application/json"})
+                t0 = time.time()
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(json.loads(r.read())["usage"]["output_tokens"], 5)
+                self.assertLess(time.time() - t0, 50)
+            finally:
+                s.close()
+        self.assertIn("the client stopped reading for 1 s", out.getvalue())
+
+    def test_a_body_that_stops_arriving_is_a_408(self):
+        s = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: 100\r\n\r\n", b'{"model"')
+        try:
+            s.settimeout(30)
+            got = b""
+            while True:
+                piece = s.recv(65536)
+                if not piece:
+                    break
+                got += piece
+        finally:
+            s.close()
+        self.assertTrue(got.startswith(b"HTTP/1.0 408"), got[:80])
+        self.assertIn(b"stopped arriving", got)
+
+    def test_a_silent_connection_is_closed(self):
+        s = self.raw(b"")
+        try:
+            s.settimeout(30)
+            t0 = time.time()
+            self.assertEqual(s.recv(100), b"")                          # closed by the server, not left open
+            self.assertLess(time.time() - t0, 20)
+        finally:
+            s.close()
 
 
 if __name__ == "__main__":

@@ -1275,6 +1275,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_VISION_START_S` / `STRATA_VISION_ENCODE_S` | 600 / 120 | （サーバー）画像エンコーダーの起動と 1 枚ごとの応答の上限。超えると止めてリクエストはエラー、次の画像で起動し直す（v1.3.78） |
 | `STRATA_HTTP_BACKLOG` | 256 | （サーバー）listen のバックログ（accept 待ちのリクエスト数） |
 | `STRATA_MAX_BODY_MIB` | 256 | （サーバー）リクエスト本文の上限。超えると読まずに 413 |
+| `STRATA_HTTP_STALL_S` | 120 | （サーバー）ソケットの 1 回の操作が待てる秒数。リクエストの読み込み（本文が届かなくなったら 408）と、答えの 1 回の書き込み。要求全体の上限ではないので、長い prompt や長いストリームは切れない。ストリームを読まなくなったクライアント（スリープした PC、切れた VPN）がエンジンを握り続けなくなる。その答えは切断と同じく取り消され、次のリクエストが動く。`0` で上限なし |
+| `STRATA_FIT_FLOOR` | min(1024, 文脈 / 4) | （サーバー）`fit_max_tokens` が文脈に収まらない max_tokens を縮めるとき（Anthropic の API の既定）に残す、答えのトークン数の下限。これより少ないと 400 `prompt is too long: N tokens > M maximum`（Anthropic の形。OpenAI の API では `context_length_exceeded`）で断り、Claude Code はこれを受けて会話を compaction する。max_tokens 無しのリクエストは今まで通り文脈の残り全部。`0` で 1 トークンまで縮める（v1.3.172 より前の動き） |
 | `STRATA_RAW_SPECIALS` | 0 | （サーバー）`1`：メッセージ中の特殊トークンの文字列を再び制御トークンにする（以前の encode） |
 | `GPU_MAX_HW_QUEUES` | 2（HIP） | ROCm がデバイスごとに作る HW キューの数。シェルにも設定ファイルにもないとき、サーバーが 2 を渡す（v1.3.40）。AI PRO R9700 の DeepSeek V4 の 8K / 16K の prompt は、1 で 586〜650 / 676〜684 tok/s（R9700 向けの手順でアイドル電力の回避策として広まっている値。この PC ではどちらでもアイドル 12 W）、ROCm の既定の 4 で 653〜737 / 748〜756、2 で 866〜995 / 999〜1,011 |
 | `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU よりはっきり速ければ使う（`STRATA_GLM_IGPU_MARGIN`）。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |

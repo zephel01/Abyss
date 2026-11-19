@@ -151,6 +151,37 @@ class MockEngine:
             yield t
 
 
+class PromptTooLong(ValueError):
+    """A prompt the context cannot answer: HTTP 400 in the shape the APIs use for a context overflow.  The message
+    starts "prompt is too long: N tokens > M maximum", the Anthropic API's own words - Claude Code matches on them
+    and compacts the conversation (any other 400 text it shows as an error and stops) - and OpenAI clients get code
+    "context_length_exceeded".  M is the longest prompt that would have been answered."""
+
+    def __init__(self, tokens: int, maximum: int, detail: str):
+        super().__init__(f"prompt is too long: {tokens} tokens > {max(0, maximum)} maximum ({detail})")
+        self.tokens, self.maximum = tokens, max(0, maximum)
+
+    def body(self, anthropic: bool = False) -> dict:
+        if anthropic:
+            return {"type": "error", "error": {"type": "invalid_request_error", "message": str(self)}}
+        return {"error": {"type": "invalid_request_error", "code": "context_length_exceeded", "param": "messages",
+                          "message": str(self)}}
+
+
+def fit_floor(context: int) -> int:
+    """The fewest answer tokens a clamped max_tokens may leave (fit_max_tokens): STRATA_FIT_FLOOR, default
+    min(1024, context / 4).  1024 is the answer room's own reserve (STRATA_GLM_THINK_RESERVE): with that many the
+    reasoning still gets closed with room for an answer or a tool call; a quarter of the context keeps a small
+    context usable.  0 turns the floor off (clamp down to 1 token, as before v1.3.172)."""
+    try:
+        v = os.environ.get("STRATA_FIT_FLOOR")
+        if v not in (None, ""):
+            return max(0, int(v))
+    except ValueError:
+        pass
+    return min(1024, max(1, context // 4))
+
+
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
@@ -1910,13 +1941,26 @@ class Service:
         fit = bool(self.fit_max_tokens) if fit is None else fit
         if max_new is None or max_new <= 0 or (fit and room < 1):
             if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                raise PromptTooLong(len(ids), self.engine.max_context - CTX_SLACK - 1,
+                                    f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                    f"({self.engine.max_context}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not fit:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
+            floor = fit_floor(self.engine.max_context)
+            if room < floor:
+                # Strata 33cfc83aa's idea: "max tokens 4096 shortened to 221" left the answer room no place for an
+                # answer or a tool call, and the agent repeated the cut sentence turn after turn.  Below the floor
+                # the request is refused as a context overflow instead - Claude Code compacts the conversation on it
+                print(f"[abyss] max tokens {max_new:,}: the context leaves {room:,} after the prompt "
+                      f"({len(ids):,} of {self.engine.max_context:,}), fewer than {floor:,}: refused as "
+                      "\"prompt is too long\" (the client compacts)", flush=True)
+                raise PromptTooLong(len(ids), self.engine.max_context - CTX_SLACK - floor,
+                                    f"the context ({self.engine.max_context:,}) leaves {room:,} tokens to answer "
+                                    f"after the prompt, fewer than the {floor:,} the answer needs "
+                                    f"(max tokens {max_new:,}); compact or shorten the conversation")
             print(f"[abyss] max tokens {max_new:,} is more than the context leaves after the prompt "
                   f"({len(ids):,} of {self.engine.max_context:,}): answering with up to {max(1, room):,}", flush=True)
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
@@ -2815,6 +2859,20 @@ def _backlog() -> int:
         return 256
 
 
+def stall_limit() -> float | None:
+    """The longest one socket operation of a request may wait, in seconds (STRATA_HTTP_STALL_S, default 120; 0 = no
+    limit): a read of the request, or one write of the answer.  Per operation, not per request - while the engine works
+    the socket is not touched, and a stream writes a keep-alive at least every few seconds, so long prompts and long
+    answers are not cut.  A client that stops reading (a PC gone to sleep, a dropped VPN or NAT) filled the send
+    buffer and the write never returned, holding the engine's one turn: every request after it waited for good
+    (Strata 99b1b27b1's idea).  Now the write fails after this long and the answer is cancelled, as on a disconnect."""
+    try:
+        v = float(os.environ.get("STRATA_HTTP_STALL_S") or 120)
+    except ValueError:
+        v = 120.0
+    return v if v > 0 else None
+
+
 def body_limit() -> int:
     """The most a request body may hold, in bytes (it is read into memory): 256 MiB, a million-token conversation with
     room to spare; STRATA_MAX_BODY_MIB changes it.  A larger one is answered 413 before it is read (Strata #893)."""
@@ -2961,6 +3019,7 @@ def loading_handler(httpd) -> type:
 
     class Loading(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
+        timeout = stall_limit()                             # (as the real handler: a silent client is let go)
 
         def log_message(self, *a):
             pass
@@ -3005,9 +3064,17 @@ def make_handler(svc: Service):
         # Nagle's algorithm on, a piece waited for the client's ACK of the one before, up to 40 ms (the delayed ACK)
         # on a slow link (Maya #626's idea); the whole answers are one write, nothing changes for them
         disable_nagle_algorithm = True
+        # a stall limit on every socket operation (StreamRequestHandler.setup sets it on the connection): a client that
+        # stops reading a stream no longer holds the engine's turn - the write times out and the answer is cancelled
+        timeout = stall_limit()
 
         def log_message(self, fmt, *args):
             pass
+
+        def _stalled(self, e: OSError) -> None:
+            if isinstance(e, TimeoutError):
+                print(f"[abyss] the client stopped reading for {self.timeout:g} s: its answer is cancelled "
+                      "(STRATA_HTTP_STALL_S)", flush=True)
 
         def send_response(self, code, message=None):
             self.answer_started = True
@@ -3015,7 +3082,15 @@ def make_handler(svc: Service):
 
         def _body(self) -> bytes:
             """The request body: Content-Length checked first (a bad one is a 400, one over body_limit() a 413 before
-            anything is read), or a Transfer-Encoding: chunked one from a relay that does not buffer it."""
+            anything is read), or a Transfer-Encoding: chunked one from a relay that does not buffer it.  A body that
+            stops arriving for stall_limit() seconds is a 408."""
+            try:
+                return self._read_body()
+            except TimeoutError:
+                self.close_connection = True
+                raise BadBody(408, f"the request body stopped arriving for {self.timeout:g} s") from None
+
+        def _read_body(self) -> bytes:
             limit = body_limit()
             te = self.headers.get("Transfer-Encoding", "") or ""
             if te.split(",")[-1].strip().lower() == "chunked":
@@ -3261,6 +3336,8 @@ def make_handler(svc: Service):
             except EngineStopped as e:                       # the engine stopped the answer itself: not retried
                 if not self.answer_started:
                     self._json(422, e.body(anthropic=path == "/v1/messages"))
+            except PromptTooLong as e:                       # the context overflow shape (Claude Code compacts)
+                self._json(400, e.body(anthropic=path in ("/v1/messages", "/v1/messages/count_tokens")))
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
@@ -3276,7 +3353,7 @@ def make_handler(svc: Service):
                 # a dropped connection, as every exception below was (ThreadingHTTPServer closes the socket)
                 if not self.answer_started:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": f"chat template: {e}"}})
-            except ConnectionError:                         # the client went away: nobody to answer
+            except (ConnectionError, TimeoutError):         # the client went away or stopped reading: nobody to answer
                 raise
             except Exception as e:                          # anything else: a 500 with the reason, never silence
                 traceback.print_exc()
@@ -3443,8 +3520,9 @@ def make_handler(svc: Service):
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
-                cancel.set()                                 # client went away: stop the engine
+            except OSError as e:                             # client went away (or stalled): stop the engine
+                self._stalled(e)
+                cancel.set()
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
@@ -3530,7 +3608,8 @@ def make_handler(svc: Service):
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
-            except OSError:
+            except OSError as e:                             # client went away (or stalled): stop the engine
+                self._stalled(e)
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
@@ -3554,7 +3633,8 @@ class Server(ThreadingHTTPServer):
     request_queue_size = _backlog()
 
     def handle_error(self, request, client_address):
-        if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
+        if not isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):   # a client that hangs up (or stops
+            # reading: stall_limit) needs no stack trace
             super().handle_error(request, client_address)
 
 
