@@ -7,10 +7,10 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.174 - (draft)
+## v1.3.174 - 2026-11-19
 
 On Linux the server now helps against systemd-oomd, which on Ubuntu desktops can end the whole terminal (engine,
-server and shell) while a big model loads. Outputs are as in v1.3.173.
+server and shell) while a big model loads. Greedy and seeded outputs are as in v1.3.173.
 
 - Before the engine starts, when free RAM (MemAvailable) is under 0.8x the model's size and the user's slice holds
   1 GiB or more of file cache, the server drops the model files' clean cached pages (posix_fadvise DONTNEED). The
