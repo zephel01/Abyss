@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.175 - (draft)
+## v1.3.175 - 2026-11-19
 
 `--kv int8` at long contexts: faster prompts on the qwen35 family, Laguna support, and a start-up hint. fp16 KV (the
 default) gives the same bits as v1.3.174.
