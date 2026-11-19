@@ -95,7 +95,8 @@ class FakeEngineTests(unittest.TestCase):
         self.exe = script(self.tmp, "fake-strata", FAKE_ENGINE)
         self.log = self.tmp / "lines.txt"
         self.log.write_text("")
-        self.patches = [mock.patch.object(S, "wait_gpu_release", lambda pid, timeout=60.0: None)]
+        self.patches = [mock.patch.object(S, "wait_gpu_release", lambda pid, timeout=60.0: None),
+                        mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.tmp / "cache")})]   # (run markers)
         for p in self.patches:
             p.start()
 
@@ -122,6 +123,34 @@ class FakeEngineTests(unittest.TestCase):
         self.assertEqual((e.max_context, e.can_stop, e.info["engine"]), (4096, True, "fake"))
         self.assertEqual(list(e.generate([1, 2], 3, {}, threading.Event())), [100, 101, 102])
         self.assertEqual(e.last["finish"], "stop")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the systemd-oomd run marker is Linux only")
+    def test_run_marker_life_cycle(self):
+        import contextlib
+        import io
+        with mock.patch.dict(os.environ, {"STRATA_OOMD_GUARD": "1", "STRATA_ENGINE_QUIT_S": "10"}), \
+                mock.patch.object(S, "oomd_kills_since", lambda ts, timeout=5.0: []), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            S.OWN_MARKERS.clear()
+            e = self.engine()
+            m = e.run_marker
+            self.assertEqual(json.loads(m.read_text())["pid"], e.proc.pid)
+            e.proc.kill()                                   # died under this server: its restart is not reported
+            e.proc.wait()
+            e.restart()
+            self.assertEqual(json.loads(m.read_text())["pid"], e.proc.pid)
+            e.close()                                       # a clean stop: no marker
+            self.assertFalse(m.exists())
+            e2 = self.engine()                              # a new server: the previous engine was killed
+            e2.proc.kill()
+            e2.proc.wait()
+            S.OWN_MARKERS.clear()
+            e3 = self.engine()
+            e3.close()
+            self.assertFalse(m.exists())
+        said = [ln for ln in out.getvalue().splitlines() if "previous engine" in ln]
+        self.assertEqual(len(said), 1, out.getvalue())
+        self.assertTrue(said[0].endswith("did not end cleanly"))
 
     def test_restart_asks_quit_first(self):
         e = self.engine()

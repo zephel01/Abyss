@@ -379,6 +379,197 @@ def engine_model_path(args: list[str]) -> str:
     return paths.get("--native") or paths.get("--glm-pack") or paths.get("--pack", "pack/full")
 
 
+# --- systemd-oomd (Linux): a big model's start is where the user slice's memory pressure peaks, and systemd-oomd then
+# ends the whole scope (engine, server and the terminal).  Two small helps; STRATA_OOMD_GUARD=0 turns both off.
+
+GIB = 1 << 30
+
+
+def oomd_guard_on() -> bool:
+    return sys.platform.startswith("linux") and os.environ.get("STRATA_OOMD_GUARD", "1") != "0"
+
+
+def meminfo(path: str = "/proc/meminfo") -> dict:
+    """/proc/meminfo in bytes ({} when unreadable)."""
+    out = {}
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                f2 = v.split()
+                if f2 and f2[0].isdigit():
+                    out[k.strip()] = int(f2[0]) * (1024 if f2[1:2] == ["kB"] else 1)
+    except OSError:
+        pass
+    return out
+
+
+def user_slice_file_cache(cgroup_file: str = "/proc/self/cgroup", root: str = "/sys/fs/cgroup",
+                          meminfo_path: str = "/proc/meminfo") -> int | None:
+    """Bytes of file cache charged to this user's slice (memory.stat `file` of the user-UID.slice that holds this
+    process): what systemd-oomd's pressure on that slice has to reclaim.  Without cgroup v2 or outside a user slice
+    (a system service, a container) /proc/meminfo's Cached - Shmem stands in: the machine's page cache, a bigger
+    number, so the test below passes more easily there; None when neither is readable."""
+    try:
+        with open(cgroup_file, encoding="utf-8") as f:
+            path = next((ln.split(":", 2)[2].strip() for ln in f if ln.startswith("0::")), "")
+        parts = [p for p in path.split("/") if p]
+        for i in range(len(parts), 0, -1):
+            if re.fullmatch(r"user-\d+\.slice", parts[i - 1]):
+                with open(os.path.join(root, *parts[:i], "memory.stat"), encoding="ascii") as f:
+                    for line in f:
+                        k, _, v = line.partition(" ")
+                        if k == "file":
+                            return int(v)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    m = meminfo(meminfo_path)
+    if "Cached" in m:
+        return max(0, m["Cached"] - m.get("Shmem", 0))
+    return None
+
+
+def model_files(path: str) -> list[str]:
+    """Every regular file of the model: a pack directory walked, or the one file."""
+    p = Path(path)
+    if p.is_file():
+        return [str(p)]
+    out = []
+    if p.is_dir():
+        for d, _, names in os.walk(p):
+            for n in names:
+                q = os.path.join(d, n)
+                if os.path.isfile(q) and not os.path.islink(q):
+                    out.append(q)
+    return out
+
+
+def drop_file_cache(files: list[str]) -> None:
+    """posix_fadvise(DONTNEED) on each file: the kernel drops its clean cached pages (dirty ones stay)."""
+    for q in files:
+        try:
+            fd = os.open(q, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except (OSError, AttributeError):
+            pass
+        finally:
+            os.close(fd)
+
+
+def release_model_cache(model_path: str, meminfo_path: str = "/proc/meminfo", cache=None) -> float | None:
+    """Before the engine starts: when free RAM (MemAvailable) is under 0.8x the model's size and the user slice holds
+    >= 1 GiB of file cache, drop the model files' clean cached pages.  The engine reads them again either way (the
+    model does not fit in what is free), but cached pages left by the previous run add to the slice's memory and to the
+    reclaim systemd-oomd measures while the new engine allocates its expert arena.  Returns the GB the page cache fell
+    by, None when nothing was done.  Never raises."""
+    try:
+        if not oomd_guard_on():
+            return None
+        files = model_files(model_path)
+        size = sum(os.path.getsize(q) for q in files)
+        avail = meminfo(meminfo_path).get("MemAvailable")
+        if not files or avail is None or avail >= 0.8 * size:
+            return None
+        cached = user_slice_file_cache() if cache is None else cache()
+        if cached is None or cached < GIB:
+            return None
+        before = meminfo(meminfo_path).get("Cached", 0)
+        drop_file_cache(files)
+        gb = max(0, before - meminfo(meminfo_path).get("Cached", before)) / 1e9
+        print(f"[abyss] memory: released {gb:.1f} GB of the model files' page cache before loading (systemd-oomd; "
+              "STRATA_OOMD_GUARD=0 = off)", flush=True)
+        return gb
+    except Exception:  # noqa: BLE001 - a help, never a reason not to start
+        return None
+
+
+def run_marker_path(log: str | None, model_path: str) -> Path:
+    """Where this engine's run marker lives: next to its log (one per config), else in ~/.cache/abyss."""
+    if log:
+        return Path(str(log) + ".engine-run.json")
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "abyss"
+    return base / f"engine-run-{hashlib.sha1(str(model_path).encode()).hexdigest()[:12]}.json"
+
+
+def pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True              # (someone else's process with that number: not ours, but not provably gone)
+    return True
+
+
+def oomd_kills_since(ts: float, timeout: float = 5.0) -> list[str]:
+    """systemd-oomd's "Killed ..." lines since ts, from the system journal, else the user's; [] without a journal."""
+    for scope in ([], ["--user"]):
+        try:
+            r = subprocess.run(["journalctl", *scope, "--since", f"@{int(ts)}", "-t", "systemd-oomd", "-q",
+                                "--no-pager", "-o", "cat"], capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip().startswith("Killed ")]
+        if lines:
+            return lines
+    return []
+
+
+OWN_MARKERS: set = set()   # markers this server process wrote: its own engine restarts (issue #27) are not reported
+
+
+def report_previous_run(marker: Path, journal=oomd_kills_since) -> str | None:
+    """At a start: a marker left by an engine that is gone means that run did not end cleanly (close() removes it).
+    Says whether systemd-oomd ended it, then removes the marker.  A marker this server process wrote (an engine it
+    restarts itself, issue #27: that end was already told) or one whose engine still runs is left alone.  Returns the
+    line printed."""
+    if str(marker) in OWN_MARKERS:
+        return None
+    try:
+        info = json.loads(marker.read_text(encoding="utf-8"))
+        pid, started = int(info.get("pid", 0)), float(info.get("started", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if pid > 0 and pid_running(pid):
+        return None
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+        kills = journal(started) if oomd_guard_on() else []
+        if kills:
+            line = (f"[abyss] the previous engine (started {when}) was stopped by systemd-oomd (memory pressure): "
+                    f"{kills[-1]}; close other programs or lower STRATA_GLM_RAM_GB")
+        else:
+            line = f"[abyss] the previous engine (started {when}) did not end cleanly"
+        print(line, flush=True)
+        return line
+    except Exception:  # noqa: BLE001 - a report, never a reason not to start
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+
+
+def write_run_marker(marker: Path, pid: int, model_path: str) -> None:
+    OWN_MARKERS.add(str(marker))
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"pid": pid, "server": os.getpid(), "started": time.time(),
+                                      "model": str(model_path)}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_run_marker(marker: Path | None) -> None:
+    """The engine ended cleanly (close() saw it end): nothing to report at the next start."""
+    if marker is not None:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -400,11 +591,19 @@ class StrataEngine:
         log_start = os.path.getsize(log) if log else 0
         LOADING.update(stage="weights", text="starting the engine: reading the model's weights", parts={},
                        started=time.time())             # (GET /health's `load` while this start runs)
+        # systemd-oomd (Linux): say how the last run of this engine ended if it did not end cleanly, and drop the
+        # model's cached pages when RAM is short (STRATA_OOMD_GUARD=0 = neither)
+        self.run_marker = run_marker_path(log, self.model_path) if oomd_guard_on() else None
+        if self.run_marker is not None:
+            report_previous_run(self.run_marker)
+            release_model_cache(str(Path(cwd or ".") / self.model_path))
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        if self.run_marker is not None:
+            write_run_marker(self.run_marker, self.proc.pid, self.model_path)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
@@ -430,6 +629,7 @@ class StrataEngine:
             except queue.Empty:
                 loading.set()
                 self._end(f"the engine said no READY within {start_s:.0f} s (STRATA_ENGINE_START_S); ending it")
+                clear_run_marker(self.run_marker)       # (told here: not again at the next start)
                 raise RuntimeError(f"the engine did not become ready within {start_s:.0f} s (STRATA_ENGINE_START_S "
                                    "raises it)" + (f" - see {log}" if log else "")) from None
             if line is None:
@@ -447,6 +647,7 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
+            clear_run_marker(self.run_marker)
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
@@ -868,6 +1069,7 @@ class StrataEngine:
         """QUIT, then wait for the engine to end: with kept conversations (STRATA_GLM_SLOT_KEEP) it first writes the
         one it holds, so it gets STRATA_ENGINE_QUIT_S seconds (50; llama-swap's unloadTimeout should exceed it)."""
         wait = float(os.environ.get("STRATA_ENGINE_QUIT_S", "50") or 50)
+        clear_run_marker(getattr(self, "run_marker", None))   # a stop the server asked for: nothing to report later
         if self.proc.poll() is not None:                # already ended (killed by a forced shutdown)
             return
         try:

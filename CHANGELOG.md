@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.174 - (draft)
+
+On Linux the server now helps against systemd-oomd, which on Ubuntu desktops can end the whole terminal (engine,
+server and shell) while a big model loads. No engine change: outputs are as in v1.3.173.
+
+- Before the engine starts, when free RAM (MemAvailable) is under 0.8x the model's size and the user's slice holds
+  1 GiB or more of file cache, the server drops the model files' clean cached pages (posix_fadvise DONTNEED). The
+  engine reads them again anyway, as the model does not fit in what is free, but the cache the previous run left adds
+  to the slice's memory and reclaim, which is what systemd-oomd judges. One `[abyss] memory: released N GB ...` line
+  says it happened.
+- While the engine runs the server keeps a small marker next to the engine log (`<log>.engine-run.json`) and removes
+  it on a clean stop. At the next start a marker from an engine that is gone gets one line: stopped by systemd-oomd
+  (with the journal's line) or did not end cleanly. An engine the same server restarted itself is not reported.
+- `STRATA_OOMD_GUARD=0` turns both off.
+
 ## v1.3.173 - 2026-11-19
 
 Claude Code's conversation compaction no longer fails on Qwen3.8-27B with "summarization produced empty response", and
