@@ -7,10 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## v1.3.172 - (draft)
+## v1.3.172 - 2026-11-19
 
-Server guards from the upstream review (ideas from Strata, written on Abyss's own code). No engine change: greedy and
-seeded outputs are as in v1.3.171.
+Server guards: a prompt that leaves too little room to answer is a "prompt is too long" error (Claude Code compacts on
+it) instead of a cut answer, tool arguments keep their declared type through Optional / anyOf, and a client that stops
+reading no longer holds the server. No engine change: greedy and seeded outputs are as in v1.3.171. Checked on
+Qwen3.8-27B UD-Q4_K_XL (RTX 5090, context 16384): an Optional[bool] / Optional[str] tool call came back as true / "42";
+a 15,653-token prompt with max_tokens 4096 got the 400 (723 tokens left < 1024); a streaming client that stopped
+reading was cancelled after 5 s (`STRATA_HTTP_STALL_S=5`) and the next request answered at once; a 13K-token streamed
+prompt was not cut. Ideas from Strata, written on Abyss's own code.
 
 - A clamped max_tokens has a floor: when `fit_max_tokens` shortens a max_tokens the context cannot hold (the Anthropic
   API by default), it now leaves at least min(1024, context / 4) tokens (`STRATA_FIT_FLOOR`; 1024 is the answer
