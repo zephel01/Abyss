@@ -418,6 +418,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | [Config files](docs/SETTINGS.md) · [設定ファイル](docs/SETTINGS.ja.md) | where the config file and start script are, what to change where, every key, how a change takes effect |
 | [Uncensoring](docs/UNCENSOR.md) · [無検閲化](docs/UNCENSOR.ja.md) | `--uncensor`: turning it on, making the file for your model, measurements, the older ways |
 | [Small VRAM](docs/SMALL-VRAM.md) · [VRAM の小さいカード](docs/SMALL-VRAM.ja.md) | 8-12 GB cards: the expert pool below a route, prompts in chunks, the CPU lane's share, GLM-5.3-Flash's IQ4_XS dense pack (`tools/requant_dense.py`) |
+| [Long context](docs/CONTEXT.md) · [長いコンテキスト](docs/CONTEXT.ja.md) | each model's context limit (256K to 1M), what was measured at 64K / 128K / 256K, the KV memory per model, the `--max-context` / `--kv` to set for your card |
 | [Two SSDs](docs/SSD2.md) · [SSD を 2 枚](docs/SSD2.ja.md) | `STRATA_GLM_MIRROR`: a copy of the model on a second NVMe read alongside the first, measurements, space needed |
 | [AMD Radeon](docs/amd/README.md) · [日本語](docs/amd/README.ja.md) | AMD: the driver, ROCm (per-architecture packages), a discrete Radeon + the APU's iGPU, troubleshooting |
 | [DGX Spark](docs/DGX-SPARK.md) · [日本語](docs/DGX-SPARK.ja.md) | NVIDIA DGX Spark (GB10, ARM, unified memory, beta): the build, what was measured, what is untested |

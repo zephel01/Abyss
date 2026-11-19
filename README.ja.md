@@ -401,6 +401,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | [マニュアル](docs/MANUAL.ja.md) · [Manual](docs/MANUAL.md) | セットアップ、設定、API、複数 GPU、AMD、設定項目、トラブル対応 |
 | [設定ファイル](docs/SETTINGS.ja.md) · [Config files](docs/SETTINGS.md) | 設定ファイルと起動スクリプトの場所、変えたいこと別の書き換え場所、全項目、書き換えたあとの反映 |
 | [VRAM の小さいカード](docs/SMALL-VRAM.ja.md) · [Small VRAM](docs/SMALL-VRAM.md) | 8〜12 GB のカード: route より小さい置き場、prompt をまとめて読む、CPU レーンの分担、GLM-5.3-Flash の IQ4_XS dense pack（`tools/requant_dense.py`） |
+| [長いコンテキスト](docs/CONTEXT.ja.md) · [Long context](docs/CONTEXT.md) | モデルごとのコンテキストの上限（256K〜1M）、64K / 128K / 256K の実測、モデルごとの KV のメモリ、カードに合わせた `--max-context` / `--kv` の値 |
 | [SSD を 2 枚](docs/SSD2.ja.md) · [Two SSDs](docs/SSD2.md) | `STRATA_GLM_MIRROR`: 2 枚目の NVMe に置いたモデルの写しを 1 枚目と一緒に読む、実測、必要な容量 |
 | [無検閲化](docs/UNCENSOR.ja.md) · [Uncensoring](docs/UNCENSOR.md) | `--uncensor` の有効化、自分のモデル用のファイル作り、実測、以前からある方法 |
 | [AMD Radeon](docs/amd/README.ja.md) · [English](docs/amd/README.md) | AMD: ドライバ、ROCm（アーキテクチャ別のパッケージ）、単体の Radeon と APU の iGPU、トラブル対応 |

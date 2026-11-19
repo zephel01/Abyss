@@ -25,6 +25,7 @@ default) gives the same bits as v1.3.174.
   0.005. `--kv q4_0` / `k8v4` on Laguna now say in one line that they run fp16.
 - When fp16 KV pushes a dense model's FFN to RAM, or costs the expert pool at least 1 GB and 10% of it (qwen35 family,
   Laguna), the engine prints one `hint:` line with the KV size and what `--kv int8` would free. The default stays fp16.
+- New page [docs/CONTEXT.md](docs/CONTEXT.md) (EN / JA): each model's context limit from its GGUF (256K for the Qwen3.5/3.8 family, Ornith and Laguna; 1M for V4, V4.1 and GLM-5.3-Flash; 512K for SenseNova-Loop-9B), the 64K / 128K / 256K measurements of eight models on an RTX 5090 (all eight start and answer at 256K), the KV memory per model at 128K / 256K, and the `--max-context` / `--kv` to set per card.
 
 ## v1.3.174 - 2026-11-19
 
