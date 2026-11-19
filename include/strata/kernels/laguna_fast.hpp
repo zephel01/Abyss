@@ -15,6 +15,11 @@ namespace strata::kernels::lag {
 constexpr int kHeadDim = 128;
 constexpr int kMaxSplits = 64;   // a token's attention: its keys over up to this many blocks (256 keys at the least)
 
+/// `kv` (--kv on Laguna): the caches' format - 0 FP16, 2 int8 (4 groups of 32 dims a row: their FP16 scales max |x| /
+/// 127, then the 128 codes round(x / scale); qwen35_fast.hpp's int8 at head_dim 128).  The bytes of one cache row (a
+/// position and a KV head) of K or V.
+inline size_t kv_row_bytes(int kv) { return kv == 2 ? 136 : 2 * (size_t) kHeadDim; }
+
 /// The RoPE pair frequencies (n_rot / 2 of them, float64) for theta_i(p) = p * freq[i]: base^(-2i / n_rot), with
 /// YaRN (ggml's rope_yarn: ramp between corr dims from beta_fast / beta_slow over orig_ctx, ext_factor 1) when
 /// freq_scale != 1.  mscale (out): the cos / sin factor (1 + 0.1 ln(1 / freq_scale) under YaRN, else 1).
@@ -28,7 +33,7 @@ void rope_freqs(int n_rot, double base, double freq_scale, int orig_ctx, double 
 void attn_prep_rows(const float* q, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int n_rot, const double* freq, float mscale, int64_t p0,
                     int T, int ring, uint16_t* kc, uint16_t* vc, float* q_out, cudaStream_t s,
-                    const float2* cs = nullptr);
+                    const float2* cs = nullptr, int kv = 0);
 
 /// The (cos, sin) x mscale attn_prep_rows uses for rows p0 .. p0 + T - 1: cs [T][n_rot / 2] (a token's layers of one
 /// kind share them: one table a token instead of a sincos a layer)
@@ -42,7 +47,7 @@ size_t attn_part_floats(int rows, int n_head, int max_splits);
 /// The caller keeps every needed position in the ring (ring >= window + T - 1 for a window layer, ring > p0 + T - 1
 /// otherwise).  part: attn_part_floats(T, n_head, max_splits) floats; with few rows the keys are split across blocks.
 void attn(const float* q, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0,
-          int T, int window, float scale, float* part, int max_splits, float* out, cudaStream_t s);
+          int T, int window, float scale, float* part, int max_splits, float* out, cudaStream_t s, int kv = 0);
 
 /// o[t][h][d] *= softplus(g[t][h]) (the per-head output gate), T rows of n_head heads of 128.
 void gate_rows(float* o, const float* g, int T, int n_head, cudaStream_t s);

@@ -1753,9 +1753,10 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             const bool swa = Ly.lag_swa;
             lk::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv,
                                swa ? g.n_rot_swa : g.n_rot, swa ? F->lag_freq_swa : F->lag_freq,
-                               swa ? F->lag_mscale_swa : F->lag_mscale, p0, T, Ly.lag_ring, Ly.kc, Ly.vc, V->q35_q, s);
+                               swa ? F->lag_mscale_swa : F->lag_mscale, p0, T, Ly.lag_ring, Ly.kc, Ly.vc, V->q35_q, s,
+                               nullptr, q35_kv_);
             lk::attn(V->q35_q, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, p0, T, swa ? g.n_swa : 0,
-                     1.0f / std::sqrt((float) lk::kHeadDim), V->lag_part, lk::kMaxSplits, V->q35_ao, s);
+                     1.0f / std::sqrt((float) lk::kHeadDim), V->lag_part, lk::kMaxSplits, V->q35_ao, s, q35_kv_);
             lk::gate_rows(V->q35_ao, gl, T, H, s);
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HDl, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HDl, (int) E};

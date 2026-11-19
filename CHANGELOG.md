@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.175 - (draft)
+
+`--kv int8` at long contexts: faster prompts on the qwen35 family, Laguna support, and a start-up hint. fp16 KV (the
+default) gives the same bits as v1.3.174.
+
+- The int8 KV cache's prompt attention (qwen35 / qwen35moe, head_dim 256) ran on an older two-pass kernel; it now runs
+  on the one-pass tensor-core kernel fp16 uses (the int8 rows are turned into the same FP16 values as before inside
+  the kernel). Qwen3.8-27B UD-Q4_K_XL, RTX 5090, a 250K-token code prompt at a 256K context: prompt 599 -> 1,410
+  tok/s (fp16: 1,530), decode 38.4 tok/s, answers correct. At 64K the prompt's attention took 19.5 s, now 7.0 s
+  (fp16 6.4 s). KL against fp16 KV is unchanged (0.000504 before and after, 1,023 tokens after a 32K context).
+- Laguna takes `--kv int8` (K and V 8-bit, a scale per 32 values): at 256K the KV cache is 6.56 GB instead of 12.35,
+  and the expert pool 18.64 GB instead of 12.81 (96 slots a layer instead of 66). Decode at 256K is 20.9 tok/s against
+  19.8 with fp16: at that length decode is held by the attention over the long context, not by the experts. KL against
+  fp16 KV: 0.0039 after a 32K code context (256 tokens), 0.030 on the 3K EN / JA / code token-path set with the CPU
+  lane's exact arithmetic (the same set with only the experts' placement changed: 0.023 without it); nll within
+  0.005. `--kv q4_0` / `k8v4` on Laguna now say in one line that they run fp16.
+- When fp16 KV pushes a dense model's FFN to RAM, or costs the expert pool at least 1 GB and 10% of it (qwen35 family,
+  Laguna), the engine prints one `hint:` line with the KV size and what `--kv int8` would free. The default stays fp16.
+
 ## v1.3.174 - 2026-11-19
 
 On Linux the server now helps against systemd-oomd, which on Ubuntu desktops can end the whole terminal (engine,

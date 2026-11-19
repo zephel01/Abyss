@@ -1608,6 +1608,19 @@ bool Glm5Model::fast_setup(std::string& err) {
         { std::array<int, gf::kMaxK> none; none.fill(-1); F->pred_of.assign((size_t) NL, none); }
         std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
                      dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
+        // qwen35moe / laguna with FP16 attention caches: the pool is short of the experts and --kv int8 would free at
+        // least 1 GB and 10% of it - say so once (the default stays FP16)
+        if (q35_kv8_b_ > 0 && q35_kv8_b_ < q35_kv_b_ && nmax < g.n_expert && F->pool_slots > 0) {
+            const double freed = (double) (q35_kv_b_ - q35_kv8_b_);
+            int n_moe = 0;
+            for (int il = l0_; il < lt_; ++il) n_moe += F->L[(size_t) il].moe ? 1 : 0;
+            if (freed >= 1073741824.0 && freed >= 0.10 * (double) tot && n_moe > 0) {
+                const double per = freed / ((double) tot / (double) F->pool_slots) / n_moe;   // (the pool's mean slot)
+                char what[96];
+                std::snprintf(what, sizeof what, "the expert pool (about %.0f of its %d-%d slots a layer)", per, nmin, nmax);
+                q35_kv_hint(what, freed / 1073741824.0);
+            }
+        }
         fast_tail_skip_setup();
         if (const char* dv = getenv("STRATA_GLM_DEFER"); dv != nullptr && std::atoi(dv) != 0 && !F->abl_full) {
             // (a layer split: each part defers within its own layers - its last layer waits for its own part, as

@@ -224,9 +224,12 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     {
         const char* kv = getenv("STRATA_GLM_KV_Q35");
         const int want = kv != nullptr ? std::max(0, std::min(3, std::atoi(kv))) : 0;
-        q35_kv_ = !g.q4x && D == 256 ? want : 0;
+        // (laguna, head_dim 128: int8 only - laguna_fast.hpp)
+        q35_kv_ = g.laguna ? (want == 2 ? 2 : 0) : !g.q4x && D == 256 ? want : 0;
         if (want != 0 && q35_kv_ == 0 && l0_ == 0)
-            std::fprintf(stderr, "qwen35moe: --kv is not supported on this model's fast path - the KV cache stays FP16\n");
+            std::fprintf(stderr, "%s: --kv %s is not supported on this model's fast path%s - the KV cache stays FP16\n",
+                         g.laguna ? "laguna" : "qwen35moe", want == 1 ? "q4_0" : want == 3 ? "k8v4" : "int8",
+                         g.laguna ? " (--kv int8 is)" : "");
     }
     const size_t row_k = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, false) : KV * 2;
     const size_t row_v = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, true) : KV * 2;
@@ -243,9 +246,17 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         bytes -= (size_t) n_attn * cache_b;
         for (int il = l0_; il < l1_; ++il) {
             const size_t rows = (size_t) g.lag_rows(il, (int64_t) ctx);
-            lag_cache += 2 * al(rows * KV * 2);
+            lag_cache += 2 * al(rows * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_));
         }
         bytes += lag_cache + 2 * al(64 * 8) + al((size_t) g.n_head * 4) + 2 * al(64 * 8);
+    }
+    q35_kv_b_ = g.laguna ? lag_cache : (size_t) n_attn * cache_b;
+    q35_kv8_b_ = 0;
+    if (q35_kv_ == 0 && g.laguna) {
+        for (int il = l0_; il < l1_; ++il)
+            q35_kv8_b_ += 2 * al((size_t) g.lag_rows(il, (int64_t) ctx) * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(2));
+    } else if (q35_kv_ == 0 && !g.q4x && D == 256) {
+        q35_kv8_b_ = (size_t) n_attn * 2 * al(ctx * g.attn_head_kv * q35::kv_row_bytes(2, false));
     }
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
@@ -278,8 +289,8 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
             Ly.gdn_conv = (float*) take(C * (size_t) (g.d_conv - 1) * 4);
         } else if (g.laguna) {
             Ly.lag_ring = (int) g.lag_rows(il, (int64_t) ctx);
-            Ly.kc = (uint16_t*) take((size_t) Ly.lag_ring * KV * 2);
-            Ly.vc = (uint16_t*) take((size_t) Ly.lag_ring * KV * 2);
+            Ly.kc = (uint16_t*) take((size_t) Ly.lag_ring * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_));
+            Ly.vc = (uint16_t*) take((size_t) Ly.lag_ring * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_));
         } else {
             Ly.kc = (uint16_t*) take(ctx * row_k);
             Ly.vc = (uint16_t*) take(ctx * row_v);
@@ -358,8 +369,9 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         }
     }
     if (g.laguna)
-        std::fprintf(stderr, "laguna: CUDA%d %d attention layers (KV caches %.2f GB for %lld tokens, window layers' rings "
-                             "%lld rows)\n", dev_, n_attn, (double) lag_cache / 1073741824.0, (long long) ctx,
+        std::fprintf(stderr, "laguna: CUDA%d %d attention layers (KV caches %.2f GB for %lld tokens%s, window layers' "
+                             "rings %lld rows)\n", dev_, n_attn, (double) lag_cache / 1073741824.0, (long long) ctx,
+                     q35_kv_ == 2 ? ", int8" : "",
                      (long long) std::min<int64_t>((int64_t) ctx, (int64_t) g.n_swa + Glm5Geometry::kLagSlice));
     else
     std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
@@ -779,6 +791,16 @@ void Glm5Model::qwen35_reset() {
     cudaStreamSynchronize(F->cs);
 }
 
+// "--kv int8 would help" at start-up: FP16 attention caches that push `pushed_gb` of weights (`what`) out of VRAM
+void Glm5Model::q35_kv_hint(const char* what, double pushed_gb) const {
+    if (q35_kv8_b_ == 0 || q35_kv8_b_ >= q35_kv_b_) return;
+    const double G = 1073741824.0, freed = (double) (q35_kv_b_ - q35_kv8_b_) / G;
+    std::fprintf(stderr, "glm fast: CUDA%d hint: the FP16 KV cache takes %.2f GB at %lld tokens and %s %.2f GB of %s; "
+                         "--kv int8 would take %.2f GB (%.2f GB freed for them; int8 codes, a small accuracy cost)\n",
+                 dev_, (double) q35_kv_b_ / G, (long long) max_ctx_, g_.n_expert > 0 ? "costs" : "pushes", pushed_gb, what,
+                 (double) q35_kv8_b_ / G, freed);
+}
+
 size_t Glm5Model::q35_snap_bytes() const {
     const FastState* F = fast_;
     if (F == nullptr || qwen35_state_ == nullptr) return 0;
@@ -793,7 +815,7 @@ size_t Glm5Model::q35_snap_bytes() const {
         const auto& Ly = F->L[(size_t) il];
         if (Ly.recr) total += state_b + conv_b;
         else if (Ly.q4_tail != nullptr) total += tail_b;
-        total += 2 * (Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * 128 * 2 : (size_t) 0);
+        total += 2 * (Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_) : (size_t) 0);
     }
     return total;
 }
@@ -812,7 +834,7 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     // laguna: a window layer's ring (the rows a later position overwrites; the full layers' rows past the snapshot are
     // written again in order)
     const auto ring_b = [&](const FastState::Layer& Ly) {
-        return Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * 128 * 2 : (size_t) 0;
+        return Ly.lag_swa ? (size_t) Ly.lag_ring * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_) : (size_t) 0;
     };
     const size_t total = q35_snap_bytes();   // (the runs below, in this order)
     if (q35_snap_h_ == nullptr) {
@@ -1773,9 +1795,9 @@ bool Glm5Model::fast_laguna_attn(int il, int64_t p64, std::string& err) {
     float2* cs = swa ? F->lag_cs_swa : F->lag_cs;
     if (il == (swa ? F->lag_first_swa : F->lag_first)) lk::rope_table(fq, nr, ms, p64, 1, cs, s);   // (a token's first layer of its kind)
     lk::attn_prep_rows(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv, nr, fq, ms,
-                       p64, 1, Ly.lag_ring, Ly.kc, Ly.vc, F->q35_q, s, cs);
+                       p64, 1, Ly.lag_ring, Ly.kc, Ly.vc, F->q35_q, s, cs, q35_kv_);
     lk::attn(F->q35_q, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, p64, 1, swa ? g.n_swa : 0,
-             1.0f / std::sqrt((float) D), F->q35_part, lk::kMaxSplits, F->q35_ao, s);
+             1.0f / std::sqrt((float) D), F->q35_part, lk::kMaxSplits, F->q35_ao, s, q35_kv_);
     if (dumps) {
         q35_dump(s, "Qcur_rope", il, F->q35_q, HD);
         q35_dump(s, "attn_out", il, F->q35_ao, HD);

@@ -3414,14 +3414,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     lk::attn_prep_rows(B.qf + (size_t) a * HDq, B.k + (size_t) a * KV, B.v + (size_t) a * KV, Ly.q_norm,
                                        Ly.k_norm, g.norm_eps, H, g.attn_head_kv, swa ? g.n_rot_swa : g.n_rot,
                                        swa ? F->lag_freq_swa : F->lag_freq, swa ? F->lag_mscale_swa : F->lag_mscale,
-                                       pt0 + a, an, Ly.lag_ring, Ly.kc, Ly.vc, B.q + (size_t) a * HDq, s);
+                                       pt0 + a, an, Ly.lag_ring, Ly.kc, Ly.vc, B.q + (size_t) a * HDq, s, nullptr,
+                                       q35_kv_);
                     // the tensor-core kernel (prompt_flash_attn), else (HIP, under sm_80, STRATA_PROMPT_FA_OLD=1)
                     // the CUDA-core one
                     if (!strata::kernels::fpa::attn(B.q + (size_t) a * HDq, Ly.kc, Ly.vc, Ly.lag_ring, H,
                                                     g.attn_head_kv, D, pt0 + a, an, swa ? g.n_swa : 0,
-                                                    1.0f / std::sqrt((float) D), B.ao + (size_t) a * HDq, s))
+                                                    1.0f / std::sqrt((float) D), B.ao + (size_t) a * HDq, s, q35_kv_))
                         lk::attn(B.q + (size_t) a * HDq, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, pt0 + a, an,
-                                 swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), nullptr, 1, B.ao + (size_t) a * HDq, s);
+                                 swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), nullptr, 1, B.ao + (size_t) a * HDq, s,
+                                 q35_kv_);
                 }
                 lk::gate_rows(B.ao, gl, tn, H, s);
                 S->mark("lag_attn", s);

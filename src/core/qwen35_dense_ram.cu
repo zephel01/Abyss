@@ -820,6 +820,7 @@ bool Glm5Model::q35d_place(std::string& err) {
         std::fprintf(stderr, "glm fast: CUDA%d dense qwen35: the FFN %.2f GB in VRAM, %.2f GB in RAM (%d layers' last %d of "
                              "%d rows, pinned; %d CPU threads)%s; VRAM %.2f GB in use%s\n", dev_, (double) dev_b / G,
                      (double) ram_b / G, m, c_rows, FF, Q->threads, extra, (double) (total_b - free_b) / G, capb);
+    if (m > 0) q35_kv_hint("the dense FFN to RAM (CPU FFN, slower decode)", (double) ram_b / G);
     return true;
 }
 

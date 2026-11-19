@@ -588,6 +588,10 @@ public:
     // conversation snapshot are elsewhere; no layer splits yet)
     void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations
     int q35_kv_ = 0;   // --kv (STRATA_GLM_KV_Q35): the attention layers' cache format, qwen35_fast.hpp's kv (0 FP16)
+    // this GPU's attention caches (qwen35_alloc): their bytes, and what --kv int8 would take where it applies and the
+    // caches are FP16 (else 0) - the start-up hint when FP16 KV pushes weights out of VRAM (q35_kv_hint)
+    size_t q35_kv_b_ = 0, q35_kv8_b_ = 0;
+    void q35_kv_hint(const char* what, double pushed_gb) const;
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)
