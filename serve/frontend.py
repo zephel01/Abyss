@@ -344,8 +344,24 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
     turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
-    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+    merging them into the first one would change the prompt's start and cost the conversation cache every turn.
+    A late system message right after a user message goes in just before that user message (after the turn's tool
+    results): the user's own words stay the last thing the model reads.  Claude Code's compaction request ends with
+    the user's "summarize, do NOT call any tools" and then a system note (files read before, deferred tools, agent
+    types); read last, the note made Qwen3.8-27B call Read instead of summarizing ("summarization produced empty
+    response").  The same place every turn, so the conversation cache still matches."""
+    out: list[dict] = []
+    words = -1                                       # index of the last user message with the user's own words
+    for i, m in enumerate(messages):
+        if m.get("role") != "system" or i == 0:
+            words = len(out) if m.get("role") == "user" else -1
+            out.append(m)
+        elif words >= 0 and words == len(out) - 1:   # right after it: in before it (several keep their order)
+            out.insert(words, dict(m, role="user"))
+            words += 1
+        else:
+            out.append(dict(m, role="user"))
+    return out
 
 
 # DeepSeek V4 0731 answers a Japanese question in Chinese now and then - the original weights too, the answer itself

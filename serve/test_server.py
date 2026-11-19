@@ -584,7 +584,25 @@ class ClientShapes(unittest.TestCase):
         self.assertIn("You are terse.", text)
         self.assertIn("<system-reminder>answer in digits</system-reminder>", text)
         self.assertLess(text.index("You are terse."), text.index("1+1?"))          # the first system stays first
-        self.assertLess(text.index("1+1?"), text.index("answer in digits"))        # the late one stays in place
+        self.assertLess(text.index("answer in digits"), text.index("1+1?"))        # the late one goes before the words
+
+    def test_late_system_before_the_user_words(self):
+        """Claude Code's compaction request: tool results, the user's "summarize, no tools", then a system note.  The
+        note goes in after the tool results and before the words, which stay last; each turn's prompt is the start
+        of the next one's (the conversation cache still matches)."""
+        from frontend import anthropic_to_messages
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+        turn1 = [{"role": "user", "content": "read f1"}, {"role": "system", "content": "env note"}]
+        turn2 = turn1 + [call, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "R1"},
+                                                            {"type": "text", "text": "summarize, no tools"}]},
+                         {"role": "system", "content": "files read before"}, {"role": "system", "content": "tool list"}]
+        m1, _, _ = anthropic_to_messages({"system": "S", "messages": turn1})
+        m2, _, _ = anthropic_to_messages({"system": "S", "messages": turn2})
+        self.assertEqual([m["content"] for m in m1], ["S", "env note", "read f1"])
+        self.assertEqual([(m["role"], m["content"]) for m in m2[4:]],
+                         [("tool", "R1"), ("user", "files read before"), ("user", "tool list"),
+                          ("user", "summarize, no tools")])
+        self.assertEqual(m2[:len(m1)], m1)
 
     def test_openai_late_developer_and_system(self):
         status, b = self.post("/v1/chat/completions", {

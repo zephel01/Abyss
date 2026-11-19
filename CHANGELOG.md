@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.173 - 2026-11-19
+
+Claude Code's conversation compaction no longer fails on Qwen3.8-27B with "summarization produced empty response". No
+engine change: greedy and seeded outputs are as in v1.3.172.
+
+- A system message that comes right after a user message (Claude Code's notes: environment, files read before a
+  compaction, deferred tools, agent types) now goes in before that user message, after the turn's tool results, so
+  the user's own words are the last thing the model reads. Before, it stayed in place: Claude Code's compaction
+  request ends with the user's "summarize, do NOT call any tools" and then such a note, and the model read the
+  tool list last and called Read instead of writing the summary. Replaying one recorded compaction request (33.6K
+  tokens, Qwen3.8-27B UD-Q4_K_XL, RTX 5090): a tool call instead of the summary 6 of 16 times -> 0 of 16. The place
+  is the same every turn, so the conversation cache still matches (Claude Code, turn 2 read only its new tokens);
+  saved conversations from v1.3.172 are read again once. Checked end to end: Claude Code 2.1.323 on a 49,152-token
+  context compacted 3 times in a row (v1.3.172: the 2nd or 3rd failed).
+
 ## v1.3.172 - 2026-11-19
 
 Server guards: a prompt that leaves too little room to answer is a "prompt is too long" error (Claude Code compacts on
