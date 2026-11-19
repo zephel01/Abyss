@@ -671,38 +671,78 @@ def parse_dsml_calls(body: str, schemas: dict | None = None) -> list[ToolCall]:
         props = (((schemas or {}).get(m.group(1)) or {}).get("parameters") or {}).get("properties") or {}
         for pm in re.finditer(r'<\uff5cDSML\uff5c\s*parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>(.*?)'
                               r'</\uff5cDSML\uff5c\s*parameter>', m.group(2), re.S):
-            value = pm.group(3)
-            b = _as_bool(value, (props.get(pm.group(1)) or {}).get("type"))
+            value, types = pm.group(3), _declared_types(props.get(pm.group(1)))
+            b = _as_bool(value, types)
             if b is not None:
                 args[pm.group(1)] = b
             elif pm.group(2) == "true":
                 args[pm.group(1)] = value
-            else:
-                try:
-                    args[pm.group(1)] = json.loads(value)
-                except ValueError:
-                    args[pm.group(1)] = value
+            else:                                   # string="false": JSON, unless the schema says string
+                args[pm.group(1)] = _arg_value(value, types)
         calls.append(ToolCall(name=m.group(1), arguments=args))
     if not calls:
         raise ValueError("malformed DSML tool calls: " + body[:80])
     return calls
 
 
-def _declared_types(declared) -> tuple:
-    """A schema "type" (one name or a list of names) as a tuple of names."""
-    if isinstance(declared, str):
-        return (declared,)
-    if isinstance(declared, (list, tuple)):
-        return tuple(t for t in declared if isinstance(t, str))
-    return ()
+_SCHEMA_DEPTH = 8          # anyOf / oneOf nesting looked into; deeper is "no schema"
+
+
+def _declared_types(schema, depth: int = 0):
+    """The JSON types a parameter's schema allows, as a frozenset of names - from its "type" (one name or a list) or
+    gathered through anyOf / oneOf (nested, up to _SCHEMA_DEPTH): Pydantic writes Optional[bool] as
+    {"anyOf": [{"type": "boolean"}, {"type": "null"}]}.  None when it cannot be known (no schema, a branch with a
+    $ref or without a type, too deep): the value is then read as before, JSON when it parses (Strata 5e965ec57's
+    idea).  A bare type name (a string) is also taken, for the callers that had only that."""
+    if isinstance(schema, str):
+        return frozenset((schema,))
+    if not isinstance(schema, dict) or depth > _SCHEMA_DEPTH:
+        return None
+    t = schema.get("type")
+    if isinstance(t, str):
+        return frozenset((t,))
+    if isinstance(t, (list, tuple)):
+        names = frozenset(x for x in t if isinstance(x, str))
+        return names or None
+    branches = []
+    for key in ("anyOf", "oneOf"):
+        if isinstance(schema.get(key), list):
+            branches += schema[key]
+    if not branches:
+        return None
+    out = set()
+    for branch in branches:
+        got = _declared_types(branch, depth + 1)
+        if got is None:
+            return None
+        out |= got
+    return frozenset(out) or None
+
+
+def _is_string(types) -> bool:
+    """The parameter is a string (or a string or null): its text is the value as written, never JSON-decoded."""
+    return bool(types) and "string" in types and types <= {"string", "null"}
+
+
+def _fits(value, types) -> bool:
+    """A JSON-decoded value is one of the declared types."""
+    for t in types:
+        if (t == "string" and isinstance(value, str) or t == "null" and value is None or
+                t == "boolean" and isinstance(value, bool) or t == "object" and isinstance(value, dict) or
+                t == "array" and isinstance(value, list) or
+                t == "integer" and isinstance(value, int) and not isinstance(value, bool) or
+                t == "number" and isinstance(value, (int, float)) and not isinstance(value, bool)):
+            return True
+    return False
 
 
 def _as_bool(value, declared):
     """`True` / `False` (Python's spelling, any case, also a JSON string "true") for a parameter the schema declares
     boolean and not string -> the JSON bool; None otherwise.  Models write `<parameter=x>True</parameter>` with
-    thinking off, and the client got the string "True"."""
-    types = _declared_types(declared)
-    if "boolean" not in types or "string" in types or not isinstance(value, str):
+    thinking off, and the client got the string "True".  `declared`: _declared_types() of the schema (or the schema,
+    or a type name)."""
+    types = declared if isinstance(declared, frozenset) else _declared_types(declared)
+    if not types or "boolean" not in types or "string" in types or not isinstance(value, str):
         return None
     word = value.strip().lower()
     if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'":
@@ -711,18 +751,27 @@ def _as_bool(value, declared):
 
 
 def _arg_value(value: str, declared) -> object:
-    """A parameter's text as the client gets it: as written when the schema says string, else JSON-decoded when it
-    parses (numbers, booleans, objects, arrays), else as written.  A boolean parameter also takes `True` / `False`
-    in any case (and the quoted words)."""
-    if declared == "string":
+    """A parameter's text as the client gets it.  `declared`: _declared_types() of its schema (or the schema).
+    - a string (or string-or-null) parameter: as written ("42" stays "42", and so does `null`: a stream sends a
+      string value's characters as they come, so the whole call must say the same)
+    - another type that allows null: `null` is None (JSON)
+    - a boolean one also takes `True` / `False` in any case (and the quoted words)
+    - otherwise JSON-decoded when it parses (numbers, booleans, objects, arrays), else as written - except that a
+      parameter that also allows a string keeps its text when the decoded value is none of the declared types
+      (["string", "integer"]: "42" -> 42, "true" stays "true")."""
+    types = declared if isinstance(declared, frozenset) else _declared_types(declared)
+    if _is_string(types):
         return value
-    b = _as_bool(value, declared)
+    b = _as_bool(value, types)
     if b is not None:
         return b
     try:
-        return json.loads(value)
+        v = json.loads(value)
     except ValueError:
         return value
+    if types and "string" in types and not _fits(v, types):
+        return value
+    return v
 
 
 def call_name(body: str) -> str:
@@ -778,7 +827,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             end = rest.find(ARG_VAL_END)
             value = rest[:end] if end >= 0 else rest
             rest = rest[end + len(ARG_VAL_END):] if end >= 0 else ""
-            args[key] = _arg_value(value, (props.get(key) or {}).get("type"))
+            args[key] = _arg_value(value, _declared_types(props.get(key)))
         return ToolCall(name=name, arguments=args)
     if ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
@@ -799,7 +848,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = _arg_value(value, (props.get(pname) or {}).get("type"))
+        args[pname] = _arg_value(value, _declared_types(props.get(pname)))
     return ToolCall(name=name, arguments=args)
 
 
@@ -930,7 +979,7 @@ class OutputParser:
             return False                  # not announced: the whole body decides at its end (text)
         self.scall = ToolCall(name=name, arguments={})
         props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-        self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+        self.sdeclared = {k: _declared_types(v) for k, v in props.items()}
         out.append(Event("tool_start", call=self.scall))
         args("{")
         return True
@@ -988,7 +1037,7 @@ class OutputParser:
                 args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                 self.sfirst = False
                 take((len(rest) - len(stripped)) + k1 + len(ARG_KEY_END) + v0 + len(ARG_VAL))
-                if self.sdeclared.get(pname) == "string":
+                if _is_string(self.sdeclared.get(pname)):
                     args('"')
                     self.ss, self.sval_started = "str", True     # GLM's values are written as they are
                 else:
@@ -1004,7 +1053,7 @@ class OutputParser:
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     take(b + 1)
-                    if self.sdeclared.get(pname) == "string":
+                    if _is_string(self.sdeclared.get(pname)):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:

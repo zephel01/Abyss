@@ -247,6 +247,80 @@ class BoolArguments(unittest.TestCase):
             self.assertEqual([c.arguments for c in calls(ev)], [{"all": True, "long": False, "label": "True"}])
 
 
+class SchemaUnionArguments(unittest.TestCase):
+    """The declared type is read through anyOf / oneOf (nested) and type lists - Pydantic's Optional[X] - not just
+    a top-level "type" (Strata 5e965ec57's idea): Optional[bool] `True` is a bool, Optional[str] `42` / `true` stay
+    strings, `null` is None for a non-string type that allows null; a branch with a $ref or no type means "no schema" (read as
+    before).  Whole and streamed, Qwen, GLM and DSML forms."""
+
+    OPT = lambda *ts: {"anyOf": [{"type": t} for t in ts]}   # noqa: E731
+    TOOLS = [{"name": "f", "parameters": {"type": "object", "properties": {
+        "flag": OPT("boolean", "null"),
+        "s": OPT("string", "null"),
+        "one": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+        "nested": {"anyOf": [{"anyOf": [{"type": "boolean"}]}, {"type": "null"}]},
+        "n": OPT("integer", "null"),
+        "si": {"type": ["string", "integer"]},
+        "ref": {"anyOf": [{"$ref": "#/$defs/X"}, {"type": "null"}]},
+        "bare": {"anyOf": [{}, {"type": "string"}]}}}}]
+
+    def check(self, params, want):
+        body = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
+        text = "<tool_call>\n<function=f>\n" + body + "</function>\n</tool_call>"
+        for pieces in (None, 1, 5):
+            ev = run(text, pieces, tools=self.TOOLS)
+            self.assertEqual([c.arguments for c in calls(ev)], [want], (pieces, params))
+            streamed = "".join(e.text for e in ev if e.kind == "tool_args")
+            self.assertEqual(json.loads(streamed), want, (pieces, params))
+
+    def test_optional_bool_is_a_bool(self):
+        self.check({"flag": "True", "nested": "False"}, {"flag": True, "nested": False})
+
+    def test_optional_string_stays_a_string(self):
+        self.check({"s": "42", "one": "true"}, {"s": "42", "one": "true"})
+        self.check({"s": '{"a": 1}', "one": "[1, 2]"}, {"s": '{"a": 1}', "one": "[1, 2]"})
+
+    def test_null_where_allowed(self):
+        self.check({"flag": "null", "n": "null"}, {"flag": None, "n": None})
+        # a string (or string-or-null) parameter keeps the word: its stream sent the characters before the end
+        self.check({"s": "null"}, {"s": "null"})
+        self.assertEqual(parse_tool_call("<function=get_weather>\n<parameter=city>\nnull\n</parameter>\n"
+                                         "</function>", TOOLS[0]).arguments, {"city": "null"})
+
+    def test_optional_number_is_decoded(self):
+        self.check({"n": "7"}, {"n": 7})
+
+    def test_string_or_integer_keeps_text_of_another_type(self):
+        self.check({"si": "42"}, {"si": 42})
+        self.check({"si": "true"}, {"si": "true"})
+
+    def test_unknown_branch_is_no_schema(self):
+        # a $ref or an untyped branch: read as before (JSON when it parses), never forced to bool / string
+        self.check({"ref": "42", "bare": "True"}, {"ref": 42, "bare": "True"})
+
+    def test_glm_and_dsml_forms(self):
+        ev = run("<tool_call>f\n<arg_key>flag</arg_key>\n<arg_value>True</arg_value>\n<arg_key>s</arg_key>"
+                 "\n<arg_value>42</arg_value>\n</tool_call>", None, tools=self.TOOLS)
+        self.assertEqual([c.arguments for c in calls(ev)], [{"flag": True, "s": "42"}])
+        dsml = ("<\uff5cDSML\uff5ctool_calls>\n<\uff5cDSML\uff5cinvoke name=\"f\">\n"
+                "<\uff5cDSML\uff5cparameter name=\"flag\" string=\"false\">True</\uff5cDSML\uff5cparameter>\n"
+                "<\uff5cDSML\uff5cparameter name=\"s\" string=\"false\">42</\uff5cDSML\uff5cparameter>\n"
+                "<\uff5cDSML\uff5cparameter name=\"n\" string=\"false\">5</\uff5cDSML\uff5cparameter>\n"
+                "</\uff5cDSML\uff5cinvoke>\n</\uff5cDSML\uff5ctool_calls>")
+        for pieces in (None, 7):
+            ev = run(dsml, pieces, tools=self.TOOLS)
+            self.assertEqual([c.arguments for c in calls(ev)], [{"flag": True, "s": "42", "n": 5}])
+
+    def test_depth_limit(self):
+        deep = {"type": "boolean"}
+        for _ in range(20):
+            deep = {"anyOf": [deep]}
+        tools = [{"name": "g", "parameters": {"type": "object", "properties": {"b": deep}}}]
+        ev = run("<tool_call>\n<function=g>\n<parameter=b>\nTrue\n</parameter>\n</function>\n</tool_call>",
+                 None, tools=tools)
+        self.assertEqual([c.arguments for c in calls(ev)], [{"b": "True"}])   # too deep: no schema, as before
+
+
 class GenerationTag(unittest.TestCase):
     def test_laguna_generation_block_renders_its_body(self):
         # Laguna-S-2.1's template wraps the assistant's turn in transformers' {% generation %} marker
