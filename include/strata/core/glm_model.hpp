@@ -592,6 +592,35 @@ public:
     // caches are FP16 (else 0) - the start-up hint when FP16 KV pushes weights out of VRAM (q35_kv_hint)
     size_t q35_kv_b_ = 0, q35_kv8_b_ = 0;
     void q35_kv_hint(const char* what, double pushed_gb) const;
+    // ---- elastic KV (src/core/glm_elastic.cu, --kv-elastic / --kv-min): the full-context caches on CUDA's virtual
+    // memory API, mapped as positions are reached; the unmapped part lent to the expert pool's elastic ranks or the
+    // dense FFN's elastic layers and taken back when the KV grows
+    struct ElasticKv;
+    ElasticKv* ekv_ = nullptr;
+    static int64_t ekv_min_tokens();                       // --kv-min (STRATA_GLM_KV_MIN), 32768
+    bool ekv_on() const;
+    size_t ekv_lendable() const;                           // the reserved KV bytes not mapped (what the weights may take)
+    size_t ekv_lent() const;                               // ... and what the weights hold of them
+    bool ekv_kv_setup(const std::vector<size_t>& rows, std::vector<void*>& ptrs);   // qwen35_alloc: false = fixed
+    bool ekv_kv_map(int64_t tokens, std::string& err);
+    bool ekv_kv_all(std::string& err);                     // nothing borrows: map the KV whole
+    bool ekv_pool_layout(std::vector<int>& slots, const std::vector<size_t>& stride, size_t guard, bool zero,
+                         int cap_slots, std::vector<uint8_t*>& base, std::string& err);
+    bool ekv_pool_ranks(int r, std::string& err);
+    int ekv_pool_core(int il) const;                       // a layer's core slots under elastic ranks, else -1
+    void ekv_lent_set(size_t bytes);
+    void ekv_reset_mark();
+    void ekv_destroy();
+    bool q35d_elastic_shrink(size_t keep_bytes, std::string& err);   // the dense FFN's elastic layers down to keep_bytes
+    bool q35d_elastic_grow(std::string& err);                        // ... and back up to what the budget leaves
+    /// elastic KV: positions below `end` are about to be written - map them (the weights give back the room); a no-op
+    /// when the caches are fixed
+    bool kv_ensure(int64_t end, std::string& err);
+    std::string ekv_status() const;                        // "" when fixed
+    // the prompt path's lending generalised: every slot take(il, s) picks leaves the decode (its expert moves over a
+    // colder resident, parks in the RAM tier or goes) and is left in `state` (kLent: the tail; kElastic: elastic KV)
+    bool lend_slots(const std::function<bool(int, int)>& take, char state, uint64_t& moved, uint64_t& dropped,
+                    std::string& err);
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)

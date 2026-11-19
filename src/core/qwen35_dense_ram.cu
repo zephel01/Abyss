@@ -126,6 +126,7 @@ struct Glm5Model::Q35dRam {
         int loan_kind = -1;              // its block: 0 the region, 1 the MMQ buffers, 2 the staging buffers
         size_t loan_off = 0;             // ... and its offset there
         bool dirty = false;              // a prompt took its bytes (q35d_restore uploads it)
+        uint8_t* edev = nullptr;         // elastic KV: the whole layer in VRAM while the KV leaves the room (ram off)
         size_t total() const { return al256(bytes[0]) + al256(bytes[1]) + al256(bytes[2]); }
         // the bytes of a part of k FF rows (gate / up rows, down columns), as laid out
         size_t part(int k, int n_embd) const {
@@ -150,6 +151,8 @@ struct Glm5Model::Q35dRam {
     size_t dev_bytes = 0, pinned_bytes = 0;
     std::vector<int> ram_layers;  // ascending
     std::vector<int> prompt_layers;   // the RAM and the loaned layers, ascending (the prompt path stages them)
+    std::vector<int> elastic;         // elastic KV: the RAM layers given a whole VRAM copy, in that order
+    size_t elastic_bytes = 0;
     bool evicted = false;         // the loaned layers out of VRAM (a prompt runs)
     void* stage_block = nullptr;  // the two staging buffers in one allocation
     size_t loan_bytes = 0;
@@ -437,6 +440,10 @@ bool Glm5Model::q35d_place(std::string& err) {
     const bool lazy = mlv == nullptr || std::strcmp(mlv, "EAGER") != 0;
     const size_t reserve = (size_t) std::max(0.0, std::atof(getenv("STRATA_Q35D_RESERVE_MB") ? getenv("STRATA_Q35D_RESERVE_MB") : lazy ? "320" : "128")) << 20;
     room = room > reserve ? room - reserve : 0;
+    // elastic KV: the free VRAM counts the KV's unmapped part - placed as the fixed layout would, then lent to whole
+    // layers (q35d_elastic_grow, below)
+    const size_t ek_lend = ekv_lendable();
+    room -= std::min(room, ek_lend);
     size_t all = 0, max_layer = 0;
     for (const auto& f : Q->L) {
         all += f.total();
@@ -452,6 +459,7 @@ bool Glm5Model::q35d_place(std::string& err) {
             used = total_b - free_b - std::min(vram_base_, total_b - free_b);
             room = cap > 0 ? (cap > used ? std::min(cap - used, free_b) : 0) : free_b;
             room = room > reserve ? room - reserve : 0;
+            room -= std::min(room, ek_lend);
             std::fprintf(stderr, "dflash: dropped - the FFN (%.2f GB) does not fit in VRAM beside it "
                                  "(STRATA_Q35_DFLASH_KEEP=1 keeps it)\n", (double) all / G);
         }
@@ -470,7 +478,7 @@ bool Glm5Model::q35d_place(std::string& err) {
         int vg = g.n_vocab;
         // (left: the room before the reserve's clamp - negative on a card this process is past already)
         const int64_t left = (cap > 0 ? std::min<int64_t>((int64_t) cap - (int64_t) used, (int64_t) free_b) : (int64_t) free_b) -
-                             (int64_t) reserve;
+                             (int64_t) reserve - (int64_t) ek_lend;
         if (const char* v = getenv("STRATA_Q35D_HEAD_ROWS")) {
             vg = std::max(0, std::min(g.n_vocab, std::atoi(v) / 256 * 256));
         } else if (ram_ok && left < (int64_t) stage_need) {
@@ -820,7 +828,125 @@ bool Glm5Model::q35d_place(std::string& err) {
         std::fprintf(stderr, "glm fast: CUDA%d dense qwen35: the FFN %.2f GB in VRAM, %.2f GB in RAM (%d layers' last %d of "
                              "%d rows, pinned; %d CPU threads)%s; VRAM %.2f GB in use%s\n", dev_, (double) dev_b / G,
                      (double) ram_b / G, m, c_rows, FF, Q->threads, extra, (double) (total_b - free_b) / G, capb);
-    if (m > 0) q35_kv_hint("the dense FFN to RAM (CPU FFN, slower decode)", (double) ram_b / G);
+    if (m > 0 && !ekv_on()) q35_kv_hint("the dense FFN to RAM (CPU FFN, slower decode)", (double) ram_b / G);
+    if (ekv_on()) {   // elastic KV: whole VRAM copies of the RAM layers in the KV's unmapped room, else the KV maps whole
+        if (m > 0 && !q35d_elastic_grow(err)) return false;
+        if (Q->elastic.empty() && !ekv_kv_all(err)) return false;
+    }
+    return true;
+}
+
+// ---- elastic KV (glm_elastic.cu): a RAM layer (its FFN partly or wholly on the CPU) gets a whole copy in VRAM - put
+// together from its VRAM part and its pinned part, as the prompt path's staging does - and runs as a VRAM layer
+// (decode, verify windows and prompts) until the KV needs the room; then the copy goes and the layer is a RAM layer
+// again.  The layers with the most CPU rows first; they leave in the opposite order.
+namespace {
+void q35d_slots(Glm5Model::FastState* F, std::map<std::string, WSlot>& ws, int il, uint8_t* const p[3]) {
+    static const char* nm[3] = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
+    for (int r = 0; r < 3; ++r) {
+        auto it = ws.find("blk." + std::to_string(il) + "." + nm[r]);
+        if (it != ws.end()) it->second.q = p[r];
+        auto& Ly = F->L[(size_t) il];
+        WSlot& w = r == 0 ? Ly.ffn_gate : r == 1 ? Ly.ffn_up : Ly.ffn_down;
+        w.q = p[r];
+    }
+}
+}  // namespace
+
+bool Glm5Model::q35d_elastic_grow(std::string& err) {
+    Q35dRam* Q = q35d_;
+    if (Q == nullptr || !Q->placed || !ekv_on()) return true;
+    const size_t room = ekv_lendable();
+    std::vector<int> cand;
+    for (int il = 0; il < (int) Q->L.size(); ++il)
+        if (Q->L[(size_t) il].ram && !Q->L[(size_t) il].lent && Q->L[(size_t) il].edev == nullptr) cand.push_back(il);
+    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return Q->L[(size_t) a].kg < Q->L[(size_t) b].kg; });
+    const int E = Q->n_embd;
+    int added = 0;
+    for (int il : cand) {
+        auto& f = Q->L[(size_t) il];
+        if (Q->elastic_bytes + f.total() > room) break;
+        uint8_t* d = nullptr;
+        if (cudaMalloc(&d, f.total()) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        const int kg = std::max(0, f.kg);
+        uint8_t* p[3];
+        uint8_t* at = d;
+        bool ok = true;
+        for (int r = 0; r < 2; ++r) {
+            const size_t g0 = (size_t) kg * f.row[r];
+            p[r] = at;
+            if (kg > 0) ok = ok && cudaMemcpy(at, f.dev[r], g0, cudaMemcpyDeviceToDevice) == cudaSuccess;
+            ok = ok && cudaMemcpy(at + g0, f.host[r], f.bytes[r] - g0, cudaMemcpyHostToDevice) == cudaSuccess;
+            at += al256(f.bytes[r]);
+        }
+        p[2] = at;
+        if (kg > 0) {
+            ok = ok && cudaMemcpy2D(at, f.row[2], f.dev[2], f.drow_g, f.drow_g, (size_t) E, cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                 cudaMemcpy2D(at + f.drow_g, f.row[2], f.host[2], f.drow_c, f.drow_c, (size_t) E, cudaMemcpyHostToDevice) == cudaSuccess;
+        } else {
+            ok = ok && cudaMemcpy(at, f.host[2], f.bytes[2], cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        if (!ok) {
+            cudaGetLastError();
+            cudaFree(d);
+            err = "qwen35 dense: an elastic layer's copy did not upload";
+            return false;
+        }
+        f.edev = d;
+        f.ram = false;
+        q35d_slots(fast_, ws_map_, il, p);
+        Q->elastic.push_back(il);
+        Q->elastic_bytes += f.total();
+        ++added;
+    }
+    if (added == 0) return true;
+    Q->ram_layers.clear();
+    Q->prompt_layers.clear();
+    for (int il = 0; il < (int) Q->L.size(); ++il) {
+        if (Q->L[(size_t) il].ram) Q->ram_layers.push_back(il);
+        if (Q->L[(size_t) il].ram || Q->L[(size_t) il].lent) Q->prompt_layers.push_back(il);
+    }
+    ekv_lent_set(Q->elastic_bytes);
+    std::fprintf(stderr, "glm elastic: CUDA%d dense FFN +%d whole layers in VRAM (%.2f GB, %zu layers lent; %zu still "
+                         "on the CPU)\n", dev_, added, (double) Q->elastic_bytes / 1073741824.0, Q->elastic.size(),
+                 Q->ram_layers.size());
+    return true;
+}
+
+bool Glm5Model::q35d_elastic_shrink(size_t keep_bytes, std::string& err) {
+    Q35dRam* Q = q35d_;
+    if (Q == nullptr || Q->elastic_bytes <= keep_bytes) return true;
+    if (cudaDeviceSynchronize() != cudaSuccess) {   // (no kernel reads a copy that goes)
+        cudaGetLastError();
+        err = "qwen35 dense: the device did not settle before the elastic layers left";
+        return false;
+    }
+    int gone = 0;
+    while (!Q->elastic.empty() && Q->elastic_bytes > keep_bytes) {
+        const int il = Q->elastic.back();
+        Q->elastic.pop_back();
+        auto& f = Q->L[(size_t) il];
+        uint8_t* p[3];
+        for (int r = 0; r < 3; ++r) p[r] = f.kg > 0 ? f.dev[r] : f.host[r];   // (as q35d_place left the layer)
+        q35d_slots(fast_, ws_map_, il, p);
+        f.ram = true;
+        cudaFree(f.edev);
+        f.edev = nullptr;
+        Q->elastic_bytes -= f.total();
+        ++gone;
+    }
+    Q->ram_layers.clear();
+    Q->prompt_layers.clear();
+    for (int il = 0; il < (int) Q->L.size(); ++il) {
+        if (Q->L[(size_t) il].ram) Q->ram_layers.push_back(il);
+        if (Q->L[(size_t) il].ram || Q->L[(size_t) il].lent) Q->prompt_layers.push_back(il);
+    }
+    ekv_lent_set(Q->elastic_bytes);
+    std::fprintf(stderr, "glm elastic: CUDA%d dense FFN -%d whole layers back to the CPU (%zu still lent, %.2f GB)\n", dev_,
+                 gone, Q->elastic.size(), (double) Q->elastic_bytes / 1073741824.0);
     return true;
 }
 

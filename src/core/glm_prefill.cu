@@ -1082,6 +1082,9 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // device's total - free counts the page cache and every other process, and left a GB10 at 16 GB no pool here:
     // its prompts then ran token by token, 3.8K tokens in 129 s)
     if (F->unified_memory && vram_cap() > 0) avail = pool_avail_uma(dev_free, dev_total);
+    // (elastic KV: the KV not mapped yet counts as taken, as the pool's layout counts it - the chunk is then the fixed
+    // layout's, and a prompt's chunks, its sum order and its bits do not depend on --kv-elastic)
+    avail -= std::min(avail, ekv_lendable());
     size_t blob_sum = 0, stride_sum = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -1764,6 +1767,18 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
 bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
     FastState* F = fast_;
+    const auto take = [&](int il, int s) {
+        const auto& P = F->lp[(size_t) il];
+        return s >= P.n_main && s < P.n && P.slot_ptr(s) < F->xpool + limit;
+    };
+    return lend_slots(take, FastState::kLent, moved, dropped, err);
+}
+
+// ... any slots: those take(il, s) picks (the tail's, or elastic KV's main-slot ranks), left in `state`; the colder
+// residents and the free slots they move to are the main slots it does not pick
+bool Glm5Model::lend_slots(const std::function<bool(int, int)>& take, char state, uint64_t& moved, uint64_t& dropped,
+                           std::string& err) {
+    FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
     F->bg_hold = true;
@@ -1864,7 +1879,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             std::vector<std::pair<uint64_t, int>> cold;   // (count << 32 | recency rank, slot)
             if (!lend_drop)
                 for (int s = 0; s < P.n_main; ++s)
-                    if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0)
+                    if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0 && !take(il, s))
                         cold.push_back({(uint64_t) F->cnt[(size_t) il * NE + P.key[(size_t) s]], s});
             std::sort(cold.begin(), cold.end(), [&](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first < b.first : P.tick[(size_t) a.second] < P.tick[(size_t) b.second];
@@ -1874,11 +1889,11 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             std::vector<int> freem;
             if (!lend_drop)
                 for (int s = P.n_main - 1; s >= 0; --s)
-                    if (P.st[(size_t) s] == FastState::kFree) freem.push_back(s);
+                    if (P.st[(size_t) s] == FastState::kFree && !take(il, s)) freem.push_back(s);
             size_t ci = 0;
-            for (int s = P.n_main; s < P.n; ++s) {
+            for (int s = 0; s < P.n; ++s) {
                 // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) continue;
+                if (!take(il, s)) continue;
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
@@ -1931,7 +1946,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                         }
                 }
                 P.key[(size_t) s] = -1;
-                st = FastState::kLent;
+                st = state;
             }
         }
         flush();
@@ -5623,6 +5638,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     err.clear();
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;
+    if (!kv_ensure(pos_ + (int64_t) tokens.size(), err)) return false;   // (elastic KV: the prompt's rows mapped first)
     dspark_settle();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
         if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)

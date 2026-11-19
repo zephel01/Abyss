@@ -92,6 +92,14 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
+# elastic KV's engine lines (glm_elastic.cu): the split at start, and each time the KV grows
+ELASTIC_START = re.compile(r"glm elastic: ((?:CUDA|HIP)\d+) KV on demand: \d+ caches, ([\d.]+) GB reserved for (\d+) tokens, "
+                           r"([\d.]+) GB mapped for the first (\d+) \(--kv-min (\d+)\); ([\d.]+) GB free for")
+# ... and what the weights took of that free part (the expert pool's elastic slots, the dense FFN's whole layers)
+ELASTIC_LENT = re.compile(r"glm elastic: (?:CUDA|HIP)\d+ (?:the expert pool takes [\d-]+ elastic slots a layer|"
+                          r"dense FFN \+\d+ whole layers in VRAM) \(([\d.]+) GB")
+ELASTIC_STEP = re.compile(r"glm elastic: ((?:CUDA|HIP)\d+) KV \d+ -> (\d+) tokens \(([\d.]+) of ([\d.]+) GB mapped; the "
+                          r"weights hold ([\d.]+) GB")
 # the thinking budget's bridge (STRATA_GLM_THINK_BRIDGE): said inside the reasoning just before a forced </think>
 THINK_BRIDGE = ("\n\nI have used up my thinking budget, so I stop thinking here and write the final answer now, "
                 "in the language of the user's question.\n")
@@ -672,6 +680,36 @@ class StrataEngine:
         if per:
             self.info["kv_ctx"] = max(c for c, _ in per.values())
             self.info["kv_gb"] = round(sum(g for _, g in per.values()), 3)
+        # elastic KV (--kv-elastic): the split at start - the KV's reservation, what is mapped, what the weights borrow
+        m = ELASTIC_START.search(text)
+        if m:
+            self.kv_start = {"reserved_gb": float(m.group(2)), "max_tokens": int(m.group(3)),
+                             "mapped_gb": float(m.group(4)), "tokens": int(m.group(5)), "min_tokens": int(m.group(6)),
+                             "lent_gb": 0.0}
+            lent = ELASTIC_LENT.search(text)
+            if lent:
+                self.kv_start["lent_gb"] = float(lent.group(1))
+
+    def kv_status(self):
+        """Elastic KV's split now (GET /v1/status's "kv"): the last grow / shrink line of the engine log, else the
+        start's; None when the KV is allocated whole."""
+        start = getattr(self, "kv_start", None)
+        if not start:
+            return None
+        out = dict(start, elastic=True)
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - (256 << 10)))
+                tail = f.read().decode("utf-8", "replace")
+        except (OSError, TypeError):
+            return out
+        last = None
+        for last in ELASTIC_STEP.finditer(tail):
+            pass
+        if last:
+            out.update(tokens=int(last.group(2)), mapped_gb=float(last.group(3)), lent_gb=float(last.group(5)))
+        return out
 
     def set_context(self, n: int):
         """The next start's context: --max-context in the command (restart() runs it)."""
@@ -2030,6 +2068,9 @@ class Service:
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
+            # elastic KV (--kv-elastic 1): the positions mapped now and what the weights hold of the rest; null when
+            # the KV cache is allocated whole
+            "kv": self.engine.kv_status() if hasattr(self.engine, "kv_status") else None,
             "machine": {
                 "at": int(time.time()),
                 "gpu": {"name": static.get("gpu_name"), "used_mib": scaled(hw.get("gpu_mem_used"), 2 ** 20),

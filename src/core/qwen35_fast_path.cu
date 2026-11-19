@@ -258,6 +258,26 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     } else if (q35_kv_ == 0 && !g.q4x && D == 256) {
         q35_kv8_b_ = (size_t) n_attn * 2 * al(ctx * g.attn_head_kv * q35::kv_row_bytes(2, false));
     }
+    // elastic KV (glm_elastic.cu): the caches that span the whole context go on the virtual memory API, mapped as the
+    // conversation grows (a window layer's ring stays here); --kv-elastic 0 or no API: all of them here, as before
+    std::vector<size_t> erows;
+    for (int il = l0_; il < lt_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (Ly.recr) continue;
+        if (g.laguna) {
+            if ((size_t) g.lag_rows(il, (int64_t) ctx) != ctx) continue;
+            const size_t r = (size_t) g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_);
+            erows.push_back(r);
+            erows.push_back(r);
+        } else {
+            erows.push_back(row_k);
+            erows.push_back(row_v);
+        }
+    }
+    std::vector<void*> eptr;
+    if (ekv_kv_setup(erows, eptr))
+        for (size_t r : erows) bytes -= al(ctx * r);
+    size_t ei = 0;
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
@@ -289,8 +309,16 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
             Ly.gdn_conv = (float*) take(C * (size_t) (g.d_conv - 1) * 4);
         } else if (g.laguna) {
             Ly.lag_ring = (int) g.lag_rows(il, (int64_t) ctx);
+            if (!eptr.empty() && (size_t) Ly.lag_ring == ctx) {
+                Ly.kc = (uint16_t*) eptr[ei++];
+                Ly.vc = (uint16_t*) eptr[ei++];
+                continue;
+            }
             Ly.kc = (uint16_t*) take((size_t) Ly.lag_ring * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_));
             Ly.vc = (uint16_t*) take((size_t) Ly.lag_ring * g.attn_head_kv * strata::kernels::lag::kv_row_bytes(q35_kv_));
+        } else if (!eptr.empty()) {
+            Ly.kc = (uint16_t*) eptr[ei++];
+            Ly.vc = (uint16_t*) eptr[ei++];
         } else {
             Ly.kc = (uint16_t*) take(ctx * row_k);
             Ly.vc = (uint16_t*) take(ctx * row_v);
@@ -1028,6 +1056,7 @@ bool Glm5Model::q35_slot_load(const uint8_t* src, uint64_t bytes, int64_t n, std
     }
     FastState* F = fast_;
     cudaSetDevice(dev_);
+    if (!kv_ensure(n, err)) return false;   // (elastic KV: the rows the slot brings back)
     cudaDeviceSynchronize();
     if (q35_snap_h_ == nullptr && cudaHostAlloc(&q35_snap_h_, snap_b, cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();

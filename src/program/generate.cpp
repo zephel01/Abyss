@@ -163,6 +163,8 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    std::string kv_elastic;            ///< --kv-elastic 0|1 (qwen35 family on CUDA): "" = the default (1)
+    std::string kv_min;                ///< --kv-min N: the positions always mapped under elastic KV ("" = 32768)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -381,6 +383,10 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --kv-elastic 0|1     --glm-pack, qwen35 family (Laguna, Qwen3.8, Ornith, Qwen3.8-27B) on CUDA:\n"
+                 "                       1 (default) maps the KV cache as the conversation grows and lends the\n"
+                 "                       unused part of --max-context to the expert pool / FFN; 0 = allocate it whole\n"
+                 "  --kv-min N           with --kv-elastic 1: positions always mapped (default 32768)\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -1795,14 +1801,17 @@ static int glm_pack_generate(const Options& o) {
                     "pcie_share=%.2f uncensor=%d"
                     // (+ Abyss Terminal's: the lane's kind, the drafter, one expert's MiB - the pool's GB over its
                     // slots - and the settings that change the run: the tail skip's rank, deferral, a mirror, a helper)
-                    " lane=%s drafter=%s expert_mib=%.3f tail_skip=%d defer=%d mirror=%d helper=%d\n",
+                    " lane=%s drafter=%s expert_mib=%.3f tail_skip=%d defer=%d mirror=%d helper=%d"
+                    // (+ elastic KV: on, and the positions always mapped)
+                    " kv_elastic=%d kv_min=%lld\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
                     model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share(), model.abl_loaded() ? 1 : 0,
                     model.lane_kind(), model.drafter_kind(),
                     st.pool_slots > 0 ? st.pool_gb * 1024.0 / (double) st.pool_slots : 0.0, model.tail_skip_rank(),
-                    model.defer_on() ? 1 : 0, model.mirror_configured() ? 1 : 0, model.helper_configured() ? 1 : 0);
+                    model.defer_on() ? 1 : 0, model.mirror_configured() ? 1 : 0, model.helper_configured() ? 1 : 0,
+                    model.ekv_on() ? 1 : 0, (long long) strata::core::Glm5Model::ekv_min_tokens());
     }
 
     strata::kernels::SamplerParams sp;
@@ -4028,6 +4037,8 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-elastic") o.kv_elastic = next("--kv-elastic");
+        else if (a == "--kv-min") o.kv_min = next("--kv-min");
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -4218,6 +4229,21 @@ int main(int argc, char** argv) {
     // see glm_pack_generate).  --glm-pack with an explicit non-default --pack is almost certainly a
     // mistake worth saying out loud.
     if (!o.glm_pack.empty()) {
+        // --kv-elastic / --kv-min: the qwen35 family's elastic KV (glm_elastic.cu)
+        if (!o.kv_elastic.empty()) {
+            if (o.kv_elastic != "0" && o.kv_elastic != "1") {
+                std::fprintf(stderr, "maya generate: --kv-elastic must be 0 or 1\n");
+                return 2;
+            }
+            set_env("STRATA_GLM_KV_ELASTIC", o.kv_elastic.c_str());
+        }
+        if (!o.kv_min.empty()) {
+            if (std::atoll(o.kv_min.c_str()) <= 0) {
+                std::fprintf(stderr, "maya generate: --kv-min takes a number of positions\n");
+                return 2;
+            }
+            set_env("STRATA_GLM_KV_MIN", o.kv_min.c_str());
+        }
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
         // --kv q4_0 / int8 / k8v4 on the qwen35moe path (Ornith): the attention layers' cache format (qwen35_fast.hpp)

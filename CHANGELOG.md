@@ -7,6 +7,31 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased (draft)
+
+Elastic KV (`--kv-elastic 1`, the default; qwen35 family on one CUDA GPU). `--kv-elastic 0` gives the same bits and
+speed as v1.3.175.
+
+- The KV cache's address space is reserved for the whole `--max-context` (CUDA virtual memory), but VRAM is mapped
+  behind it only as the conversation reaches it: `--kv-min` positions at start (32768), then 8192 at a time. The part
+  not mapped yet is lent to the weights: extra expert slots a layer on the MoE models (Laguna, Qwen3.8-Flash-Next,
+  Ornith), whole-layer VRAM copies of the FFN layers that ran on the CPU on the dense Qwen3.8-27B. When the KV needs
+  the room the lent part goes back first (experts move over colder ones or to the RAM tier; FFN layers run on the CPU
+  again); a new conversation gives it back. The prompt's chunks stay the fixed layout's.
+- RTX 5090, `--max-context 262144`, iGPU off, a code prompt of 1K / 64K / 128K / 250K tokens (bench/ctx128 client),
+  decode tok/s fixed -> elastic: Laguna-S-2.1 UD-IQ4_XS 51.8 -> 75.3, 39.5 -> 50.0, 34.8 -> 35.5, 20.4 -> 20.7
+  (expert slots 66 -> 120 a layer at start); Qwen3.8-27B UD-Q4_K_XL 38.3 -> 130.3, 37.0 -> 78.2, 31.5 -> 55.8,
+  26.3 -> 26.2 (8.25 GB of FFN back in VRAM until the KV passes ~128K; a 1K prompt 860 -> 1,567 tok/s). Laguna
+  prompts at 128K / 250K are 7% / 8% slower (the experts the KV takes back move at the prompt's start); 27B prompts
+  are the same or faster. A new conversation after a 128K one: Laguna decodes at 81.7 tok/s again.
+- Outputs: Laguna with `STRATA_DETERMINISTIC=1 STRATA_GLM_CPU_EXACT=1` gives the same tokens as v1.3.175 at 1K /
+  64K / 128K (only where the experts live changes). The 27B's KV on virtual memory alone (the FFN placed as before)
+  gives the same tokens as v1.3.175; with the FFN layers moved to VRAM the rows that ran on the CPU run on the GPU,
+  whose sums are in another order - other tokens, as on a card with more VRAM (the answers' facts 4/4 at every size).
+- Logs: one `glm elastic:` line at start (reserved, mapped, free for the weights), one for what the weights took and
+  one per grow / shrink; `/v1/status` has `kv`. HIP, a split across GPUs and unified memory stay fixed and say so in
+  one line. Idle conversations' KV is not moved to RAM (not part of this change).
+
 ## v1.3.175 - 2026-11-19
 
 `--kv int8` at long contexts: faster prompts on the qwen35 family, Laguna support, and a start-up hint. fp16 KV (the

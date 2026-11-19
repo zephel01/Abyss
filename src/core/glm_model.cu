@@ -1522,6 +1522,7 @@ void Glm5Model::reset() {
         cudaStreamSynchronize(0);
     }
     pos_ = 0;
+    ekv_reset_mark();   // (elastic KV: the next prompt may give the KV's unused room back to the weights)
     if (g_.qwen35()) qwen35_reset();
     if (g_.arch == 0) q35_pend_pos_ = q35_row_done_ = -1;   // (glm5-next's NextN drafter on one part)
     dspark_reset();

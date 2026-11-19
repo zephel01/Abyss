@@ -1078,6 +1078,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         err = "deepseek4 verify: the window exceeds max_ctx";
         return false;
     }
+    if (!kv_ensure(pos_ + T, err)) return false;   // (elastic KV)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
         if (!m->verify_alloc(err)) return false;

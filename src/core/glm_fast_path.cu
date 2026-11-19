@@ -1288,6 +1288,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                 return false;
             }
         }
+        // elastic KV: the free VRAM counts the KV's unmapped part, which the elastic ranks (below) take on top of the
+        // pool the fixed layout would give - the core is sized without it
+        const size_t ek_lend = ekv_lendable();
+        avail -= std::min(avail, ek_lend);
+        avail_top -= std::min(avail_top, ek_lend);
         if (getenv("STRATA_GLM_POOL_GB")) {
             avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
             avail_top = std::min(avail_top, avail);
@@ -1301,7 +1306,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                                     ? (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_ + F->arena_bytes + 8 * sstride) +
                                           ((size_t) 1 << 30)
                                     : total_b - free_b - std::min(vram_base_, total_b - free_b);
-            const size_t room = cap > used + reserve ? cap - used - reserve : 0;
+            const size_t room0 = cap > used + reserve ? cap - used - reserve : 0;
+            const size_t room = room0 - std::min(room0, ek_lend);   // (elastic KV: as above)
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
             avail = std::min(avail, room);
@@ -1529,7 +1535,48 @@ bool Glm5Model::fast_setup(std::string& err) {
         // 0xFF are NaN in the tensor cores, and NaN x 0 is NaN)
         const size_t guard = F->nv_guard;   // (set where the layers' expert types are read)
         const bool nvm = guard > 0;
-        if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes + guard) == cudaSuccess) {
+        // elastic KV: the main slots on the virtual memory API, every layer's partition its core (the slots above)
+        // plus the elastic ranks the KV's unmapped room maps (glm_elastic.cu); else the KV maps whole
+        std::vector<uint8_t*> ebase;
+        bool epool = false;
+        int nmin_tier = nmin;   // (the RAM tier's "every expert in VRAM" check: the fixed layout's slots)
+        if (ekv_on()) {
+            std::vector<int> core((size_t) NL, -1);
+            std::vector<size_t> strides((size_t) NL, 0);
+            for (int il = l0_; il < lt_; ++il)
+                if (F->L[(size_t) il].moe) {
+                    core[(size_t) il] = nsl[(size_t) il] - k_extra;
+                    strides[(size_t) il] = slot_stride(il);
+                }
+            std::string eerr;
+            epool = ekv_pool_layout(core, strides, guard, nvm, g.n_expert + gf::kSpares, ebase, eerr);
+            if (epool) {
+                int emin = INT32_MAX, emax = 0;
+                const int fmin = nmin, fmax = nmax;
+                nmin_tier = fmin;
+                nmin = INT32_MAX;
+                nmax = 0;
+                tot = xtot;
+                for (int il = l0_; il < lt_; ++il)
+                    if (F->L[(size_t) il].moe) {
+                        const int e = core[(size_t) il] - (nsl[(size_t) il] - k_extra);
+                        emin = std::min(emin, e);
+                        emax = std::max(emax, e);
+                        nsl[(size_t) il] = core[(size_t) il] + k_extra;
+                        tot += (size_t) core[(size_t) il] * slot_stride(il);
+                        nmin = std::min(nmin, nsl[(size_t) il]);
+                        nmax = std::max(nmax, nsl[(size_t) il]);
+                    }
+                std::fprintf(stderr, "glm elastic: CUDA%d the expert pool takes %d-%d elastic slots a layer (%.2f GB) on "
+                                     "top of the fixed layout's %d-%d while the KV is short\n", dev_, emin, emax,
+                             (double) ekv_lent() / 1073741824.0, fmin, fmax);
+            } else if (!ekv_kv_all(err)) {
+                return false;
+            }
+        }
+        if (epool) {
+            segs.push_back(nullptr);
+        } else if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes + guard) == cudaSuccess) {
             if (nvm) cudaMemset(one, 0, main_bytes + guard);
             segs.push_back(one);
         } else {
@@ -1583,7 +1630,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             P.stride = slot_stride(il);
             P.n = nl;
             P.n_main = nl - k_extra;
-            P.base = b;
+            P.base = epool ? ebase[(size_t) il] : b;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
             P.st.assign((size_t) nl, FastState::kFree);
@@ -1610,7 +1657,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                      dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
         // qwen35moe / laguna with FP16 attention caches: the pool is short of the experts and --kv int8 would free at
         // least 1 GB and 10% of it - say so once (the default stays FP16)
-        if (q35_kv8_b_ > 0 && q35_kv8_b_ < q35_kv_b_ && nmax < g.n_expert && F->pool_slots > 0) {
+        if (q35_kv8_b_ > 0 && q35_kv8_b_ < q35_kv_b_ && nmax < g.n_expert && F->pool_slots > 0 && !ekv_on()) {
             const double freed = (double) (q35_kv_b_ - q35_kv8_b_);
             int n_moe = 0;
             for (int il = l0_; il < lt_; ++il) n_moe += F->L[(size_t) il].moe ? 1 : 0;
@@ -1673,13 +1720,16 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->layer_rc[(size_t) il] = c;
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
             // borrows it, and the experts there go to RAM meanwhile, prefill_lend)
+            // (elastic KV: only the core slots count - the elastic ranks' experts come to this tier when the KV
+            // takes them back, and a tier sized without them sent them to the disk)
+            const int held = ekv_pool_core(il) >= 0 ? ekv_pool_core(il) : F->lp[(size_t) il].n_main;
             cls_weight[(size_t) c] +=
-                (double) std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack) * (double) st;
+                (double) std::max(2, g.n_expert - held + gf::kSpares + 2 + F->ram_slack) * (double) st;
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
         int64_t budget = ram_budget_;
-        const bool staging_only = glmfast::minimal_ram_tier(F->unified_memory, nmin >= g.n_expert,
+        const bool staging_only = glmfast::minimal_ram_tier(F->unified_memory, nmin_tier >= g.n_expert,
                                                            ram_budget_ >= 0 || getenv("STRATA_GLM_RAM_GB") != nullptr);
         if (staging_only) {
             // Decode misses and pool-tail lending still need landing slots. Keep
@@ -4825,6 +4875,7 @@ void Glm5Model::fast_destroy() {
     if (F->ev_mtp) cudaEventDestroy(F->ev_mtp);
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
+    ekv_destroy();   // (elastic KV: the caches' and the pool's mappings)
     if (F->xpool) cudaFree(F->xpool);
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
@@ -8750,6 +8801,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
 
 bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err) {
     FastState* F = fast_;
+    if (!kv_ensure(pos_ + (int64_t) tokens.size(), err)) return false;   // (elastic KV: the rows these tokens write)
     for (int32_t t : tokens) {
         const auto t0 = std::chrono::steady_clock::now();
         if (!fast_token(t, err)) return false;
