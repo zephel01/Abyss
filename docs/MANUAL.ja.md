@@ -1029,10 +1029,18 @@ python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gg
 設定は `"args": ["--glm-pack", "<dir>/pack-hy4", "--max-context", "16384"]`、`"tokenizer": "<dir>/pack-hy4/tokenizer"` とし、
 サーバーは `--engine strata` で起動します。思考は `reasoning_effort` に従います（`none` で切る。テンプレートにあれば `max`）。
 RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークンのプロンプト、512 トークン生成の 3 回の中央値:
-生成 60.0 tok/s、プロンプト 66 tok/s（プロンプトは 1 トークンずつ読みます。まとめて読む経路はまだありません）。画像: mmproj
+生成 60.0 tok/s。32 トークン以上のプロンプトは、まとめて読む経路（未リリース）を通ります。注意・Engram の行（チャンク分を
+まとめて読む）・射影をチャンク単位で計算し、潜在空間のエキスパートは共通のエキスパートの仕組みで計算します。同じ機械・
+コードのプロンプト・その後 256 トークン生成で、プロンプト tok/s（1 トークンずつ → まとめて）: 459 トークン 62 → 487（3 回の中央値）、
+4,096 トークン 49 → 1,092、15,808 トークン 50 → 1,573。その後の生成は変わりません（61 / 49 / 48）。この経路があれば
+`--max-context 65536` も使えます。秘密 3 つ + 関数 1 つを埋めたプロンプト（bench/ctx128 のクライアント）を 32K と 63K
+トークンで試し、どちらも 4 問すべて正解、プロンプト 1,351 / 1,381 tok/s、生成 48 / 51 tok/s（65,536 でキャッシュ 0.95 GB）。
+設定: `STRATA_HY4_PREFILL=0` でプロンプトを 1 トークンずつに戻します（v1.3.177 と同じトークン経路）。
+`STRATA_HY4_PREFILL_SUB=<64-4096>` は注意と密な FFN のサブバッチ（512）、`STRATA_HY4_PREFILL_READERS=<n>` は
+チャンク分の Engram の行を読むスレッド数（32）です。画像: mmproj
 （`mmproj-Hy4-Flash-Maya-XS.gguf`）は strata-vision で動きます（`tools/vision/hy4v_patch.py`、setup の vision ビルドが当てます）。
 `"model"` には `python tools/vision/hy4v_ref.py vocab --gguf <1 本目の分割ファイル> --out <dir>/hy4-vocab.gguf` で作る語彙だけの GGUF を指定します。
-まだのもの: MTP ドラフター、16K を超える長さでの確認、AMD（HIP）。
+まだのもの: MTP ドラフター、AMD（HIP）。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

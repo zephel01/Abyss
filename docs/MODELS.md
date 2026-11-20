@@ -119,7 +119,7 @@ Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a pos
 
 | file (source) | size | quality | speed | use |
 | --- | ---: | --- | --- | --- |
-| `Maya-XS` IQ2_XXS ([peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)) | 44.8 GB + the Engram table 63.4 GB (read from the SSD) | nll 1.622 on the v1.3.177 build (1.657 on the pre-release build: the CPU lane, 1.4% error, took twice the experts); without the CPU lane 1.620 on both; Engram off 3.446 | decode 60.0, prompt 66 tok/s (one token at a time) | 32 GB GPU + 64 GB RAM |
+| `Maya-XS` IQ2_XXS ([peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)) | 44.8 GB + the Engram table 63.4 GB (read from the SSD) | nll 1.622 on the v1.3.177 build (1.657 on the pre-release build: the CPU lane, 1.4% error, took twice the experts); without the CPU lane 1.620 on both; Engram off 3.446 | decode 60.0, prompt 66 tok/s (one token at a time). The batched prompt path (unreleased), a code prompt: 487 tok/s at 459 tokens, 1,092 at 4K, 1,573 at 16K (decode after it 61 / 49 / 48); 32K / 63K needle prompts at `--max-context 65536` 1,351 / 1,381 tok/s, all four facts | 32 GB GPU + 64 GB RAM |
 | `Maya-S` / `Maya-M` / `Maya-L` (same repository) | 53.0 / 68.4 / 89.5 GB + the same table | not measured (same tensor types as Maya-XS) | not measured | more RAM |
 | `Q3_K_M` / `Q4_K_M` ([nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF); IQ4_NL Engram table inside the shards) | 107.5 / 127.2 GB | not measured yet (the loader reads its table format; the file is not checked yet) | not measured | |
 

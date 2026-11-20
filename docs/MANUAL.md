@@ -1088,10 +1088,18 @@ python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gg
 The config: `"args": ["--glm-pack", "<dir>/pack-hy4", "--max-context", "16384"]`, `"tokenizer": "<dir>/pack-hy4/tokenizer"`,
 and start the server with `--engine strata`. Thinking follows `reasoning_effort` (`none` turns it off; `max` where the
 template has it). RTX 5090 (Gen4 x4) + RAM tier 60 GB, iGPU lane off, a 459-token prompt, 512 tokens, median of 3:
-decode 60.0 tok/s, prompt 66 tok/s (the prompt is read one token at a time; no batched prefill yet). Images: the
+decode 60.0 tok/s. Prompts of 32+ tokens go through the batched prompt path (unreleased): the attention, the Engram rows
+(read for the whole chunk at once) and the projections a chunk at a time, the latent experts through the shared expert
+machinery. Same box, a code prompt, 256 tokens after it, prompt tok/s token path -> prompt path: 459 tokens 62 -> 487 (median of 3),
+4,096 tokens 49 -> 1,092, 15,808 tokens 50 -> 1,573; decode after it unchanged (61 / 49 / 48). With the prompt path
+`--max-context 65536` works: the 3-secret + function needle prompt (bench/ctx128 client) at 32K and 63K tokens answered
+all four, prompt 1,351 and 1,381 tok/s, decode 48 and 51 tok/s (caches 0.95 GB at 65,536). Settings:
+`STRATA_HY4_PREFILL=0` reads prompts one token at a time again (the token path, as v1.3.177);
+`STRATA_HY4_PREFILL_SUB=<64-4096>` the attention's / dense FFN's sub-batch (512); `STRATA_HY4_PREFILL_READERS=<n>` the
+threads that read a chunk's Engram rows (32). Images: the
 mmproj (`mmproj-Hy4-Flash-Maya-XS.gguf`) runs on strata-vision (`tools/vision/hy4v_patch.py`, applied by setup's
 vision build) with a vocab-only GGUF from `python tools/vision/hy4v_ref.py vocab --gguf <shard 1> --out <dir>/hy4-vocab.gguf`
-as its `"model"`. Not yet: the MTP drafter, contexts past 16K tested at length, AMD (HIP).
+as its `"model"`. Not yet: the MTP drafter, AMD (HIP).
 
 ## EXL3 quants (GLM-5.3-Flash)
 

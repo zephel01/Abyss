@@ -116,7 +116,7 @@ numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの 
 
 | ファイル（入手先） | 大きさ | 品質 | 速さ | 向き |
 | --- | ---: | --- | --- | --- |
-| `Maya-XS` IQ2_XXS（[peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)） | 44.8 GB ＋ Engram の表 63.4 GB（SSD から読む） | nll 1.622（v1.3.177 のビルド。リリース前のビルドでは 1.657: 誤差 1.4% の CPU レーンに回るエキスパートが倍だった）。CPU レーンなしはどちらも 1.620。Engram なしで 3.446 | 生成 60.0、プロンプト 66 tok/s（1 トークンずつ） | GPU 32 GB + RAM 64 GB |
+| `Maya-XS` IQ2_XXS（[peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)） | 44.8 GB ＋ Engram の表 63.4 GB（SSD から読む） | nll 1.622（v1.3.177 のビルド。リリース前のビルドでは 1.657: 誤差 1.4% の CPU レーンに回るエキスパートが倍だった）。CPU レーンなしはどちらも 1.620。Engram なしで 3.446 | 生成 60.0、プロンプト 66 tok/s（1 トークンずつ）。まとめて読む経路（未リリース）、コードのプロンプト: 459 トークン 487 tok/s、4K 1,092、16K 1,573（その後の生成 61 / 49 / 48）。`--max-context 65536` で 32K / 63K の needle プロンプト 1,351 / 1,381 tok/s、4 問とも正解 | GPU 32 GB + RAM 64 GB |
 | `Maya-S` / `Maya-M` / `Maya-L`（同じリポジトリ） | 53.0 / 68.4 / 89.5 GB ＋ 同じ表 | 未計測（テンソルの型は Maya-XS と同じ） | 未計測 | RAM が多い PC |
 | `Q3_K_M` / `Q4_K_M`（[nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF)。Engram の表は IQ4_NL で各ファイルの中） | 107.5 / 127.2 GB | まだ未計測（表の形式はローダーが読めるが、ファイルでは未確認） | 未計測 | |
 

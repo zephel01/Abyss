@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased (draft)
+
+Hy4-flash: a batched prompt path. Other models give the same bits as v1.3.177 (the 6-config md5 regression).
+
+- Prompts of 32+ tokens go through the prompt path a chunk at a time: the hyper-connection reads and adds, the gated
+  MLA attention (window layers in sub-batches over their ring, full layers dense to 2,048 positions and then the
+  indexer's pools and selection), the absorbed products as batched GEMMs per head, the dense layer 0, the Engram rows
+  of the whole chunk read from the SSD by 32 threads, and the latent experts through the prompt path's expert
+  grouping, MMQ / own GEMM, staging and CPU lane. Hy4-Flash Maya-XS IQ2_XXS, RTX 5090 (Gen4 x4) + RAM tier 60 GB,
+  iGPU lane off, a code prompt, prompt tok/s token path -> prompt path: 459 tokens 62 -> 487 (median of 3),
+  4,096 tokens 49 -> 1,092, 15,808 tokens 50 -> 1,573; decode after it unchanged. `--max-context 65536`: a 63K-token needle prompt at
+  1,381 tok/s, all four facts found.
+- Exactness: the numpy reference (ref/hy4.py) on the 459-token set, the 228 tokens after a 229-token context:
+  KL(reference || engine) 0.16 with the token path's context, 0.18 with the prompt path's (nll 1.89 / 1.84, the
+  reference 1.81). `STRATA_HY4_PREFILL=0` gives the token path back (the same bits as v1.3.177).
+- Fixes: a conversation snapshot of a Hy4 prompt (the server's reuse, the CLI at 4K+ tokens) copied the GLM layout's
+  indexer rows out of bounds (a crash at 4K tokens); it now keeps the window rings and the open indexer groups. The
+  Engram table's file is closed when the engine stops (POSIX and Windows). Conversation slots (to a file) say they
+  are not implemented for Hy4.
+- Prompt path, shared code: experts whose gate/up rows are wider than the residual rows (2 n_ff > n_embd, Hy4's latent
+  experts) get their own gate/up buffer and skip the light kernels; every other model takes the old branches.
+
 ## v1.3.177 - 2026-11-20
 
 Tencent Hy4-flash (`hy_v4_flash`), beta. Other models give the same bits as v1.3.176 (the 6-config md5 regression).
