@@ -111,6 +111,16 @@ Download counts not surveyed. UD-Q4_K_XL holds all its experts in 32 GB of VRAM 
 | `UD-IQ3_XXS` (unsloth) | 49.5 GB | not measured | user report only (#8 below) | 16 GB cards |
 | `IQ3_XXS-B` ([zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)) | 51.7 GB | KL about UD-IQ3_XXS's (0.138-0.140); swe-bench 56 of 60 resolved | 5090, the config `--model ornith` writes: 116 tok/s, 75% of the NextN drafts accepted (v1.3.100) | 16 GB GPU + 64 GB RAM |
 
+### Hy4-flash (beta, unreleased)
+
+Download counts not surveyed. Speeds: RTX 5090 (PCIe Gen4 x4) + RAM tier 60 GB, iGPU lane off, a 459-token prompt,
+512 tokens, median of 3. Quality: nll on a 459-token JA / EN / code set (457 tokens scored); the numpy reference from
+Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a position).
+
+| file (source) | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `Maya-XS` IQ2_XXS ([peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya)) | see the model card | nll 1.657 (ppl 5.24, top-1 72.0%); without the CPU lane 1.620; Engram off 3.446 | decode 60.0, prompt 66 tok/s | 32 GB GPU + 64 GB RAM |
+
 ### Qwen3.8-Flash-Next (qwen4exp)
 
 Details, packing and the drafter: [docs/qwen38](qwen38/README.md). KL is against the NVFP4 teacher (seq 0-9, 2,048

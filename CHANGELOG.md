@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.177 - 2026-11-20
+
+Tencent Hy4-flash (`hy_v4_flash`), beta. Other models give the same bits as v1.3.176 (the 6-config md5 regression).
+
+- The engine runs Hy4-flash: gated MLA with sinks, 4 hyper-connection streams, window / sparse-indexed layers, the
+  latent MoE and the Engram n-gram table (rows read from the SSD a token). peasantsmith's Maya-XS (IQ2_XXS), RTX 5090
+  (Gen4 x4) + RAM tier 60 GB, iGPU lane off: decode 60.0 tok/s, prompt 66 tok/s (one token at a time); nll 1.657 on a
+  459-token JA / EN / code set; the same top-1 as a numpy reference written from Tencent's semantics.
+- The loader takes other converters' files: the Engram table by name in any shard and in FP8, IQ4_NL, Q8_0, F16, BF16
+  or F32; BF16 / F16 projections; k_b / v_b in types the attention kernels do not read (decoded to F32 at load).
+- The server: Hy4's chat template (`reasoning_effort` high / max / no_think), its turn end and `</think:opensource>`.
+- Images: Hy4's vision tower on strata-vision (`tools/vision/hy4v_patch.py`, `hy4v_ref.py` for the reference and the
+  vocab GGUF), M-RoPE positions (sections 12 / 10 / 10) in the engine. Matches the numpy tower at cosine 0.9998.
+- Not yet: a batched prompt path (prompts read one token at a time), contexts past 16K (the indexer's selection
+  starts past 2,048 positions), the MTP drafter, setup.sh's `--model` entry (pack and config by hand for now),
+  an AMD run, other converters' files on a real download.
+
 ## v1.3.176 - 2026-11-20
 
 Elastic KV (`--kv-elastic 1`, the default; qwen35 family on one CUDA GPU). `--kv-elastic 0` gives the same bits and

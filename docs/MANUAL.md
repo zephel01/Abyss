@@ -1073,6 +1073,26 @@ unsloth's UD-IQ4_XS (58 GB). RTX 5090 capped at 16 / 24 / 32 GB: decode 42.5 / 5
 47.4 in v1.3.140; llama.cpp 32.0 / 38.1 / 43.2), prompts 859 / 1,005 / 1,174 (318 / 391 / 470); KL against llama.cpp 0.024, the
 same as its own CPU against CUDA. No NextN drafter; the n-gram drafts are on from v1.3.142. Details: [docs/laguna](laguna/README.md).
 
+## Hy4-flash (beta, unreleased)
+
+The engine runs Tencent's Hy4-flash (GGUF architecture `hy_v4_flash`: gated MLA attention with sinks, 4 hyper-connection
+streams, window and sparse-indexed layers, a latent MoE, and an Engram n-gram table read from the SSD). Tested on
+[peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya) `Maya-XS` (IQ2_XXS experts, FP8 Engram);
+the loader also takes other converters' files (an Engram table in IQ4_NL / Q8_0 / F16 / BF16 / F32 in any shard,
+BF16 / F16 projections), not tested on such a file yet. No setup entry yet: pack it by hand and write the config.
+
+```bash
+python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf --out <dir>/pack-hy4
+```
+
+The config: `"args": ["--glm-pack", "<dir>/pack-hy4", "--max-context", "16384"]`, `"tokenizer": "<dir>/pack-hy4/tokenizer"`,
+and start the server with `--engine strata`. Thinking follows `reasoning_effort` (`none` turns it off; `max` where the
+template has it). RTX 5090 (Gen4 x4) + RAM tier 60 GB, iGPU lane off, a 459-token prompt, 512 tokens, median of 3:
+decode 60.0 tok/s, prompt 66 tok/s (the prompt is read one token at a time; no batched prefill yet). Images: the
+mmproj (`mmproj-Hy4-Flash-Maya-XS.gguf`) runs on strata-vision (`tools/vision/hy4v_patch.py`, applied by setup's
+vision build) with a vocab-only GGUF from `python tools/vision/hy4v_ref.py vocab --gguf <shard 1> --out <dir>/hy4-vocab.gguf`
+as its `"model"`. Not yet: the MTP drafter, contexts past 16K tested at length, AMD (HIP).
+
 ## EXL3 quants (GLM-5.3-Flash)
 
 From v1.3.35 the engine also reads [exllamav3](https://github.com/turboderp-org/exllamav3)'s EXL3 quants of

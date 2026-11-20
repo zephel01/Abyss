@@ -1014,6 +1014,26 @@ MoE、1 トークンあたり約 8B が動く）を qwen35moe の層経路で動
 36.3 / 41.4 / 47.4。llama.cpp 32.0 / 38.1 / 43.2）、プロンプト 859 / 1,005 / 1,174（318 / 391 / 470）、llama.cpp との KL 0.024
 （llama.cpp 自身の CPU と CUDA の差と同じ）。NextN ドラフターはなく、v1.3.142 から n-gram の下書きが有効です。詳しくは [docs/laguna](laguna/README.ja.md)。
 
+## Hy4-flash（ベータ、未リリース）
+
+エンジンは Tencent の Hy4-flash（GGUF のアーキテクチャ `hy_v4_flash`。シンク付きのゲート MLA 注意、4 本の hyper-connection、
+窓の層と疎な索引の層、潜在空間の MoE、SSD から読む Engram の n-gram 表）を動かします。試したのは
+[peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya) の `Maya-XS`（エキスパート IQ2_XXS、Engram FP8）です。
+読み込みは、ほかの変換ツールのファイル（Engram 表が IQ4_NL / Q8_0 / F16 / BF16 / F32 でどの分割ファイルにあってもよい、
+射影が BF16 / F16）にも対応しますが、そのようなファイルではまだ試していません。setup にはまだ入っていないので、手でパックして設定を書きます。
+
+```bash
+python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf --out <dir>/pack-hy4
+```
+
+設定は `"args": ["--glm-pack", "<dir>/pack-hy4", "--max-context", "16384"]`、`"tokenizer": "<dir>/pack-hy4/tokenizer"` とし、
+サーバーは `--engine strata` で起動します。思考は `reasoning_effort` に従います（`none` で切る。テンプレートにあれば `max`）。
+RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークンのプロンプト、512 トークン生成の 3 回の中央値:
+生成 60.0 tok/s、プロンプト 66 tok/s（プロンプトは 1 トークンずつ読みます。まとめて読む経路はまだありません）。画像: mmproj
+（`mmproj-Hy4-Flash-Maya-XS.gguf`）は strata-vision で動きます（`tools/vision/hy4v_patch.py`、setup の vision ビルドが当てます）。
+`"model"` には `python tools/vision/hy4v_ref.py vocab --gguf <1 本目の分割ファイル> --out <dir>/hy4-vocab.gguf` で作る語彙だけの GGUF を指定します。
+まだのもの: MTP ドラフター、16K を超える長さでの確認、AMD（HIP）。
+
 ## EXL3 量子化（GLM-5.3-Flash）
 
 v1.3.35 から、エンジンは [exllamav3](https://github.com/turboderp-org/exllamav3) の EXL3 量子化の GLM-5.3-Flash も、

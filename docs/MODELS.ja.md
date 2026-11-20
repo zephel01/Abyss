@@ -108,6 +108,16 @@ GiB、手順は[VRAM の小さいカード](SMALL-VRAM.ja.md)）。そこでは 
 | `UD-IQ3_XXS`（unsloth） | 49.5 GB | 未計測 | ユーザー報告のみ（下の #8） | 16 GB のカード向け |
 | `IQ3_XXS-B`（[zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)） | 51.7 GB | KL は UD-IQ3_XXS とほぼ同じ（0.138〜0.140）。swe-bench 60 問中 56 問解決 | 5090、`--model ornith` が書く設定: 116 tok/s、NextN の下書きの採用率 75%（v1.3.100） | GPU 16 GB + RAM 64 GB |
 
+### Hy4-flash（ベータ、未リリース）
+
+ダウンロード数は調べていません。速さ: RTX 5090（PCIe Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークンのプロンプト、
+512 トークン生成の 3 回の中央値。品質: 日本語 / 英語 / コードの 459 トークン（457 トークンを採点）の nll。Tencent の仕様から書いた
+numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの KL 0.0006〜0.23）。
+
+| ファイル（入手先） | 大きさ | 品質 | 速さ | 向き |
+| --- | ---: | --- | --- | --- |
+| `Maya-XS` IQ2_XXS（[peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya)） | モデルカード参照 | nll 1.657（ppl 5.24、top-1 72.0%）。CPU レーンなしで 1.620。Engram なしで 3.446 | 生成 60.0、プロンプト 66 tok/s | GPU 32 GB + RAM 64 GB |
+
 ### Qwen3.8-Flash-Next（qwen4exp）
 
 詳細、pack、ドラフターは [docs/qwen38](qwen38/README.ja.md)。KL は特に書かない限り NVFP4 教師との比較（seq 0〜9、
