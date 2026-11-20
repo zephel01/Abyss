@@ -294,7 +294,8 @@ bool Glm5Model::hy4_setup(std::string& err) {
     };
     const auto q = [&](const std::string& n, int64_t n_in, int64_t n_out) -> WSlot {
         auto it = ws_map_.find(n);
-        if (it == ws_map_.end())   // (a projection the GGUF keeps in F32 / F16 - widened to F32 by the pack)
+        // (a projection the GGUF keeps in F32 / F16 - widened to F32 by the pack; an F32 row of the index is type 0)
+        if (it == ws_map_.end() || it->second.type == 0)
             if (auto f = w_.find(n); f != w_.end()) return WSlot{f->second, gf::kTypeF32, f->second, n_in, n_out};
         if (it == ws_map_.end() || it->second.type == 0 || !gf::mv_supported(it->second.type)) {
             missing += n + " (quant) ";
@@ -378,9 +379,9 @@ bool Glm5Model::hy4_setup(std::string& err) {
         Y.k_b = raw(P + "attn_k_b.weight", 8, g.qk_nope, (int64_t) g.kv_lora * nh, Y.kb_f32);      // Q8_0
         Y.v_b = raw(P + "attn_v_b.weight", 14, g.kv_lora, (int64_t) g.v_head * nh, Y.vb_f32);      // Q6_K
         if (!Y.swa) {
-            Y.ik = f32m(P + "indexer.attn_k.weight", D, g.idx_key);
+            Y.ik = q(P + "indexer.attn_k.weight", D, g.idx_key);         // F32 (Maya) or quantized (nace-ai: Q8_0)
             Y.ik_norm = f32(P + "indexer.k_norm.weight");
-            Y.iqb = f32m(P + "indexer.attn_q_b.weight", g.q_lora, (int64_t) g.idx_heads * g.idx_key);
+            Y.iqb = q(P + "indexer.attn_q_b.weight", g.q_lora, (int64_t) g.idx_heads * g.idx_key);
             Y.iproj = f32m(P + "indexer.proj.weight", D, g.idx_heads);
             Y.cv = f32(P + "indexer_compressor_value.weight");
             Y.cg = f32(P + "indexer_compressor_gate.weight");
@@ -828,7 +829,7 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
             j[nj++] = {Y.kv_a.q, H->xq, H->x, H->kv, nullptr, 1.0f, Y.kv_a.type, D, g.kv_lora + g.n_rot};
             j[nj++] = {Y.gate.q, H->xq, H->x, H->gate, nullptr, 1.0f, Y.gate.type, D, nh * g.v_head};
             if (!Y.swa) {
-                j[nj++] = {Y.ik.q, nullptr, H->x, H->tk, nullptr, 1.0f, gf::kTypeF32, D, g.idx_key};
+                j[nj++] = {Y.ik.q, H->xq, H->x, H->tk, nullptr, 1.0f, Y.ik.type, D, g.idx_key};
                 j[nj++] = {Y.iproj.q, nullptr, H->x, H->iw, nullptr, 1.0f, gf::kTypeF32, D, g.idx_heads};
             }
             if (!gf::mv(j, nj, s)) {
@@ -843,7 +844,7 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
             int nj = 0;
             j[nj++] = {Y.q_b.q, H->qrq, H->qr, H->q, nullptr, 1.0f, Y.q_b.type, g.q_lora, nh * g.head_dim};
             if (!Y.swa)
-                j[nj++] = {Y.iqb.q, nullptr, H->qr, H->iq, nullptr, 1.0f, gf::kTypeF32, g.q_lora, g.idx_heads * g.idx_key};
+                j[nj++] = {Y.iqb.q, H->qrq, H->qr, H->iq, nullptr, 1.0f, Y.iqb.type, g.q_lora, g.idx_heads * g.idx_key};
             if (!gf::mv(j, nj, s)) {
                 err = "hy4: q_b";
                 return false;
