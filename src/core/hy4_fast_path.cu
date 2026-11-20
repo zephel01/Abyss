@@ -12,10 +12,14 @@
 //     tiers exactly as every other model's - Glm5Geometry::n_embd is that width; ffn_routed_up back; the shared expert
 //     on x) -> post_ffw_norm -> R_c += post_c * f
 //   * the head: a 4-mix collapse of the streams, output_norm, output
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -28,6 +32,53 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+
+// the Engram table's file: opened once, read at 64-bit offsets from the read pool's threads (Windows: an overlapped
+// handle, so the threads' reads run side by side; elsewhere pread)
+namespace {
+#ifdef _WIN32
+using EngFile = HANDLE;
+const EngFile kEngNone = INVALID_HANDLE_VALUE;
+EngFile eng_open(const std::string& path) {
+    return CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr);
+}
+bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
+    struct Ev {
+        HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        ~Ev() { if (ev != nullptr) CloseHandle(ev); }
+    };
+    static thread_local Ev ev;
+    if (ev.ev == nullptr) return false;
+    size_t done = 0;
+    while (done < n) {
+        OVERLAPPED ov{};
+        ov.Offset = (DWORD) (at + done);
+        ov.OffsetHigh = (DWORD) ((at + done) >> 32);
+        ov.hEvent = ev.ev;
+        DWORD r = 0;
+        if (!ReadFile(f, dst + done, (DWORD) (n - done), nullptr, &ov) && GetLastError() != ERROR_IO_PENDING) return false;
+        if (!GetOverlappedResult(f, &ov, &r, TRUE) || r == 0) return false;
+        done += (size_t) r;
+    }
+    return true;
+}
+#else
+using EngFile = int;
+const EngFile kEngNone = -1;
+EngFile eng_open(const std::string& path) { return ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
+bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t r = ::pread(f, dst + done, n - done, (off_t) (at + done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        done += (size_t) r;
+    }
+    return true;
+}
+#endif
+}   // namespace
 #include "strata/kernels/hy4_fast.hpp"
 #include "strata/qtypes.hpp"
 
@@ -151,7 +202,7 @@ struct Hy4State {
     uint8_t* erow_h = nullptr;     // pinned 64 rows of eng_rb bytes
     float* erow_fh = nullptr;      // pinned 64 x eng_dim floats (a table that is not FP8: decoded on the host)
     // Engram (pack/engram.txt)
-    int eng_fd = -1;
+    EngFile eng_fd = kEngNone;
     uint64_t eng_table = 0, eng_rows = 0;
     int eng_dim = 96, eng_ng = 3, eng_hpn = 8, eng_pad = 120002;
     int eng_type = -1;              // the table's ggml type (-1: FP8 E4M3 codes, decoded on the GPU)
@@ -484,8 +535,8 @@ bool Glm5Model::hy4_setup(std::string& err) {
         tm.seekg(0);
         tm.read((char*) H->tmap.data(), (std::streamsize) nb);
         const std::string path = pack_dir_ + "/../" + shard;
-        H->eng_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (H->eng_fd < 0) {
+        H->eng_fd = eng_open(path);
+        if (H->eng_fd == kEngNone) {
             err = "hy4: cannot open the Engram table's shard " + path;
             return false;
         }
@@ -545,7 +596,7 @@ bool Glm5Model::hy4_embed(int32_t token, int64_t p, const float* img, std::strin
     }
     H->hist[(size_t) p] = token;
     H->img_pos[(size_t) p] = img != nullptr;
-    if (H->eng_fd < 0 || !H->eng_on) return true;
+    if (H->eng_fd == kEngNone || !H->eng_on) return true;
     // the 64 rows: per Engram layer, 8 heads of the 2-gram and 8 of the 3-gram
     const auto cid = [&](int64_t q) -> int64_t {
         const int32_t t = q < 0 ? H->eng_pad : H->hist[(size_t) q];
@@ -568,9 +619,9 @@ bool Glm5Model::hy4_embed(int32_t token, int64_t p, const float* img, std::strin
     const int n_rows = 16 * NL;
     bool bad = false;
     H->pool->run(n_rows, [&](int k) {
-        const off_t at = (off_t) (H->eng_table + rows[k] * (uint64_t) H->eng_rb);
+        const uint64_t at = H->eng_table + rows[k] * (uint64_t) H->eng_rb;
         uint8_t* dst = H->erow_h + (size_t) k * H->eng_rb;
-        if (::pread(H->eng_fd, dst, (size_t) H->eng_rb, at) != (ssize_t) H->eng_rb) {
+        if (!eng_pread(H->eng_fd, dst, (size_t) H->eng_rb, at)) {
             bad = true;
             return;
         }
@@ -701,7 +752,7 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
         err = "hy4: the context is full";
         return false;
     }
-    const bool eng_live = H->eng_fd >= 0 && H->eng_on;
+    const bool eng_live = H->eng_fd != kEngNone && H->eng_on;
     const int32_t tok = H->hist[(size_t) p];
     const bool eng_masked = H->img_pos[(size_t) p] || tok == H->eng_pad || tok == 120120 || tok == 120124;
     for (int il = 0; il < g.n_layers; ++il) {
