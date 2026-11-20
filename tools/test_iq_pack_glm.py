@@ -142,7 +142,15 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("qwen35", iq_pack.ARCHITECTURES)      # Abyss: the dense Qwen3.5 / Qwen3.8-27B (v1.3.138)
         self.assertIn("laguna", iq_pack.ARCHITECTURES)      # Abyss: poolside Laguna-S-2.1
         self.assertIn("sensenova_loop", iq_pack.ARCHITECTURES)   # Abyss: SenseNova-Loop-9B (v1.3.169)
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 9)
+        self.assertIn("hy_v4_flash", iq_pack.ARCHITECTURES)      # Abyss: Tencent Hy4-flash
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 10)
+
+    def test_hy4_as_stored(self):
+        # hy_v4_flash: every non-expert tensor served as stored (the 3-D absorbed k_b / v_b too), nothing to BF16
+        for n in ("attn_q_b", "attn_k_b", "attn_v_b", "attn_gate", "ffn_routed_down", "ffn_routed_up", "engram_kv"):
+            self.assertFalse(iq_pack.needs_bf16(f"blk.1.{n}.weight", "Q8_0", "hy_v4_flash"), n)
+            self.assertTrue(f"{n}.weight".endswith(iq_pack.HY4_NATIVE_OK), n)
+        self.assertIn("per_layer_token_embd.weight", iq_pack.NOT_IN_PACK)   # the Engram table stays in shard 2
 
     def test_qwen35_dense_as_stored(self):
         # the dense qwen35: qwen35moe's set with a dense FFN, every tensor served as stored

@@ -95,6 +95,11 @@ class ChatTemplate:
         # DeepSeek V4 0731 (the DSML template, not V4.1: no Engram pack, not V4.1's effort map) - the model that answers
         # a Japanese question in Chinese without a system prompt (ja_system_prompt below)
         self.dsv4_0731 = self.dsv4 and not dsml41 and not self.v41_effort
+        # Tencent Hy4-flash: reasoning_effort "no_think" (thinking off), "high" (the default) and, in the GGUFs'
+        # template, "max" - any other value is an error there; the level goes into the system turn as
+        # <｜reasoning_mode｜>reasoning_effort:<level>, the think tags are <think:opensource> / </think:opensource>
+        self.hy4 = "reasoning_mode" in self.source and "'no_think'" in self.source
+        self.hy4_max = self.hy4 and "'max'" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -114,6 +119,13 @@ class ChatTemplate:
             if tools:
                 tools = [t if t.get("type") == "function" and "function" in t else {"type": "function", "function": t}
                          for t in tools]
+        elif self.hy4:
+            kwargs.pop("effort_raw", None)
+            off = kwargs.pop("enable_thinking", True) is False
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs["reasoning_effort"] = ("no_think" if off or level in ("none", "no_think") else
+                                          "max" if level == "max" and self.hy4_max else "high")
+            off = False   # (the template closes its own think block for no_think)
         elif self.glm_effort:
             kwargs.pop("effort_raw", None)
             off = kwargs.pop("enable_thinking", True) is False
@@ -616,6 +628,7 @@ class Event:
 
 
 THINK_END = "</think>"
+THINK_END_HY4 = "</think:opensource>"   # Hy4-flash's end-of-reasoning token
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 FUNC_START = "<function="                       # Qwen's form: <function=NAME><parameter=P>V</parameter>...</function>
@@ -1254,12 +1267,14 @@ class OutputParser:
                         out.append(Event("reasoning", self._think_track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
-                i = self.buf.rfind(THINK_END)   # the special token's text ends this delta
+                # the special token's text ends this delta (Hy4-flash spells it </think:opensource>)
+                tag = THINK_END_HY4 if THINK_END_HY4 in self.buf else THINK_END
+                i = self.buf.rfind(tag)
                 if i < 0:
                     i = len(self.buf)
                 if i:
                     out.append(Event("reasoning", self.buf[:i]))
-                self.buf = self.buf[i + len(THINK_END):] if self.buf[i:].startswith(THINK_END) else ""
+                self.buf = self.buf[i + len(tag):] if self.buf[i:].startswith(tag) else ""
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0
                 think_end = False

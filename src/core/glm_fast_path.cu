@@ -815,7 +815,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.recr = is_mtp ? false : g.is_recr(il);
         Ly.moe = il >= g.dense_lead;
         Ly.mtp = is_mtp;
-        if (g.qwen35()) {
+        if (g.is_hy4()) {
+            // (hy4_fast_path.cu's hy4_setup binds the mixer, the hyper-connections and the latent MoE's projections)
+        } else if (g.qwen35()) {
             qwen35_bind(il, missing);   // (qwen35_fast_path.cu: no hyper-connections, its own mixers)
         } else {
         if (is_mtp) {
@@ -876,7 +878,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (!g.dsv4()) Ly.out = q("attn_output.weight");
         }   // (!qwen35)
         if (Ly.moe) {
-            if ((g.v41 || g.qwen35()) && w16_.find(P + "ffn_gate_inp.weight") == w16_.end()) {   // (F32 routers, served as F32)
+            if ((g.v41 || g.qwen35() || g.is_hy4()) && w16_.find(P + "ffn_gate_inp.weight") == w16_.end()) {   // (F32 routers, served as F32)
                 Ly.router = (const uint16_t*) f32("ffn_gate_inp.weight");
                 Ly.router_type = gf::kTypeF32;
             } else {
@@ -967,6 +969,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (g.dsv4() && !g.v41 && (!dsv4_bind(err) || !dsv4_alloc(err))) return false;
     if (g.v41 && (!dsv41_bind(err) || !dsv41_alloc(err))) return false;
     if (g.qwen35() && !qwen35_alloc(err)) return false;
+    if (g.is_hy4() && !hy4_setup(err)) return false;
 
     // ---- the activation arena
     const int64_t E = g.n_embd, DI = g.d_inner(), FF = g.n_ff_exp * g.n_shared;
@@ -1132,7 +1135,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     std::memset(F->tok_h, 0, 64);
     std::memset(F->tok_in_h, 0, 64 * sizeof(int));
     // the pinned copy of token_embd (Q8_0 / Q5_K - the other types keep the host dequantizer and its copy)
-    if (F->zero_copy && pack_emb_src_ != nullptr && gf::embed_rows_q_supported(pack_emb_type_, (int) g.n_embd)) {
+    if (F->zero_copy && !g.is_hy4() && pack_emb_src_ != nullptr && gf::embed_rows_q_supported(pack_emb_type_, (int) g.n_embd)) {
         const size_t bytes = (size_t) g.n_vocab * strata::qt::row_size((strata::qt::Type) pack_emb_type_, g.n_embd);
         if (cudaHostAlloc((void**) &F->emb_tab_h, bytes, cudaHostAllocMapped) == cudaSuccess) {
             if (cudaHostGetDevicePointer((void**) &F->emb_tab_d, F->emb_tab_h, 0) == cudaSuccess) {
@@ -7381,6 +7384,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     if (graphs && F->copy2 != nullptr) F->bg_drain(nullptr, SIZE_MAX, 3, F->copy2);
     F->hc_cpu_on = F->bg_after_hc = false;
     if (g.qwen35()) return fast_qwen35_layers(p, err);   // (plain residuals: qwen35_fast_path.cu)
+    if (g.is_hy4()) return fast_hy4_layers(p, err);      // (hy4_fast_path.cu)
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -7631,7 +7635,9 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     const float* img = image_row(p);
-    if (F->emb_tab_d != nullptr && img == nullptr) {
+    if (g.is_hy4()) {
+        if (!hy4_embed(token, p, img, err)) return false;   // (the hy_dim-wide row into the 4 streams, the Engram rows)
+    } else if (F->emb_tab_d != nullptr && img == nullptr) {
         // the row from the pinned table, gathered by the kernel (the id read host-mapped): no copy engine
         F->tok_in_h[0] = token;
         gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, F->tok_in_d, 1, g.n_embd, F->emb, F->cs);
@@ -7641,8 +7647,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         if (img) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
         cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     }
-    abl_res(F->emb, 1, g.n_embd, F->cs);
-    if (g.qwen35() && !g.q4x)   // one residual stream (qwen4exp: hc copies, as the others)
+    if (!g.is_hy4()) abl_res(F->emb, 1, g.n_embd, F->cs);
+    if (g.is_hy4()) {
+        // (hy4_embed wrote state_)
+    } else if (g.qwen35() && !g.q4x)   // one residual stream (qwen4exp: hc copies, as the others)
         cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
     else
         gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
@@ -7717,6 +7725,8 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         } else if (q35_mtp_on()) {
             q35_mtp_pend_set(p, FT->head_x);
         }
+    } else if (g.is_hy4()) {
+        if (!hy4_head(err)) return false;   // (head_x / head_xq of hy_dim: hy4_head_x() / hy4_head_xq())
     } else if (g.v41) {
         if (!tail->dsv41_head(err)) return false;
     } else if (g.dsv4()) {
@@ -7762,6 +7772,11 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
+    if (g.is_hy4()) {
+        o.xq = hy4_head_xq();
+        o.xf = hy4_head_x();
+        o.n_in = g.hy_dim;
+    }
     if (tail->q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
         if (!tail->q35d_head(FT->head_xq, 1, tail->sc_ + tail->sc_logits, FT->cs, err, FT->head_x)) return false;
     } else if (!gf::mv(&o, 1, FT->cs)) {

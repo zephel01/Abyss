@@ -127,9 +127,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna"
-                             % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
+                             "hy_v4" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -150,7 +150,8 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
-        seq = JOYAI_PATTERNS if pre == "joyai-llm" else LAGUNA_PATTERNS if pre == "laguna" else None
+        # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
+        seq = JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna" else None
         self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -410,7 +411,7 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else (list(JOYAI_PATTERNS) if tk.pre == "joyai-llm"
+        "pre_pattern": GLM_PATTERN if tk.ignore_merges else (list(JOYAI_PATTERNS) if tk.pre in ("joyai-llm", "hy_v4")
                                                               else QWEN35_PATTERN),
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else

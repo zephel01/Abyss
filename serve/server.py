@@ -100,6 +100,9 @@ ELASTIC_LENT = re.compile(r"glm elastic: (?:CUDA|HIP)\d+ (?:the expert pool take
                           r"dense FFN \+\d+ whole layers in VRAM) \(([\d.]+) GB")
 ELASTIC_STEP = re.compile(r"glm elastic: ((?:CUDA|HIP)\d+) KV \d+ -> (\d+) tokens \(([\d.]+) of ([\d.]+) GB mapped; the "
                           r"weights hold ([\d.]+) GB")
+HY4_END = "<\uff5chy_end:opensource\uff5c>"   # Hy4-flash's turn end (its EOS)
+HY4_IMAGE_START = "<\uff5chy_image\u2581start:opensource\uff5c>"
+HY4_IMAGE_PAD = "<\uff5chy_image\u2581pad:opensource\uff5c>"
 # the thinking budget's bridge (STRATA_GLM_THINK_BRIDGE): said inside the reasoning just before a forced </think>
 THINK_BRIDGE = ("\n\nI have used up my thinking budget, so I stop thinking here and write the final answer now, "
                 "in the language of the user's question.\n")
@@ -1679,9 +1682,11 @@ class Service:
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
                             _special_ids("<|observation|>") + _special_ids("<\uff5cend\u2581of\u2581sentence\uff5c>") +
                             # (Laguna: an assistant turn ends with </assistant>, a document with its EOS)
-                            _special_ids("</assistant>") + _special_ids("\u3008|EOS|\u3009"))
+                            _special_ids("</assistant>") + _special_ids("\u3008|EOS|\u3009") +
+                            # (Hy4-flash: an assistant turn ends with <｜hy_end:opensource｜>)
+                            _special_ids(HY4_END))
         # (as the engine gets them: the template's turn end first - the answer-loop guard ends a turn with it)
-        turn_end = (_special_ids(IM_END) + _special_ids("</assistant>"))[:1]
+        turn_end = (_special_ids(IM_END) + _special_ids("</assistant>") + _special_ids(HY4_END))[:1]
         self.stop_order = turn_end + sorted(self.stop_ids - set(turn_end))
         # the tool call's argument tags as one token each (GLM-5.3), else none: the engine's loop guard closes a looping
         # argument with the second (GEN key arg_ids=)
@@ -1693,11 +1698,11 @@ class Service:
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
-        end = _special_ids("</think>")
+        end = _special_ids("</think>") or _special_ids("</think:opensource>")   # (Hy4-flash's spelling)
         self.think_end_id = end[0] if end else None
         # <think> as one token: a template that leaves the opening to the model (MiMo-V2.6-Distill-Qwen-9B's ends the
         # prompt at "<|im_start|>assistant\n") gets it as the answer's first token - not reasoning text (run())
-        start = _special_ids("<think>")
+        start = _special_ids("<think>") or _special_ids("<think:opensource>")
         self.think_start_id = start[0] if start else None
         # Qwen's call form (<tool_call><function=NAME>...): its templates' response_template ends the reasoning at a
         # <tool_call> as well as at </think> (2026-11-07), so a call started inside the thinking is still a call
@@ -2146,6 +2151,8 @@ class Service:
             # <|vision_start|><|image_pad|><|vision_end|>
             glm = "<|begin_of_image|>" in self.template.source
             image_pad, image_start = ("<|image|>", "<|begin_of_image|>") if glm else (IMAGE_PAD, VISION_START)
+            if getattr(self.template, "hy4", False):   # Hy4-flash: <｜hy_image▁start｜><｜hy_image▁pad｜><｜hy_image▁end｜>
+                image_pad, image_start = HY4_IMAGE_PAD, HY4_IMAGE_START
             if v41_images:   # DeepSeek V4.1: one <｜deepseek_image｜> a row, no start marker (the rows carry their own)
                 image_pad = V41_IMAGE
             pad = self.tok.encode(image_pad, parse_special=True)[0]

@@ -577,6 +577,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
         return from_gguf_qwen35(g, out, err) && eog_from_gguf(g, out);
     if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err) && eog_from_gguf(g, out);
     if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("hy_v4_flash.block_count")) return from_gguf_hy4(g, out, err) && eog_from_gguf(g, out);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -981,6 +982,105 @@ bool Glm5Geometry::from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out
     out.n_head_kv.assign((size_t) out.n_layers, out.attn_head_kv);
     out.indexer_full.assign((size_t) out.n_layers, 1);
     out.comp_ratio.assign((size_t) out.n_layers, 0);
+    return true;
+}
+
+// hy4: Tencent Hy4-flash's hparams (config.json's names under the GGUF's hy_v4_flash.* keys); the defaults are
+// Hy4-flash's own.  n_embd is set to the experts' latent width (expert_latent_length) - see Glm5Geometry::hy4
+bool Glm5Geometry::from_gguf_hy4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "hy_v4_flash.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    const auto per_layer = [&](const std::string& key, std::vector<int>& dst, int n, int def) -> bool {
+        dst.assign((size_t) n, def);
+        const auto* v = g.get(p + key);
+        if (v == nullptr) return true;
+        if (v->type != strata::MetaType::ARRAY) {
+            if (v->is_num()) std::fill(dst.begin(), dst.end(), (int) v->num());
+            return true;
+        }
+        if (v->items.size() < (size_t) n) return false;
+        for (int i = 0; i < n; ++i) dst[(size_t) i] = (int) v->items[(size_t) i].num();
+        return true;
+    };
+    out.arch = 3;
+    out.hy4 = true;
+    out.hc = (int) num("hyper_connection.count", 4);
+    out.hc_eps = (float) num("hyper_connection.epsilon", 1e-6);
+    out.hc_mag = (float) num("hyper_connection.magnitude", 2.0);
+    out.hy_dim = (int) num("embedding_length", 3072);
+    out.n_embd = (int) num("expert_latent_length", 1536);
+    out.n_layers = (int) num("block_count", 42);
+    out.nextn = 0;
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-5);
+    out.q_lora = (int) num("attention.q_lora_rank", 1024);
+    out.kv_lora = (int) num("attention.kv_lora_rank", 512);
+    out.n_rot = out.n_rot_swa = (int) num("rope.dimension_count", 64);
+    out.qk_nope = (int) num("attention.key_length_mla", 256) - out.n_rot;
+    out.v_head = (int) num("attention.value_length_mla", 256);
+    out.head_dim = out.qk_nope + out.n_rot;
+    out.rope_base = (float) num("rope.freq_base", 1e7);
+    out.rope_base_swa = (float) num("rope.freq_base_swa", 1e4);
+    out.n_swa = (int) num("attention.sliding_window", 512);
+    out.idx_heads = (int) num("attention.indexer.head_count", 16);
+    out.idx_key = (int) num("attention.indexer.key_length", 128);
+    out.idx_top_k = (int) num("attention.indexer.top_k", 2048);
+    out.idx_kpool = (int) num("attention.indexer.kpool", 4);
+    out.idx_select_tail = 1;
+    out.n_expert = (int) num("expert_count", 512);
+    out.n_exp_used = (int) num("expert_used_count", 16);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 1536);
+    out.n_shared = (int) num("expert_shared_count", 1) > 0 ? 1 : 0;
+    out.n_ff_shexp = out.n_ff_exp;
+    out.n_ff_dense = (int) num("feed_forward_length", 13824);
+    out.dense_lead = (int) num("leading_dense_block_count", 1);
+    out.gating = (int) num("expert_gating_func", 2) == 2 ? 0 : -1;   // (2 = sigmoid)
+    out.w_scale = (float) num("expert_weights_scale", 3.998);
+    out.norm_w = (int) num("expert_weights_norm", 1) != 0 ? 1 : 0;
+    out.swiglu_exp = (float) num("swiglu_clamp_exp", 10.0);   // (the routed experts'; the shared one has none)
+    if (!(out.swiglu_exp > 0.0f)) out.swiglu_exp = INFINITY;
+    out.swiglu_shexp = INFINITY;
+    out.n_vocab = 120832;
+    if (const auto* v = g.get("tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY) out.n_vocab = (int) v->count;
+    if (const auto* v = g.get(p + "vocab_size"); v && v->is_num()) out.n_vocab = std::max(out.n_vocab, (int) v->num());
+    std::vector<int> swa;
+    if (!per_layer("attention.head_count", out.lag_heads, out.n_layers, 64) ||
+        !per_layer("attention.sliding_window_pattern", swa, out.n_layers, 0)) {
+        err = "hy4: attention.head_count / sliding_window_pattern list fewer entries than layers";
+        return false;
+    }
+    out.lag_swa.assign((size_t) out.n_layers, 0);
+    for (int il = 0; il < out.n_layers; ++il) out.lag_swa[(size_t) il] = swa[(size_t) il] != 0;
+    out.n_head = *std::max_element(out.lag_heads.begin(), out.lag_heads.end());
+    std::vector<int> sw;   // the per-layer clamp: one value is supported
+    if (per_layer("swiglu_clamp_exp", sw, out.n_layers, 10))
+        for (int il = out.dense_lead; il < out.n_layers; ++il)
+            if (std::fabs((float) sw[(size_t) il] - out.swiglu_exp) > 1e-6f && out.swiglu_exp != INFINITY) {
+                err = "hy4: swiglu_clamp_exp differs between the MoE layers (one value is supported)";
+                return false;
+            }
+    out.hy_eng.clear();
+    if (const auto* v = g.get(p + "ple.layers"); v && v->type == strata::MetaType::ARRAY)
+        for (const auto& it : v->items) out.hy_eng.push_back((int) it.num());
+    if (out.hc != 4 || out.hy_dim % 256 != 0 || out.n_embd % 256 != 0 || out.n_layers < 1 || out.n_expert <= 0 ||
+        out.n_expert > 512 || out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK || out.gating != 0 ||
+        out.kv_lora != 512 || out.n_rot != 64 || out.qk_nope != 192 || out.v_head != 256 || out.q_lora % 256 != 0 ||
+        out.idx_key != 128 || out.idx_kpool != 4 || out.idx_heads > 32 || out.n_head > 64 || out.n_swa > 1024 ||
+        out.n_ff_exp != out.n_embd || out.n_ff_dense % 256 != 0) {
+        err = "hy4: a geometry the hy4 kernels do not take (hc 4, kv_lora 512, rope 64, nope 192, v 256, indexer 128 x "
+              "kpool 4, <= 64 heads, the experts n_ff = latent width)";
+        return false;
+    }
+    out.n_head_kv.assign((size_t) out.n_layers, 1);   // (no delta-net layers)
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
+    // (a small delta-net scratch: load_pack's shared scratch sizes a few buffers by it)
+    out.kda_head_dim = 128;
+    out.d_conv = 4;
     return true;
 }
 
@@ -1524,6 +1624,7 @@ void Glm5Model::reset() {
     pos_ = 0;
     ekv_reset_mark();   // (elastic KV: the next prompt may give the KV's unused room back to the weights)
     if (g_.qwen35()) qwen35_reset();
+    if (g_.is_hy4()) hy4_reset();
     if (g_.arch == 0) q35_pend_pos_ = q35_row_done_ = -1;   // (glm5-next's NextN drafter on one part)
     dspark_reset();
     if (split_next_) {
@@ -3726,7 +3827,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
             // deepseek4: a projection the GEMVs serve (the compressors', the indexer's q_b) that the GGUF stored as F16
             // comes as a BF16 row (iq_pack.py --compat-bf16) and runs on the BF16 GEMV
-            if (g_.dsv4())
+            // hy4: a projection a GGUF keeps in BF16 (the llama.cpp-fork conversions) runs on the BF16 GEMV too
+            if (g_.dsv4() || g_.is_hy4())
                 ws_map_[r.name] = strata::core::WSlot{nullptr, strata::kernels::glmf::kTypeBF16, (const void*) ((uint8_t*) w_arena_ + at),
                                                       (int64_t) t->shape[0], (int64_t) (t->shape.size() > 1 ? t->shape[1] : 1)};
             at += (r.bytes + 255u) & ~(uint64_t) 255u;
@@ -3876,7 +3978,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
 
     // 6. the state and scratch arenas (identical to load()), then the CPU MoE buffers
-    const int64_t hc_dim = (int64_t) g_.hc * g_.n_embd;
+    const int64_t hc_dim = (int64_t) g_.hc * (g_.is_hy4() ? g_.hy_dim : g_.n_embd);   // (hy4: the residual's width)
     const int64_t max_pools = max_ctx / g_.idx_kpool;
     int64_t floats = 2 * hc_dim;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
@@ -3911,7 +4013,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     for (int il = 0; il < g_.n_layers; ++il) {
         if (il < l0_ || il >= l1_) continue;   // the other half's caches stay on the other device
-        if (g_.dsv4() || g_.qwen35()) continue;   // their caches: dsv4_alloc / qwen35_alloc
+        if (g_.dsv4() || g_.qwen35() || g_.is_hy4()) continue;   // their caches: dsv4_alloc / qwen35_alloc / hy4_setup
         if (g_.is_recr(il)) {
             kda_S_[(size_t) il] = floats;
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;

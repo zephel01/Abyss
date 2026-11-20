@@ -155,8 +155,17 @@ LAGUNA_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_out
                     "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                     "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                     "token_embd.weight", "output.weight")
+# hy_v4_flash (Tencent Hy4-flash, peasantsmith's Maya GGUFs): every non-expert tensor served as stored (the Q6_K / Q8_0
+# projections, the absorbed MLA k_b / v_b as their 3-D Q8_0 / Q6_K bytes, the latent MoE's routed_down / routed_up, the
+# Engram projection); F32 norms, routers, indexer and hyper-connection weights into dense.bin.  The Engram table
+# (per_layer_token_embd, FP8 rows in shard 2) stays in its GGUF: engram.txt says where
+HY4_NATIVE_OK = ("attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_output.weight", "attn_gate.weight",
+                 "attn_k_b.weight", "attn_v_b.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                 "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                 "ffn_routed_down.weight", "ffn_routed_up.weight", "engram_kv.weight",
+                 "token_embd.weight", "output.weight")
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
-                 "sensenova_loop")   # unsloth spells glm5-next without the hyphen
+                 "sensenova_loop", "hy_v4_flash")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -170,7 +179,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
-    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna"):
+    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna", "hy_v4_flash"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -311,13 +320,16 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 # [4096, 8192]: the same bytes - rows of ne0 - so it packs as the 2-D view (ne0, ne1 * ne2))
                 t.shape = [int(t.shape[0]), int(t.shape[1]) * int(t.shape[2])]
                 dims = 2
-            if dims > 2 and not (arch in ("glm5-next", "glm5next") and dims == 3):
+            if dims > 2 and not (arch in ("glm5-next", "glm5next", "hy_v4_flash") and dims == 3):
                 print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
             ne0, ne1 = index_shape(t.shape)
             convert = compat_bf16 and needs_bf16(t.name, t.type_name, arch) and t.type_name != "BF16"
             widen = (compat_bf16 and arch in ("deepseek4", "deepseek41") and t.type_name == "F16" and name.startswith("blk.")
                      and name.endswith(DEEPSEEK4_F16_TO_F32))
+            # hy_v4_flash: a tensor a GGUF keeps in F16 (a source-precision conversion) is widened to F32, exactly - the
+            # hy4 path reads F32 and BF16 rows, not F16
+            widen = widen or (arch == "hy_v4_flash" and t.type_name == "F16")
             # (BF16 too: unsloth's 1017 GGUFs keep indexer.proj in BF16, exact in F32)
             widen_q = (compat_bf16 and arch == "deepseek41" and t.type_name not in ("F32", "F16") and name.startswith("blk.")
                        and name.endswith(DEEPSEEK41_ANY_TO_F32))
@@ -369,6 +381,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             elif arch == "laguna" and not name.endswith(LAGUNA_NATIVE_OK):
                 print("%s is %s: not on the laguna native set (LAGUNA_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
+            elif arch == "hy_v4_flash" and not name.endswith(HY4_NATIVE_OK):
+                print("%s is %s: not on the hy_v4_flash native set (HY4_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
             elif arch == "qwen4exp-fast" and not name.endswith(QWEN4EXP_FAST_NATIVE_OK):
@@ -600,6 +616,68 @@ def write_engram(out, g, model: Model) -> int:
     return 0
 
 
+def write_hy4_engram(out, g, model: Model) -> int:
+    """hy_v4_flash: what the engine needs to read the Engram rows from shard 2 - engram.txt (the row bytes, the table's
+    absolute offset and row count, the 4 layers, 3 multipliers a layer, the 64 heads' offsets and primes, the pad id)
+    and the normalized-vocabulary map as raw uint32 (engram_token_map.u32)."""
+    m = g.metadata
+    p = "hy_v4_flash."
+    keys = ("ple.layers", "ple.layer_multipliers", "ple.head_offsets", "ple.head_vocab_sizes", "engram.token_map",
+            "engram.pad_token_id", "ple.heads_per_ngram", "ple.ngram_size", "embedding_length_per_layer_input")
+    miss = [k for k in keys if p + k not in m]
+    if miss:
+        print("hy_v4_flash: Engram metadata missing: " + ", ".join(miss))
+        return 1
+    layers = [int(v) for v in m[p + "ple.layers"]]
+    mult = [int(v) for v in m[p + "ple.layer_multipliers"]]
+    offs = [int(v) for v in m[p + "ple.head_offsets"]]
+    sizes = [int(v) for v in m[p + "ple.head_vocab_sizes"]]
+    hpn, ng, dim = int(m[p + "ple.heads_per_ngram"]), int(m[p + "ple.ngram_size"]), \
+        int(m[p + "embedding_length_per_layer_input"])
+    heads = hpn * (ng - 1)
+    if len(mult) != ng * len(layers) or len(offs) != heads * len(layers) or len(sizes) != len(offs):
+        print("hy_v4_flash: Engram lists of unexpected lengths (layers %d, multipliers %d, offsets %d, sizes %d)"
+              % (len(layers), len(mult), len(offs), len(sizes)))
+        return 1
+    if any(offs[i + 1] != offs[i] + sizes[i] for i in range(len(offs) - 1)):
+        print("hy_v4_flash: the Engram head offsets are not the running sum of the head sizes")
+        return 1
+    name = "per_layer_token_embd.weight"
+    if name not in model.where:
+        print("hy_v4_flash: %s (the Engram table) is in none of the shards" % name)
+        return 1
+    gg, t, _, path = model.where[name]
+    # the table's row format: whatever shard holds it, in any of the types a converter writes it in (Maya's GGUFs:
+    # FP8 E4M3 codes without a scale; llama.cpp-fork GGUFs: IQ4_NL; the source precisions); the engine decodes a row
+    # of `dim` values from `row bytes` bytes
+    formats = {43: ("fp8_e4m3", 1, 1), 20: ("iq4_nl", 32, 18), 8: ("q8_0", 32, 34), 1: ("f16", 1, 2),
+               30: ("bf16", 1, 2), 0: ("f32", 1, 4)}
+    if t.type_id not in formats or int(t.shape[0]) != dim or int(t.shape[1]) < offs[-1] + sizes[-1] or \
+            dim % formats[t.type_id][1]:
+        print("hy_v4_flash: %s is type %d %s, not rows of %d (FP8 / IQ4_NL / Q8_0 / F16 / BF16 / F32) for %d buckets"
+              % (name, t.type_id, list(t.shape), dim, offs[-1] + sizes[-1]))
+        return 1
+    fmt, blk, bb = formats[t.type_id]
+    row_bytes = dim // blk * bb
+    lines = ["# hy4 Engram: format <type> <values a row> <row bytes>; table <abs offset> <rows> <shard>; layers ...; "
+             "mult <layer> <m0..m(n-1)>; head <k> <offset> <size>; pad <id>; ngram <n> <heads_per_ngram>",
+             "format %s %d %d" % (fmt, dim, row_bytes),
+             "table %d %d %s" % (gg.data_start + t.offset, int(t.shape[1]), path.name),
+             "layers " + " ".join(str(v) for v in layers),
+             "ngram %d %d" % (ng, hpn),
+             "pad %d" % int(m[p + "engram.pad_token_id"])]
+    for i, il in enumerate(layers):
+        lines.append("mult %d %s" % (il, " ".join(str(v) for v in mult[ng * i: ng * i + ng])))
+    for k, (o, s) in enumerate(zip(offs, sizes)):
+        lines.append("head %d %d %d" % (k, o, s))
+    (out / "engram.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmap = np.asarray(m[p + "engram.token_map"], dtype=np.int64)
+    tmap.astype(np.uint32).tofile(out / "engram_token_map.u32")
+    print("hy_v4_flash: engram.txt + engram_token_map.u32 (%d tokens, %d rows of %d %s values in %s)"
+          % (tmap.size, int(t.shape[1]), dim, fmt, path.name))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
@@ -655,12 +733,16 @@ def main() -> int:
         prefix = "laguna."
         print("laguna: packing for the Glm5Model runner's qwen35moe path, laguna layers (every dense tensor served as "
               "stored)")
+    if arch == "hy_v4_flash":
+        prefix = "hy_v4_flash."
+        print("hy_v4_flash: packing for the Glm5Model runner's hy4 path (every dense tensor served as stored; the "
+              "Engram table stays in shard 2)")
     if arch in ("qwen35moe", "qwen35"):
         prefix = loop_prefix or arch + "."
         print("%s: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna", "hy_v4_flash"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -716,6 +798,10 @@ def main() -> int:
         rc = write_engram(out, g, model) or write_vl_bias(out, g, model)
         if rc:
             return rc
+    if arch == "hy_v4_flash":
+        rc = write_hy4_engram(out, g, model)
+        if rc:
+            return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
@@ -745,7 +831,7 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna", "hy_v4_flash"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)

@@ -3528,8 +3528,12 @@ static int glm_pack_generate(const Options& o) {
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
     constexpr int64_t kV41ImageToken = 129264;   // deepseek41: <｜deepseek_image｜> (one token a row of the record)
     constexpr int64_t kQwenImageToken = 248056;  // qwen35: <|image_pad|> (config.json image_token_id)
-    const bool img_mrope = model.geometry().qwen35() && !model.geometry().v41;
-    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : img_mrope ? kQwenImageToken : kGlmImageToken;
+    // hy4 (Hy4-flash): <｜hy_image▁pad｜> a row as well, M-RoPE like Qwen's; the record's grid is nx = merged columns + 1
+    // (each merged row ends with the newline row), ny = merged rows, so the text after it goes on at t + max(nx, ny)
+    constexpr int64_t kHy4ImageToken = 120120;
+    const bool img_mrope = (model.geometry().qwen35() && !model.geometry().v41) || model.geometry().is_hy4();
+    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : model.geometry().is_hy4() ? kHy4ImageToken
+                                : img_mrope ? kQwenImageToken : kGlmImageToken;
     strata::program::LogposWriter logpos;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     std::string line;
@@ -3814,7 +3818,7 @@ static int glm_pack_generate(const Options& o) {
             cur_img_rows.clear();
             bool mrope_set = false;
             if (cmd == "GENI") {
-                const int64_t E = model.geometry().n_embd;
+                const int64_t E = model.geometry().is_hy4() ? model.geometry().hy_dim : model.geometry().n_embd;
                 std::string why;
                 if (!model.images_ok(why)) {
                     std::printf("ERR %s\n", why.c_str());

@@ -2177,6 +2177,10 @@ bool Glm5Model::images_ok(std::string& why) const {
 }
 
 bool Glm5Model::set_mrope(const std::vector<int32_t>& tab, std::string& err) {
+    if (g_.is_hy4()) {   // hy4: its token path rotates on the host's positions (hy4_fast_path.cu), no device table
+        mrope_h_ = tab;
+        return true;
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
         if (tab.empty()) {

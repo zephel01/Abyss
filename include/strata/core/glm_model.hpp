@@ -157,6 +157,20 @@ struct Glm5Geometry {
     }
     static bool from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
+    // ---- hy4 (Tencent Hy4-flash, GGUF arch hy_v4_flash; src/core/hy4_fast_path.cu, kernels/hy4_fast.hpp): arch 3.
+    // n_embd is the EXPERTS' width here - the latent MoE runs its 512 experts in 1536 (ffn_routed_down / _up around
+    // them), so the expert machinery (pool, RAM tier, CPU lane) is sized by n_embd as for every other model; the
+    // residual is hy_dim wide (4 hyper-connection streams, no stream-mixing matrix).  Gated MLA attention (one shared
+    // 512 latent + a 64-dim rope key, a learned sink per head, a sigmoid output gate per head), q heads per layer
+    // (lag_heads), sliding-window layers (lag_swa: window n_swa, rope_base_swa) and the others' compressed indexer
+    // (top idx_top_k cells past that many), Engram on hy_eng layers (FP8 rows in the GGUF's second shard)
+    bool hy4 = false;
+    int hy_dim = 3072;
+    float hc_mag = 2.0f;
+    std::vector<int> hy_eng;            // the Engram layers (0-based, as the GGUF's ple.layers)
+    bool is_hy4() const { return arch == 3; }
+    static bool from_gguf_hy4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
@@ -621,6 +635,16 @@ public:
     // colder resident, parks in the RAM tier or goes) and is left in `state` (kLent: the tail; kElastic: elastic KV)
     bool lend_slots(const std::function<bool(int, int)>& take, char state, uint64_t& moved, uint64_t& dropped,
                     std::string& err);
+    // ---- hy4 (src/core/hy4_fast_path.cu): the token path; its weights, caches and activations live in hy4_
+    void* hy4_ = nullptr;
+    bool hy4_setup(std::string& err);                      // fast_setup: bind, allocate, open the Engram table
+    bool hy4_embed(int32_t token, int64_t p, const float* img, std::string& err);   // the row -> state_'s 4 streams
+    bool fast_hy4_layers(int64_t p, std::string& err);
+    bool fast_hy4_moe(int il, std::string& err);           // x -> ffn (the latent MoE through the tiers)
+    bool hy4_head(std::string& err);                       // the collapse + output_norm -> hy4_head_x / _xq
+    const float* hy4_head_x() const;
+    const void* hy4_head_xq() const;
+    void hy4_reset();
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)
@@ -892,12 +916,14 @@ public:
     const float* image_row(int64_t p) const {
         const auto it = std::lower_bound(img_pos_.begin(), img_pos_.end(), p);
         if (it == img_pos_.end() || *it != p) return nullptr;
-        return img_rows_.data() + (size_t) (it - img_pos_.begin()) * (size_t) g_.n_embd;
+        // (hy4: rows of the residual width; its n_embd is the experts' latent)
+        return img_rows_.data() + (size_t) (it - img_pos_.begin()) * (size_t) (g_.is_hy4() ? g_.hy_dim : g_.n_embd);
     }
 private:
     std::vector<int64_t> img_pos_;                         // ascending
     std::vector<float> img_rows_;
     int32_t* mrope_d_ = nullptr;                           // set_mrope's device table (this half's device)
+    std::vector<int32_t> mrope_h_;                         // hy4: set_mrope's table on the host (cells x (t, h, w))
     size_t mrope_cap_ = 0;                                 // ... its int32 count
 public:
     /// The pipelined speculative decode (src/core/glm_fast_path.cu): needs a two-half split whose tail carries the
