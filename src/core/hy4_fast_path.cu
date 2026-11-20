@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
