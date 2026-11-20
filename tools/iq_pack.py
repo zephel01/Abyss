@@ -163,6 +163,7 @@ HY4_NATIVE_OK = ("attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "
                  "attn_k_b.weight", "attn_v_b.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                  "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                  "ffn_routed_down.weight", "ffn_routed_up.weight", "engram_kv.weight",
+                 "indexer.attn_k.weight", "indexer.attn_q_b.weight",   # (nace-ai's GGUFs: Q8_0; Maya's: F32)
                  "token_embd.weight", "output.weight")
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
                  "sensenova_loop", "hy_v4_flash")   # unsloth spells glm5-next without the hyphen
