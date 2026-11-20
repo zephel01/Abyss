@@ -111,7 +111,7 @@ Download counts not surveyed. UD-Q4_K_XL holds all its experts in 32 GB of VRAM 
 | `UD-IQ3_XXS` (unsloth) | 49.5 GB | not measured | user report only (#8 below) | 16 GB cards |
 | `IQ3_XXS-B` ([zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)) | 51.7 GB | KL about UD-IQ3_XXS's (0.138-0.140); swe-bench 56 of 60 resolved | 5090, the config `--model ornith` writes: 116 tok/s, 75% of the NextN drafts accepted (v1.3.100) | 16 GB GPU + 64 GB RAM |
 
-### Hy4-flash (beta, unreleased)
+### Hy4-flash (beta, v1.3.177)
 
 Download counts not surveyed. Speeds: RTX 5090 (PCIe Gen4 x4) + RAM tier 60 GB, iGPU lane off, a 459-token prompt,
 512 tokens, median of 3. Quality: nll on a 459-token JA / EN / code set (457 tokens scored); the numpy reference from
@@ -119,7 +119,9 @@ Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a pos
 
 | file (source) | size | quality | speed | use |
 | --- | ---: | --- | --- | --- |
-| `Maya-XS` IQ2_XXS ([peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya)) | see the model card | nll 1.657 (ppl 5.24, top-1 72.0%); without the CPU lane 1.620; Engram off 3.446 | decode 60.0, prompt 66 tok/s | 32 GB GPU + 64 GB RAM |
+| `Maya-XS` IQ2_XXS ([peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)) | 44.8 GB + the Engram table 63.4 GB (read from the SSD) | nll 1.622 on the v1.3.177 build (1.657 on the pre-release build: the CPU lane, 1.4% error, took twice the experts); without the CPU lane 1.620 on both; Engram off 3.446 | decode 60.0, prompt 66 tok/s (one token at a time) | 32 GB GPU + 64 GB RAM |
+| `Maya-S` / `Maya-M` / `Maya-L` (same repository) | 53.0 / 68.4 / 89.5 GB + the same table | not measured (same tensor types as Maya-XS) | not measured | more RAM |
+| `Q3_K_M` / `Q4_K_M` ([nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF); IQ4_NL Engram table inside the shards) | 107.5 / 127.2 GB | not measured yet (the loader reads its table format; the file is not checked yet) | not measured | |
 
 ### Qwen3.8-Flash-Next (qwen4exp)
 

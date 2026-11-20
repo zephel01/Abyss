@@ -322,6 +322,9 @@ RAM 層 60 GB、モデルは NVMe（3.4 GB/s）、Abyss v1.3.31:
 | | Maya の Maya-S-v2 IQ2_XXS、Maya-S24 | 96.5 / 94.7 GB | 計測済み |
 | | turboderp の EXL3 sc_2.10bpw（[EXL3](docs/exl3/README.md)） | | 計測済み、試験的 |
 | | kindlingai の [exlr8](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) K2 を `tools/exlr8_convert.py` で変換（v1.3.53） | 86 GB | AI PRO R9700 で計測済み: 約 23 tok/s、nll 1.61（Maya-S-v2 は 1.634、低いほど良い）。K3（125 GB）は nll 1.548、約 11 tok/s |
+| Hy4-flash（Tencent、`hy_v4_flash`。ベータ、テキストと画像。[docs/MODELS](docs/MODELS.ja.md#hy4-flashベータv13177)） | peasantsmith の [Maya-XS IQ2_XXS](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)（v1.3.177） | 44.8 GB ＋ Engram の表 63.4 GB（SSD から読む） | RTX 5090 ＋ RAM 段 60 GB で計測済み: 生成 60.0 tok/s、プロンプト 66 tok/s（1 トークンずつ読むので長いプロンプトは遅い）。numpy の参照と最有力トークンが一致。画像も正しく読む。16K より長いコンテキストは未確認。パックと設定は手で作る（`--model` はまだ） |
+| | peasantsmith の Maya-S / Maya-M / Maya-L | 53.0 / 68.4 / 89.5 GB ＋ 表 | テンソルの型は Maya-XS と同じ。未確認 |
+| | nace-ai の [Q3_K_M / Q4_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF)（Engram の表は IQ4_NL で各ファイルの中） | 107.5 / 127.2 GB | ローダーは形式を読めるが、ファイルでは未確認 |
 
 自作ファイルの以前の名前（ファイルの中身は同じ）: LDLQ 132G / 139G = DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G、Compact JA256 =
 DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G、IQ3_XXS-B = Ornith-1.5-122B-IQ3_XXS-16G64G、IQ3_XXS-B2 = Qwen3.5-122B-A10B-IQ3_XXS-16G64G、
