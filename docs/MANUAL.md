@@ -1096,7 +1096,13 @@ machinery. Same box, a code prompt, 256 tokens after it, prompt tok/s token path
 all four, prompt 1,351 and 1,381 tok/s, decode 48 and 51 tok/s (caches 0.95 GB at 65,536). Settings:
 `STRATA_HY4_PREFILL=0` reads prompts one token at a time again (the token path, as v1.3.177);
 `STRATA_HY4_PREFILL_SUB=<64-4096>` the attention's / dense FFN's sub-batch (512); `STRATA_HY4_PREFILL_READERS=<n>` the
-threads that read a chunk's Engram rows (32). Images: the
+threads that read a chunk's Engram rows (32); `STRATA_HY4_PREFILL_ATTN=f32` the prompt attention's F32 kernel (default:
+tensor cores, sm_80+); `STRATA_HY4_IX_TILED=0` the indexer score's warp-per-group kernel (default: the register-tiled
+one, 16 heads); `STRATA_HY4_ENG_ASYNC=0` a token's Engram rows read before its layers start (default: read while
+layer 0 runs, each Engram layer waiting for its own rows - the same values); `STRATA_HY4_PREFILL_ENG_ASYNC=0` a prompt
+chunk's Engram rows read before its layers start (default: read while they run, each Engram layer waiting for its own
+rows - the same rows). `STRATA_GLM_PREFILL_PROF=1` /
+`STRATA_GLM_PROF=<n>` break the prompt / token time down by stage (`hy4_*` and the token path's stages). Images: the
 mmproj (`mmproj-Hy4-Flash-Maya-XS.gguf`) runs on strata-vision (`tools/vision/hy4v_patch.py`, applied by setup's
 vision build) with a vocab-only GGUF from `python tools/vision/hy4v_ref.py vocab --gguf <shard 1> --out <dir>/hy4-vocab.gguf`
 as its `"model"`. Not yet: the MTP drafter, AMD (HIP).

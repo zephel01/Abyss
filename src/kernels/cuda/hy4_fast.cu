@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "dsa_topk.cuh"
 
@@ -672,6 +674,214 @@ __global__ void __launch_bounds__(256) attend_rows_kernel(const float* __restric
     }
 }
 
+#if !defined(STRATA_USE_HIP)
+// attend_rows_kernel on tensor cores (mma.sync m16n8k16, FP16 in, F32 accumulate; Ampere and newer): a block takes a
+// row's 32 heads; S = Q . K^T over the 576-wide cache rows (the absorbed latent query and the rope part, each head row
+// scaled by 2^e into FP16's range and back after), the online softmax from the sink (m = sink, l = 1, as the F32
+// kernel), O += P . L over the 512 latent columns with P in FP16.  The keys of a chunk are read once for the 32 heads
+// (the F32 kernel: once for 16).  The selection, the masking and the softmax are the F32 kernel's
+constexpr int TA_H = 32, TA_C = 32, TA_LD = kRow + 8;   // heads, keys a chunk, padded row (FP16)
+constexpr size_t kTaSmem = ((size_t) (TA_H + TA_C) * TA_LD + (size_t) TA_H * (TA_C + 8)) * sizeof(__half) +
+                           (size_t) TA_H * TA_C * sizeof(float);
+__device__ __forceinline__ void ta_ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+#else
+    (void) p;
+    r0 = r1 = r2 = r3 = 0u;
+#endif
+}
+__device__ __forceinline__ void ta_ldsm_x2(uint32_t& r0, uint32_t& r1, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
+#else
+    (void) p;
+    r0 = r1 = 0u;
+#endif
+}
+__device__ __forceinline__ void ta_ldsm_x2_t(uint32_t& r0, uint32_t& r1, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
+#else
+    (void) p;
+    r0 = r1 = 0u;
+#endif
+}
+__device__ __forceinline__ void ta_mma(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                       uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+__global__ void __launch_bounds__(256) attend_rows_tc_kernel(const float* __restrict__ qabs, const float* __restrict__ q,
+                                                             const uint16_t* __restrict__ cache, int64_t row_base,
+                                                             int ring, const int* __restrict__ cells,
+                                                             const int* __restrict__ n_cells, int cells_ld, int64_t p0,
+                                                             int window, const float* __restrict__ sinks, float scale,
+                                                             int n_head, float* __restrict__ ctx) {
+    extern __shared__ __align__(16) unsigned char ta_sm[];
+    __half* sQ = (__half*) ta_sm;                  // TA_H x TA_LD
+    __half* sL = sQ + TA_H * TA_LD;                // TA_C x TA_LD
+    __half* sP = sL + TA_C * TA_LD;                // TA_H x (TA_C + 8)
+    float* sS = (float*) (sP + TA_H * (TA_C + 8));  // TA_H x TA_C
+    __shared__ float s_m[TA_H], s_l[TA_H], s_sc[TA_H], s_qs[TA_H];
+    __shared__ int s_row[TA_C];
+    const int t = blockIdx.x, h0 = blockIdx.y * TA_H, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int64_t p = p0 + t;
+    const int nc = cells != nullptr ? n_cells[t] : -1;
+    const int* cl = cells != nullptr ? cells + (size_t) t * cells_ld : nullptr;
+    const int64_t lo = window > 0 ? (p - window + 1 > 0 ? p - window + 1 : 0) : 0;
+    const int ns = nc >= 0 ? nc : (int) (p - lo + 1);
+    // the 32 heads' 576-wide queries -> FP16, each row scaled by 2^e to a largest magnitude in [2^13, 2^14)
+    for (int rr = 0; rr < TA_H / 8; ++rr) {
+        const int r = warp * (TA_H / 8) + rr;
+        const float* qa = qabs + ((size_t) t * n_head + h0 + r) * kLat;
+        const float* qr = q + ((size_t) t * n_head + h0 + r) * (kNope + kRot) + kNope;
+        float mx = 0.f;
+        for (int c = lane; c < kLat; c += 32) mx = fmaxf(mx, fabsf(qa[c]));
+        for (int c = lane; c < kRot; c += 32) mx = fmaxf(mx, fabsf(qr[c]));
+        mx = warp_max(mx);
+        int ex = 0;
+        if (mx > 0.f) {
+            frexpf(mx, &ex);
+            ex = max(-60, min(60, 14 - ex));
+        }
+        const float f = ldexpf(1.0f, ex);
+        for (int c = 2 * lane; c < kLat; c += 64)
+            *(__half2*) (sQ + r * TA_LD + c) = __floats2half2_rn(qa[c] * f, qa[c + 1] * f);
+        for (int c = 2 * lane; c < kRot; c += 64)
+            *(__half2*) (sQ + r * TA_LD + kLat + c) = __floats2half2_rn(qr[c] * f, qr[c + 1] * f);
+        if (lane == 0) s_qs[r] = ldexpf(1.0f, -ex);
+    }
+    if (tid < TA_H) {
+        s_m[tid] = sinks[h0 + tid];
+        s_l[tid] = 1.0f;
+    }
+    float acc[2][8][4];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 8; ++b)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.0f;
+    const int g = lane >> 2, q2 = (lane & 3) * 2;
+    for (int s0 = 0; s0 < ns; s0 += TA_C) {
+        __syncthreads();
+        if (tid < TA_C) {
+            const int i = s0 + tid;
+            int64_t j = -1;
+            if (i < ns) j = nc >= 0 ? (int64_t) cl[i] : lo + i;
+            s_row[tid] = j < 0 ? -1 : (int) ((j - row_base) % ring);
+        }
+        __syncthreads();
+        for (int i = tid; i < TA_C * (kRow / 8); i += blockDim.x) {
+            const int r = i / (kRow / 8), c8 = i - r * (kRow / 8);
+            const int row = s_row[r];
+            *(uint4*) (sL + r * TA_LD + 8 * c8) =
+                row < 0 ? make_uint4(0u, 0u, 0u, 0u) : ((const uint4*) (cache + (size_t) row * kRow))[c8];
+        }
+        __syncthreads();
+        // S = Q . K^T: warp w -> m-tile w / 4 (16 heads), n-tile w % 4 (8 keys); 36 k-steps of 16
+        {
+            const int mt = warp >> 2, nt = warp & 3;
+            float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+            for (int ks = 0; ks < kRow / 16; ++ks) {
+                uint32_t a0, a1, a2, a3, b0, b1;
+                ta_ldsm_x4(a0, a1, a2, a3, sQ + (mt * 16 + (lane & 15)) * TA_LD + ks * 16 + (lane >> 4) * 8);
+                ta_ldsm_x2(b0, b1, sL + (nt * 8 + (lane & 7)) * TA_LD + ks * 16 + ((lane >> 3) & 1) * 8);
+                ta_mma(sacc, a0, a1, a2, a3, b0, b1);
+            }
+            const int r0 = mt * 16 + g, c0 = nt * 8 + q2;
+            const float fa = scale * s_qs[r0], fb = scale * s_qs[r0 + 8];
+            sS[r0 * TA_C + c0] = sacc[0] * fa;
+            sS[r0 * TA_C + c0 + 1] = sacc[1] * fa;
+            sS[(r0 + 8) * TA_C + c0] = sacc[2] * fb;
+            sS[(r0 + 8) * TA_C + c0 + 1] = sacc[3] * fb;
+        }
+        __syncthreads();
+        // the online softmax: 8 threads a head row, 4 keys each
+        {
+            const int r = tid >> 3, j0 = (tid & 7) * 4;
+            float v[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[j] = s_row[j0 + j] >= 0 ? sS[r * TA_C + j0 + j] : -INFINITY;
+                mx = fmaxf(mx, v[j]);
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = s_m[r], m_new = fmaxf(m_old, mx);
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = v[j] == -INFINITY ? 0.f : expf(v[j] - m_new);
+                sum += e;
+                sP[r * (TA_C + 8) + j0 + j] = __float2half(e);
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                const float sc = expf(m_old - m_new);
+                s_sc[r] = sc;
+                s_l[r] = s_l[r] * sc + sum;
+                s_m[r] = m_new;
+            }
+        }
+        __syncthreads();
+        // O = O * sc(row) + P . L: warp w's 64 latent columns (8 n-tiles) of both m-tiles, 2 k-steps of 16 keys
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const float sa = s_sc[mt * 16 + g], sb = s_sc[mt * 16 + g + 8];
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                acc[mt][nt][0] *= sa;
+                acc[mt][nt][1] *= sa;
+                acc[mt][nt][2] *= sb;
+                acc[mt][nt][3] *= sb;
+            }
+        }
+#pragma unroll
+        for (int ks = 0; ks < TA_C / 16; ++ks) {
+            uint32_t pa[2][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                ta_ldsm_x4(pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3],
+                           sP + (mt * 16 + (lane & 15)) * (TA_C + 8) + ks * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                uint32_t b0, b1;
+                ta_ldsm_x2_t(b0, b1, sL + (ks * 16 + (lane & 15)) * TA_LD + warp * 64 + nt * 8);
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) ta_mma(acc[mt][nt], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b0, b1);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int ra = mt * 16 + g, rb = ra + 8;
+        const float ia = 1.f / s_l[ra], ib = 1.f / s_l[rb];
+        float* oa = ctx + ((size_t) t * n_head + h0 + ra) * kLat;
+        float* ob = ctx + ((size_t) t * n_head + h0 + rb) * kLat;
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int c = warp * 64 + nt * 8 + q2;
+            *(float2*) (oa + c) = make_float2(acc[mt][nt][0] * ia, acc[mt][nt][1] * ia);
+            *(float2*) (ob + c) = make_float2(acc[mt][nt][2] * ib, acc[mt][nt][3] * ib);
+        }
+    }
+}
+#endif
+
 // q's no-rope parts (each head's first 192 of 256) -> FP16 [t][h][192] (the absorb product's input)
 __global__ void q_nope_f16_kernel(const float* __restrict__ q, int64_t n, uint16_t* __restrict__ q16) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
@@ -866,6 +1076,32 @@ void mla_attend_rows(const float* qabs, const float* q, const uint16_t* cache, i
         std::fprintf(stderr, "hy4 mla_attend_rows: %d heads (a multiple of %d)\n", n_head, AR_HG);
         return;
     }
+#if !defined(STRATA_USE_HIP)
+    // STRATA_HY4_PREFILL_ATTN=f32: the F32 kernel; else tensor cores where the device has mma.sync (sm_80+) and the
+    // 82 KB of shared memory (per device, decided once)
+    static int tc_ok[16] = {};
+    static const char* mode = getenv("STRATA_HY4_PREFILL_ATTN");
+    static const bool f32_only = mode != nullptr && std::strcmp(mode, "f32") == 0;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) dev = 0;
+    if (tc_ok[dev] == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        tc_ok[dev] = -1;
+        if (!f32_only && major >= 8 &&
+            cudaFuncSetAttribute((const void*) attend_rows_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) kTaSmem) == cudaSuccess)
+            tc_ok[dev] = 1;
+        cudaGetLastError();
+    }
+    if (tc_ok[dev] == 1 && n_head % TA_H == 0) {
+        attend_rows_tc_kernel<<<dim3((unsigned) T, (unsigned) (n_head / TA_H)), 256, kTaSmem, s>>>(
+            qabs, q, cache, row_base, ring, cells, n_cells, cells_ld, p0, window, sinks, scale, n_head, ctx);
+        check("mla_attend_rows_tc");
+        return;
+    }
+#endif
     attend_rows_kernel<<<dim3((unsigned) T, (unsigned) (n_head / AR_HG)), 256, 0, s>>>(
         qabs, q, cache, row_base, ring, cells, n_cells, cells_ld, p0, window, sinks, scale, n_head, ctx);
     check("mla_attend_rows");

@@ -134,7 +134,6 @@ STRATA_GLM_PREFILL_VERBOSE  # src/core/glm_prefill.cu
 STRATA_GLM_PRESTAGE_ADAPT  # src/core/glm_prefill.cu
 STRATA_GLM_PRESTAGE_CARVE  # src/core/glm_prefill.cu
 STRATA_GLM_PRESTAGE_PIECES  # src/core/glm_prefill.cu
-STRATA_GLM_PROF  # src/core/glm_fast_path.cu
 STRATA_GLM_PROFILE_WEIGHT  # src/core/glm_fast_path.cu
 STRATA_GLM_PROMOTE_FILL  # src/core/glm_fast_path.cu
 STRATA_GLM_PROMOTE_MARGIN  # src/core/glm_fast_path.cu

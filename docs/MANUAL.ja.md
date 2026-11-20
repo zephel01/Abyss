@@ -1037,7 +1037,12 @@ RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークン�
 トークンで試し、どちらも 4 問すべて正解、プロンプト 1,351 / 1,381 tok/s、生成 48 / 51 tok/s（65,536 でキャッシュ 0.95 GB）。
 設定: `STRATA_HY4_PREFILL=0` でプロンプトを 1 トークンずつに戻します（v1.3.177 と同じトークン経路）。
 `STRATA_HY4_PREFILL_SUB=<64-4096>` は注意と密な FFN のサブバッチ（512）、`STRATA_HY4_PREFILL_READERS=<n>` は
-チャンク分の Engram の行を読むスレッド数（32）です。画像: mmproj
+チャンク分の Engram の行を読むスレッド数（32）です。`STRATA_HY4_PREFILL_ATTN=f32` でプロンプトの注意を F32 のカーネルに戻します
+（既定は tensor core、sm_80 以上）。`STRATA_HY4_IX_TILED=0` でインデクサのスコアをワープ 1 本でグループ 1 つの版に戻します
+（既定はレジスタでタイルを組む版、16 ヘッド）。`STRATA_HY4_ENG_ASYNC=0` で、トークンの Engram の行を層の計算の前に読み終える
+形に戻します（既定は層 0 の計算中に読み、各 Engram 層が自分の行だけを待つ。値は同じ）。
+`STRATA_HY4_PREFILL_ENG_ASYNC=0` でプロンプトのチャンクの Engram の行を、その層の計算の前にまとめて読む形に戻します（既定は層の計算中に読み、各 Engram 層が自分の行だけを待つ。同じ行）。`STRATA_GLM_PREFILL_PROF=1` /
+`STRATA_GLM_PROF=<n>` でプロンプト / 生成の時間を段階ごとに出します（`hy4_*` とトークン経路の各段階）。画像: mmproj
 （`mmproj-Hy4-Flash-Maya-XS.gguf`）は strata-vision で動きます（`tools/vision/hy4v_patch.py`、setup の vision ビルドが当てます）。
 `"model"` には `python tools/vision/hy4v_ref.py vocab --gguf <1 本目の分割ファイル> --out <dir>/hy4-vocab.gguf` で作る語彙だけの GGUF を指定します。
 まだのもの: MTP ドラフター、AMD（HIP）。

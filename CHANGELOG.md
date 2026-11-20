@@ -13,6 +13,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   live on the heap, shared with the thread. They were on the serve function's stack while the detached thread kept
   reading, so a stdin closed after QUIT could lock a destroyed mutex while the engine shut down (an abort after a
   finished answer; Maya c9bd85f found the same shape). Same output.
+- Hy4-flash prompts: the indexer score (16 heads) runs on the register-tiled kernel the 32-head models use
+  (`STRATA_HY4_IX_TILED=0` goes back; sum order only, KL vs the token path equal at 16K and 32K); at 63K the score
+  stage went 0.097 -> 0.007 ms a token.
+- Hy4-flash prompts: attention (window and selected/dense layers, with the sinks) runs on tensor cores on sm_80+:
+  FP16 Q (a per-row power-of-two scale), FP16 cache rows, FP32 softmax and sums (`STRATA_HY4_PREFILL_ATTN=f32` goes
+  back). KL vs the numpy reference 0.2190 (F32 kernel 0.2193) at 459 tokens, vs the token path equal at 16K/32K.
+- Hy4-flash Engram: a token's rows are read while layer 0 runs, each Engram layer waiting for its own
+  (`STRATA_HY4_ENG_ASYNC=0`), and a prompt chunk's rows are read while its layers run, Engram layer by Engram layer
+  (`STRATA_HY4_PREFILL_ENG_ASYNC=0`). Same rows, same tokens.
+- `STRATA_GLM_PREFILL_PROF=1` / `STRATA_GLM_PROF=<n>` cover Hy4-flash (`hy4_*` prompt stages; engram, hc, attn_win,
+  attn_sel, idx_* token stages) and the prompt line lists 24 stages; with `STRATA_GLM_TIMING=1` the run ends with
+  how long the host waited for Engram rows.
 
 ## v1.3.179 - 2026-11-20
 

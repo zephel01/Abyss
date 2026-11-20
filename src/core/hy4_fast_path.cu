@@ -156,7 +156,8 @@ struct ReadPool {
             if (left == 0) done_cv.notify_all();
         }
     }
-    void run(int jobs, std::function<void(int)> f) {
+    // the jobs to the threads; the caller does not take part (wait() for them - before the next start / run)
+    void start(int jobs, std::function<void(int)> f) {
         if (jobs <= 0) return;
         {
             std::lock_guard<std::mutex> l(m);
@@ -167,9 +168,16 @@ struct ReadPool {
             ++gen;
         }
         cv.notify_all();
-        drain();
+    }
+    void wait() {
         std::unique_lock<std::mutex> l(m);
         done_cv.wait(l, [&] { return left == 0; });
+    }
+    void run(int jobs, std::function<void(int)> f) {
+        if (jobs <= 0) return;
+        start(jobs, std::move(f));
+        drain();
+        wait();
     }
 };
 
@@ -233,6 +241,13 @@ struct Hy4State {
     float eng_eps = 0.0078125f, eng_row_eps = 1e-12f;
     bool eng_vfirst = false;
     std::unique_ptr<ReadPool> pool;
+    // STRATA_HY4_ENG_ASYNC (default on): a token's Engram reads run on the pool while the GPU computes layer 0 - each
+    // Engram layer waits for its own 16 rows (eng_done) and uploads them just before it uses them; the same values
+    bool eng_async = true;
+    bool eng_pending = false;            // this token's reads were started and not all waited for
+    std::atomic<int> eng_done[16];       // per Engram layer: rows read
+    std::atomic<bool> eng_bad{false};
+    uint64_t eng_sel[256] = {};          // the rows being read (row index in the table)
     // the head
     const float *ohc_fn = nullptr, *ohc_scale = nullptr, *ohc_base = nullptr, *onorm = nullptr;
     int max_ctx = 0;
@@ -248,6 +263,16 @@ struct Hy4State {
     std::unique_ptr<ReadPool> pf_pool;
     double pf_read_ms = 0.0;
     uint64_t pf_reads = 0;
+    // STRATA_HY4_PREFILL_ENG_ASYNC (default on): a prompt chunk's rows read on the pool while its layers run, Engram
+    // layer by Engram layer (the first one's rows first); each Engram layer waits for its own (pf_done)
+    bool pf_async = true;
+    bool pf_pending = false;               // reads started for the chunk, the pool not waited for yet
+    std::atomic<int> pf_done[16];          // per Engram layer: the chunk's tokens read
+    std::atomic<bool> pf_bad{false};
+    std::vector<unsigned char> pf_skip;    // the chunk's skips, kept while the reads run
+    int pf_T = 0;
+    double tok_read_ms = 0.0;   // the token path's Engram reads (host time; STRATA_GLM_PROF / STRATA_GLM_TIMING report it)
+    uint64_t tok_reads = 0;
     uint8_t* snap = nullptr;   // the conversation snapshot (hy4_snap_copy): every window ring, every tk4
 };
 
@@ -264,6 +289,10 @@ const void* Glm5Model::hy4_head_xq() const { return S(hy4_)->head_xq; }
 void Glm5Model::hy4_reset() {
     if (hy4_ == nullptr) return;
     Hy4State* H = S(hy4_);
+    if (H->pf_pending) {   // (a prompt chunk's Engram reads read the history)
+        H->pf_pool->wait();
+        H->pf_pending = false;
+    }
     H->hist.clear();
     H->img_pos.clear();
 }
@@ -578,6 +607,10 @@ bool Glm5Model::hy4_setup(std::string& err) {
         const char* off = getenv("STRATA_HY4_ENGRAM");
         H->eng_on = off == nullptr || std::atoi(off) != 0;
         H->pool.reset(new ReadPool(8));
+        const char* pa = getenv("STRATA_HY4_PREFILL_ENG_ASYNC");
+        H->pf_async = (pa == nullptr || std::atoi(pa) != 0) && g.hy_eng.size() <= 16;
+        const char* ea = getenv("STRATA_HY4_ENG_ASYNC");
+        H->eng_async = (ea == nullptr || std::atoi(ea) != 0) && g.hy_eng.size() <= 4;
         if (H->eng_rb > 96) {   // (the pinned row buffer was sized for FP8 rows)
             cudaFreeHost(H->erow_h);
             H->erow_h = nullptr;
@@ -606,6 +639,10 @@ bool Glm5Model::hy4_setup(std::string& err) {
 bool Glm5Model::hy4_embed(int32_t token, int64_t p, const float* img, std::string& err) {
     FastState* F = fast_;
     Hy4State* H = S(hy4_);
+    if (H->pf_pending) {   // (a prompt chunk's Engram reads: done before the history grows)
+        H->pf_pool->wait();
+        H->pf_pending = false;
+    }
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     const int D = g.hy_dim;
@@ -646,7 +683,29 @@ bool Glm5Model::hy4_embed(int32_t token, int64_t p, const float* img, std::strin
             }
     }
     const int n_rows = 16 * NL;
+    if (H->eng_pending) {   // (a token whose layers stopped early: its reads end before the buffers are reused)
+        H->pool->wait();
+        H->eng_pending = false;
+    }
+    if (H->eng_async) {
+        // the reads in the background; fast_hy4_layers' Engram layers wait for their rows (hy4_eng_upload)
+        for (int k = 0; k < n_rows; ++k) H->eng_sel[k] = rows[k];
+        for (int li = 0; li < NL; ++li) H->eng_done[li].store(0, std::memory_order_relaxed);
+        H->eng_bad.store(false, std::memory_order_relaxed);
+        H->eng_pending = true;
+        H->pool->start(n_rows, [H](int k) {
+            const uint64_t at = H->eng_table + H->eng_sel[k] * (uint64_t) H->eng_rb;
+            uint8_t* dst = H->erow_h + (size_t) k * H->eng_rb;
+            if (!eng_pread(H->eng_fd, dst, (size_t) H->eng_rb, at))
+                H->eng_bad.store(true, std::memory_order_relaxed);
+            else if (H->eng_type >= 0)
+                strata::qt::traits(H->eng_type)->to_float(dst, H->erow_fh + (size_t) k * H->eng_dim, H->eng_dim);
+            H->eng_done[k / 16].fetch_add(1, std::memory_order_release);
+        });
+        return true;
+    }
     bool bad = false;
+    const auto tr0 = std::chrono::steady_clock::now();
     H->pool->run(n_rows, [&](int k) {
         const uint64_t at = H->eng_table + rows[k] * (uint64_t) H->eng_rb;
         uint8_t* dst = H->erow_h + (size_t) k * H->eng_rb;
@@ -657,6 +716,8 @@ bool Glm5Model::hy4_embed(int32_t token, int64_t p, const float* img, std::strin
         if (H->eng_type >= 0)
             strata::qt::traits(H->eng_type)->to_float(dst, H->erow_fh + (size_t) k * H->eng_dim, H->eng_dim);
     });
+    H->tok_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr0).count();
+    ++H->tok_reads;
     if (bad) {
         err = "hy4: an Engram row read failed";
         return false;
@@ -672,7 +733,29 @@ bool Glm5Model::hy4_embed(int32_t token, int64_t p, const float* img, std::strin
     return true;
 }
 
-namespace { void hy4_dump(const std::string& dir, const std::string& name, const float* d, size_t n, cudaStream_t s); }
+namespace {
+void hy4_dump(const std::string& dir, const std::string& name, const float* d, size_t n, cudaStream_t s);
+
+// STRATA_HY4_ENG_ASYNC: Engram layer li's 16 rows, once read, up to the device (the slice of the synchronous path's one
+// copy and conversion: the same bytes, the same values).  The host waits here, the GPU runs the layers before it
+bool hy4_eng_upload(Hy4State* H, int li, cudaStream_t s, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (H->eng_done[li].load(std::memory_order_acquire) < 16) std::this_thread::yield();
+    H->tok_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (H->eng_bad.load(std::memory_order_relaxed)) {
+        err = "hy4: an Engram row read failed";
+        return false;
+    }
+    const size_t off = (size_t) li * 16 * H->eng_dim;
+    if (H->eng_type < 0) {
+        cudaMemcpyAsync(H->erow_raw + off, H->erow_h + off, (size_t) 16 * H->eng_dim, cudaMemcpyHostToDevice, s);
+        hk::e4m3_to_f32(H->erow_raw + off, H->erow + off, 16 * H->eng_dim, s);
+    } else {
+        cudaMemcpyAsync(H->erow + off, H->erow_fh + off, (size_t) 16 * H->eng_dim * sizeof(float), cudaMemcpyHostToDevice, s);
+    }
+    return true;
+}
+}  // namespace
 
 bool Glm5Model::fast_hy4_moe(int il, std::string& err) {
     FastState* F = fast_;
@@ -692,6 +775,7 @@ bool Glm5Model::fast_hy4_moe(int il, std::string& err) {
         err = "hy4: router / routed_down / shared expert";
         return false;
     }
+    if (F->prof_on) F->mark("router_shexp_mv");
     if (!H->dump_dir.empty()) {
         hy4_dump(H->dump_dir, "rlog-" + std::to_string(il), F->rlog, (size_t) g.n_expert, s);
         hy4_dump(H->dump_dir, "rlat-" + std::to_string(il), F->x, (size_t) E, s);
@@ -716,20 +800,27 @@ bool Glm5Model::fast_hy4_moe(int il, std::string& err) {
                   g.swiglu_shexp, 0, F->sh_hq, s, nullptr, nullptr, 0, nullptr, nullptr, 0, fast_skip_from(il),
                   lane ? F->cpu_plan : 0ull, dlane ? -1 : promote_min, 0, g.gating, nullptr, fast_skip_w(il),
                   F->tail_skip_disk ? 1 : 0, lane && F->igpu_experts_q != nullptr ? F->xq : nullptr);
+    if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     if (F->bg_moe > 0) F->bg_drain(s, F->bg_moe, F->bg_moe_mask);
     // the shared expert while the lane and the fetches run (no clamp on it)
     hk::swiglu(H->sg, H->su, FS, H->sg, s);
     gf::quantize_q8_1(H->sg, H->shq, FS, s);
+    if (F->prof_on) F->mark("shexp");
     gf::moe_wait(md, E, s);
+    if (F->prof_on) F->mark("moe_wait");
     if (F->stream_fetch)
         gf::moe_fetch(md, g.n_exp_used, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks, Ly.up_bytes);
     else
         gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+    if (F->prof_on) F->mark("moe_fetch");
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, nullptr, 0, F->sh_hq, 0,
                     F->sh_out, s, Ly.up_type);
+    if (F->prof_on) F->mark("moe_gate_up");
     gf::moe_down(Ly.d_type, md, g.n_exp_used, E, g.n_ff_exp, Ly.down_off, F->hq, nullptr, F->ffn, s);
+    if (F->prof_on) F->mark("moe_down");
     if (lane) gf::moe_cpu_wait(md, E, F->ffn, s, 1, g.n_exp_used);
+    if (F->prof_on && lane) F->mark("moe_cpu_wait");
     if (!H->dump_dir.empty()) hy4_dump(H->dump_dir, "rsum-" + std::to_string(il), F->ffn, (size_t) E, s);
     // back to hy_dim: routed_up (the routed sum) + the shared expert's down, then post_ffw_norm
     gf::quantize_q8_1(F->ffn, H->ffq, E, s);
@@ -745,6 +836,7 @@ bool Glm5Model::fast_hy4_moe(int il, std::string& err) {
         hy4_dump(H->dump_dir, "shx-" + std::to_string(il), H->sh, (size_t) D, s);
     }
     hk::rms(H->r_out, Y.post_ffw, g.norm_eps, D, H->f, s, H->sh);
+    if (F->prof_on) F->mark("rup_shd_mv");
     if (!F->kda_graph_on) F->bg_drain(s, F->bg_pace, F->bg_attn_mask);
     return true;
 }
@@ -799,6 +891,8 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
         return false;
     }
     const bool eng_live = H->eng_fd != kEngNone && H->eng_on;
+    const bool pm = F->prof_on;   // (STRATA_GLM_PROF: the stages' events)
+    if (pm) F->mark("start");
     const int32_t tok = H->hist[(size_t) p];
     const bool eng_masked = H->img_pos[(size_t) p] || tok == H->eng_pad || tok == 120120 || tok == 120124;
     for (int il = 0; il < g.n_layers; ++il) {
@@ -806,6 +900,7 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
         const int nh = Y.heads;
         // ---- Engram
         if (Y.eng >= 0 && eng_live && !eng_masked) {
+            if (H->eng_pending && !hy4_eng_upload(H, Y.eng, s, err)) return false;
             hk::eng_rows(H->erow + (size_t) Y.eng * 16 * 96, Y.elnorm, 16, 96, H->eng_row_eps, H->e, s);
             gf::quantize_q8_1(H->e, H->eq, 16 * 96, s);
             const gf::MvJob ej = {Y.ekv.q, H->eq, H->e, H->ekv, Y.ekv_b, 1.0f, Y.ekv.type, 16 * 96, (HC + 1) * D};
@@ -815,6 +910,7 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
             }
             hk::eng_add(H->ekv, R, Y.egate, Y.escale, Y.epg, HC, D, H->eng_eps, H->eng_vfirst, s);
             hy4_dump(dd, "engram-" + std::to_string(il), R, (size_t) HC * D, s);
+            if (pm) F->mark("engram");
         }
         // ---- attention
         hk::hc_mix(R, Y.hc_fn[0], HC, D, 2 * HC, g.norm_eps, H->mix, s);
@@ -822,6 +918,7 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
                    H->post, s);
         gf::quantize_q8_1(H->x, H->xq, D, s);
         hy4_dump(dd, "attn_norm-" + std::to_string(il), H->x, D, s);
+        if (pm) F->mark("hc_attn");
         {
             gf::MvJob j[5];
             int nj = 0;
@@ -850,28 +947,36 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
                 return false;
             }
         }
+        if (pm) F->mark("attn_proj_mv");
         const float base = Y.swa ? g.rope_base_swa : g.rope_base;
         hk::mla_prep(H->q, nh, H->kv, Y.kv_a_norm, g.norm_eps, rp(p), base, Y.cache + (size_t) (p % Y.ring) * hk::kRow, s);
         hk::mla_absorb(H->q, Y.k_b, nh, H->qabs, s, Y.kb_f32);
+        if (pm) F->mark("mla_prep_absorb");
         const float scale = 1.0f / std::sqrt((float) g.head_dim);
         if (Y.swa) {
             const int64_t lo = std::max<int64_t>(0, p - g.n_swa + 1);
             hk::mla_attend(H->qabs, H->q, Y.cache, Y.ring, nullptr, 0, lo, p, Y.sinks, scale, nh, H->ctx, s);
+            if (pm) F->mark("attn_win");
         } else {
             // the indexer's token key into its slot; a closed group's pooled key
             hk::rms(H->tk, Y.ik_norm, g.norm_eps, g.idx_key, Y.tk4 + (size_t) (p % 4) * 128, s);
             if (p % 4 == 3)
                 hk::idx_pool(Y.tk4, Y.cv, Y.cg, Y.ape, Y.cnorm, g.norm_eps, rp(p - 3), g.rope_base, Y.pooled + (size_t) (p / 4) * 128, s);
+            if (pm) F->mark("idx_key");
             if (p + 1 <= g.idx_top_k) {
                 hk::mla_attend(H->qabs, H->q, Y.cache, Y.ring, nullptr, 0, 0, p, Y.sinks, scale, nh, H->ctx, s);
+                if (pm) F->mark("attn_dense");
             } else {
                 const int own = (int) (p / 4);
                 hk::idx_query(H->iq, g.idx_heads, H->iw, rp(p), g.rope_base, s);
                 hk::idx_score(H->iq, H->iw, g.idx_heads, Y.pooled, own, H->score, s);
+                if (pm) F->mark("idx_score");
                 const int top = g.idx_top_k / 4 - 1;
                 hk::idx_select(H->score, own, top, p, H->cells, H->n_cells, s);
+                if (pm) F->mark("idx_select");
                 hk::mla_attend(H->qabs, H->q, Y.cache, Y.ring, H->cells, std::min(top, own) * 4 + 4, 0, 0, Y.sinks,
                                scale, nh, H->ctx, s);
+                if (pm) F->mark("attn_sel");
             }
         }
         hk::mla_out(H->ctx, Y.v_b, H->gate, nh, H->o, s, Y.vb_f32);
@@ -885,12 +990,14 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
         }
         hk::hc_add(R, H->post, H->a, Y.post_attn, g.norm_eps, HC, D, s);
         hy4_dump(dd, "attn_out-" + std::to_string(il), H->a, D, s);
+        if (pm) F->mark("attn_out");
         // ---- the FFN
         hk::hc_mix(R, Y.hc_fn[1], HC, D, 2 * HC, g.norm_eps, H->mix, s);
         hk::hc_pre(H->mix, Y.hc_scale[1], Y.hc_base[1], R, HC, D, g.hc_eps, g.hc_mag, Y.ffn_norm, g.norm_eps, H->x,
                    H->post, s);
         gf::quantize_q8_1(H->x, H->xq, D, s);
         hy4_dump(dd, "ffn_norm-" + std::to_string(il), H->x, D, s);
+        if (pm) F->mark("hc_ffn");
         if (Y.moe) {
             if (!fast_hy4_moe(il, err)) return false;
         } else {
@@ -909,10 +1016,21 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
                 return false;
             }
             hk::rms(H->r_out, Y.post_ffw, g.norm_eps, D, H->f, s);
+            if (pm) F->mark("dense_ffn");
         }
         hy4_dump(dd, "ffn_out-" + std::to_string(il), H->f, D, s);
         hk::hc_add(R, H->post, H->f, nullptr, g.norm_eps, HC, D, s);
         hy4_dump(dd, "l_out-" + std::to_string(il), R, (size_t) HC * D, s);
+        if (pm) F->mark("hc_add");
+    }
+    if (H->eng_pending) {   // (a masked token's reads, unused: done before the buffers are reused)
+        H->pool->wait();
+        H->eng_pending = false;
+        if (H->eng_bad.load()) {
+            err = "hy4: an Engram row read failed";
+            return false;
+        }
+        ++H->tok_reads;
     }
     return true;
 }
@@ -966,6 +1084,15 @@ bool Glm5Model::hy4_snap_copy(bool restore) {
 void Glm5Model::hy4_destroy() {
     if (hy4_ == nullptr) return;
     Hy4State* H = S(hy4_);
+    if (H->eng_pending && H->pool) H->pool->wait();
+    if (H->pf_pending && H->pf_pool) H->pf_pool->wait();
+    if ((fast_ != nullptr && (fast_->prof_on || fast_->timing)) && (H->tok_reads > 0 || H->pf_reads > 0))
+        std::fprintf(stderr, "hy4 engram reads: tokens %llu, the host waited %.1f ms for their rows (%.3f ms a token; %s), "
+                             "prompt %llu rows, the host waited %.1f ms for them (%s)\n",
+                     (unsigned long long) H->tok_reads, H->tok_read_ms,
+                     H->tok_read_ms / (double) std::max<uint64_t>(1, H->tok_reads),
+                     H->eng_async ? "async: past what layer 0 hid" : "sync: the GPU idle meanwhile", (unsigned long long) H->pf_reads,
+                     H->pf_read_ms, H->pf_async ? "async: past what the layers before each Engram layer hid" : "sync");
     H->pool.reset();
     H->pf_pool.reset();
     eng_close(H->eng_fd);   // (the Engram table's shard: opened once in hy4_setup)
@@ -1241,6 +1368,107 @@ bool Glm5Model::hy4_prompt_ok(std::string& why) const {
 
 // the chunk's embedding rows into the 4 streams, its n-gram history, positions and Engram rows (read now, every row of
 // the 4 Engram layers, by more threads than a token's 8)
+namespace {
+// a prompt chunk's Engram rows into pinned memory: [Engram layer][row][16 heads] rows of eng_rb bytes (+ floats for a
+// table that is not FP8), as hy4_embed hashes them (H->hist holds the chunk's tokens already, H->pf_skip its skips).
+// A job is one (Engram layer, token), Engram layer major: async (STRATA_HY4_PREFILL_ENG_ASYNC) the pool reads them
+// while the layers run and hy4_prompt_layer waits for its layer's (hy4_eng_wait); else they are read here
+bool hy4_eng_chunk(Hy4State* H, const Glm5Geometry& g, int64_t p0, int T, bool async, std::string& err) {
+    const int NL = (int) g.hy_eng.size();
+    const size_t n_rows = (size_t) NL * T * 16;
+    if (H->pf_rows_n < n_rows * H->eng_rb) {
+        if (H->pf_rows_h != nullptr) cudaFreeHost(H->pf_rows_h);
+        H->pf_rows_h = nullptr;
+        H->pf_rows_n = 0;
+        if (cudaHostAlloc((void**) &H->pf_rows_h, n_rows * H->eng_rb, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            H->pf_rows_h = nullptr;
+            err = "hy4 prompt: the chunk's pinned Engram rows did not allocate";
+            return false;
+        }
+        H->pf_rows_n = n_rows * H->eng_rb;
+    }
+    if (H->eng_type >= 0 && H->pf_rowsf_n < n_rows * 96) {
+        if (H->pf_rowsf_h != nullptr) cudaFreeHost(H->pf_rowsf_h);
+        H->pf_rowsf_h = nullptr;
+        H->pf_rowsf_n = 0;
+        if (cudaHostAlloc((void**) &H->pf_rowsf_h, n_rows * 96 * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            H->pf_rowsf_h = nullptr;
+            err = "hy4 prompt: the chunk's pinned Engram rows did not allocate";
+            return false;
+        }
+        H->pf_rowsf_n = n_rows * 96;
+    }
+    // STRATA_HY4_PREFILL_READERS=<n>: the threads that read a chunk's rows (a token's 64 rows take 8)
+    static const int readers = [] {
+        const char* v = getenv("STRATA_HY4_PREFILL_READERS");
+        return v != nullptr ? std::clamp(std::atoi(v), 1, 256) : 32;
+    }();
+    if (H->pf_pool == nullptr) H->pf_pool.reset(new ReadPool(readers - 1));   // (the calling thread reads too, sync)
+    uint8_t* const rows_h = H->pf_rows_h;
+    float* const rowsf_h = H->pf_rowsf_h;
+    const unsigned char* skip = H->pf_skip.data();
+    const auto job = [H, p0, T, skip, rows_h, rowsf_h](int j) {
+        const int li = j / T, t = j - li * T;
+        if (!skip[(size_t) t] && !H->pf_bad.load(std::memory_order_relaxed)) {
+            const auto cid = [&](int64_t q) -> int64_t {
+                const int32_t tk = q < 0 ? H->eng_pad : H->hist[(size_t) q];
+                const int32_t tt2 = (tk >= 0 && (size_t) tk < H->tmap.size()) ? tk : H->eng_pad;
+                return (int64_t) H->tmap[(size_t) tt2];
+            };
+            const int64_t p = p0 + t;
+            const int64_t c0 = cid(p), c1 = cid(p - 1), c2 = cid(p - 2);
+            const auto& m = H->eng_mult[(size_t) li];
+            const uint64_t m0 = (uint64_t) (c0 * m[0]), m1 = (uint64_t) (c1 * m[1]), m2 = (uint64_t) (c2 * m[2]);
+            const uint64_t mix[2] = {m0 ^ m1, m0 ^ m1 ^ m2};
+            bool ok = true;
+            for (int nn = 0; nn < 2 && ok; ++nn)
+                for (int jj = 0; jj < 8; ++jj) {
+                    const int h = nn * 8 + jj, gh = 16 * li + h;
+                    const uint64_t r = H->eng_off[(size_t) gh] + mix[nn] % H->eng_size[(size_t) gh];
+                    const size_t k = ((size_t) li * T + t) * 16 + h;
+                    uint8_t* dst = rows_h + k * H->eng_rb;
+                    if (!eng_pread(H->eng_fd, dst, (size_t) H->eng_rb, H->eng_table + r * (uint64_t) H->eng_rb)) {
+                        H->pf_bad = true;
+                        ok = false;
+                        break;
+                    }
+                    if (H->eng_type >= 0) strata::qt::traits(H->eng_type)->to_float(dst, rowsf_h + k * 96, H->eng_dim);
+                }
+        }
+        H->pf_done[li].fetch_add(1, std::memory_order_release);
+    };
+    H->pf_bad.store(false);
+    for (int li = 0; li < NL; ++li) H->pf_done[li].store(0, std::memory_order_relaxed);
+    H->pf_T = T;
+    if (async) {
+        H->pf_pending = true;
+        H->pf_pool->start(NL * T, job);
+        return true;
+    }
+    H->pf_pool->run(NL * T, job);
+    if (H->pf_bad.load()) {
+        err = "hy4 prompt: an Engram row read failed";
+        return false;
+    }
+    return true;
+}
+
+// STRATA_HY4_PREFILL_ENG_ASYNC: Engram layer li's rows of the chunk, before hy4_prompt_layer uses them
+bool hy4_eng_wait(Hy4State* H, int li, std::string& err) {
+    if (!H->pf_pending) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (H->pf_done[li].load(std::memory_order_acquire) < H->pf_T) std::this_thread::yield();
+    H->pf_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (H->pf_bad.load()) {
+        err = "hy4 prompt: an Engram row read failed";
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
 bool Glm5Model::hy4_prompt_embed(const int32_t* toks, int64_t p0, int T, const Hy4PromptIo& io, std::string& err) {
     FastState* F = fast_;
     Hy4State* H = S(hy4_);
@@ -1250,6 +1478,10 @@ bool Glm5Model::hy4_prompt_embed(const int32_t* toks, int64_t p0, int T, const H
     Cv kc{io.keep};
     const Keep K = carve_keep(kc, g, (size_t) T);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "hy4 prompt embedding", err)) return false;   // (the staging's reuse)
+    if (H->pf_pending) {   // (the chunk before's reads: done before the history and the rows are rewritten)
+        H->pf_pool->wait();
+        H->pf_pending = false;
+    }
     // the history, the positions and the rows Engram skips
     if ((int64_t) H->hist.size() < p0 + T) {
         H->hist.resize((size_t) (p0 + T), H->eng_pad);
@@ -1304,73 +1536,11 @@ bool Glm5Model::hy4_prompt_embed(const int32_t* toks, int64_t p0, int T, const H
     if (H->eng_fd == kEngNone || !H->eng_on || g.hy_eng.empty()) return true;
     // the Engram rows of every row and Engram layer: [layer][row][16 heads] (the token path's hashes, hy4_embed)
     const auto tp = std::chrono::steady_clock::now();
-    const int NL = (int) g.hy_eng.size();
-    const size_t n_rows = (size_t) NL * T * 16;
-    if (H->pf_rows_n < n_rows * H->eng_rb) {
-        if (H->pf_rows_h != nullptr) cudaFreeHost(H->pf_rows_h);
-        H->pf_rows_h = nullptr;
-        H->pf_rows_n = 0;
-        if (cudaHostAlloc((void**) &H->pf_rows_h, n_rows * H->eng_rb, cudaHostAllocDefault) != cudaSuccess) {
-            cudaGetLastError();
-            H->pf_rows_h = nullptr;
-            err = "hy4 prompt: the chunk's pinned Engram rows did not allocate";
-            return false;
-        }
-        H->pf_rows_n = n_rows * H->eng_rb;
-    }
-    if (H->eng_type >= 0 && H->pf_rowsf_n < n_rows * 96) {
-        if (H->pf_rowsf_h != nullptr) cudaFreeHost(H->pf_rowsf_h);
-        H->pf_rowsf_h = nullptr;
-        H->pf_rowsf_n = 0;
-        if (cudaHostAlloc((void**) &H->pf_rowsf_h, n_rows * 96 * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-            cudaGetLastError();
-            H->pf_rowsf_h = nullptr;
-            err = "hy4 prompt: the chunk's pinned Engram rows did not allocate";
-            return false;
-        }
-        H->pf_rowsf_n = n_rows * 96;
-    }
-    // STRATA_HY4_PREFILL_READERS=<n>: the threads that read a chunk's rows (a token's 64 rows take 8)
-    static const int readers = [] {
-        const char* v = getenv("STRATA_HY4_PREFILL_READERS");
-        return v != nullptr ? std::clamp(std::atoi(v), 1, 256) : 32;
-    }();
-    if (H->pf_pool == nullptr) H->pf_pool.reset(new ReadPool(readers - 1));   // (the calling thread reads too)
-    const auto cid = [&](int64_t q) -> int64_t {
-        const int32_t t = q < 0 ? H->eng_pad : H->hist[(size_t) q];
-        const int32_t tt2 = (t >= 0 && (size_t) t < H->tmap.size()) ? t : H->eng_pad;
-        return (int64_t) H->tmap[(size_t) tt2];
-    };
-    std::atomic<bool> bad{false};
-    H->pf_pool->run(T, [&](int t) {
-        if (skip[(size_t) t] || bad.load(std::memory_order_relaxed)) return;
-        const int64_t p = p0 + t;
-        const int64_t c0 = cid(p), c1 = cid(p - 1), c2 = cid(p - 2);
-        for (int li = 0; li < NL; ++li) {
-            const auto& m = H->eng_mult[(size_t) li];
-            const uint64_t m0 = (uint64_t) (c0 * m[0]), m1 = (uint64_t) (c1 * m[1]), m2 = (uint64_t) (c2 * m[2]);
-            const uint64_t mix[2] = {m0 ^ m1, m0 ^ m1 ^ m2};
-            for (int nn = 0; nn < 2; ++nn)
-                for (int j = 0; j < 8; ++j) {
-                    const int h = nn * 8 + j, gh = 16 * li + h;
-                    const uint64_t r = H->eng_off[(size_t) gh] + mix[nn] % H->eng_size[(size_t) gh];
-                    const size_t k = ((size_t) li * T + t) * 16 + h;
-                    uint8_t* dst = H->pf_rows_h + k * H->eng_rb;
-                    if (!eng_pread(H->eng_fd, dst, (size_t) H->eng_rb, H->eng_table + r * (uint64_t) H->eng_rb)) {
-                        bad = true;
-                        return;
-                    }
-                    if (H->eng_type >= 0)
-                        strata::qt::traits(H->eng_type)->to_float(dst, H->pf_rowsf_h + k * 96, H->eng_dim);
-                }
-        }
-    });
-    if (bad) {
-        err = "hy4 prompt: an Engram row read failed";
-        return false;
-    }
-    H->pf_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
-    H->pf_reads += n_rows;
+    H->pf_skip.swap(skip);
+    if (!hy4_eng_chunk(H, g, p0, T, H->pf_async, err)) return false;
+    if (!H->pf_async)
+        H->pf_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+    H->pf_reads += (size_t) g.hy_eng.size() * T * 16;
     return true;
 }
 
@@ -1384,8 +1554,13 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
     Cv kc{io.keep};
     const Keep K = carve_keep(kc, g, (size_t) T);
     const int sub = std::min(T, hy4_sub());
+    const auto M = [&](const char* nm) {   // (STRATA_GLM_PREFILL_PROF)
+        if (io.mark != nullptr) io.mark(io.mark_ctx, nm, (void*) s);
+    };
+    M("hy4_pre");
     // ---- Engram: the rows of this layer, normed per head, engram_kv as a GEMM, the gated adds into the streams
     if (Y.eng >= 0 && H->eng_fd != kEngNone && H->eng_on && H->pf_rows_h != nullptr) {
+        if (!hy4_eng_wait(H, Y.eng, err)) return false;
         for (int t0 = 0; t0 < T; t0 += sub) {
             const int tn = std::min(sub, T - t0);
             Cv c{io.uni};
@@ -1406,12 +1581,14 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
             hk::eng_add_rows(B.kv, K.R + (size_t) t0 * HC * D, Y.egate, Y.escale, Y.epg, HC, D, H->eng_eps,
                              H->eng_vfirst, K.skip + t0, tn, s);
         }
+        M("hy4_engram");
     }
     // ---- the attention: the streams' read for every row, then sub-batches
     hk::hc_mix_rows(K.R, Y.hc_fn[0], HC, D, 2 * HC, g.norm_eps, K.mix, T, s);
     hk::hc_pre_rows(K.mix, 2 * HC, Y.hc_scale[0], Y.hc_base[0], K.R, HC, D, g.hc_eps, g.hc_mag, Y.attn_norm, g.norm_eps,
                     K.x, K.post, T, s);
     gb::f32_to_f16(K.x, K.x16, (int64_t) T * D, s);
+    M("hy4_hc");
     const float base = Y.swa ? g.rope_base_swa : g.rope_base;
     const float scale = 1.0f / std::sqrt((float) g.head_dim);
     const int qd = nh * (hk::kNope + hk::kRot);
@@ -1431,6 +1608,7 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
             gb::f32_to_f16(A.qr, A.qr16, (int64_t) tn * g.q_lora, s);
             if (!gemm16(io, Y.q_b, qd, g.q_lora, A.qr16, g.q_lora, A.q, qd, tn, 0.0f, s, err)) return false;
         }
+        M("hy4_proj");
         // the cache rows: a window layer's into a linear buffer of the window before the sub-batch and its rows (the
         // ring's last positions first), back into the ring after the attention; the others' into the cache itself
         const int64_t kb0 = Y.swa ? std::max<int64_t>(0, pt0 - (g.n_swa - 1)) : 0;
@@ -1441,6 +1619,7 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
         if (Y.swa) hk::ring_copy(Y.cache, 0, Y.ring, A.kbuf, kb0, kLinear, kb0, (int) (pt0 - kb0), s);
         hk::mla_prep_rows(A.q, skip_output ? 0 : nh, A.kv, Y.kv_a_norm, g.norm_eps, K.pos + 3 + t0, pt0, base, cache,
                           row_base, ring, tn, s);
+        M("hy4_prep");
         bool indexed = false;
         if (!Y.swa) {
             // the indexer: the rows' token keys, the groups they close pooled, the selection where it applies
@@ -1448,16 +1627,20 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
             hk::rms_rows(A.tk, Y.ik_norm, g.norm_eps, g.idx_key, A.tk, tn, s);
             hk::idx_pool_rows(A.tk, pt0, tn, Y.tk4, Y.cv, Y.cg, Y.ape, Y.cnorm, g.norm_eps, K.pos + t0, g.rope_base,
                               Y.pooled, s);
+            M("hy4_ix_key");
             indexed = !skip_output && pt0 + tn > g.idx_top_k;   // (a row past the dense span)
             if (indexed) {
                 if (!gemm32(io, (const float*) Y.iproj.q, g.idx_heads, D, xf, A.iw, tn, err) ||
                     !gemm32(io, (const float*) Y.iqb.q, g.idx_heads * g.idx_key, g.q_lora, A.qr, A.iq, tn, err))
                     return false;
                 hk::idx_query_rows(A.iq, g.idx_heads, A.iw, K.pos + 3 + t0, g.rope_base, tn, s);
+                M("hy4_ix_q");
                 gb::dsa_score(A.iq, Y.pooled, A.iw, g.idx_key, g.idx_heads, (int) pt0, 4, tn, (int) ((pt0 + tn) / 4),
                               A.score, A.score_ld, s);
+                M("hy4_ix_score");
                 hk::idx_select_rows(A.score, A.score_ld, pt0, g.idx_top_k, g.idx_top_k / 4 - 1, A.cells, hk::kMaxCells,
                                     A.n_cells, tn, s);
+                M("hy4_ix_select");
             }
         }
         if (skip_output) {
@@ -1469,8 +1652,10 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
         // q_abs = k_b . q_nope per head; the attention; o = v_b . ctx per head, times sigmoid(gate); the output
         hk::q_nope_f16(A.q, nh, tn, A.q16, s);
         if (!head_gemm(io, Y.k_b, Y.kb_f32, 8, nh, hk::kLat, hk::kNope, A.q16, A.qabs, tn, s, err)) return false;
+        M("hy4_qabs");
         hk::mla_attend_rows(A.qabs, A.q, cache, row_base, ring, indexed ? A.cells : nullptr, A.n_cells, hk::kMaxCells,
                             pt0, Y.swa ? g.n_swa : 0, Y.sinks, scale, nh, tn, A.ctx, s);
+        M(Y.swa ? "hy4_attn_win" : indexed ? "hy4_attn_sel" : "hy4_attn_dense");
         if (Y.swa)
             hk::ring_copy(A.kbuf, kb0, kLinear, Y.cache, 0, Y.ring, std::max(kb0, pt0 + tn - Y.ring),
                           (int) (pt0 + tn - std::max(kb0, pt0 + tn - Y.ring)), s);
@@ -1479,6 +1664,7 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
         hk::gate_rows(A.o, A.gate, (int64_t) tn * nh * hk::kV, A.o16, s);
         if (!gemm16(io, Y.out, D, nh * hk::kV, A.o16, nh * hk::kV, A.a, D, tn, 0.0f, s, err)) return false;
         hk::hc_add_rows(K.R + (size_t) t0 * HC * D, K.post + (size_t) t0 * HC, A.a, Y.post_attn, g.norm_eps, HC, D, tn, s);
+        M("hy4_attn_out");
     }
     if (skip_output) return true;
     // ---- the FFN's read
@@ -1486,9 +1672,11 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
     hk::hc_pre_rows(K.mix, 2 * HC, Y.hc_scale[1], Y.hc_base[1], K.R, HC, D, g.hc_eps, g.hc_mag, Y.ffn_norm, g.norm_eps,
                     K.x, K.post, T, s);
     gb::f32_to_f16(K.x, K.x16, (int64_t) T * D, s);
+    M("hy4_hc");
     if (Y.moe) {   // the latent: the experts' input, for the prompt path's MoE
         if (!gemm16(io, Y.rdown, E, D, K.x16, D, io.x, E, T, 0.0f, s, err)) return false;
         gb::f32_to_f16(io.x, io.x16, (int64_t) T * E, s);
+        M("hy4_rdown");
         return true;
     }
     // layer 0's dense SwiGLU (no clamp), post_ffw_norm, the add
@@ -1506,6 +1694,7 @@ bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, co
         hk::rms_rows(B.r, Y.post_ffw, g.norm_eps, D, B.r, tn, s);
         hk::hc_add_rows(K.R + (size_t) t0 * HC * D, K.post + (size_t) t0 * HC, B.r, nullptr, g.norm_eps, HC, D, tn, s);
     }
+    M("hy4_dense");
     return true;
 }
 

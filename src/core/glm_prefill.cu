@@ -2548,6 +2548,12 @@ static Glm5Model::Hy4PromptIo hy4_io(const Glm5Model::PrefillState* S, size_t em
     io.uni_bytes = S->uni_bytes;
     io.emb_h = S->emb_h;
     io.emb_floats = emb_floats;
+    if (S->prof) {
+        io.mark_ctx = (void*) S;
+        io.mark = [](void* c, const char* nm, void* st) {
+            static_cast<Glm5Model::PrefillState*>(c)->mark(nm, (cudaStream_t) st);
+        };
+    }
     return io;
 }
 
@@ -6172,7 +6178,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         const double nt = (double) std::max<int64_t>(1, pf_->tokens);
         std::string line;
         char buf[96];
-        for (size_t i = 0; i < v.size() && i < 8; ++i) {
+        for (size_t i = 0; i < v.size() && i < 24; ++i) {
             std::snprintf(buf, sizeof buf, "%s%s %.3f", i ? ", " : "", v[i].second.c_str(), v[i].first / nt);
             line += buf;
         }

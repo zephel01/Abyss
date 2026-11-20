@@ -663,6 +663,9 @@ public:
         size_t uni_bytes = 0;
         float* emb_h = nullptr;                            // pinned staging (emb_floats floats)
         size_t emb_floats = 0;
+        // STRATA_GLM_PREFILL_PROF: the prompt path's phase marks (an event on the stream, name = the phase just ended)
+        void (*mark)(void* ctx, const char* name, void* stream) = nullptr;
+        void* mark_ctx = nullptr;
     };
     bool hy4_prompt_ok(std::string& why) const;
     /// a chunk of T tokens: {the rows kept across its layers, a layer's scratch} in bytes

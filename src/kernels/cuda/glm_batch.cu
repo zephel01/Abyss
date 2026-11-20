@@ -551,17 +551,20 @@ __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict_
 // relu(dot) * w over each token's 32 heads.  FP32 throughout - only the summation order differs from dsa_score_kernel
 // (which split each 128-long dot across a warp and shuffled it down once a head and pool: ~0.9 TFLOPS on a 3090,
 // 111 ms for 4096 tokens at position 10240; this one ~15x faster).
-constexpr int TS_T = 4, TS_P = 64, TS_K = 32;
+constexpr int TS_P = 64, TS_K = 32;
+// H query heads a token (32: GLM; 16: hy4's indexer), 128 / H tokens a tile - always 128 query rows, so the tile and
+// the inner loop are the same for both; a thread's 8 rows are 8 heads of one token (H / 8 of them make a token)
+template <int H>
 __global__ void __launch_bounds__(256) dsa_score_tiled_kernel(const float* __restrict__ iq,
                                                               const float* __restrict__ pooled,
                                                               const float* __restrict__ iw, int p0, int kpool, int T,
                                                               int max_vis, float* __restrict__ score, int score_ld) {
-    constexpr int H = 32, K = 128, R = TS_T * H;   // 128 query rows
+    constexpr int K = 128, R = 128, TT = R / H, NQ = H / 8;   // tokens a tile, head groups of 8 a token
     __shared__ float As[TS_K][R + 4];              // [k][row]
     __shared__ float Bs[TS_K][TS_P + 4];           // [k][pool]
-    __shared__ float red[4][TS_T][TS_P];           // the 4 head quarters' partial sums
-    const int t0 = blockIdx.y * TS_T, pbeg = blockIdx.x * TS_P;
-    const int t_last = min(T, t0 + TS_T) - 1;
+    __shared__ float red[NQ][TT][TS_P];            // the head groups' partial sums
+    const int t0 = blockIdx.y * TT, pbeg = blockIdx.x * TS_P;
+    const int t_last = min(T, t0 + TT) - 1;
     if (pbeg >= (p0 + t_last + 1) / kpool) return;   // no pool of this tile is visible to any of its tokens
     const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;   // rows ty*8 .. +7, pools tx*4 .. +3
     float acc[8][4];
@@ -570,13 +573,13 @@ __global__ void __launch_bounds__(256) dsa_score_tiled_kernel(const float* __res
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
     for (int k0 = 0; k0 < K; k0 += TS_K) {
-        // A: 128 rows x 32 k = 1024 float4, 4 a thread (row = token-in-tile * 32 + head)
+        // A: 128 rows x 32 k = 1024 float4, 4 a thread (row = token-in-tile * H + head)
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             const int idx = tid + 256 * q, r = idx >> 3, kk = (idx & 7) * 4;
-            const int t = t0 + (r >> 5);
+            const int t = t0 + r / H;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (t < T) v = *(const float4*) (iq + ((size_t) t * H + (r & 31)) * K + k0 + kk);
+            if (t < T) v = *(const float4*) (iq + ((size_t) t * H + (r % H)) * K + k0 + kk);
             As[kk + 0][r] = v.x;
             As[kk + 1][r] = v.y;
             As[kk + 2][r] = v.z;
@@ -607,8 +610,8 @@ __global__ void __launch_bounds__(256) dsa_score_tiled_kernel(const float* __res
         }
         __syncthreads();
     }
-    // epilogue: this thread's 8 heads (quarter ty & 3 of token ty >> 2) -> relu * w, summed; then the 4 quarters
-    const int tt = ty >> 2, qh = ty & 3, t = t0 + tt;
+    // epilogue: this thread's 8 heads (group ty % NQ of token ty / NQ) -> relu * w, summed; then the groups
+    const int tt = ty / NQ, qh = ty % NQ, t = t0 + tt;
     float wv[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) wv[i] = t < T ? iw[(size_t) t * H + qh * 8 + i] : 0.0f;
@@ -620,11 +623,15 @@ __global__ void __launch_bounds__(256) dsa_score_tiled_kernel(const float* __res
         red[qh][tt][tx * 4 + j] = sum;
     }
     __syncthreads();
-    // 256 threads = 4 tokens x 64 pools
-    {
-        const int ot = tid >> 6, op = tid & 63, tok = t0 + ot, p = pbeg + op;
-        if (tok < T && p < (p0 + tok + 1) / kpool)
-            score[(size_t) tok * score_ld + p] = red[0][ot][op] + red[1][ot][op] + red[2][ot][op] + red[3][ot][op];
+    // TT tokens x 64 pools, 256 at a time
+    for (int o = tid; o < TT * TS_P; o += 256) {
+        const int ot = o >> 6, op = o & 63, tok = t0 + ot, p = pbeg + op;
+        if (tok < T && p < (p0 + tok + 1) / kpool) {
+            float v = red[0][ot][op];
+#pragma unroll
+            for (int q = 1; q < NQ; ++q) v += red[q][ot][op];
+            score[(size_t) tok * score_ld + p] = v;
+        }
     }
 }
 
@@ -1938,15 +1945,26 @@ void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, fl
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int p0, int kpool,
                int T, int max_vis, float* score, int score_ld, cudaStream_t s) {
     if (T <= 0 || max_vis <= 0) return;
-    // STRATA_GLM_DSA_SCORE=0: the warp-per-pool kernel (the tiled one needs idx_heads 32 and key_dim 128)
+    // STRATA_GLM_DSA_SCORE=0: the warp-per-pool kernel (the tiled one needs idx_heads 32 or 16 and key_dim 128; 16 is
+    // hy4's indexer - its own switch, STRATA_HY4_IX_TILED=0)
     static const bool tiled = [] {
         const char* v = getenv("STRATA_GLM_DSA_SCORE");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    static const bool tiled16 = [] {
+        const char* v = getenv("STRATA_HY4_IX_TILED");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     if (tiled && idx_heads == 32 && key_dim == 128) {
-        dsa_score_tiled_kernel<<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + TS_T - 1) / TS_T)), 256,
-                                 0, s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
+        dsa_score_tiled_kernel<32><<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + 3) / 4)), 256, 0,
+                                     s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
         check("dsa_score_tiled");
+        return;
+    }
+    if (tiled && tiled16 && idx_heads == 16 && key_dim == 128) {
+        dsa_score_tiled_kernel<16><<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + 7) / 8)), 256, 0,
+                                     s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
+        check("dsa_score_tiled16");
         return;
     }
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
