@@ -7,9 +7,10 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased (draft)
+## v1.3.178 - 2026-11-20
 
-Hy4-flash: a batched prompt path. Other models give the same bits as v1.3.177 (the 6-config md5 regression).
+Hy4-flash: a batched prompt path, a fix for a crash at 4K-token prompts, and nace-ai's GGUFs. Other models give the same
+bits as v1.3.177 (the 6-config md5 regression).
 
 - Prompts of 32+ tokens go through the prompt path a chunk at a time: the hyper-connection reads and adds, the gated
   MLA attention (window layers in sub-batches over their ring, full layers dense to 2,048 positions and then the
@@ -26,6 +27,9 @@ Hy4-flash: a batched prompt path. Other models give the same bits as v1.3.177 (t
   indexer rows out of bounds (a crash at 4K tokens); it now keeps the window rings and the open indexer groups. The
   Engram table's file is closed when the engine stops (POSIX and Windows). Conversation slots (to a file) say they
   are not implemented for Hy4.
+- nace-ai's [Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF) loads (its indexer's attn_k / attn_q_b are
+  Q8_0). Q3_K_M, same box: decode 40.5 tok/s, Japanese facts 76 / 80 (Maya-XS 76 / 80), nll on a Japanese 4K text
+  3.91 (Maya-XS 4.17).
 - Prompt path, shared code: experts whose gate/up rows are wider than the residual rows (2 n_ff > n_embd, Hy4's latent
   experts) get their own gate/up buffer and skip the light kernels; every other model takes the old branches.
 
