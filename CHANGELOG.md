@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.179 - 2026-11-20
+
+From the TokenWing comparison: routing counts after a prompt are aged the same in every layer. Other models give the
+same bits as v1.3.178 except the Ornith-35B md5 (MTP placement only, see below).
+
+- After a prompt, every layer's routing counts are now aged the same (`STRATA_GLM_PREFILL_FLAT_DECAY`, default on;
+  `0` restores the old way). Until now each layer halved every layer's counts after adding its own, so after an 8K
+  prompt 36 of GLM-5.3's 42 MoE layers had count 0 and the RAM tier threw their experts out first for the next ~200
+  tokens. RTX 5090 (Gen4 x4) + RAM tier 45 GB (a 64 GB box), iGPU off, 8K prompt then 512 tokens, medians of 3:
+  GLM-5.3 Maya-S-v2 25.6 -> 27.7 tok/s, V4.1 JA256 39.1 -> 40.4 tok/s (SSD reads 6.32 -> 5.67 and 3.55 -> 3.37 a
+  token); V4 0731 UD-Q2_K_XL 43.0 -> 42.2 (median of 6, same SSD reads, noise). Boxes where the model fits VRAM + RAM:
+  same speed (GLM-5.3 52.3 -> 53.7, V4 0731 70.2 -> 69.9, V4.1 65.2 -> 64.9, Qwen3.8 63.8 -> 64.1 tok/s on identical
+  tokens). Only expert placement changes: the one-token path gives the same logits bit for bit (Ornith-35B 16 GB,
+  3,071 scored tokens), and without MTP the deterministic Ornith-35B md5 is the same either way; with MTP drafting it
+  changes (a verify-window near tie at token 200), so the 6-config md5 regression has a new Ornith-35B value.
+- `STRATA_GLM_ROUTE_LOG` also writes `C` lines: per layer, the counts and the VRAM / RAM residents, at the first route
+  and every ~64 tokens.
+
 ## v1.3.178 - 2026-11-20
 
 Hy4-flash: a batched prompt path, a fix for a crash at 4K-token prompts, and nace-ai's GGUFs. Other models give the same

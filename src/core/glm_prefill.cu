@@ -4165,23 +4165,55 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 else if (rs >= 0 && RC.st[(size_t) rs] == FastState::kRHold) src = RC.base + (size_t) rs * RC.stride;
                 staged.push_back(Staged{e, src, dev});
             }
-            // the prompt's routing feeds the LFU counts the decode's tiers evict by
+            // the prompt's routing feeds the LFU counts the decode's tiers evict by.  The decode halves every count
+            // each 32,768 route-experts; a chunk brings that many events times its layers at once.  By default each
+            // layer halves every layer's counts after adding its own, so after an 8K prompt the first layers' counts
+            // are 0 and the last layers' a quarter of the chunk's (GLM-5.3: 36 of 42 MoE layers at 0, 2026-11-20) -
+            // the RAM tier's evictions and fills, which compare counts across the layers sharing an arena, then throw
+            // out the first layers' experts.  So every layer is aged the same (STRATA_GLM_PREFILL_FLAT_DECAY, default
+            // on; 0 = the per-layer halving above): its old counts by the chunk's h halvings, the chunk's own as if its
+            // tokens had been decoded one by one - the mean weight of a uniform spread under that decay,
+            // (1 - 2^-h) / (h ln 2).  It moves experts between the tiers only: the one-token path's logits are the same
+            // bits (Ornith-35B 16 GB, 3,071 scored tokens); the greedy tokens of the deterministic Ornith-35B check
+            // change through the MTP verify windows (a 0.31 log-prob near tie at token 200).  RTX 5090 + RAM tier
+            // 45 GB, 8K prompt then 512 tokens: GLM-5.3 25.6 -> 27.7 tok/s, V4.1 JA256 39.1 -> 40.4 (SSD reads
+            // 6.32 -> 5.67, 3.55 -> 3.37 a token; medians of 3)
+            static const bool flat_decay = [] {
+                const char* v = getenv("STRATA_GLM_PREFILL_FLAT_DECAY");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
             uint64_t ev = 0;
             for (int e = 0; e < NE; ++e) {
                 const int cnt = std::abs(S->h_counts[e]);
                 if (cnt == 0) continue;
-                uint32_t& cc = F->cnt[(size_t) il * NE + e];
-                cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + (uint64_t) cnt, 1u << 24);
                 ev += (uint64_t) cnt;
                 uint32_t& uu = F->usage[(size_t) il * NE + e];
                 uu = (uint32_t) std::min<uint64_t>((uint64_t) uu + (uint64_t) cnt, 1u << 30);
                 if (uu >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
             }
-            F->cnt_events += ev;
-            while (F->cnt_events >= 32768) {
-                F->cnt_events -= 32768;
-                for (auto& cc : F->cnt) cc >>= 1;
+            if (flat_decay) {
+                int n_moe = 0;
+                for (int l2 = l0_; l2 < l1_; ++l2) n_moe += F->L[(size_t) l2].moe ? 1 : 0;
+                const double h = (double) ev * (double) std::max(1, n_moe) / 32768.0;
+                const double keep = std::exp2(-h), w = h > 1e-9 ? (1.0 - keep) / (h * 0.69314718055994531) : 1.0;
+                for (int e = 0; e < NE; ++e) {
+                    uint32_t& cc = F->cnt[(size_t) il * NE + e];
+                    const double v = std::floor((double) cc * keep) + std::nearbyint((double) std::abs(S->h_counts[e]) * w);
+                    cc = (uint32_t) std::min(v, (double) (1u << 24));
+                }
+                F->cnt_events = (F->cnt_events + ev) % 32768;
+            } else {
+                for (int e = 0; e < NE; ++e) {
+                    const int cnt = std::abs(S->h_counts[e]);
+                    uint32_t& cc = F->cnt[(size_t) il * NE + e];
+                    cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + (uint64_t) cnt, 1u << 24);
+                }
+                F->cnt_events += ev;
+                while (F->cnt_events >= 32768) {
+                    F->cnt_events -= 32768;
+                    for (auto& cc : F->cnt) cc >>= 1;
+                }
             }
             auto& lc = S->last_cnt[(size_t) il];
             lc.resize((size_t) NE);

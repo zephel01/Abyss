@@ -5365,6 +5365,27 @@ void Glm5Model::fast_service() {
                         std::fprintf(rf, "\n");
                     }
                 }
+                // "C route layer hash sum-of-counts max-count experts-counted in-VRAM in-RAM" a layer, at the first
+                // route and every 64 routes of each layer after it: the LFU counts the tiers evict by, per layer
+                static thread_local uint64_t rf_n = 0;
+                if (rf != nullptr && rf_n++ % (uint64_t) (64 * std::max(1, lt_ - l0_)) == 0)
+                    for (int l2 = l0_; l2 < lt_; ++l2) {
+                        if (!F->L[(size_t) l2].moe) continue;
+                        uint64_t sum = 0;
+                        uint32_t mx = 0;
+                        int nz = 0, nv = 0, nr2 = 0;
+                        for (int e = 0; e < g.n_expert; ++e) {
+                            const size_t k2 = (size_t) l2 * g.n_expert + e;
+                            sum += F->cnt[k2];
+                            mx = std::max(mx, F->cnt[k2]);
+                            nz += F->cnt[k2] != 0;
+                            nv += F->slot_of[k2] >= 0;
+                            nr2 += F->ram_of[k2] >= 0;
+                        }
+                        std::fprintf(rf, "C %llu %d %d %llu %u %d %d %d\n", (unsigned long long) (rf_n - 1), l2,
+                                     F->L[(size_t) l2].tid2eid != nullptr ? 1 : 0, (unsigned long long) sum, mx, nz, nv,
+                                     nr2);
+                    }
                 if (rf != nullptr) {
                     std::fprintf(rf, "%d", il);
                     for (int i = 0; i < K; ++i) std::fprintf(rf, " %d", ids[i]);
