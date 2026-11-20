@@ -746,6 +746,64 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 #endif
 }
 
+// --serve's stdin queue (both serve loops).  The reader thread is detached - a read(2) waiting on stdin cannot be
+// woken portably - so it outlives the serve loop: QUIT returns while the thread still waits for EOF.  The state it
+// touches lives on the heap and is owned by the thread and the loop together; on the stack, the reader locked the
+// mutex after its destructor once stdin closed (pthread_mutex_lock assertion, rc 134 after a clean answer).
+struct ServeInput {
+    std::atomic<bool> stop{false}, quit{false}, wrap{false};
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+};
+
+// keep(line, in): true = queue the line for the serve loop, false = a control line it handled itself
+std::shared_ptr<ServeInput> start_serve_input(std::function<bool(const std::string&, ServeInput&)> keep) {
+    auto in = std::make_shared<ServeInput>();
+    std::thread([in, keep] {
+        // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
+        // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
+        // std::exit) would hang in exit() on Linux, and the server would wait for it forever
+        std::string l, buf;
+        char chunk[4096];
+        auto getline_fd = [&](std::string& out) -> bool {
+            for (;;) {
+                const size_t nlpos = buf.find('\n');
+                if (nlpos != std::string::npos) {
+                    out.assign(buf, 0, nlpos);
+                    buf.erase(0, nlpos + 1);
+                    return true;
+                }
+#if defined(_WIN32)
+                const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+                const ssize_t n = ::read(0, chunk, sizeof chunk);
+                if (n < 0 && errno == EINTR) continue;
+#endif
+                if (n <= 0) {
+                    if (buf.empty()) return false;
+                    out.swap(buf);
+                    buf.clear();
+                    return true;
+                }
+                buf.append(chunk, (size_t) n);
+            }
+        };
+        while (getline_fd(l)) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (!keep(l, *in)) continue;
+            std::lock_guard<std::mutex> lk(in->mu);   // a GEN written before QUIT must still run (pipes)
+            in->lines.push_back(l);
+            in->cv.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(in->mu);
+        in->eof = true;
+        in->cv.notify_one();
+    }).detach();
+    return in;
+}
+
 // issue #29: a request whose heartbeat (tokens, prompt chunks or layers, verify windows) stops for STRATA_WATCHDOG_S
 // seconds (default_s when unset; 0 = off) is stuck on a flag nobody will raise - end the engine with where it was, so
 // the server starts it again instead of the GPU spinning forever.  Issue #31: before it does, it reports what every
@@ -1834,53 +1892,20 @@ static int glm_pack_generate(const Options& o) {
     // ---- stdin on its own thread (the qwen serve's pattern): a STOP line must reach a request that is
     // still running.  read(2), not std::cin - glibc's exit() flushes stdio and waits on stdin's lock,
     // which getline holds while it waits for input.
-    std::atomic<bool> stop_req{false}, quit_req{false};
     // WRAP (the server is stopping): a request still thinking closes its reasoning at the next token and answers
-    std::atomic<bool> wrap_req{false};
-    std::mutex in_mu;
-    std::condition_variable in_cv;
-    std::deque<std::string> in_lines;
-    bool in_eof = false;
-    if (o.serve) {
-        std::thread([&] {
-            std::string l, buf;
-            char chunk[4096];
-            auto getline_fd = [&](std::string& out) -> bool {
-                for (;;) {
-                    const size_t nlpos = buf.find('\n');
-                    if (nlpos != std::string::npos) {
-                        out.assign(buf, 0, nlpos);
-                        buf.erase(0, nlpos + 1);
-                        return true;
-                    }
-#if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
-                    if (n < 0 && errno == EINTR) continue;
-#endif
-                    if (n <= 0) {
-                        if (buf.empty()) return false;
-                        out.swap(buf);
-                        buf.clear();
-                        return true;
-                    }
-                    buf.append(chunk, (size_t) n);
-                }
-            };
-            while (getline_fd(l)) {
-                if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "WRAP") { wrap_req.store(true); continue; }
-                if (!strata::program::queue_input(l, stop_req, quit_req)) continue;
-                std::lock_guard<std::mutex> lk(in_mu);   // a GEN written before QUIT must still run (pipes)
-                in_lines.push_back(l);
-                in_cv.notify_one();
-            }
-            std::lock_guard<std::mutex> lk(in_mu);
-            in_eof = true;
-            in_cv.notify_one();
-        }).detach();
-    }
+    const std::shared_ptr<ServeInput> serve_in =
+        o.serve ? start_serve_input([](const std::string& l, ServeInput& in) {
+            if (l == "WRAP") { in.wrap.store(true); return false; }
+            return strata::program::queue_input(l, in.stop, in.quit);
+        })
+                : std::make_shared<ServeInput>();
+    std::atomic<bool>& stop_req = serve_in->stop;
+    std::atomic<bool>& quit_req = serve_in->quit;
+    std::atomic<bool>& wrap_req = serve_in->wrap;
+    std::mutex& in_mu = serve_in->mu;
+    std::condition_variable& in_cv = serve_in->cv;
+    std::deque<std::string>& in_lines = serve_in->lines;
+    bool& in_eof = serve_in->eof;
     const auto next_line = [&](std::string& out) -> bool {
         std::unique_lock<std::mutex> lk(in_mu);
         in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof || quit_req.load(); });
@@ -6626,51 +6651,15 @@ int main(int argc, char** argv) {
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-        std::atomic<bool> stop_req{false};
-        std::mutex in_mu;
-        std::condition_variable in_cv;
-        std::deque<std::string> in_lines;
-        bool in_eof = false;
-        std::thread([&] {
-            // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
-            // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
-            // std::exit) would hang in exit() on Linux, and the server would wait for it forever
-            std::string l, buf;
-            char chunk[4096];
-            auto getline_fd = [&](std::string& out) -> bool {
-                for (;;) {
-                    const size_t nlpos = buf.find('\n');
-                    if (nlpos != std::string::npos) {
-                        out.assign(buf, 0, nlpos);
-                        buf.erase(0, nlpos + 1);
-                        return true;
-                    }
-#if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
-                    if (n < 0 && errno == EINTR) continue;
-#endif
-                    if (n <= 0) {
-                        if (buf.empty()) return false;
-                        out.swap(buf);
-                        buf.clear();
-                        return true;
-                    }
-                    buf.append(chunk, (size_t) n);
-                }
-            };
-            while (getline_fd(l)) {
-                if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop_req.store(true); continue; }
-                std::lock_guard<std::mutex> lk(in_mu);
-                in_lines.push_back(l);
-                in_cv.notify_one();
-            }
-            std::lock_guard<std::mutex> lk(in_mu);
-            in_eof = true;
-            in_cv.notify_one();
-        }).detach();
+        const std::shared_ptr<ServeInput> serve_in = start_serve_input([](const std::string& l, ServeInput& in) {
+            if (l == "STOP") { in.stop.store(true); return false; }
+            return true;
+        });
+        std::atomic<bool>& stop_req = serve_in->stop;
+        std::mutex& in_mu = serve_in->mu;
+        std::condition_variable& in_cv = serve_in->cv;
+        std::deque<std::string>& in_lines = serve_in->lines;
+        bool& in_eof = serve_in->eof;
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });

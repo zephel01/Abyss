@@ -7,6 +7,13 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+- `--serve` (every engine on the pack path, and the qwen serve): the stdin reader thread's queue, flags and lock now
+  live on the heap, shared with the thread. They were on the serve function's stack while the detached thread kept
+  reading, so a stdin closed after QUIT could lock a destroyed mutex while the engine shut down (an abort after a
+  finished answer; Maya c9bd85f found the same shape). Same output.
+
 ## v1.3.179 - 2026-11-20
 
 From the TokenWing comparison: routing counts after a prompt are aged the same in every layer. Other models give the
