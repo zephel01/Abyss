@@ -38,6 +38,7 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -645,6 +646,33 @@ public:
     const float* hy4_head_x() const;
     const void* hy4_head_xq() const;
     void hy4_reset();
+    void hy4_destroy();                                    // fast_destroy: the arena, the buffers, the table's file
+    bool hy4_snap_copy(bool restore);                      // the window rings + the open indexer groups <-> a copy
+    // the batched prompt path's hy4 half (hy4_fast_path.cu): glm_prefill.cu's prefill_half runs the latent MoE through
+    // its expert machinery between hy4_prompt_layer (the Engram adds, the attention, the FFN's read and the latent) and
+    // hy4_prompt_ffn_out (routed_up, the shared expert, post_ffw_norm, the streams' add).  STRATA_HY4_PREFILL=0: none
+    struct Hy4PromptIo {
+        void* blas = nullptr;                              // the prompt path's cublasHandle_t (on the compute stream)
+        uint16_t* w16 = nullptr;                           // the FP16 weight scratch
+        int64_t w16_elems = 0;
+        float* x = nullptr;                                // T x n_embd: a MoE layer's latent (the experts' input)
+        uint16_t* x16 = nullptr;
+        float* ffn = nullptr;                              // T x n_embd: the routed experts' sum
+        uint8_t* keep = nullptr;                           // the chunk's rows across its layers (hy4_prompt_bytes)
+        uint8_t* uni = nullptr;                            // a layer's scratch (the MoE's buffers between)
+        size_t uni_bytes = 0;
+        float* emb_h = nullptr;                            // pinned staging (emb_floats floats)
+        size_t emb_floats = 0;
+    };
+    bool hy4_prompt_ok(std::string& why) const;
+    /// a chunk of T tokens: {the rows kept across its layers, a layer's scratch} in bytes
+    std::pair<size_t, size_t> hy4_prompt_bytes(size_t T) const;
+    bool hy4_prompt_embed(const int32_t* toks, int64_t p0, int T, const Hy4PromptIo& io, std::string& err);
+    bool hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, const Hy4PromptIo& io, std::string& err);
+    bool hy4_prompt_router(int il, int T, float* logits, const Hy4PromptIo& io, std::string& err);
+    bool hy4_prompt_shared(int il, int T, float* sg, float* su, uint16_t* sh16, int sub, const Hy4PromptIo& io,
+                           std::string& err);
+    bool hy4_prompt_ffn_out(int il, int T, const Hy4PromptIo& io, std::string& err);
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)

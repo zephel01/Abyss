@@ -17,17 +17,22 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "glm_fast_state.hpp"
@@ -43,6 +48,9 @@ const EngFile kEngNone = INVALID_HANDLE_VALUE;
 EngFile eng_open(const std::string& path) {
     return CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr);
+}
+void eng_close(EngFile f) {
+    if (f != kEngNone) CloseHandle(f);
 }
 bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
     struct Ev {
@@ -68,6 +76,9 @@ bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
 using EngFile = int;
 const EngFile kEngNone = -1;
 EngFile eng_open(const std::string& path) { return ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
+void eng_close(EngFile f) {
+    if (f != kEngNone) ::close(f);
+}
 bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
     size_t done = 0;
     while (done < n) {
@@ -80,9 +91,12 @@ bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
 }
 #endif
 }   // namespace
+#include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/hy4_fast.hpp"
 #include "strata/qtypes.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -93,6 +107,7 @@ bool eng_pread(EngFile f, uint8_t* dst, size_t n, uint64_t at) {
 namespace strata::core {
 
 namespace gf = strata::kernels::glmf;
+namespace gb = strata::kernels::glmb;
 namespace hk = strata::kernels::hy4;
 
 namespace {
@@ -223,6 +238,17 @@ struct Hy4State {
     int max_ctx = 0;
     // GLM_CB_DIR-style dumps (HY4_DUMP_DIR): per position, appended
     std::string dump_dir;
+    std::vector<void*> owned;                       // device buffers hy4_setup allocated (k_b / v_b decoded at load)
+    // the prompt path: a chunk's Engram rows (pinned, [Engram layer][row][16 heads] rows of eng_rb bytes; a table
+    // that is not FP8: decoded floats beside them) and the readers that fetch them
+    uint8_t* pf_rows_h = nullptr;
+    size_t pf_rows_n = 0;
+    float* pf_rowsf_h = nullptr;
+    size_t pf_rowsf_n = 0;
+    std::unique_ptr<ReadPool> pf_pool;
+    double pf_read_ms = 0.0;
+    uint64_t pf_reads = 0;
+    uint8_t* snap = nullptr;   // the conversation snapshot (hy4_snap_copy): every window ring, every tk4
 };
 
 size_t al(size_t b) { return (b + 255u) & ~(size_t) 255u; }
@@ -313,7 +339,8 @@ bool Glm5Model::hy4_setup(std::string& err) {
             }
         }
         void* d = nullptr;
-        if (host.empty() || cudaMalloc(&d, count * sizeof(float)) != cudaSuccess ||
+        if (!host.empty() && cudaMalloc(&d, count * sizeof(float)) == cudaSuccess) H->owned.push_back(d);
+        if (host.empty() || d == nullptr ||
             cudaMemcpy(d, host.data(), count * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
             missing += n + " (" + std::to_string(n_in) + "x" + std::to_string(n_out) + ", Q" +
                        (type == 8 ? "8_0" : "6_K") + " or a type with a host decoder) ";
@@ -743,6 +770,23 @@ bool Glm5Model::fast_hy4_layers(int64_t p, std::string& err) {
     const int D = g.hy_dim, HC = g.hc;
     float* R = state_;
     const std::string& dd = H->dump_dir;
+    // STRATA_HY4_DUMP_CACHE=<file> + STRATA_HY4_DUMP_CACHE_AT=<p> (debug): every layer's cache rows of positions
+    // [0, p) as FP16 (a window layer's ring as it stands), when the token path reaches p - the prompt path's against
+    // the token path's
+    static const char* cdump = getenv("STRATA_HY4_DUMP_CACHE");
+    static const int64_t cdump_at = getenv("STRATA_HY4_DUMP_CACHE_AT") ? std::atoll(getenv("STRATA_HY4_DUMP_CACHE_AT")) : -1;
+    if (cdump != nullptr && p == cdump_at) {
+        cudaStreamSynchronize(s);
+        if (FILE* f = std::fopen(cdump, "wb")) {
+            for (const Hy4Layer& Y : H->L) {
+                const int64_t n = Y.swa ? std::min<int64_t>(p, Y.ring) : p;
+                std::vector<uint16_t> h((size_t) Y.ring * hk::kRow);
+                cudaMemcpy(h.data(), Y.cache, h.size() * 2, cudaMemcpyDeviceToHost);
+                for (int64_t j = p - n; j < p; ++j) std::fwrite(h.data() + (size_t) (j % Y.ring) * hk::kRow, 2, hk::kRow, f);
+            }
+            std::fclose(f);
+        }
+    }
     // the cell's rotary position: the image request's (t, h, w) table, else the cell itself
     const std::vector<int32_t>& mt = mrope_h_;
     const auto rp = [&mt](int64_t c) -> strata::kernels::hy4::Pos3 {
@@ -884,6 +928,646 @@ bool Glm5Model::hy4_head(std::string& err) {
     gf::quantize_q8_1(H->head_x, H->head_xq, D, s);
     hy4_dump(H->dump_dir, "result_norm", H->head_x, D, s);
     (void) err;
+    return true;
+}
+
+// ================================================================ the conversation snapshot
+// What a position's restore needs beyond the position: the window layers' rings (their rows past the snapshot overwrite
+// rows it still reads) and the full layers' open indexer group (tk4).  The full layers' cache rows and pooled keys are
+// append-only - rewritten as the new tokens arrive.  On the compute stream.
+bool Glm5Model::hy4_snap_copy(bool restore) {
+    if (hy4_ == nullptr) return false;
+    Hy4State* H = S(hy4_);
+    size_t need = 0;
+    for (const Hy4Layer& Y : H->L)
+        need += Y.swa ? (size_t) Y.ring * hk::kRow * sizeof(uint16_t) : (Y.tk4 != nullptr ? 4 * 128 * sizeof(float) : 0);
+    if (H->snap == nullptr) {
+        if (restore) return false;
+        if (cudaMalloc((void**) &H->snap, need) != cudaSuccess) {
+            cudaGetLastError();
+            H->snap = nullptr;
+            return false;
+        }
+    }
+    size_t off = 0;
+    for (const Hy4Layer& Y : H->L) {
+        void* live = Y.swa ? (void*) Y.cache : (void*) Y.tk4;
+        const size_t n = Y.swa ? (size_t) Y.ring * hk::kRow * sizeof(uint16_t) : (Y.tk4 != nullptr ? 4 * 128 * sizeof(float) : 0);
+        if (n == 0 || live == nullptr) continue;
+        cudaMemcpyAsync(restore ? live : (void*) (H->snap + off), restore ? (const void*) (H->snap + off) : live, n,
+                        cudaMemcpyDeviceToDevice, fast_->cs);
+        off += n;
+    }
+    return true;
+}
+
+// ================================================================ teardown
+void Glm5Model::hy4_destroy() {
+    if (hy4_ == nullptr) return;
+    Hy4State* H = S(hy4_);
+    H->pool.reset();
+    H->pf_pool.reset();
+    eng_close(H->eng_fd);   // (the Engram table's shard: opened once in hy4_setup)
+    H->eng_fd = kEngNone;
+    if (H->arena != nullptr) cudaFree(H->arena);
+    for (void* d : H->owned) cudaFree(d);
+    if (H->snap != nullptr) cudaFree(H->snap);
+    for (void* h : {(void*) H->emb_h, (void*) H->erow_h, (void*) H->erow_fh, (void*) H->pf_rows_h, (void*) H->pf_rowsf_h})
+        if (h != nullptr) cudaFreeHost(h);
+    delete H;
+    hy4_ = nullptr;
+}
+
+// ================================================================ the batched prompt path
+//
+// glm_prefill.cu's prefill_half runs a chunk of T tokens a layer at a time; for hy4 it calls, per layer:
+//   hy4_prompt_layer: [the Engram adds] -> the attention's hyper-connection read (every row) -> the attention in
+//     sub-batches (the projections as FP16 GEMMs on dequantized weights - the prompt path's arithmetic -, the cache
+//     rows, the indexer's keys / pools / selection, the attention over each row's keys with the sinks, the absorbed
+//     products as batched GEMMs per head, the gate, the output) -> the streams' add -> the FFN's read; layer 0 its
+//     dense SwiGLU whole, a MoE layer the latent (routed_down x) into the prompt path's x / x16
+//   hy4_prompt_router / hy4_prompt_shared: the router's logits and the shared expert (on x, the residual's width)
+//   (the routed experts: the prompt path's own grouping, MMQ products, staging and CPU lane, on the latent)
+//   hy4_prompt_ffn_out: routed_up of the routed sum + the shared expert, post_ffw_norm, the streams' add
+// The kernels are the token path's arithmetic row by row (hy4_fast.hpp's _rows variants); the GEMMs' FP16 rounding of
+// the activations and their summing order are what differs (the token path's GEMVs read q8_1 activations).
+namespace {
+
+int hy4_sub() {   // the attention's / the dense FFN's sub-batch (STRATA_HY4_PREFILL_SUB, 64 .. 4096)
+    static const int v = [] {
+        const char* e = getenv("STRATA_HY4_PREFILL_SUB");
+        return e != nullptr ? std::clamp(std::atoi(e), 64, 4096) : 512;
+    }();
+    return v;
+}
+
+struct Cv {   // 256-byte aligned carving from a base (base null: sizing only)
+    uint8_t* base = nullptr;
+    size_t off = 0;
+    template <class Tp>
+    Tp* take(size_t n) {
+        Tp* p = base != nullptr ? (Tp*) (base + off) : nullptr;
+        off += (n * sizeof(Tp) + 255u) & ~(size_t) 255u;
+        return p;
+    }
+};
+
+// the chunk's rows across the layers
+struct Keep {
+    float *R, *x, *post, *mix, *sh;
+    uint16_t* x16;
+    hk::Pos3* pos;          // positions p0 - 3 .. p0 + T - 1 (the indexer's pools read 3 before the chunk)
+    unsigned char* skip;    // the rows Engram adds nothing to
+};
+Keep carve_keep(Cv& c, const Glm5Geometry& g, size_t T) {
+    const size_t D = (size_t) g.hy_dim, HC = (size_t) g.hc;
+    Keep k{};
+    k.R = c.take<float>(T * HC * D);
+    k.x = c.take<float>(T * D);
+    k.x16 = c.take<uint16_t>(T * D);
+    k.post = c.take<float>(T * HC);
+    k.mix = c.take<float>(T * 2 * HC);
+    k.sh = c.take<float>(T * D);
+    k.pos = c.take<hk::Pos3>(T + 3);
+    k.skip = c.take<unsigned char>(T);
+    return k;
+}
+// a sub-batch of the attention (n_head heads at most)
+struct Attn {
+    float *qr, *kv, *gate, *q, *qabs, *ctx, *a, *tk, *iw, *iq, *score;
+    uint16_t *qr16, *q16, *ctx16, *o16, *kbuf;
+    float* o;
+    int *cells, *n_cells;
+    int score_ld;
+};
+Attn carve_attn(Cv& c, const Glm5Geometry& g, size_t tn, int64_t max_ctx) {
+    const size_t NH = (size_t) g.n_head, D = (size_t) g.hy_dim;
+    Attn b{};
+    b.qr = c.take<float>(tn * g.q_lora);
+    b.qr16 = c.take<uint16_t>(tn * g.q_lora);
+    b.kv = c.take<float>(tn * hk::kRow);
+    b.gate = c.take<float>(tn * NH * hk::kV);
+    b.q = c.take<float>(tn * NH * (hk::kNope + hk::kRot));
+    b.o = b.q;   // (q is dead once the attention ran)
+    b.q16 = c.take<uint16_t>(tn * NH * hk::kNope);
+    b.qabs = c.take<float>(tn * NH * hk::kLat);
+    b.ctx16 = (uint16_t*) b.qabs;   // (q_abs is dead once the attention ran)
+    b.ctx = c.take<float>(tn * NH * hk::kLat);
+    b.o16 = c.take<uint16_t>(tn * NH * hk::kV);
+    b.a = c.take<float>(tn * D);
+    b.tk = c.take<float>(tn * g.idx_key);
+    b.iw = c.take<float>(tn * std::max(1, g.idx_heads));
+    b.iq = c.take<float>(tn * std::max(1, g.idx_heads) * g.idx_key);
+    b.score_ld = (int) (max_ctx / 4 + 8);
+    b.score = c.take<float>(tn * (size_t) b.score_ld);
+    b.cells = c.take<int>(tn * (size_t) hk::kMaxCells);
+    b.n_cells = c.take<int>(tn);
+    b.kbuf = c.take<uint16_t>((tn + (size_t) g.n_swa) * hk::kRow);
+    return b;
+}
+// the dense FFN's / the routed output's / an Engram layer's sub-batch scratch
+struct Ffn {
+    float *dg, *du, *r;
+    uint16_t* h16;
+};
+Ffn carve_ffn(Cv& c, const Glm5Geometry& g, size_t tn) {
+    Ffn b{};
+    b.dg = c.take<float>(tn * g.n_ff_dense);
+    b.du = c.take<float>(tn * g.n_ff_dense);
+    b.h16 = c.take<uint16_t>(tn * std::max<size_t>(g.n_ff_dense, g.n_embd));
+    b.r = c.take<float>(tn * g.hy_dim);
+    return b;
+}
+struct Eng {
+    uint8_t* raw;
+    float *rows, *e, *kv;
+    uint16_t* e16;
+};
+Eng carve_eng(Cv& c, const Glm5Geometry& g, size_t tn) {
+    Eng b{};
+    b.raw = c.take<uint8_t>(tn * 16 * 96);
+    b.rows = c.take<float>(tn * 16 * 96);
+    b.e = c.take<float>(tn * 16 * 96);
+    b.e16 = c.take<uint16_t>(tn * 16 * 96);
+    b.kv = c.take<float>(tn * (size_t) (g.hc + 1) * g.hy_dim);
+    return b;
+}
+
+bool blas_ok(cublasStatus_t st, const char* what, std::string& err) {
+    if (st == CUBLAS_STATUS_SUCCESS) return true;
+    err = std::string("hy4 prompt: ") + what + ": cuBLAS status " + std::to_string((int) st);
+    return false;
+}
+// the weight types the prompt's FP16 products read (dequant_f16, or BF16 / F32 widened / narrowed)
+bool f16_type(int t) { return t == gf::kTypeBF16 || t == gf::kTypeF32 || strata::kernels::dequant_bf16_supported(t); }
+// rows [r0, r0 + n) of a weight (n_in = Kd) as FP16 into dst
+void to_f16(const WSlot& w, int64_t r0, int64_t n, int64_t Kd, uint16_t* dst, cudaStream_t s) {
+    if (w.type == gf::kTypeBF16)
+        gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, dst, n * Kd, s);
+    else if (w.type == gf::kTypeF32)
+        gb::f32_to_f16((const float*) w.q + (size_t) r0 * Kd, dst, n * Kd, s);
+    else
+        strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, dst, s);
+}
+// Y[t][N] (row stride ldy) = X16[t][Kd] (ldx) . W[N][Kd]^T; beta 1 adds to Y.  W dequantized to FP16 in slices of
+// rows that fit the scratch, the product on the tensor cores with F32 accumulation (the prompt path's hgemm_q)
+bool gemm16(const Glm5Model::Hy4PromptIo& io, const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y,
+            int ldy, int Tn, float beta, cudaStream_t s, std::string& err) {
+    if (Tn <= 0) return true;
+    const float one = 1.0f;
+    const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, io.w16_elems / Kd));
+    for (int r0 = 0; r0 < N; r0 += rows) {
+        const int n = std::min(rows, N - r0);
+        to_f16(w, r0, n, Kd, io.w16, s);
+        if (!blas_ok(cublasGemmEx((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, io.w16,
+                                  CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,
+                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                     "gemm f16", err))
+            return false;
+    }
+    return true;
+}
+// Y[t][N] = X[t][Kd] . W[N][Kd]^T in F32 (the indexer's and the router's F32 weights, as the token path keeps them)
+bool gemm32(const Glm5Model::Hy4PromptIo& io, const float* W, int N, int Kd, const float* X, float* Y, int Tn,
+            std::string& err) {
+    if (Tn <= 0) return true;
+    const float one = 1.0f, zero = 0.0f;
+    return blas_ok(cublasSgemm((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, N, Tn, Kd, &one, W, Kd, X, Kd, &zero,
+                               Y, N),
+                   "sgemm", err);
+}
+// per head h < nh: Y_h[t][M] (ldy = nh * M, head offset h * M) = X_h[t][Kd] (ldx = nh * Kd) . B_h[M][Kd]^T with B_h
+// rows [h * M, (h + 1) * M) of the weight (k_b: M 512, Kd 192; v_b: M 256, Kd 512) - FP16 in the scratch, as many heads
+// a pass as fit, one strided batched product a pass
+bool head_gemm(const Glm5Model::Hy4PromptIo& io, const void* w, bool f32, int wtype, int nh, int M, int Kd,
+               const uint16_t* X16, float* Y, int Tn, cudaStream_t s, std::string& err) {
+    if (Tn <= 0) return true;
+    const float one = 1.0f, zero = 0.0f;
+    const int per = (int) std::max<int64_t>(1, std::min<int64_t>(nh, io.w16_elems / ((int64_t) M * Kd)));
+    for (int h0 = 0; h0 < nh; h0 += per) {
+        const int nhp = std::min(per, nh - h0);
+        if (f32)
+            gb::f32_to_f16((const float*) w + (size_t) h0 * M * Kd, io.w16, (int64_t) nhp * M * Kd, s);
+        else
+            strata::kernels::dequant_f16(wtype, w, (int64_t) h0 * M, (int64_t) nhp * M, Kd, io.w16, s);
+        if (!blas_ok(cublasGemmStridedBatchedEx((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, M, Tn, Kd, &one,
+                                                io.w16, CUDA_R_16F, Kd, (long long) M * Kd, X16 + (size_t) h0 * Kd,
+                                                CUDA_R_16F, nh * Kd, (long long) Kd, &zero, Y + (size_t) h0 * M,
+                                                CUDA_R_32F, nh * M, (long long) M, nhp, CUBLAS_COMPUTE_32F,
+                                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                     "head gemm", err))
+            return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::pair<size_t, size_t> Glm5Model::hy4_prompt_bytes(size_t T) const {
+    const Glm5Geometry& g = g_;
+    Cv k;
+    carve_keep(k, g, T);
+    const size_t tn = std::min<size_t>(T, (size_t) hy4_sub());
+    size_t uni = 0;
+    {
+        Cv c;
+        carve_attn(c, g, tn, max_ctx_);
+        uni = std::max(uni, c.off);
+    }
+    {
+        Cv c;
+        carve_ffn(c, g, tn);
+        uni = std::max(uni, c.off);
+    }
+    {
+        Cv c;
+        carve_eng(c, g, tn);
+        uni = std::max(uni, c.off);
+    }
+    return {k.off, uni};
+}
+
+bool Glm5Model::hy4_prompt_ok(std::string& why) const {
+    const char* v = getenv("STRATA_HY4_PREFILL");
+    if (v != nullptr && std::atoi(v) == 0) {
+        why = "STRATA_HY4_PREFILL=0";
+        return false;
+    }
+    if (hy4_ == nullptr) {
+        why = "hy4: no token path state";
+        return false;
+    }
+    const Hy4State* H = S(hy4_);
+    const Glm5Geometry& g = g_;
+    if (g.n_head % 16 != 0) {
+        why = "hy4: " + std::to_string(g.n_head) + " attention heads (the prompt kernels take multiples of 16)";
+        return false;
+    }
+    std::string bad;
+    const auto ck = [&](const WSlot& w, int il, const char* nm) {
+        if (w.q == nullptr || !f16_type(w.type))
+            bad += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
+    };
+    for (int il = 0; il < g.n_layers; ++il) {
+        const Hy4Layer& Y = H->L[(size_t) il];
+        if (Y.heads % 16 != 0) bad += "blk." + std::to_string(il) + " heads " + std::to_string(Y.heads) + " ";
+        ck(Y.q_a, il, "attn_q_a");
+        ck(Y.q_b, il, "attn_q_b");
+        ck(Y.kv_a, il, "attn_kv_a_mqa");
+        ck(Y.gate, il, "attn_gate");
+        ck(Y.out, il, "attn_output");
+        if (!Y.kb_f32 && !strata::kernels::dequant_bf16_supported(8)) bad += "attn_k_b (Q8_0) ";
+        if (!Y.vb_f32 && !strata::kernels::dequant_bf16_supported(14)) bad += "attn_v_b (Q6_K) ";
+        if (Y.eng >= 0) ck(Y.ekv, il, "engram_kv");
+        if (Y.moe) {
+            ck(Y.rdown, il, "ffn_routed_down");
+            ck(Y.rup, il, "ffn_routed_up");
+            ck(Y.shg, il, "ffn_gate_shexp");
+            ck(Y.shu, il, "ffn_up_shexp");
+            ck(Y.shd, il, "ffn_down_shexp");
+        } else {
+            ck(Y.dg, il, "ffn_gate");
+            ck(Y.du, il, "ffn_up");
+            ck(Y.dd, il, "ffn_down");
+        }
+    }
+    if (!bad.empty()) {
+        why = "hy4: weights without an FP16 decode: " + bad.substr(0, 300);
+        return false;
+    }
+    return true;
+}
+
+// the chunk's embedding rows into the 4 streams, its n-gram history, positions and Engram rows (read now, every row of
+// the 4 Engram layers, by more threads than a token's 8)
+bool Glm5Model::hy4_prompt_embed(const int32_t* toks, int64_t p0, int T, const Hy4PromptIo& io, std::string& err) {
+    FastState* F = fast_;
+    Hy4State* H = S(hy4_);
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int D = g.hy_dim, HC = g.hc;
+    Cv kc{io.keep};
+    const Keep K = carve_keep(kc, g, (size_t) T);
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "hy4 prompt embedding", err)) return false;   // (the staging's reuse)
+    // the history, the positions and the rows Engram skips
+    if ((int64_t) H->hist.size() < p0 + T) {
+        H->hist.resize((size_t) (p0 + T), H->eng_pad);
+        H->img_pos.resize((size_t) (p0 + T), 0);
+    }
+    std::vector<unsigned char> skip((size_t) T, 0);
+    for (int t = 0; t < T; ++t) {
+        const int64_t p = p0 + t;
+        H->hist[(size_t) p] = toks[t];
+        H->img_pos[(size_t) p] = image_row(p) != nullptr;
+        const int32_t tok = toks[t];
+        skip[(size_t) t] = H->img_pos[(size_t) p] || tok == H->eng_pad || tok == 120120 || tok == 120124;
+    }
+    const std::vector<int32_t>& mt = mrope_h_;
+    std::vector<hk::Pos3> pos;
+    pos.reserve((size_t) T + 3);
+    for (int64_t c = p0 - 3; c < p0 + T; ++c) {
+        const int64_t cc = std::max<int64_t>(0, c);
+        if ((size_t) cc * 3 + 2 < mt.size())
+            pos.emplace_back((int64_t) mt[(size_t) cc * 3], (int64_t) mt[(size_t) cc * 3 + 1], (int64_t) mt[(size_t) cc * 3 + 2]);
+        else
+            pos.emplace_back(cc);
+    }
+    // (pageable sources: the copies complete before the calls return)
+    cudaMemcpyAsync(K.pos, pos.data(), pos.size() * sizeof(hk::Pos3), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(K.skip, skip.data(), skip.size(), cudaMemcpyHostToDevice, s);
+    // the embedding rows through the pinned staging, as many rows a pass as it holds
+    const strata::qt::Traits* tt = strata::qt::traits((strata::qt::Type) pack_emb_type_);
+    const size_t row_b = strata::qt::row_size((strata::qt::Type) pack_emb_type_, D);
+    const int per = (int) std::max<size_t>(1, io.emb_floats / (size_t) D);
+    for (int t0 = 0; t0 < T; t0 += per) {
+        const int n = std::min(per, T - t0);
+        const auto row = [&](int t) {
+            float* dst = io.emb_h + (size_t) (t - t0) * D;
+            if (const float* img = image_row(p0 + t))
+                std::memcpy(dst, img, (size_t) D * sizeof(float));
+            else
+                tt->to_float(pack_emb_src_ + (size_t) toks[t] * row_b, dst, D);
+        };
+        if (F->workers != nullptr && n >= 256) {
+            const int nj = 8;
+            F->workers->run(nj, [&](int job) { for (int t = t0 + job; t < t0 + n; t += nj) row(t); });
+        } else {
+            for (int t = t0; t < t0 + n; ++t) row(t);
+        }
+        for (int c = 0; c < HC; ++c)
+            cudaMemcpy2DAsync(K.R + (size_t) t0 * HC * D + (size_t) c * D, (size_t) HC * D * sizeof(float), io.emb_h,
+                              (size_t) D * sizeof(float), (size_t) D * sizeof(float), (size_t) n, cudaMemcpyHostToDevice,
+                              s);
+        if (t0 + n < T && !glmfast::cuda_ok(cudaStreamSynchronize(s), "hy4 prompt embedding", err)) return false;
+    }
+    if (H->eng_fd == kEngNone || !H->eng_on || g.hy_eng.empty()) return true;
+    // the Engram rows of every row and Engram layer: [layer][row][16 heads] (the token path's hashes, hy4_embed)
+    const auto tp = std::chrono::steady_clock::now();
+    const int NL = (int) g.hy_eng.size();
+    const size_t n_rows = (size_t) NL * T * 16;
+    if (H->pf_rows_n < n_rows * H->eng_rb) {
+        if (H->pf_rows_h != nullptr) cudaFreeHost(H->pf_rows_h);
+        H->pf_rows_h = nullptr;
+        H->pf_rows_n = 0;
+        if (cudaHostAlloc((void**) &H->pf_rows_h, n_rows * H->eng_rb, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            H->pf_rows_h = nullptr;
+            err = "hy4 prompt: the chunk's pinned Engram rows did not allocate";
+            return false;
+        }
+        H->pf_rows_n = n_rows * H->eng_rb;
+    }
+    if (H->eng_type >= 0 && H->pf_rowsf_n < n_rows * 96) {
+        if (H->pf_rowsf_h != nullptr) cudaFreeHost(H->pf_rowsf_h);
+        H->pf_rowsf_h = nullptr;
+        H->pf_rowsf_n = 0;
+        if (cudaHostAlloc((void**) &H->pf_rowsf_h, n_rows * 96 * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            H->pf_rowsf_h = nullptr;
+            err = "hy4 prompt: the chunk's pinned Engram rows did not allocate";
+            return false;
+        }
+        H->pf_rowsf_n = n_rows * 96;
+    }
+    // STRATA_HY4_PREFILL_READERS=<n>: the threads that read a chunk's rows (a token's 64 rows take 8)
+    static const int readers = [] {
+        const char* v = getenv("STRATA_HY4_PREFILL_READERS");
+        return v != nullptr ? std::clamp(std::atoi(v), 1, 256) : 32;
+    }();
+    if (H->pf_pool == nullptr) H->pf_pool.reset(new ReadPool(readers - 1));   // (the calling thread reads too)
+    const auto cid = [&](int64_t q) -> int64_t {
+        const int32_t t = q < 0 ? H->eng_pad : H->hist[(size_t) q];
+        const int32_t tt2 = (t >= 0 && (size_t) t < H->tmap.size()) ? t : H->eng_pad;
+        return (int64_t) H->tmap[(size_t) tt2];
+    };
+    std::atomic<bool> bad{false};
+    H->pf_pool->run(T, [&](int t) {
+        if (skip[(size_t) t] || bad.load(std::memory_order_relaxed)) return;
+        const int64_t p = p0 + t;
+        const int64_t c0 = cid(p), c1 = cid(p - 1), c2 = cid(p - 2);
+        for (int li = 0; li < NL; ++li) {
+            const auto& m = H->eng_mult[(size_t) li];
+            const uint64_t m0 = (uint64_t) (c0 * m[0]), m1 = (uint64_t) (c1 * m[1]), m2 = (uint64_t) (c2 * m[2]);
+            const uint64_t mix[2] = {m0 ^ m1, m0 ^ m1 ^ m2};
+            for (int nn = 0; nn < 2; ++nn)
+                for (int j = 0; j < 8; ++j) {
+                    const int h = nn * 8 + j, gh = 16 * li + h;
+                    const uint64_t r = H->eng_off[(size_t) gh] + mix[nn] % H->eng_size[(size_t) gh];
+                    const size_t k = ((size_t) li * T + t) * 16 + h;
+                    uint8_t* dst = H->pf_rows_h + k * H->eng_rb;
+                    if (!eng_pread(H->eng_fd, dst, (size_t) H->eng_rb, H->eng_table + r * (uint64_t) H->eng_rb)) {
+                        bad = true;
+                        return;
+                    }
+                    if (H->eng_type >= 0)
+                        strata::qt::traits(H->eng_type)->to_float(dst, H->pf_rowsf_h + k * 96, H->eng_dim);
+                }
+        }
+    });
+    if (bad) {
+        err = "hy4 prompt: an Engram row read failed";
+        return false;
+    }
+    H->pf_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+    H->pf_reads += n_rows;
+    return true;
+}
+
+bool Glm5Model::hy4_prompt_layer(int il, int64_t p0, int T, bool skip_output, const Hy4PromptIo& io, std::string& err) {
+    FastState* F = fast_;
+    Hy4State* H = S(hy4_);
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const Hy4Layer& Y = H->L[(size_t) il];
+    const int D = g.hy_dim, HC = g.hc, nh = Y.heads, E = g.n_embd;
+    Cv kc{io.keep};
+    const Keep K = carve_keep(kc, g, (size_t) T);
+    const int sub = std::min(T, hy4_sub());
+    // ---- Engram: the rows of this layer, normed per head, engram_kv as a GEMM, the gated adds into the streams
+    if (Y.eng >= 0 && H->eng_fd != kEngNone && H->eng_on && H->pf_rows_h != nullptr) {
+        for (int t0 = 0; t0 < T; t0 += sub) {
+            const int tn = std::min(sub, T - t0);
+            Cv c{io.uni};
+            const Eng B = carve_eng(c, g, (size_t) tn);
+            const size_t k0 = ((size_t) Y.eng * T + t0) * 16;
+            if (H->eng_type < 0) {
+                cudaMemcpyAsync(B.raw, H->pf_rows_h + k0 * H->eng_rb, (size_t) tn * 16 * 96, cudaMemcpyHostToDevice, s);
+                hk::e4m3_to_f32(B.raw, B.rows, tn * 16 * 96, s);
+            } else {
+                cudaMemcpyAsync(B.rows, H->pf_rowsf_h + k0 * 96, (size_t) tn * 16 * 96 * sizeof(float),
+                                cudaMemcpyHostToDevice, s);
+            }
+            hk::eng_rows_rows(B.rows, Y.elnorm, 16, 96, H->eng_row_eps, B.e, tn, s);
+            gb::f32_to_f16(B.e, B.e16, (int64_t) tn * 16 * 96, s);
+            if (!gemm16(io, Y.ekv, (HC + 1) * D, 16 * 96, B.e16, 16 * 96, B.kv, (HC + 1) * D, tn, 0.0f, s, err))
+                return false;
+            hk::add_bias_rows(B.kv, Y.ekv_b, (HC + 1) * D, tn, s);
+            hk::eng_add_rows(B.kv, K.R + (size_t) t0 * HC * D, Y.egate, Y.escale, Y.epg, HC, D, H->eng_eps,
+                             H->eng_vfirst, K.skip + t0, tn, s);
+        }
+    }
+    // ---- the attention: the streams' read for every row, then sub-batches
+    hk::hc_mix_rows(K.R, Y.hc_fn[0], HC, D, 2 * HC, g.norm_eps, K.mix, T, s);
+    hk::hc_pre_rows(K.mix, 2 * HC, Y.hc_scale[0], Y.hc_base[0], K.R, HC, D, g.hc_eps, g.hc_mag, Y.attn_norm, g.norm_eps,
+                    K.x, K.post, T, s);
+    gb::f32_to_f16(K.x, K.x16, (int64_t) T * D, s);
+    const float base = Y.swa ? g.rope_base_swa : g.rope_base;
+    const float scale = 1.0f / std::sqrt((float) g.head_dim);
+    const int qd = nh * (hk::kNope + hk::kRot);
+    for (int t0 = 0; t0 < T; t0 += sub) {
+        const int tn = std::min(sub, T - t0);
+        const int64_t pt0 = p0 + t0;
+        Cv c{io.uni};
+        const Attn A = carve_attn(c, g, (size_t) tn, max_ctx_);
+        const uint16_t* x16 = K.x16 + (size_t) t0 * D;
+        const float* xf = K.x + (size_t) t0 * D;
+        if (!gemm16(io, Y.q_a, g.q_lora, D, x16, D, A.qr, g.q_lora, tn, 0.0f, s, err) ||
+            !gemm16(io, Y.kv_a, hk::kRow, D, x16, D, A.kv, hk::kRow, tn, 0.0f, s, err))
+            return false;
+        if (!skip_output) {
+            if (!gemm16(io, Y.gate, nh * hk::kV, D, x16, D, A.gate, nh * hk::kV, tn, 0.0f, s, err)) return false;
+            hk::rms_rows(A.qr, Y.q_a_norm, g.norm_eps, g.q_lora, A.qr, tn, s);
+            gb::f32_to_f16(A.qr, A.qr16, (int64_t) tn * g.q_lora, s);
+            if (!gemm16(io, Y.q_b, qd, g.q_lora, A.qr16, g.q_lora, A.q, qd, tn, 0.0f, s, err)) return false;
+        }
+        // the cache rows: a window layer's into a linear buffer of the window before the sub-batch and its rows (the
+        // ring's last positions first), back into the ring after the attention; the others' into the cache itself
+        const int64_t kb0 = Y.swa ? std::max<int64_t>(0, pt0 - (g.n_swa - 1)) : 0;
+        constexpr int kLinear = 1 << 30;
+        uint16_t* cache = Y.swa ? A.kbuf : Y.cache;
+        const int64_t row_base = Y.swa ? kb0 : 0;
+        const int ring = Y.swa ? kLinear : Y.ring;
+        if (Y.swa) hk::ring_copy(Y.cache, 0, Y.ring, A.kbuf, kb0, kLinear, kb0, (int) (pt0 - kb0), s);
+        hk::mla_prep_rows(A.q, skip_output ? 0 : nh, A.kv, Y.kv_a_norm, g.norm_eps, K.pos + 3 + t0, pt0, base, cache,
+                          row_base, ring, tn, s);
+        bool indexed = false;
+        if (!Y.swa) {
+            // the indexer: the rows' token keys, the groups they close pooled, the selection where it applies
+            if (!gemm32(io, Y.ik.q ? (const float*) Y.ik.q : Y.ik.f32, g.idx_key, D, xf, A.tk, tn, err)) return false;
+            hk::rms_rows(A.tk, Y.ik_norm, g.norm_eps, g.idx_key, A.tk, tn, s);
+            hk::idx_pool_rows(A.tk, pt0, tn, Y.tk4, Y.cv, Y.cg, Y.ape, Y.cnorm, g.norm_eps, K.pos + t0, g.rope_base,
+                              Y.pooled, s);
+            indexed = !skip_output && pt0 + tn > g.idx_top_k;   // (a row past the dense span)
+            if (indexed) {
+                if (!gemm32(io, (const float*) Y.iproj.q, g.idx_heads, D, xf, A.iw, tn, err) ||
+                    !gemm32(io, (const float*) Y.iqb.q, g.idx_heads * g.idx_key, g.q_lora, A.qr, A.iq, tn, err))
+                    return false;
+                hk::idx_query_rows(A.iq, g.idx_heads, A.iw, K.pos + 3 + t0, g.rope_base, tn, s);
+                gb::dsa_score(A.iq, Y.pooled, A.iw, g.idx_key, g.idx_heads, (int) pt0, 4, tn, (int) ((pt0 + tn) / 4),
+                              A.score, A.score_ld, s);
+                hk::idx_select_rows(A.score, A.score_ld, pt0, g.idx_top_k, g.idx_top_k / 4 - 1, A.cells, hk::kMaxCells,
+                                    A.n_cells, tn, s);
+            }
+        }
+        if (skip_output) {
+            if (Y.swa)
+                hk::ring_copy(A.kbuf, kb0, kLinear, Y.cache, 0, Y.ring, std::max(kb0, pt0 + tn - Y.ring),
+                              (int) (pt0 + tn - std::max(kb0, pt0 + tn - Y.ring)), s);
+            continue;
+        }
+        // q_abs = k_b . q_nope per head; the attention; o = v_b . ctx per head, times sigmoid(gate); the output
+        hk::q_nope_f16(A.q, nh, tn, A.q16, s);
+        if (!head_gemm(io, Y.k_b, Y.kb_f32, 8, nh, hk::kLat, hk::kNope, A.q16, A.qabs, tn, s, err)) return false;
+        hk::mla_attend_rows(A.qabs, A.q, cache, row_base, ring, indexed ? A.cells : nullptr, A.n_cells, hk::kMaxCells,
+                            pt0, Y.swa ? g.n_swa : 0, Y.sinks, scale, nh, tn, A.ctx, s);
+        if (Y.swa)
+            hk::ring_copy(A.kbuf, kb0, kLinear, Y.cache, 0, Y.ring, std::max(kb0, pt0 + tn - Y.ring),
+                          (int) (pt0 + tn - std::max(kb0, pt0 + tn - Y.ring)), s);
+        gb::f32_to_f16(A.ctx, A.ctx16, (int64_t) tn * nh * hk::kLat, s);
+        if (!head_gemm(io, Y.v_b, Y.vb_f32, 14, nh, hk::kV, hk::kLat, A.ctx16, A.o, tn, s, err)) return false;
+        hk::gate_rows(A.o, A.gate, (int64_t) tn * nh * hk::kV, A.o16, s);
+        if (!gemm16(io, Y.out, D, nh * hk::kV, A.o16, nh * hk::kV, A.a, D, tn, 0.0f, s, err)) return false;
+        hk::hc_add_rows(K.R + (size_t) t0 * HC * D, K.post + (size_t) t0 * HC, A.a, Y.post_attn, g.norm_eps, HC, D, tn, s);
+    }
+    if (skip_output) return true;
+    // ---- the FFN's read
+    hk::hc_mix_rows(K.R, Y.hc_fn[1], HC, D, 2 * HC, g.norm_eps, K.mix, T, s);
+    hk::hc_pre_rows(K.mix, 2 * HC, Y.hc_scale[1], Y.hc_base[1], K.R, HC, D, g.hc_eps, g.hc_mag, Y.ffn_norm, g.norm_eps,
+                    K.x, K.post, T, s);
+    gb::f32_to_f16(K.x, K.x16, (int64_t) T * D, s);
+    if (Y.moe) {   // the latent: the experts' input, for the prompt path's MoE
+        if (!gemm16(io, Y.rdown, E, D, K.x16, D, io.x, E, T, 0.0f, s, err)) return false;
+        gb::f32_to_f16(io.x, io.x16, (int64_t) T * E, s);
+        return true;
+    }
+    // layer 0's dense SwiGLU (no clamp), post_ffw_norm, the add
+    const int NF = g.n_ff_dense;
+    for (int t0 = 0; t0 < T; t0 += sub) {
+        const int tn = std::min(sub, T - t0);
+        Cv c{io.uni};
+        const Ffn B = carve_ffn(c, g, (size_t) tn);
+        const uint16_t* x16 = K.x16 + (size_t) t0 * D;
+        if (!gemm16(io, Y.dg, NF, D, x16, D, B.dg, NF, tn, 0.0f, s, err) ||
+            !gemm16(io, Y.du, NF, D, x16, D, B.du, NF, tn, 0.0f, s, err))
+            return false;
+        gb::swiglu_f16(B.dg, B.du, B.h16, (int64_t) tn * NF, INFINITY, s);
+        if (!gemm16(io, Y.dd, D, NF, B.h16, NF, B.r, D, tn, 0.0f, s, err)) return false;
+        hk::rms_rows(B.r, Y.post_ffw, g.norm_eps, D, B.r, tn, s);
+        hk::hc_add_rows(K.R + (size_t) t0 * HC * D, K.post + (size_t) t0 * HC, B.r, nullptr, g.norm_eps, HC, D, tn, s);
+    }
+    return true;
+}
+
+bool Glm5Model::hy4_prompt_router(int il, int T, float* logits, const Hy4PromptIo& io, std::string& err) {
+    Hy4State* H = S(hy4_);
+    const Glm5Geometry& g = g_;
+    const Hy4Layer& Y = H->L[(size_t) il];
+    Cv kc{io.keep};
+    const Keep K = carve_keep(kc, g, (size_t) T);
+#if defined(STRATA_USE_HIP)
+    (void) err;
+    gb::router_f32((const float*) Y.router.q, g.n_expert, K.x, T, g.hy_dim, logits, fast_->cs);
+    return true;
+#else
+    return gemm32(io, (const float*) Y.router.q, g.n_expert, g.hy_dim, K.x, logits, T, err);
+#endif
+}
+
+bool Glm5Model::hy4_prompt_shared(int il, int T, float* sg, float* su, uint16_t* sh16, int sub, const Hy4PromptIo& io,
+                                  std::string& err) {
+    Hy4State* H = S(hy4_);
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = fast_->cs;
+    const Hy4Layer& Y = H->L[(size_t) il];
+    const int D = g.hy_dim, FS = g.n_ff_shexp;
+    Cv kc{io.keep};
+    const Keep K = carve_keep(kc, g, (size_t) T);
+    for (int t0 = 0; t0 < T; t0 += sub) {
+        const int tn = std::min(sub, T - t0);
+        const uint16_t* x16 = K.x16 + (size_t) t0 * D;
+        if (!gemm16(io, Y.shg, FS, D, x16, D, sg, FS, tn, 0.0f, s, err) ||
+            !gemm16(io, Y.shu, FS, D, x16, D, su, FS, tn, 0.0f, s, err))
+            return false;
+        gb::swiglu_f16(sg, su, sh16, (int64_t) tn * FS, INFINITY, s);   // (the shared expert: no clamp)
+        if (!gemm16(io, Y.shd, D, FS, sh16, FS, K.sh + (size_t) t0 * D, D, tn, 0.0f, s, err)) return false;
+    }
+    // (the routed rows are added into ffn: it starts at zero - the shared expert has the residual's width)
+    cudaMemsetAsync(io.ffn, 0, (size_t) T * g.n_embd * sizeof(float), s);
+    return true;
+}
+
+bool Glm5Model::hy4_prompt_ffn_out(int il, int T, const Hy4PromptIo& io, std::string& err) {
+    Hy4State* H = S(hy4_);
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = fast_->cs;
+    const Hy4Layer& Y = H->L[(size_t) il];
+    const int D = g.hy_dim, HC = g.hc, E = g.n_embd;
+    Cv kc{io.keep};
+    const Keep K = carve_keep(kc, g, (size_t) T);
+    const int sub = std::min(T, hy4_sub());
+    for (int t0 = 0; t0 < T; t0 += sub) {
+        const int tn = std::min(sub, T - t0);
+        Cv c{io.uni};
+        const Ffn B = carve_ffn(c, g, (size_t) tn);
+        gb::f32_to_f16(io.ffn + (size_t) t0 * E, B.h16, (int64_t) tn * E, s);
+        if (!gemm16(io, Y.rup, D, E, B.h16, E, B.r, D, tn, 0.0f, s, err)) return false;
+        hk::rms_rows(B.r, Y.post_ffw, g.norm_eps, D, B.r, tn, s, K.sh + (size_t) t0 * D);
+        hk::hc_add_rows(K.R + (size_t) t0 * HC * D, K.post + (size_t) t0 * HC, B.r, nullptr, g.norm_eps, HC, D, tn, s);
+    }
+    if (hk::launch_errors() > 0) {
+        err = "hy4 prompt: " + std::to_string(hk::launch_errors()) + " kernel launch(es) failed (see stderr)";
+        return false;
+    }
     return true;
 }
 

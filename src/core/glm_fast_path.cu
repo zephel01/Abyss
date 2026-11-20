@@ -4663,6 +4663,7 @@ void Glm5Model::fast_destroy() {
     dflash_destroy();
     prefill_destroy();
     q35d_destroy();
+    hy4_destroy();   // (hy4_fast_path.cu: its arena, buffers and the Engram table's file)
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
     if (F->expert_helper) {
@@ -8548,6 +8549,13 @@ bool Glm5Model::snapshot_save() {
                 cudaMemcpyAsync(m->snap_ + (size_t) k++ * run, m->state_ + m->kda_S_[(size_t) il], run * sizeof(float),
                                 cudaMemcpyDeviceToDevice, m->fast_->cs);
         m->snap_pos_ = pos_;
+        if (g.is_hy4()) {   // (its own caches: hy4_fast_path.cu; one GPU)
+            const bool ok = m->hy4_snap_copy(false);
+            cudaStreamSynchronize(m->fast_->cs);
+            if (!ok) m->snap_pos_ = -1;
+            cudaSetDevice(dev_);
+            return ok;
+        }
         if (g.dsv4()) {
             const bool ok = m->dsv4_snap_copy(false);
             cudaStreamSynchronize(m->fast_->cs);
@@ -8587,8 +8595,16 @@ bool Glm5Model::snapshot_restore() {
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->state_ + m->kda_S_[(size_t) il], m->snap_ + (size_t) k++ * run, run * sizeof(float),
                                 cudaMemcpyDeviceToDevice, m->fast_->cs);
-        if (g.dsv4()) m->dsv4_snap_copy(true);
-        else m->snap_pool_copy(true);
+        if (g.is_hy4()) {
+            if (!m->hy4_snap_copy(true)) {
+                cudaSetDevice(dev_);
+                return false;
+            }
+        } else if (g.dsv4()) {
+            m->dsv4_snap_copy(true);
+        } else {
+            m->snap_pool_copy(true);
+        }
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
     }
@@ -8633,6 +8649,10 @@ std::vector<std::pair<int64_t, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bo
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, std::string* mem) {
     if (g_.dsv4()) {
         err = "deepseek4: conversation slots are not implemented (the live snapshot is)";
+        return 0;
+    }
+    if (g_.is_hy4()) {
+        err = "hy4: conversation slots are not implemented (the live snapshot is)";
         return 0;
     }
     std::vector<Glm5Model*> halves;

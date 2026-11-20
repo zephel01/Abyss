@@ -275,4 +275,6 @@ STRATA_NO_OWN_AVX2  # src/kernels/cpu/own_dot.cpp (debug: the portable own dots 
 STRATA_HY4_ENGRAM  # src/core/hy4_fast_path.cu (debug: 0 turns Hy4's Engram lookup off)
 STRATA_HY4_ENG_EPS  # src/core/hy4_fast_path.cu (debug: the Engram key/value norm's eps, default 2^-7)
 STRATA_HY4_ENG_ROW_EPS  # src/core/hy4_fast_path.cu (debug: the Engram row norm's eps)
+STRATA_HY4_DUMP_CACHE  # src/core/hy4_fast_path.cu (debug: every layer's cache rows into this file at STRATA_HY4_DUMP_CACHE_AT)
+STRATA_HY4_DUMP_CACHE_AT  # src/core/hy4_fast_path.cu (debug: the position STRATA_HY4_DUMP_CACHE writes at)
 STRATA_HY4_ENG_VFIRST  # src/core/hy4_fast_path.cu (debug: the values-first n-gram order, for A/B only)

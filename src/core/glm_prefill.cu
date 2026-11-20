@@ -405,6 +405,7 @@ bool own_type(int type) {
 
 struct MoeBufs {
     float *logits, *rw, *OUTP, *OUTPc;
+    float* GUX;   // 2 n_ff > n_embd (hy4's latent experts): a part's gate/up rows, apart from OUTP
     float *sh_g, *sh_u;
     uint16_t* sh16;
     int *ids, *rank, *counts, *base, *row_tok, *pos, *bounds;
@@ -432,6 +433,7 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     // each set's gate/up rows live in its own OUTP rows until the down product, the swiglu over their gate halves
     b.OUTP = c.take<float>(W * g.n_embd);
     b.OUTPc = c.take<float>(W * g.n_embd);
+    b.GUX = 2 * (size_t) g.n_ff_exp > (size_t) g.n_embd ? c.take<float>(W * 2 * (size_t) g.n_ff_exp) : nullptr;
     const size_t ts = std::min(T, sub);   // the shared expert's sub-batch
     b.sh_g = c.take<float>(ts * FF);
     b.sh_u = c.take<float>(ts * FF);
@@ -555,6 +557,7 @@ struct Glm5Model::PrefillState {
     uint16_t* x16 = nullptr;
     int* iota = nullptr;
     uint8_t* v41_rows = nullptr;     // deepseek41: each row's top-k selection and candidate mask (prefill_v41_row)
+    uint8_t* hy4_keep = nullptr;     // hy4: the chunk's rows across its layers (Glm5Model::hy4_prompt_bytes)
     uint8_t* uni = nullptr;          // the per-layer region (KDA | DSA | dense | MoE)
     size_t uni_bytes = 0;            // ... its size (a chunk's use of it must stay inside: the pool's experts follow)
     // weight scratch
@@ -914,9 +917,19 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                                !strata::kernels::dequant_bf16_supported(w.type)))
             why += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
     };
+    // hy4: its attention, Engram and FFN projections are hy4_fast_path.cu's (hy4_prompt_ok); the routed experts here
+    if (g.is_hy4()) {
+        std::string hw;
+        if (!hy4_prompt_ok(hw)) {
+            std::fprintf(stderr, "glm prefill: CUDA%d hy4 has no prompt path (%s) - token by token\n", dev_, hw.c_str());
+            return true;
+        }
+    }
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (g.qwen35()) {
+        if (g.is_hy4()) {
+            // (hy4_prompt_ok above)
+        } else if (g.qwen35()) {
             if (Ly.recr) {
                 deq_ok(Ly.qkv, "attn_qkv", il);
                 deq_ok(Ly.zg, "attn_gate", il);
@@ -982,7 +995,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
-        if (!g.dsv4() && !(g.qwen35() && Ly.recr)) deq_ok(Ly.out, "attn_output", il);
+        if (!g.dsv4() && !(g.qwen35() && Ly.recr) && !g.is_hy4()) deq_ok(Ly.out, "attn_output", il);
         if (Ly.moe) {
             has_moe = true;
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
@@ -1002,7 +1015,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                 ++(own_gate_up(Ly, g) || own_gu_split(Ly, g) ? own_n : mmq_n)["gate/up " + gu];
                 ++(own_down(Ly, g) ? own_n : mmq_n)[std::string("down ") + strata::qt::type_name(Ly.d_type)];
             }
-        } else {
+        } else if (!g.is_hy4()) {   // (hy4's dense layer 0: hy4_prompt_layer's own buffers)
             has_dense = true;
             deq_ok(Ly.ffn_gate, "ffn_gate", il);
             deq_ok(Ly.ffn_up, "ffn_up", il);
@@ -1549,7 +1562,7 @@ bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
 // fill's scratch} - the layout prefill_carve lays out
 static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa,
                                              bool has_dense, bool has_moe, int max_pools, int sub_env, bool mtp,
-                                             size_t v41_row = 0) {
+                                             size_t v41_row = 0, std::pair<size_t, size_t> hy4 = {0, 0}) {
     const size_t E = (size_t) g.n_embd;
     Carve a;
     a.take<float>(T * 4 * E);                    // R
@@ -1566,7 +1579,8 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T * 24);
     a.take<int>(T * (size_t) g.n_exp_used + (size_t) mmq::ids_pad(T));   // iota (+ the tile over-read's pad)
     if (v41_row) a.take<uint8_t>(T * v41_row);   // v41_rows
-    size_t uni = 0;
+    if (hy4.first) a.take<uint8_t>(hy4.first);  // hy4_keep
+    size_t uni = hy4.second;                     // (hy4: its layers' scratch, the MoE's between)
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
     if (g.qwen35()) { Carve q; carve_q35(q, ts, g); carve_q4x(q, ts, g); uni = std::max(uni, q.off); }
@@ -1591,7 +1605,7 @@ Glm5Model::PinnedPrompt Glm5Model::prefill_pinned() const {
 std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T) const {
     const PrefillState* S = pf_;
     return chunk_bytes(g_, T, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env, mtp_il_ >= 0,
-                       prefill_v41_row());
+                       prefill_v41_row(), g_.is_hy4() ? hy4_prompt_bytes(T) : std::pair<size_t, size_t>{0, 0});
 }
 
 size_t Glm5Model::prefill_v41_row() const {
@@ -1665,6 +1679,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->mix = a.take<float>(T * 24);
     S->iota = a.take<int>(T * (size_t) g.n_exp_used + (size_t) mmq::ids_pad(T));
     S->v41_rows = prefill_v41_row() ? a.take<uint8_t>(T * prefill_v41_row()) : nullptr;
+    S->hy4_keep = g.is_hy4() ? a.take<uint8_t>(hy4_prompt_bytes(T).first) : nullptr;
     S->uni = S->arena + a.off;
     S->uni_bytes = uni;
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
@@ -2519,6 +2534,23 @@ bool Glm5Model::prefill_v41_engram_block(int il, int bn, int kd, const float* ro
 }
 
 // ---------------------------------------------------------------- one half's layers over a chunk
+// hy4: what its half of the prompt path reads and writes (the chunk's buffers, the scratch, the cuBLAS handle)
+static Glm5Model::Hy4PromptIo hy4_io(const Glm5Model::PrefillState* S, size_t emb_floats) {
+    Glm5Model::Hy4PromptIo io;
+    io.blas = (void*) S->blas;
+    io.w16 = S->w16;
+    io.w16_elems = S->w16_elems;
+    io.x = S->x;
+    io.x16 = S->x16;
+    io.ffn = S->ffn;
+    io.keep = S->hy4_keep;
+    io.uni = S->uni;
+    io.uni_bytes = S->uni_bytes;
+    io.emb_h = S->emb_h;
+    io.emb_floats = emb_floats;
+    return io;
+}
+
 bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t* next_ids) {
     FastState* F = fast_;
     // the prompt's CPU share on every core the pool has (the decode leaves two to the threads that feed the GPU);
@@ -3332,6 +3364,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaStreamWaitEvent(s, S->ev_xd, 0);
             S->x_q8k = false;
         }
+        if (g.is_hy4()) {
+            // hy4 (hy4_fast_path.cu): Engram, the attention and the FFN's read in its own buffers; a MoE layer leaves the
+            // latent in x / x16 for the experts below, layer 0 runs its dense FFN whole
+            if (!hy4_prompt_layer(il, p0, T, skip_output, hy4_io(S, (size_t) S->T * E), err)) return false;
+            S->mark("hy4", s);
+            if (skip_output || !Ly.moe) continue;
+        } else {
         if (g.v41) {
             // deepseek41: an Engram layer writes the previous FFN alone, adds its rows, then reads without a write;
             // the read collapses with the previous sublayer's pre (layer 0: the one-hot)
@@ -3739,6 +3778,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_fn8, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
         dump_row("ffn_norm-" + std::to_string(il), S->x, E);
+        }   // (!hy4)
         // the CPU lane's x (this layer's FFN input) goes down now, under the shared expert and the routing - not
         // after the plan, where the host's experts waited for it (~40 ms of a 16K chunk's 260 MB)
         // (not when the iGPU takes them: after the plan only their rows go down, gathered - a 32K chunk's whole x is
@@ -3914,7 +3954,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the shared expert: before the route (as before), or after the route's sync so its GEMMs run while the
         // host plans the expert sets (the stream was idle through the plan).  STRATA_GLM_PREFILL_SH_LATE=0: before
         static const bool sh_late = [] { const char* v = getenv("STRATA_GLM_PREFILL_SH_LATE"); return v == nullptr || std::atoi(v) != 0; }();
+        bool hy4_sh_ok = true;   // (hy4: its shared expert reads x at the residual's width - hy4_prompt_shared)
         const auto shared_expert = [&] {
+            if (g.is_hy4()) {
+                hy4_sh_ok = hy4_prompt_shared(il, T, M.sh_g, M.sh_u, M.sh16, std::min(T, S->sh_sub()),
+                                              hy4_io(S, (size_t) S->T * E), err);
+                S->mark("shexp", s);
+                return;
+            }
             for (int t0 = 0, shs = S->sh_sub(); t0 < T; t0 += shs) {
                 const int tn = std::min(shs, T - t0);
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
@@ -3929,7 +3976,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->mark("shexp", s);
         };
         if (!sh_late) shared_expert();
-        if (Ly.router_type == gf::kTypeF32) {   // (deepseek41, qwen35moe: an F32 router)
+        if (!hy4_sh_ok) return false;
+        if (g.is_hy4()) {   // (its router reads x at the residual's width)
+            if (!hy4_prompt_router(il, T, M.logits, hy4_io(S, (size_t) S->T * E), err)) return false;
+        } else if (Ly.router_type == gf::kTypeF32) {   // (deepseek41, qwen35moe: an F32 router)
 #if defined(STRATA_USE_HIP)
             // the engine's own tile kernel: rocBLAS's F32 GEMM took 15.7 ms a layer here (575 rows, 256 experts, 3072),
             // 751 of a 575-token prompt's 2255 ms (an AI PRO R9700), against 0.2 ms for the same shape alone
@@ -3956,6 +4006,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->mark("route", s);
         if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt route/count sync", err)) return false;
         if (sh_late) shared_expert();   // (into ffn, ahead of the expert sets' combines on the same stream)
+        if (!hy4_sh_ok) return false;
         int counted = 0;
         for (int e = 0; e < NE; ++e) counted += S->h_counts[e];
         if (counted != T * K) {
@@ -4020,7 +4071,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }();
         // (a chunk whose routed rows do not all fit the output window - over ~2,000 tokens on Qwen3.8 - adds them into
         // ffn as the window fills, in the order the experts ran: not one order anyway, so it keeps the timed share)
-        const bool xact = F->xc && xrows_env > 0 && (size_t) T * (size_t) K <= (size_t) moe_window_rows((size_t) T, g) &&
+        // (2 n_ff > n_embd - hy4's latent experts: the light kernels keep an expert's gate/up in its n_embd-wide output
+        // rows, which do not hold them; those experts go through the sets)
+        const bool light_fit = 2 * nff <= E;
+        const bool xact = light_fit && F->xc && xrows_env > 0 && (size_t) T * (size_t) K <= (size_t) moe_window_rows((size_t) T, g) &&
                           gf::rows_exact_type(Ly.gu_type) && gf::rows_exact_type(Ly.d_type) &&
                           !Ly.mixed() && !Ly.exl3 && Ly.nv_host.empty() && Ly.nv_scale == nullptr &&
                           (size_t) il < F->cpu_exact.size() && F->cpu_exact[(size_t) il] != 0 &&
@@ -4028,7 +4082,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                           kc::lane_q81_act_bytes(E) <= kc::kNativeActBytes &&
                           kc::lane_q81_act_bytes(nff) <= kc::kNativeHBytes;
         const int light_rows = xact ? xrows_env
-                               : lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && (light_layer < 0 || il == light_layer)
+                               : light_fit && lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && (light_layer < 0 || il == light_layer)
                                    ? light_env : 0;
         if (xact && S->xl_ptrs_h.empty()) S->xl_ptrs_h.resize((size_t) kLightMax);
         int n_light = 0, rows_mmq = 0;
@@ -4514,7 +4568,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->mark("x_quant", s);
                     // the part's bounds are the set's (from a): the activations and the destination are addressed a
                     // rows back so that bound a is the part's first row
-                    float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff <= n_embd: the set's own OUTP rows hold its gate/up
+                    // 2 * n_ff <= n_embd: the set's own OUTP rows hold its gate/up (else GUX: one part at a time, as
+                    // the stream runs them)
+                    float* GU = M.GUX != nullptr ? M.GUX : M.OUTP + (size_t) o * E;
                     mmq::Product gu;
                     gu.w = wbase + (size_t) i0 * stride;
                     gu.type = Ly.gu_type;
@@ -4768,7 +4824,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // GU rows of 2 n_ff (gate | up) as MMQ's (2 * n_ff <= n_embd: inside the expert's own OUTP rows); the
             // down's E-wide outputs then overwrite them from the expert's first row on, so its parts run last first
             // (part c0's outputs reach only the inputs of rows past it, already multiplied)
-            float* GU = M.OUTP + (size_t) o * E;
+            float* GU = M.GUX != nullptr ? M.GUX : M.OUTP + (size_t) o * E;
+            float* DN = M.OUTP + (size_t) o * E;   // (the down's outputs: GU's rows when it is inside OUTP)
             strata::kernels::dequant_f16(Ly.gu_type, blob, 0, nff, E, S->w16, s);
             strata::kernels::dequant_f16(Ly.up_type, blob + up_off, 0, nff, E, S->w16 + (size_t) nff * E, s);
             uint16_t* X16 = S->w16 + wgu;
@@ -4787,7 +4844,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const int n = std::min(dn_rows, nrows - c0);
                 strata::kernels::exl3::rows_f16(GU + (size_t) c0 * 2 * nff, 2 * nff, nullptr, n, nff, H16, s);
                 blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
-                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUDA_R_16F, nff, &zero, DN + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "gemm dq down");
             }
@@ -4803,7 +4860,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 run_set(wbase, n_exp, stride, d_bounds, hb, r0);
             }
         };
-        if (2 * nff > E) {   // (deepseek41: 2 x 2304 < 5120 - the packed rows still fit)
+        if (2 * nff > E && (M.GUX == nullptr || Ly.exl3)) {   // (deepseek41: 2 x 2304 < 5120 - the packed rows still fit)
             err = "glm prefill: 2 * n_ff_exp > n_embd (the gate/up rows would not fit the set's output rows)";
             return false;
         }
@@ -5430,6 +5487,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->mark("combine", s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
+        if (g.is_hy4()) {   // routed_up, the shared expert, post_ffw_norm and the streams' add
+            if (!hy4_prompt_ffn_out(il, T, hy4_io(S, (size_t) S->T * E), err)) return false;
+            S->mark("hy4_out", s);
+        }
     }
     // the last layer's write half: R = post x ffn + comb . R (qwen35moe's plain residual has none: the NextN rows below
     // add the last FFN themselves - this update, run with the hyper-connections' unset post / comb, broke R and with it
@@ -5443,7 +5504,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
     }
     if (!tail_skip && g.q4x && l1_ < g.n_layers && kv_cut < 0) q4_mix(l1_ - 1, 0, S->ffn, S->post, nullptr, true);
-    if (!tail_skip && !g.qwen35() && kv_cut < 0) {
+    if (!tail_skip && !g.qwen35() && !g.is_hy4() && kv_cut < 0) {   // (hy4: each layer added its own)
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
         if (dsp_ != nullptr) {   // DSpark: the chunk's last rows into its context
@@ -5748,6 +5809,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         PrefillState* S = pf_;
         const int T = chunk_len(c);
         const int64_t i = cs[(size_t) c];
+        if (g.is_hy4())   // (rows of the residual's width into its own streams; the Engram rows read)
+            return hy4_prompt_embed(tokens.data() + i, pos_start + i, T, hy4_io(S, (size_t) S->T * E), err);
         if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt embedding", err)) return false;
         // the rows by the disk workers' threads (a 32K chunk's rows took ~100 ms on one thread, the GPU idle);
         // STRATA_GLM_PREFILL_EMB_PAR=0: one thread

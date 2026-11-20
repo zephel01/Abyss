@@ -82,4 +82,53 @@ void swiglu(const float* g, const float* u, int n, float* h, cudaStream_t s);
 /// FP8 E4M3 codes -> floats (n values)
 void e4m3_to_f32(const uint8_t* src, float* dst, int n, cudaStream_t s);
 
+// ---- the batched prompt path (src/core/hy4_fast_path.cu's hy4_prompt_*): the kernels above a chunk's rows at once
+// (row-major, row t = position p0 + t; the same arithmetic as their token versions), and the chunk's own pieces
+void hc_mix_rows(const float* R, const float* fn, int hc, int dim, int n_mix, float eps, float* mixes, int T,
+                 cudaStream_t s);
+/// mixes: rows of mix_ld; R rows of hc * dim, x of dim, post of hc
+void hc_pre_rows(const float* mixes, int mix_ld, const float* scale, const float* base, const float* R, int hc, int dim,
+                 float hc_eps, float mag, const float* norm_w, float eps, float* x, float* post, int T, cudaStream_t s);
+void hc_add_rows(float* R, const float* post, float* a, const float* a_norm, float eps, int hc, int dim, int T,
+                 cudaStream_t s);
+void rms_rows(const float* x, const float* w, float eps, int n, float* y, int T, cudaStream_t s,
+              const float* add = nullptr);
+/// pos: a device row of Pos3 per row; row t's cache row is (p0 + t - row_base) % ring
+void mla_prep_rows(float* q, int n_head, const float* kv, const float* kv_norm, float eps, const Pos3* pos, int64_t p0,
+                   float base, uint16_t* cache, int64_t row_base, int ring, int T, cudaStream_t s);
+/// q's no-rope parts as FP16 [T][n_head][192]
+void q_nope_f16(const float* q, int n_head, int T, uint16_t* q16, cudaStream_t s);
+/// mla_attend for T rows (q_abs [T][n_head][512], q [T][n_head][256]): row t's keys cells[t][0, n_cells[t]) when
+/// cells is non-null and n_cells[t] >= 0, else positions [max(0, p - window + 1), p] (window 0: [0, p]); position j
+/// in cache row (j - row_base) % ring.  n_head a multiple of 16
+void mla_attend_rows(const float* qabs, const float* q, const uint16_t* cache, int64_t row_base, int ring,
+                     const int* cells, const int* n_cells, int cells_ld, int64_t p0, int window, const float* sinks,
+                     float scale, int n_head, int T, float* ctx, cudaStream_t s);
+/// o *= sigmoid(gate) (n values), o16 = FP16(o)
+void gate_rows(float* o, const float* gate, int64_t n, uint16_t* o16, cudaStream_t s);
+/// cache rows of positions [j0, j0 + n) from src (row (j - src_base) % src_ring) to dst (the same for dst)
+void ring_copy(const uint16_t* src, int64_t src_base, int src_ring, uint16_t* dst, int64_t dst_base, int dst_ring,
+               int64_t j0, int n, cudaStream_t s);
+/// The groups that close in positions [pt0, pt0 + tn) pooled (their token keys from tkb's rows, the earlier ones from
+/// tk4's slots; pos[i] is position pt0 - 3 + i), then the sub-batch's last 4 keys into tk4
+void idx_pool_rows(const float* tkb, int64_t pt0, int tn, float* tk4, const float* wv, const float* wg,
+                   const float* ape, const float* norm, float eps, const Pos3* pos, float base, float* pooled,
+                   cudaStream_t s);
+void idx_query_rows(float* iq, int heads, float* w, const Pos3* pos, float base, int T, cudaStream_t s);
+/// idx_select per row: n_cells[t] = -1 (dense) while p + 1 <= dense, else the top groups of score[t] and the own group
+void idx_select_rows(const float* score, int score_ld, int64_t p0, int dense, int top, int* cells, int cells_ld,
+                     int* n_cells, int T, cudaStream_t s);
+/// eng_rows over T rows of n_heads heads (lnorm per head)
+void eng_rows_rows(const float* rows, const float* lnorm, int n_heads, int d, float row_eps, float* e, int T,
+                   cudaStream_t s);
+/// eng_add per row (kv rows of (hc + 1) dim, R rows of hc dim); skip[t] != 0: row t adds nothing (skip may be null)
+void eng_add_rows(const float* kv, float* R, const float* gate, const float* hc_scale, const float* pre_gamma, int hc,
+                  int dim, float eps, bool vfirst, const unsigned char* skip, int T, cudaStream_t s);
+/// y[t][i] += b[i]
+void add_bias_rows(float* y, const float* b, int n, int T, cudaStream_t s);
+/// swiglu over n values (64-bit count)
+void swiglu_n(const float* g, const float* u, int64_t n, float* h, cudaStream_t s);
+/// launches that failed (all hy4 kernels)
+int launch_errors();
+
 }  // namespace strata::kernels::hy4
