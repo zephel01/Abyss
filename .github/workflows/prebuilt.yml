@@ -136,7 +136,8 @@ jobs:
             exit "$rc"
           fi
           sccache --show-stats
-          sha256sum build/abyss build/abyss_gpu_tune
+          # (the binaries' SHA-256 as a notice: a cached build and a fresh one of the same sources give the same bytes)
+          sha256sum build/abyss build/abyss_gpu_tune | sed 's/^/::notice::/'
       - name: Package
         run: |
           set -euo pipefail
