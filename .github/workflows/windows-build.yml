@@ -2,12 +2,13 @@
 # compile only: the CUDA engine for sm_120a (RTX 50) and the GPU tuner, then that the binary starts.  It catches
 # POSIX-only headers and calls in the engine (v1.3.109-119 failed to build on Windows over hop_link.cu's
 # sys/socket.h, issue #31) before a release.
+# Only where prebuilt.yml does not build (main and by hand): on ci-* branches prebuilt's windows-x64 job compiles
+# the same engine for more GPUs (sm_86, sm_89, sm_120a) and checks that it starts.
 name: windows-build
 
 on:
   push:
-    branches: [main, "ci-*"]   # ci-*: a release candidate runs every build before the tag
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -30,19 +31,10 @@ jobs:
           repository: ggml-org/llama.cpp
           ref: ${{ env.LLAMA_CPP_COMMIT }}
           path: third_party/llama.cpp
-      - name: CUDA toolkit (NVIDIA's network installer, silent)
-        shell: pwsh
-        run: |
-          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_FULL/network_installers/cuda_${env:CUDA_FULL}_windows_network.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda.exe"
-          Start-Process -FilePath "$env:RUNNER_TEMP\cuda.exe" -ArgumentList "-s" -Wait -NoNewWindow
-          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$env:CUDA_MM"
-          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { Write-Error "nvcc not found under $cuda"; exit 1 }
-          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          # (CUDA 13 on Windows keeps its DLLs - cuBLAS among them - in bin\x64)
-          if (Test-Path "$cuda\bin\x64") { "$cuda\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
-          & "$cuda\bin\nvcc.exe" --version
+      - uses: ./.github/actions/cuda-windows
+        with:
+          cuda-full: ${{ env.CUDA_FULL }}
+          cuda-mm: ${{ env.CUDA_MM }}
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64

@@ -6,8 +6,7 @@ name: arm-build
 
 on:
   push:
-    branches: [main, "ci-*"]   # ci-*: a release candidate runs every build before the tag
-    tags: ["v*"]
+    branches: [main, "ci-*"]   # ci-*: a release candidate runs every build before the tag (so not on the tag again)
   pull_request:
   workflow_dispatch:
 
@@ -68,7 +67,7 @@ jobs:
 
   cuda-build:
     # the engine as the DGX Spark builds it: CUDA 13 for arm64 (sbsa), sm_121a (GB10; the MXFP4 MMQ kernels use the
-    # arch-specific FP4 MMA, as 120a does on RTX 50).  Compile only (no GPU): on main, tags and by hand, not on PRs
+    # arch-specific FP4 MMA, as 120a does on RTX 50).  Compile only (no GPU): on main, ci-* branches and by hand, not on PRs
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120

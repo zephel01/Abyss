@@ -3,7 +3,9 @@
 # GPU's own code, and the engine's per-GPU choices ask the device at run time.  Each archive carries the engine, the
 # GPU tuner and the CUDA libraries they load (NVIDIA's CUDA EULA, Attachment A: cudart, cuBLAS / cuBLASLt may be
 # distributed with an application, unmodified), and SHA256SUMS lists them.
-# Branches: the archives are workflow artifacts.  Tags: also attached to the tag's release (the release job).
+# Branches: the archives are workflow artifacts.  Tags: attached to the tag's release (the release job) - taken from the
+# ci-* branch's run of the same commit when it has them (the reuse job: no second build), else built here.
+# Compiles go through sccache, its cache kept in the Actions cache, so unchanged sources are not compiled again.
 name: prebuilt
 
 on:
@@ -11,6 +13,11 @@ on:
     branches: ["ci-*"]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      reuse_from_sha:
+        description: "dry run of a tag's reuse: find, download and check the ci-* run's archives of this commit (no release)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -23,14 +30,59 @@ env:
   # SASS only (no PTX): 8.6 code also runs on 8.7; 12.0a only on 12.0 (RTX 50 desktop / RTX PRO Blackwell)
   ARCHS: "86-real;89-real;120a-real"
 
+  SCCACHE_VERSION: "v0.10.0"
+  SCCACHE_CACHE_SIZE: "4G"
+
 jobs:
+  reuse:
+    # a tag (or a dry run by hand): the successful prebuilt run of this commit on a ci-* branch, its archives downloaded
+    # and their SHA-256 checked; run_id stays empty when there is none (or they fail the check), and the builds run
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.reuse_from_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run_id: ${{ steps.check.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Find the ci-* run (waits for one still running)
+        id: find
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/find_prebuilt_run.py "${{ inputs.reuse_from_sha || github.sha }}" --wait 90
+      - uses: actions/download-artifact@v4
+        if: steps.find.outputs.run_id != ''
+        continue-on-error: true
+        with:
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+          pattern: abyss-engine-cuda-*
+          path: dist
+          merge-multiple: true
+      - name: Check the archives
+        id: check
+        if: steps.find.outputs.run_id != ''
+        run: |
+          set -uo pipefail
+          cd dist 2>/dev/null && ls -la && test -f abyss-engine-cuda-linux-x64.tar.gz && test -f abyss-engine-cuda-windows-x64.zip \
+            && sha256sum -c abyss-engine-cuda-linux-x64.tar.gz.sha256 abyss-engine-cuda-windows-x64.zip.sha256 \
+            && echo "run_id=${{ steps.find.outputs.run_id }}" >> "$GITHUB_OUTPUT" \
+            || echo "::warning::the archives of run ${{ steps.find.outputs.run_id }} did not check out: building"
+
   linux-x64:
     # Ubuntu 22.04: glibc 2.35, so the binary runs on 22.04 and newer; libstdc++ linked in
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.run_id == '' && inputs.reuse_from_sha == '' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     env:
       CUDA_HOME: /usr/local/cuda-13.3
       PKG: abyss-engine-cuda-linux-x64
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -47,10 +99,21 @@ jobs:
             cuda-minimal-build-${CUDA_VER} libcublas-dev-${CUDA_VER} cuda-nvtx-${CUDA_VER}
           "$CUDA_HOME/bin/nvcc" --version
           cmake --version
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
+      - uses: actions/cache@v4
+        # one entry a commit, started from the newest one (restore-keys): every flag and input that changes an object is in
+        # sccache's own hash, the key's parts only keep unrelated caches apart
+        with:
+          path: .sccache
+          key: sccache-linux-x64-cuda${{ env.CUDA_FULL }}-${{ github.sha }}
+          restore-keys: sccache-linux-x64-cuda${{ env.CUDA_FULL }}-
       - name: Configure
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CUDA_HOST_COMPILER=g++-12
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache
           -DSTRATA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$ARCHS"
           -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"
           -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF -DSTRATA_PORTABLE=ON
@@ -61,8 +124,11 @@ jobs:
         # (nvcc takes 2-4 GB a job on the big kernels: the runner's 16 GB allow four)
         run: |
           date -u +"build start %H:%M:%S"
+          sccache --zero-stats > /dev/null
           cmake --build build --target strata abyss_gpu_tune -j4
           date -u +"build end %H:%M:%S"
+          sccache --show-stats
+          sha256sum build/abyss build/abyss_gpu_tune
       - name: Package
         run: |
           set -euo pipefail
@@ -110,10 +176,13 @@ jobs:
           retention-days: 14
 
   windows-x64:
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.run_id == '' && inputs.reuse_from_sha == '' }}
     runs-on: windows-2022
     timeout-minutes: 300
     env:
       PKG: abyss-engine-cuda-windows-x64
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -121,18 +190,18 @@ jobs:
           repository: ggml-org/llama.cpp
           ref: ${{ env.LLAMA_CPP_COMMIT }}
           path: third_party/llama.cpp
-      - name: CUDA toolkit (NVIDIA's network installer, silent)
-        shell: pwsh
-        run: |
-          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_FULL/network_installers/cuda_${env:CUDA_FULL}_windows_network.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda.exe"
-          Start-Process -FilePath "$env:RUNNER_TEMP\cuda.exe" -ArgumentList "-s" -Wait -NoNewWindow
-          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$env:CUDA_MM"
-          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { Write-Error "nvcc not found under $cuda"; exit 1 }
-          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          if (Test-Path "$cuda\bin\x64") { "$cuda\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
-          & "$cuda\bin\nvcc.exe" --version
+      - uses: ./.github/actions/cuda-windows
+        with:
+          cuda-full: ${{ env.CUDA_FULL }}
+          cuda-mm: ${{ env.CUDA_MM }}
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: .sccache
+          key: sccache-windows-x64-cuda${{ env.CUDA_FULL }}-${{ github.sha }}
+          restore-keys: sccache-windows-x64-cuda${{ env.CUDA_FULL }}-
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -142,15 +211,18 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DSTRATA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS"
           -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache
           -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_IGPU_LANE=OFF -DSTRATA_PORTABLE=ON
           -DSTRATA_GGML_DIR="$env:GITHUB_WORKSPACE/third_party/llama.cpp"
       - name: Build the engine and the GPU tuner
         shell: pwsh
         run: |
           Get-Date -AsUTC -Format "'build start' HH:mm:ss"
+          sccache --zero-stats | Out-Null
           cmake --build build --target strata abyss_gpu_tune -j4 2>&1 | Tee-Object -FilePath build.log
           $rc = $LASTEXITCODE
           Get-Date -AsUTC -Format "'build end' HH:mm:ss"
+          sccache --show-stats
           if ($rc -ne 0) {
             Select-String -Path build.log -Pattern ': (fatal )?error|error:|FAILED:' | Select-Object -First 15 |
               ForEach-Object { Write-Output ("::error::" + $_.Line.Trim()) }
@@ -210,21 +282,30 @@ jobs:
           retention-days: 14
 
   release:
-    # attach both archives and SHA256SUMS to the tag's release (the setups download them from there).
+    # attach both archives and SHA256SUMS to the tag's release (the setups download them from there): the ci-* run's
+    # (reuse) or, when it had none, this run's own builds.
     # on from v1.3.164 (checked on an RTX 5090 under Linux; Windows and RTX 30 / 40 not yet run on a GPU: marked trial)
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-x64, windows-x64]
+    if: >-
+      !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
+      (needs.reuse.outputs.run_id != '' || (needs.linux-x64.result == 'success' && needs.windows-x64.result == 'success'))
+    needs: [reuse, linux-x64, windows-x64]
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          run-id: ${{ needs.reuse.outputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
+          pattern: abyss-engine-cuda-*
           path: dist
           merge-multiple: true
       - name: SHA256SUMS
         working-directory: dist
         run: |
+          echo "archives from run ${{ needs.reuse.outputs.run_id || github.run_id }}"
+          sha256sum -c abyss-engine-cuda-*.sha256
           sha256sum abyss-engine-cuda-*.tar.gz abyss-engine-cuda-*.zip > SHA256SUMS
           cat SHA256SUMS
       - name: Upload to the release (made by hand for the tag; created here when it is missing)
