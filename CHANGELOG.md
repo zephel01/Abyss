@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.180 - 2026-11-21
+
+Hy4-flash prompts 1.6-2.2x faster, and a `--serve` shutdown fix. Other models give the same bits as v1.3.179 (7-config
+md5 check). RTX 5090 (Gen4 x4), Hy4-Flash Maya-XS (IQ2_XXS), medians of 3: 4K prompt 1225 -> 1946 tok/s, 16K 1731 ->
+3239, 63K 1570 -> 3375; decode unchanged. 128K and 256K needle prompts: all four facts found.
+
 - `--serve` (every engine on the pack path, and the qwen serve): the stdin reader thread's queue, flags and lock now
   live on the heap, shared with the thread. They were on the serve function's stack while the detached thread kept
   reading, so a stdin closed after QUIT could lock a destroyed mutex while the engine shut down (an abort after a
