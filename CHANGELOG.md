@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.182 - 2026-11-21
+
+HIP prompts on the engine's own GEMM, no rocBLAS / hipBLASLt call (#49): faster on the Radeon 8060S (Ornith-1.5-35B
+2K prompt 801 -> 1,320 tok/s) and the crash path of #49 gone. Faster CI and release builds. CUDA gives the same bits
+as v1.3.181 (7-config md5 check).
+
 - HIP: the prompt path's matrix products run on the engine's own GEMM instead of hipBLAS / rocBLAS / hipBLASLt (#49:
   Windows 11, RX 9060 XT, TheRock ROCm 7.14.1 - a 2K prompt on Qwen3.8 16G64G stopped with an access violation inside
   `hipblasGemmEx` -> `rocblas_gemm_ex` -> `hipblasLtMatmul`). Every cuBLAS-style product the HIP build made (FP16 /
@@ -24,6 +30,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   `STRATA_HIPBLASLT_TUNING` again), `STRATA_HIP_GEMM_PORTABLE=1` takes the plain kernel on gfx11 too. The build still
   links hipBLAS (and hipBLASLt where present) for that library path. CUDA is unchanged (the same bits on the 7-config
   md5 check).
+- CI (no change to the engine): a release's tag no longer builds the prebuilt engine a second time - prebuilt's
+  reuse job takes the archives of the ci-v<version> (or main) run of the same commit, checks their SHA-256 and the
+  release job attaches them; tests and arm-build no longer run on tags. The prebuilt jobs compile through sccache
+  (cache in the Actions cache; main's runs keep it for the next release branch), the Windows jobs take only the CUDA
+  parts they build with, cached. prebuilt also runs on main and replaces windows-build there (now by hand only).
+  MSVC Release builds use /Z7 instead of /Zi when a compiler launcher is set (sccache cannot cache /Zi).
 
 ## v1.3.181 - 2026-11-21
 

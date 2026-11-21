@@ -1,0 +1,56 @@
+# The CUDA toolkit on a Windows runner (prebuilt.yml windows-x64, windows-build.yml): NVIDIA's network installer, silent,
+# only the parts the engine builds with, kept in the Actions cache (keyed by the CUDA version, the parts and the runner
+# image) so the installer (6-8 min) runs only on a cache miss.  Either way: CUDA_PATH set, bin and bin\x64 (CUDA 13
+# keeps its DLLs - cuBLAS among them - in bin\x64) on PATH.
+name: CUDA toolkit (Windows)
+description: NVIDIA's CUDA toolkit for the Windows builds, cached
+inputs:
+  cuda-full:
+    description: the toolkit's full version (13.3.0)
+    required: true
+  cuda-mm:
+    description: major.minor (13.3)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache key
+      id: key
+      shell: pwsh
+      run: |
+        # the parts (13.3's installer names): the compiler (nvcc + cicc in nvvm, the CRT headers), CCCL (thrust_), the
+        # runtime, cuBLAS, NVTX and the
+        # profiler API header - what CMakeLists.txt and the engine's sources include and link
+        $mm = "${{ inputs.cuda-mm }}"
+        $parts = "nvcc crt nvvm thrust cudart cublas cublas_dev nvtx cuda_profiler_api".Split(" ") | ForEach-Object { "${_}_$mm" }
+        "parts=$($parts -join ' ')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "dir=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$mm" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($parts -join ' '))).Replace("-", "").Substring(0, 12)
+        "key=cuda-${{ inputs.cuda-full }}-$env:ImageOS-$h" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+    - name: Install (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $url = "https://developer.download.nvidia.com/compute/cuda/${{ inputs.cuda-full }}/network_installers/cuda_${{ inputs.cuda-full }}_windows_network.exe"
+        Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\cuda.exe"
+        $argv = @("-s") + "${{ steps.key.outputs.parts }}".Split(" ")
+        $p = Start-Process -FilePath "$env:RUNNER_TEMP\cuda.exe" -ArgumentList $argv -Wait -NoNewWindow -PassThru
+        Write-Output "installer exit code $($p.ExitCode)"
+    - name: CUDA_PATH and PATH
+      shell: pwsh
+      run: |
+        $cuda = "${{ steps.key.outputs.dir }}"
+        if (-not (Test-Path "$cuda\bin\nvcc.exe")) {
+          $have = (Get-ChildItem $cuda -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
+          Write-Output "::error::nvcc not found under $cuda (there: $have)"; exit 1
+        }
+        "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        if (Test-Path "$cuda\bin\x64") { "$cuda\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
+        & "$cuda\bin\nvcc.exe" --version
+        Get-ChildItem "$cuda\bin\x64" -Filter *.dll -ErrorAction SilentlyContinue | Format-Table Name, Length

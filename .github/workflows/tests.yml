@@ -1,9 +1,11 @@
 # Every push and pull request: the Python tests (server, installer, tools) and the AMD build's CUDA-name check - no GPU
 # needed. The engine's CUDA build and its GPU tests run on the maintainers' V100s before a merge (CONTRIBUTING.md).
+# Not on tags: a release's tag points at a commit its ci-* branch already ran (branches only below).
 name: tests
 
 on:
   push:
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
