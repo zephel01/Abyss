@@ -1984,6 +1984,7 @@ static int glm_pack_generate(const Options& o) {
     //   qwen35 (Qwen3.8 / Ornith / Qwen3.8-27B; Glm5Model::q35_slot_*: the snapshot and every attention cache's rows
     //   up to it): host RAM first (pinned; STRATA_GLM_SLOT_RAM_GB, default a quarter of the memory free at the first
     //   slot, at most 8 GB, and never below 8 GB of the machine's memory free), then files.
+    //   DeepSeek V4 / V4.1 and Hy4: none (the live snapshot only) - not tried, so no "not implemented" line a request.
     // STRATA_GLM_SLOTS=<n> slots (default 4, qwen35 8; 0 off: one conversation in the model, as before), for
     // conversations of STRATA_GLM_SLOT_MIN tokens or more (1024), files in STRATA_GLM_SLOT_DIR (default <pack>/slots,
     // emptied at start), at most STRATA_GLM_SLOT_GB on disk (16) and never below 8 GB free.  Text only: a
@@ -1998,7 +1999,7 @@ static int glm_pack_generate(const Options& o) {
     const bool q35_path = model.fast() && model.geometry().qwen35();
     std::string q35_slot_why;
     const bool q35_slot_ok = q35_path && model.q35_slot_supported(q35_slot_why);
-    int slot_max = model.fast() && !model.geometry().dsv4() && (!q35_path || q35_slot_ok) &&
+    int slot_max = model.fast() && !model.geometry().dsv4() && !model.geometry().is_hy4() && (!q35_path || q35_slot_ok) &&
                            getenv("STRATA_GLM_NO_REUSE") == nullptr
                        ? (int) env_num("STRATA_GLM_SLOTS", q35_path ? 8 : 4)
                        : 0;

@@ -9,6 +9,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Fix (Hy4, the server): every request tried to set the conversation aside in a slot, which Hy4 does not have, and
+  logged "conversation slots are not implemented"; Hy4 now skips the slots, as DeepSeek V4 / V4.1 do.
+
 ## v1.3.185 - 2026-11-22
 
 Inkling 2 Mini with thinking off: the English planning it still writes no longer lands in the answer. The engine is
