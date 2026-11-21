@@ -56,12 +56,17 @@ too - its quality check tells a broken kernel on your GPU from a prompt problem.
 - **A new CUDA call needs its AMD mapping.** The AMD build compiles the same sources with
   `include/strata/hip_compat/` forced in. A CUDA runtime or cuBLAS name without a `#define` there breaks every AMD build,
   as v1.0.21 did. `python tools/check_hip_compat.py` names any missing one.
-- **Every push and pull request runs the checks** (GitHub Actions, `.github/workflows/tests.yml`), with no GPU needed:
+- **Every branch push and pull request runs the checks** (GitHub Actions, `.github/workflows/tests.yml`), with no GPU needed:
   - the AMD-mapping check;
   - the server tests;
   - the installer and tools tests.
   
   A pull request is merged only when they pass.
+- **A release is built on its `ci-v<version>` branch before the tag:** a push there runs every workflow (tests,
+  arm-build, prebuilt with the Windows and Linux CUDA archives). The tag then runs only prebuilt, which attaches that
+  branch run's archives to the release (checked against their SHA-256) instead of building them again; it builds them
+  itself only when the branch run is missing or its artifacts expired (14 days). windows-build (one GPU target) runs
+  on pushes to main, where prebuilt does not.
 - **Before merging, we build every NVIDIA target** and run on Tesla V100s (one GPU and two):
   - the engine's parity tests (`glm_*_parity --selftest`);
   - a decode / prefill A/B;

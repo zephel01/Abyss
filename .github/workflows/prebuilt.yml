@@ -30,7 +30,7 @@ env:
   # SASS only (no PTX): 8.6 code also runs on 8.7; 12.0a only on 12.0 (RTX 50 desktop / RTX PRO Blackwell)
   ARCHS: "86-real;89-real;120a-real"
 
-  SCCACHE_VERSION: "v0.10.0"
+  SCCACHE_VERSION: "v0.18.0"
   SCCACHE_CACHE_SIZE: "4G"
 
 jobs:
@@ -99,7 +99,7 @@ jobs:
             cuda-minimal-build-${CUDA_VER} libcublas-dev-${CUDA_VER} cuda-nvtx-${CUDA_VER}
           "$CUDA_HOME/bin/nvcc" --version
           cmake --version
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: ${{ env.SCCACHE_VERSION }}
       - uses: actions/cache@v4
@@ -125,8 +125,16 @@ jobs:
         run: |
           date -u +"build start %H:%M:%S"
           sccache --zero-stats > /dev/null
-          cmake --build build --target strata abyss_gpu_tune -j4
+          set +e
+          cmake --build build --target strata abyss_gpu_tune -j4 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
           date -u +"build end %H:%M:%S"
+          if [ "$rc" != 0 ]; then
+            # (the first compiler errors also go out as annotations, readable without the full log)
+            grep -E ': (fatal )?error|error:|FAILED:|sccache' build.log | head -15 | sed 's/^/::error::/'
+            exit "$rc"
+          fi
           sccache --show-stats
           sha256sum build/abyss build/abyss_gpu_tune
       - name: Package
@@ -194,7 +202,7 @@ jobs:
         with:
           cuda-full: ${{ env.CUDA_FULL }}
           cuda-mm: ${{ env.CUDA_MM }}
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: ${{ env.SCCACHE_VERSION }}
       - uses: actions/cache@v4
