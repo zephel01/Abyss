@@ -276,3 +276,4 @@ STRATA_HY4_ENG_ROW_EPS  # src/core/hy4_fast_path.cu (debug: the Engram row norm'
 STRATA_HY4_DUMP_CACHE  # src/core/hy4_fast_path.cu (debug: every layer's cache rows into this file at STRATA_HY4_DUMP_CACHE_AT)
 STRATA_HY4_DUMP_CACHE_AT  # src/core/hy4_fast_path.cu (debug: the position STRATA_HY4_DUMP_CACHE writes at)
 STRATA_HY4_ENG_VFIRST  # src/core/hy4_fast_path.cu (debug: the values-first n-gram order, for A/B only)
+STRATA_INK_F16  # src/kernels/cuda/inkling_fast.cu (debug: Inkling's attention with the bias (1) / the scaled q (2) rounded to FP16, an A/B against llama.cpp's flash attention)

@@ -872,6 +872,10 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
     }
+    if (g_.ink) {   // (inkling: no batched prompt path yet)
+        std::fprintf(stderr, "inkling: the prompt runs token by token (no batched prompt path yet)\n");
+        return true;
+    }
 #if defined(STRATA_MOE_OWN)
     const bool have_own = own::built();
 #else

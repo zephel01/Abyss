@@ -21,6 +21,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/inkling_fast.hpp"
 #include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -932,10 +933,12 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
+            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
+            if (!g.ink) {   // (inkling: no shared expert)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
             Ly.sh_down = q("ffn_down_shexp.weight");
+            }
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
@@ -979,8 +982,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 // the SiLU, so the kernels take one number for both
                 if (Ly.gu_type == 40 || Ly.d_type == 40) {
                     F->nv_guard = kNvGuard;   // (set here, before the prompt path and the pool size their buffers)
-                    const float* sg = f32("ffn_gate_exps.scale");
-                    const float* su = f32("ffn_up_exps.scale");
+                    // (a fused gate_up tensor - inkling - carries the one scale both share)
+                    const bool fused = w_.count(P + "ffn_gate_up_exps.scale") != 0;
+                    const float* sg = f32(fused ? "ffn_gate_up_exps.scale" : "ffn_gate_exps.scale");
+                    const float* su = f32(fused ? "ffn_gate_up_exps.scale" : "ffn_up_exps.scale");
                     const float* sd = f32("ffn_down_exps.scale");
                     if (sg != nullptr && su != nullptr && sd != nullptr) {
                         const int NE = g.n_expert;
@@ -4727,8 +4732,8 @@ bool Glm5Model::fast_warm(std::string& err) {
                 return;
             }
             const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
-            const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
-                                 : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.up_bytes
+            const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * (nl.gu_stride ? nl.gu_stride : Ly.gu_bytes)
+                                 : role == 1 ? nl.up_off + (uint64_t) J.e * (nl.gu_stride ? nl.gu_stride : Ly.up_bytes)
                                              : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
             const size_t len = role == 2 ? Ly.dn_bytes : role == 1 ? Ly.up_bytes : Ly.gu_bytes;
             uint8_t* base = J.vram ? F->stage[(size_t) (job / 3)] : J.dst;
@@ -4772,6 +4777,7 @@ void Glm5Model::fast_destroy() {
     dflash_destroy();
     prefill_destroy();
     q35d_destroy();
+    ink_free();   // (inkling_fast_path.cu: its slots and scratch)
     hy4_destroy();   // (hy4_fast_path.cu: its arena, buffers and the Engram table's file)
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
@@ -6075,8 +6081,8 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
         return;
     }
     const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
-    const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) e * Ly.gu_bytes
-                         : role == 1 ? nl.up_off + (uint64_t) e * Ly.up_bytes
+    const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) e * (nl.gu_stride ? nl.gu_stride : Ly.gu_bytes)
+                         : role == 1 ? nl.up_off + (uint64_t) e * (nl.gu_stride ? nl.gu_stride : Ly.up_bytes)
                                      : nl.down_off + (uint64_t) e * Ly.dn_bytes;
     const size_t len = role == 2 ? Ly.dn_bytes : role == 1 ? Ly.up_bytes : Ly.gu_bytes;
     const size_t piece = ((len + (size_t) n_chunks - 1) / (size_t) n_chunks + 4095) & ~(size_t) 4095;
@@ -7262,9 +7268,9 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         return v == nullptr || std::atoi(v) != 0;
     }();
     const bool late = sh_late && FFs > 0;
-    int nj = late ? 1 : 3;
+    int nj = late || FFs == 0 ? 1 : 3;   // (no shared expert: the router alone)
     j[0] = {Ly.router, nullptr, F->x, F->rlog, nullptr, 1.0f, Ly.router_type, g.n_embd, g.n_expert};
-    if (!late) {
+    if (nj == 3) {
         j[1] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
         j[2] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
     }
@@ -7912,6 +7918,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    if (g.ink) strata::kernels::ink::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
     // STRATA_Q4X_ARGMAX_MB (qwen4exp on CUDA, default on): the argmax over 128 blocks - the same index
 #if defined(STRATA_USE_HIP)
     static const bool am_mb = [] { const char* v = getenv("STRATA_Q4X_ARGMAX_MB"); return v != nullptr && std::atoi(v) != 0; }();
@@ -9037,6 +9044,7 @@ bool Glm5Model::part_token_head(int64_t p, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    if (g.ink) strata::kernels::ink::softcap(sc_ + sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
     if (FT->zero_copy) {
         gf::argmax(sc_ + sc_logits, g.n_vocab, FT->tok_hd, FT->cs);
     } else {

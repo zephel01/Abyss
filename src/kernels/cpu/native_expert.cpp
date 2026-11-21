@@ -333,7 +333,11 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
                           float swiglu_limit, float scale) {
     // scale: NVFP4's second-level scale of the gate and up rows (inside the SiLU; 1 for every other type)
     const int n = (int) f.n_embd;
-    const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
+    const bool situ = swiglu_limit < 0.0f;   // (Inkling's SITU: glm_fast.cu's situ_act)
+    const bool clamp = !situ && swiglu_limit != std::numeric_limits<float>::infinity();
+    const auto situ_act = [](float g, float u) {
+        return (4.0f * std::tanh(g * 0.25f)) * (1.0f / (1.0f + std::exp(-g))) * (25.0f * std::tanh(u * 0.04f));
+    };
     if (r1 > r0) {
         const RowsFn fn = exact_rows_nt(f.gu_type, nt);
         // (a mixed layer: up's own rows kernel - both exact, or ggml's dots below for both)
@@ -360,7 +364,7 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
                         g = std::fmin(g, swiglu_limit);
                         u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
                     }
-                    ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
+                    ff[t][r0 + r] = situ ? situ_act(g, u) : (g / (1.f + std::exp(-g))) * u;
                 }
             }
             return;
@@ -377,7 +381,7 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
                 g = std::fmin(g, swiglu_limit);
                 u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
             }
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            ff[t][r] = situ ? situ_act(g, u) : (g / (1.f + std::exp(-g))) * u;
         }
     }
 }

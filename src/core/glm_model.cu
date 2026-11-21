@@ -578,6 +578,8 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err) && eog_from_gguf(g, out);
     if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err) && eog_from_gguf(g, out);
     if (g.get("hy_v4_flash.block_count")) return from_gguf_hy4(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("inkling2_loop.block_count") || g.get("inkling2.block_count"))
+        return from_gguf_inkling(g, out, err) && eog_from_gguf(g, out);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -1081,6 +1083,131 @@ bool Glm5Geometry::from_gguf_hy4(const strata::GgufFile& g, Glm5Geometry& out, s
     // (a small delta-net scratch: load_pack's shared scratch sizes a few buffers by it)
     out.kda_head_dim = 128;
     out.d_conv = 4;
+    return true;
+}
+
+// inkling (Inkling 2 Mini): the GGUF's inkling2_loop.* (or inkling2.*, no loop) keys.  On the qwen35moe path (arch 2)
+// with ink set: every layer attention (no delta-net), 128 experts top 8 with a sigmoid router and exp_probs_b (gating 0,
+// normalised, x expert_weights_scale), no shared expert, no dense lead layer; the SwiGLU clamp off (the SITU kernels'
+// inputs pass the clamp unchanged)
+bool Glm5Geometry::from_gguf_inkling(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = g.get("inkling2_loop.block_count") ? "inkling2_loop." : "inkling2.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    out.arch = 2;
+    out.ink = true;
+    out.hc = 1;
+    out.n_embd = (int) num("embedding_length", 2304);
+    out.n_layers = (int) num("block_count", 24);
+    out.nextn = 0;
+    out.n_head = (int) num("attention.head_count", 24);
+    out.attn_head_kv = (int) num("attention.head_count_kv", 8);
+    out.head_dim = (int) num("attention.key_length", 128);
+    const int v_len = (int) num("attention.value_length", 128);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+    out.n_rot = 0;
+    out.n_swa = (int) num("attention.sliding_window", 1024);
+    out.n_expert = (int) num("expert_count", 128);
+    out.n_exp_used = (int) num("expert_used_count", 8);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 1152);
+    out.n_ff_shexp = 0;
+    out.n_shared = 0;
+    out.n_ff_dense = out.n_ff_exp;
+    out.dense_lead = 0;
+    out.gating = 0;
+    out.w_scale = (float) num("expert_weights_scale", 1.0);
+    out.norm_w = 1;
+    // (the experts' activation is SITU, not a clamped SwiGLU: a negative clamp selects it in every expert kernel -
+    // glm_fast.cu's situ_act, the CPU lane's)
+    out.swiglu_exp = -1.0f;
+    out.swiglu_shexp = INFINITY;
+    out.ink_rel = (int) num("attention.relative_length", 16);
+    out.ink_extent = (int) num("attention.relative_extent", 1024);
+    out.ink_qk_clip = (float) num("attention.qk_clip", 22.627416610717773);
+    out.ink_rel_clip = (float) num("attention.relative_clip", 8.0);
+    out.ink_log_floor = (float) num("attention.log_scale_floor", 8192.0);
+    out.ink_log_alpha = (float) num("attention.log_scale_alpha", 0.1);
+    out.ink_conv = (int) num("shortconv.l_cache", 4);
+    out.ink_block = (int) num("attn_res.block_size", 6);
+    out.ink_situ_b = (float) num("activation.situ_beta", 4.0);
+    out.ink_situ_lb = (float) num("activation.situ_linear_beta", 0.0);
+    out.ink_softcap = (float) num("final_logit_softcapping", 0.0);
+    out.ink_vocab_pad = (int) num("vocab_size", 0);
+    if (p == "inkling2_loop.") {
+        out.ink_lo = (int) num("loop.start", 6);
+        out.ink_hi = (int) num("loop.end", 18);
+        out.ink_passes = (int) num("loop.count", 3);
+        out.ink_rank = (int) num("loop.gate_rank", 64);
+        const auto* vr = g.get(p + "loop.varying");
+        if (vr != nullptr && vr->is_num() && vr->num() != 0) {
+            err = "inkling: a varying loop (loop.varying) is not supported";
+            return false;
+        }
+    } else if (num("num_loops", 1) > 1) {
+        // (unsloth's own looped layout: block_count counts the layer applications - 6 + 3 x 12 + 6 = 48 - over the
+        // same 24 layers; tools/iq_pack.py gives its loop tensors the inkling2_loop names)
+        out.ink_lo = (int) num("loop.core_start", 6);
+        out.ink_hi = (int) num("loop.core_end", 18);
+        out.ink_passes = (int) num("num_loops", 3);
+        out.ink_rank = (int) num("loop.gate_rank", 64);
+        out.n_layers -= (out.ink_passes - 1) * (out.ink_hi - out.ink_lo);
+    } else {   // (inkling2: no loop - one pass)
+        out.ink_lo = out.ink_hi = 0;
+        out.ink_passes = 1;
+    }
+    // no delta-net layers: the GDN scratch at its smallest (qwen35_alloc's shared buffers are sized by it)
+    out.ssm_state = 32;
+    out.ssm_k_heads = out.ssm_v_heads = 1;
+    out.ssm_inner = 32;
+    out.d_conv = 4;
+    out.kda_head_dim = out.head_dim;
+    const auto* tv = g.get("tokenizer.ggml.tokens");
+    out.n_vocab = tv != nullptr && tv->type == strata::MetaType::ARRAY ? (int) tv->count
+                                                                        : (int) num("vocab_size_unpadded", 200058);
+    if (out.ink_vocab_pad < out.n_vocab) out.ink_vocab_pad = out.n_vocab;
+    out.ink_swa.assign((size_t) out.n_layers, 0);
+    const auto* sp = g.get(p + "attention.sliding_window_pattern");
+    if (sp == nullptr || sp->type != strata::MetaType::ARRAY || sp->items.size() < (size_t) out.n_layers) {
+        err = "inkling: attention.sliding_window_pattern is missing or shorter than the layers";
+        return false;
+    }
+    for (int il = 0; il < out.n_layers; ++il) out.ink_swa[(size_t) il] = sp->items[(size_t) il].u != 0;
+    const auto per_layer_same = [&](const char* key, int want) {
+        const auto* v = g.get(p + key);
+        if (v == nullptr || v->type != strata::MetaType::ARRAY) return true;
+        for (const auto& it : v->items)
+            if (!it.is_num() || (int) it.num() != want) return false;
+        return true;
+    };
+    if (!per_layer_same("attention.head_count", out.n_head) || !per_layer_same("attention.head_count_kv", out.attn_head_kv)) {
+        err = "inkling: per-layer head counts differ (not supported)";
+        return false;
+    }
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_embd % 256 != 0 || out.n_expert <= 0 || out.n_expert > 512 ||
+        out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK || out.n_ff_exp % 128 != 0) {
+        err = "inkling: block_count / embedding_length / expert_count / expert_used_count / expert_feed_forward_length "
+              "are off";
+        return false;
+    }
+    if (out.head_dim != 128 || v_len != 128 || out.n_head % out.attn_head_kv != 0 || out.n_head > 64 ||
+        out.ink_rel != 16 || out.ink_conv != 4 || out.ink_extent <= 0 || out.n_swa <= 0 || out.ink_block <= 0 ||
+        out.ink_situ_b != 4.0f || out.ink_situ_lb != 25.0f) {
+        err = "inkling: the kernels take head_dim 128, relative_length 16, l_cache 4 and SITU betas 4 / 25";
+        return false;
+    }
+    if (out.ink_passes < 1 ||
+        (out.ink_passes > 1 && (out.ink_lo <= 0 || out.ink_hi > out.n_layers || out.ink_lo >= out.ink_hi ||
+                                out.ink_lo % out.ink_block != 0 || out.ink_hi % out.ink_block != 0))) {
+        err = "inkling: the loop core [loop.start, loop.end) is off for the block size";
+        return false;
+    }
+    out.n_head_kv.assign((size_t) out.n_layers, out.attn_head_kv);
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
     return true;
 }
 
@@ -2001,6 +2128,13 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
              : q35_kv != 0 ? (double) (strata::kernels::q35::kv_row_bytes(q35_kv, false) + strata::kernels::q35::kv_row_bytes(q35_kv, true)) : 4.0 * g.head_dim) +
         (g.q4x ? 4.0 * 128.0 * ((double) max_ctx / 4.0 + 2.0 + 3.0) : 0.0);
     const auto layer_state = [&](int l) {
+        if (g.ink) {   // (inkling: a slot a pass - a window layer's ring of n_swa + kLagSlice rows - and its conv rows)
+            const double passes = l >= g.ink_lo && l < g.ink_hi ? (double) g.ink_passes : 1.0;
+            const double rows = g.ink_swa[(size_t) l] ? std::min<double>((double) max_ctx, (double) g.n_swa + Glm5Geometry::kLagSlice)
+                                                      : (double) max_ctx;
+            return passes * (rows * g.attn_head_kv * 4.0 * g.head_dim +
+                             4.0 * 3.0 * (2.0 * g.attn_head_kv * g.head_dim + 2.0 * g.n_embd));
+        }
         if (g.qwen35()) return g.is_recr(l) ? gdn_state : q35_attn_state;
         return g.is_recr(l) ? kda_state : dsa_state;
     };
@@ -3509,7 +3643,25 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const int role_sh[3] = {nl.gate_shard, nl.up_shard, nl.down_shard};
             const uint64_t role_of[3] = {nl.gate_off, nl.up_off, nl.down_off};
             const int role_ty[3] = {gu, ut, dty};   // (ut == gu unless the layer is mixed)
+            // a fused gate_up tensor (Inkling 2's ffn_gate_up_exps: an expert's gate rows then its up rows): the row's
+            // gate offset is the tensor's, its up offset the gate rows' bytes past it, both with the fused stride
+            {
+                const std::string fn = "blk." + std::to_string(layer) + ".ffn_gate_up_exps.weight";
+                const strata::TensorInfo* tf = gfs[(size_t) nl.gate_shard]->find(fn);
+                if (tf != nullptr && gfs[(size_t) nl.gate_shard]->find("blk." + std::to_string(layer) + ".ffn_gate_exps.weight") == nullptr) {
+                    const uint64_t gb = (uint64_t) nl.fmt.gu_row * (uint64_t) g_.n_ff_exp;
+                    if ((int) tf->type != gu || gu != ut || nl.up_shard != nl.gate_shard ||
+                        (uint64_t) gfs[(size_t) nl.gate_shard]->data_start() + tf->offset != nl.gate_off ||
+                        nl.up_off != nl.gate_off + gb) {
+                        err = "pack: native_experts row " + std::to_string(layer) + " disagrees with " + fn;
+                        return false;
+                    }
+                    nl.gu_stride = 2 * gb;
+                    role_tn[0] = role_tn[1] = nullptr;
+                }
+            }
             for (int ri = 0; ri < 3; ++ri) {
+                if (role_tn[ri] == nullptr) continue;   // (the fused gate_up: checked above)
                 const std::string rn = "blk." + std::to_string(layer) + "." + role_tn[ri];
                 const strata::TensorInfo* ti = gfs[(size_t) role_sh[ri]]->find(rn);
                 if (ti == nullptr || (int) ti->type != role_ty[ri] ||

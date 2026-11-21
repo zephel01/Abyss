@@ -172,6 +172,28 @@ struct Glm5Geometry {
     bool is_hy4() const { return arch == 3; }
     static bool from_gguf_hy4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
+    // ---- inkling (Thinking Machines Inkling 2 Mini, GGUF arch inkling2_loop / inkling2; src/core/inkling_fast_path.cu,
+    // kernels/inkling_fast.hpp): arch stays 2 (the qwen35moe path's MoE, pool, tiers and CPU lane) with ink set.  n_layers
+    // counts the PHYSICAL layers (24); layers [ink_lo, ink_hi) run ink_passes times with shared weights (48 layer
+    // applications a token), each pass with its own KV and convolution state (a "slot").  No RoPE: a relative-position
+    // bias (ink_rel dims a head, a table of ink_extent distances), log-scaled q / r on the full layers, qk / r L2 clips,
+    // a per-query sink logit, a sigmoid output gate, short causal convolutions (ink_conv taps) on K, V and the two
+    // sublayer outputs, attention residual blocks of ink_block layers (learned depth-attention over the earlier blocks),
+    // the loop's controllers mixing the previous pass's messages in.  128 experts, top 8, no shared expert, SITU
+    // activation (gate beta ink_situ_b, up ink_situ_lb), a final logit softcap
+    bool ink = false;
+    std::vector<char> ink_swa;          // per physical layer: a sliding-window layer (window n_swa)
+    int ink_rel = 16, ink_extent = 1024, ink_conv = 4, ink_block = 6;
+    int ink_lo = 6, ink_hi = 18, ink_passes = 3, ink_rank = 64;
+    float ink_qk_clip = 22.627417f, ink_rel_clip = 8.0f, ink_log_floor = 8192.0f, ink_log_alpha = 0.1f;
+    float ink_situ_b = 4.0f, ink_situ_lb = 25.0f, ink_softcap = 30.0f;
+    int ink_vocab_pad = 0;              // the embedding / output rows (n_vocab is the tokenizer's, unpadded)
+    /// the layer applications a token (prelude + passes x core + coda) - every one a slot of its own state
+    int ink_slots() const { return n_layers + (ink_passes - 1) * (ink_hi - ink_lo); }
+    /// a slot's physical layer
+    int ink_phys(int sl) const { return sl < n_layers ? sl : ink_lo + (sl - n_layers) % (ink_hi - ink_lo); }
+    static bool from_gguf_inkling(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
@@ -440,6 +462,9 @@ public:
         strata::kernels::cpu::NativeFmt fmt;
         int gate_shard = 0, up_shard = 0, down_shard = 0;
         uint64_t gate_off = 0, up_off = 0, down_off = 0;   // absolute file offsets of the tensors
+        // a fused ffn_gate_up_exps tensor (Inkling 2): expert e's gate rows at gate_off + e gu_stride, its up rows right
+        // after them (up_off = gate_off + the gate rows' bytes, the same stride); 0 = separate gate / up tensors
+        uint64_t gu_stride = 0;
         // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
         // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
         int x_cb = -1;
@@ -683,6 +708,15 @@ public:
     bool fast_qwen35_gdn(int il, std::string& err);        // x / xq -> mixer
     bool fast_qwen35_attn(int il, int64_t p, std::string& err);
     bool fast_laguna_attn(int il, int64_t p, std::string& err);   // laguna's attention layer (x / xq -> mixer)
+    // ---- inkling (inkling_fast_path.cu): the physical layer's weights (from qwen35_bind), the slots and scratch (from
+    // qwen35_alloc, inside qwen35_state_), the token path's 48 layer applications and the head's mix (head_x / head_xq),
+    // a new sequence's zeroed conv states, the snapshot's runs (conv states, window rings)
+    void ink_bind(int il, std::string& missing);
+    bool ink_alloc(size_t& bytes, bool place, uint8_t*& at, std::string& err);
+    bool fast_ink_layers(int64_t p, std::string& err);
+    void ink_reset();
+    void ink_snap_runs(std::vector<std::pair<void*, size_t>>& out) const;
+    void ink_free();
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);

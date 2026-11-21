@@ -124,6 +124,20 @@ Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a pos
 | `Q3_K_M` ([nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF); IQ4_NL Engram table inside the shards; v1.3.178) | 107.5 GB | nll 1.746 on the 459-token set, 3.910 on a Japanese 4K text (Maya-XS 4.167); Japanese facts 76 / 80 at temp 0.9 (2 seeds), 38 / 40 at temp 0 (Maya-XS 76 / 80, 40 / 40) | decode 40.5 tok/s (median of 3; 35% of its 63.8 GB of experts in VRAM, 264 experts a token on the CPU) | 32 GB GPU + 96 GB RAM |
 | `Q4_K_M` (same repository) | 127.2 GB | not measured | not measured | |
 
+### Inkling 2 Mini (beta, unreleased)
+
+Thinking Machines' Inkling-2-Mini (Apache-2.0, 26B, depth-attention mixes and a 3-pass loop over layers 6-17), text
+only. Both GGUF layouts load: the mainline `inkling2_loop` files and unsloth's root `inkling2` files. Quality: KL
+against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token EN / JA / code set, and on positions
+8,960-9,471 of a 9.5K text. Speeds: RTX 5090 (PCIe Gen4 x4), iGPU lane off, a 4K prompt, then 512 tokens, median of
+3. llama.cpp is `llama-bench -fa 1 -d 4096 -n 512` on the same Q4_K_XL file. The prompt runs one token at a time in
+Abyss for now: about 120 tok/s, against llama.cpp's 2,135 at a 4K depth.
+
+| file (source) | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `Q8_0` ([ggml-org/Inkling-2-Mini-GGUF](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)) | 27.8 GB | KL 0.0051 (EN 0.0037, JA 0.0067, code 0.0044), same top-1 96.8%; 9K positions KL 0.0046 | all in VRAM: 118.5 tok/s | 32 GB GPU |
+| `UD-Q4_K_XL` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF); NVFP4 experts) | 17.6 GB | KL 0.0126 against llama.cpp on the same file, 0.0057 against the llama.cpp Q8_0 (llama.cpp's own run of this file: 0.0133) | all in VRAM 128.2; `STRATA_GLM_VRAM_GB=16` 122.8; `=12` 104.6 tok/s. llama.cpp: all in VRAM 94.9, `--n-cpu-moe 6` (15.3 GB) 71.7, `--n-cpu-moe 12` 48.9 | 12-16 GB GPU + RAM |
+
 ### Qwen3.8-Flash-Next (qwen4exp)
 
 Details, packing and the drafter: [docs/qwen38](qwen38/README.md). KL is against the NVFP4 teacher (seq 0-9, 2,048

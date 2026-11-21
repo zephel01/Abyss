@@ -165,8 +165,16 @@ HY4_NATIVE_OK = ("attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "
                  "ffn_routed_down.weight", "ffn_routed_up.weight", "engram_kv.weight",
                  "indexer.attn_k.weight", "indexer.attn_q_b.weight",   # (nace-ai's GGUFs: Q8_0; Maya's: F32)
                  "token_embd.weight", "output.weight")
+# inkling2_loop / inkling2 (Thinking Machines Inkling 2 Mini): every non-expert tensor served as stored (the Q8_0
+# projections, the relative-position and sink projections, the dynamic conv taps' projections); F32 norms, clips, conv
+# taps, residual queries, the loop's controllers and the router into dense.bin.  The experts' gate and up are ONE
+# tensor (ffn_gate_up_exps: an expert's gate rows, then its up rows): native_experts.txt gives the up role the offset
+# of the gate rows' end, and the engine reads both with the fused stride
+INKLING_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_gate.weight",
+                     "attn_rel.weight", "attn_sink_proj.weight", "attn_k_conv_proj.weight", "attn_v_conv_proj.weight",
+                     "token_embd.weight", "output.weight")
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
-                 "sensenova_loop", "hy_v4_flash")   # unsloth spells glm5-next without the hyphen
+                 "sensenova_loop", "hy_v4_flash", "inkling2_loop", "inkling2")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -180,7 +188,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
-    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna", "hy_v4_flash"):
+    if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna", "hy_v4_flash", "inkling2_loop", "inkling2"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -382,6 +390,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             elif arch == "laguna" and not name.endswith(LAGUNA_NATIVE_OK):
                 print("%s is %s: not on the laguna native set (LAGUNA_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
+            elif arch in ("inkling2_loop", "inkling2") and not name.endswith(INKLING_NATIVE_OK):
+                print("%s is %s: not on the inkling native set (INKLING_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
             elif arch == "hy_v4_flash" and not name.endswith(HY4_NATIVE_OK):
@@ -734,6 +746,10 @@ def main() -> int:
         prefix = "laguna."
         print("laguna: packing for the Glm5Model runner's qwen35moe path, laguna layers (every dense tensor served as "
               "stored)")
+    if arch in ("inkling2_loop", "inkling2"):
+        prefix = arch + "."
+        print("%s: packing for the Glm5Model runner's qwen35moe path, inkling layers (every dense tensor served as "
+              "stored; the fused gate_up experts read in place)" % arch)
     if arch == "hy_v4_flash":
         prefix = "hy_v4_flash."
         print("hy_v4_flash: packing for the Glm5Model runner's hy4 path (every dense tensor served as stored; the "
@@ -743,7 +759,8 @@ def main() -> int:
         print("%s: packing for the Glm5Model runner's qwen35moe path (every dense tensor served as stored)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna", "hy_v4_flash"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna", "hy_v4_flash",
+                "inkling2_loop", "inkling2"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -779,6 +796,11 @@ def main() -> int:
         print("%s: nextn_predict_layers %d but blk.%d is a trunk layer (no draft block in the file)"
               % (arch, block_count - trunk, block_count - 1))
         trunk = block_count
+    if arch == "inkling2" and int(g.metadata.get("inkling2.num_loops", 1)) > 1:
+        # (unsloth's looped layout: block_count counts the layer applications; the file holds the physical layers)
+        nl = int(g.metadata["inkling2.num_loops"])
+        core = int(g.metadata.get("inkling2.loop.core_end", 18)) - int(g.metadata.get("inkling2.loop.core_start", 6))
+        block_count = trunk = block_count - (nl - 1) * core
     if trunk is not None:
         print("%s: block_count %d -> trunk layers 0..%d" % (arch, block_count, trunk - 1))
     T = {n: w[1] for n, w in model.where.items()}
@@ -832,7 +854,8 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna", "hy_v4_flash"):
+    if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna", "hy_v4_flash", "inkling2_loop",
+                "inkling2"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)
@@ -843,7 +866,24 @@ def main() -> int:
         print("the routers disagree on the expert count; a per-layer pruned model cannot be packed")
         return 1
     layout, offset = [], 0
+    fused = {}   # layer -> the fused gate_up tensor's gate-rows bytes an expert (inkling)
     for l in moe_layers:
+        fu = "blk.%d.ffn_gate_up_exps.weight" % l
+        if fu in T and "blk.%d.ffn_gate_exps.weight" % l not in T:
+            # gate and up in one tensor, an expert's gate rows then its up rows: the two roles are its halves
+            t = T[fu]
+            half = t.expected_bytes() // n_expert // 2
+            if half * 2 * n_expert != t.expected_bytes():
+                print("%s: the fused gate_up tensor does not split into two halves an expert" % fu)
+                return 1
+            ts = [t, t, T["blk.%d.ffn_down_exps.weight" % l]]
+            per = [half, half, ts[2].expected_bytes() // n_expert]
+            fused[l] = half
+            gt = str(t.type_id)
+            blob = per[0] + per[1] + per[2]
+            layout.append((l, gt, ts[2].type_id, offset, blob, ts))
+            offset += blob * n_expert
+            continue
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
         per = [t.expected_bytes() // n_expert for t in ts]
         # gate and up may differ in type (unsloth's UD-IQ1_S Qwen3.8: IQ2_S gate + IQ2_XXS up in 13 layers): the row's
@@ -869,6 +909,8 @@ def main() -> int:
             # gate role's file for every role put layer 25's down 7616 bytes low in the
             # UD-IQ1_S pack: gate/up sat in one shard, down in another.)
             offs = [w[0].data_start + t.offset for w, t in zip(ws, ts)]
+            if l in fused:   # (the up role: the fused tensor's gate rows' end)
+                offs[1] += fused[l]
             if len(set(shards)) == 1:
                 # v3 row: one shard for the whole blob (omitted when it is shard 1)
                 line = "%d %s %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
@@ -887,6 +929,9 @@ def main() -> int:
         if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
         return 0
+    if fused:
+        print("--experts-bin: a fused gate_up model is read from its GGUF only")
+        return 1
     path = out / "experts.bin"
     if path.exists() and path.stat().st_size == offset:
         print("experts.bin exists with the right size; not rewritten")

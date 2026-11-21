@@ -9,6 +9,22 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.183 - 2026-11-21
+
+Inkling 2 Mini (text, beta): decode faster than llama.cpp on every VRAM size tried (RTX 5090 Q4_K_XL 128 vs 95 tok/s,
+12 GB 105 vs 49); prompts still one token at a time (about 120 tok/s). Other models give the same bits as v1.3.182
+(7-config md5 check).
+
+- Inkling 2 Mini (Thinking Machines, Apache-2.0), text only, beta: `--model inkling2mini` (unsloth UD-Q4_K_XL). Both
+  GGUF layouts load (mainline `inkling2_loop`, unsloth root `inkling2` with `num_loops`), and so do NVFP4 fused
+  gate_up experts with a per-expert scale. The engine has its own kernels for the depth-attention mixes, the loop
+  controllers, the short convolutions (dynamic K / V taps), the clips with log-scaled positions, the sink + relative-bias
+  attention, the SITU activation (a negative clamp selects it, so other models are unchanged) and the logit
+  softcap. The server parses the Inkling message markers and sets the thinking effort. KL against llama.cpp: Q8_0
+  0.0051, Q4_K_XL 0.0126 (0.0057 against the Q8_0). RTX 5090, 4K: Q4_K_XL 128.2 tok/s all in VRAM, 122.8 at 16 GB,
+  104.6 at 12 GB (llama.cpp 94.9 / 71.7 / 48.9). Prompts run one token at a time for now. Other models give the
+  same bits (7-config md5 check).
+
 ## v1.3.182 - 2026-11-21
 
 HIP prompts on the engine's own GEMM, no rocBLAS / hipBLASLt call (#49): faster on the Radeon 8060S (Ornith-1.5-35B

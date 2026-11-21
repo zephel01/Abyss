@@ -48,6 +48,10 @@ size_t al(size_t b) { return (b + 255u) & ~(size_t) 255u; }
 void Glm5Model::qwen35_bind(int il, std::string& missing) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    if (g.ink) {   // (inkling: its own layer weights - inkling_fast_path.cu)
+        ink_bind(il, missing);
+        return;
+    }
     auto& Ly = F->L[(size_t) il];
     const std::string P = "blk." + std::to_string(g.phys(il)) + ".";   // (SenseNova-Loop: a second visit's weights)
     const auto f32 = [&](const char* n) -> const float* {
@@ -200,6 +204,11 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
 bool Glm5Model::qwen35_alloc(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    if (g.ink) {   // (inkling: its slots and scratch - inkling_fast_path.cu)
+        size_t b = 0;
+        uint8_t* a = nullptr;
+        return ink_alloc(b, false, a, err);
+    }
     if (g.q4x && l1_ == g.n_layers) {   // the output mixer's weights (the head's part)
         const auto nw = w_.find("output_hc_norm.weight");
         const auto dw = ws_map_.find("output_hc_down.weight"), uw = ws_map_.find("output_hc_up.weight");
@@ -807,6 +816,7 @@ void Glm5Model::qwen35_reset() {
     if (F == nullptr || qwen35_state_ == nullptr) return;
     const Glm5Geometry& g = g_;
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim();
+    if (g.ink) ink_reset();   // (inkling: the conv states)
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.recr) continue;
@@ -833,6 +843,13 @@ size_t Glm5Model::q35_snap_bytes() const {
     const FastState* F = fast_;
     if (F == nullptr || qwen35_state_ == nullptr) return 0;
     const Glm5Geometry& g = g_;
+    if (g.ink) {   // (inkling: every slot's conv state and window ring - ink_snap_runs)
+        std::vector<std::pair<void*, size_t>> runs;
+        ink_snap_runs(runs);
+        size_t t = 0;
+        for (const auto& r : runs) t += r.second;
+        return t;
+    }
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim();
     const size_t state_b = S * HV * S * 4, conv_b = C * (size_t) (g.d_conv - 1) * 4;
     const size_t pend_b = F->q35_pend_h != nullptr ? (size_t) (g.q4x ? g.hc : 1) * g.n_embd * 4 : 0;
@@ -879,7 +896,12 @@ bool Glm5Model::q35_snap_copy(bool restore) {
                         F->cs);
         at += b;
     };
-    for (int il = l0_; il < l1_; ++il) {
+    if (g.ink) {
+        std::vector<std::pair<void*, size_t>> runs;
+        ink_snap_runs(runs);
+        for (const auto& r : runs) run(r.first, r.second);
+    }
+    for (int il = l0_; il < l1_ && !g.ink; ++il) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.recr) {
             if (Ly.q4_tail != nullptr) run(Ly.q4_tail, tail_b);
@@ -925,6 +947,10 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
     }
     if (split_next_ != nullptr || next_port_ != nullptr || l0_ != 0 || l1_ != g_.n_layers) {
         why = "the model is split across GPUs";
+        return false;
+    }
+    if (g_.ink) {
+        why = "inkling's slots are not covered yet";
         return false;
     }
     if (g_.laguna) {
@@ -1934,6 +1960,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     q35_dump_pos = p;
     if (g.q4x) return fast_q4x_layers(p, err);
     if (g.loop) return fast_loop_layers(p, err);
+    if (g.ink) return fast_ink_layers(p, err);
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];

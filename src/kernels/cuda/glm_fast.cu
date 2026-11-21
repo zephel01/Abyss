@@ -110,6 +110,12 @@ __device__ __forceinline__ float lane_expf(float x) {
     if (k > 127) return __fmul_rn(__fmul_rn(p, __int_as_float(254 << 23)), 2.0f);
     return __fmul_rn(p, __int_as_float((k + 127) << 23));
 }
+
+// SITU (Inkling 2's expert activation), selected by a negative clamp `limit` (kSituLimit; the clamped SwiGLU's limit is
+// never negative): beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb), beta 4, lb 25 (the loader checks the GGUF's)
+__device__ __forceinline__ float situ_act(float g, float u) {
+    return (4.0f * tanhf(g * 0.25f)) * (1.0f / (1.0f + expf(-g))) * (25.0f * tanhf(u * 0.04f));
+}
 // the exact combine's fixed point (glm_fast.hpp kFxShift; the CPU lane's q81::fx_term): a term to int64 units of
 // 2^-kFxShift, rounded to nearest even; kFxBad when it is not finite or |v| >= 2^24.  fx_float: a sum back, rounded once
 __device__ __forceinline__ long long fx_term(float v) {
@@ -2878,6 +2884,10 @@ __global__ void swiglu_q8_kernel(const float* __restrict__ gate, const float* __
                                  block_q8_1* __restrict__ hq) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n % 32 == 0
+    if (limit < 0.0f) {
+        q8_1_store_warp(situ_act(gate[i], up[i]), hq + i / 32, threadIdx.x & 31);
+        return;
+    }
     const float g = fminf(gate[i], limit);
     const float u = fminf(fmaxf(up[i], -limit), limit);
     q8_1_store_warp((g / (1.0f + expf(-g))) * u, hq + i / 32, threadIdx.x & 31);
@@ -4252,9 +4262,13 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
         float sc = 1.0f;
         if constexpr (TG == 40)
             if (d.nv_scale != nullptr && plan_id != nullptr && plan_id[ei] >= 0) sc = d.nv_scale[2 * plan_id[ei]];
+        if (limit < 0.0f) {
+            q8_1_store_warp(situ_act(sc * sg[lane], sc * su[lane]), hq + (size_t) ei * (n_ff / 32) + chunk, lane);
+        } else {
         const float g = fminf(sc * sg[lane], limit);
         const float u = fminf(fmaxf(sc * su[lane], -limit), limit);
         q8_1_store_warp(__fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, lane_expf(-g))), u), hq + (size_t) ei * (n_ff / 32) + chunk, lane);
+        }
     }
 }
 
@@ -4674,6 +4688,10 @@ __global__ void rows_swiglu_q8_kernel(const float* __restrict__ gu, int ld, int 
     const int64_t r = rlo + w / per, b = w % per;
     if (r >= rhi) return;
     const float* row = gu + (size_t) r * ld;
+    if (limit < 0.0f) {
+        q8_1_store_warp(situ_act(row[b * 32 + lane], row[n_ff + b * 32 + lane]), hq + (size_t) (r - rlo) * per + b, lane);
+        return;
+    }
     const float gv = fminf(row[b * 32 + lane], limit);
     const float uv = fminf(fmaxf(row[n_ff + b * 32 + lane], -limit), limit);
     q8_1_store_warp((gv / (1.0f + expf(-gv))) * uv, hq + (size_t) (r - rlo) * per + b, lane);
@@ -5739,6 +5757,10 @@ void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq,
 __global__ void swiglu_f32_kernel(const float* gate, const float* __restrict__ up, float limit, int n, float* h) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (limit < 0.0f) {
+        h[i] = situ_act(gate[i], up[i]);
+        return;
+    }
     const float g = fminf(gate[i], limit);
     const float u = fminf(fmaxf(up[i], -limit), limit);
     h[i] = (g / (1.0f + expf(-g))) * u;
@@ -6366,10 +6388,15 @@ __global__ void __launch_bounds__(GU_WARPS * 32) xrows_gate_up_kernel(const uint
         __syncthreads();
         if (warp < nt) {   // (moe_gate_up_kernel's epilogue: sc = 1)
             const float sc = 1.0f;
+            if (limit < 0.0f) {
+                q8_1_store_warp(situ_act(sc * sg[warp][lane], sc * su[warp][lane]),
+                                hq + (size_t) (R0 + t0 + warp - rlo) * (n_ff / 32) + chunk, lane);
+            } else {
             const float g = fminf(sc * sg[warp][lane], limit);
             const float u = fminf(fmaxf(sc * su[warp][lane], -limit), limit);
             q8_1_store_warp(__fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, lane_expf(-g))), u),
                             hq + (size_t) (R0 + t0 + warp - rlo) * (n_ff / 32) + chunk, lane);
+            }
         }
         __syncthreads();
     }

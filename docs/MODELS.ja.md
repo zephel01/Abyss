@@ -121,6 +121,20 @@ numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの 
 | `Q3_K_M`（[nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF)。Engram の表は IQ4_NL で各ファイルの中。v1.3.178） | 107.5 GB | nll は 459 トークンの組で 1.746、日本語 4K の文で 3.910（Maya-XS 4.167）。日本語の事実問題は温度 0.9 で 80 中 76（seed 2 つ）、温度 0 で 40 中 38（Maya-XS は 76 / 80、40 / 40） | 生成 40.5 tok/s（3 回の中央値。エキスパート 63.8 GB のうち VRAM に 35%、1 トークンあたり 264 個を CPU で計算） | GPU 32 GB + RAM 96 GB |
 | `Q4_K_M`（同じリポジトリ） | 127.2 GB | 未計測 | 未計測 | |
 
+### Inkling 2 Mini（ベータ、未リリース）
+
+Thinking Machines の Inkling-2-Mini（Apache-2.0、26B。深さ方向の注意による混ぜ合わせと、層 6〜17 を 3 回まわすループ）。
+今はテキストだけ。GGUF は 2 つの形式とも読める: mainline の `inkling2_loop` と、unsloth の `inkling2`。品質は
+llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL。3,072 トークンの英語・日本語・コードの組と、9.5K
+の文の 8,960〜9,471 番目で測った。速さは RTX 5090（PCIe Gen4 x4）、iGPU レーンなし、4K のプロンプトの後に 512
+トークン生成、3 回の中央値。llama.cpp は同じ Q4_K_XL のファイルで `llama-bench -fa 1 -d 4096 -n 512`。Abyss のプロンプトは今は
+1 トークンずつ読む: 約 120 tok/s（llama.cpp は 4K の位置で 2,135）。
+
+| ファイル（入手先） | 大きさ | 品質 | 速さ | 向き |
+| --- | ---: | --- | --- | --- |
+| `Q8_0`（[ggml-org/Inkling-2-Mini-GGUF](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)） | 27.8 GB | KL 0.0051（英語 0.0037、日本語 0.0067、コード 0.0044）、top-1 の一致 96.8%。9K の位置で KL 0.0046 | 全部 VRAM: 118.5 tok/s | GPU 32 GB |
+| `UD-Q4_K_XL`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)。エキスパートは NVFP4） | 17.6 GB | 同じファイルの llama.cpp との KL 0.0126。llama.cpp の Q8_0 との KL 0.0057（llama.cpp でこのファイルを動かすと 0.0133） | 全部 VRAM 128.2、`STRATA_GLM_VRAM_GB=16` 122.8、`=12` 104.6 tok/s。llama.cpp: 全部 VRAM 94.9、`--n-cpu-moe 6`（15.3 GB）71.7、`--n-cpu-moe 12` 48.9 | GPU 12〜16 GB ＋ RAM |
+
 ### Qwen3.8-Flash-Next（qwen4exp）
 
 詳細、pack、ドラフターは [docs/qwen38](qwen38/README.ja.md)。KL は特に書かない限り NVFP4 教師との比較（seq 0〜9、

@@ -1727,6 +1727,17 @@ class Service:
         self.think_budget = 0
         end = _special_ids("</think>") or _special_ids("</think:opensource>")   # (Hy4-flash's spelling)
         self.think_end_id = end[0] if end else None
+        # Inkling 2: no think tags - a turn is messages, <|message_model|><|content_thinking|> reasoning <|end_message|>
+        # <|message_model|><|content_text|> answer <|end_message|> <|content_model_end_sampling|> (its EOS).  The
+        # reasoning's <|end_message|> is its think end; the role / content markers are not text (run() drops them); a
+        # message that opens with <|content_text|> while the reasoning is open has no reasoning
+        ink = [_special_ids(x) for x in ("<|message_model|>", "<|content_thinking|>", "<|content_text|>",
+                                         "<|end_message|>", "<|content_model_end_sampling|>")]
+        self.ink_ids = [x[0] for x in ink] if all(ink) else None
+        if self.ink_ids is not None:
+            self.think_end_id = self.ink_ids[3]
+            self.stop_ids.add(self.ink_ids[4])
+            self.stop_order = [self.ink_ids[4]] + sorted(self.stop_ids - {self.ink_ids[4]})
         # <think> as one token: a template that leaves the opening to the model (MiMo-V2.6-Distill-Qwen-9B's ends the
         # prompt at "<|im_start|>assistant\n") gets it as the answer's first token - not reasoning text (run())
         start = _special_ids("<think>") or _special_ids("<think:opensource>")
@@ -2480,6 +2491,13 @@ class Service:
                                     raw_ids.append(t)
                                     break
                             raw_ids.append(t)
+                            if getattr(self, "ink_ids", None) is not None:   # (Inkling's message markers: not text)
+                                ink_mm, ink_th, ink_tx, ink_em = self.ink_ids[:4]
+                                if t == ink_tx and parser.state == "reasoning":
+                                    parser.state, parser.lead, closed_by = "content", True, None
+                                    continue
+                                if t in (ink_mm, ink_th, ink_tx) or (t == ink_em and parser.state != "reasoning"):
+                                    continue
                             if model_opens:
                                 model_opens = False
                                 if t == tsid:           # the model's own <think>: the reasoning starts after it
@@ -2487,6 +2505,8 @@ class Service:
                                 parser.state, parser.lead, closed_by = "content", True, None   # no reasoning at all
                             in_reasoning = parser.state == "reasoning"
                             text, stopped = detok.push(t), False
+                            if getattr(self, "ink_ids", None) is not None and t == self.ink_ids[3]:
+                                text = ""                   # (Inkling: the reasoning's end marker is not text)
                             stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
                             if (is_think_end and parser.state == "reasoning") or soft:   # the real end, or a kept end
                                 text, held, stops = held + text, "", []                  # token: past the stop scan

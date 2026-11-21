@@ -102,6 +102,16 @@ LAGUNA_PATTERNS = (
 )
 
 
+# The `inkling2` pre-tokenizer (Thinking Machines Inkling 2, an o200k vocabulary): llama-vocab.cpp maps it to
+# LLAMA_VOCAB_PRE_TYPE_GPT4O - one expression, the model's tokenizer.json split (cased letter runs with an optional
+# contraction, digits in runs of up to three, punctuation runs that take trailing newlines and slashes)
+GPT4O_PATTERNS = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+
 def split_sequential(text: str, pats) -> list[str]:
     pieces = [text]
     for pat in pats:
@@ -127,9 +137,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4"):
+        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
-                             "hy_v4" % pre)
+                             "hy_v4, inkling2" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -151,7 +161,8 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
         # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
-        seq = JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna" else None
+        seq = (JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna"
+               else GPT4O_PATTERNS if pre == "inkling2" else None)
         self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,

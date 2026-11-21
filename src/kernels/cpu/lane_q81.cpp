@@ -851,6 +851,11 @@ void lane_q81_gu_rows(int gate_type, int up_type, const uint8_t* gate_base, size
     lane_q81_rows(up_type, up_base + (size_t) r0 * up_row, up_row, n, act, nt, uo.data(), 0, nr);
     for (int t = 0; t < nt; ++t)
         for (int r = 0; r < nr; ++r) {
+            if (limit < 0.0f) {   // (Inkling's SITU: glm_fast.cu's situ_act)
+                const float g = scale * go[(size_t) t][r], u = scale * uo[(size_t) t][r];
+                ff[t][r0 + r] = (4.0f * std::tanh(g * 0.25f)) * (1.0f / (1.0f + std::exp(-g))) * (25.0f * std::tanh(u * 0.04f));
+                continue;
+            }
             const float g = std::fmin(scale * go[(size_t) t][r], limit);
             const float u = std::fmin(std::fmax(scale * uo[(size_t) t][r], -limit), limit);
             ff[t][r0 + r] = (g / (1.0f + q81::lane_expf(-g))) * u;   // (the device epilogue's exp)

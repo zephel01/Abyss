@@ -143,7 +143,9 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("laguna", iq_pack.ARCHITECTURES)      # Abyss: poolside Laguna-S-2.1
         self.assertIn("sensenova_loop", iq_pack.ARCHITECTURES)   # Abyss: SenseNova-Loop-9B (v1.3.169)
         self.assertIn("hy_v4_flash", iq_pack.ARCHITECTURES)      # Abyss: Tencent Hy4-flash
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 10)
+        self.assertIn("inkling2_loop", iq_pack.ARCHITECTURES)    # Abyss: Inkling 2 Mini (mainline's layout)
+        self.assertIn("inkling2", iq_pack.ARCHITECTURES)         # Abyss: Inkling 2 Mini (unsloth's looped layout)
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 12)
 
     def test_hy4_as_stored(self):
         # hy_v4_flash: every non-expert tensor served as stored (the 3-D absorbed k_b / v_b too), nothing to BF16
