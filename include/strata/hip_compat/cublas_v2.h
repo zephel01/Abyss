@@ -1,5 +1,8 @@
 #pragma once
 #include <hipblas/hipblas.h>
+// The handle and the products go to the engine's own GEMM (hip_gemm.hpp); hipBLAS stays behind it for what the own
+// kernels do not cover and for STRATA_HIP_OWN_GEMM=0.
+#include "hip_gemm.hpp"
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
@@ -11,14 +14,14 @@
 #define CUDA_R_16BF HIP_R_16BF
 #define CUDA_R_16F HIP_R_16F
 #define CUDA_R_32F HIP_R_32F
-#define cublasCreate hipblasCreate
-#define cublasDestroy hipblasDestroy
-#define cublasGemmEx hipblasGemmEx
-#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
-#define cublasSgemm hipblasSgemm
-#define cublasSgemmStridedBatched hipblasSgemmStridedBatched
-#define cublasHandle_t hipblasHandle_t
-#define cublasSetMathMode hipblasSetMathMode
-#define cublasSetStream hipblasSetStream
-#define cublasSetWorkspace hipblasSetWorkspace
+#define cublasCreate ::strata::hipgemm::create
+#define cublasDestroy ::strata::hipgemm::destroy
+#define cublasGemmEx ::strata::hipgemm::gemm_ex
+#define cublasGemmStridedBatchedEx ::strata::hipgemm::gemm_strided_batched_ex
+#define cublasSgemm ::strata::hipgemm::sgemm
+#define cublasSgemmStridedBatched ::strata::hipgemm::sgemm_strided_batched
+#define cublasHandle_t ::strata::hipgemm::handle_t
+#define cublasSetMathMode ::strata::hipgemm::set_math_mode
+#define cublasSetStream ::strata::hipgemm::set_stream
+#define cublasSetWorkspace ::strata::hipgemm::set_workspace
 #define cublasStatus_t hipblasStatus_t

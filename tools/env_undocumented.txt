@@ -178,7 +178,6 @@ STRATA_GLM_WINDOW_GROUP  # src/core/dsv4_verify.cu (columns a group of the pipel
 STRATA_GLM_WINDOW_JUNK  # src/core/dsv4_verify.cu (tests only: random drafts, all rejected)
 STRATA_GROUP_COPY  # src/prefill/prefill.cpp
 STRATA_GR_UNFUSED  # src/prefill/prefill.cpp
-STRATA_HIPBLASLT_TUNING  # src/core/glm_prefill.cu
 STRATA_HIPBLASLT_VERBOSE  # src/prefill/gemm.cu
 STRATA_IDX_FP16_CHECK  # src/prefill/prefill.cpp
 STRATA_INDEXER_PER_TOKEN  # src/prefill/prefill.cpp

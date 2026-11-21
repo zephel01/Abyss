@@ -121,6 +121,10 @@ struct HipLtDescriptors {
 std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
     const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
     if (!path || !*path) return nullptr;
+    if (strata::hipgemm::own_on()) {   // (the own GEMM takes every product; the table is for the library path)
+        std::fprintf(stderr, "prefill gemm: STRATA_HIPBLASLT_TUNING is read only with STRATA_HIP_OWN_GEMM=0\n");
+        return nullptr;
+    }
 
     auto state = std::make_unique<HipLtState>();
     state->workspace = workspace;

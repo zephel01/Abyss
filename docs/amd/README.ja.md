@@ -69,6 +69,13 @@ ROCm はカーネルの amdgpu ドライバと、ドライバが作る `/dev/kfd
 ROCm 10 のパッケージは GPU のアーキテクチャごとに分かれています。**使う GPU のアーキテクチャをすべて入れて
 ください。** 入っていないアーキテクチャの GPU では、rocBLAS / hipBLASLt のカーネルが読めません。
 
+> HIP ではプロンプト経路の行列積を Abyss 自前のカーネルで計算します（RDNA3 / RDNA3.5 は WMMA、RDNA4 とそのほかのカードは素の
+> カーネル。[マニュアル](../MANUAL.ja.md) の `STRATA_HIP_OWN_GEMM`）。そのため実行中に rocBLAS / hipBLASLt は呼ばれません。
+> issue #49（Windows、TheRock ROCm 7.14.1）はこの中で落ちていました。ビルドは今も hipBLAS をリンクします（ヘッダーと、
+> `STRATA_HIP_OWN_GEMM=0` で使うライブラリ経路のため）。Radeon 8060S では自前カーネルの方が hipBLAS より速く prompt を読みます
+> （Ornith-1.5-35B Q4_K_M、2K の prompt: 812 -> 1,340 tok/s）。RDNA4 の WMMA カーネルは、実機で動かすまでは
+> `STRATA_HIP_GEMM_WMMA12=1` を付けたときだけ使います。
+
 1. AMD の ROCm インストールの説明に従って、リポジトリと署名鍵を登録します。上の PC の
    `/etc/apt/sources.list.d/amdrocm-stable.sources` は次のとおりです。
 
@@ -353,7 +360,7 @@ iGPU のない PC でも、R9700 と十分な RAM があれば、この 6 問を
 | `rocminfo` が `HSA_STATUS_ERROR_OUT_OF_RESOURCES` で終わる | `HSA_OVERRIDE_GFX_VERSION` が残っている | 「3. 環境変数」の手順で消し、ログインし直す |
 | `rocminfo` が `/dev/kfd` を開けない（permission denied） | `render` グループに入っていない | `sudo usermod -aG render,video $USER` のあとログインし直す |
 | モデルは読み込めて `/health` も答えるのに、どのリクエストも `kernel launch(es) failed`（HTTP 400）ですぐ失敗する | ドライバが RAM 層をピン留めできない: `sudo dmesg \| grep -i userptr` に `failed to pin userptr` や `failed to validate BO` が出る（カーネルの amdgpu。issue #1）。または、エンジンを ROCm 7.0〜7.2 でビルドした（issue #1: ROCm 7.0 の pip SDK と amdgpu-dkms 6.19.14。issue #8: 7.2.1。ログに `hipHostRegister: invalid argument`） | ROCm 10 にして、セットアップをもう一度（「別の ROCm に切り替えるとき」）。`dmesg` のエラーには amdgpu-dkms と `iommu=pt`（「1. ドライバ」） |
-| 生成はできるのに、最初の prompt で止まる。サーバーが 503 を返し、180 秒でエンジンが終了させられる | rocBLAS / hipBLASLt にその GPU のカーネルがない（例: gfx1151 の分しか入っていない） | `sudo apt install amdrocm10.0-<arch>`（R9700 なら gfx1201）。確かめ方は「4. 動作確認」 |
+| 生成はできるのに、最初の prompt で止まる。サーバーが 503 を返し、180 秒でエンジンが終了させられる | rocBLAS / hipBLASLt にその GPU のカーネルがない（例: gfx1151 の分しか入っていない）。自前の prompt GEMM になってからは `STRATA_HIP_OWN_GEMM=0` のときだけ | `sudo apt install amdrocm10.0-<arch>`（R9700 なら gfx1201）。確かめ方は「4. 動作確認」 |
 | エンジンのログに `No compatible code objects found for: gfx1201` が出る。iGPU レーンで `invalid device function` になる | 古いビルドの `libabyss_igpu.so` に、エンジンの GPU 用のコードが入っていない。HIP は、見えている GPU のどれか 1 つでもコードがないライブラリだと、そのカーネルを全部の GPU で使えなくする | 今のソースでビルドし直す（`./setup-deepseek.sh --backend hip`） |
 | 単体カードがあるのに遅く、ログの GPU が iGPU（gfx1151）になっている | HIP の番号が入れ替わり、設定の `"gpu"` が iGPU を指している | 設定に `"gpu_pci"` を書く（「GPU の番号が変わる場合」）。`rocminfo` で順番を確かめる |
 | 単体カードと iGPU があるのに、ログに `-> the iGPU computes the lane` が出ない | 設定の `env` で `HIP_VISIBLE_DEVICES` を単体カードだけにしている、または `STRATA_GLM_IGPU=0` | どちらも外す |

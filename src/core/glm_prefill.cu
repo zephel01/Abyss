@@ -2638,7 +2638,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 #if defined(STRATA_USE_HIP)
         if (!S->lt_tried) {
             S->lt_tried = true;
-            if (getenv("STRATA_HIPBLASLT_TUNING")) {
+            // (a hipBLASLt tuning table is read only on the library path: STRATA_HIP_OWN_GEMM=0)
+            if (getenv("STRATA_HIPBLASLT_TUNING") && !strata::hipgemm::own_on()) {
                 auto lt = std::make_unique<strata::prefill::Gemm>();
                 std::string lt_err;
                 if (lt->init_external(F->cs, S->w16, S->w16_elems, S->ws, S->ws_bytes, lt_err))
@@ -3767,7 +3768,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     else
                         bf16_to_f16<<<1024, 256, 0, s>>>(Ly.k_b, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.q, hp_q, tn, g.n_head, g.qk_nope);
-                    blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
+                    blas_ck(cublasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
                                                         S->w16, HIP_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
                                                         hp_q, HIP_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
                                                         B.q_abs, use_f16q ? HIP_R_16F : HIP_R_32F, g.n_head * g.kv_lora,
@@ -3809,7 +3810,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     else
                         bf16_to_f16<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.ctx, hp_c, tn, g.n_head, g.kv_lora);
-                    blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                    blas_ck(cublasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
                                                         S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
                                                         hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
                                                         B.attn, HIP_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,

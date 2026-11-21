@@ -68,6 +68,13 @@ ROCm reaches the GPU through the kernel's amdgpu driver and the `/dev/kfd` devic
 ROCm 10's packages are split by GPU architecture. **Install every architecture you will use.** On a GPU whose
 architecture is missing, rocBLAS and hipBLASLt find no kernels.
 
+> The prompt path's matrix products run on Abyss's own kernels on HIP (WMMA on RDNA3 / RDNA3.5, a plain kernel on
+> RDNA4 and other cards; `STRATA_HIP_OWN_GEMM` in the [manual](../MANUAL.md)), so rocBLAS / hipBLASLt are no longer
+> called during a run - issue #49 (Windows, TheRock ROCm 7.14.1) crashed inside them. The build still links hipBLAS
+> (headers, and the library path behind `STRATA_HIP_OWN_GEMM=0`). On a Radeon 8060S the own kernels read prompts
+> faster than hipBLAS did (Ornith-1.5-35B Q4_K_M, 2K prompt: 812 -> 1,340 tok/s). On RDNA4 the WMMA kernel is opt-in
+> (`STRATA_HIP_GEMM_WMMA12=1`) until it has been run on such a card.
+
 1. Add the repository and its signing key as AMD's ROCm install guide describes. On the machine above,
    `/etc/apt/sources.list.d/amdrocm-stable.sources` reads:
 
@@ -344,7 +351,7 @@ windows are pipelined in two groups on the two hardware queues - another reason 
 | `rocminfo` ends with `HSA_STATUS_ERROR_OUT_OF_RESOURCES` | `HSA_OVERRIDE_GFX_VERSION` is still set | remove it as in "3. Environment variables", then log in again |
 | `rocminfo` cannot open `/dev/kfd` (permission denied) | not in the `render` group | `sudo usermod -aG render,video $USER`, then log in again |
 | The model loads and `/health` answers, but every request fails at once with `kernel launch(es) failed` (HTTP 400) | the driver cannot pin the RAM tier: `sudo dmesg \| grep -i userptr` shows `failed to pin userptr` or `failed to validate BO` (the kernel's own amdgpu, issue #1). Or the engine was built with ROCm 7.0-7.2 (issue #1: a 7.0 pip SDK with amdgpu-dkms 6.19.14; issue #8: 7.2.1, the log shows `hipHostRegister: invalid argument`) | ROCm 10, then setup again ("Switching to another ROCm"); for the `dmesg` error amdgpu-dkms and `iommu=pt` ("1. The driver") |
-| Decode works, but the first prompt hangs; the server answers 503 and the engine is stopped after 180 s | rocBLAS / hipBLASLt have no kernels for that GPU (for example only gfx1151's are installed) | `sudo apt install amdrocm10.0-<arch>` (gfx1201 for an R9700); check as in "4. Check the install" |
+| Decode works, but the first prompt hangs; the server answers 503 and the engine is stopped after 180 s | rocBLAS / hipBLASLt have no kernels for that GPU (for example only gfx1151's are installed); since the own prompt GEMM this needs `STRATA_HIP_OWN_GEMM=0` | `sudo apt install amdrocm10.0-<arch>` (gfx1201 for an R9700); check as in "4. Check the install" |
 | The engine log shows `No compatible code objects found for: gfx1201`, or the iGPU lane fails with `invalid device function` | an older build's `libabyss_igpu.so` has no code for the engine's GPU. HIP refuses a library's kernels on every GPU when any visible GPU has no code in it | rebuild from the current source (`./setup-deepseek.sh --backend hip`) |
 | Slow with a discrete card attached, and the log's GPU is the iGPU (gfx1151) | the HIP numbers flipped and the config's `"gpu"` now names the iGPU | add `"gpu_pci"` to the config ("When the GPU numbers change"); check the order with `rocminfo` |
 | A discrete card and the iGPU are there, but the log never shows `-> the iGPU computes the lane` | the config's `env` narrows `HIP_VISIBLE_DEVICES` to the discrete card, or sets `STRATA_GLM_IGPU=0` | remove both |

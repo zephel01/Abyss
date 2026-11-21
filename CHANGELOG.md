@@ -9,6 +9,22 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- HIP: the prompt path's matrix products run on the engine's own GEMM instead of hipBLAS / rocBLAS / hipBLASLt (#49:
+  Windows 11, RX 9060 XT, TheRock ROCm 7.14.1 - a 2K prompt on Qwen3.8 16G64G stopped with an access violation inside
+  `hipblasGemmEx` -> `rocblas_gemm_ex` -> `hipblasLtMatmul`). Every cuBLAS-style product the HIP build made (FP16 /
+  BF16 / F32 weights x tokens with F32 accumulation, single and strided batched: all models' dense projections, the
+  GLM MLA head products, the DeepSeek V4 / V4.1 indexer weights and Engram, the qwen35 QSA projections, EXL3 /
+  dequantized dense FFNs, Hy4, the older prefill path and the hipBLASLt-table GEMM) goes to
+  `include/strata/hip_compat/hip_gemm.hpp`: WMMA kernels on RDNA3 / RDNA3.5 (gfx11), a plain FMA kernel on RDNA4
+  (gfx12) and other cards. The library handle is created only when something falls back to it, so a run never
+  initializes rocBLAS or hipBLASLt. Only the summation order changes. Radeon 8060S (gfx1151), prompt tok/s, library ->
+  own: @SPEEDS@. KL against the token path on the same prompts: Ornith-1.5-35B Q4_K_M 0.01013 (library) / 0.01015
+  (own), GLM-5.3-Flash Maya-S-v2 IQ2_XXS @GLMKL@. RDNA4 has a WMMA kernel too, built but not yet run on a card:
+  `STRATA_HIP_GEMM_WMMA12=1` takes it. `STRATA_HIP_OWN_GEMM=0` goes back to hipBLAS (and reads
+  `STRATA_HIPBLASLT_TUNING` again), `STRATA_HIP_GEMM_PORTABLE=1` takes the plain kernel on gfx11 too. The build still
+  links hipBLAS (and hipBLASLt where present) for that library path. CUDA is unchanged (the same bits on the 7-config
+  md5 check).
+
 ## v1.3.181 - 2026-11-21
 
 Fixes from issue #49 (Windows, AMD RX 9060 XT) and the Strata / Maya review: start-up when pinnable memory runs out
