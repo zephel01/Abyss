@@ -2366,6 +2366,11 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+        # Inkling 2 thinks at any effort level, "none" included (thinking off writes a short
+        # <|content_thinking|> message in English): the reasoning is read as reasoning either way, and a turn that
+        # opens with <|content_text|> has none (the message markers below)
+        if getattr(self, "ink_ids", None) is not None:
+            thinking = True
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}

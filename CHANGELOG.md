@@ -9,6 +9,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Fix (Inkling 2 Mini, the server): with thinking off (`enable_thinking: false`, reasoning effort none) the model still
+  writes a short reasoning message, and the server put it into the answer - English planning before every answer. It
+  is now read as reasoning at every effort level; a turn without one is all answer.
+
 ## v1.3.184 - 2026-11-22
 
 Inkling 2 Mini reads prompts in batches: RTX 5090 Q4_K_XL 4K prompt about 120 -> 3,654 tok/s (llama.cpp 2,135), at the

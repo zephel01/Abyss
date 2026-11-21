@@ -534,6 +534,33 @@ class ModelOpensThink(unittest.TestCase):
         self.assertEqual(self.answer("plan</think>Tokyo.", "<|im_start|>assistant\n<think>\n"), ("plan", "Tokyo."))
 
 
+class InklingThinkingOff(unittest.TestCase):
+    """Inkling 2 with thinking off (reasoning_effort none) still writes a reasoning message: it must not reach the
+    answer, and a turn without one is all content."""
+
+    class InkTok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<|message_model|>", "<|content_thinking|>", "<|content_text|>",
+                                             "<|end_message|>", "<|content_model_end_sampling|>"]
+
+    def answer(self, script):
+        tok = self.InkTok()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out = {"reasoning": "", "content": ""}
+        for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+            if kind == "event" and v.kind in out:
+                out[v.kind] += v.text
+        return out["reasoning"], out["content"]
+
+    def test_reasoning_message_with_thinking_off(self):
+        self.assertEqual(self.answer("<|message_model|><|content_thinking|>plan<|end_message|>"
+                                     "<|message_model|><|content_text|>Tokyo.<|end_message|>"
+                                     "<|content_model_end_sampling|>"), ("plan", "Tokyo."))
+
+    def test_no_reasoning_message(self):
+        self.assertEqual(self.answer("<|message_model|><|content_text|>Tokyo.<|end_message|>"
+                                     "<|content_model_end_sampling|>"), ("", "Tokyo."))
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""
