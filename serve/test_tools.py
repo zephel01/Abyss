@@ -390,6 +390,76 @@ class QuotedCalls(unittest.TestCase):
             self.assertEqual([c.name for c in got], ["get_weather"], pieces)
 
 
+class StrayBacktick(unittest.TestCase):
+    """A backtick left open with text after it on its line is a stray mark: the calls after it in the paragraph are
+    calls (Strata #5183 / #4923's case); inline code still open at the end of a line goes on to the next."""
+
+    def test_call_after_a_stray_backtick(self):
+        for sep in ("\n", "\nMore text on a second line.\n"):
+            text = "Let me use `run_commands to check." + sep + GLM
+            for pieces in (None, 1, 4):
+                got = calls(run(text, pieces))
+                self.assertEqual([c.name for c in got], ["get_weather"], (sep, pieces))
+
+    def test_two_calls_after_a_stray_backtick(self):
+        text = "Checking `foo and bar.\n" + GLM + "\n" + GLM
+        for pieces in (None, 3):
+            self.assertEqual([c.name for c in calls(run(text, pieces))], ["get_weather", "get_weather"], pieces)
+
+    def test_inline_code_open_at_the_line_end_goes_on(self):
+        text = "Write this `\n" + GLM + "` to run it."
+        for pieces in (None, 1):
+            ev = run(text, pieces)
+            self.assertEqual(calls(ev), [], pieces)
+            self.assertIn("<tool_call>get_weather", content(ev))
+
+    def test_same_line_inline_code_still_quotes(self):
+        text = "Write `<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>` then go on."
+        self.assertEqual(calls(run(text, 2)), [])
+
+
+class LooseNumbers(unittest.TestCase):
+    """Numbers JSON does not take (+10, 010, .5, 5.) are numbers for an integer / number parameter (Strata
+    #4754's case); a string parameter keeps them as written."""
+    TOOLS = [{"name": "f", "parameters": {"type": "object", "properties": {
+        "i": {"type": "integer"}, "x": {"type": "number"}, "s": {"type": "string"},
+        "si": {"type": ["string", "integer"]}, "oi": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}}}]
+
+    def check(self, params, want):
+        body = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
+        text = "<tool_call>\n<function=f>\n" + body + "</function>\n</tool_call>"
+        for pieces in (None, 1, 5):
+            ev = run(text, pieces, tools=self.TOOLS)
+            got = [c.arguments for c in calls(ev)]
+            self.assertEqual(got, [want], (pieces, params))
+            for k, v in want.items():
+                self.assertIs(type(got[0][k]), type(v), (k, pieces))
+            self.assertEqual(json.loads("".join(e.text for e in ev if e.kind == "tool_args")), want, pieces)
+
+    def test_integer(self):
+        self.check({"i": "+10"}, {"i": 10})
+        self.check({"i": "010"}, {"i": 10})
+        self.check({"i": "-007"}, {"i": -7})
+        self.check({"i": "+3.0"}, {"i": 3})
+        self.check({"oi": "+5"}, {"oi": 5})
+
+    def test_integer_keeps_a_fraction_as_text(self):
+        self.check({"i": "1.5"}, {"i": 1.5})      # (valid JSON: decoded as before)
+        self.check({"i": "+1.5"}, {"i": "+1.5"})  # not whole: text, as before
+
+    def test_number(self):
+        self.check({"x": ".5"}, {"x": 0.5})
+        self.check({"x": "5."}, {"x": 5.0})
+        self.check({"x": "+2.5e3"}, {"x": 2500.0})
+        self.check({"x": "-.25"}, {"x": -0.25})
+        self.check({"x": "010"}, {"x": 10})
+
+    def test_strings_and_words_stay_text(self):
+        self.check({"s": "+10", "si": "010"}, {"s": "+10", "si": "010"})
+        self.check({"i": "ten", "x": "1/2"}, {"i": "ten", "x": "1/2"})
+        self.check({"x": "inf", "i": "0x10"}, {"x": "inf", "i": "0x10"})
+
+
 class HttpToolCalls(unittest.TestCase):
     """Through the server: a GLM call reaches an OpenAI and an Anthropic client as a tool call."""
 

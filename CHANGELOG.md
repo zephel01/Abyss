@@ -9,6 +9,30 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Start-up when the GPU driver runs out of pinnable memory before the RAM (#49: Windows 11, RX 9060 XT 16 GB, 64 GB
+  of RAM, Qwen3.8 16G64G with `STRATA_GLM_RAM_GB=46` stopped at "pinned disk staging did not allocate" right after
+  the 46 GB RAM tier pinned): the table-update buffers and the disk staging are now pinned before the RAM tier, so
+  the tier shrinks to what is left instead of failing them, and after the tier a 512 MB spare (for what pins later:
+  the CPU lane, the first prompt's buffers) is tried - when it does not fit, the tier gives slots back and says so
+  (`gave back ... GB of RAM-tier slots`). The tier is shared by GLM, Qwen3.8 / Qwen3.5, Ornith, DeepSeek V4 / V4.1
+  and Hy4-flash; the dense Qwen3.8-27B RAM path pins its small buffers first too. Same output when the allocations
+  succeed. `STRATA_GLM_PIN_CAP_GB` (test hook) caps those pinned bytes to show the path on any machine.
+- HIP, dense qwen35 prompts (Qwen3.8-27B, SenseNova-Loop-9B): the first prompt times one layer's gate product on MMQ
+  and on the FP16 path and drops MMQ when it is more than 1.5x slower (#49: an RX 9060 XT on Windows, TheRock ROCm
+  7.14.1, read 2K / 8K prompts at 3 tok/s through MMQ while decode ran at 30.8 tok/s). The mixers' projections follow
+  (they use MMQ only with the FFN's buffers). A Radeon 8060S keeps MMQ (575 tok/s; 141 on FP16).
+  `STRATA_Q35D_MMQ=1` keeps MMQ without the check, `=0` uses FP16 as before; CUDA is unchanged. The qwen35moe expert
+  MMQ (#43) is a different path and is not checked yet.
+- Server: an unclosed backtick in an answer ("Let me use `run_commands to check.") no longer turns the tool calls
+  after it in the same paragraph into quoted text - a backtick left open with more text after it on its line is a
+  stray mark; one at the end of a line still opens inline code that goes on (Strata #5183 / #4923's case). Tool
+  calls in fences and same-line inline code stay text.
+- Server: an engine that aborted (exit code -6 / 3, or an assertion or `terminate` line at the end of its log) or
+  crashed (-11, an access violation) is no longer explained as "running out of RAM"; the note quotes the log line.
+- Server: an OpenAI non-streamed answer with neither text nor tool calls has `"content": ""`, not `null`.
+- Server: numbers JSON does not take (`+10`, `010`, `.5`, `5.`) are numbers for a parameter whose schema says integer
+  or number (not string); an integer parameter takes whole values only.
+
 ## v1.3.180 - 2026-11-21
 
 Hy4-flash prompts 1.6-2.2x faster, and a `--serve` shutdown fix. Other models give the same bits as v1.3.179 (7-config

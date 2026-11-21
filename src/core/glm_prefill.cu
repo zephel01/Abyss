@@ -539,6 +539,9 @@ struct Glm5Model::PrefillState {
     // (qwen35moe with STRATA_Q35_PROJ_MMQ=1: the same buffers, without dq_gu / dq_xq, for the mixers' projections only;
     // dq_kmax: their widest input, the bound mmq_gemm checks instead of the dense n_ff)
     int64_t dq_kmax = 0;
+    // HIP, STRATA_Q35D_MMQ unset: the first prompt times one layer's gate product on MMQ and on the FP16 path
+    // (prefill_half); dq_off: MMQ was the slower by far - the FP16 products from then on (the buffers stay)
+    bool dq_checked = false, dq_off = false;
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
     bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
@@ -2678,7 +2681,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // Y[t][N] = X[t][Kd] (F32 rows, contiguous) . W[N][Kd]^T through MMQ (the weights as stored, X as q8_1) - the dense
     // qwen35's projections, where its FFN buffers exist (prefill_setup_own); false: not taken (the caller's FP16 GEMM)
     const auto mmq_gemm = [&](const WSlot& w, int N, int Kd, const float* X, float* Y, int Tn) -> bool {
-        if (S->dq == nullptr || !int8_dense(w.type, N, Kd) || Kd % 512 != 0 || N % 128 != 0 ||
+        if (S->dq == nullptr || S->dq_off || !int8_dense(w.type, N, Kd) || Kd % 512 != 0 || N % 128 != 0 ||
             Kd > (S->dq_kmax > 0 ? S->dq_kmax : (int64_t) g.n_ff_dense) ||
             w.q == nullptr)
             return false;
@@ -3356,6 +3359,82 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         for (int t = 0; t < T; ++t) oh[(size_t) t * 4] = 1.0f;
         cudaMemcpyAsync(S->onehot, oh.data(), oh.size() * sizeof(float), cudaMemcpyHostToDevice, s);
     }
+#if defined(STRATA_USE_HIP)
+    // the dense qwen35's MMQ, checked once (#49): an RX 9060 XT on Windows (TheRock ROCm 7.14.1) ran MMQ ~100-180x
+    // slower than an 8060S does (3 tok/s prompts where decode was fine), while a Radeon 8060S reads prompts 4x faster
+    // on it than on the FP16 path (575 vs 141 tok/s).  So no fixed default: one layer's gate product (up to 1024
+    // tokens, its real type) on each path, each warmed once, and MMQ is dropped when it takes more than 1.5x the FP16
+    // path's time.  STRATA_Q35D_MMQ=1 keeps MMQ without the check, =0 never sets it up; STRATA_Q35D_MMQ_CHECK_SCALE
+    // (a test hook) multiplies the MMQ time.  Reads x as it is and writes only scratch the layers write again.
+    if (!S->dq_checked && S->dq != nullptr && S->dq_gu != nullptr) {
+        S->dq_checked = true;
+        static const bool forced = [] { const char* v = getenv("STRATA_Q35D_MMQ"); return v != nullptr && std::atoi(v) != 0; }();
+        int il_c = -1;
+        for (int il = l0_; il < l1_ && il_c < 0 && !forced; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (!Ly.moe && !q35d_prompt_ram(il) && Ly.ffn_gate.q != nullptr &&
+                int8_dense(Ly.ffn_gate.type, g.n_ff_dense, E) && S->w16_elems >= E)
+                il_c = il;
+        }
+        if (il_c >= 0) {
+            const WSlot& w = F->L[(size_t) il_c].ffn_gate;
+            const int64_t FF = g.n_ff_dense;
+            const int tn = std::max(1, std::min({S->dq_rows, (int) S->T, 1024}));   // (x / x16 hold S->T rows: a short first prompt times the long-prompt shape)
+            const auto run_mmq = [&] {
+                const int32_t hb[2] = {0, tn};
+                cudaMemcpyAsync(S->dq_bounds, hb, sizeof hb, cudaMemcpyHostToDevice, s);
+                mmq::quantize(S->x, nullptr, S->dq_xq, w.type, E, E, tn, s);
+                mmq::Product p;
+                p.w = w.q;
+                p.type = w.type;
+                p.w_rows = FF;
+                p.w_cols = E;
+                p.expert_bytes = mmq::matrix_bytes(w.type, FF, E);
+                p.n = 1;
+                p.xq = S->dq_xq;
+                p.bounds = S->dq_bounds;
+                p.ids = S->dq_iota;
+                p.total_rows = tn;
+                p.max_rows = tn;
+                p.dst = S->dq_gu;
+                p.ld_dst = 2 * FF;
+                S->mq->run(p, s);
+            };
+            const auto run_f16 = [&] { hgemm_q(w, (int) FF, (int) E, S->x16, (int) E, S->dq_gu, (int) FF, tn, 0.0f); };
+            cudaEvent_t ev[3] = {nullptr, nullptr, nullptr};
+            bool ok = true;
+            for (auto& e : ev) ok = ok && cudaEventCreate(&e) == cudaSuccess;
+            float t_mmq = 0, t_f16 = 0;
+            if (ok) {
+                run_mmq();
+                run_f16();
+                cudaEventRecord(ev[0], s);
+                run_mmq();
+                cudaEventRecord(ev[1], s);
+                run_f16();
+                cudaEventRecord(ev[2], s);
+                ok = cudaEventSynchronize(ev[2]) == cudaSuccess &&
+                     cudaEventElapsedTime(&t_mmq, ev[0], ev[1]) == cudaSuccess &&
+                     cudaEventElapsedTime(&t_f16, ev[1], ev[2]) == cudaSuccess;
+            }
+            for (auto& e : ev)
+                if (e) cudaEventDestroy(e);
+            if (!ok) cudaGetLastError();
+            static const double scale = [] { const char* v = getenv("STRATA_Q35D_MMQ_CHECK_SCALE"); return v != nullptr ? std::max(0.0, std::atof(v)) : 1.0; }();
+            const double tm = (double) t_mmq * scale;
+            if (ok && t_f16 > 0 && tm > 1.5 * (double) t_f16) {
+                S->dq_off = true;
+                std::fprintf(stderr, "glm prefill: HIP%d the dense FFN's MMQ is slow on this GPU / driver (layer %d gate, "
+                                     "%d tokens: MMQ %.2f ms, FP16 %.2f ms) - prompts use the FP16 products "
+                                     "(STRATA_Q35D_MMQ=1 keeps MMQ, =0 skips this check)\n", dev_, il_c, tn, tm,
+                             (double) t_f16);
+            } else if (ok) {
+                std::fprintf(stderr, "glm prefill: HIP%d the dense FFN's MMQ check (layer %d gate, %d tokens): MMQ %.2f ms, "
+                                     "FP16 %.2f ms - MMQ kept\n", dev_, il_c, tn, tm, (double) t_f16);
+            }
+        }
+    }
+#endif
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
     for (int il = l0_; il < l1_; ++il) {
@@ -3830,7 +3909,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         WSlot dffn[3] = {Ly.ffn_gate, Ly.ffn_up, Ly.ffn_down};
         const bool dram = !Ly.moe && q35d_prompt_ram(il);
         if (dram && !q35d_stage(il, s, dffn, err)) return false;
-        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr && int8_dense(dffn[0].type, g.n_ff_dense, E) &&
+        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr && !S->dq_off && int8_dense(dffn[0].type, g.n_ff_dense, E) &&
             int8_dense(dffn[1].type, g.n_ff_dense, E) && int8_dense(dffn[2].type, E, g.n_ff_dense)) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
             // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into

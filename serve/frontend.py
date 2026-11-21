@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import uuid
@@ -813,10 +814,38 @@ def _arg_value(value: str, declared) -> object:
     try:
         v = json.loads(value)
     except ValueError:
-        return value
+        n = _as_number(value, types)
+        return value if n is None else n
     if types and "string" in types and not _fits(v, types):
         return value
     return v
+
+
+_LOOSE_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _as_number(value, types):
+    """A number JSON does not take - a leading `+`, leading zeros (`010`), a bare `.5` or `5.` - as a number, for a
+    parameter the schema declares integer or number and not string; None otherwise.  Quantized models write them
+    now and then, and the client got the string "+10".  An integer parameter takes a whole value only (`010` -> 10,
+    `+3.0` -> 3); `1.5` there stays text, as before."""
+    if not types or "string" in types or not ({"integer", "number"} & types) or not isinstance(value, str):
+        return None
+    word = value.strip()
+    if not _LOOSE_NUMBER.fullmatch(word):
+        return None
+    try:
+        f = float(word)
+    except ValueError:
+        return None
+    if not math.isfinite(f):
+        return None
+    whole = "." not in word and "e" not in word.lower()
+    if whole:
+        return int(word)
+    if "number" in types:
+        return f
+    return int(f) if f.is_integer() else None
 
 
 def call_name(body: str) -> str:
@@ -949,10 +978,20 @@ class OutputParser:
                 elif not s:
                     self.ticks = 0
                 else:
-                    self.ticks += line.count("`")
+                    self.ticks = self._carry(line)
             else:
                 self.line += part
         return text
+
+    def _carry(self, line: str) -> int:
+        """The backticks a finished line leaves open for the next line of its paragraph: 1 when inline code is
+        still open at the end of the line, else 0.  A backtick left open with more text after it on the same line
+        is a stray mark ("Let me use `run_commands to check."), not code that goes on: carrying it made every
+        tool call after it in the paragraph quoted text, and the agent got a turn without its calls.  A backtick at
+        the end of a line (only spaces after it) still opens inline code that goes on to the next line."""
+        if (self.ticks + line.count("`")) % 2 == 0:
+            return 0
+        return 1 if not line[line.rfind("`") + 1:].strip() else 0
 
     def _in_code(self) -> bool:
         """The answer so far leaves the next character inside a code fence or inline code."""
@@ -1329,6 +1368,9 @@ class OutputParser:
                     continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                # the call ends the line before it (its text went out without the newline): nothing of that line is
+                # open - the call was at the top level - so a stray backtick there does not quote the next call
+                self.line, self.ticks = "", 0
                 if self.no_calls:
                     out.append(Event("calls_refused"))
                     self.state, self.buf = "refused", ""

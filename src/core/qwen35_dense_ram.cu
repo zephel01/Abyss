@@ -697,6 +697,20 @@ bool Glm5Model::q35d_place(std::string& err) {
     }
     if (q35d_head_split()) ram_b -= H.host.size();
     if (ram_b > 0 || q35d_head_split()) {
+        // the service's mapped request / answer buffers before the FFN's big pinned block (#49: a driver whose
+        // pinnable limit runs out before the RAM failed the small buffers pinned after a big one)
+        const size_t q8e = (size_t) g.n_embd / 32 * 36;
+        if (cudaHostAlloc(&Q->req_h, 64 + Q35dRam::kCols * q8e, cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostAlloc(&Q->ans_h, 64 + (size_t) Q35dRam::kCols * std::max(g.n_embd, g.n_vocab - std::max(0, H.vg)) * sizeof(float),
+                          cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer(&Q->req_d, Q->req_h, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&Q->ans_d, Q->ans_h, 0) != cudaSuccess) {
+            cudaGetLastError();
+            err = "qwen35 dense: the CPU FFN's mapped buffers did not allocate";
+            return false;
+        }
+        std::memset(Q->req_h, 0, 64);
+        std::memset(Q->ans_h, 0, 64);
         if (ram_b > 0 && cudaHostAlloc(&Q->pinned, ram_b, cudaHostAllocPortable) != cudaSuccess) {
             cudaGetLastError();
             err = "qwen35 dense: " + std::to_string(ram_b >> 20) + " MB of pinned RAM for the FFN did not allocate";
@@ -753,18 +767,7 @@ bool Glm5Model::q35d_place(std::string& err) {
                 }
             });
         for (auto& t : th) t.join();
-        // the service: request / answer mapped, the pool, its thread
-        const size_t q8e = (size_t) g.n_embd / 32 * 36;
-        if (cudaHostAlloc(&Q->req_h, 64 + Q35dRam::kCols * q8e, cudaHostAllocMapped) != cudaSuccess ||
-            cudaHostAlloc(&Q->ans_h, 64 + (size_t) Q35dRam::kCols * std::max(g.n_embd, g.n_vocab - std::max(0, H.vg)) * sizeof(float),
-                          cudaHostAllocMapped) != cudaSuccess ||
-            cudaHostGetDevicePointer(&Q->req_d, Q->req_h, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer(&Q->ans_d, Q->ans_h, 0) != cudaSuccess) {
-            err = "qwen35 dense: the CPU FFN's mapped buffers did not allocate";
-            return false;
-        }
-        std::memset(Q->req_h, 0, 64);
-        std::memset(Q->ans_h, 0, 64);
+        // the service: request / answer mapped (allocated above, before the FFN's pinned block), the pool, its thread
         // one core short of all of them (the service thread spins on the request; 16-core Ryzen AI Max+ 395: 15
         // threads 22.2 tok/s, 16 21.0)
         int threads = std::max(1, physical_core_count() - 1);

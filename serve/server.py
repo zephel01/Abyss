@@ -581,6 +581,34 @@ def clear_run_marker(marker: Path | None) -> None:
             marker.unlink()
 
 
+# exit codes of an engine that aborted (SIGABRT on Linux / macOS; abort() on Windows) or crashed (SIGSEGV / SIGBUS;
+# an access violation or a stack overflow on Windows) - not ones RAM explains
+_ABORT_RCS = {-6, 3}
+_CRASH_RCS = {-11, -7, 0xC0000005, 0xC00000FD, -1073741819, -1073741571}
+_ABORT_MARKS = ("Assertion", "assertion", "terminate called", "what():", "Aborted", "abort()")
+
+
+def engine_death_note(rc, tail: str) -> str:
+    """Why the engine most likely ended: `rc` its exit code (None: not known), `tail` the end of its log.  Its own
+    watchdog (issue #29), an abort or a crash (the log line that says what), else the usual cause, RAM."""
+    lines = [ln.strip() for ln in (tail or "").splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if "issue #29" in line:
+            return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
+                    "line: " + line + " - please report it at github.com/zephel01/Abyss/issues.")
+    mark = next((ln for ln in reversed(lines) if any(m in ln for m in _ABORT_MARKS)), "")
+    code = "" if rc is None else f" (exit code {rc})"
+    if rc in _ABORT_RCS or (mark and rc != -9 and rc not in _CRASH_RCS):
+        return ("The engine aborted on an internal error" + code + ", not for lack of RAM." +
+                (" Its log line: " + mark if mark else " The end of its log says what it stopped on.") +
+                " Please report it at github.com/zephel01/Abyss/issues with the log.")
+    if rc in _CRASH_RCS:
+        return ("The engine crashed" + code + ": a memory access fault, not lack of RAM. Please report it at "
+                "github.com/zephel01/Abyss/issues with the log.")
+    return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
+            "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
+            "smaller model (Q2_0 / IQ2_XS).")
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -732,7 +760,7 @@ class StrataEngine:
         lines.put(None)
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        """Why the engine most likely ended, from its exit code and the end of its log (engine_death_note)."""
         tail = ""
         try:
             with open(self.log_path, "rb") as f:
@@ -741,13 +769,12 @@ class StrataEngine:
                 tail = f.read().decode("utf-8", "replace")
         except (OSError, TypeError):
             pass
-        for line in reversed(tail.splitlines()):
-            if "issue #29" in line:
-                return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
-                        "line: " + line.strip() + " - please report it at github.com/zephel01/Abyss/issues.")
-        return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
-                "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
-                "smaller model (Q2_0 / IQ2_XS).")
+        rc = None
+        try:
+            rc = self.proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001 - still running, or no process: the log alone decides
+            pass
+        return engine_death_note(rc, tail)
 
     def alive(self) -> bool:
         return not getattr(self, "ended", False) and self.proc.poll() is None
@@ -2919,7 +2946,8 @@ def openai_collect(chunks) -> dict:
     with engine_stopped(content, reasoning):
         last = _openai_collect(chunks, content, reasoning, by_index, mcp)
     calls = [by_index[i] for i in sorted(by_index)]
-    msg = {"role": "assistant", "content": "".join(content) or None}
+    # (an answer with neither text nor calls says "": some clients fail on a null content; with calls it stays null)
+    msg = {"role": "assistant", "content": "".join(content) or (None if calls else "")}
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
     if calls:

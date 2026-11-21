@@ -1698,5 +1698,55 @@ class StallLimit(unittest.TestCase):
             s.close()
 
 
+class DeathNote(unittest.TestCase):
+    """Why the engine ended: an abort or a crash is not called a RAM shortage (Maya #1007's idea)."""
+
+    def test_abort_quotes_its_line(self):
+        from serve.server import engine_death_note
+        tail = "glm fast: loading\nabyss: src/core/x.cu:12: void f(): Assertion `n > 0' failed.\n"
+        for rc in (-6, 3):
+            note = engine_death_note(rc, tail)
+            self.assertIn("aborted", note)
+            self.assertIn("Assertion `n > 0' failed", note)
+            self.assertNotIn("RAM:", note)
+        self.assertIn("aborted", engine_death_note(-6, "no marks here\n"))
+        self.assertIn("aborted", engine_death_note(None, "terminate called after throwing an instance of 'x'\n"))
+
+    def test_crash(self):
+        from serve.server import engine_death_note
+        for rc in (-11, 0xC0000005):
+            self.assertIn("crashed", engine_death_note(rc, "glm fast: decode\n"))
+
+    def test_killed_is_ram_and_watchdog_wins(self):
+        from serve.server import engine_death_note
+        self.assertIn("running out of RAM", engine_death_note(-9, "glm fast: decode\n"))
+        self.assertIn("running out of RAM", engine_death_note(None, ""))
+        # a kill by the OOM killer is RAM even when an earlier line mentioned an assertion
+        self.assertIn("running out of RAM", engine_death_note(-9, "Assertion checks on\n"))
+        self.assertIn("stopped itself", engine_death_note(-6, "x\nwatchdog: no progress (issue #29)\n"))
+
+
+class EmptyAnswerContent(unittest.TestCase):
+    """OpenAI non-streamed: an answer with neither text nor calls has content "", not null (Strata #5249's case)."""
+
+    @staticmethod
+    def chunk(delta, finish=None):
+        return {"id": "c", "created": 1, "model": "m", "usage": {},
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+    def test_empty(self):
+        from serve.server import openai_collect
+        out = openai_collect([self.chunk({"role": "assistant"}), self.chunk({}, "stop")])
+        self.assertEqual(out["choices"][0]["message"]["content"], "")
+
+    def test_calls_keep_null_and_text_stays(self):
+        from serve.server import openai_collect
+        call = {"index": 0, "id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        out = openai_collect([self.chunk({"tool_calls": [call]}), self.chunk({}, "tool_calls")])
+        self.assertIsNone(out["choices"][0]["message"]["content"])
+        out = openai_collect([self.chunk({"content": "hi"}), self.chunk({}, "stop")])
+        self.assertEqual(out["choices"][0]["message"]["content"], "hi")
+
+
 if __name__ == "__main__":
     unittest.main()

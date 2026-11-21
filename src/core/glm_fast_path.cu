@@ -454,6 +454,54 @@ static void numa_pinned_free(void* p, size_t bytes) {
 #endif
 }
 
+// The pinned memory the RAM tier and the buffers around it take (fast_setup).  A driver can run out of pinnable memory
+// well before the RAM does: AMD's Windows driver stopped a 64 GB PC's start at "pinned disk staging did not allocate"
+// right after a 46 GB tier had pinned (#49).  STRATA_GLM_PIN_CAP_GB (a test hook) makes these allocations fail once
+// their total would pass that many GB, as such a driver's do.
+static std::atomic<int64_t> g_pin_counted{0};
+static int64_t pin_cap_bytes() {
+    static const int64_t cap = [] {
+        const char* v = getenv("STRATA_GLM_PIN_CAP_GB");
+        const double gb = v != nullptr ? std::atof(v) : 0.0;
+        return gb > 0 ? (int64_t) (gb * 1073741824.0) : (int64_t) -1;
+    }();
+    return cap;
+}
+static bool pin_cap_allows(size_t bytes) {
+    const int64_t cap = pin_cap_bytes();
+    return cap < 0 || g_pin_counted.load() + (int64_t) bytes <= cap;
+}
+static bool pin_alloc(void** p, size_t bytes, unsigned int flags) {
+    *p = nullptr;
+    if (!pin_cap_allows(bytes)) return false;
+    if (cudaHostAlloc(p, bytes, flags) != cudaSuccess) {
+        cudaGetLastError();
+        *p = nullptr;
+        return false;
+    }
+    g_pin_counted += (int64_t) bytes;
+    return true;
+}
+// one RAM-tier block of n slots (numa_pinned's mmap + registration where that applies, else cudaHostAlloc)
+static void* tier_block_alloc(size_t bytes, bool try_numa, bool& registered) {
+    registered = false;
+    if (!pin_cap_allows(bytes)) return nullptr;
+    void* p = try_numa ? numa_pinned(bytes) : nullptr;
+    if (p != nullptr) registered = true;
+    else if (cudaHostAlloc(&p, bytes, cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    g_pin_counted += (int64_t) bytes;
+    return p;
+}
+static void tier_block_free(void* p, size_t bytes, bool registered) {
+    if (p == nullptr) return;
+    if (registered) numa_pinned_free(p, bytes);
+    else cudaFreeHost(p);
+    g_pin_counted -= (int64_t) bytes;
+}
+
 namespace glmfast {
 // the VRAM a discrete card keeps free beside the expert pool (STRATA_GLM_RESERVE_MB): ~700 MB for the driver, the
 // sampler and kernel launches' local memory; 1.5 GB on HIP, where the first prompt's hipBLASLt GEMMs load their code
@@ -1764,7 +1812,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
         const double head_gb = glmfast::ram_headroom_gb(F->unified_memory);
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
-        // the disk staging pinned after the tier (one set of max(8, k) experts per in-flight route, below)
+        // the disk staging pinned beside the tier (one set of max(8, k) experts per in-flight route, below)
         const int64_t stage_b = (int64_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers *
                                 (int64_t) ((blob_max + 255u) & ~(size_t) 255u);
         const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
@@ -1907,7 +1955,34 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d %s: RAM-tier experts are read in place, not copied into VRAM slots "
                                  "(STRATA_GLM_UMA_DIRECT=0: copy them)\n", dev_,
                          F->integrated ? "integrated GPU (unified memory)" : "STRATA_GLM_UMA_DIRECT=1 on a discrete GPU");
+        // the small pinned buffers first, the RAM tier after them (#49): the tier takes what pinned memory is left, and
+        // a driver whose pinnable limit runs out before the RAM (AMD on Windows) then shrinks the tier instead of
+        // failing the buffers after it.  The table updates' buffers, then the disk staging for when the RAM tier has
+        // no free slot (fast_warm streams 8 at a time; the service's disk misses take a set of 8 per in-flight route,
+        // by its seq modulo kCpuAnswers - a verify window has several routes of a layer answered before the device
+        // reads them)
+        for (int ub = 0; ub < 2; ++ub)
+            if (!pin_alloc((void**) &F->upd_key_h[ub], FastState::kMaxUpd * sizeof(int), cudaHostAllocMapped) ||
+                !pin_alloc((void**) &F->upd_val_h[ub], FastState::kMaxUpd * sizeof(unsigned long long),
+                           cudaHostAllocMapped) ||
+                cudaHostGetDevicePointer((void**) &F->upd_key_hd[ub], F->upd_key_h[ub], 0) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &F->upd_val_hd[ub], F->upd_val_h[ub], 0) != cudaSuccess ||
+                cudaMalloc((void**) &F->upd_key_d[ub], FastState::kMaxUpd * sizeof(int)) != cudaSuccess ||
+                cudaMalloc((void**) &F->upd_val_d[ub], FastState::kMaxUpd * sizeof(unsigned long long)) != cudaSuccess ||
+                cudaEventCreateWithFlags(&F->upd_ev[ub], cudaEventDisableTiming) != cudaSuccess) {
+                err = "glm fast: the table update buffers did not allocate";
+                return false;
+            }
+        F->stage.assign((size_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers, nullptr);
+        for (auto& sbuf : F->stage)
+            if (!pin_alloc((void**) &sbuf, sstride, cudaHostAllocPortable)) {
+                err = "glm fast: pinned disk staging did not allocate (" +
+                      std::to_string((F->stage.size() * sstride) >> 20) + " MB, before the RAM tier)";
+                return false;
+            }
+        const bool tier_numa = !F->md.ram_direct || numa_nodes().size() >= 2;
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
+        std::vector<int64_t> cls_least(cls_stride.size(), 0);
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
             auto& R = F->rc[c];
             R.stride = cls_stride[c];
@@ -1928,15 +2003,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                     if (sh.fd >= 0) posix_fadvise(sh.fd, 0, 0, POSIX_FADV_DONTNEED);
             }
 #endif
-            while (n >= least) {
-                if ((!F->md.ram_direct || numa_nodes().size() >= 2) &&
-                    (p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
-                    R.registered = true;
-                    break;
-                }
-                if (cudaHostAlloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) break;
-                cudaGetLastError();
-                p = nullptr;
+            cls_least[c] = least;
+            while (n >= least) {   // (over every socket: numa_pinned)
+                if ((p = tier_block_alloc((size_t) n * R.stride, tier_numa, R.registered)) != nullptr) break;
                 n = (n > least && n * 7 / 8 < least) ? least : n * 7 / 8;
             }
             if (p == nullptr) {
@@ -1956,6 +2025,66 @@ bool Glm5Model::fast_setup(std::string& err) {
             R.st.assign((size_t) n, FastState::kRFree);
             R.tick.assign((size_t) n, 0);
             F->ram_bytes += (size_t) n * R.stride;
+        }
+        // what pins after the tier (the CPU lane's answers, the first prompt's buffers, a conversation snapshot) needs
+        // room too: a pinned spare that does not allocate means the driver's pinnable limit ran out with the tier -
+        // the tier gives slots back until one does (#49; the tier is still empty here, so a smaller block loses
+        // nothing).  When the spare allocates this changes nothing.
+        if (wsum > 0 && !F->ram_resident) {
+            constexpr size_t kPinSpare = (size_t) 512 << 20;
+            size_t given = 0;
+            for (int tries = 0; tries < 64; ++tries) {
+                void* q = nullptr;
+                if (pin_alloc(&q, kPinSpare, cudaHostAllocDefault)) {
+                    cudaFreeHost(q);
+                    g_pin_counted -= (int64_t) kPinSpare;
+                    break;
+                }
+                // the class with the most bytes above its floor gives back a spare's worth of slots (and a few more)
+                int best = -1;
+                int64_t best_b = 0;
+                for (size_t c = 0; c < F->rc.size(); ++c) {
+                    const auto& R = F->rc[c];
+                    const int64_t above = (int64_t) (R.n - cls_least[c]) * (int64_t) R.stride;
+                    if (R.base != nullptr && above > best_b) best_b = above, best = (int) c;
+                }
+                if (best < 0) {
+                    std::fprintf(stderr, "glm fast: WARNING - CUDA%d: pinned memory ran out with the RAM tier at its "
+                                         "floor; later pinned buffers may not allocate (set STRATA_GLM_RAM_GB lower)\n",
+                                 dev_);
+                    break;
+                }
+                auto& R = F->rc[(size_t) best];
+                const int64_t back = std::min<int64_t>(R.n - cls_least[(size_t) best],
+                                                       (int64_t) ((kPinSpare + kPinSpare / 4) / R.stride) + 1);
+                tier_block_free(R.base, (size_t) R.n * R.stride, R.registered);
+                F->ram_bytes -= (size_t) R.n * R.stride;
+                R.base = nullptr;
+                int64_t n = R.n - back;
+                void* p = nullptr;
+                while (n >= cls_least[(size_t) best]) {
+                    if ((p = tier_block_alloc((size_t) n * R.stride, tier_numa, R.registered)) != nullptr) break;
+                    n = (n > cls_least[(size_t) best] && n * 7 / 8 < cls_least[(size_t) best])
+                            ? cls_least[(size_t) best] : n * 7 / 8;
+                }
+                if (p == nullptr) {
+                    err = "glm fast: the pinned RAM tier did not allocate again after giving slots back";
+                    return false;
+                }
+                given += (size_t) (R.n - n) * R.stride;
+                R.base = (uint8_t*) p;
+                R.n = (int) n;
+                R.key.assign((size_t) n, -1);
+                R.st.assign((size_t) n, FastState::kRFree);
+                R.tick.assign((size_t) n, 0);
+                F->ram_bytes += (size_t) n * R.stride;
+            }
+            if (given > 0)
+                std::fprintf(stderr, "glm fast: CUDA%d pinned memory ran out after the RAM tier (the GPU driver's "
+                                     "pinnable limit, not the RAM): gave back %.2f GB of RAM-tier slots so the buffers "
+                                     "pinned after it fit; the tier is now %.2f GB (set STRATA_GLM_RAM_GB at or below "
+                                     "this to skip the retry)\n", dev_, (double) given / 1073741824.0,
+                             (double) F->ram_bytes / 1073741824.0);
         }
         if (!staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
@@ -1998,31 +2127,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             prefill_settle(all > 0 ? std::min(1.0, held / all) : 1.0);
         }
-        for (int ub = 0; ub < 2; ++ub)
-            if (cudaHostAlloc((void**) &F->upd_key_h[ub], FastState::kMaxUpd * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
-                cudaHostAlloc((void**) &F->upd_val_h[ub], FastState::kMaxUpd * sizeof(unsigned long long),
-                              cudaHostAllocMapped) != cudaSuccess ||
-                cudaHostGetDevicePointer((void**) &F->upd_key_hd[ub], F->upd_key_h[ub], 0) != cudaSuccess ||
-                cudaHostGetDevicePointer((void**) &F->upd_val_hd[ub], F->upd_val_h[ub], 0) != cudaSuccess ||
-                cudaMalloc((void**) &F->upd_key_d[ub], FastState::kMaxUpd * sizeof(int)) != cudaSuccess ||
-                cudaMalloc((void**) &F->upd_val_d[ub], FastState::kMaxUpd * sizeof(unsigned long long)) != cudaSuccess ||
-                cudaEventCreateWithFlags(&F->upd_ev[ub], cudaEventDisableTiming) != cudaSuccess) {
-                err = "glm fast: the table update buffers did not allocate";
-                return false;
-            }
         F->upd_at.assign((size_t) (2 * F->n_keys + NL * gf::kSpares), 0);
         F->upd_gen.assign(F->upd_at.size(), 0u);
-        // disk reads: three slices per expert in parallel; pinned staging for when the RAM tier has no free slot
+        // disk reads: three slices per expert in parallel (the pinned staging is allocated before the RAM tier)
         F->workers.reset(new Workers(8));
         F->shared_readers = F->workers->size();   // (for the disk-read stats, printed after the pool is gone)
-        // (fast_warm streams 8 at a time; the service's disk misses take a set of 8 per in-flight route, by its seq
-        // modulo kCpuAnswers - a verify window has several routes of a layer answered before the device reads them)
-        F->stage.assign((size_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers, nullptr);
-        for (auto& sbuf : F->stage)
-            if (cudaHostAlloc((void**) &sbuf, sstride, cudaHostAllocPortable) != cudaSuccess) {
-                err = "glm fast: pinned disk staging did not allocate";
-                return false;
-            }
         // LOOKAHEAD: the predictions per layer, a load state per RAM slot, and the reader threads
         if (const char* ah = getenv("STRATA_GLM_AHEAD")) F->n_ahead = std::max(0, std::min(gf::kAhead, std::atoi(ah)));
         if (g.n_expert > 512) F->n_ahead = 0;
@@ -4845,9 +4954,7 @@ void Glm5Model::fast_destroy() {
         F->igpu_unreg = nullptr;
     }
 #endif
-    for (auto& R : F->rc)
-        if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
-        else if (R.base) cudaFreeHost(R.base);
+    for (auto& R : F->rc) tier_block_free(R.base, (size_t) R.n * R.stride, R.registered);
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);
