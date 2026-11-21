@@ -5659,18 +5659,35 @@ void Glm5Model::fast_service() {
                     }
                     // Demoted at the last boundary: its RAM copy is still landing (kRDemote until the next boundary makes
                     // it live), so the table has no entry for it - but its bytes are one PCIe copy away, not a disk read
-                    // away.  Wait for that drain's event and serve it from the slot.  (The boundary runs only once this
-                    // thread has caught up, so F->draining is not being edited here.)  A route that promotes it leaves
-                    // a duplicate that the tier clean-up frees.
+                    // away.  (The boundary runs only once this thread has caught up, so F->draining is not being edited
+                    // here.)  A route that promotes it leaves a duplicate that the tier clean-up frees.
+                    // DRAIN SERVE (STRATA_GLM_DRAIN_SERVE, default on; 0: as before): the fetch copies it from the VRAM
+                    // slot it is leaving - kDraining, so nothing writes it before the next boundary, and the boundary
+                    // runs after this token's fetches - instead of this thread waiting for the copy's event.  Same
+                    // bytes.  The wait sat in the thread every route of the token queues behind; a copy engine that
+                    // has not started the copy (WDDM batching it, Maya's #860 stall while drafting) held them all.
+                    // The disk lane reads the expert on the CPU, from the RAM copy: it keeps the wait
                     if (rs >= 0 && R.st[(size_t) rs] == FastState::kRDemote && R.key[(size_t) rs] == key) {
-                        bool draining = false;
+                        static const bool drain_serve = [] {
+                            const char* v = getenv("STRATA_GLM_DRAIN_SERVE");
+                            return v == nullptr || std::atoi(v) != 0;
+                        }();
+                        const bool host_read = F->disk_lane && promo == 0u && F->cpu_plan != 0ull &&
+                                               F->cpu_fmt[(size_t) il].n_ff > 0;   // (dlane_now, below)
+                        const FastState::Drain* dr = nullptr;
                         for (const auto& d : F->draining)
                             if (d.rclass == cls && d.rslot == rs) {
-                                cudaEventSynchronize(d.ev);
-                                draining = true;
+                                dr = &d;
                                 break;
                             }
-                        if (draining) {
+                        if (dr != nullptr && drain_serve && !host_read && dr->il == il && dr->key == key &&
+                            P.st[(size_t) dr->vslot] == FastState::kDraining) {
+                            dst[m] = (uint8_t*) P.slot_ptr(dr->vslot);
+                            ++F->drain_served;
+                            continue;
+                        }
+                        if (dr != nullptr) {
+                            cudaEventSynchronize(dr->ev);
                             dst[m] = R.base + (size_t) rs * R.stride;
                             continue;
                         }
@@ -7078,9 +7095,9 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                                  "no tier\n", c, layers, (double) R.stride / 1e6, R.n, held, nfree, out);
         }
         std::fprintf(stderr, "glm tier diag clean-up: %llu duplicate RAM copies freed, %llu lost copies adopted, %llu "
-                             "stale demotion copies freed\n",
+                             "stale demotion copies freed, %llu misses served from a draining VRAM slot\n",
                      (unsigned long long) F->diag_dup, (unsigned long long) F->diag_adopt,
-                     (unsigned long long) F->diag_stale_drain);
+                     (unsigned long long) F->diag_stale_drain, (unsigned long long) F->drain_served);
     }
     return ok;
 }

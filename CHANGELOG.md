@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Fix (GLM-5.3, DeepSeek V4 / V4.1, Qwen3.8, Hy4 - the expert tiers): a route that missed an expert demoted at the last
+  token boundary waited in the service thread for that expert's VRAM -> RAM copy, and every route of the token queued
+  behind it - a copy the driver had not started yet (Windows batching copies, while drafting) stalled the whole token
+  (Maya #860's shape). The route now fetches it from the VRAM slot it is leaving: the same bytes, the same answers
+  (GLM-5.3 Maya-S-v2 IQ2_XXS under `STRATA_DETERMINISTIC=1`: the same tokens, 1,921 misses served so; decode 52.00 ->
+  52.04 tok/s, RTX 5090). `STRATA_GLM_DRAIN_SERVE=0` waits as before.
 - Fix (setup): `--rewrite-config` kept nothing of the old config, so the port, the API key, the host and the MCP
   servers set by hand were lost. It now keeps the server settings (`port`, `host`, `api_key`, `allow_shutdown`,
   `reasoning_effort`, `thinking_budget`, `fit_max_tokens`, `mcp`, `mcp_servers`) and writes the model's part again;
