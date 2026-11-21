@@ -9,16 +9,29 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
-- HIP, MoE prompts (Qwen3.8-Flash-Next, Ornith, GLM, DeepSeek V4 / V4.1 ...): the first prompt of 256+ tokens times
-  one layer's routed experts on MMQ, on the own int8 GEMM and on the FP16 path (each expert decoded once, then the own
-  FP16 GEMM), and moves off MMQ only when another path is more than 1.5x faster and gives the same products (relative
-  L2 under 0.1 against MMQ's). #49: an RX 9060 XT on Windows (TheRock ROCm 7.14.1) ran a dense layer's MMQ ~390x
-  slower than FP16, and Qwen3.8-Flash-Next 16G64G read 2K prompts at 9 tok/s (110 ms a token) with every FP16 GEMM
-  already on the own kernels - its experts go through the same MMQ. The log says `glm prefill: HIP0 expert kernels
-  (layer ..): MMQ .. ms, own GEMM .. ms, FP16 .. ms -> ...`. A Radeon 8060S keeps MMQ (Qwen3.8 UD-IQ3_XXS layer 0,
-  32 experts x 39 rows: MMQ 1.65 ms, own 5.50, FP16 4.85; 2K prompt 509 -> 517 tok/s, same tokens).
-  `STRATA_HIP_EXPERTS=mmq / own / fp16` fixes the path without the check; `STRATA_HIP_EXPERTS_CHECK_SCALE` (test
-  hook) multiplies the timed MMQ cost. CUDA is unchanged (7-config md5 check).
+- HIP, MoE prompts (Qwen3.8-Flash-Next, Ornith, Hy4, GLM, DeepSeek V4 / V4.1 - one prompt path): the first batched
+  prompt (32+ tokens) times one layer's routed experts on MMQ, on the own int8 GEMM and on the FP16 path (each expert
+  decoded to FP16 once, then the own FP16 GEMM), and moves off MMQ only when another path is more than 1.5x faster and
+  gives the same products (relative L2 against MMQ's under 0.02 for the own GEMM, under 0.1 for the FP16 path, which
+  does not round the activations to 8 bits). #49: an RX 9060 XT on Windows (TheRock ROCm 7.14.1) ran a dense layer's
+  MMQ ~390x slower than FP16 (1367.89 vs 3.52 ms), and Qwen3.8-Flash-Next 16G64G read 2K prompts at 9 tok/s (110 ms a
+  token) with every FP16 GEMM already on the own kernels - its experts go through the same MMQ (not confirmed on that
+  card yet). The log says `glm prefill: HIP0 expert kernels (layer .., n experts x R rows, types): MMQ .. ms, own GEMM
+  .. ms (rel ..), FP16 .. ms (rel ..) -> MMQ kept / the FP16 path / the own int8 GEMM`.
+  - The check is bounded where MMQ is the slow one: 4 experts first, the full 32 only when MMQ took under 5 ms for
+    those. A layer it cannot time (two gate/up types, EXL3, NVFP4) passes it to the next MoE layer.
+  - RDNA4 (gfx12): the own int8 WMMA kernels have not run on a card yet, so the check neither times nor takes them
+    there - such a card moves to the FP16 path. `STRATA_HIP_EXPERTS=own` still tries them.
+  - A layer the chosen kernel does not cover takes the other trusted one instead of MMQ (`own`: the FP16 path; `fp16`:
+    the own GEMM where the check measured it).
+  - Radeon 8060S, Qwen3.8-Flash-Next UD-IQ3_XXS, 16 GB VRAM + 45 GB RAM tier: MMQ kept (layer 0, 32 experts x 39 rows:
+    MMQ 1.09 ms, own 5.48, FP16 4.86), the same bits as v1.3.184 (`STRATA_DETERMINISTIC=1`: the same nll and KL). 2K
+    prompt: MMQ 500-517 tok/s, FP16 path 397-399, own GEMM 355-360. With the test hook making MMQ look slow the check
+    stops at 4 experts and takes the FP16 path (2K prompt) or the own GEMM (96-token prompt). Prompt path against
+    the token path (1,023 scored tokens, deterministic): KL 0.189 on MMQ (v1.3.184 the same), 0.166 on the own
+    GEMM, 0.125 on the FP16 path.
+  - `STRATA_HIP_EXPERTS=mmq / own / fp16` fixes the path without the check; `STRATA_HIP_EXPERTS_CHECK_SCALE` (test
+    hook) multiplies the timed MMQ cost. CUDA is unchanged (7-config md5 check).
 
 ## v1.3.185 - 2026-11-22
 

@@ -415,14 +415,40 @@ bool own_type(int type) {
 // keeps MMQ unless another is more than 1.5x faster; mmq / own / fp16 fix the choice without the check.
 // STRATA_PROMPT_MMQ / STRATA_PROMPT_OWN_TYPES set: their choice, no check.  (One process-wide choice: the cards of
 // one HIP box take the same kernels.)  CUDA: always kXpMmq (its own type lists).
+// A layer the chosen kernel does not cover takes the other non-MMQ one where that one is trusted (hip_xp_alt_f16 /
+// hip_xp_alt_own: own -> the FP16 path for a type or shape the own GEMM does not take; fp16 -> the own GEMM for a
+// type without an FP16 decode, only where the check measured it and its output agreed), else MMQ as before.
+// RDNA4 (gfx12): the own int8 WMMA kernels have not run on a card yet - auto never times or takes them there (the
+// FP16 path is the known-good one on such a card); STRATA_HIP_EXPERTS=own still tries them.
 enum HipExperts { kXpAuto = -1, kXpMmq = 0, kXpOwn = 1, kXpFp16 = 2 };
+static bool hip_gfx12() {   // the current device is an RDNA4 one
+#if defined(STRATA_USE_HIP)
+    int dev = 0;
+    hipDeviceProp_t p{};
+    return hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&p, dev) == hipSuccess &&
+           std::strncmp(p.gcnArchName, "gfx12", 5) == 0;
+#else
+    return false;
+#endif
+}
+static bool& hip_xp_alt_f16() {   // own chosen: the FP16 path for the layers the own GEMM does not cover
+    static bool on = false;
+    return on;
+}
+static bool& hip_xp_alt_own() {   // fp16 chosen: the own GEMM for the layers without an FP16 decode
+    static bool on = false;
+    return on;
+}
 static int& hip_experts() {
 #if defined(STRATA_USE_HIP)
     static int mode = [] {
         const char* v = getenv("STRATA_HIP_EXPERTS");
         const std::string m = v != nullptr ? v : "";
         if (m == "mmq") return (int) kXpMmq;
-        if (m == "own") return (int) kXpOwn;
+        if (m == "own") {
+            hip_xp_alt_f16() = true;
+            return (int) kXpOwn;
+        }
         if (m == "fp16") return (int) kXpFp16;
         if (m.empty() || m == "auto")
             return getenv("STRATA_PROMPT_MMQ") != nullptr || getenv("STRATA_PROMPT_OWN_TYPES") != nullptr ? (int) kXpMmq
@@ -441,8 +467,9 @@ static int& hip_experts() {
 static bool own_type_l(int type, const Glm5Geometry& g) {
 #if defined(STRATA_MOE_OWN)
     static const bool ink_own = [] { const char* v = getenv("STRATA_INK_NV_OWN"); return v == nullptr || std::atoi(v) != 0; }();
+    const int xp = hip_experts();
     return own_type(type) || (g.ink && type == 40 && ink_own && own::supported(40)) ||
-           (hip_experts() == kXpOwn && own::supported(type));
+           ((xp == kXpOwn || (xp == kXpFp16 && hip_xp_alt_own())) && own::supported(type));
 #else
     (void) g;
     return own_type(type);
@@ -947,7 +974,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         // that share its buffers - any of their types may be one; STRATA_GLM_Q35_PROJ_MMQ the same)
         // (HIP, STRATA_HIP_EXPERTS=auto: the check may move the experts to the own GEMM - its sums sized for)
         const auto st = [&](int t) {
-            return own::needs_sums(t) && (own_type_l(t, g) || (hip_experts() == kXpAuto && own::supported(t)));
+            return own::needs_sums(t) && (own_type_l(t, g) || (hip_experts() == kXpAuto && !hip_gfx12() && own::supported(t)));
         };
         bool on = false, dense = getenv("STRATA_GLM_Q35_PROJ_MMQ") != nullptr;
         for (int il = l0_; il < l1_; ++il) {
@@ -1073,7 +1100,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             }
             if (ink_nv_dq_on(Ly, g)) has_deq = true;   // (inkling NVFP4: run_blas_dq)
             // (HIP: STRATA_HIP_EXPERTS=fp16, or its check may choose run_blas_dq - its scratch, no message)
-            if (!Ly.exl3 && (hip_experts() == kXpAuto || hip_experts() == kXpFp16) && deq_expert_type(Ly.gu_type) &&
+            if (!Ly.exl3 && hip_experts() != kXpMmq && deq_expert_type(Ly.gu_type) &&
                 deq_expert_type(Ly.up_type) && deq_expert_type(Ly.d_type))
                 hip_deq = true;
             if (!Ly.exl3 && !int8_layer(Ly, g)) {   // (EXL3: run_set_x3)
@@ -1700,7 +1727,7 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
     const int sub_env = prefill_sub_env();
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp);
     // (v41: an IQ1_M part's run_blas_dq scratch, at most; HIP's STRATA_HIP_EXPERTS auto / fp16 the same)
-    const auto ws = weight_scratch(g, has_dsa, g.v41 || hip_experts() == kXpAuto || hip_experts() == kXpFp16);
+    const auto ws = weight_scratch(g, has_dsa, g.v41 || hip_experts() != kXpMmq);
     Carve c;
     c.take<uint8_t>(pu.first + pu.second);
     c.take<uint16_t>((size_t) ws.first);
@@ -3529,45 +3556,57 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }
 #endif
 #if defined(STRATA_USE_HIP)
-    // STRATA_HIP_EXPERTS=auto (hip_experts): the first MoE layer of a prompt of 256+ tokens, before its route, times its
-    // routed experts on MMQ, on the own int8 GEMM and on the FP16 path (run_blas_dq's steps) - up to 32 resident
-    // experts of the pool, the chunk's mean rows an expert (8-128), rows of this layer's x - each warmed once, then
-    // timed once.  Another path is taken when MMQ takes more than 1.5x its time and its output agrees with MMQ's
-    // (relative L2 under 0.1: a kernel that computes something else on this GPU is never taken).  It writes only the
-    // MoE buffers the layer's route and products write again (OUTP, OUTPc, Xq, Hq, row_tok, bounds) and w16.
-    const auto hip_experts_check = [&](int il, int T, const MoeBufs& M) {
-        S->xp_checked = true;
+    // STRATA_HIP_EXPERTS=auto (hip_experts): the first MoE layer of the first batched prompt whose experts MMQ reads,
+    // before its route, times its routed experts on MMQ, on the own int8 GEMM (not on RDNA4: hip_gfx12) and on the FP16
+    // path (run_blas_dq's steps) - resident experts of the pool, the chunk's mean rows an expert (32-128), rows of this
+    // layer's x - each warmed once, then timed once.  Another path is taken when MMQ takes more than 1.5x its time and
+    // its output agrees with MMQ's (relative L2 under 0.02 for the own GEMM: the same integers in another order; under
+    // 0.1 for the FP16 path: it does not round the activations to 8 bits - a kernel that computes something else on
+    // this GPU is never taken).  The cost is bounded where MMQ is the slow one (~390x in #49: 1.4 s for one dense
+    // layer): 4 experts first, and the full 32 only when MMQ took under 5 ms for those.  It writes only the MoE
+    // buffers the layer's route and products write again (OUTP, OUTPc / GUX, Xq, Hq, row_tok, bounds) and w16.
+    // false: this layer cannot be timed (EXL3, two gate/up types, NVFP4's scales, no MMQ for its types, no resident
+    // expert) - the next MoE layer is.
+    const auto hip_experts_check = [&](int il, int T, const MoeBufs& M) -> bool {
         const auto& Ly = F->L[(size_t) il];
         const auto& P = F->lp[(size_t) il];
         const int nff = g.n_ff_exp;
-        const auto skip = [&](const char* why) {
+        if (Ly.exl3 || Ly.mixed() || Ly.nv_scale != nullptr || g.ink || !mmq_layer(Ly.gu_type, Ly.d_type) ||
+            (M.GUX == nullptr && 2 * nff > E))
+            return false;
+        const auto keep_mmq = [&](const char* why) {
+            S->xp_checked = true;
             hip_experts() = kXpMmq;
             std::fprintf(stderr, "glm prefill: HIP%d the experts stay on MMQ (no kernel check: %s; STRATA_HIP_EXPERTS="
                                  "own / fp16 picks another)\n", dev_, why);
+            return true;
         };
-        if (Ly.exl3 || Ly.mixed() || Ly.nv_scale != nullptr || g.ink || M.GUX != nullptr ||
-            !mmq_layer(Ly.gu_type, Ly.d_type))
-            return skip("the layer's experts are not plain MMQ ones");
-        // the rows: the chunk's mean routes an expert; the experts: the first run of resident slots that holds them
-        const int R = std::max(8, std::min(128, (int) ((int64_t) T * K / std::max(1, g.n_expert))));
-        const int n = std::max(1, std::min(32, std::min(moe_window_rows((size_t) T, g), T) / R));
-        int i0 = -1;
-        for (int sl = 0, run = 0; sl < P.n_main && i0 < 0; ++sl) {
+        // the rows: the chunk's mean routes an expert (a short prompt: 32, the long prompts' order - its rows repeat);
+        // the experts: the longest run of resident slots, 32 at most
+        const int W = moe_window_rows((size_t) T, g);
+        const int R = std::min(W, std::max(32, std::min(128, (int) ((int64_t) T * K / std::max(1, g.n_expert)))));
+        const int n_max = std::min(32, W / std::max(1, R));
+        int i0 = -1, n_full = 0;
+        for (int sl = 0, run = 0; sl < P.n_main && n_full < n_max; ++sl) {
             run = P.key[(size_t) sl] >= 0 ? run + 1 : 0;
-            if (run == n) i0 = sl - n + 1;
+            if (run > n_full) {
+                n_full = run;
+                i0 = sl - run + 1;
+            }
         }
-        if (i0 < 0) return skip("too few resident experts in a row");
-        const int nrows = n * R;
+        if (n_full < 1 || R < 1) return false;
         const uint8_t* wb = P.base + (size_t) i0 * P.stride;
         const size_t stride = P.stride;
-        std::vector<int> hb((size_t) n + 1), rt((size_t) nrows);
-        for (int i = 0; i <= n; ++i) hb[(size_t) i] = i * R;
-        for (int r = 0; r < nrows; ++r) rt[(size_t) r] = (int) (((int64_t) r * 7919) % T);   // (rows spread over the chunk)
+        const size_t up_off = mmq::matrix_bytes(Ly.gu_type, nff, E);
+        int n = std::min(n_full, 4), nrows = n * R;   // (this stage's experts: run_* read them)
+        std::vector<int> hb((size_t) n_full + 1), rt((size_t) n_full * R);
+        for (int i = 0; i <= n_full; ++i) hb[(size_t) i] = i * R;
+        for (size_t r = 0; r < rt.size(); ++r) rt[r] = (int) (((int64_t) r * 7919) % T);   // (rows spread over the chunk)
         cudaMemcpyAsync(M.bounds, hb.data(), hb.size() * sizeof(int), cudaMemcpyHostToDevice, s);
         cudaMemcpyAsync(M.row_tok, rt.data(), rt.size() * sizeof(int), cudaMemcpyHostToDevice, s);
         cudaStreamSynchronize(s);   // (hb / rt are this lambda's: pageable copies staged before they go)
-        float* GU = M.OUTPc;   // [nrows][2 nff] (2 nff <= n_embd: GUX null)
-        float* OUT = M.OUTP;   // [nrows][E]
+        float* GU = M.GUX != nullptr ? M.GUX : M.OUTPc;   // [nrows][2 nff]
+        float* OUT = M.OUTP;                               // [nrows][E]
         const int64_t dn_qk = strata::qt::blck_size((strata::qt::Type) Ly.d_type);
         const size_t dn_end = Ly.down_off + (size_t) E * (size_t) (nff / dn_qk) * strata::qt::type_size((strata::qt::Type) Ly.d_type);
         const int dn_over = (int) glmfast::mmq_down_over(Ly.d_type, nff);
@@ -3616,8 +3655,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->mq->run(dn, s);
         };
 #if defined(STRATA_MOE_OWN)
-        const bool own_ok = own::supported(Ly.gu_type) && own::usable(Ly.gu_type, nff, E) &&
-                            own::supported(Ly.d_type) && own::usable(Ly.d_type, E, nff) &&
+        // (RDNA4: its int8 WMMA kernels never ran on a card - not timed, not taken by the check)
+        const bool own_ok = !hip_gfx12() && own::usable(Ly.gu_type, nff, E) && own::usable(Ly.d_type, E, nff) &&
                             (!(own::needs_sums(Ly.gu_type) || own::needs_sums(Ly.d_type)) || own_sums_model());
         const auto run_own = [&] {
             own::Set os;
@@ -3632,7 +3671,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             os.xq = M.Xq;
             os.dst = GU;
             os.ld = 2 * nff;
-            S->oq->gate_up(os, Ly.gu_type, nff, E, mmq::matrix_bytes(Ly.gu_type, nff, E), g.swiglu_exp, s);
+            S->oq->gate_up(os, Ly.gu_type, nff, E, up_off, g.swiglu_exp, s);
             own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s, own::needs_sums(Ly.d_type));
             os.xq = M.Hq;
             os.dst = OUT;
@@ -3654,8 +3693,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const uint8_t* blob = wb + (size_t) i * stride;
                 const int a = hb[(size_t) i];
                 strata::kernels::dequant_f16(Ly.gu_type, blob, 0, nff, E, S->w16, s);
-                strata::kernels::dequant_f16(Ly.up_type, blob + mmq::matrix_bytes(Ly.gu_type, nff, E), 0, nff, E,
-                                             S->w16 + (size_t) nff * E, s);
+                strata::kernels::dequant_f16(Ly.up_type, blob + up_off, 0, nff, E, S->w16 + (size_t) nff * E, s);
                 uint16_t* X16 = S->w16 + wgu;
                 for (int c0 = 0; c0 < R; c0 += gu_rows) {
                     const int m = std::min(gu_rows, R - c0);
@@ -3706,32 +3744,43 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 num += d * d;
                 den += (double) b[i] * b[i];
             }
-            return std::isfinite(num) && den > 0 ? std::sqrt(num / den) : 1e30;
+            return std::isfinite(num) && std::isfinite(den) && den > 0 ? std::sqrt(num / den) : 1e30;
         };
-        float t_mmq = 0, t_own = 0, t_f16 = 0;
-        if (!timed(run_mmq, ref, t_mmq)) return skip("MMQ did not run");
         static const double scale = [] {   // (a test hook: MMQ's time multiplied)
             const char* v = getenv("STRATA_HIP_EXPERTS_CHECK_SCALE");
             return v != nullptr ? std::max(0.0, std::atof(v)) : 1.0;
         }();
-        const double tm = (double) t_mmq * scale;
-        double r_own = -1, r_f16 = -1;
-        if (own_ok && timed(run_own, out, t_own)) r_own = rel(out, ref);
-        if (f16_ok && timed(run_f16, out, t_f16)) r_f16 = rel(out, ref);
-        const bool own_good = r_own >= 0 && r_own < 0.1, f16_good = r_f16 >= 0 && r_f16 < 0.1;
+        float t_mmq = 0, t_own = 0, t_f16 = 0;
+        double tm = 0, r_own = -1, r_f16 = -1;
+        for (;;) {
+            t_mmq = t_own = t_f16 = 0;
+            r_own = r_f16 = -1;
+            if (!timed(run_mmq, ref, t_mmq)) return keep_mmq("MMQ did not run");
+            tm = (double) t_mmq * scale;
+            if (own_ok && timed(run_own, out, t_own)) r_own = rel(out, ref);
+            if (f16_ok && timed(run_f16, out, t_f16)) r_f16 = rel(out, ref);
+            if (n == n_full || tm >= 5.0) break;   // (a slow MMQ is not run again on 8x the experts)
+            n = n_full;
+            nrows = n * R;
+        }
+        const bool own_good = r_own >= 0 && r_own < 0.02, f16_good = r_f16 >= 0 && r_f16 < 0.1;
         int pick = kXpMmq;
         if (own_good && (double) t_own * 1.5 < tm) pick = kXpOwn;
         if (f16_good && (double) t_f16 * 1.5 < tm && (pick != kXpOwn || t_f16 < t_own)) pick = kXpFp16;
+        hip_xp_alt_f16() = f16_good;
+        hip_xp_alt_own() = own_good;
         hip_experts() = pick;
-        char so[64], sf[64];
+        S->xp_checked = true;
+        char so[80], sf[64];
         if (r_own >= 0) std::snprintf(so, sizeof so, "own GEMM %.2f ms (rel %.1e)", t_own, r_own);
-        else std::snprintf(so, sizeof so, "own GEMM -");
+        else std::snprintf(so, sizeof so, "%s", hip_gfx12() ? "own GEMM - (RDNA4: untested, not timed)" : "own GEMM -");
         if (r_f16 >= 0) std::snprintf(sf, sizeof sf, "FP16 %.2f ms (rel %.1e)", t_f16, r_f16);
         else std::snprintf(sf, sizeof sf, "FP16 -");
-        std::fprintf(stderr, "glm prefill: HIP%d expert kernels (layer %d, %d experts x %d rows, %s/%s): MMQ %.2f ms, %s, "
-                             "%s -> %s (STRATA_HIP_EXPERTS=mmq / own / fp16 fixes it)\n", dev_, il, n, R,
-                     strata::qt::type_name(Ly.gu_type), strata::qt::type_name(Ly.d_type),
+        const std::string ty = std::string(strata::qt::type_name(Ly.gu_type)) + "/" + strata::qt::type_name(Ly.d_type);
+        std::fprintf(stderr, "glm prefill: HIP%d expert kernels (layer %d, %d experts x %d rows, %s): MMQ %.2f ms, %s, "
+                             "%s -> %s (STRATA_HIP_EXPERTS=mmq / own / fp16 fixes it)\n", dev_, il, n, R, ty.c_str(),
                      tm, so, sf, pick == kXpOwn ? "the own int8 GEMM" : pick == kXpFp16 ? "the FP16 path" : "MMQ kept");
+        return true;
     };
 #endif
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
@@ -4348,7 +4397,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         MoeBufs M = carve_moe(c, (size_t) T, (size_t) S->sh_sub(), g);
         const int FF = g.n_ff_exp * g.n_shared, NE = g.n_expert, nff = g.n_ff_exp;
 #if defined(STRATA_USE_HIP)
-        if (hip_experts() == kXpAuto && !S->xp_checked && T >= 256 && Ly.moe) hip_experts_check(il, T, M);
+        if (hip_experts() == kXpAuto && !S->xp_checked && Ly.moe) hip_experts_check(il, T, M);
 #endif
         // the shared expert: before the route (as before), or after the route's sync so its GEMMs run while the
         // host plans the expert sets (the stream was idle through the plan).  STRATA_GLM_PREFILL_SH_LATE=0: before
@@ -5253,15 +5302,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // SwiGLU, then the down [E][n_ff] the same way - the outputs land in the expert's own OUTP rows as run_blas's
         // (inkling's NVFP4 experts too where the own GEMM does not take them - ink_nv_dq_on)
         // (HIP, STRATA_HIP_EXPERTS=fp16 or its check's choice: every layer whose types dequant_f16 decodes)
-        const bool deq = !Ly.exl3 && (!int8_layer(Ly, g) || ink_nv_dq_on(Ly, g) ||
-                                      (hip_experts() == kXpFp16 && !Ly.mixed() && S->w16_elems >= ((int64_t) 2 * nff + 1) * E &&
-                                       deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.up_type) &&
-                                       deq_expert_type(Ly.d_type)));
+        // (own chosen: the layers the own GEMM does not take whole, rather than MMQ - hip_xp_alt_f16)
+        const bool hip_deq_l = (hip_experts() == kXpFp16 ||
+                                (hip_experts() == kXpOwn && hip_xp_alt_f16() &&
+                                 !((own_gate_up(Ly, g) || own_gu_split(Ly, g)) && own_down(Ly, g)))) &&
+                               Ly.nv_scale == nullptr && S->w16 != nullptr && S->w16_elems >= ((int64_t) 2 * nff + 1) * E &&
+                               S->w16_elems >= (int64_t) (E + 1) * nff && deq_expert_type(Ly.gu_type) &&
+                               deq_expert_type(Ly.up_type) && deq_expert_type(Ly.d_type);
+        const bool deq = !Ly.exl3 && (!int8_layer(Ly, g) || ink_nv_dq_on(Ly, g) || hip_deq_l);
         const auto run_blas_dq = [&](const uint8_t* blob, int a, int nrows, int r0) {
             const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
             const int gu_rows = (int) std::min<int64_t>(kDqRows, std::max<int64_t>(1, (S->w16_elems - wgu) / E));
             const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
-            const size_t up_off = mmq::matrix_bytes(Ly.gu_type, nff, E);
+            const size_t up_off = Ly.mixed() ? Ly.gu_bytes : mmq::matrix_bytes(Ly.gu_type, nff, E);
             const int o = place(r0 + a, nrows);
             // GU rows of 2 n_ff (gate | up) as MMQ's (2 * n_ff <= n_embd: inside the expert's own OUTP rows); the
             // down's E-wide outputs then overwrite them from the expert's first row on, so its parts run last first
