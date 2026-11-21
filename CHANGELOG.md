@@ -9,6 +9,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.185 - 2026-11-22
+
+Inkling 2 Mini with thinking off: the English planning it still writes no longer lands in the answer. The engine is
+unchanged (same binary as v1.3.184).
+
 - Fix (Inkling 2 Mini, the server): with thinking off (`enable_thinking: false`, reasoning effort none) the model still
   writes a short reasoning message, and the server put it into the answer - English planning before every answer. It
   is now read as reasoning at every effort level; a turn without one is all answer.
