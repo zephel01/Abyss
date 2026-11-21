@@ -138,7 +138,8 @@ jobs:
             exit "$rc"
           fi
           sccache --show-stats
-          # (the binaries' SHA-256 as a notice: a cached build and a fresh one of the same sources give the same bytes)
+          # (the binaries' SHA-256 as notices - two fresh builds of one tree differ already (nvcc), a cache hit gives the
+          # bytes of the compile it stored)
           sha256sum build/abyss build/abyss_gpu_tune | sed 's/^/::notice::/'
       - name: Package
         run: |

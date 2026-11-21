@@ -9,6 +9,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- CI (no change to the engine): a release's tag no longer builds the prebuilt engine a second time - prebuilt's
+  reuse job takes the archives of the ci-v<version> (or main) run of the same commit, checks their SHA-256 and the
+  release job attaches them; tests and arm-build no longer run on tags. The prebuilt jobs compile through sccache
+  (cache in the Actions cache; main's runs keep it for the next release branch), the Windows jobs take only the CUDA
+  parts they build with, cached. prebuilt also runs on main and replaces windows-build there (now by hand only).
+  MSVC Release builds use /Z7 instead of /Zi when a compiler launcher is set (sccache cannot cache /Zi).
+
 ## v1.3.181 - 2026-11-21
 
 Fixes from issue #49 (Windows, AMD RX 9060 XT) and the Strata / Maya review: start-up when pinnable memory runs out
