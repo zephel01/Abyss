@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.184 - 2026-11-22
+
+Inkling 2 Mini reads prompts in batches: RTX 5090 Q4_K_XL 4K prompt about 120 -> 3,654 tok/s (llama.cpp 2,135), at the
+same KL as the token path. A fix for NVFP4 models with experts outside VRAM. Other models give the same bits as
+v1.3.183 (7-config md5 check).
+
 - Inkling 2 Mini: a batched prompt path. The 48 layer applications run in a token's order over each chunk: the mixes,
   controllers and attention are Inkling's own sub-batched code (FP16 GEMMs, a parallel short conv), the experts go
   through the prompt path's MoE (SITU in `swiglu_rows` and the CPU rows; NVFP4 experts on the own int8 GEMM, because
