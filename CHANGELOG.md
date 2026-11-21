@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.181 - 2026-11-21
+
+Fixes from issue #49 (Windows, AMD RX 9060 XT) and the Strata / Maya review: start-up when pinnable memory runs out
+before the RAM, a slow HIP prompt path detected and avoided, four server fixes. Other models give the same bits as
+v1.3.180 (7-config md5 check).
+
 - Start-up when the GPU driver runs out of pinnable memory before the RAM (#49: Windows 11, RX 9060 XT 16 GB, 64 GB
   of RAM, Qwen3.8 16G64G with `STRATA_GLM_RAM_GB=46` stopped at "pinned disk staging did not allocate" right after
   the 46 GB RAM tier pinned): the table-update buffers and the disk staging are now pinned before the RAM tier, so
