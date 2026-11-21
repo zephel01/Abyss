@@ -2,13 +2,11 @@
 # compile only: the CUDA engine for sm_120a (RTX 50) and the GPU tuner, then that the binary starts.  It catches
 # POSIX-only headers and calls in the engine (v1.3.109-119 failed to build on Windows over hop_link.cu's
 # sys/socket.h, issue #31) before a release.
-# Only where prebuilt.yml does not build (main and by hand): on ci-* branches prebuilt's windows-x64 job compiles
-# the same engine for more GPUs (sm_86, sm_89, sm_120a) and checks that it starts.
+# By hand only: on main and ci-* pushes prebuilt.yml's windows-x64 job compiles the same engine for more GPUs (sm_86,
+# sm_89, sm_120a) and checks that it starts, so this quicker one-target build is for a check of a branch by hand.
 name: windows-build
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

@@ -3,19 +3,21 @@
 # GPU's own code, and the engine's per-GPU choices ask the device at run time.  Each archive carries the engine, the
 # GPU tuner and the CUDA libraries they load (NVIDIA's CUDA EULA, Attachment A: cudart, cuBLAS / cuBLASLt may be
 # distributed with an application, unmodified), and SHA256SUMS lists them.
-# Branches: the archives are workflow artifacts.  Tags: attached to the tag's release (the release job) - taken from the
-# ci-* branch's run of the same commit when it has them (the reuse job: no second build), else built here.
-# Compiles go through sccache, its cache kept in the Actions cache, so unchanged sources are not compiled again.
+# Branches (ci-* release candidates, main): the archives are workflow artifacts.  Tags: attached to the tag's release
+# (the release job) - taken from the ci-* (or main) run of the same commit when it has them (the reuse job: no second
+# build), else built here.  Compiles go through sccache, its cache kept in the Actions cache, so unchanged sources are
+# not compiled again; main's runs keep the cache that the next release's ci-* branch starts from (a branch reads only
+# its own caches and main's).  On main they also stand in for windows-build (a superset of its Windows compile).
 name: prebuilt
 
 on:
   push:
-    branches: ["ci-*"]
+    branches: ["ci-*", main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       reuse_from_sha:
-        description: "dry run of a tag's reuse: find, download and check the ci-* run's archives of this commit (no release)"
+        description: "dry run of a tag's reuse: find, download and check the ci-* / main run's archives of this commit (no build, no release)"
         required: false
         default: ""
 
@@ -35,7 +37,7 @@ env:
 
 jobs:
   reuse:
-    # a tag (or a dry run by hand): the successful prebuilt run of this commit on a ci-* branch, its archives downloaded
+    # a tag (or a dry run by hand): the successful prebuilt run of this commit on a ci-* branch or main, its archives downloaded
     # and their SHA-256 checked; run_id stays empty when there is none (or they fail the check), and the builds run
     if: startsWith(github.ref, 'refs/tags/v') || inputs.reuse_from_sha != ''
     runs-on: ubuntu-latest
@@ -49,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: .github/scripts
-      - name: Find the ci-* run (waits for one still running)
+      - name: Find the ci-* / main run (waits for one still running)
         id: find
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -291,8 +293,8 @@ jobs:
           retention-days: 14
 
   release:
-    # attach both archives and SHA256SUMS to the tag's release (the setups download them from there): the ci-* run's
-    # (reuse) or, when it had none, this run's own builds.
+    # attach both archives and SHA256SUMS to the tag's release (the setups download them from there): the ci-* / main
+    # run's (reuse) or, when there was none, this run's own builds.
     # on from v1.3.164 (checked on an RTX 5090 under Linux; Windows and RTX 30 / 40 not yet run on a GPU: marked trial)
     if: >-
       !cancelled() && startsWith(github.ref, 'refs/tags/v') &&

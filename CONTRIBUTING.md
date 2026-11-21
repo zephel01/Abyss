@@ -65,8 +65,9 @@ too - its quality check tells a broken kernel on your GPU from a prompt problem.
 - **A release is built on its `ci-v<version>` branch before the tag:** a push there runs every workflow (tests,
   arm-build, prebuilt with the Windows and Linux CUDA archives). The tag then runs only prebuilt, which attaches that
   branch run's archives to the release (checked against their SHA-256) instead of building them again; it builds them
-  itself only when the branch run is missing or its artifacts expired (14 days). windows-build (one GPU target) runs
-  on pushes to main, where prebuilt does not.
+  itself only when neither that run nor main's run of the same commit has them (artifacts are kept 14 days). Pushes
+  to main run tests, arm-build and prebuilt (whose Windows job replaces windows-build there; windows-build is now
+  by hand only).
 - **Before merging, we build every NVIDIA target** and run on Tesla V100s (one GPU and two):
   - the engine's parity tests (`glm_*_parity --selftest`);
   - a decode / prefill A/B;
