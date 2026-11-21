@@ -18,8 +18,8 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   `include/strata/hip_compat/hip_gemm.hpp`: WMMA kernels on RDNA3 / RDNA3.5 (gfx11), a plain FMA kernel on RDNA4
   (gfx12) and other cards. The library handle is created only when something falls back to it, so a run never
   initializes rocBLAS or hipBLASLt. Only the summation order changes. Radeon 8060S (gfx1151), prompt tok/s, library ->
-  own: @SPEEDS@. KL against the token path on the same prompts: Ornith-1.5-35B Q4_K_M 0.01013 (library) / 0.01015
-  (own), GLM-5.3-Flash Maya-S-v2 IQ2_XXS @GLMKL@. RDNA4 has a WMMA kernel too, built but not yet run on a card:
+  own: Ornith-1.5-35B Q4_K_M 2K / 8K / 16K 801 -> 1,320 / 714 -> 1,137 / 600 -> 847, GLM-5.3-Flash Maya-S-v2 IQ2_XXS 108 -> 160 / 131 -> 232 / 136 -> 248, SenseNova-Loop-9B Q4_K_M on the FP16 path (`STRATA_Q35D_MMQ=0`) 2K 135 -> 537 (medians of 3, `STRATA_GLM_IGPU=0`); the plain kernel there (`STRATA_HIP_GEMM_PORTABLE=1`) 943 / 834 / 668 and 132 / 172 / 186. KL against the token path on the same prompts: Ornith-1.5-35B Q4_K_M 0.01013 (library) / 0.01015
+  (own), GLM-5.3-Flash Maya-S-v2 IQ2_XXS 0.0193 / 0.0174 (library, two runs) and 0.0198 / 0.0190 (own) - library run against library run 0.0171, its CPU lane's share varies. RDNA4 has a WMMA kernel too, built but not yet run on a card:
   `STRATA_HIP_GEMM_WMMA12=1` takes it. `STRATA_HIP_OWN_GEMM=0` goes back to hipBLAS (and reads
   `STRATA_HIPBLASLT_TUNING` again), `STRATA_HIP_GEMM_PORTABLE=1` takes the plain kernel on gfx11 too. The build still
   links hipBLAS (and hipBLASLt where present) for that library path. CUDA is unchanged (the same bits on the 7-config

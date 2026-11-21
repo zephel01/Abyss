@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -159,14 +160,29 @@ bool run_case(const Case& c, std::mt19937& rng, bool lib, hipblasHandle_t hb) {
     return ok && untouched;
 }
 
-void bench(hipblasHandle_t hb, bool lib) {
+void bench(hipblasHandle_t hb, bool lib, bool small) {
     struct S { int m, n, k; hipDataType in; };
-    const S shapes[] = {
+    const S big_shapes[] = {
+        {8192, 8192, 8192, HIP_R_16F}, {8192, 8192, 8192, HIP_R_16BF}, {8192, 8192, 8192, HIP_R_32F}};
+    // few tokens: where a WMMA tile of 128 tokens is mostly idle
+    const S small_shapes[] = {
+        {4096, 1, 4096, HIP_R_16F},   {4096, 4, 4096, HIP_R_16F},   {4096, 8, 4096, HIP_R_16F},
+        {4096, 16, 4096, HIP_R_16F},  {4096, 32, 4096, HIP_R_16F},  {4096, 48, 4096, HIP_R_16F},
+        {4096, 64, 4096, HIP_R_16F},  {4096, 96, 4096, HIP_R_16F},  {4096, 128, 4096, HIP_R_16F},
+        {4096, 256, 4096, HIP_R_16F}, {12288, 16, 4096, HIP_R_16F}, {12288, 64, 4096, HIP_R_16F},
+        {512, 16, 4096, HIP_R_16F},   {512, 64, 4096, HIP_R_16F}};
+    const S std_shapes[] = {
         {2048, 2048, 2048, HIP_R_16F}, {4096, 2048, 4096, HIP_R_16F}, {12288, 2048, 4096, HIP_R_16F},
         {4096, 512, 4096, HIP_R_16F},  {512, 2048, 4096, HIP_R_16F},  {4096, 4096, 1536, HIP_R_16F},
         {2048, 2048, 2048, HIP_R_16BF}, {64, 2048, 4096, HIP_R_32F},  {256, 2048, 3072, HIP_R_32F},
         {2048, 2048, 2048, HIP_R_32F},
     };
+    std::vector<S> shapes;
+    if (small) shapes.assign(std::begin(small_shapes), std::end(small_shapes));
+    else {
+        shapes.assign(std::begin(std_shapes), std::end(std_shapes));
+        shapes.insert(shapes.end(), std::begin(big_shapes), std::end(big_shapes));
+    }
     for (const S& s : shapes) {
         void *dA, *dB, *dC;
         HK(hipMalloc(&dA, (size_t) s.m * s.k * esz(s.in)));
@@ -176,7 +192,7 @@ void bench(hipblasHandle_t hb, bool lib) {
         HK(hipMemset(dB, 0x22, (size_t) s.n * s.k * esz(s.in)));
         const float one = 1.0f, zero = 0.0f;
         const auto time = [&](auto&& f) {
-            f();
+            for (int w = 0; w < 3; ++w) f();   // (fresh buffers on an APU settle over the first calls)
             HK(hipDeviceSynchronize());
             const int reps = 10;
             const auto t0 = std::chrono::steady_clock::now();
@@ -194,7 +210,7 @@ void bench(hipblasHandle_t hb, bool lib) {
                               HIP_R_32F, s.m, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
             });
         const double fl = 2.0 * s.m * s.n * s.k;
-        std::printf("bench %-4s m %5d n %5d k %5d: own %7.3f ms %6.2f TFLOPS", tn(s.in), s.m, s.n, s.k, t_own * 1e3,
+        std::printf("bench %-4s m %5d n %5d k %5d: own %8.3f ms %6.2f TFLOPS", tn(s.in), s.m, s.n, s.k, t_own * 1e3,
                     fl / t_own * 1e-12);
         if (lib) std::printf(" | hipBLAS %7.3f ms %6.2f TFLOPS", t_lib * 1e3, fl / t_lib * 1e-12);
         std::printf("\n");
@@ -207,10 +223,11 @@ void bench(hipblasHandle_t hb, bool lib) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool lib = false, do_bench = false;
+    bool lib = false, do_bench = false, small = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--lib")) lib = true;
         if (!std::strcmp(argv[i], "--bench")) do_bench = true;
+        if (!std::strcmp(argv[i], "--small")) do_bench = small = true;
     }
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
@@ -224,7 +241,7 @@ int main(int argc, char** argv) {
         lib = false;
     }
     if (do_bench) {
-        bench(hb, hb != nullptr);
+        bench(hb, hb != nullptr, small);
         if (hb) hipblasDestroy(hb);
         return 0;
     }

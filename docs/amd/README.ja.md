@@ -73,7 +73,7 @@ ROCm 10 のパッケージは GPU のアーキテクチャごとに分かれて�
 > カーネル。[マニュアル](../MANUAL.ja.md) の `STRATA_HIP_OWN_GEMM`）。そのため実行中に rocBLAS / hipBLASLt は呼ばれません。
 > issue #49（Windows、TheRock ROCm 7.14.1）はこの中で落ちていました。ビルドは今も hipBLAS をリンクします（ヘッダーと、
 > `STRATA_HIP_OWN_GEMM=0` で使うライブラリ経路のため）。Radeon 8060S では自前カーネルの方が hipBLAS より速く prompt を読みます
-> （Ornith-1.5-35B Q4_K_M、2K の prompt: 812 -> 1,340 tok/s）。RDNA4 の WMMA カーネルは、実機で動かすまでは
+> （Ornith-1.5-35B Q4_K_M、2K / 16K の prompt: 801 -> 1,320 / 600 -> 847 tok/s。GLM-5.3-Flash Maya-S-v2 IQ2_XXS の 16K: 136 -> 248）。RDNA4 の WMMA カーネルは、実機で動かすまでは
 > `STRATA_HIP_GEMM_WMMA12=1` を付けたときだけ使います。
 
 1. AMD の ROCm インストールの説明に従って、リポジトリと署名鍵を登録します。上の PC の

@@ -72,7 +72,7 @@ architecture is missing, rocBLAS and hipBLASLt find no kernels.
 > RDNA4 and other cards; `STRATA_HIP_OWN_GEMM` in the [manual](../MANUAL.md)), so rocBLAS / hipBLASLt are no longer
 > called during a run - issue #49 (Windows, TheRock ROCm 7.14.1) crashed inside them. The build still links hipBLAS
 > (headers, and the library path behind `STRATA_HIP_OWN_GEMM=0`). On a Radeon 8060S the own kernels read prompts
-> faster than hipBLAS did (Ornith-1.5-35B Q4_K_M, 2K prompt: 812 -> 1,340 tok/s). On RDNA4 the WMMA kernel is opt-in
+> faster than hipBLAS did (Ornith-1.5-35B Q4_K_M, 2K / 16K prompts: 801 -> 1,320 / 600 -> 847 tok/s; GLM-5.3-Flash Maya-S-v2 IQ2_XXS 16K: 136 -> 248). On RDNA4 the WMMA kernel is opt-in
 > (`STRATA_HIP_GEMM_WMMA12=1`) until it has been run on such a card.
 
 1. Add the repository and its signing key as AMD's ROCm install guide describes. On the machine above,
