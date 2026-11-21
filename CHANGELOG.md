@@ -9,6 +9,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Inkling 2 Mini: a batched prompt path. The 48 layer applications run in a token's order over each chunk: the mixes,
+  controllers and attention are Inkling's own sub-batched code (FP16 GEMMs, a parallel short conv), the experts go
+  through the prompt path's MoE (SITU in `swiglu_rows` and the CPU rows; NVFP4 experts on the own int8 GEMM, because
+  MMQ's NVFP4 product cost the Q4_K_XL KL 0.015 against 0.006). KL against llama.cpp's Q8_0, over the prompt path's own
+  logits (`STRATA_GLM_SCORE_PREFILL=all`, new): Q8_0 0.0052, Q4_K_XL 0.0056 all in VRAM, 0.0062 at 16 GB, 0.0056 at 12 GB;
+  the 9K text (log-scaled positions) 0.0043. RTX 5090, 4K prompt: Q4_K_XL 3,654 tok/s all in VRAM, 2,145 at 16 GB,
+  1,527 at 12 GB (was ~120 a token at a time; llama.cpp 2,135 all in VRAM, 748 / 527 with 6 / 12 layers of experts
+  on the CPU, at a 4K depth), Q8_0 2,657.
+- Fix (NVFP4 models, the prompt path): with experts outside VRAM, the prompt's staging buffers were zeroed before the
+  pool's tail was lent, so the experts there went to the RAM tier as zeros - later prompts and the decode read them.
+  The buffers are now zeroed after the loan. Other models are unchanged (the zeroing runs only for NVFP4).
+
 ## v1.3.183 - 2026-11-21
 
 Inkling 2 Mini (text, beta): decode faster than llama.cpp on every VRAM size tried (RTX 5090 Q4_K_XL 128 vs 95 tok/s,

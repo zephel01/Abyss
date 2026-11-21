@@ -20,8 +20,11 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/inkling_fast.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -35,6 +38,7 @@
 namespace strata::core {
 
 namespace gf = strata::kernels::glmf;
+namespace gb = strata::kernels::glmb;
 namespace ik = strata::kernels::ink;
 
 namespace {
@@ -77,6 +81,23 @@ struct Ink {
     void* base = nullptr;
     size_t bytes = 0;
     std::vector<float*> owned;   // (unsloth's looped layout: the gathered message queries)
+    // the batched prompt's cursor through a chunk's applications (ink_prompt_*): the token path's bookkeeping, over
+    // the chunk's rows (each residual buffer T rows of E)
+    struct Cursor {
+        float* hb[kBufs] = {};
+        float* fin = nullptr;    // the last application's head rows
+        int nb = 0;
+        float* h = nullptr;      // the residual
+        float* hin = nullptr;    // (an application's attention input, before its block starts)
+        const float* bl[ik::kMaxStates] = {};
+        int bn = 0;
+        float* prelude = nullptr;
+        const float* pbl[ik::kMaxStates] = {};
+        int pbn = 0;
+        const float* bank[ik::kMaxStates] = {};
+        int bank_n = 0;
+        const float* bank_out = nullptr;
+    } pc;
 };
 
 // ---------------------------------------------------------------- weights
@@ -494,6 +515,362 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         err = std::string("inkling: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- the batched prompt path
+namespace {
+
+int ink_sub() {   // the attention's sub-batch (STRATA_INK_PREFILL_SUB, 64 .. 2048: a window ring's rows stay unread)
+    static const int v = [] {
+        const char* e = getenv("STRATA_INK_PREFILL_SUB");
+        return e != nullptr ? std::clamp(std::atoi(e), 64, 2048) : 512;
+    }();
+    return v;
+}
+constexpr int kPromptSplits = 4;   // the prompt attention's key ranges a row (the rows fill the GPU)
+
+struct Cv {   // 256-byte aligned carving from a base (base null: sizing only)
+    uint8_t* base = nullptr;
+    size_t off = 0;
+    template <class Tp>
+    Tp* take(size_t n) {
+        Tp* p = base != nullptr ? (Tp*) (base + off) : nullptr;
+        off += (n * sizeof(Tp) + 255u) & ~(size_t) 255u;
+        return p;
+    }
+};
+// a sub-batch's scratch
+struct Sub {
+    float *mixo, *msgs, *cin[3], *cat, *lo, *cg, *cf, *xn[3];
+    uint16_t* x16[3];
+    float *qf, *gl, *kf, *vf, *kc, *vc, *rf, *sk, *kd, *vd, *ao, *tmp, *tmp2, *part;
+    uint16_t* ao16;
+};
+Sub carve_sub(Cv& c, const Glm5Geometry& g, size_t tn) {
+    const size_t E = (size_t) g.n_embd, HD = (size_t) g.n_head * g.head_dim, KV = (size_t) g.attn_head_kv * g.head_dim;
+    const size_t H = (size_t) g.n_head, Hkv = (size_t) g.attn_head_kv, R = (size_t) g.ink_rank;
+    Sub b{};
+    b.mixo = c.take<float>(tn * 3 * E);
+    b.msgs = c.take<float>(tn * 4 * E);
+    for (int j = 0; j < 3; ++j) {
+        b.cin[j] = c.take<float>(tn * E);
+        b.xn[j] = c.take<float>(tn * E);
+        b.x16[j] = c.take<uint16_t>(tn * E);
+    }
+    b.cat = c.take<float>(tn * 2 * E);
+    b.lo = c.take<float>(tn * R);
+    b.cg = c.take<float>(tn * E);
+    b.cf = c.take<float>(tn * E);
+    b.qf = c.take<float>(tn * HD);
+    b.gl = c.take<float>(tn * HD);
+    b.kf = c.take<float>(tn * KV);
+    b.vf = c.take<float>(tn * KV);
+    b.kc = c.take<float>(tn * KV);
+    b.vc = c.take<float>(tn * KV);
+    b.rf = c.take<float>(tn * H * ik::kRel);
+    b.sk = c.take<float>(tn * H);
+    b.kd = c.take<float>(tn * Hkv * ik::kConv);
+    b.vd = c.take<float>(tn * Hkv * ik::kConv);
+    b.ao = c.take<float>(tn * HD);
+    b.ao16 = c.take<uint16_t>(tn * HD);
+    b.tmp = c.take<float>(tn * E);
+    b.tmp2 = c.take<float>(tn * E);
+    b.part = c.take<float>(ik::attn_part_floats((int) tn, (int) H, kPromptSplits));
+    return b;
+}
+bool blas_ok(cublasStatus_t st, const char* what, std::string& err) {
+    if (st == CUBLAS_STATUS_SUCCESS) return true;
+    err = std::string("inkling prompt: ") + what + ": cuBLAS status " + std::to_string((int) st);
+    return false;
+}
+bool f16_type(int t) { return t == gf::kTypeBF16 || t == gf::kTypeF32 || strata::kernels::dequant_bf16_supported(t); }
+// Y[t][N] (ldy) = X16[t][Kd] . W[N][Kd]^T: W widened / dequantized to FP16 in slices that fit the scratch, the tensor
+// cores' product with F32 accumulation (the prompt path's hgemm_q)
+bool gemm16(const Glm5Model::Hy4PromptIo& io, const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y,
+            int ldy, int Tn, cudaStream_t s, std::string& err) {
+    if (Tn <= 0) return true;
+    const float one = 1.0f, zero = 0.0f;
+    const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, io.w16_elems / Kd));
+    for (int r0 = 0; r0 < N; r0 += rows) {
+        const int n = std::min(rows, N - r0);
+        if (w.type == gf::kTypeBF16)
+            gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, io.w16, (int64_t) n * Kd, s);
+        else if (w.type == gf::kTypeF32)
+            gb::f32_to_f16((const float*) w.q + (size_t) r0 * Kd, io.w16, (int64_t) n * Kd, s);
+        else
+            strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, io.w16, s);
+        if (!blas_ok(cublasGemmEx((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, io.w16,
+                                  CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &zero, Y + r0, CUDA_R_32F, ldy,
+                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                     "gemm f16", err))
+            return false;
+    }
+    return true;
+}
+// Y[t][N] = X[t][Kd] (ldx) . W[N][Kd]^T in F32 (the controllers' F32 rows)
+bool gemm32(const Glm5Model::Hy4PromptIo& io, const float* W, int N, int Kd, const float* X, int ldx, float* Y, int Tn,
+            std::string& err) {
+    if (Tn <= 0) return true;
+    const float one = 1.0f, zero = 0.0f;
+    return blas_ok(cublasSgemm((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, N, Tn, Kd, &one, W, Kd, X, ldx, &zero,
+                               Y, N),
+                   "sgemm", err);
+}
+ik::States rows_of(const float* const* p, int n, const float* cur, int64_t t0, int64_t E) {
+    ik::States st;
+    for (int i = 0; i < n; ++i) st.p[i] = p[i] + t0 * E;
+    st.p[n] = cur + t0 * E;
+    st.n = n + 1;
+    st.stride = E;
+    return st;
+}
+
+}  // namespace
+
+bool Glm5Model::ink_prompt_ok(std::string& why) const {
+    const char* v = getenv("STRATA_INK_PREFILL");
+    if (v != nullptr && std::atoi(v) == 0) {
+        why = "STRATA_INK_PREFILL=0";
+        return false;
+    }
+    const FastState* F = fast_;
+    if (F == nullptr || F->ink == nullptr) {
+        why = "inkling: no token path state";
+        return false;
+    }
+    const Glm5Geometry& g = g_;
+    if (g.head_dim != ik::kHeadDim || g.n_head % g.attn_head_kv != 0) {
+        why = "inkling: head geometry";
+        return false;
+    }
+    std::string bad;
+    const auto ck = [&](const WSlot& w, int il, const char* nm) {
+        if (w.q == nullptr || !f16_type(w.type))
+            bad += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
+    };
+    for (int il = 0; il < g.n_layers; ++il) {
+        const auto& Ly = F->ink->L[(size_t) il];
+        ck(Ly.q, il, "attn_q");
+        ck(Ly.k, il, "attn_k");
+        ck(Ly.v, il, "attn_v");
+        ck(Ly.o, il, "attn_output");
+        ck(Ly.gate, il, "attn_gate");
+        ck(Ly.rel, il, "attn_rel");
+        ck(Ly.sink, il, "attn_sink_proj");
+        if (!Ly.swa) {
+            ck(Ly.kcp, il, "attn_k_conv_proj");
+            ck(Ly.vcp, il, "attn_v_conv_proj");
+        }
+        const auto& FL = F->L[(size_t) il];
+        if (FL.router_type != gf::kTypeF32 && FL.router_type != gf::kTypeBF16)
+            bad += "blk." + std::to_string(il) + ".ffn_gate_inp (type " + std::to_string(FL.router_type) + ") ";
+    }
+    if (!bad.empty()) {
+        why = "inkling: weights without an FP16 decode: " + bad.substr(0, 300);
+        return false;
+    }
+    return true;
+}
+
+std::pair<size_t, size_t> Glm5Model::ink_prompt_bytes(size_t T) const {
+    const Glm5Geometry& g = g_;
+    const size_t E = (size_t) g.n_embd;
+    Cv k;
+    for (int i = 0; i < Ink::kBufs; ++i) k.take<float>(T * E);
+    k.take<float>(T * E);   // fin
+    Cv c;
+    carve_sub(c, g, std::min<size_t>(T, (size_t) ink_sub()));
+    return {k.off, c.off};
+}
+
+const float* Glm5Model::ink_prompt_final() const {
+    return fast_ != nullptr && fast_->ink != nullptr ? fast_->ink->pc.fin : nullptr;
+}
+
+bool Glm5Model::ink_prompt_embed(int T, const Hy4PromptIo& io, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    Ink& K = *F->ink;
+    const size_t E = (size_t) g.n_embd;
+    auto& C = K.pc;
+    Cv k{io.keep};
+    for (int i = 0; i < Ink::kBufs; ++i) C.hb[i] = k.take<float>((size_t) T * E);
+    C.fin = k.take<float>((size_t) T * E);
+    C.nb = 0;
+    C.bn = 0;
+    C.pbn = 0;
+    C.bank_n = 0;
+    C.bank_out = nullptr;
+    C.prelude = nullptr;
+    C.h = C.hb[C.nb++ % Ink::kBufs];
+    if (pos_ == 0) ink_reset();   // (a new sequence: the conv states start at zero)
+    // the embedding rows (prefill_run's, in io.x), rms-normed with token_embd_norm
+    ik::rms_rows(io.x, (int64_t) E, K.tok_norm, g.norm_eps, (int) E, T, C.h, (int64_t) E, F->cs);
+    (void) err;
+    return true;
+}
+
+bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& io, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    Ink& K = *F->ink;
+    auto& C = K.pc;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, D = g.head_dim, H = g.n_head, Hkv = g.attn_head_kv, KV = Hkv * D, HD = H * D;
+    const int R = g.ink_rank;
+    const int il = g.ink_app_phys(ia), pass = g.ink_app_pass(ia), sl = g.ink_app_slot(ia);
+    const auto& Ly = K.L[(size_t) il];
+    auto& S = K.S[(size_t) sl];
+    const bool swa = Ly.swa;
+    const bool looped = g.ink_passes > 1;
+    // ---- the passes' bookkeeping (the token path's): the prelude before the core, each later pass from it again
+    if (looped && il == g.ink_lo) {
+        if (pass == 0) {
+            C.prelude = C.h;
+            C.pbn = C.bn;
+            for (int i = 0; i < C.bn; ++i) C.pbl[i] = C.bl[i];
+        } else {
+            C.bank_n = 0;
+            for (int i = C.pbn + 1; i < C.bn; ++i) C.bank[C.bank_n++] = C.bl[i];
+            C.bank_out = C.h;
+            C.h = C.prelude;
+            C.bn = C.pbn;
+            for (int i = 0; i < C.pbn; ++i) C.bl[i] = C.pbl[i];
+        }
+    }
+    const bool has_msgs = pass > 0;
+    const bool starts = il % g.ink_block == 0;
+    float* hin = C.h;
+    const float* ab[ik::kMaxStates];   // the attention mix's blocks
+    const int an = C.bn;
+    for (int i = 0; i < an; ++i) ab[i] = C.bl[i];
+    if (starts) {
+        if (C.bn + 1 >= ik::kMaxStates) {
+            err = "inkling prompt: too many residual blocks";
+            return false;
+        }
+        C.bl[C.bn++] = hin;
+        C.h = C.hb[C.nb++ % Ink::kBufs];
+    }
+    float* hout = C.h;
+    C.hin = hin;
+    const int tn_max = std::min(T, ink_sub());
+    Cv cv{io.uni};
+    const Sub B = carve_sub(cv, g, (size_t) tn_max);
+    if (cv.off > io.uni_bytes) {
+        err = "inkling prompt: the scratch";
+        return false;
+    }
+    for (int t0 = 0; t0 < T; t0 += tn_max) {
+        const int tn = std::min(tn_max, T - t0);
+        const int64_t pt = p0 + t0;
+        // ---- the attention's inputs
+        const float* in[3] = {hin + (size_t) t0 * E, hin + (size_t) t0 * E, hin + (size_t) t0 * E};
+        int64_t ins = E;
+        if (Ly.attn_rq != nullptr) {
+            const int nq = swa ? 1 : 3;
+            ik::mix(rows_of(ab, an, hin, t0, E), Ly.attn_rq, nq, E, tn, B.mixo, s);
+            for (int j = 0; j < 3; ++j) in[j] = B.mixo + (size_t) (swa ? 0 : j) * E;
+            ins = (int64_t) nq * E;
+        }
+        const auto control = [&](int c, const float* cur, int64_t cs, const float* msg, int64_t ms, float* out) -> bool {
+            ik::ctrl_cat(cur, cs, msg, ms, E, tn, B.cat, s);
+            if (!gemm32(io, Ly.down[c], R, 2 * E, B.cat, 2 * E, B.lo, tn, err) ||
+                !gemm32(io, Ly.gain[c], E, R, B.lo, R, B.cg, tn, err) ||
+                !gemm32(io, Ly.forget[c], E, R, B.lo, R, B.cf, tn, err))
+                return false;
+            ik::ctrl_apply(cur, cs, msg, ms, B.cg, B.cf, E, tn, out, E, s);
+            return true;
+        };
+        if (has_msgs) {
+            ik::mix(rows_of(C.bank, C.bank_n, C.bank_out, t0, E), Ly.msg_q, kCtrl, E, tn, B.msgs, s);
+            for (int j = 0; j < 3; ++j)
+                if (!control(j, in[j], ins, B.msgs + (size_t) j * E, 4 * (int64_t) E, B.cin[j])) return false;
+            for (int j = 0; j < 3; ++j) in[j] = B.cin[j];
+            ins = E;
+        }
+        const int nx = swa && !has_msgs ? 1 : 3;
+        const float* gm[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
+        for (int j = 0; j < nx; ++j) {
+            ik::rms_rows(in[j], ins, gm[j], g.norm_eps, E, tn, B.xn[j], E, s);
+            gb::f32_to_f16(B.xn[j], B.x16[j], (int64_t) tn * E, s);
+        }
+        const int i1 = nx == 1 ? 0 : 1, i2 = nx == 1 ? 0 : 2;
+        // ---- the projections
+        if (!gemm16(io, Ly.q, HD, E, B.x16[0], E, B.qf, HD, tn, s, err) ||
+            !gemm16(io, Ly.gate, HD, E, B.x16[0], E, B.gl, HD, tn, s, err) ||
+            !gemm16(io, Ly.rel, H * ik::kRel, E, B.x16[0], E, B.rf, H * ik::kRel, tn, s, err) ||
+            !gemm16(io, Ly.sink, H, E, B.x16[0], E, B.sk, H, tn, s, err) ||
+            !gemm16(io, Ly.k, KV, E, B.x16[i1], E, B.kf, KV, tn, s, err) ||
+            !gemm16(io, Ly.v, KV, E, B.x16[i2], E, B.vf, KV, tn, s, err))
+            return false;
+        if (!swa && (!gemm16(io, Ly.kcp, ik::kConv * Hkv, E, B.x16[i1], E, B.kd, ik::kConv * Hkv, tn, s, err) ||
+                     !gemm16(io, Ly.vcp, ik::kConv * Hkv, E, B.x16[i2], E, B.vd, ik::kConv * Hkv, tn, s, err)))
+            return false;
+        if (io.mark) io.mark(io.mark_ctx, "ink_proj", s);
+        // ---- conv, clips, the caches
+        float* conv = S.conv;
+        ik::conv_rows_par(B.kf, KV, Ly.k_conv, swa ? nullptr : B.kd, ik::kConv * Hkv, D, conv, KV, tn, B.kc, KV, s);
+        ik::conv_rows_par(B.vf, KV, Ly.v_conv, swa ? nullptr : B.vd, ik::kConv * Hkv, D, conv + (size_t) KV * 3, KV, tn,
+                          B.vc, KV, s);
+        const float lf = swa ? 0.0f : g.ink_log_floor;
+        ik::clip_heads(B.qf, HD, Ly.q_clip, D, H, g.ink_qk_clip, pt, lf, g.ink_log_alpha, tn, s);
+        ik::clip_heads(B.kc, KV, nullptr, D, Hkv, g.ink_qk_clip, pt, 0.0f, 0.0f, tn, s);
+        ik::clip_heads(B.rf, H * ik::kRel, Ly.rel_clip, ik::kRel, H, g.ink_rel_clip, pt, lf, g.ink_log_alpha, tn, s);
+        ik::kv_store(B.kc, KV, B.vc, KV, g.norm_eps, Hkv, pt, tn, S.ring, S.kc, S.vc, s);
+        // ---- attention, gate, output, post conv
+        ik::attn(B.qf, HD, B.rf, H * ik::kRel, B.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring,
+                 H, Hkv, pt, tn, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), B.part, kPromptSplits, B.ao, HD, s);
+        ik::gate_sigmoid(B.ao, HD, B.gl, HD, HD, tn, s);
+        gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HD, s);
+        if (!gemm16(io, Ly.o, E, HD, B.ao16, HD, B.tmp, E, tn, s, err)) return false;
+        if (io.mark) io.mark(io.mark_ctx, "ink_attn", s);
+        float* conv_post = conv + (size_t) 2 * KV * 3;
+        if (starts) {   // (the attention's output starts the next block)
+            ik::conv_rows_par(B.tmp, E, Ly.post_conv, nullptr, 0, E, conv_post, E, tn, hout + (size_t) t0 * E, E, s);
+        } else {
+            ik::conv_rows_par(B.tmp, E, Ly.post_conv, nullptr, 0, E, conv_post, E, tn, B.tmp2, E, s);
+            ik::add_rows(hout + (size_t) t0 * E, E, B.tmp2, E, E, tn, s);
+        }
+        // ---- the FFN's input
+        ik::mix(rows_of(C.bl, C.bn, hout, t0, E), Ly.ffn_rq, 1, E, tn, B.mixo, s);
+        const float* fin = B.mixo;
+        if (has_msgs) {
+            if (!control(3, fin, E, B.msgs + (size_t) 3 * E, 4 * (int64_t) E, B.cin[0])) return false;
+            fin = B.cin[0];
+        }
+        ik::rms_rows(fin, E, Ly.ffn_norm, g.norm_eps, E, tn, io.x + (size_t) t0 * E, E, s);
+    }
+    gb::f32_to_f16(io.x, io.x16, (int64_t) T * E, s);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("inkling prompt: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+bool Glm5Model::ink_prompt_ffn_out(int ia, int T, const Hy4PromptIo& io, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    Ink& K = *F->ink;
+    auto& C = K.pc;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, KV = g.attn_head_kv * g.head_dim;
+    const int il = g.ink_app_phys(ia), sl = g.ink_app_slot(ia);
+    const auto& Ly = K.L[(size_t) il];
+    float* conv = K.S[(size_t) sl].conv;
+    // (x, the experts' input, is free now: the post conv's rows)
+    ik::conv_rows_par(io.ffn, E, Ly.ffn_conv, nullptr, 0, E, conv + (size_t) (2 * KV + E) * 3, E, T, io.x, E, s);
+    ik::add_rows(C.h, E, io.x, E, E, T, s);
+    if (ia + 1 == g.ink_slots())   // the head's rows: the depth attention with output_res_query
+        ik::mix(rows_of(C.bl, C.bn, C.h, 0, E), K.out_rq, 1, E, T, C.fin, s);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("inkling prompt ffn: ") + cudaGetErrorString(e);
         return false;
     }
     return true;

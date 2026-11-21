@@ -3423,7 +3423,30 @@ static int glm_pack_generate(const Options& o) {
             // STRATA_GLM_SCORE_PREFILL=1: the unscored context (all but its last token) through the prompt path, so a
             // long context is scored in minutes (the KV-cache formats at 128K); the scored tokens stay token by token
             size_t i0 = 0;
-            if (getenv("STRATA_GLM_SCORE_PREFILL") != nullptr && model.fast() && model.prefill_chunk() > 0 && c > 2 &&
+            // STRATA_GLM_SCORE_PREFILL=all: every position through the prompt path, its logits rows scored (the prompt
+            // path's yardstick against the reference; DeepSeek V4.1 / Inkling, one device)
+            const char* spf = getenv("STRATA_GLM_SCORE_PREFILL");
+            std::vector<std::vector<float>> pf_rows;
+            const bool pf_all = spf != nullptr && std::strcmp(spf, "all") == 0;
+            if (pf_all) {
+                if (!model.fast() || model.prefill_chunk() <= 0 || o.tokens.size() < 3) {
+                    std::printf("ERR STRATA_GLM_SCORE_PREFILL=all: no prompt path\n");
+                    return 1;
+                }
+                pf_rows.resize(o.tokens.size() - 1);
+                model.prefill_logits = [&](int64_t pos, const std::vector<float>& row, std::string& e) {
+                    if (pos < 0 || (size_t) pos >= pf_rows.size()) { e = "score prefill: position"; return false; }
+                    if ((size_t) pos >= c) pf_rows[(size_t) pos] = row;
+                    return true;
+                };
+                const std::vector<int32_t> part(o.tokens.begin(), o.tokens.end() - 1);
+                const bool pok = model.prefill(part, err, (int32_t) o.tokens.back());
+                model.prefill_logits = nullptr;
+                if (!pok) {
+                    std::printf("ERR %s\n", err.empty() ? "prefill" : err.c_str());
+                    return 1;
+                }
+            } else if (spf != nullptr && model.fast() && model.prefill_chunk() > 0 && c > 2 &&
                 c < o.tokens.size()) {
                 const std::vector<int32_t> part(o.tokens.begin(), o.tokens.begin() + (long) (c - 1));
                 if (!model.prefill(part, err, (int32_t) o.tokens[c - 1])) {
@@ -3461,6 +3484,9 @@ static int glm_pack_generate(const Options& o) {
                             }
                     }
                     lg = wl[i - w0];
+                } else if (pf_all) {
+                    if (i + 1 <= c) continue;
+                    lg = std::move(pf_rows[i]);
                 } else if (!model.forward({(int32_t) o.tokens[i]}, lg, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;

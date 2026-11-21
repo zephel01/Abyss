@@ -21,6 +21,11 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                  void* stream);
 
+/// NVFP4 (type 40: 64 values a 36-byte block, four UE4M3 sub-block scales) into FP16 bits - without the tensor's
+/// second-level scale (the caller's).  Every value is exact in FP16.  Apart from dequant_f16 so that
+/// dequant_bf16_supported (the other models' path choices) stays as it was.
+void dequant_nvfp4_f16(const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out, void* stream);
+
 /// The same into FP32 (tests and small tensors).
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream);
 

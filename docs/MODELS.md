@@ -130,8 +130,8 @@ Thinking Machines' Inkling-2-Mini (Apache-2.0, 26B, depth-attention mixes and a 
 only. Both GGUF layouts load: the mainline `inkling2_loop` files and unsloth's root `inkling2` files. Quality: KL
 against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token EN / JA / code set, and on positions
 8,960-9,471 of a 9.5K text. Speeds: RTX 5090 (PCIe Gen4 x4), iGPU lane off, a 4K prompt, then 512 tokens, median of
-3. llama.cpp is `llama-bench -fa 1 -d 4096 -n 512` on the same Q4_K_XL file. The prompt runs one token at a time in
-Abyss for now: about 120 tok/s, against llama.cpp's 2,135 at a 4K depth.
+3. llama.cpp is `llama-bench -fa 1 -d 4096 -n 512` on the same Q4_K_XL file. Prompts (the batched prompt path, a 4K prompt): Q4_K_XL
+3,654 tok/s all in VRAM, 2,145 at 16 GB, 1,527 at 12 GB (llama.cpp at a 4K depth: 2,135 all in VRAM, 748 / 527 with `-ncmoe 6` / `12`); Q8_0 2,657.
 
 | file (source) | size | quality | speed | use |
 | --- | ---: | --- | --- | --- |

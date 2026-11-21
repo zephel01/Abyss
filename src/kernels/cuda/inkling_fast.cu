@@ -174,6 +174,45 @@ __global__ void ctrl_apply_kernel(const float* __restrict__ cur, int64_t cs, con
 }
 
 // ---------------------------------------------------------------- the short convolutions
+// grid (C / 128, T): row t from the inputs t - 3 .. t (the state's for t < 3), as conv_kernel's step
+__global__ void conv_par_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
+                                const float* __restrict__ dw, int64_t dws, int head_ch, const float* __restrict__ state,
+                                int C, float* __restrict__ out, int64_t os) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= C) return;
+    float xv[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int tt = t - 3 + k;
+        xv[k] = tt >= 0 ? in[(int64_t) tt * is + c] : state[(size_t) c * 3 + (3 + tt)];
+    }
+    const float x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+    const float w0 = w[(size_t) c * 4 + 0], w1 = w[(size_t) c * 4 + 1], w2 = w[(size_t) c * 4 + 2], w3 = w[(size_t) c * 4 + 3];
+    const float scale = 1.0f / sqrtf(dw != nullptr ? 9.0f : 5.0f);
+    float o = x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3;
+    if (dw != nullptr) {
+        const float* d = dw + (int64_t) t * dws + (size_t) (c / head_ch) * 4;
+        o = o + x3 * d[0];
+        o = o + x2 * d[1];
+        o = o + x1 * d[2];
+        o = o + x0 * d[3];
+    }
+    out[(int64_t) t * os + c] = (x3 + o) * scale;
+}
+// the state after T rows: the last 3 inputs (the old state's where T < 3)
+__global__ void conv_state_kernel(const float* __restrict__ in, int64_t is, float* __restrict__ state, int C, int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float v[3];
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int tt = T - 3 + k;
+        v[k] = tt >= 0 ? in[(int64_t) tt * is + c] : state[(size_t) c * 3 + (3 + tt)];
+    }
+#pragma unroll
+    for (int k = 0; k < 3; ++k) state[(size_t) c * 3 + k] = v[k];
+}
+
 __global__ void conv_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
                             const float* __restrict__ dw, int64_t dws, int head_ch, float* __restrict__ state, int C, int T,
                             float* __restrict__ out, int64_t os) {
@@ -508,6 +547,15 @@ void conv_rows(const float* in, int64_t is, const float* w, const float* dw, int
     if (T <= 0) return;
     conv_kernel<<<(C + 127) / 128, 128, 0, s>>>(in, is, w, dw, dws, head_ch, state, C, T, out, os);
     check("conv_rows");
+}
+
+void conv_rows_par(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
+                   int C, int T, float* out, int64_t os, cudaStream_t s) {
+    if (T <= 0) return;
+    conv_par_kernel<<<dim3((unsigned) ((C + 127) / 128), (unsigned) T), 128, 0, s>>>(in, is, w, dw, dws, head_ch, state, C,
+                                                                                    out, os);
+    conv_state_kernel<<<(C + 127) / 128, 128, 0, s>>>(in, is, state, C, T);
+    check("conv_rows_par");
 }
 
 void clip_heads(float* x, int64_t xs, const float* scale, int dim, int H, float thr, int64_t p0, float log_floor,

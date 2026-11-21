@@ -344,6 +344,44 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
     launch<uint16_t>(ggml_type, blocks, row0, rows, cols, out, stream);
 }
 
+namespace {
+// NVFP4: a thread a 16-value sub-block - its UE4M3 scale halved against the doubled MXFP4 table (the CPU's dot_nvfp4)
+__device__ __forceinline__ float nv_ue4m3_half(uint32_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t e = (x >> 3) & 15u, m = x & 7u;
+    return 0.5f * (e == 0 ? (float) m * (1.0f / 512.0f) : __uint_as_float((e + 120u) << 23 | m << 20));
+}
+__constant__ int8_t kv_mxfp4_d[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+__global__ void dequant_nvfp4_f16_kernel(const uint8_t* __restrict__ p, int64_t row_bytes, int64_t row0, int64_t rows,
+                                         int64_t subs, __half* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * subs) return;
+    const int64_t r = i / subs, sb = i - r * subs;
+    const uint8_t* b = p + (row0 + r) * row_bytes + (sb / 4) * 36;
+    const int s = (int) (sb % 4);
+    const float d = nv_ue4m3_half(b[s]);
+    const uint8_t* q = b + 4 + 8 * s;
+    __half* o = out + r * (subs * 16) + sb * 16;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        o[j] = __float2half_rn((float) kv_mxfp4_d[q[j] & 0xF] * d);
+        o[j + 8] = __float2half_rn((float) kv_mxfp4_d[q[j] >> 4] * d);
+    }
+}
+}  // namespace
+
+void dequant_nvfp4_f16(const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out, void* stream) {
+    if (rows <= 0 || cols % 64 != 0) {
+        std::fprintf(stderr, "dequant nvfp4: shape %lld x %lld\n", (long long) rows, (long long) cols);
+        std::exit(1);
+    }
+    const int64_t subs = cols / 16, total = rows * subs;
+    dequant_nvfp4_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) blocks, cols / 64 * 36, row0, rows, subs, reinterpret_cast<__half*>(out));
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                  void* stream) {
     if (iq_only(ggml_type)) {

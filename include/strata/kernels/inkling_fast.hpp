@@ -49,6 +49,10 @@ void ctrl_apply(const float* cur, int64_t cs, const float* msg, int64_t ms, cons
 void conv_rows(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
                int C, int T, float* out, int64_t os, cudaStream_t s);
 
+/// conv_rows over the T rows in parallel (the same arithmetic a row): out must not overlap in
+void conv_rows_par(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
+                   int C, int T, float* out, int64_t os, cudaStream_t s);
+
 /// The L2 clip of T rows of H heads of `dim` (x[t][h][:], rows at x + t xs): x *= scale[h][:] (null: none), then
 /// x *= min(1, thr / (|x| + 1e-6)), then (log_floor > 0) x *= 1 + alpha log(max(1, (p0 + t + 1) / log_floor))
 void clip_heads(float* x, int64_t xs, const float* scale, int dim, int H, float thr, int64_t p0, float log_floor,

@@ -192,6 +192,22 @@ struct Glm5Geometry {
     int ink_slots() const { return n_layers + (ink_passes - 1) * (ink_hi - ink_lo); }
     /// a slot's physical layer
     int ink_phys(int sl) const { return sl < n_layers ? sl : ink_lo + (sl - n_layers) % (ink_hi - ink_lo); }
+    /// application ia (in a token's order: the prelude, pass 0's core, pass 1's, ..., the coda): its pass (0 outside
+    /// the core), physical layer and slot
+    int ink_app_pass(int ia) const {
+        const int core = ink_hi - ink_lo;
+        return ink_passes > 1 && ia >= ink_lo && ia < ink_lo + ink_passes * core ? (ia - ink_lo) / core : 0;
+    }
+    int ink_app_phys(int ia) const {
+        const int core = ink_hi - ink_lo;
+        if (ink_passes <= 1 || ia < ink_lo) return ia;
+        if (ia < ink_lo + ink_passes * core) return ink_lo + (ia - ink_lo) % core;
+        return ia - (ink_passes - 1) * core;
+    }
+    int ink_app_slot(int ia) const {
+        const int pass = ink_app_pass(ia), il = ink_app_phys(ia);
+        return pass == 0 ? il : n_layers + (pass - 1) * (ink_hi - ink_lo) + (il - ink_lo);
+    }
     static bool from_gguf_inkling(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
     int d_inner() const { return kda_head_dim * n_head; }
@@ -701,6 +717,16 @@ public:
     bool hy4_prompt_shared(int il, int T, float* sg, float* su, uint16_t* sh16, int sub, const Hy4PromptIo& io,
                            std::string& err);
     bool hy4_prompt_ffn_out(int il, int T, const Hy4PromptIo& io, std::string& err);
+    // the batched prompt path's inkling half (inkling_fast_path.cu): prefill_half runs the 48 layer applications in a
+    // token's order (ink_app_phys), each through ink_prompt_layer (the depth mixes, the controllers, the attention, the
+    // FFN's read into io.x / io.x16), the MoE of prefill_half's machinery, then ink_prompt_ffn_out (the FFN's post conv
+    // and add; the last application also the head's mix rows).  The prompt's KV, conv states, slots are the token path's
+    bool ink_prompt_ok(std::string& why) const;
+    std::pair<size_t, size_t> ink_prompt_bytes(size_t T) const;
+    bool ink_prompt_embed(int T, const Hy4PromptIo& io, std::string& err);    // io.x (the embedding rows) -> h
+    bool ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& io, std::string& err);
+    bool ink_prompt_ffn_out(int ia, int T, const Hy4PromptIo& io, std::string& err);
+    const float* ink_prompt_final() const;                                      // the last chunk's head rows (T x E)
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
     void qwen35_reset();                                   // a new sequence: the states zeroed (on the fast stream)

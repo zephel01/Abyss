@@ -1740,6 +1740,11 @@ __global__ void swiglu_rows_kernel(const float* gu, float* h, int rows, int n_ff
     const int64_t r = i / n_ff;
     const int c = (int) (i - r * n_ff);
     const float* row = gu + r * 2 * n_ff;
+    if (limit < 0.0f) {   // (Inkling's SITU, selected by a negative clamp: glm_fast.cu's situ_act)
+        const float gs = row[c], us = row[n_ff + c];
+        h[r * ld_h + c] = (4.0f * tanhf(gs * 0.25f)) * (1.0f / (1.0f + expf(-gs))) * (25.0f * tanhf(us * 0.04f));
+        return;
+    }
     const float g = fminf(row[c], limit);
     const float u = fminf(fmaxf(row[n_ff + c], -limit), limit);
     h[r * ld_h + c] = (g / (1.0f + expf(-g))) * u;
