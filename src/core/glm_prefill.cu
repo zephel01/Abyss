@@ -408,12 +408,41 @@ bool own_type(int type) {
     return false;
 #endif
 }
+// HIP: the kernels that multiply the prompt's routed experts (#49).  An RX 9060 XT on Windows (TheRock ROCm 7.14.1)
+// ran the dense FFN's MMQ ~390x slower than the FP16 path, and Qwen3.8's prompts stayed at 9 tok/s with every
+// FP16 GEMM replaced: its experts go through the same MMQ.  STRATA_HIP_EXPERTS=auto (the default) times one layer's
+// experts once at the first prompt on MMQ, on the own int8 GEMM and on the FP16 path (each expert decoded once) and
+// keeps MMQ unless another is more than 1.5x faster; mmq / own / fp16 fix the choice without the check.
+// STRATA_PROMPT_MMQ / STRATA_PROMPT_OWN_TYPES set: their choice, no check.  (One process-wide choice: the cards of
+// one HIP box take the same kernels.)  CUDA: always kXpMmq (its own type lists).
+enum HipExperts { kXpAuto = -1, kXpMmq = 0, kXpOwn = 1, kXpFp16 = 2 };
+static int& hip_experts() {
+#if defined(STRATA_USE_HIP)
+    static int mode = [] {
+        const char* v = getenv("STRATA_HIP_EXPERTS");
+        const std::string m = v != nullptr ? v : "";
+        if (m == "mmq") return (int) kXpMmq;
+        if (m == "own") return (int) kXpOwn;
+        if (m == "fp16") return (int) kXpFp16;
+        if (m.empty() || m == "auto")
+            return getenv("STRATA_PROMPT_MMQ") != nullptr || getenv("STRATA_PROMPT_OWN_TYPES") != nullptr ? (int) kXpMmq
+                                                                                                         : (int) kXpAuto;
+        std::fprintf(stderr, "glm prefill: STRATA_HIP_EXPERTS=%s is none of auto, mmq, own, fp16 - auto\n", v);
+        return (int) kXpAuto;
+    }();
+#else
+    static int mode = kXpMmq;
+#endif
+    return mode;
+}
 // own_type for this model's layers: inkling's NVFP4 experts take the own GEMM too (MMQ's NVFP4 product cost the
 // Q4_K_XL prompt KL 0.015 against the Q8_0, the own one 0.006 - the token path's level); STRATA_INK_NV_OWN=0: MMQ
+// (HIP, STRATA_HIP_EXPERTS=own or its check chose it: every type the own GEMM reads)
 static bool own_type_l(int type, const Glm5Geometry& g) {
 #if defined(STRATA_MOE_OWN)
     static const bool ink_own = [] { const char* v = getenv("STRATA_INK_NV_OWN"); return v == nullptr || std::atoi(v) != 0; }();
-    return own_type(type) || (g.ink && type == 40 && ink_own && own::supported(40));
+    return own_type(type) || (g.ink && type == 40 && ink_own && own::supported(40)) ||
+           (hip_experts() == kXpOwn && own::supported(type));
 #else
     (void) g;
     return own_type(type);
@@ -559,6 +588,7 @@ struct Glm5Model::PrefillState {
     // HIP, STRATA_Q35D_MMQ unset: the first prompt times one layer's gate product on MMQ and on the FP16 path
     // (prefill_half); dq_off: MMQ was the slower by far - the FP16 products from then on (the buffers stay)
     bool dq_checked = false, dq_off = false;
+    bool xp_checked = false;   // HIP, STRATA_HIP_EXPERTS=auto: the experts' kernels were timed (hip_experts)
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
     bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
@@ -909,12 +939,16 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // NVFP4 experts: the MMQ sets apply their second-level scales (the down one folded into the route weights, the
     // gate/up one on the product's rows before the SwiGLU); the light kernels, the CPU and the iGPU rows do not take
     // them (their staged experts all go over PCIe), and the fused SwiGLU product is off for them
-    bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false;
+    bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false,
+         hip_deq = false;
     std::map<std::string, int> own_n, mmq_n;   // the layers' products by kernel
 #if defined(STRATA_MOE_OWN)
     {   // own_sums_model: an expert matrix of a sums type, or dense products (a dense layer's FFN and the projections
         // that share its buffers - any of their types may be one; STRATA_GLM_Q35_PROJ_MMQ the same)
-        const auto st = [&](int t) { return own::needs_sums(t) && own_type_l(t, g); };
+        // (HIP, STRATA_HIP_EXPERTS=auto: the check may move the experts to the own GEMM - its sums sized for)
+        const auto st = [&](int t) {
+            return own::needs_sums(t) && (own_type_l(t, g) || (hip_experts() == kXpAuto && own::supported(t)));
+        };
         bool on = false, dense = getenv("STRATA_GLM_Q35_PROJ_MMQ") != nullptr;
         for (int il = l0_; il < l1_; ++il) {
             const auto& Ly = F->L[(size_t) il];
@@ -1038,6 +1072,10 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                 deq_ok(Ly.sh_down, "ffn_down_shexp", il);
             }
             if (ink_nv_dq_on(Ly, g)) has_deq = true;   // (inkling NVFP4: run_blas_dq)
+            // (HIP: STRATA_HIP_EXPERTS=fp16, or its check may choose run_blas_dq - its scratch, no message)
+            if (!Ly.exl3 && (hip_experts() == kXpAuto || hip_experts() == kXpFp16) && deq_expert_type(Ly.gu_type) &&
+                deq_expert_type(Ly.up_type) && deq_expert_type(Ly.d_type))
+                hip_deq = true;
             if (!Ly.exl3 && !int8_layer(Ly, g)) {   // (EXL3: run_set_x3)
                 if (deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.up_type) && deq_expert_type(Ly.d_type))
                     has_deq = true;   // (run_blas_dq)
@@ -1100,7 +1138,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
 
     // ---- sizes: the chunk T from the budget (per device)
     const int64_t E = g.n_embd;
-    const auto wsc = weight_scratch(g, has_dsa, has_deq);
+    const auto wsc = weight_scratch(g, has_dsa, has_deq || hip_deq);
     if (has_deq)
         std::fprintf(stderr, "glm prefill: CUDA%d experts without MMQ (IQ1_M ...) decoded to FP16 once each, then cuBLAS\n", dev_);
     const int64_t w16_elems = wsc.first, w32_elems = wsc.second;
@@ -1661,7 +1699,8 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
     const int max_pools = (int) std::max<int64_t>(1, max_ctx / g.idx_kpool);
     const int sub_env = prefill_sub_env();
     const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp);
-    const auto ws = weight_scratch(g, has_dsa, g.v41);   // (v41: an IQ1_M part's run_blas_dq scratch, at most)
+    // (v41: an IQ1_M part's run_blas_dq scratch, at most; HIP's STRATA_HIP_EXPERTS auto / fp16 the same)
+    const auto ws = weight_scratch(g, has_dsa, g.v41 || hip_experts() == kXpAuto || hip_experts() == kXpFp16);
     Carve c;
     c.take<uint8_t>(pu.first + pu.second);
     c.take<uint16_t>((size_t) ws.first);
@@ -3489,6 +3528,212 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
     }
 #endif
+#if defined(STRATA_USE_HIP)
+    // STRATA_HIP_EXPERTS=auto (hip_experts): the first MoE layer of a prompt of 256+ tokens, before its route, times its
+    // routed experts on MMQ, on the own int8 GEMM and on the FP16 path (run_blas_dq's steps) - up to 32 resident
+    // experts of the pool, the chunk's mean rows an expert (8-128), rows of this layer's x - each warmed once, then
+    // timed once.  Another path is taken when MMQ takes more than 1.5x its time and its output agrees with MMQ's
+    // (relative L2 under 0.1: a kernel that computes something else on this GPU is never taken).  It writes only the
+    // MoE buffers the layer's route and products write again (OUTP, OUTPc, Xq, Hq, row_tok, bounds) and w16.
+    const auto hip_experts_check = [&](int il, int T, const MoeBufs& M) {
+        S->xp_checked = true;
+        const auto& Ly = F->L[(size_t) il];
+        const auto& P = F->lp[(size_t) il];
+        const int nff = g.n_ff_exp;
+        const auto skip = [&](const char* why) {
+            hip_experts() = kXpMmq;
+            std::fprintf(stderr, "glm prefill: HIP%d the experts stay on MMQ (no kernel check: %s; STRATA_HIP_EXPERTS="
+                                 "own / fp16 picks another)\n", dev_, why);
+        };
+        if (Ly.exl3 || Ly.mixed() || Ly.nv_scale != nullptr || g.ink || M.GUX != nullptr ||
+            !mmq_layer(Ly.gu_type, Ly.d_type))
+            return skip("the layer's experts are not plain MMQ ones");
+        // the rows: the chunk's mean routes an expert; the experts: the first run of resident slots that holds them
+        const int R = std::max(8, std::min(128, (int) ((int64_t) T * K / std::max(1, g.n_expert))));
+        const int n = std::max(1, std::min(32, std::min(moe_window_rows((size_t) T, g), T) / R));
+        int i0 = -1;
+        for (int sl = 0, run = 0; sl < P.n_main && i0 < 0; ++sl) {
+            run = P.key[(size_t) sl] >= 0 ? run + 1 : 0;
+            if (run == n) i0 = sl - n + 1;
+        }
+        if (i0 < 0) return skip("too few resident experts in a row");
+        const int nrows = n * R;
+        const uint8_t* wb = P.base + (size_t) i0 * P.stride;
+        const size_t stride = P.stride;
+        std::vector<int> hb((size_t) n + 1), rt((size_t) nrows);
+        for (int i = 0; i <= n; ++i) hb[(size_t) i] = i * R;
+        for (int r = 0; r < nrows; ++r) rt[(size_t) r] = (int) (((int64_t) r * 7919) % T);   // (rows spread over the chunk)
+        cudaMemcpyAsync(M.bounds, hb.data(), hb.size() * sizeof(int), cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(M.row_tok, rt.data(), rt.size() * sizeof(int), cudaMemcpyHostToDevice, s);
+        cudaStreamSynchronize(s);   // (hb / rt are this lambda's: pageable copies staged before they go)
+        float* GU = M.OUTPc;   // [nrows][2 nff] (2 nff <= n_embd: GUX null)
+        float* OUT = M.OUTP;   // [nrows][E]
+        const int64_t dn_qk = strata::qt::blck_size((strata::qt::Type) Ly.d_type);
+        const size_t dn_end = Ly.down_off + (size_t) E * (size_t) (nff / dn_qk) * strata::qt::type_size((strata::qt::Type) Ly.d_type);
+        const int dn_over = (int) glmfast::mmq_down_over(Ly.d_type, nff);
+        const bool glu = mmq::glu_supported(Ly.gu_type, nff);
+        const auto run_mmq = [&] {
+            mmq::quantize(S->x, M.row_tok, M.Xq, Ly.gu_type, E, E, nrows, s, M.Xs);
+            mmq::Product gu;
+            gu.w = wb;
+            gu.type = Ly.gu_type;
+            gu.w_rows = 2 * nff;
+            gu.w_cols = E;
+            gu.expert_bytes = stride;
+            gu.n = n;
+            gu.xq = M.Xq;
+            gu.bounds = M.bounds;
+            gu.ids = S->iota;
+            gu.total_rows = nrows;
+            gu.max_rows = R;
+            gu.dst = GU;
+            gu.ld_dst = 2 * nff;
+            gu.y_scale = M.Xs;
+            if (glu) {
+                S->mq->run_glu(gu, g.swiglu_exp, s);
+            } else {
+                S->mq->run(gu, s);
+                gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            }
+            mmq::quantize(GU, nullptr, M.Hq, Ly.d_type, nff, 2 * nff, nrows, s, M.Hs);
+            if (dn_over > 0 && dn_end + (size_t) dn_over <= stride)   // (as run_set: the down's over-read reads zeros)
+                zero_tails<<<n, 128, 0, s>>>(const_cast<uint8_t*>(wb), stride, dn_end, dn_over);
+            mmq::Product dn;
+            dn.w = wb + Ly.down_off;
+            dn.type = Ly.d_type;
+            dn.w_rows = E;
+            dn.w_cols = nff;
+            dn.expert_bytes = stride;
+            dn.n = n;
+            dn.xq = M.Hq;
+            dn.bounds = M.bounds;
+            dn.ids = S->iota;
+            dn.total_rows = nrows;
+            dn.max_rows = R;
+            dn.dst = OUT;
+            dn.ld_dst = E;
+            dn.y_scale = M.Hs;
+            S->mq->run(dn, s);
+        };
+#if defined(STRATA_MOE_OWN)
+        const bool own_ok = own::supported(Ly.gu_type) && own::usable(Ly.gu_type, nff, E) &&
+                            own::supported(Ly.d_type) && own::usable(Ly.d_type, E, nff) &&
+                            (!(own::needs_sums(Ly.gu_type) || own::needs_sums(Ly.d_type)) || own_sums_model());
+        const auto run_own = [&] {
+            own::Set os;
+            os.w = wb;
+            os.stride = stride;
+            os.n = n;
+            os.bounds = M.bounds;
+            os.host_bounds = hb.data();
+            os.row0 = 0;
+            os.rows = nrows;
+            own::quantize(S->x, M.row_tok, M.Xq, E, E, nrows, s, own::needs_sums(Ly.gu_type));
+            os.xq = M.Xq;
+            os.dst = GU;
+            os.ld = 2 * nff;
+            S->oq->gate_up(os, Ly.gu_type, nff, E, mmq::matrix_bytes(Ly.gu_type, nff, E), g.swiglu_exp, s);
+            own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s, own::needs_sums(Ly.d_type));
+            os.xq = M.Hq;
+            os.dst = OUT;
+            os.ld = E;
+            S->oq->down(os, Ly.d_type, E, nff, Ly.down_off, s);
+        };
+#else
+        const bool own_ok = false;
+        const auto run_own = [] {};
+#endif
+        const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+        const bool f16_ok = deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.d_type) && S->w16 != nullptr &&
+                            S->w16_elems >= wgu + E && S->w16_elems >= wdn + nff;
+        const auto run_f16 = [&] {   // (run_blas_dq's steps, an expert at a time)
+            const float one = 1.0f, zero = 0.0f;
+            const int gu_rows = (int) std::min<int64_t>(kDqRows, (S->w16_elems - wgu) / E);
+            const int dn_rows = (int) ((S->w16_elems - wdn) / nff);
+            for (int i = 0; i < n; ++i) {
+                const uint8_t* blob = wb + (size_t) i * stride;
+                const int a = hb[(size_t) i];
+                strata::kernels::dequant_f16(Ly.gu_type, blob, 0, nff, E, S->w16, s);
+                strata::kernels::dequant_f16(Ly.up_type, blob + mmq::matrix_bytes(Ly.gu_type, nff, E), 0, nff, E,
+                                             S->w16 + (size_t) nff * E, s);
+                uint16_t* X16 = S->w16 + wgu;
+                for (int c0 = 0; c0 < R; c0 += gu_rows) {
+                    const int m = std::min(gu_rows, R - c0);
+                    strata::kernels::exl3::rows_f16(S->x, E, M.row_tok + a + c0, m, E, X16, s);
+                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, m, E, &one, S->w16, CUDA_R_16F, E,
+                                         X16, CUDA_R_16F, E, &zero, GU + (size_t) (a + c0) * 2 * nff, CUDA_R_32F,
+                                         2 * nff, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm check gate/up");
+                }
+                gb::swiglu_rows(GU + (size_t) a * 2 * nff, GU + (size_t) a * 2 * nff, R, nff, g.swiglu_exp, s, 2 * nff);
+                strata::kernels::dequant_f16(Ly.d_type, blob + Ly.down_off, 0, E, nff, S->w16, s);
+                uint16_t* H16 = S->w16 + wdn;
+                for (int c0 = 0; c0 < R; c0 += dn_rows) {
+                    const int m = std::min(dn_rows, R - c0);
+                    strata::kernels::exl3::rows_f16(GU + (size_t) (a + c0) * 2 * nff, 2 * nff, nullptr, m, nff, H16, s);
+                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, m, nff, &one, S->w16, CUDA_R_16F, nff,
+                                         H16, CUDA_R_16F, nff, &zero, OUT + (size_t) (a + c0) * E, CUDA_R_32F, E,
+                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm check down");
+                }
+            }
+        };
+        // each path: warmed once, timed once, its output kept for the comparison with MMQ's
+        std::vector<float> ref, out;
+        const auto timed = [&](const std::function<void()>& fn, std::vector<float>& keep, float& ms) {
+            cudaEvent_t e0 = nullptr, e1 = nullptr;
+            bool ok = cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+            if (ok) {
+                fn();
+                cudaEventRecord(e0, s);
+                fn();
+                cudaEventRecord(e1, s);
+                ok = cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+            }
+            if (e0) cudaEventDestroy(e0);
+            if (e1) cudaEventDestroy(e1);
+            if (ok) {
+                keep.resize((size_t) nrows * E);
+                ok = cudaMemcpy(keep.data(), OUT, keep.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+            }
+            if (!ok) cudaGetLastError();
+            return ok;
+        };
+        const auto rel = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double d = (double) a[i] - b[i];
+                num += d * d;
+                den += (double) b[i] * b[i];
+            }
+            return std::isfinite(num) && den > 0 ? std::sqrt(num / den) : 1e30;
+        };
+        float t_mmq = 0, t_own = 0, t_f16 = 0;
+        if (!timed(run_mmq, ref, t_mmq)) return skip("MMQ did not run");
+        static const double scale = [] {   // (a test hook: MMQ's time multiplied)
+            const char* v = getenv("STRATA_HIP_EXPERTS_CHECK_SCALE");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 1.0;
+        }();
+        const double tm = (double) t_mmq * scale;
+        double r_own = -1, r_f16 = -1;
+        if (own_ok && timed(run_own, out, t_own)) r_own = rel(out, ref);
+        if (f16_ok && timed(run_f16, out, t_f16)) r_f16 = rel(out, ref);
+        const bool own_good = r_own >= 0 && r_own < 0.1, f16_good = r_f16 >= 0 && r_f16 < 0.1;
+        int pick = kXpMmq;
+        if (own_good && (double) t_own * 1.5 < tm) pick = kXpOwn;
+        if (f16_good && (double) t_f16 * 1.5 < tm && (pick != kXpOwn || t_f16 < t_own)) pick = kXpFp16;
+        hip_experts() = pick;
+        char so[64], sf[64];
+        if (r_own >= 0) std::snprintf(so, sizeof so, "own GEMM %.2f ms (rel %.1e)", t_own, r_own);
+        else std::snprintf(so, sizeof so, "own GEMM -");
+        if (r_f16 >= 0) std::snprintf(sf, sizeof sf, "FP16 %.2f ms (rel %.1e)", t_f16, r_f16);
+        else std::snprintf(sf, sizeof sf, "FP16 -");
+        std::fprintf(stderr, "glm prefill: HIP%d expert kernels (layer %d, %d experts x %d rows, %s/%s): MMQ %.2f ms, %s, "
+                             "%s -> %s (STRATA_HIP_EXPERTS=mmq / own / fp16 fixes it)\n", dev_, il, n, R,
+                     strata::qt::type_name(Ly.gu_type), strata::qt::type_name(Ly.d_type),
+                     tm, so, sf, pick == kXpOwn ? "the own int8 GEMM" : pick == kXpFp16 ? "the FP16 path" : "MMQ kept");
+    };
+#endif
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
     // the layer applications in a token's order: the layers themselves, or (inkling) its 48 applications of 24
@@ -4102,6 +4347,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         Carve c{S->uni};
         MoeBufs M = carve_moe(c, (size_t) T, (size_t) S->sh_sub(), g);
         const int FF = g.n_ff_exp * g.n_shared, NE = g.n_expert, nff = g.n_ff_exp;
+#if defined(STRATA_USE_HIP)
+        if (hip_experts() == kXpAuto && !S->xp_checked && T >= 256 && Ly.moe) hip_experts_check(il, T, M);
+#endif
         // the shared expert: before the route (as before), or after the route's sync so its GEMMs run while the
         // host plans the expert sets (the stream was idle through the plan).  STRATA_GLM_PREFILL_SH_LATE=0: before
         static const bool sh_late = [] { const char* v = getenv("STRATA_GLM_PREFILL_SH_LATE"); return v == nullptr || std::atoi(v) != 0; }();
@@ -5004,7 +5252,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // (the blob's gate rows, then its up rows), the expert's rows gathered to FP16 and multiplied by cuBLAS, the
         // SwiGLU, then the down [E][n_ff] the same way - the outputs land in the expert's own OUTP rows as run_blas's
         // (inkling's NVFP4 experts too where the own GEMM does not take them - ink_nv_dq_on)
-        const bool deq = !Ly.exl3 && (!int8_layer(Ly, g) || ink_nv_dq_on(Ly, g));
+        // (HIP, STRATA_HIP_EXPERTS=fp16 or its check's choice: every layer whose types dequant_f16 decodes)
+        const bool deq = !Ly.exl3 && (!int8_layer(Ly, g) || ink_nv_dq_on(Ly, g) ||
+                                      (hip_experts() == kXpFp16 && !Ly.mixed() && S->w16_elems >= ((int64_t) 2 * nff + 1) * E &&
+                                       deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.up_type) &&
+                                       deq_expert_type(Ly.d_type)));
         const auto run_blas_dq = [&](const uint8_t* blob, int a, int nrows, int r0) {
             const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
             const int gu_rows = (int) std::min<int64_t>(kDqRows, std::max<int64_t>(1, (S->w16_elems - wgu) / E));

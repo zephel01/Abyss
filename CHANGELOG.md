@@ -9,6 +9,17 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- HIP, MoE prompts (Qwen3.8-Flash-Next, Ornith, GLM, DeepSeek V4 / V4.1 ...): the first prompt of 256+ tokens times
+  one layer's routed experts on MMQ, on the own int8 GEMM and on the FP16 path (each expert decoded once, then the own
+  FP16 GEMM), and moves off MMQ only when another path is more than 1.5x faster and gives the same products (relative
+  L2 under 0.1 against MMQ's). #49: an RX 9060 XT on Windows (TheRock ROCm 7.14.1) ran a dense layer's MMQ ~390x
+  slower than FP16, and Qwen3.8-Flash-Next 16G64G read 2K prompts at 9 tok/s (110 ms a token) with every FP16 GEMM
+  already on the own kernels - its experts go through the same MMQ. The log says `glm prefill: HIP0 expert kernels
+  (layer ..): MMQ .. ms, own GEMM .. ms, FP16 .. ms -> ...`. A Radeon 8060S keeps MMQ (Qwen3.8 UD-IQ3_XXS layer 0,
+  32 experts x 39 rows: MMQ 1.65 ms, own 5.50, FP16 4.85; 2K prompt 509 -> 517 tok/s, same tokens).
+  `STRATA_HIP_EXPERTS=mmq / own / fp16` fixes the path without the check; `STRATA_HIP_EXPERTS_CHECK_SCALE` (test
+  hook) multiplies the timed MMQ cost. CUDA is unchanged (7-config md5 check).
+
 ## v1.3.185 - 2026-11-22
 
 Inkling 2 Mini with thinking off: the English planning it still writes no longer lands in the answer. The engine is
