@@ -23,6 +23,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/inkling_fast.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -586,7 +587,12 @@ bool blas_ok(cublasStatus_t st, const char* what, std::string& err) {
     err = std::string("inkling prompt: ") + what + ": cuBLAS status " + std::to_string((int) st);
     return false;
 }
-bool f16_type(int t) { return t == gf::kTypeBF16 || t == gf::kTypeF32 || strata::kernels::dequant_bf16_supported(t); }
+// (i-quants too: unsloth's UD-IQ3_XXS / UD-IQ2_XXS store the last layers' attention as IQ3_XXS; rows of whole
+// 256-value super-blocks)
+bool f16_type(int t) {
+    return t == gf::kTypeBF16 || t == gf::kTypeF32 || strata::kernels::dequant_bf16_supported(t) ||
+           strata::kernels::iq_supported(t);
+}
 // Y[t][N] (ldy) = X16[t][Kd] . W[N][Kd]^T: W widened / dequantized to FP16 in slices that fit the scratch, the tensor
 // cores' product with F32 accumulation (the prompt path's hgemm_q)
 bool gemm16(const Glm5Model::Hy4PromptIo& io, const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y,
@@ -600,6 +606,9 @@ bool gemm16(const Glm5Model::Hy4PromptIo& io, const WSlot& w, int N, int Kd, con
             gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, io.w16, (int64_t) n * Kd, s);
         else if (w.type == gf::kTypeF32)
             gb::f32_to_f16((const float*) w.q + (size_t) r0 * Kd, io.w16, (int64_t) n * Kd, s);
+        else if (!strata::kernels::dequant_bf16_supported(w.type))   // (an i-quant: f16_type)
+            strata::kernels::iq_dequant_f16(w.type, (const uint8_t*) w.q + (size_t) r0 * strata::kernels::iq_row_bytes(w.type, Kd),
+                                            (int64_t) n * Kd, io.w16, s);
         else
             strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, io.w16, s);
         if (!blas_ok(cublasGemmEx((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, io.w16,

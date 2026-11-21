@@ -9,6 +9,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Fix (Inkling 2 Mini, unsloth's UD-IQ3_XXS / UD-IQ2_XXS): these files keep the per-expert scales of the NVFP4 model
+  on experts requantized to i-quants, and the engine applied them only to NVFP4 weights, so every answer was garbage
+  (KL 12). The scales now apply whatever the type; KL against the Q8_0: UD-IQ3_XXS 0.028, UD-IQ2_XXS 0.078. Their
+  prompts also run batched now (layers 20-22 keep attention in IQ3_XXS): RTX 5090, 4K prompt about 3,800 tok/s all in
+  VRAM; decode 136 / 140 tok/s, at an 8 GB VRAM cap 103 / 120. Other models give the same bits (7-config md5 check).
 - Fix (Inkling 2 Mini, the server): with thinking off (`enable_thinking: false`, reasoning effort none) the model still
   writes a short reasoning message, and the server put it into the answer - English planning before every answer. It
   is now read as reasoning at every effort level; a turn without one is all answer.
