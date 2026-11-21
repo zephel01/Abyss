@@ -6918,7 +6918,7 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
         // switch took that for the pool's level - GLM-5.3 29-31 tok/s against 35-39 when the calibration came out
         // a hair faster (bench/glmspeed/results.md)
         const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all || (F->lean_armed && F->cpu_plan != 0ull);
-        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, GLM-5.3 and V4 / V4.1 on CUDA, off elsewhere):
+        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, GLM-5.3, V4 / V4.1 and Hy4 on CUDA, off elsewhere):
         // the moves rank experts by counts that decay smoothly (bgc) instead of the route counts halved every ~32K
         // route events, swap when the hottest RAM-only expert's count passes the layer's coldest resident's by
         // STRATA_GLM_BG_DECAY_MARGIN (2), and make at most STRATA_GLM_BG_DECAY_N (8) swaps a boundary.  Replayed on
@@ -6929,10 +6929,15 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
         // bench/parity/results-port.md): their ~7-8 MB experts left VRAM hits at 56-67% and the CPU lane took 85-150
         // experts a token; the decayed counts keep more of what the text uses (GLM-5.3 Maya-S-v2 IQ2_XXS 43.4 -> 46.8
         // tok/s, V4 0731 UD-Q2_K_XL 54.0 -> 57.5).  HIP keeps the old moves (not measured there)
+        // Hy4 too (CUDA; RTX 5090 + Gen4 x4, mix459 + 512 greedy, iGPU off, 3-run medians, 2026-11-22): its 1.8 MB
+        // experts left VRAM hits at 62-79%.  RAM tier 60 GB: own 32G96G C 46.8 -> 50.8 tok/s (VRAM hits 64 -> 79%),
+        // Maya-XS IQ2_XXS 57.1 -> 59.9 (77 -> 88%); 40 GB: 47.9 -> 52.7, 56.9 -> 59.6.  BG_SPLIT=1 beside it: 52.2 / 60.6
+        // at 60 GB but 50.9 / 60.0 at 40 - no clear gain, left off.  (PROMOTE / _RATIO / _MARGIN do not act with the
+        // decayed counts: their swaps follow _DECAY_N / _DECAY_MARGIN)
 #if defined(STRATA_USE_HIP)
         const bool decay_dflt = small_x;
 #else
-        const bool decay_dflt = small_x || g.arch == 0 || g.dsv4();
+        const bool decay_dflt = small_x || g.arch == 0 || g.dsv4() || g.is_hy4();
 #endif
         static const float bg_decay = [decay_dflt] {
             const char* v = getenv("STRATA_GLM_BG_DECAY");

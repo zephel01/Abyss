@@ -9,6 +9,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Speed (Hy4, CUDA): the decayed expert counts (`STRATA_GLM_BG_DECAY=0.995`) that GLM-5.3, V4 / V4.1 and Qwen3.8 have
+  run by default since v1.3.132 are now Hy4's default too: more of what the text uses stays in VRAM. RTX 5090 Gen4 x4,
+  mix459 + 512 tokens, iGPU off, 3-run medians: own Hy4-flash 32G96G 46.8 -> 50.8 tok/s (VRAM hits 64 -> 79%),
+  Maya-XS IQ2_XXS 57.1 -> 59.9 at a 60 GB RAM tier; 47.9 -> 52.7 and 56.9 -> 59.6 at 40 GB. Weights move, the math does
+  not. `STRATA_GLM_BG_DECAY=0`: the old counts.
 - Fix (GLM-5.3, DeepSeek V4 / V4.1, Qwen3.8, Hy4 - the expert tiers): a route that missed an expert demoted at the last
   token boundary waited in the service thread for that expert's VRAM -> RAM copy, and every route of the token queued
   behind it - a copy the driver had not started yet (Windows batching copies, while drafting) stalled the whole token
