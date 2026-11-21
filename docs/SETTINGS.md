@@ -196,7 +196,7 @@ These change part of the config file; the other keys stay as they are.
 | --- | --- |
 | changing the context length on the dashboard | `--max-context` in `"args"` |
 | running setup again | `"lib_dirs"` (AMD, after a ROCm switch); with `--dspark` / `--no-dspark`, `STRATA_DS4_DSPARK` in `"env"` |
-| `./setup-deepseek.sh --rewrite-config` | **everything** (your own changes are lost) |
+| `./setup-deepseek.sh --rewrite-config` | **everything** except the server settings (`"port"`, `"host"`, `"api_key"`, `"allow_shutdown"`, `"reasoning_effort"`, `"thinking_budget"`, `"fit_max_tokens"`, `"mcp"`, `"mcp_servers"`): your other changes are lost; `--port` given with it sets a new port |
 | `./abyss.sh --gpu-tune` | the faster kernel choices, into `"env"` |
 | `./abyss.sh --calibrate` (GLM) | `STRATA_GLM_PCIE_SHARE`, `STRATA_GLM_CPU_LANE` in `"env"` |
 

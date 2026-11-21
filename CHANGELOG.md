@@ -9,6 +9,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- Fix (setup): `--rewrite-config` kept nothing of the old config, so the port, the API key, the host and the MCP
+  servers set by hand were lost. It now keeps the server settings (`port`, `host`, `api_key`, `allow_shutdown`,
+  `reasoning_effort`, `thinking_budget`, `fit_max_tokens`, `mcp`, `mcp_servers`) and writes the model's part again;
+  a `--port` given with it still sets the port.
 - Fix (Hy4, the server): every request tried to set the conversation aside in a slot, which Hy4 does not have, and
   logged "conversation slots are not implemented"; Hy4 now skips the slots, as DeepSeek V4 / V4.1 do.
 

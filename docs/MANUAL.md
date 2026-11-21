@@ -181,7 +181,7 @@ so it can be run again at any time:
 | `--nvcc PATH` | the CUDA compiler to build with (a CUDA 12 one for a V100) |
 | `--gpus 0,1`, `--gpus all` | split the layers across several GPUs (see "Several GPUs"); builds for every GPU's architecture |
 | `--download-model`, `--yes` | download without asking; the defaults for every question |
-| `--rewrite-config` | write `abyss-<name>.json` again (otherwise an existing one is kept; a DSpark drafter it named stays on) |
+| `--rewrite-config` | write `abyss-<name>.json` again (otherwise an existing one is kept; a DSpark drafter it named stays on, and so do its server settings: port, host, API key, MCP servers) |
 | `--dspark`, `--no-dspark` | download DeepSeek's DSpark drafter (6.9 GB, to `../Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF`) and turn it on in the config; turn it off (the file stays). One GPU only |
 | `--tools-only` | only create / update Abyss-tools |
 | `--prebuilt` | download the prebuilt engine instead of compiling it (taken by itself when `nvcc` or the C++ compiler is missing; see below) |

@@ -529,8 +529,15 @@ def hip_engine(a):
     return gpus, extra
 
 
-def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus=None,
+# the run config's server settings (serve/server.py reads them; the user sets them by hand): --rewrite-config writes
+# the model's part again and keeps these (Maya #1089: a setup run again lost the port, the API key and the host)
+SERVER_KEYS = ("port", "host", "api_key", "allow_shutdown", "reasoning_effort", "thinking_budget", "fit_max_tokens",
+               "mcp", "mcp_servers", "mcpServers")
+
+
+def write_config(name: str, pack: Path, ctx: int, port: int | None, rewrite: bool, gpus=None,
                  extra: dict | None = None, model: dict | None = None) -> tuple[Path, Path]:
+    """port None: the existing config's (--rewrite-config), else 8082; a port given wins."""
     model = model or MODELS["v4"]
     cfg = ROOT / f"abyss-{name}.json"
     run = ROOT / f"run-abyss-{name}.sh"
@@ -547,6 +554,14 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             cfg.write_text(json.dumps(kept, indent=1) + "\n", encoding="utf-8")
             S.ok(f"{cfg.name}: lib_dirs {', '.join(extra['lib_dirs'])} (the libraries the engine was compiled with)")
     else:
+        old = {}
+        if cfg.exists():
+            try:
+                old = json.loads(cfg.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                old = {}
+            old = {k: old[k] for k in SERVER_KEYS if k in old} if isinstance(old, dict) else {}
+        port = port if port is not None else old.get("port", 8082)
         cfg.write_text(json.dumps({
             "exe": str(S.engine_path(ROOT / "build")),
             "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto"],
@@ -559,8 +574,11 @@ def write_config(name: str, pack: Path, ctx: int, port: int, rewrite: bool, gpus
             "port": port,
             "log": str(ROOT / f"abyss-{name}.log"),
             **(extra or {}),
+            **{k: v for k, v in old.items() if k != "port"},
         }, indent=1) + "\n", encoding="utf-8")
-        S.ok(f"{cfg.name} written (context {ctx}, port {port})")
+        kept = [k for k in old if k != "port" or old[k] == port]
+        S.ok(f"{cfg.name} written (context {ctx}, port {port})" +
+             (f" - kept from the old one: {', '.join(kept)}" if kept else ""))
     py = venv_bin("python")
     run.write_text("#!/bin/sh\n"
                    f"# {model['title']} ({name}) on Abyss: the dashboard and API (written by setup-deepseek.sh)\n"
@@ -1062,7 +1080,7 @@ def main() -> int:
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")
     ap.add_argument("--tools-dir", default=str(ROOT.parent / "Abyss-tools"), help="the tools folder (default: Abyss-tools beside Abyss)")
     ap.add_argument("--context", type=int, default=65536, help="the context in tokens (default 65536)")
-    ap.add_argument("--port", type=int, default=8082)
+    ap.add_argument("--port", type=int, help="the server's port (default 8082; --rewrite-config keeps the config's)")
     ap.add_argument("--backend", choices=("cuda", "hip"), help="cuda (NVIDIA) or hip (AMD: RX 7900 XT / XTX, RX 9070 / "
                     "AI PRO R9700, Ryzen AI Max's Radeon 8060S; ROCm 7). Default: cuda when an NVIDIA GPU is there, else hip")
     ap.add_argument("--gpu", type=int, help="the GPU, as nvidia-smi numbers it (default: the one with the most VRAM)")
@@ -1293,7 +1311,7 @@ def main() -> int:
 
     S.say()
     S.say(f"Done. Start it with:  {tools / 'abyss.sh'} start {name}")
-    S.say(f"then open http://127.0.0.1:{a.port}/  (the manual: {ROOT / 'docs' / 'MANUAL.md'})")
+    S.say(f"then open http://127.0.0.1:{json.loads(cfg.read_text(encoding='utf-8')).get('port', 8082)}/  (the manual: {ROOT / 'docs' / 'MANUAL.md'})")
     if not model.get("vram_ctx"):   # (a model all in VRAM has no CPU lane or PCIe split to tune)
         S.say(f"Once, with it stopped: {tools / 'abyss.sh'} --calibrate  tunes the CPU lane / PCIe split for this PC "
               "(~10-15 minutes; +12% on an RTX 4090, issue #39)")

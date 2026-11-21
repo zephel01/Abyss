@@ -177,7 +177,7 @@ zephel01 のファイルを知らせるだけ。`--quant` を付ければいつ�
 | `--nvcc PATH` | ビルドに使う CUDA コンパイラ（V100 には CUDA 12 のもの） |
 | `--gpus 0,1`, `--gpus all` | 複数の GPU に層を分けて載せる（下の「複数の GPU」）。全 GPU のアーキテクチャをまとめてビルドする |
 | `--download-model`, `--yes` | 確認せずにダウンロード、すべての質問に既定値で答える |
-| `--rewrite-config` | `abyss-<名前>.json` を書き直す（なければ既存のものを残す。書いてあった DSpark ドラフトモデルはそのまま使う） |
+| `--rewrite-config` | `abyss-<名前>.json` を書き直す（なければ既存のものを残す。書いてあった DSpark ドラフトモデルはそのまま使い、ポート、ホスト、API キー、MCP サーバーなどサーバーの設定も残す） |
 | `--dspark`, `--no-dspark` | DeepSeek の DSpark ドラフトモデル（6.9 GB、`../Abyss-data/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF` へ）をダウンロードして設定でオンにする / 設定でオフにする（ファイルは残す）。GPU 1 枚のときだけ |
 | `--tools-only` | Abyss-tools だけを作る / 更新する |
 | `--prebuilt` | エンジンをコンパイルせず、ビルド済みのものをダウンロードする（`nvcc` か C++ コンパイラが無いときは自動でこちらになる。下を参照） |
