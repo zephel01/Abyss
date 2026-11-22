@@ -63,6 +63,20 @@ void clip_heads(float* x, int64_t xs, const float* scale, int dim, int H, float 
 void kv_store(const float* k, int64_t ks, const float* v, int64_t vs, float eps, int n_head_kv, int64_t p0, int T,
               int ring, uint16_t* kc, uint16_t* vc, cudaStream_t s);
 
+/// A decode token's (T = 1) conv_rows of k and v (the head's channels: head_ch = 128), clip_heads of q, k and rel and
+/// kv_store in one launch - the same arithmetic as those calls one after another (STRATA_INK_FUSE=0: those calls)
+struct PostProj {
+    float *qf, *kf, *vf, *rf, *conv;            // (conv: the layer's state; v's at conv + KV * 3)
+    const float *kd, *vd, *k_conv, *v_conv;     // (kd / vd: the dynamic taps, null on a window layer)
+    const float *q_clip, *rel_clip;
+    int64_t dws, KV, HD;
+    int H, Hkv, ring;
+    int64_t p;
+    float qk_clip, rel_clip_thr, lf, alpha, eps;
+    uint16_t *kc, *vc;
+};
+void post_proj(const PostProj& a, cudaStream_t s);
+
 /// The scratch (floats) attn needs for T rows of n_head heads in up to max_splits key ranges.
 size_t attn_part_floats(int T, int n_head, int max_splits);
 

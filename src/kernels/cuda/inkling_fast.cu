@@ -213,11 +213,11 @@ __global__ void conv_state_kernel(const float* __restrict__ in, int64_t is, floa
     for (int k = 0; k < 3; ++k) state[(size_t) c * 3 + k] = v[k];
 }
 
-__global__ void conv_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
-                            const float* __restrict__ dw, int64_t dws, int head_ch, float* __restrict__ state, int C, int T,
-                            float* __restrict__ out, int64_t os) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C) return;
+// conv_kernel's channel c over T rows in order (the decode's fused post_proj_kernel runs the same function)
+__device__ __forceinline__ void conv_channel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
+                                             const float* __restrict__ dw, int64_t dws, int head_ch,
+                                             float* __restrict__ state, int c, int T, float* __restrict__ out,
+                                             int64_t os) {
     float x0 = state[(size_t) c * 3 + 0], x1 = state[(size_t) c * 3 + 1], x2 = state[(size_t) c * 3 + 2];
     const float w0 = w[(size_t) c * 4 + 0], w1 = w[(size_t) c * 4 + 1], w2 = w[(size_t) c * 4 + 2], w3 = w[(size_t) c * 4 + 3];
     const float scale = 1.0f / sqrtf(dw != nullptr ? 9.0f : 5.0f);
@@ -241,14 +241,18 @@ __global__ void conv_kernel(const float* __restrict__ in, int64_t is, const floa
     state[(size_t) c * 3 + 1] = x1;
     state[(size_t) c * 3 + 2] = x2;
 }
+__global__ void conv_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
+                            const float* __restrict__ dw, int64_t dws, int head_ch, float* __restrict__ state, int C, int T,
+                            float* __restrict__ out, int64_t os) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    conv_channel(in, is, w, dw, dws, head_ch, state, c, T, out, os);
+}
 
 // ---------------------------------------------------------------- clips
 // a warp a (row, head)
-__global__ void clip_kernel(float* __restrict__ x, int64_t xs, const float* __restrict__ scale, int dim, int H, float thr,
-                            int64_t p0, float log_floor, float alpha, int T) {
-    const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (wid >= T * H) return;
-    const int t = wid / H, h = wid % H;
+__device__ __forceinline__ void clip_head(float* __restrict__ x, int64_t xs, const float* __restrict__ scale, int dim,
+                                          float thr, int64_t p0, float log_floor, float alpha, int t, int h, int lane) {
     float* r = x + (int64_t) t * xs + (size_t) h * dim;
     float v[4];
     float ss = 0.0f;
@@ -280,15 +284,18 @@ __global__ void clip_kernel(float* __restrict__ x, int64_t xs, const float* __re
         }
     }
 }
+__global__ void clip_kernel(float* __restrict__ x, int64_t xs, const float* __restrict__ scale, int dim, int H, float thr,
+                            int64_t p0, float log_floor, float alpha, int T) {
+    const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (wid >= T * H) return;
+    clip_head(x, xs, scale, dim, thr, p0, log_floor, alpha, wid / H, wid % H, lane);
+}
 
 // ---------------------------------------------------------------- the KV rows
 // a warp a (row, KV head): k as it is, v normalised, both FP16
-__global__ void kv_store_kernel(const float* __restrict__ k, int64_t ks, const float* __restrict__ v, int64_t vs, float eps,
-                                int n_head_kv, int64_t p0, int T, int ring, __half* __restrict__ kc,
-                                __half* __restrict__ vc) {
-    const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (wid >= T * n_head_kv) return;
-    const int t = wid / n_head_kv, h = wid % n_head_kv;
+__device__ __forceinline__ void kv_store_head(const float* __restrict__ k, int64_t ks, const float* __restrict__ v,
+                                              int64_t vs, float eps, int n_head_kv, int64_t p0, int ring,
+                                              __half* __restrict__ kc, __half* __restrict__ vc, int t, int h, int lane) {
     const float* kr = k + (int64_t) t * ks + (size_t) h * kD;
     const float* vr = v + (int64_t) t * vs + (size_t) h * kD;
     float vv[4];
@@ -305,6 +312,37 @@ __global__ void kv_store_kernel(const float* __restrict__ k, int64_t ks, const f
     for (int q = 0; q < 4; ++q) {
         kc[row + lane * 4 + q] = __float2half(kr[lane * 4 + q]);
         vc[row + lane * 4 + q] = __float2half(vv[q] * inv);
+    }
+}
+__global__ void kv_store_kernel(const float* __restrict__ k, int64_t ks, const float* __restrict__ v, int64_t vs, float eps,
+                                int n_head_kv, int64_t p0, int T, int ring, __half* __restrict__ kc,
+                                __half* __restrict__ vc) {
+    const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (wid >= T * n_head_kv) return;
+    kv_store_head(k, ks, v, vs, eps, n_head_kv, p0, ring, kc, vc, wid / n_head_kv, wid % n_head_kv, lane);
+}
+
+// a decode token's conv_rows (k, v) + clip_heads (q, k, rel) + kv_store in one launch, the same functions as the
+// separate kernels (the same bits): a warp a KV head (its k / v channels' convs, k's clip, the cache rows), a q head's
+// clip or a rel head's clip
+__global__ void post_proj_kernel(PostProj a) {
+    const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (wid < a.Hkv) {
+        const int h = wid;
+        for (int d = lane; d < kD; d += 32) {
+            const int c = h * kD + d;
+            conv_channel(a.kf, a.KV, a.k_conv, a.kd, a.dws, kD, a.conv, c, 1, a.kf, a.KV);
+            conv_channel(a.vf, a.KV, a.v_conv, a.vd, a.dws, kD, a.conv + (size_t) a.KV * 3, c, 1, a.vf, a.KV);
+        }
+        __syncwarp();
+        clip_head(a.kf, a.KV, nullptr, kD, a.qk_clip, a.p, 0.0f, 0.0f, 0, h, lane);
+        __syncwarp();
+        kv_store_head(a.kf, a.KV, a.vf, a.KV, a.eps, a.Hkv, a.p, a.ring, (__half*) a.kc, (__half*) a.vc, 0, h, lane);
+    } else if (wid < a.Hkv + a.H) {
+        clip_head(a.qf, a.HD, a.q_clip, kD, a.qk_clip, a.p, a.lf, a.alpha, 0, wid - a.Hkv, lane);
+    } else if (wid < a.Hkv + 2 * a.H) {
+        clip_head(a.rf, (int64_t) a.H * kRel, a.rel_clip, kRel, a.rel_clip_thr, a.p, a.lf, a.alpha, 0, wid - a.Hkv - a.H,
+                  lane);
     }
 }
 
@@ -558,6 +596,12 @@ void conv_rows_par(const float* in, int64_t is, const float* w, const float* dw,
     check("conv_rows_par");
 }
 
+void post_proj(const PostProj& a, cudaStream_t s) {
+    const int warps = a.Hkv + 2 * a.H;
+    post_proj_kernel<<<(warps + 7) / 8, 256, 0, s>>>(a);
+    check("post_proj");
+}
+
 void clip_heads(float* x, int64_t xs, const float* scale, int dim, int H, float thr, int64_t p0, float log_floor,
                 float alpha, int T, cudaStream_t s) {
     if (T <= 0) return;
@@ -597,6 +641,7 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
         return;
     }
     // the splits: the longest row's keys, a tile (128) at the least a split - a decode token fills the GPU
+    // (r12 B1, 32-key splits at a short context: +0.5% at a 31-token prompt, within noise - not taken)
     const int64_t p1 = p0 + T - 1;
     const int64_t nk = window > 0 ? std::min<int64_t>(p1 + 1, window) : p1 + 1;
     int ns = (int) std::min<int64_t>(max_splits, std::max<int64_t>(1, (nk + kTile - 1) / kTile));

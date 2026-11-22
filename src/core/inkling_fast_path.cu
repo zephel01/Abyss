@@ -353,6 +353,8 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
     const int R = g.ink_rank;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     (void) dumps;
+    // STRATA_INK_FUSE=0: the layer's small kernels one by one (the fused ones compute the same bits)
+    static const bool fuse = [] { const char* v = getenv("STRATA_INK_FUSE"); return v == nullptr || std::atoi(v) != 0; }();
     if (F->prof_on) F->mark("start");
     if (p == 0) ink_reset();   // (a new sequence: the conv states start at zero; the caches' rows are written first)
     int nb = 0;                // the next free residual buffer
@@ -433,14 +435,21 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
         if (F->prof_on) F->mark("ink_proj");
         // ---- conv, clips, the caches
         float* conv = S.conv;
-        ik::conv_rows(K.kf, KV, Ly.k_conv, swa ? nullptr : K.kd, ik::kConv * Hkv, D, conv, KV, 1, K.kf, KV, s);
-        ik::conv_rows(K.vf, KV, Ly.v_conv, swa ? nullptr : K.vd, ik::kConv * Hkv, D, conv + (size_t) KV * 3, KV, 1, K.vf,
-                      KV, s);
         const float lf = swa ? 0.0f : g.ink_log_floor;
-        ik::clip_heads(K.qf, HD, Ly.q_clip, D, H, g.ink_qk_clip, p, lf, g.ink_log_alpha, 1, s);
-        ik::clip_heads(K.kf, KV, nullptr, D, Hkv, g.ink_qk_clip, p, 0.0f, 0.0f, 1, s);
-        ik::clip_heads(K.rf, H * ik::kRel, Ly.rel_clip, ik::kRel, H, g.ink_rel_clip, p, lf, g.ink_log_alpha, 1, s);
-        ik::kv_store(K.kf, KV, K.vf, KV, g.norm_eps, Hkv, p, 1, S.ring, S.kc, S.vc, s);
+        if (fuse && D == ik::kHeadDim) {   // (one launch, the same arithmetic as the six below)
+            ik::PostProj pp{K.qf, K.kf, K.vf, K.rf, conv, swa ? nullptr : K.kd, swa ? nullptr : K.vd, Ly.k_conv, Ly.v_conv,
+                            Ly.q_clip, Ly.rel_clip, (int64_t) ik::kConv * Hkv, KV, HD, H, Hkv, S.ring, p, g.ink_qk_clip,
+                            g.ink_rel_clip, lf, g.ink_log_alpha, g.norm_eps, S.kc, S.vc};
+            ik::post_proj(pp, s);
+        } else {
+            ik::conv_rows(K.kf, KV, Ly.k_conv, swa ? nullptr : K.kd, ik::kConv * Hkv, D, conv, KV, 1, K.kf, KV, s);
+            ik::conv_rows(K.vf, KV, Ly.v_conv, swa ? nullptr : K.vd, ik::kConv * Hkv, D, conv + (size_t) KV * 3, KV, 1,
+                          K.vf, KV, s);
+            ik::clip_heads(K.qf, HD, Ly.q_clip, D, H, g.ink_qk_clip, p, lf, g.ink_log_alpha, 1, s);
+            ik::clip_heads(K.kf, KV, nullptr, D, Hkv, g.ink_qk_clip, p, 0.0f, 0.0f, 1, s);
+            ik::clip_heads(K.rf, H * ik::kRel, Ly.rel_clip, ik::kRel, H, g.ink_rel_clip, p, lf, g.ink_log_alpha, 1, s);
+            ik::kv_store(K.kf, KV, K.vf, KV, g.norm_eps, Hkv, p, 1, S.ring, S.kc, S.vc, s);
+        }
         // ---- attention, gate, output, post conv
         ik::attn(K.qf, HD, K.rf, H * ik::kRel, K.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring, H,
                  Hkv, p, 1, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), K.part, ik::kMaxSplits, K.ao, HD, s);
