@@ -9,6 +9,19 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- AMD on Windows (#49): the MMQ prompt kernels were built at -O0 when the toolchain left `CMAKE_HIP_FLAGS_RELEASE`
+  empty (TheRock ROCm 7.14.1 + CMake + Ninja, as in #3): the -O3 of v1.3.29 reached only the targets linking
+  `strata_hip_runtime`, and `strata_mmq` does not. Every HIP target now gets `-O3 -DNDEBUG` outside Debug builds, and
+  configure says when the cache has no -O level. Radeon 8060S with the flags emptied: one 1024-token dense layer on
+  MMQ 2841 ms before, 4.66 ms after (4.63 ms in a normal build); the RX 9060 XT's self-check showed MMQ 1368 ms
+  against FP16 3.5 ms. Linux builds compile as before (CMake already passed -O3 there).
+- The engine's log and `--bench` say whether the MMQ kernels were built optimized (`MMQ kernels built optimized` /
+  `built WITHOUT optimization (-O0)`; the bench's first line names the second).
+- AMD on Windows: the server and `--bench` start HIP engines with `ROCBLAS_USE_HIPBLASLT=0` (rocBLAS's FP16 GEMM
+  crashed in `amdhip64_7.dll` through hipBLASLt on ROCm SDK 7.14.1, #49); a value in the shell or the config's
+  `"env"` wins.
+- docs/amd (Windows): how to check a build's -O level, and the hipBLASLt note.
+
 ## v1.3.187 - 2026-11-22
 
 Two crash / garbage paths closed (all-NaN logits, NVFP4 files without their scales) and Inkling 2 Mini tool calls in
