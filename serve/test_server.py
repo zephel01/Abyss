@@ -602,6 +602,76 @@ class InklingAnswerOpen(unittest.TestCase):
         self.assertEqual((out["reasoning"], out["content"]), ("", "Tokyo."))
 
 
+class InklingToolCalls(unittest.TestCase):
+    """Inkling 2's call messages (<|message_model|>NAME<|content_invoke_tool_json|>{"name","args"}<|end_message|>)
+    become the server's tool calls; anything else in that shape stays text."""
+
+    class InkTok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<|message_model|>", "<|content_thinking|>", "<|content_text|>",
+                                             "<|end_message|>", "<|content_model_end_sampling|>",
+                                             "<|content_invoke_tool_json|>"]
+
+    TOOLS = [{"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+
+    def answer(self, script, tools=TOOLS, prompt="hi", sampling=None):
+        tok = self.InkTok()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out = {"reasoning": "", "content": "", "calls": []}
+        for kind, v in svc.run(tok.encode(prompt, parse_special=True), True, tools, 200, sampling or {},
+                               threading.Event()):
+            if kind == "event" and v.kind == "tool_call":
+                out["calls"].append((v.call.name, v.call.arguments))
+            elif kind == "event" and v.kind in out:
+                out[v.kind] += v.text
+        return out
+
+    CALL = ('<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Tokyo"}}'
+            '<|end_message|>')
+
+    def test_call_after_reasoning(self):
+        out = self.answer("<|message_model|><|content_thinking|>look it up<|end_message|>" + self.CALL +
+                          "<|content_model_end_sampling|>")
+        self.assertEqual(out, {"reasoning": "look it up", "content": "", "calls": [("get_weather", {"city": "Tokyo"})]})
+
+    def test_text_then_two_calls(self):
+        out = self.answer("<|message_model|><|content_text|>Checking.<|end_message|>" + self.CALL +
+                          self.CALL.replace("Tokyo", "Osaka") + "<|content_model_end_sampling|>")
+        self.assertEqual(out["content"], "Checking.")
+        self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"}), ("get_weather", {"city": "Osaka"})])
+
+    def test_bad_json_and_unknown_tool_are_text(self):
+        out = self.answer('<|message_model|>get_weather<|content_invoke_tool_json|>{"name":<|end_message|>'
+                          "<|content_model_end_sampling|>")
+        self.assertEqual(out["calls"], [])
+        self.assertEqual(out["content"], 'get_weather<|content_invoke_tool_json|>{"name":')
+        out = self.answer(self.CALL.replace("get_weather", "rm_rf") + "<|content_model_end_sampling|>")
+        self.assertEqual(out["calls"], [])
+
+    def test_unterminated_call_at_the_end(self):
+        out = self.answer(self.CALL.replace("<|end_message|>", ""))
+        self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})])
+
+    def test_required_call_opened_in_the_prompt(self):
+        from serve.frontend import ink_call_open
+        out = self.answer('{"name":"get_weather","args":{"city":"Kyoto"}}<|end_message|><|content_model_end_sampling|>',
+                          prompt="hi" + ink_call_open("get_weather"), sampling={"_prefill": ink_call_open("get_weather")})
+        self.assertEqual(out["calls"], [("get_weather", {"city": "Kyoto"})])
+
+    def test_tool_results_named_for_the_template(self):
+        from serve.frontend import ink_tool_names, openai_to_messages
+        msgs, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"Tokyo"}'}},
+                {"id": "b", "type": "function", "function": {"name": "get_time", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "sunny"},
+            {"role": "tool", "tool_call_id": "b", "content": "noon"}]})
+        named = ink_tool_names(msgs)
+        self.assertEqual([m.get("name") for m in named if m["role"] == "tool"], ["get_weather", "get_time"])
+        self.assertEqual(named[1]["tool_calls"][0]["function"]["arguments"], {"city": "Tokyo"})   # an object
+        self.assertNotIn("name", msgs[2])                                                          # (a copy)
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""

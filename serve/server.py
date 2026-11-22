@@ -51,6 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, ContentGuard, Event,  # noqa: E402
+                            INK_CALL, InklingCalls, ink_call_open,
                             OutputParser, thinking_signature,
                             anthropic_to_messages, effort_kwargs, effort_level, images_of, ja_system_prompt,
                             openai_to_messages,
@@ -1734,6 +1735,8 @@ class Service:
         ink = [_special_ids(x) for x in ("<|message_model|>", "<|content_thinking|>", "<|content_text|>",
                                          "<|end_message|>", "<|content_model_end_sampling|>")]
         self.ink_ids = [x[0] for x in ink] if all(ink) else None
+        inv = _special_ids(INK_CALL) if self.ink_ids is not None else []
+        self.ink_invoke_id = inv[0] if inv else None   # (its tool calls: InklingCalls)
         if self.ink_ids is not None:
             self.think_end_id = self.ink_ids[3]
             self.stop_ids.add(self.ink_ids[4])
@@ -2143,7 +2146,11 @@ class Service:
             # it empty, the form the same template writes for a past turn that did not think.
             prompt += "</think>"
         prefill = ""
-        if force is not None and tools:
+        if force is not None and tools and getattr(self.template, "ink", False):
+            # Inkling: a named call opens its call message (InklingCalls reads the JSON); "any" leaves it to the model
+            prefill = ink_call_open(force) if force else ""
+            prompt += prefill
+        elif force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
@@ -2381,7 +2388,15 @@ class Service:
                               call_ends_think=getattr(self, "call_ends_think", False),
                               no_calls=(sampling or {}).get("_no_calls") is True)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
-        pre_events = parser.feed(prefill) if prefill else []
+        # Inkling's call messages: read on the ids (InklingCalls), ahead of the text parser
+        ink_calls = None
+        if getattr(self, "ink_ids", None) is not None and getattr(self, "ink_invoke_id", None) is not None:
+            ink_calls = InklingCalls(self.tok, *self.ink_ids[:4], self.ink_invoke_id, parser)
+        if ink_calls is not None and prefill.endswith(INK_CALL):
+            ink_calls.start_call(prefill[len("<|message_model|>"):-len(INK_CALL)])
+            pre_events = []
+        else:
+            pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         held = ""                                       # text that may be the start of a stop marker (stop_texts)
         # the client's own stop strings (OpenAI "stop", Anthropic "stop_sequences"): the answer ends before one.  They
@@ -2497,6 +2512,22 @@ class Service:
                                     raw_ids.append(t)
                                     break
                             raw_ids.append(t)
+                            if ink_calls is not None:   # (Inkling's call messages)
+                                evs = ink_calls.push(t)
+                                if evs is not None:
+                                    refused = any(ev.kind == "calls_refused" for ev in evs)
+                                    evs = [ev for ev in evs if ev.kind != "calls_refused"]
+                                    if refused:
+                                        print("[abyss] tool_choice none: the model started a tool call - the answer "
+                                              "ends before it", flush=True)
+                                    self._note(n, evs)
+                                    last_print = self._progress(last_print)
+                                    for ev in evs:
+                                        yield "event", ev
+                                    if refused:
+                                        finish = "stop"
+                                        break
+                                    continue
                             if getattr(self, "ink_ids", None) is not None:   # (Inkling's message markers: not text)
                                 ink_mm, ink_th, ink_tx, ink_em = self.ink_ids[:4]
                                 if t == ink_tx and parser.state == "reasoning":
@@ -2636,7 +2667,7 @@ class Service:
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[abyss] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
-        for ev in parser.finish():
+        for ev in (ink_calls.finish() if ink_calls is not None else []) + parser.finish():
             yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "stop_sequence": matched if finish == "stop" else None}

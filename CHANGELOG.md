@@ -20,6 +20,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Inkling 2 Mini, server: thinking off without tools ends the prompt with the answer message's opening
   (`<|message_model|><|content_text|>`), so the model answers at once; before, it still wrote a short English plan
   first (hidden as reasoning, but the wait was there). With tools the model still picks text or a call itself.
+- Inkling 2 Mini, server: tool calls. The model's call messages (`<|message_model|>NAME<|content_invoke_tool_json|>
+  {"name": .., "args": {..}}<|end_message|>`) come back as ordinary tool calls on both APIs (several a turn too); one
+  to an undeclared tool or with broken JSON stays text. Tool results are headed with their call's name for the
+  template, a required call (`tool_choice` with a name) opens the call message in the prompt.
 
 ## v1.3.186 - 2026-11-22
 

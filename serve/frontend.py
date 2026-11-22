@@ -58,6 +58,20 @@ def keep_past_thinking(source: str) -> str:
                                 "loop.index0 > ns.last_query_index %}", source)
 
 
+def ink_tool_names(messages: list[dict]) -> list[dict]:
+    """Inkling's template heads a tool result with the tool's name (<|message_tool|>NAME), from the message's name or
+    its tool_call_id; the requests' tool messages carry neither here, so each result gets the name of the call it
+    answers - the calls of the assistant turn before it, in order (both APIs keep results in the calls' order)."""
+    out, names = [], []
+    for m in messages:
+        if m.get("role") == "assistant":
+            names = [(c.get("function") or {}).get("name") or "" for c in m.get("tool_calls") or []]
+        elif m.get("role") == "tool" and not m.get("name") and names:
+            m = {**m, "name": names.pop(0)}
+        out.append(m)
+    return out
+
+
 # Inkling 2's answer message opening: a prompt that ends with it (thinking off) has the model write the answer only
 INK_ANSWER_OPEN = "<|message_model|><|content_text|>"
 
@@ -145,6 +159,7 @@ class ChatTemplate:
             kwargs["reasoning_effort"] = ("none" if off else raw if raw in ok else level if level in ok else None)
             off = False   # (no think block to close: the effort level says it)
             ink_open = kwargs["reasoning_effort"] == "none" and not tools and add_generation_prompt
+            messages = ink_tool_names(messages)
         elif self.glm_effort:
             kwargs.pop("effort_raw", None)
             off = kwargs.pop("enable_thinking", True) is False
@@ -944,6 +959,86 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[:-1]
         args[pname] = _arg_value(value, _declared_types(props.get(pname)))
     return ToolCall(name=name, arguments=args)
+
+
+# Inkling 2's tool call is a model message of its own: <|message_model|>NAME<|content_invoke_tool_json|>
+# {"name": NAME, "args": {...}}<|end_message|> (its chat template writes past calls so, the arguments an object)
+INK_CALL = "<|content_invoke_tool_json|>"
+
+
+def ink_call_open(name: str) -> str:
+    """A required call's opening in Inkling's form (the prompt ends with it; InklingCalls reads the rest)."""
+    return "<|message_model|>" + name + INK_CALL
+
+
+class InklingCalls:
+    """Inkling 2's call messages out of the token stream (the markers are special tokens, so this works on ids, ahead
+    of the text parser): a <|message_model|> holds its header (the tool's name) until the message's kind is known; a
+    text / thinking message goes on as before, an invoke message's JSON is read to its <|end_message|> and becomes one
+    tool_call event (the existing call shape) - or text when it is not a call to a declared tool or not valid JSON."""
+
+    HDR_MAX = 64                     # header tokens at most (a tool's name): more is not a header - text
+
+    def __init__(self, tok, mm: int, th: int, tx: int, em: int, invoke: int, parser: "OutputParser"):
+        self.tok, self.mm, self.th, self.tx, self.em, self.invoke = tok, mm, th, tx, em, invoke
+        self.parser = parser
+        self.state, self.hdr, self.body, self.name = "idle", [], [], ""
+
+    def start_call(self, name: str) -> None:
+        """The prompt ended inside a call's header (a required call, ink_call_open): its JSON comes next."""
+        self.state, self.body, self.name = "json", [], name
+        self.parser.state, self.parser.lead = "content", True   # (a call message: any reasoning is over)
+
+    def push(self, t: int) -> list[Event] | None:
+        """One generated id.  None: not this reader's - the caller handles it as before; a list: taken (the events
+        to send, often none)."""
+        if self.state == "idle":
+            if t == self.mm:
+                self.state, self.hdr = "hdr", []
+                return []
+            return None
+        if self.state == "hdr":
+            if t == self.invoke:
+                self.start_call(self.tok.decode(self.hdr).strip())
+                return []
+            if t == self.mm:                 # (an empty message: a new header)
+                self.hdr = []
+                return []
+            if t in (self.th, self.tx, self.em):
+                self.state, self.hdr = "idle", []   # (a text / thinking message: its header, if any, is not text)
+                return None
+            self.hdr.append(t)
+            if len(self.hdr) > self.HDR_MAX:
+                text, self.state, self.hdr = self.tok.decode(self.hdr), "idle", []
+                return self.parser.feed(text)
+            return []
+        if t == self.em:
+            return self._close()
+        self.body.append(t)
+        return []
+
+    def _close(self) -> list[Event]:
+        text, name = self.tok.decode(self.body), self.name
+        self.state, self.body, self.name = "idle", [], ""
+        call = None
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("args", {}), dict):
+            nm = obj.get("name") if isinstance(obj.get("name"), str) and obj.get("name") else name
+            if nm and self.parser._declared(nm):
+                call = ToolCall(name=nm, arguments=obj.get("args") or {})
+        if call is None:                     # (not a call this request can take: the text, as the parser would)
+            return [Event("content", name + INK_CALL + text)]
+        if self.parser.no_calls:
+            return [Event("calls_refused")]
+        self.parser.state, self.parser.lead = "content", True
+        return [Event("tool_call", call=call)]
+
+    def finish(self) -> list[Event]:
+        """The output ended inside a call message (no <|end_message|>): read what came."""
+        return self._close() if self.state == "json" else []
 
 
 class OutputParser:
