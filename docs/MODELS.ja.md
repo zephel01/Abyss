@@ -134,6 +134,8 @@ llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL�
 | --- | ---: | --- | --- | --- |
 | `Q8_0`（[ggml-org/Inkling-2-Mini-GGUF](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)） | 27.8 GB | KL 0.0051（英語 0.0037、日本語 0.0067、コード 0.0044）、top-1 の一致 96.8%。9K の位置で KL 0.0046 | 全部 VRAM: 118.5 tok/s | GPU 32 GB |
 | `UD-Q4_K_XL`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)。エキスパートは NVFP4） | 17.6 GB | 同じファイルの llama.cpp との KL 0.0126。llama.cpp の Q8_0 との KL 0.0057（llama.cpp でこのファイルを動かすと 0.0133） | 全部 VRAM 128.2、`STRATA_GLM_VRAM_GB=16` 122.8、`=12` 104.6 tok/s。llama.cpp: 全部 VRAM 94.9、`--n-cpu-moe 6`（15.3 GB）71.7、`--n-cpu-moe 12` 48.9 | GPU 12〜16 GB ＋ RAM |
+| `UD-IQ3_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 11.7 GB | llama.cpp の Q8_0 との KL 0.0280（英語 0.0304、日本語 0.0291、コード 0.0218）、top-1 の一致 93.6%。日本語の事実 589/666（Q4_K_XL は 593） | 全部 VRAM 136.1、`STRATA_GLM_VRAM_GB=12` 127.5、`=8` 102.9 tok/s。プロンプト 3,799 / 2,526 / 1,667 | GPU 8〜12 GB ＋ RAM |
+| `UD-IQ2_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 8.5 GB | KL 0.0782（英語 0.0835、日本語 0.0792、コード 0.0693）、top-1 の一致 89.1%。日本語の事実 552/666 とはっきり落ちる。VRAM 8 GB でも UD-IQ3_XXS のほうがよい | 全部 VRAM 140.2、`=12` 134.0、`=8` 120.5 tok/s | GPU 8 GB で、日本語より速さを取るとき |
 
 ### Qwen3.8-Flash-Next（qwen4exp）
 

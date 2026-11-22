@@ -137,6 +137,8 @@ against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token E
 | --- | ---: | --- | --- | --- |
 | `Q8_0` ([ggml-org/Inkling-2-Mini-GGUF](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)) | 27.8 GB | KL 0.0051 (EN 0.0037, JA 0.0067, code 0.0044), same top-1 96.8%; 9K positions KL 0.0046 | all in VRAM: 118.5 tok/s | 32 GB GPU |
 | `UD-Q4_K_XL` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF); NVFP4 experts) | 17.6 GB | KL 0.0126 against llama.cpp on the same file, 0.0057 against the llama.cpp Q8_0 (llama.cpp's own run of this file: 0.0133) | all in VRAM 128.2; `STRATA_GLM_VRAM_GB=16` 122.8; `=12` 104.6 tok/s. llama.cpp: all in VRAM 94.9, `--n-cpu-moe 6` (15.3 GB) 71.7, `--n-cpu-moe 12` 48.9 | 12-16 GB GPU + RAM |
+| `UD-IQ3_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 11.7 GB | KL 0.0280 against the llama.cpp Q8_0 (EN 0.0304, JA 0.0291, code 0.0218), same top-1 93.6%; Japanese facts 589/666 (Q4_K_XL 593) | all in VRAM 136.1; `STRATA_GLM_VRAM_GB=12` 127.5; `=8` 102.9 tok/s; prompts 3,799 / 2,526 / 1,667 | 8-12 GB GPU + RAM |
+| `UD-IQ2_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 8.5 GB | KL 0.0782 (EN 0.0835, JA 0.0792, code 0.0693), same top-1 89.1%; Japanese facts 552/666, clearly below - prefer UD-IQ3_XXS at an 8 GB cap | all in VRAM 140.2; `=12` 134.0; `=8` 120.5 tok/s | 8 GB GPU, when speed matters more than Japanese |
 
 ### Qwen3.8-Flash-Next (qwen4exp)
 

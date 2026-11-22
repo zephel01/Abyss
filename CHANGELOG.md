@@ -9,6 +9,14 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.186 - 2026-11-22
+
+HIP MoE prompts check their expert kernel once and leave MMQ where it is broken-slow (#49: Qwen3.8-Flash-Next 16G64G at
+9 tok/s on an RX 9060 XT, not yet confirmed on that card). unsloth's small Inkling 2 Mini files (UD-IQ3_XXS 11.7 GB,
+UD-IQ2_XXS 8.5 GB) now work: UD-IQ3_XXS is the pick for 8-12 GB GPUs (decode 103 tok/s at an 8 GB cap, Q4_K_XL 72).
+Hy4 decode +5-10% on the RTX 5090 (decayed expert counts by default). Other models give the same bits as v1.3.185
+(7-config md5 check).
+
 - HIP, MoE prompts (Qwen3.8-Flash-Next, Ornith, Hy4, GLM, DeepSeek V4 / V4.1 - one prompt path): the first batched
   prompt (32+ tokens) times one layer's routed experts on MMQ, on the own int8 GEMM and on the FP16 path (each expert
   decoded to FP16 once, then the own FP16 GEMM), and moves off MMQ only when another path is more than 1.5x faster and
