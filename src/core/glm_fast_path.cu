@@ -5664,18 +5664,35 @@ void Glm5Model::fast_service() {
                     }
                     // Demoted at the last boundary: its RAM copy is still landing (kRDemote until the next boundary makes
                     // it live), so the table has no entry for it - but its bytes are one PCIe copy away, not a disk read
-                    // away.  Wait for that drain's event and serve it from the slot.  (The boundary runs only once this
-                    // thread has caught up, so F->draining is not being edited here.)  A route that promotes it leaves
-                    // a duplicate that the tier clean-up frees.
+                    // away.  (The boundary runs only once this thread has caught up, so F->draining is not being edited
+                    // here.)  A route that promotes it leaves a duplicate that the tier clean-up frees.
+                    // DRAIN SERVE (STRATA_GLM_DRAIN_SERVE, default on; 0: as before): the fetch copies it from the VRAM
+                    // slot it is leaving - kDraining, so nothing writes it before the next boundary, and the boundary
+                    // runs after this token's fetches - instead of this thread waiting for the copy's event.  Same
+                    // bytes.  The wait sat in the thread every route of the token queues behind; a copy engine that
+                    // has not started the copy (WDDM batching it, Maya's #860 stall while drafting) held them all.
+                    // The disk lane reads the expert on the CPU, from the RAM copy: it keeps the wait
                     if (rs >= 0 && R.st[(size_t) rs] == FastState::kRDemote && R.key[(size_t) rs] == key) {
-                        bool draining = false;
+                        static const bool drain_serve = [] {
+                            const char* v = getenv("STRATA_GLM_DRAIN_SERVE");
+                            return v == nullptr || std::atoi(v) != 0;
+                        }();
+                        const bool host_read = F->disk_lane && promo == 0u && F->cpu_plan != 0ull &&
+                                               F->cpu_fmt[(size_t) il].n_ff > 0;   // (dlane_now, below)
+                        const FastState::Drain* dr = nullptr;
                         for (const auto& d : F->draining)
                             if (d.rclass == cls && d.rslot == rs) {
-                                cudaEventSynchronize(d.ev);
-                                draining = true;
+                                dr = &d;
                                 break;
                             }
-                        if (draining) {
+                        if (dr != nullptr && drain_serve && !host_read && dr->il == il && dr->key == key &&
+                            P.st[(size_t) dr->vslot] == FastState::kDraining) {
+                            dst[m] = (uint8_t*) P.slot_ptr(dr->vslot);
+                            ++F->drain_served;
+                            continue;
+                        }
+                        if (dr != nullptr) {
+                            cudaEventSynchronize(dr->ev);
                             dst[m] = R.base + (size_t) rs * R.stride;
                             continue;
                         }
@@ -6906,7 +6923,7 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
         // switch took that for the pool's level - GLM-5.3 29-31 tok/s against 35-39 when the calibration came out
         // a hair faster (bench/glmspeed/results.md)
         const bool bg_on = bg_split ? F->cpu_plan != 0ull : lane_all || (F->lean_armed && F->cpu_plan != 0ull);
-        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, GLM-5.3 and V4 / V4.1 on CUDA, off elsewhere):
+        // DECAYED COUNTS (STRATA_GLM_BG_DECAY=<factor a boundary>, 0: off; default 0.995 for qwen4exp, GLM-5.3, V4 / V4.1 and Hy4 on CUDA, off elsewhere):
         // the moves rank experts by counts that decay smoothly (bgc) instead of the route counts halved every ~32K
         // route events, swap when the hottest RAM-only expert's count passes the layer's coldest resident's by
         // STRATA_GLM_BG_DECAY_MARGIN (2), and make at most STRATA_GLM_BG_DECAY_N (8) swaps a boundary.  Replayed on
@@ -6917,10 +6934,15 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
         // bench/parity/results-port.md): their ~7-8 MB experts left VRAM hits at 56-67% and the CPU lane took 85-150
         // experts a token; the decayed counts keep more of what the text uses (GLM-5.3 Maya-S-v2 IQ2_XXS 43.4 -> 46.8
         // tok/s, V4 0731 UD-Q2_K_XL 54.0 -> 57.5).  HIP keeps the old moves (not measured there)
+        // Hy4 too (CUDA; RTX 5090 + Gen4 x4, mix459 + 512 greedy, iGPU off, 3-run medians, 2026-11-22): its 1.8 MB
+        // experts left VRAM hits at 62-79%.  RAM tier 60 GB: own 32G96G C 46.8 -> 50.8 tok/s (VRAM hits 64 -> 79%),
+        // Maya-XS IQ2_XXS 57.1 -> 59.9 (77 -> 88%); 40 GB: 47.9 -> 52.7, 56.9 -> 59.6.  BG_SPLIT=1 beside it: 52.2 / 60.6
+        // at 60 GB but 50.9 / 60.0 at 40 - no clear gain, left off.  (PROMOTE / _RATIO / _MARGIN do not act with the
+        // decayed counts: their swaps follow _DECAY_N / _DECAY_MARGIN)
 #if defined(STRATA_USE_HIP)
         const bool decay_dflt = small_x;
 #else
-        const bool decay_dflt = small_x || g.arch == 0 || g.dsv4();
+        const bool decay_dflt = small_x || g.arch == 0 || g.dsv4() || g.is_hy4();
 #endif
         static const float bg_decay = [decay_dflt] {
             const char* v = getenv("STRATA_GLM_BG_DECAY");
@@ -7083,9 +7105,9 @@ bool Glm5Model::fast_boundary(std::string& err, bool early) {
                                  "no tier\n", c, layers, (double) R.stride / 1e6, R.n, held, nfree, out);
         }
         std::fprintf(stderr, "glm tier diag clean-up: %llu duplicate RAM copies freed, %llu lost copies adopted, %llu "
-                             "stale demotion copies freed\n",
+                             "stale demotion copies freed, %llu misses served from a draining VRAM slot\n",
                      (unsigned long long) F->diag_dup, (unsigned long long) F->diag_adopt,
-                     (unsigned long long) F->diag_stale_drain);
+                     (unsigned long long) F->diag_stale_drain, (unsigned long long) F->drain_served);
     }
     return ok;
 }

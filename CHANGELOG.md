@@ -38,6 +38,23 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   (KL 12). The scales now apply whatever the type; KL against the Q8_0: UD-IQ3_XXS 0.028, UD-IQ2_XXS 0.078. Their
   prompts also run batched now (layers 20-22 keep attention in IQ3_XXS): RTX 5090, 4K prompt about 3,800 tok/s all in
   VRAM; decode 136 / 140 tok/s, at an 8 GB VRAM cap 103 / 120. Other models give the same bits (7-config md5 check).
+- Speed (Hy4, CUDA): the decayed expert counts (`STRATA_GLM_BG_DECAY=0.995`) that GLM-5.3, V4 / V4.1 and Qwen3.8 have
+  run by default since v1.3.132 are now Hy4's default too: more of what the text uses stays in VRAM. RTX 5090 Gen4 x4,
+  mix459 + 512 tokens, iGPU off, 3-run medians: own Hy4-flash 32G96G 46.8 -> 50.8 tok/s (VRAM hits 64 -> 79%),
+  Maya-XS IQ2_XXS 57.1 -> 59.9 at a 60 GB RAM tier; 47.9 -> 52.7 and 56.9 -> 59.6 at 40 GB. Weights move, the math does
+  not. `STRATA_GLM_BG_DECAY=0`: the old counts.
+- Fix (GLM-5.3, DeepSeek V4 / V4.1, Qwen3.8, Hy4 - the expert tiers): a route that missed an expert demoted at the last
+  token boundary waited in the service thread for that expert's VRAM -> RAM copy, and every route of the token queued
+  behind it - a copy the driver had not started yet (Windows batching copies, while drafting) stalled the whole token
+  (Maya #860's shape). The route now fetches it from the VRAM slot it is leaving: the same bytes, the same answers
+  (GLM-5.3 Maya-S-v2 IQ2_XXS under `STRATA_DETERMINISTIC=1`: the same tokens, 1,921 misses served so; decode 52.00 ->
+  52.04 tok/s, RTX 5090). `STRATA_GLM_DRAIN_SERVE=0` waits as before.
+- Fix (setup): `--rewrite-config` kept nothing of the old config, so the port, the API key, the host and the MCP
+  servers set by hand were lost. It now keeps the server settings (`port`, `host`, `api_key`, `allow_shutdown`,
+  `reasoning_effort`, `thinking_budget`, `fit_max_tokens`, `mcp`, `mcp_servers`) and writes the model's part again;
+  a `--port` given with it still sets the port.
+- Fix (Hy4, the server): every request tried to set the conversation aside in a slot, which Hy4 does not have, and
+  logged "conversation slots are not implemented"; Hy4 now skips the slots, as DeepSeek V4 / V4.1 do.
 
 ## v1.3.185 - 2026-11-22
 

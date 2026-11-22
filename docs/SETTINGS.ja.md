@@ -195,7 +195,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | --- | --- |
 | ダッシュボードでコンテキスト長を変える | `"args"` の `--max-context` |
 | セットアップをもう一度実行する | `"lib_dirs"`（AMD、ROCm を入れ替えたとき）。`--dspark` / `--no-dspark` を付けたときは `"env"` の `STRATA_DS4_DSPARK` |
-| `./setup-deepseek.sh --rewrite-config` | **全部**（手で書き換えた内容は消えます） |
+| `./setup-deepseek.sh --rewrite-config` | サーバーの設定（`"port"`、`"host"`、`"api_key"`、`"allow_shutdown"`、`"reasoning_effort"`、`"thinking_budget"`、`"fit_max_tokens"`、`"mcp"`、`"mcp_servers"`）**以外の全部**（そのほかに手で書き換えた内容は消えます。`--port` を一緒に付けると、そのポートになります） |
 | `./abyss.sh --gpu-tune` | 速かったカーネルの選択を `"env"` に |
 | `./abyss.sh --calibrate`（GLM） | `"env"` の `STRATA_GLM_PCIE_SHARE`、`STRATA_GLM_CPU_LANE` |
 

@@ -376,6 +376,32 @@ class ToolkitSwitch(unittest.TestCase):
             self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["lib_dirs"], ["/opt/rocm/core-10.0/lib"])
 
 
+    def test_rewrite_config_keeps_the_server_settings(self):
+        # (Maya #1089) the model's part is written again; port, API key, host and the other server keys stay
+        cfg = self.root / "abyss-dsv41-132g.json"
+        mine = {"exe": "old/strata", "args": ["--glm-pack", "old"], "port": 9001, "host": "0.0.0.0", "api_key": "sk-x",
+                "allow_shutdown": False, "mcp_servers": {"fs": {"command": "mcp-fs"}}, "thinking_budget": 4096,
+                "env": {"STRATA_GLM_RAM_GB": "80"}}
+        cfg.write_text(json.dumps(mine), encoding="utf-8")
+        m = A.MODELS["v41"]
+        with mock.patch.object(A, "ROOT", self.root):
+            _, run = A.write_config("dsv41-132g", self.root / "pack", 65536, None, True, None, {"env": dict(m["env"])}, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            for k in ("port", "host", "api_key", "allow_shutdown", "mcp_servers", "thinking_budget"):
+                self.assertEqual(got[k], mine[k], k)
+            self.assertEqual(got["args"][:2], ["--glm-pack", str(self.root / "pack")])   # the model's part: new
+            self.assertNotIn("STRATA_GLM_RAM_GB", got["env"])
+            self.assertIn('"--port" "9001"', run.read_text(encoding="utf-8"))
+            # a port given on the command line wins; a new config without one: 8082
+            A.write_config("dsv41-132g", self.root / "pack", 65536, 8090, True, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual((got["port"], got["api_key"]), (8090, "sk-x"))
+            cfg.unlink()
+            A.write_config("dsv41-132g", self.root / "pack", 65536, None, True, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(got["port"], 8082)
+            self.assertNotIn("api_key", got)
+
     def test_v41_config_has_its_name_and_settings(self):
         m = A.MODELS["v41"]
         extra = {"env": dict(m["env"], GPU_MAX_HW_QUEUES="2")}
