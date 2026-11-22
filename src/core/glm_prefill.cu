@@ -3614,7 +3614,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         cudaMemcpyAsync(M.row_tok, rt.data(), rt.size() * sizeof(int), cudaMemcpyHostToDevice, s);
         cudaStreamSynchronize(s);   // (hb / rt are this lambda's: pageable copies staged before they go)
         float* GU = M.GUX != nullptr ? M.GUX : M.OUTPc;   // [nrows][2 nff]
-        float* OUT = M.OUTP;                               // [nrows][E]
+        float* OUTB = M.OUTP;                               // [nrows][E]
         const int64_t dn_qk = strata::qt::blck_size((strata::qt::Type) Ly.d_type);
         const size_t dn_end = Ly.down_off + (size_t) E * (size_t) (nff / dn_qk) * strata::qt::type_size((strata::qt::Type) Ly.d_type);
         const int dn_over = (int) glmfast::mmq_down_over(Ly.d_type, nff);
@@ -3657,7 +3657,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             dn.ids = S->iota;
             dn.total_rows = nrows;
             dn.max_rows = R;
-            dn.dst = OUT;
+            dn.dst = OUTB;
             dn.ld_dst = E;
             dn.y_scale = M.Hs;
             S->mq->run(dn, s);
@@ -3682,7 +3682,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->oq->gate_up(os, Ly.gu_type, nff, E, up_off, g.swiglu_exp, s);
             own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s, own::needs_sums(Ly.d_type));
             os.xq = M.Hq;
-            os.dst = OUT;
+            os.dst = OUTB;
             os.ld = E;
             S->oq->down(os, Ly.d_type, E, nff, Ly.down_off, s);
         };
@@ -3718,7 +3718,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     const int m = std::min(dn_rows, R - c0);
                     strata::kernels::exl3::rows_f16(GU + (size_t) (a + c0) * 2 * nff, 2 * nff, nullptr, m, nff, H16, s);
                     blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, m, nff, &one, S->w16, CUDA_R_16F, nff,
-                                         H16, CUDA_R_16F, nff, &zero, OUT + (size_t) (a + c0) * E, CUDA_R_32F, E,
+                                         H16, CUDA_R_16F, nff, &zero, OUTB + (size_t) (a + c0) * E, CUDA_R_32F, E,
                                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                             "gemm check down");
                 }
@@ -3740,7 +3740,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (e1) cudaEventDestroy(e1);
             if (ok) {
                 keep.resize((size_t) nrows * E);
-                ok = cudaMemcpy(keep.data(), OUT, keep.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                ok = cudaMemcpy(keep.data(), OUTB, keep.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
             }
             if (!ok) cudaGetLastError();
             return ok;
