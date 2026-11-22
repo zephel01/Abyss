@@ -571,11 +571,12 @@ struct Glm5Model::PrefillState {
     // the dense tier (issue #53, Glm5Model::DenseTier): this prompt's buffers partly in the layers' dense rows; place:
     // which go there (kDtAct the rows kept across a layer, kDtUni the per-layer scratch, kDtFix the weight scratch and
     // the staging groups, kDtPre the prestage slots, kDtRows the image flags / token ids of a chunk longer than their
-    // allocations); dt_used: the
-    // bytes of the dense rows that layout takes; dt_T: the longest chunk it lays out (-1 not sized yet, 0 none)
+    // allocations; a group there sits in the segment dt_loc names); dt_used: the
+    // bytes of each segment of the dense rows that layout takes; dt_T: the longest chunk it lays out (-1 not sized
+    // yet, 0 none)
     bool dt_on = false;
     int dt_place = 0, dt_T = -1, emb_T = 0;   // (emb_T: the tokens emb_h holds)
-    size_t dt_used = 0;
+    size_t dt_used[4] = {};
     unsigned char* dt_img_save = nullptr;
     int* dt_toks_save = nullptr;
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
@@ -809,21 +810,42 @@ struct Glm5Model::PrefillState {
 // decode reads the arena it always did.  The idea came from issue #53's report (a 16 GB card, a 469K-token prompt
 // in chunks of 17,152 instead of 7,168: -18%); this is Abyss's own take on it.
 constexpr int kDtAct = 1, kDtFix = 2, kDtPre = 4, kDtRows = 8, kDtUni = 16;   // PrefillState::dt_place's bits
+// a pack's layers' rows need not lie one layer after another (tools/dense_overlay.py's: the changed rows of every layer
+// first, the head's rows, then the rest of every layer): a layer's rows are one or more ranges, the arena's stretches
+// of layers' rows only are what may be lent - up to kDtSegs segments of them; a group of buffers on the dense side
+// sits in the segment dt_loc names (dt_place's bits 8 + 2 i .. 9 + 2 i for the group of bit 1 << i)
+constexpr int kDtSegs = 4;
+static int dt_loc(int place, int bit) {   // -1: the pool's tail, else the segment
+    if ((place & bit) == 0) return -1;
+    int i = 0;
+    while ((1 << i) != bit) ++i;
+    return (place >> (8 + 2 * i)) & 3;
+}
 
 struct Glm5Model::DenseTier {
     int dev = 0;
-    uint8_t* span = nullptr;           // the layers' rows in w_arena_: [span, span + span_bytes)
+    uint8_t* span = nullptr;           // w_arena_ from the layers' first row to their last: [span, span + span_bytes)
     size_t span_bytes = 0;
-    size_t region = 0;                 // [span, span + region): the prompt path's (dt_fits)
-    size_t lbuf = 0;                   // a layer buffer's bytes (the largest layer's span)
-    uint8_t* buf[2] = {nullptr, nullptr};   // the two layer buffers (the span's last 2 lbuf)
+    struct Seg {
+        uint64_t off = 0, bytes = 0;   // in the span
+    };
+    std::vector<Seg> st;               // the stretches of layers' rows only (nothing else among them), ascending
+    std::vector<Seg> seg;              // what the prompt path may take (dt_fits): the largest stretches, largest first
+    size_t lbuf = 0;                   // a layer buffer's bytes (the largest layer's ranges)
+    uint8_t* buf[2] = {nullptr, nullptr};   // the two layer buffers (the largest stretch's last 2 lbuf)
+    uint64_t b0 = 0, b1 = 0;           // the span's bytes the buffers take (dt_restore writes them back)
     struct Piece {
         uint64_t off = 0, bytes = 0;   // in the span
         const uint8_t* src = nullptr;  // the bytes on the host (the shard mapping, or `backup`)
     };
-    std::vector<Piece> pc;             // ascending, disjoint (the gaps are the arena's 256-byte alignment: zeros)
+    std::vector<Piece> pc;             // ascending, disjoint (in a stretch the gaps are the 256-byte alignment: zeros)
+    struct Rg {
+        uint64_t off = 0, bytes = 0;   // consecutive rows of a layer in the span
+        uint64_t at = 0;               // where they go in a layer buffer
+    };
     struct Lay {
-        uint64_t off = 0, bytes = 0;   // this layer's rows in the span
+        std::vector<Rg> rg;            // this layer's rows, ascending (one range when they lie together)
+        uint64_t bytes = 0;            // in a layer buffer
         std::vector<uintptr_t> orig;   // its pointers as load set them (fields' order)
     };
     std::vector<Lay> L;                // by layer
@@ -839,10 +861,14 @@ struct Glm5Model::DenseTier {
     uint8_t* bounce = nullptr;
     cudaEvent_t ev_b[NB] = {};
     int bi = 0;
-    // the host worker: one job at a time - the span's [a, a + n) to dst, after ev_free[wait_b], then ev_ready[ready_b]
-    struct Job {
+    // the host worker: one job at a time - each part, the span's [a, a + n) to dst, after ev_free[wait_b], then
+    // ev_ready[ready_b]
+    struct Part {
         uint64_t a = 0, n = 0;
         uint8_t* dst = nullptr;
+    };
+    struct Job {
+        std::vector<Part> part;
         int wait_b = -1, ready_b = -1;
     };
     std::thread th;
@@ -892,12 +918,17 @@ struct Glm5Model::DenseTier {
     // layer il's pointers into buffer b (b < 0: as load set them)
     void point(FastState::Layer& Ly, int il, int b) {
         const Lay& y = L[(size_t) il];
-        const uintptr_t lo = (uintptr_t) (span + y.off), hi = lo + y.bytes;
-        const uintptr_t to = b >= 0 ? (uintptr_t) buf[b] : lo;
+        const uintptr_t s = (uintptr_t) span;
         size_t i = 0;
         fields(Ly, [&](auto& p) {
-            const uintptr_t o = y.orig[i++];
-            p = (std::remove_reference_t<decltype(p)>) (o >= lo && o < hi ? o - lo + to : o);
+            uintptr_t o = y.orig[i++];
+            if (b >= 0)
+                for (const Rg& r : y.rg)
+                    if (o >= s + r.off && o < s + r.off + r.bytes) {
+                        o = o - (s + r.off) + (uintptr_t) buf[b] + r.at;
+                        break;
+                    }
+            p = (std::remove_reference_t<decltype(p)>) o;
         });
     }
     // the span's bytes [a, a + n) as load left them, into dst (host)
@@ -921,23 +952,24 @@ struct Glm5Model::DenseTier {
             e = "dense tier: wait";
             return false;
         }
-        for (uint64_t x = 0; x < j.n; x += kSlice) {
-            const uint64_t n = std::min<uint64_t>(kSlice, j.n - x);
-            uint8_t* h = bounce + (size_t) bi * kSlice;
-            if (cudaEventSynchronize(ev_b[bi]) != cudaSuccess) {   // (the slice's last copy has read it)
-                e = "dense tier: ring";
-                return false;
+        for (const Part& pt : j.part)
+            for (uint64_t x = 0; x < pt.n; x += kSlice) {
+                const uint64_t n = std::min<uint64_t>(kSlice, pt.n - x);
+                uint8_t* h = bounce + (size_t) bi * kSlice;
+                if (cudaEventSynchronize(ev_b[bi]) != cudaSuccess) {   // (the slice's last copy has read it)
+                    e = "dense tier: ring";
+                    return false;
+                }
+                const auto h0 = std::chrono::steady_clock::now();
+                fill(pt.a + x, n, h);
+                host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+                if (cudaMemcpyAsync(pt.dst + x, h, (size_t) n, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+                    cudaEventRecord(ev_b[bi], cs) != cudaSuccess) {
+                    e = "dense tier: copy";
+                    return false;
+                }
+                bi = (bi + 1) % NB;
             }
-            const auto h0 = std::chrono::steady_clock::now();
-            fill(j.a + x, n, h);
-            host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
-            if (cudaMemcpyAsync(j.dst + x, h, (size_t) n, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-                cudaEventRecord(ev_b[bi], cs) != cudaSuccess) {
-                e = "dense tier: copy";
-                return false;
-            }
-            bi = (bi + 1) % NB;
-        }
         if (j.ready_b >= 0 && cudaEventRecord(ev_ready[j.ready_b], cs) != cudaSuccess) {
             e = "dense tier: event";
             return false;
@@ -984,7 +1016,9 @@ struct Glm5Model::DenseTier {
     }
 };
 
-static uint8_t* dt_region_base(Glm5Model::DenseTier* D) { return D != nullptr ? D->span : nullptr; }
+static uint8_t* dt_seg_base(Glm5Model::DenseTier* D, int k) {
+    return D != nullptr && (size_t) k < D->seg.size() ? D->span + D->seg[(size_t) k].off : nullptr;
+}
 
 int Glm5Model::prefill_chunk() const { return pf_ ? pf_->T : 0; }
 const char* Glm5Model::prefill_off_reason() const {
@@ -1971,11 +2005,12 @@ size_t Glm5Model::prefill_carve(int Tn) {
     const auto [pers, uni] = prefill_bytes_for(T);
     Carve c{S->region};
     // (the dense tier: the buffers its layout gives the layers' dense rows - dt_place - are carved there)
-    Carve cd{S->dt_on ? dt_region_base(dt_) : nullptr};
-    const auto at = [&](int bit) -> Carve& { return S->dt_on && (S->dt_place & bit) ? cd : c; };
+    Carve cd[kDtSegs];
+    for (int k = 0; k < kDtSegs; ++k) cd[k].base = S->dt_on ? dt_seg_base(dt_, k) : nullptr;
+    const auto at = [&](int bit) -> Carve& { return S->dt_on && (S->dt_place & bit) ? cd[dt_loc(S->dt_place, bit)] : c; };
     if (F->nv_guard > 0) c.take<uint8_t>(F->nv_guard);   // (NVFP4: the region starts with a guard - nv_zero_staging)
     // (the dense tier may put the per-layer scratch apart from the rows kept across a layer)
-    const bool uni_apart = S->dt_on && ((S->dt_place & kDtAct) != 0) != ((S->dt_place & kDtUni) != 0);
+    const bool uni_apart = S->dt_on && dt_loc(S->dt_place, kDtAct) != dt_loc(S->dt_place, kDtUni);
     S->arena = at(kDtAct).take<uint8_t>(uni_apart ? pers : pers + uni);
     uint8_t* uni_at = uni_apart ? at(kDtUni).take<uint8_t>(uni) : nullptr;
     S->w16 = at(kDtFix).take<uint16_t>((size_t) S->w16_elems);
@@ -2017,7 +2052,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->T_bound = Tn;
     S->need = c.off;
     S->carved = c.off;
-    S->dt_used = cd.off;
+    for (int k = 0; k < kDtSegs; ++k) S->dt_used[k] = cd[k].off;
     return c.off;
 }
 
@@ -2373,6 +2408,13 @@ bool Glm5Model::prefill_return(std::string& err) {
 }
 
 // ---- the dense tier (DenseTier above)
+// STRATA_GLM_PREFILL_DENSE_TIER_CHECK=1: every row byte checked against its mapping at the start, and the layers' rows
+// checked against their host bytes after each prompt's write-back
+static bool dt_full_check() {
+    static const bool c = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_CHECK"); return v != nullptr && std::atoi(v) != 0; }();
+    return c;
+}
+
 int Glm5Model::dt_mode() const {
     static const int m = [] {
         const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER");
@@ -2399,40 +2441,78 @@ bool Glm5Model::dt_prepare(std::string& err) {
     if (S->own) { err = "no expert pool"; return false; }
     if (dt_rows_.empty()) { err = "no record of the dense rows (not a pack load)"; return false; }
     cudaSetDevice(dev_);
-    // the layers' spans: each layer's rows one after another, the layers in order, nothing else among them
+    // the layers' rows in arena order: each layer's ranges (its rows with nothing else between them - one range when
+    // they lie together, two in a tools/dense_overlay.py pack), and the stretches with nothing but layers' rows
     const int nl = g_.n_layers;
-    std::vector<uint64_t> lo((size_t) nl, UINT64_MAX), hi((size_t) nl, 0);
+    const auto mine = [&](const DtRow* r) { return r->layer >= l0_ && r->layer < l1_; };
+    const auto al = [](uint64_t v) { return (v + 255u) & ~(uint64_t) 255u; };
+    std::vector<const DtRow*> ord;
     for (const DtRow& r : dt_rows_)
-        if (r.layer >= l0_ && r.layer < l1_) {
-            lo[(size_t) r.layer] = std::min(lo[(size_t) r.layer], r.off);
-            hi[(size_t) r.layer] = std::max(hi[(size_t) r.layer], r.off + r.bytes);
+        if (r.bytes > 0) ord.push_back(&r);
+    std::stable_sort(ord.begin(), ord.end(), [](const DtRow* x, const DtRow* y) { return x->off < y->off; });
+    uint64_t s0 = UINT64_MAX, s1 = 0;
+    for (const DtRow* r : ord)
+        if (mine(r)) {
+            s0 = std::min(s0, r->off);
+            s1 = std::max(s1, r->off + r->bytes);
         }
-    for (int il = l0_; il < l1_; ++il)
-        if (hi[(size_t) il] == 0) { err = "layer " + std::to_string(il) + " has no dense rows in the arena"; return false; }
-    for (int il = l0_ + 1; il < l1_; ++il)
-        if (lo[(size_t) il] < hi[(size_t) il - 1]) { err = "the layers' rows are not in layer order"; return false; }
-    const uint64_t s0 = lo[(size_t) l0_], s1 = hi[(size_t) l1_ - 1];
-    for (const DtRow& r : dt_rows_)
-        if ((r.layer < l0_ || r.layer >= l1_) && r.off < s1 && r.off + r.bytes > s0) {
-            err = "another row lies among the layers' rows";
-            return false;
-        }
+    if (s1 == 0) { err = "no layer has dense rows in the arena"; return false; }
     auto D = std::make_unique<DenseTier>();
     D->dev = dev_;
     D->span = (uint8_t*) w_arena_ + s0;
     D->span_bytes = (size_t) (s1 - s0);
     D->L.resize((size_t) nl);
+    {
+        const DtRow* prev = nullptr;
+        for (const DtRow* r : ord) {
+            // (rows next to each other: only the arena's 256-byte alignment between them)
+            const bool next = prev != nullptr && mine(prev) && r->off >= prev->off + prev->bytes &&
+                              r->off <= al(prev->off + prev->bytes);
+            if (mine(r)) {
+                const uint64_t o = r->off - s0;
+                auto& rg = D->L[(size_t) r->layer].rg;
+                if (next && prev->layer == r->layer && !rg.empty()) rg.back().bytes = o + r->bytes - rg.back().off;
+                else rg.push_back(DenseTier::Rg{o, r->bytes, 0});
+                if (next) D->st.back().bytes = o + r->bytes - D->st.back().off;
+                else D->st.push_back(DenseTier::Seg{o, r->bytes});
+            }
+            prev = r;
+        }
+    }
     uint64_t big = 0;
+    size_t nrg = 0;
     for (int il = l0_; il < l1_; ++il) {
         auto& y = D->L[(size_t) il];
-        y.off = lo[(size_t) il] - s0;
-        y.bytes = hi[(size_t) il] - lo[(size_t) il];
+        if (y.rg.empty()) { err = "layer " + std::to_string(il) + " has no dense rows in the arena"; return false; }
+        for (auto& r : y.rg) {
+            r.at = y.bytes;
+            y.bytes += al(r.bytes);
+        }
+        nrg += y.rg.size();
         big = std::max(big, y.bytes);
     }
-    D->lbuf = (size_t) ((big + 255) & ~(uint64_t) 255);
-    if (D->span_bytes < 4 * D->lbuf) { err = "the layers' rows are too few to lend"; return false; }
-    D->region = (D->span_bytes - 2 * D->lbuf) & ~(size_t) 255;
-    D->buf[0] = D->span + D->region;
+    D->lbuf = (size_t) big;
+    // the layer buffers at the end of the largest stretch (the last of equal ones); what the stretches keep besides,
+    // the largest kDtSegs, is what the prompt path may take
+    size_t bs = 0;
+    for (size_t i = 1; i < D->st.size(); ++i)
+        if (D->st[i].bytes >= D->st[bs].bytes) bs = i;
+    if (D->st[bs].bytes < 2 * D->lbuf) { err = "the layers' rows are too few to lend"; return false; }
+    uint64_t lend = 0;
+    for (size_t i = 0; i < D->st.size(); ++i) {
+        const DenseTier::Seg& t = D->st[i];
+        const uint64_t n = (i == bs ? t.bytes - 2 * D->lbuf : t.bytes) & ~(uint64_t) 255;
+        if (n > 0) D->seg.push_back(DenseTier::Seg{t.off, n});
+        if (i == bs) {
+            D->b0 = t.off + n;
+            D->b1 = t.off + t.bytes;
+        }
+    }
+    std::stable_sort(D->seg.begin(), D->seg.end(), [](const DenseTier::Seg& x, const DenseTier::Seg& y) { return x.bytes > y.bytes; });
+    if (D->seg.size() > (size_t) kDtSegs) D->seg.resize((size_t) kDtSegs);
+    for (const auto& t : D->seg) lend += t.bytes;
+    if (lend < 2 * D->lbuf) { err = "the layers' rows are too few to lend"; return false; }
+    D->buf[0] = D->span + D->b0;
     D->buf[1] = D->buf[0] + D->lbuf;
     // each row's bytes on the host: the shard mapping where the arena holds the GGUF's bytes, else a host copy
     size_t nb = 0;
@@ -2447,7 +2527,7 @@ bool Glm5Model::dt_prepare(std::string& err) {
         err = "no RAM for the converted rows' copy";
         return false;
     }
-    static const bool full_check = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_CHECK"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool full_check = dt_full_check();
     std::vector<uint8_t> probe;
     size_t bat = 0;
     uint64_t mapped = 0;
@@ -2492,14 +2572,18 @@ bool Glm5Model::dt_prepare(std::string& err) {
     std::sort(D->pc.begin(), D->pc.end(), [](const DenseTier::Piece& a, const DenseTier::Piece& b) { return a.off < b.off; });
     for (size_t i = 1; i < D->pc.size(); ++i)
         if (D->pc[i].off < D->pc[i - 1].off + D->pc[i - 1].bytes) { err = "rows overlap in the arena"; return false; }
-    // the layers' pointers: each one inside its own span, none left there once moved (a field the visitor misses would
-    // read a prompt buffer) - and the fast state holds none into the span itself
+    // the layers' pointers: none left in the layers' rows once moved (a field the visitor misses, or one into another
+    // layer's rows, would read a prompt buffer) - and the fast state holds none into them itself
     const auto in_span = [&](uintptr_t v, uintptr_t a, uintptr_t b) { return v >= a && v < b; };
+    const auto in_rows = [&](uintptr_t v) {
+        for (const auto& t : D->st)
+            if (in_span(v, (uintptr_t) (D->span + t.off), (uintptr_t) (D->span + t.off + t.bytes))) return true;
+        return false;
+    };
     for (int il = l0_; il < l1_; ++il) {
         auto& Ly = F->L[(size_t) il];
         auto& y = D->L[(size_t) il];
         DenseTier::fields(Ly, [&](auto& p) { y.orig.push_back((uintptr_t) p); });
-        const uintptr_t a = (uintptr_t) (D->span + y.off), b = a + y.bytes;
         bool stray = false;
         // (moved to the other buffer than a pointer of the layer could already point into: buf[1] lies past them all
         // only when the layer is not the span's last - test both)
@@ -2509,7 +2593,7 @@ bool Glm5Model::dt_prepare(std::string& err) {
             for (size_t o = 0; o + sizeof(uintptr_t) <= sizeof(Ly) && !stray; o += sizeof(uintptr_t)) {
                 uintptr_t v;
                 std::memcpy(&v, raw + o, sizeof v);
-                if (in_span(v, a, b) && !in_span(v, (uintptr_t) D->buf[bb], (uintptr_t) D->buf[bb] + y.bytes)) stray = true;
+                if (in_rows(v) && !in_span(v, (uintptr_t) D->buf[bb], (uintptr_t) D->buf[bb] + y.bytes)) stray = true;
             }
             D->point(Ly, il, -1);
         }
@@ -2523,7 +2607,7 @@ bool Glm5Model::dt_prepare(std::string& err) {
         for (size_t o = 0; o + sizeof(uintptr_t) <= sizeof(FastState); o += sizeof(uintptr_t)) {
             uintptr_t v;
             std::memcpy(&v, raw + o, sizeof v);
-            if (in_span(v, (uintptr_t) D->span, (uintptr_t) D->span + D->span_bytes)) {
+            if (in_rows(v)) {
                 err = "the fast state points into the layers' rows";
                 return false;
             }
@@ -2549,10 +2633,24 @@ bool Glm5Model::dt_prepare(std::string& err) {
     d->th = std::thread([d] { d->loop(); });
     dt_ = d;
     const double G = 1073741824.0;
+    uint64_t rows = 0;
+    for (const auto& t : d->st) rows += t.bytes;
+    // (a layer whose rows lie in two or more places: how many ranges and stretches)
+    std::string where;
+    if (nrg > (size_t) (l1_ - l0_) || d->st.size() > 1) {
+        char t[64];
+        std::snprintf(t, sizeof t, ", %zu ranges in %zu stretches (lent", nrg, d->st.size());
+        where = t;
+        for (size_t k = 0; k < d->seg.size(); ++k) {
+            std::snprintf(t, sizeof t, "%s%.2f", k ? " + " : " ", (double) d->seg[k].bytes / G);
+            where += t;
+        }
+        where += " GB)";
+    }
     std::fprintf(stderr, "glm prefill: CUDA%d dense tier (STRATA_GLM_PREFILL_DENSE_TIER=%d): layers %d-%d's rows %.2f GB "
-                         "(%.2f GB from the mapping, %.2f GB host copy), %.2f GB lendable, layer buffers 2 x %.0f MB\n",
-                 dev_, dt_mode(), l0_, l1_ - 1, (double) d->span_bytes / G, (double) mapped / G,
-                 (double) d->backup.size() / G, (double) d->region / G, (double) d->lbuf / 1048576.0);
+                         "(%.2f GB from the mapping, %.2f GB host copy), %.2f GB lendable, layer buffers 2 x %.0f MB%s\n",
+                 dev_, dt_mode(), l0_, l1_ - 1, (double) rows / G, (double) mapped / G,
+                 (double) d->backup.size() / G, (double) lend / G, (double) d->lbuf / 1048576.0, where.c_str());
     return true;
 }
 
@@ -2576,18 +2674,37 @@ bool Glm5Model::dt_fits(int T, int& place) const {
                            (S->toks_d != nullptr || S->dt_toks_save != nullptr ? al((size_t) T * sizeof(int)) : 0)
                      : 0;
     sz[4] = al(pu.second);
-    const size_t cap_e = std::min(S->region_bytes, std::max(S->lend_max, S->borrow_bytes)), cap_d = D->region;
+    const size_t cap_e = std::min(S->region_bytes, std::max(S->lend_max, S->borrow_bytes));
+    const int ns = (int) std::min<size_t>(D->seg.size(), kDtSegs);
     int best = -1;
-    size_t best_e = SIZE_MAX;
+    size_t best_e = SIZE_MAX, best_d0 = SIZE_MAX;
     for (int pl = 0; pl < 32; ++pl) {
-        size_t e = 0, d = 0;
-        for (int i = 0; i < 5; ++i) (pl & (1 << i) ? d : e) += sz[i];
-        if (((pl & kDtAct) != 0) == ((pl & kDtUni) != 0))   // (one carve: no alignment between them)
-            (pl & kDtAct ? d : e) -= sz[0] + sz[4] - al(pu.first + pu.second);
-        if (e + 256 > cap_e || d > cap_d) continue;
-        if (e < best_e) {
-            best_e = e;
-            best = pl;
+        // (the dense side's groups over the segments: every combination - one when the rows lie together)
+        int gi[5], ng = 0, combos = 1;
+        for (int i = 0; i < 5; ++i)
+            if (pl & (1 << i)) {
+                gi[ng++] = i;
+                combos *= ns;
+            }
+        for (int c = 0; c < combos; ++c) {
+            int code = pl;
+            for (int j = 0, x = c; j < ng; ++j, x /= ns) code |= (x % ns) << (8 + 2 * gi[j]);
+            size_t e = 0, d[kDtSegs] = {};
+            for (int i = 0; i < 5; ++i) {
+                const int k = dt_loc(code, 1 << i);
+                (k < 0 ? e : d[k]) += sz[i];
+            }
+            if (const int k = dt_loc(code, kDtAct); k == dt_loc(code, kDtUni))   // (one carve: no alignment between them)
+                (k < 0 ? e : d[k]) -= sz[0] + sz[4] - al(pu.first + pu.second);
+            bool fit = e + 256 <= cap_e;
+            for (int k = 0; k < ns && fit; ++k) fit = d[k] <= D->seg[(size_t) k].bytes;
+            // (as few of the tail's bytes as may be; of equal ones, the least of the largest segment - the smaller
+            // segments take what they can hold)
+            if (fit && (e < best_e || (e == best_e && ns > 1 && d[0] < best_d0))) {
+                best_e = e;
+                best_d0 = d[0];
+                best = code;
+            }
         }
     }
     if (best < 0) return false;
@@ -2636,13 +2753,13 @@ bool Glm5Model::dt_layer(int il, int il_next, std::string& err) {
         if (D->held[b] >= 0 && D->held[b] != l) D->point(F->L[(size_t) D->held[b]], D->held[b], -1);
         D->held[b] = l;
         DenseTier::Job j;
-        j.a = D->L[(size_t) l].off;
-        j.n = D->L[(size_t) l].bytes;
-        j.dst = D->buf[b];
+        for (const auto& r : D->L[(size_t) l].rg) {
+            j.part.push_back(DenseTier::Part{r.off, r.bytes, D->buf[b] + r.at});
+            D->load_bytes += r.bytes;
+        }
         j.wait_b = b;
         j.ready_b = b;
         ++D->loads;
-        D->load_bytes += j.n;
         return D->submit(j, err);
     };
     int b = D->held[0] == il ? 0 : D->held[1] == il ? 1 : -1;
@@ -2689,15 +2806,17 @@ bool Glm5Model::dt_restore(std::string& err) {
         std::lock_guard<std::mutex> l(D->m);
         D->werr.clear();
     }
-    const uint64_t r0 = std::min<uint64_t>(S->dt_used, D->region), b0 = D->region, b1 = D->span_bytes;
+    // (each segment's carved part, then the layer buffers)
+    std::vector<std::pair<uint64_t, uint64_t>> back_rg;
+    for (size_t k = 0; k < D->seg.size() && k < (size_t) kDtSegs; ++k)
+        back_rg.push_back({D->seg[k].off, D->seg[k].off + std::min<uint64_t>(S->dt_used[k], D->seg[k].bytes)});
+    back_rg.push_back({D->b0, D->b1});
     uint64_t back = 0;
-    for (const auto& rg : {std::make_pair<uint64_t, uint64_t>(0, (uint64_t) r0), std::make_pair(b0, b1)}) {
+    for (const auto& rg : back_rg) {
         if (rg.second <= rg.first) continue;
         DenseTier::Job j;
-        j.a = rg.first;
-        j.n = rg.second - rg.first;
-        j.dst = D->span + rg.first;
-        back += j.n;
+        j.part.push_back(DenseTier::Part{rg.first, rg.second - rg.first, D->span + rg.first});
+        back += rg.second - rg.first;
         std::string e2;
         if (!D->submit(j, e2)) {
             ok = false;
@@ -2715,9 +2834,35 @@ bool Glm5Model::dt_restore(std::string& err) {
     if (!werr.empty() && err.empty()) err = werr;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const double G = 1073741824.0;
+    std::string segs;   // (the rows lent in two or more places: each one's share)
+    if (D->seg.size() > 1) {
+        char t[48];
+        for (size_t k = 0; k < D->seg.size() && k < (size_t) kDtSegs; ++k) {
+            std::snprintf(t, sizeof t, "%s%.2f", k ? " + " : " (segments ", (double) S->dt_used[k] / G);
+            segs += t;
+        }
+        segs += " GB)";
+    }
+    if (ok && dt_full_check()) {
+        // (the check: every row as the mapping or the host copy holds it)
+        std::vector<uint8_t> h;
+        size_t bad = 0;
+        for (const auto& p : D->pc)
+            for (uint64_t x = 0; x < p.bytes && ok; x += DenseTier::kSlice) {
+                const size_t n = (size_t) std::min<uint64_t>(DenseTier::kSlice, p.bytes - x);
+                h.resize(n);
+                ok = glmfast::cuda_ok(cudaMemcpy(h.data(), D->span + p.off + x, n, cudaMemcpyDeviceToHost), "glm dense tier: check", err);
+                if (ok && std::memcmp(h.data(), p.src + x, n) != 0) ++bad;
+            }
+        if (bad) {
+            ok = false;
+            err = "glm prefill: the dense tier's check: " + std::to_string(bad) + " slices of the rows differ after the write-back";
+        }
+        segs += bad ? ", checked: DIFFERS" : ", checked: same bytes";
+    }
     std::fprintf(stderr, "glm prefill: CUDA%d dense tier: chunks of %d, %llu layer loads (%.2f GB; host copies %.0f ms, "
-                         "waits %.0f ms), %.2f GB back in %.0f ms%s\n", dev_, S->T_bound, (unsigned long long) D->loads,
-                 (double) D->load_bytes / G, D->ms_host, D->ms_wait, (double) back / G, ms, ok ? "" : " - FAILED");
+                         "waits %.0f ms), %.2f GB back in %.0f ms%s%s\n", dev_, S->T_bound, (unsigned long long) D->loads,
+                 (double) D->load_bytes / G, D->ms_host, D->ms_wait, (double) back / G, ms, segs.c_str(), ok ? "" : " - FAILED");
     D->loads = D->load_bytes = 0;
     D->ms_host = D->ms_wait = 0;
     D->dirty = !ok;
