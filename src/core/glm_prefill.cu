@@ -66,9 +66,12 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <condition_variable>
 #include <map>
+#include <mutex>
 #include <set>
 #include <memory>
+#include <type_traits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -565,6 +568,16 @@ void blas_ck(cublasStatus_t st, const char* what) {
 
 struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
+    // the dense tier (issue #53, Glm5Model::DenseTier): this prompt's buffers partly in the layers' dense rows; place:
+    // which go there (kDtAct the rows kept across a layer, kDtUni the per-layer scratch, kDtFix the weight scratch and
+    // the staging groups, kDtPre the prestage slots, kDtRows the image flags / token ids of a chunk longer than their
+    // allocations); dt_used: the
+    // bytes of the dense rows that layout takes; dt_T: the longest chunk it lays out (-1 not sized yet, 0 none)
+    bool dt_on = false;
+    int dt_place = 0, dt_T = -1, emb_T = 0;   // (emb_T: the tokens emb_h holds)
+    size_t dt_used = 0;
+    unsigned char* dt_img_save = nullptr;
+    int* dt_toks_save = nullptr;
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
     std::function<std::pair<int64_t, int>(int64_t)> choose;
@@ -785,6 +798,194 @@ struct Glm5Model::PrefillState {
     std::vector<Tr> tr;
 };
 
+// ---- the dense tier (issue #53; STRATA_GLM_PREFILL_DENSE_TIER).  On a small card the chunk is what the expert pool's
+// tail can lend, while the layers' dense rows - a few GB in w_arena_, blk.0 to blk.<n-1> one after another - stay put
+// through the whole prompt although a layer reads only its own.  A prompt longer than the chunk lends them too: the
+// span of the layers' rows holds the prompt path's buffers (the weight scratch, the staging groups, the prestage
+// slots, the chunk's rows where they fit - dt_fits), its last bytes two layer buffers, and before each layer runs its
+// rows come back into one of them from the shard mapping (or a host copy, for a row the load converted) through a
+// pinned ring, the next layer's while this one computes; the layer's pointers (FastState::Layer) point there while
+// it runs.  After the prompt every byte the prompt took is written back and every pointer reset (dt_restore), so the
+// decode reads the arena it always did.  The idea came from issue #53's report (a 16 GB card, a 469K-token prompt
+// in chunks of 17,152 instead of 7,168: -18%); this is Abyss's own take on it.
+constexpr int kDtAct = 1, kDtFix = 2, kDtPre = 4, kDtRows = 8, kDtUni = 16;   // PrefillState::dt_place's bits
+
+struct Glm5Model::DenseTier {
+    int dev = 0;
+    uint8_t* span = nullptr;           // the layers' rows in w_arena_: [span, span + span_bytes)
+    size_t span_bytes = 0;
+    size_t region = 0;                 // [span, span + region): the prompt path's (dt_fits)
+    size_t lbuf = 0;                   // a layer buffer's bytes (the largest layer's span)
+    uint8_t* buf[2] = {nullptr, nullptr};   // the two layer buffers (the span's last 2 lbuf)
+    struct Piece {
+        uint64_t off = 0, bytes = 0;   // in the span
+        const uint8_t* src = nullptr;  // the bytes on the host (the shard mapping, or `backup`)
+    };
+    std::vector<Piece> pc;             // ascending, disjoint (the gaps are the arena's 256-byte alignment: zeros)
+    struct Lay {
+        uint64_t off = 0, bytes = 0;   // this layer's rows in the span
+        std::vector<uintptr_t> orig;   // its pointers as load set them (fields' order)
+    };
+    std::vector<Lay> L;                // by layer
+    std::vector<uint8_t> backup;       // the rows with no mapping (converted at load: F32, BF16 rows ...)
+    int held[2] = {-1, -1};            // the layer each buffer holds
+    int cur = -1;                      // the buffer the running layer reads
+    bool dirty = false;                // the span holds prompt buffers: dt_restore writes it back
+    cudaStream_t cs = nullptr;         // the copies' stream
+    cudaEvent_t ev_ready[2] = {nullptr, nullptr}, ev_free[2] = {nullptr, nullptr};
+    // the pinned ring the host fills (a slice each) while the copies of the slices before it run
+    static constexpr int NB = 4;
+    static constexpr size_t kSlice = (size_t) 32 << 20;
+    uint8_t* bounce = nullptr;
+    cudaEvent_t ev_b[NB] = {};
+    int bi = 0;
+    // the host worker: one job at a time - the span's [a, a + n) to dst, after ev_free[wait_b], then ev_ready[ready_b]
+    struct Job {
+        uint64_t a = 0, n = 0;
+        uint8_t* dst = nullptr;
+        int wait_b = -1, ready_b = -1;
+    };
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    Job job;
+    bool pending = false, quit = false;
+    std::string werr;                  // the worker's first failure (dt_layer / dt_restore report it)
+    // stats (a prompt's: dt_restore prints them)
+    uint64_t loads = 0, load_bytes = 0;
+    double ms_host = 0, ms_wait = 0;
+
+    // the visitor over every pointer of a layer (the weights and, harmlessly, the caches - which lie outside the span)
+    template <class Fn>
+    static void fields(FastState::Layer& L, Fn&& f) {
+        const auto w = [&](WSlot& s) { f(s.f32); f(s.q); };
+        w(L.eh); f(L.enorm); f(L.hnorm); f(L.shnorm); f(L.hc_attn_fn); f(L.hc_ffn_fn); f(L.hc_attn_scale);
+        f(L.hc_attn_base); f(L.hc_ffn_scale); f(L.hc_ffn_base); f(L.attn_norm); f(L.ffn_norm);
+        w(L.q); w(L.k); w(L.v); w(L.out);
+        f(L.f_a); f(L.g_a); f(L.f_b); f(L.g_b); f(L.beta);
+        for (auto& c : L.conv) f(c);
+        f(L.dt_bias); f(L.ssm_a); f(L.ssm_norm);
+        w(L.q_a); w(L.q_b); w(L.kv_a);
+        f(L.q_a_norm); f(L.kv_a_norm); f(L.k_norm_w); f(L.k_norm_b); f(L.ape);
+        f(L.idx_k); f(L.idx_gate); f(L.idx_q_b); f(L.idx_proj); f(L.k_b); f(L.v_b);
+        f(L.hc_attn_fn8); f(L.hc_ffn_fn8); f(L.f_a8); f(L.g_a8); f(L.f_b8); f(L.g_b8); f(L.beta8); f(L.idx_k8);
+        f(L.idx_gate8); f(L.idx_q_b8); f(L.k_b8); f(L.v_b8);
+        f(L.router); f(L.router_bias); f(L.router_bias_vl);
+        w(L.sh_gate); w(L.sh_up); w(L.sh_down); w(L.ffn_gate); w(L.ffn_up); w(L.ffn_down);
+        f(L.nv_scale);
+        w(L.kv); w(L.out_a); w(L.out_b); w(L.comp_kv); w(L.comp_gate); w(L.idx_comp_kv); w(L.idx_comp_gate);
+        w(L.idx_q_b_q);
+        f(L.sinks); f(L.comp_ape); f(L.comp_norm); f(L.idx_comp_ape); f(L.idx_comp_norm); f(L.idx_proj_f); f(L.tid2eid);
+        f(L.raw); f(L.comp_cache); f(L.idx_cache); f(L.ring_kv); f(L.ring_sc); f(L.iring_kv); f(L.iring_sc);
+        w(L.idx_k_w); w(L.eng_kv); f(L.idx_k_norm); f(L.eng_qn); f(L.eng_kn);
+        w(L.qkv); w(L.zg); w(L.ssm_o); w(L.alpha_w); w(L.beta_w); f(L.conv1d);
+        w(L.aq); w(L.ak); w(L.av); f(L.q_norm); f(L.k_norm); f(L.post_norm); f(L.sh_gate_w);
+        f(L.gdn_state); f(L.gdn_conv); f(L.kc); f(L.vc);
+        w(L.lag_g);
+        for (auto& h : L.hc4) { f(h.norm); w(h.down); w(h.up); w(h.inject); }
+        for (auto& p : L.mhc_w) f(p);
+        for (auto& p : L.mhc_b) f(p);
+        w(L.q4_ik); w(L.q4_iq); f(L.q4_ikn); f(L.q4_iqn);
+        f(L.q4_tail); f(L.q4_dead); f(L.q4_pooled); f(L.q4_bpos); f(L.q27_kbn);
+        w(L.idx_q_b_x);
+    }
+    // layer il's pointers into buffer b (b < 0: as load set them)
+    void point(FastState::Layer& Ly, int il, int b) {
+        const Lay& y = L[(size_t) il];
+        const uintptr_t lo = (uintptr_t) (span + y.off), hi = lo + y.bytes;
+        const uintptr_t to = b >= 0 ? (uintptr_t) buf[b] : lo;
+        size_t i = 0;
+        fields(Ly, [&](auto& p) {
+            const uintptr_t o = y.orig[i++];
+            p = (std::remove_reference_t<decltype(p)>) (o >= lo && o < hi ? o - lo + to : o);
+        });
+    }
+    // the span's bytes [a, a + n) as load left them, into dst (host)
+    void fill(uint64_t a, uint64_t n, uint8_t* dst) const {
+        auto it = std::upper_bound(pc.begin(), pc.end(), a, [](uint64_t v, const Piece& p) { return v < p.off + p.bytes; });
+        const uint64_t end = a + n;
+        uint64_t c = a;
+        for (; it != pc.end() && it->off < end; ++it) {
+            const uint64_t p0 = std::max(it->off, a), p1 = std::min(it->off + it->bytes, end);
+            if (p0 > c) std::memset(dst + (c - a), 0, (size_t) (p0 - c));
+            std::memcpy(dst + (p0 - a), it->src + (p0 - it->off), (size_t) (p1 - p0));
+            c = p1;
+        }
+        if (c < end) std::memset(dst + (c - a), 0, (size_t) (end - c));
+    }
+    // the worker's side of a job
+    bool run(const Job& j, std::string& e) {
+        const auto t0 = std::chrono::steady_clock::now();
+        double host = 0;
+        if (j.wait_b >= 0 && cudaStreamWaitEvent(cs, ev_free[j.wait_b], 0) != cudaSuccess) {
+            e = "dense tier: wait";
+            return false;
+        }
+        for (uint64_t x = 0; x < j.n; x += kSlice) {
+            const uint64_t n = std::min<uint64_t>(kSlice, j.n - x);
+            uint8_t* h = bounce + (size_t) bi * kSlice;
+            if (cudaEventSynchronize(ev_b[bi]) != cudaSuccess) {   // (the slice's last copy has read it)
+                e = "dense tier: ring";
+                return false;
+            }
+            const auto h0 = std::chrono::steady_clock::now();
+            fill(j.a + x, n, h);
+            host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+            if (cudaMemcpyAsync(j.dst + x, h, (size_t) n, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+                cudaEventRecord(ev_b[bi], cs) != cudaSuccess) {
+                e = "dense tier: copy";
+                return false;
+            }
+            bi = (bi + 1) % NB;
+        }
+        if (j.ready_b >= 0 && cudaEventRecord(ev_ready[j.ready_b], cs) != cudaSuccess) {
+            e = "dense tier: event";
+            return false;
+        }
+        (void) t0;
+        ms_host += host;
+        return true;
+    }
+    void loop() {
+        cudaSetDevice(dev);
+        std::unique_lock<std::mutex> l(m);
+        for (;;) {
+            cv.wait(l, [&] { return pending || quit; });
+            if (!pending) return;
+            const Job j = job;
+            l.unlock();
+            std::string e;
+            const bool ok = run(j, e);
+            l.lock();
+            if (!ok && werr.empty()) werr = e + " (" + cudaGetErrorString(cudaGetLastError()) + ")";
+            pending = false;
+            cv.notify_all();
+        }
+    }
+    // the worker idle (its last job's copies issued); false: a job failed
+    bool wait(std::string& err) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> l(m);
+        cv.wait(l, [&] { return !pending; });
+        ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!werr.empty()) {
+            err = "glm prefill: " + werr;
+            return false;
+        }
+        return true;
+    }
+    bool submit(const Job& j, std::string& err) {
+        if (!wait(err)) return false;
+        std::lock_guard<std::mutex> l(m);
+        job = j;
+        pending = true;
+        cv.notify_all();
+        return true;
+    }
+};
+
+static uint8_t* dt_region_base(Glm5Model::DenseTier* D) { return D != nullptr ? D->span : nullptr; }
+
 int Glm5Model::prefill_chunk() const { return pf_ ? pf_->T : 0; }
 const char* Glm5Model::prefill_off_reason() const {
     if (pf_ != nullptr) return vis_lent_ ? "its tail is lent to the vision encoder" : "none";
@@ -818,6 +1019,8 @@ void Glm5Model::prefill_cap(int T, const char* why) {
     }
     std::fprintf(stderr, "glm prefill: CUDA%d chunks of %d tokens (%s)\n", dev_, T, why);
     S->T = T;
+    S->emb_T = T;
+    S->dt_T = -1;   // (the dense tier's chunk is sized again against this one)
 }
 
 // Strata's lend cap, settled once the RAM tier exists (prefill_setup sized the chunk with its 90): 90% of the pool's
@@ -1416,6 +1619,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         prefill_destroy();
         return true;
     }
+    S->emb_T = (int) T;
     if (has_moe) {
         // the landing ring: ~3% of the free RAM per device (it is pinned before the RAM tier measures what is left,
         // so it comes out of that tier), 12 to 96 slots; halved while the pinning fails.  96 slots let the second
@@ -1745,6 +1949,17 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
     return c.off;
 }
 
+// the prestage slots a chunk of Tn tokens gets: T / 128 (16 .. the buffer's), unless STRATA_GLM_PRESTAGE_CARVE says
+// otherwise (0: the whole buffer, as before) - the rest of the buffer stays with the pool's experts; in bytes
+static size_t prestage_carve(const Glm5Model::PrefillState* S, int Tn) {
+    static const long long carve_env = [] { const char* v = getenv("STRATA_GLM_PRESTAGE_CARVE"); return v ? std::atoll(v) : -1LL; }();
+    if (!S->pbuf_bytes || Tn < kPreMinT || S->gstride == 0) return 0;
+    const size_t all = S->pbuf_bytes / S->gstride;
+    size_t slots = carve_env == 0 ? all : carve_env > 0 ? (size_t) carve_env : std::max<size_t>(16, (size_t) Tn / 128);
+    slots = std::min(slots, all);
+    return slots * S->gstride;
+}
+
 // the prompt path's device buffers for chunks of T tokens, carved from the start of the lendable region; returns the
 // bytes that layout uses (a short prompt borrows - and evicts - only that much of the pool's tail)
 size_t Glm5Model::prefill_carve(int Tn) {
@@ -1755,23 +1970,27 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->sub = mixer_sub(T, g, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env);
     const auto [pers, uni] = prefill_bytes_for(T);
     Carve c{S->region};
+    // (the dense tier: the buffers its layout gives the layers' dense rows - dt_place - are carved there)
+    Carve cd{S->dt_on ? dt_region_base(dt_) : nullptr};
+    const auto at = [&](int bit) -> Carve& { return S->dt_on && (S->dt_place & bit) ? cd : c; };
     if (F->nv_guard > 0) c.take<uint8_t>(F->nv_guard);   // (NVFP4: the region starts with a guard - nv_zero_staging)
-    S->arena = c.take<uint8_t>(pers + uni);
-    S->w16 = c.take<uint16_t>((size_t) S->w16_elems);
-    S->w32 = c.take<float>((size_t) S->w32_elems);
-    S->ws = c.take<uint8_t>(S->ws_bytes);
-    S->gbuf = S->gbuf_bytes ? c.take<uint8_t>(S->gbuf_bytes) : nullptr;
-    // the prestage slots this chunk gets: T / 128 (16 .. the buffer's), unless STRATA_GLM_PRESTAGE_CARVE says
-    // otherwise (0: the whole buffer, as before) - the rest of the buffer stays with the pool's experts
-    static const long long carve_env = [] { const char* v = getenv("STRATA_GLM_PRESTAGE_CARVE"); return v ? std::atoll(v) : -1LL; }();
-    S->pbuf_carved = 0;
-    if (S->pbuf_bytes && Tn >= kPreMinT && S->gstride > 0) {
-        const size_t all = S->pbuf_bytes / S->gstride;
-        size_t slots = carve_env == 0 ? all : carve_env > 0 ? (size_t) carve_env : std::max<size_t>(16, T / 128);
-        slots = std::min(slots, all);
-        S->pbuf_carved = slots * S->gstride;
+    // (the dense tier may put the per-layer scratch apart from the rows kept across a layer)
+    const bool uni_apart = S->dt_on && ((S->dt_place & kDtAct) != 0) != ((S->dt_place & kDtUni) != 0);
+    S->arena = at(kDtAct).take<uint8_t>(uni_apart ? pers : pers + uni);
+    uint8_t* uni_at = uni_apart ? at(kDtUni).take<uint8_t>(uni) : nullptr;
+    S->w16 = at(kDtFix).take<uint16_t>((size_t) S->w16_elems);
+    S->w32 = at(kDtFix).take<float>((size_t) S->w32_elems);
+    S->ws = at(kDtFix).take<uint8_t>(S->ws_bytes);
+    S->gbuf = S->gbuf_bytes ? at(kDtFix).take<uint8_t>(S->gbuf_bytes) : nullptr;
+    S->pbuf_carved = prestage_carve(S, Tn);
+    S->pbuf = S->pbuf_carved ? at(kDtPre).take<uint8_t>(S->pbuf_carved + F->nv_guard) : nullptr;   // (a short prompt: none)
+    // (the dense tier's chunk longer than the image flags' and token ids' allocations: theirs carved too)
+    if (S->dt_on && Tn > S->T) {
+        if (S->dt_img_save == nullptr) S->dt_img_save = S->img_d;
+        if (S->dt_toks_save == nullptr) S->dt_toks_save = S->toks_d;
+        if (S->dt_img_save != nullptr) S->img_d = at(kDtRows).take<unsigned char>(T);
+        if (S->dt_toks_save != nullptr) S->toks_d = at(kDtRows).take<int>(T);
     }
-    S->pbuf = S->pbuf_carved ? c.take<uint8_t>(S->pbuf_carved + F->nv_guard) : nullptr;   // (a short prompt: none)
     // (NVFP4: the guards and the staging slots are zeroed in prefill_lend, once the tail's experts left - here the
     // region still holds them)
     Carve a{S->arena};
@@ -1792,12 +2011,13 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->hy4_keep = g.is_hy4() ? a.take<uint8_t>(hy4_prompt_bytes(T).first)
                   : g.ink    ? a.take<uint8_t>(ink_prompt_bytes(T).first)   // (inkling: its residual rows)
                              : nullptr;
-    S->uni = S->arena + a.off;
+    S->uni = uni_at != nullptr ? uni_at : S->arena + a.off;
     S->uni_bytes = uni;
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
     S->T_bound = Tn;
     S->need = c.off;
     S->carved = c.off;
+    S->dt_used = cd.off;
     return c.off;
 }
 
@@ -2148,8 +2368,388 @@ bool Glm5Model::prefill_return(std::string& err) {
     return q35d_restore(err);
 }
 
+// ---- the dense tier (DenseTier above)
+int Glm5Model::dt_mode() const {
+    static const int m = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER");
+        return v != nullptr && v[0] != '\0' ? std::max(0, std::min(2, std::atoi(v))) : 0;
+    }();
+    return m;
+}
+
+// once, at the first prompt that may take it: the layers' span in the arena, each row's host bytes, the layers'
+// pointers, the buffers and the worker.  false (err the reason): no tier for this session
+bool Glm5Model::dt_prepare(std::string& err) {
+    FastState* F = fast_;
+    PrefillState* S = pf_;
+    if (F == nullptr || S == nullptr) { err = "no prompt path"; return false; }
+    // (the models whose prompt layers read every weight through FastState::Layer: deepseek41, deepseek4, glm5-next and
+    // the qwen35moe family; hy4 and inkling keep theirs elsewhere, the dense qwen35 places its FFN itself; a split's
+    // parts pipeline their chunks - not yet)
+    const bool arch_ok = g_.dsv4() || ((g_.arch == 0 || g_.qwen35()) && g_.n_expert > 0 && !g_.loop && !g_.ink && !g_.q4x &&
+                                                  !g_.laguna);
+    if (!arch_ok) { err = "not this model (DeepSeek V4 / V4.1, GLM-5.3 and the qwen35moe models only)"; return false; }
+    if (split_next_ != nullptr || n_parts_ != 1 || l0_ != 0 || l1_ != g_.n_layers) { err = "one GPU only"; return false; }
+    if (dt_exl3_) { err = "an EXL3 pack"; return false; }
+    if (F->nv_guard > 0) { err = "NVFP4 rows (the staging guards)"; return false; }
+    if (S->own) { err = "no expert pool"; return false; }
+    if (dt_rows_.empty()) { err = "no record of the dense rows (not a pack load)"; return false; }
+    cudaSetDevice(dev_);
+    // the layers' spans: each layer's rows one after another, the layers in order, nothing else among them
+    const int nl = g_.n_layers;
+    std::vector<uint64_t> lo((size_t) nl, UINT64_MAX), hi((size_t) nl, 0);
+    for (const DtRow& r : dt_rows_)
+        if (r.layer >= l0_ && r.layer < l1_) {
+            lo[(size_t) r.layer] = std::min(lo[(size_t) r.layer], r.off);
+            hi[(size_t) r.layer] = std::max(hi[(size_t) r.layer], r.off + r.bytes);
+        }
+    for (int il = l0_; il < l1_; ++il)
+        if (hi[(size_t) il] == 0) { err = "layer " + std::to_string(il) + " has no dense rows in the arena"; return false; }
+    for (int il = l0_ + 1; il < l1_; ++il)
+        if (lo[(size_t) il] < hi[(size_t) il - 1]) { err = "the layers' rows are not in layer order"; return false; }
+    const uint64_t s0 = lo[(size_t) l0_], s1 = hi[(size_t) l1_ - 1];
+    for (const DtRow& r : dt_rows_)
+        if ((r.layer < l0_ || r.layer >= l1_) && r.off < s1 && r.off + r.bytes > s0) {
+            err = "another row lies among the layers' rows";
+            return false;
+        }
+    auto D = std::make_unique<DenseTier>();
+    D->dev = dev_;
+    D->span = (uint8_t*) w_arena_ + s0;
+    D->span_bytes = (size_t) (s1 - s0);
+    D->L.resize((size_t) nl);
+    uint64_t big = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        auto& y = D->L[(size_t) il];
+        y.off = lo[(size_t) il] - s0;
+        y.bytes = hi[(size_t) il] - lo[(size_t) il];
+        big = std::max(big, y.bytes);
+    }
+    D->lbuf = (size_t) ((big + 255) & ~(uint64_t) 255);
+    if (D->span_bytes < 4 * D->lbuf) { err = "the layers' rows are too few to lend"; return false; }
+    D->region = (D->span_bytes - 2 * D->lbuf) & ~(size_t) 255;
+    D->buf[0] = D->span + D->region;
+    D->buf[1] = D->buf[0] + D->lbuf;
+    // each row's bytes on the host: the shard mapping where the arena holds the GGUF's bytes, else a host copy
+    size_t nb = 0;
+    for (const DtRow& r : dt_rows_)
+        if (r.layer >= l0_ && r.layer < l1_ &&
+            !(r.shard >= 0 && (size_t) r.shard < pack_shards_.size() && pack_shards_[(size_t) r.shard].base != nullptr &&
+              r.src + r.bytes <= pack_shards_[(size_t) r.shard].size))
+            nb += (size_t) r.bytes;
+    try {
+        D->backup.resize(nb);
+    } catch (...) {
+        err = "no RAM for the converted rows' copy";
+        return false;
+    }
+    static const bool full_check = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_CHECK"); return v != nullptr && std::atoi(v) != 0; }();
+    std::vector<uint8_t> probe;
+    size_t bat = 0;
+    uint64_t mapped = 0;
+    for (const DtRow& r : dt_rows_) {
+        if (r.layer < l0_ || r.layer >= l1_ || r.bytes == 0) continue;
+        DenseTier::Piece p;
+        p.off = r.off - s0;
+        p.bytes = r.bytes;
+        const uint8_t* dev_row = (const uint8_t*) w_arena_ + r.off;
+        if (r.shard >= 0 && (size_t) r.shard < pack_shards_.size() && pack_shards_[(size_t) r.shard].base != nullptr &&
+            r.src + r.bytes <= pack_shards_[(size_t) r.shard].size) {
+            p.src = pack_shards_[(size_t) r.shard].base + r.src;
+            mapped += r.bytes;
+            // the arena holds the mapping's bytes (a row some setup step changed in place would come back wrong): its
+            // first and last 4 KB, or all of it with STRATA_GLM_PREFILL_DENSE_TIER_CHECK=1
+            const size_t k = full_check ? (size_t) r.bytes : (size_t) std::min<uint64_t>(4096, r.bytes);
+            for (int part = 0; part < (full_check ? 1 : 2); ++part) {
+                const size_t o = part == 0 ? 0 : (size_t) r.bytes - k;
+                probe.resize(k);
+                if (cudaMemcpy(probe.data(), dev_row + o, k, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    cudaGetLastError();
+                    err = "the arena's read back failed";
+                    return false;
+                }
+                if (std::memcmp(probe.data(), p.src + o, k) != 0) {
+                    err = "a layer " + std::to_string(r.layer) + " row in the arena differs from its mapping";
+                    return false;
+                }
+            }
+        } else {
+            uint8_t* h = D->backup.data() + bat;
+            if (cudaMemcpy(h, dev_row, (size_t) r.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cudaGetLastError();
+                err = "the converted rows' copy failed";
+                return false;
+            }
+            p.src = h;
+            bat += (size_t) r.bytes;
+        }
+        D->pc.push_back(p);
+    }
+    std::sort(D->pc.begin(), D->pc.end(), [](const DenseTier::Piece& a, const DenseTier::Piece& b) { return a.off < b.off; });
+    for (size_t i = 1; i < D->pc.size(); ++i)
+        if (D->pc[i].off < D->pc[i - 1].off + D->pc[i - 1].bytes) { err = "rows overlap in the arena"; return false; }
+    // the layers' pointers: each one inside its own span, none left there once moved (a field the visitor misses would
+    // read a prompt buffer) - and the fast state holds none into the span itself
+    const auto in_span = [&](uintptr_t v, uintptr_t a, uintptr_t b) { return v >= a && v < b; };
+    for (int il = l0_; il < l1_; ++il) {
+        auto& Ly = F->L[(size_t) il];
+        auto& y = D->L[(size_t) il];
+        DenseTier::fields(Ly, [&](auto& p) { y.orig.push_back((uintptr_t) p); });
+        const uintptr_t a = (uintptr_t) (D->span + y.off), b = a + y.bytes;
+        bool stray = false;
+        // (moved to the other buffer than a pointer of the layer could already point into: buf[1] lies past them all
+        // only when the layer is not the span's last - test both)
+        for (int bb = 0; bb < 2 && !stray; ++bb) {
+            D->point(Ly, il, bb);
+            const unsigned char* raw = (const unsigned char*) &Ly;
+            for (size_t o = 0; o + sizeof(uintptr_t) <= sizeof(Ly) && !stray; o += sizeof(uintptr_t)) {
+                uintptr_t v;
+                std::memcpy(&v, raw + o, sizeof v);
+                if (in_span(v, a, b) && !in_span(v, (uintptr_t) D->buf[bb], (uintptr_t) D->buf[bb] + y.bytes)) stray = true;
+            }
+            D->point(Ly, il, -1);
+        }
+        if (stray) {
+            err = "a layer " + std::to_string(il) + " pointer the tier does not move";
+            return false;
+        }
+    }
+    {
+        const unsigned char* raw = (const unsigned char*) F;
+        for (size_t o = 0; o + sizeof(uintptr_t) <= sizeof(FastState); o += sizeof(uintptr_t)) {
+            uintptr_t v;
+            std::memcpy(&v, raw + o, sizeof v);
+            if (in_span(v, (uintptr_t) D->span, (uintptr_t) D->span + D->span_bytes)) {
+                err = "the fast state points into the layers' rows";
+                return false;
+            }
+        }
+    }
+    bool ok = cudaStreamCreateWithFlags(&D->cs, cudaStreamNonBlocking) == cudaSuccess;
+    for (int b = 0; b < 2 && ok; ++b)
+        ok = cudaEventCreateWithFlags(&D->ev_ready[b], cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&D->ev_free[b], cudaEventDisableTiming) == cudaSuccess;
+    for (int b = 0; b < DenseTier::NB && ok; ++b)
+        ok = cudaEventCreateWithFlags(&D->ev_b[b], cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventRecord(D->ev_b[b], D->cs) == cudaSuccess;
+    if (ok) ok = cudaHostAlloc((void**) &D->bounce, DenseTier::NB * DenseTier::kSlice, cudaHostAllocDefault) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        err = "its stream, events or pinned ring did not allocate";
+        DenseTier* d = D.release();
+        dt_ = d;
+        dt_destroy();
+        return false;
+    }
+    DenseTier* d = D.release();
+    d->th = std::thread([d] { d->loop(); });
+    dt_ = d;
+    const double G = 1073741824.0;
+    std::fprintf(stderr, "glm prefill: CUDA%d dense tier (STRATA_GLM_PREFILL_DENSE_TIER=%d): layers %d-%d's rows %.2f GB "
+                         "(%.2f GB from the mapping, %.2f GB host copy), %.2f GB lendable, layer buffers 2 x %.0f MB\n",
+                 dev_, dt_mode(), l0_, l1_ - 1, (double) d->span_bytes / G, (double) mapped / G,
+                 (double) d->backup.size() / G, (double) d->region / G, (double) d->lbuf / 1048576.0);
+    return true;
+}
+
+// the layout of a chunk of T tokens with the dense tier: the buffers into the pool's tail or the dense rows' region,
+// the placement that lends the fewest experts (place: PrefillState::dt_place's bits).  The tail lends what the plain
+// layout may (its bytes, at most the lend cap's), the dense rows their region
+bool Glm5Model::dt_fits(int T, int& place) const {
+    const PrefillState* S = pf_;
+    const DenseTier* D = dt_;
+    if (S == nullptr || D == nullptr || T <= 0) return false;
+    const auto al = [](size_t b) { return (b + 255) & ~(size_t) 255; };
+    const auto pu = prefill_bytes_for((size_t) T);
+    // (in the order of the bits: the kept rows, the weight scratch and staging, the prestage slots, the longer chunk's
+    // image flags / token ids, the per-layer scratch; the kept rows and the scratch together where they share a side)
+    size_t sz[5];
+    sz[0] = al(pu.first);
+    sz[1] = al((size_t) S->w16_elems * 2) + al((size_t) S->w32_elems * 4) + al(S->ws_bytes) +
+            (S->gbuf_bytes ? al(S->gbuf_bytes) : 0);
+    sz[2] = al(prestage_carve(S, T));
+    sz[3] = T > S->T ? (S->img_d != nullptr || S->dt_img_save != nullptr ? al((size_t) T) : 0) +
+                           (S->toks_d != nullptr || S->dt_toks_save != nullptr ? al((size_t) T * sizeof(int)) : 0)
+                     : 0;
+    sz[4] = al(pu.second);
+    const size_t cap_e = std::min(S->region_bytes, std::max(S->lend_max, S->borrow_bytes)), cap_d = D->region;
+    int best = -1;
+    size_t best_e = SIZE_MAX;
+    for (int pl = 0; pl < 32; ++pl) {
+        size_t e = 0, d = 0;
+        for (int i = 0; i < 5; ++i) (pl & (1 << i) ? d : e) += sz[i];
+        if (((pl & kDtAct) != 0) == ((pl & kDtUni) != 0))   // (one carve: no alignment between them)
+            (pl & kDtAct ? d : e) -= sz[0] + sz[4] - al(pu.first + pu.second);
+        if (e + 256 > cap_e || d > cap_d) continue;
+        if (e < best_e) {
+            best_e = e;
+            best = pl;
+        }
+    }
+    if (best < 0) return false;
+    place = best;
+    return true;
+}
+
+// the longest chunk (256-token grid, up to --prefill auto's 32768) the tier lays out; 0: none longer than the plain one
+int Glm5Model::dt_chunk() {
+    PrefillState* S = pf_;
+    if (S == nullptr || dt_ == nullptr) return 0;
+    if (S->dt_T >= 0) return S->dt_T;
+    S->dt_T = 0;
+    if (S->mode.rfind("auto", 0) != 0) return 0;   // (--prefill N: the operator's chunk)
+    int lo = S->T / 256 + 1, hi = 32768 / 256, best = 0, pl = 0;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (dt_fits(mid * 256, pl)) {
+            best = mid * 256;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    S->dt_T = best > S->T ? best : 0;
+    if (S->dt_T > 0)
+        std::fprintf(stderr, "glm prefill: CUDA%d dense tier: prompts longer than %d tokens run in chunks of %d\n", dev_,
+                     S->T, S->dt_T);
+    else
+        std::fprintf(stderr, "glm prefill: CUDA%d dense tier: no chunk longer than %d fits - prompts as before\n", dev_,
+                     S->T);
+    return S->dt_T;
+}
+
+// prefill_half, before layer il runs (nothing of it enqueued yet): its rows in a layer buffer and its pointers there;
+// il_next (>= 0): the next layer to run, whose rows the worker brings into the other buffer meanwhile
+bool Glm5Model::dt_layer(int il, int il_next, std::string& err) {
+    PrefillState* S = pf_;
+    DenseTier* D = dt_;
+    FastState* F = fast_;
+    if (S == nullptr || D == nullptr || !S->dt_on) return true;
+    static const bool sync_env = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_SYNC"); return v != nullptr && std::atoi(v) != 0; }();
+    // the layer before has all its work enqueued: its buffer is free once that ran
+    if (D->cur >= 0 && !glmfast::cuda_ok(cudaEventRecord(D->ev_free[D->cur], F->cs), "glm dense tier: free", err)) return false;
+    const auto stage = [&](int l, int b) -> bool {
+        if (D->held[b] >= 0 && D->held[b] != l) D->point(F->L[(size_t) D->held[b]], D->held[b], -1);
+        D->held[b] = l;
+        DenseTier::Job j;
+        j.a = D->L[(size_t) l].off;
+        j.n = D->L[(size_t) l].bytes;
+        j.dst = D->buf[b];
+        j.wait_b = b;
+        j.ready_b = b;
+        ++D->loads;
+        D->load_bytes += j.n;
+        return D->submit(j, err);
+    };
+    int b = D->held[0] == il ? 0 : D->held[1] == il ? 1 : -1;
+    if (b < 0) {
+        b = D->cur == 0 ? 1 : 0;
+        if (!stage(il, b)) return false;
+    }
+    if (!D->wait(err)) return false;   // (its copies issued, ev_ready[b] recorded)
+    if (!glmfast::cuda_ok(cudaStreamWaitEvent(F->cs, D->ev_ready[b], 0), "glm dense tier: ready", err)) return false;
+    if (sync_env && (!glmfast::cuda_ok(cudaStreamSynchronize(D->cs), "glm dense tier: copies", err) ||
+                     !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm dense tier: compute", err)))
+        return false;
+    D->point(F->L[(size_t) il], il, b);
+    D->cur = b;
+    if (il_next >= 0 && il_next != il && D->held[1 - b] != il_next && !stage(il_next, 1 - b)) return false;
+    return true;
+}
+
+// after the prompt (whatever its end): the worker idle, every layer's pointers as load set them, the image flags' and
+// token ids' allocations back, and the span's bytes the prompt took - its region's carved part and the two layer
+// buffers - written back from the host on the copy stream, waited for (the decode reads them next)
+bool Glm5Model::dt_restore(std::string& err) {
+    PrefillState* S = pf_;
+    DenseTier* D = dt_;
+    FastState* F = fast_;
+    if (S == nullptr || D == nullptr || !D->dirty) {
+        if (S != nullptr) S->dt_on = false;
+        return true;
+    }
+    cudaSetDevice(dev_);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string werr;
+    bool ok = D->wait(werr);
+    ok = glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm dense tier: the prompt's work", err) && ok;
+    ok = glmfast::cuda_ok(cudaStreamSynchronize(D->cs), "glm dense tier: the copies", err) && ok;
+    for (int il = l0_; il < l1_; ++il) D->point(F->L[(size_t) il], il, -1);
+    D->held[0] = D->held[1] = D->cur = -1;
+    if (S->dt_img_save != nullptr) S->img_d = S->dt_img_save;
+    if (S->dt_toks_save != nullptr) S->toks_d = S->dt_toks_save;
+    S->dt_img_save = nullptr;
+    S->dt_toks_save = nullptr;
+    // (a failed job: the worker's error stays; the bytes go back anyway, on a fresh error state)
+    if (!werr.empty()) {
+        std::lock_guard<std::mutex> l(D->m);
+        D->werr.clear();
+    }
+    const uint64_t r0 = std::min<uint64_t>(S->dt_used, D->region), b0 = D->region, b1 = D->span_bytes;
+    uint64_t back = 0;
+    for (const auto& rg : {std::make_pair<uint64_t, uint64_t>(0, (uint64_t) r0), std::make_pair(b0, b1)}) {
+        if (rg.second <= rg.first) continue;
+        DenseTier::Job j;
+        j.a = rg.first;
+        j.n = rg.second - rg.first;
+        j.dst = D->span + rg.first;
+        back += j.n;
+        std::string e2;
+        if (!D->submit(j, e2)) {
+            ok = false;
+            if (err.empty()) err = e2;
+        }
+    }
+    {
+        std::string e2;
+        if (!D->wait(e2)) {
+            ok = false;
+            if (err.empty()) err = e2;
+        }
+    }
+    ok = glmfast::cuda_ok(cudaStreamSynchronize(D->cs), "glm dense tier: the rows back", err) && ok;
+    if (!werr.empty() && err.empty()) err = werr;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double G = 1073741824.0;
+    std::fprintf(stderr, "glm prefill: CUDA%d dense tier: chunks of %d, %llu layer loads (%.2f GB; host copies %.0f ms, "
+                         "waits %.0f ms), %.2f GB back in %.0f ms%s\n", dev_, S->T_bound, (unsigned long long) D->loads,
+                 (double) D->load_bytes / G, D->ms_host, D->ms_wait, (double) back / G, ms, ok ? "" : " - FAILED");
+    D->loads = D->load_bytes = 0;
+    D->ms_host = D->ms_wait = 0;
+    D->dirty = !ok;
+    S->dt_on = false;
+    if (!ok) {
+        // (the arena may hold prompt bytes: the decode must not read it)
+        dt_failed_ = true;
+        if (err.empty()) err = "glm prefill: the dense tier could not put the dense rows back";
+    }
+    return ok;
+}
+
+void Glm5Model::dt_destroy() {
+    DenseTier* D = dt_;
+    if (D == nullptr) return;
+    if (D->th.joinable()) {
+        {
+            std::lock_guard<std::mutex> l(D->m);
+            D->quit = true;
+        }
+        D->cv.notify_all();
+        D->th.join();
+    }
+    if (D->cs) cudaStreamSynchronize(D->cs);
+    for (auto& e : D->ev_ready) if (e) cudaEventDestroy(e);
+    for (auto& e : D->ev_free) if (e) cudaEventDestroy(e);
+    for (auto& e : D->ev_b) if (e) cudaEventDestroy(e);
+    if (D->bounce) cudaFreeHost(D->bounce);
+    if (D->cs) cudaStreamDestroy(D->cs);
+    delete D;
+    dt_ = nullptr;
+}
+
 void Glm5Model::prefill_destroy() {
     PrefillState* S = pf_;
+    dt_destroy();
     if (S == nullptr) return;
     cudaSetDevice(dev_);
     if (fast_ && fast_->cs) cudaStreamSynchronize(fast_->cs);
@@ -3804,6 +4404,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         progress_at("the prompt: layer", ia);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
         if (kv_cut >= 0 && il > kv_cut) break;
+        // (the dense tier: this layer's rows back in a layer buffer, the next one's on their way - DenseTier)
+        if (S->dt_on && !dt_layer(il, il + 1 < n_app && !(kv_cut >= 0 && il + 1 > kv_cut) ? il + 1 : -1, err))
+            return false;
         const auto& Ly = F->L[(size_t) il];
         const bool skip_output = (tail_skip && il == g.n_layers - 1) || il == kv_cut;
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
@@ -6236,16 +6839,81 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + Tmax - 1) / Tmax;
+    const int64_t nn = (int64_t) tokens.size();
+    // the dense tier (STRATA_GLM_PREFILL_DENSE_TIER, DenseTier): =1 a prompt longer than the chunk runs in the longer
+    // chunks it lays out; =2 (a test) every batched prompt takes it at the plain chunk (the same arithmetic: its
+    // tokens must match =0's bit for bit)
+    bool dt = false;
+    if (const int dtm = dt_mode(); dtm > 0 && split_next_ == nullptr && !dt_failed_) {
+        if (dt_ == nullptr) {
+            std::string why;
+            if (!dt_prepare(why)) {
+                dt_failed_ = true;
+                std::fprintf(stderr, "glm prefill: CUDA%d dense tier off: %s\n", dev_, why.c_str());
+            }
+        }
+        if (dt_ != nullptr) {
+            if (dtm == 2) {
+                dt = true;
+            } else if (nn > Tmax) {
+                const int Td = dt_chunk();
+                if (Td > Tmax) {
+                    Tmax = Td;
+                    dt = true;
+                }
+            }
+        }
+    }
+    const int64_t nchunks = (nn + Tmax - 1) / Tmax;
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                            : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
+                                      : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    if (dt) {
+        PrefillState* S = pf_;
+        int place = 0;
+        // (the embedding rows' pinned staging for the longer chunk; it stays that size for the next ones)
+        if (Trun > S->emb_T) {
+            float* nb = nullptr;
+            if (cudaHostAlloc((void**) &nb, (size_t) Trun * g_.n_embd * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
+                cudaFreeHost(S->emb_h);
+                S->emb_h = nb;
+                S->emb_T = Trun;
+            } else {
+                cudaGetLastError();
+                dt = false;
+            }
+        }
+        if (dt && !dt_fits(Trun, place)) dt = false;
+        if (!dt) {
+            Trun = (int) std::min<int64_t>(pf_->T, (nn + 63) / 64 * 64);
+        } else {
+            S->dt_on = true;
+            S->dt_place = place;
+            dt_->dirty = true;
+            for (int b = 0; b < 2; ++b) {
+                cudaEventRecord(dt_->ev_free[b], fast_->cs);
+                cudaEventRecord(dt_->ev_ready[b], fast_->cs);
+            }
+        }
+    }
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
-        m->prefill_carve(Trun);
+        if (dt && dt_mode() == 2) {
+            // (the test: the tail lends what the plain layout does - the same experts stay resident, staged the same
+            // way, so only the dense tier's own work differs from =0)
+            PrefillState* S = m->pf_;
+            S->dt_on = false;
+            m->prefill_carve(Trun);
+            const size_t need0 = S->need;
+            S->dt_on = true;
+            m->prefill_carve(Trun);
+            S->need = S->carved = std::max(S->need, need0);
+        } else {
+            m->prefill_carve(Trun);
+        }
         if (!m->prefill_lend(err)) { ok = false; break; }
     }
     // STRATA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
@@ -6258,6 +6926,13 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         std::this_thread::sleep_for(std::chrono::seconds(stall_test));
     }
     if (ok) ok = prefill_run(tokens, err);
+    if (pf_->dt_on) {   // (the dense rows back before anything else reads the arena)
+        std::string dt_err;
+        if (!dt_restore(dt_err)) {
+            if (ok) err = dt_err;
+            ok = false;
+        }
+    }
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         std::string return_err;

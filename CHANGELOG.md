@@ -9,6 +9,17 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- `STRATA_GLM_PREFILL_DENSE_TIER=1` (opt-in, off by default; DeepSeek V4 / V4.1, GLM-5.3 and the qwen35moe models on one GPU; issue #53): a prompt longer
+  than the prompt chunk also borrows the layers' dense weights in VRAM for the prompt path's buffers. Each layer's
+  weights are copied back from the model file's mapping (a few converted rows from a host copy) through a small pinned
+  ring just before the layer runs, the next layer's while this one computes, and every borrowed byte is written back
+  after the prompt, so the decode reads the arena as before. Measured on V4.1 UD-IQ2_XXS with the RTX 5090 capped at 16 GB (44 GB RAM tier): 32K prompts ~440 -> ~670 tok/s, 128K 413 -> 1,374, 250K 445 -> 1,662 (262,144-token context, chunks 6,400 -> 32,768), the needles all found, decode the same; a 32 GB card is unchanged (660.9 vs 660.4 tok/s at 32K). `=2` is a test mode (every batched prompt takes
+  the tier at the old chunk; its tokens match `=0`'s bit for bit on V4, V4.1, GLM-5.3 and Ornith 35B / 122B). The idea is the issue reporter's prototype; the
+  code is Abyss's own (`src/core/glm_prefill.cu`, `DenseTier`). With the setting unset nothing changes (the same bits
+  as v1.3.189).
+
 ## v1.3.189 - 2026-11-22
 
 Windows AMD builds of v1.3.186-v1.3.188 stopped in `glm_prefill.cu` ("expected unqualified-id", #49): a HIP-only

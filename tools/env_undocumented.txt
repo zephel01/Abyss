@@ -117,6 +117,8 @@ STRATA_GLM_PREFILL_ATTN  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_ATTN_CHECK  # src/kernels/cuda/glm_batch.cu
 STRATA_GLM_PREFILL_CHUNK  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_CPU_ROW_MS  # src/core/glm_prefill.cu
+STRATA_GLM_PREFILL_DENSE_TIER_CHECK  # src/core/glm_prefill.cu
+STRATA_GLM_PREFILL_DENSE_TIER_SYNC  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_EMB_PAR  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_IQ512  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_LAND  # src/core/glm_prefill.cu

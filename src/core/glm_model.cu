@@ -3858,9 +3858,17 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     uint64_t at = 0;
     std::vector<float> host;
     std::vector<uint8_t> raw;
+    // (the dense tier's record: each row's place in the arena and its bytes in the mapping, glm_model.hpp's DtRow)
+    dt_rows_.clear();
+    dt_exl3_ = false;
+    const auto dt_note = [&](const std::string& name, uint64_t nbytes, int si, uint64_t src) {
+        const int il = name.rfind("blk.", 0) == 0 ? std::atoi(name.c_str() + 4) : -1;
+        dt_rows_.push_back(DtRow{il, at, nbytes, si, src});
+    };
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
         if (r.kind == "x") {
+            dt_exl3_ = true;
             // the trellis, suh and svh straight from the safetensors mapping, each 256-aligned in the arena
             const Exl3Table::Mat& m = xt.mats.at(r.name);
             const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
@@ -3959,6 +3967,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const size_t nbytes = (size_t) ti->elements() / 32 * 34;
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            dt_note(r.name, nbytes, si, gfs[(size_t) si]->data_start() + ti->offset);
             w8_[r.name] = (const void*) ((uint8_t*) w_arena_ + at);
             at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
@@ -3976,6 +3985,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 return false;
             }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            dt_note(r.name, r.bytes, -1, 0);
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
             // deepseek4: a projection the GEMVs serve (the compressors', the indexer's q_b) that the GGUF stored as F16
             // comes as a BF16 row (iq_pack.py --compat-bf16) and runs on the BF16 GEMV
@@ -3996,6 +4006,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const size_t nbytes = (size_t) ti->elements() * 4;
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            dt_note(r.name, nbytes, si, gfs[(size_t) si]->data_start() + ti->offset);
             wi32_[r.name] = (const int*) ((uint8_t*) w_arena_ + at);
             at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
@@ -4011,6 +4022,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0], native_rows(ti));
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            dt_note(r.name, nbytes, si, gfs[(size_t) si]->data_start() + ti->offset);
             ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
                                     (int64_t) ti->shape[0], (int64_t) native_rows(ti)};
             if (r.name == "token_embd.weight") {
@@ -4079,6 +4091,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
         { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_f32 * 4,
                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+        dt_note(r.name, n_f32 * 4, -1, 0);
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
         ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;

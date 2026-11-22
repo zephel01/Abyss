@@ -1102,6 +1102,30 @@ public:
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
+    // ---- the dense tier (issue #53, STRATA_GLM_PREFILL_DENSE_TIER; glm_prefill.cu): while a prompt longer than the
+    // chunk runs, the layers' dense rows in w_arena_ hold the prompt path's buffers too (a longer chunk: fewer passes
+    // over the experts), each layer's rows carried back into one of two layer buffers just before it runs, and every
+    // row put back once the prompt ends (the decode reads the arena as it was).  load_pack notes each row's place in
+    // the arena and, for a row uploaded as the GGUF stores it, its bytes in the shard mapping (shard -1: none - the
+    // tier keeps a host copy of that row)
+    struct DtRow {
+        int layer = -1;                  // blk.<layer>, -1: not a layer's row
+        uint64_t off = 0, bytes = 0;     // in w_arena_
+        int shard = -1;                  // pack_shards_[shard].base + src: the bytes (-1: no mapping)
+        uint64_t src = 0;
+    };
+    std::vector<DtRow> dt_rows_;
+    bool dt_exl3_ = false;               // an EXL3 matrix in the arena (its WSlot is a host table): no tier
+    struct DenseTier;
+    DenseTier* dt_ = nullptr;
+    bool dt_failed_ = false;             // dt_prepare refused (said why once): no tier for the session
+    int dt_mode() const;                 // STRATA_GLM_PREFILL_DENSE_TIER: 0 off, 1 long prompts, 2 every prompt (test)
+    bool dt_prepare(std::string& err);   // the first prompt that may take it: spans, sources, buffers, the worker
+    int dt_chunk();                      // the longest chunk the tier lays out (0: none longer than the plain one)
+    bool dt_fits(int T, int& place) const;   // ... for T: which buffers go to the dense rows (dt_chunk, prefill_carve)
+    bool dt_layer(int il, int il_next, std::string& err);   // prefill_half: layer il's rows in place, il_next's coming
+    bool dt_restore(std::string& err);   // after the prompt: every borrowed byte and pointer back
+    void dt_destroy();
     // a long deepseek41 prompt's skip (prefill_run): the chunks before the cut stop at this layer - its attention (its
     // compressed KV and index keys, which the layers after it read) and no FFN, no layer after it (-1: every layer)
     int pf_kv_cut_ = -1;
