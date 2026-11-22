@@ -193,6 +193,24 @@ Windows での違い:
 - **Intel のハイブリッド CPU:** `STRATA_GLM_CPU_PIN=0-15` で、CPU レーンを P コアのスレッドに載せられます。
   プロセス全体を P コアに絞ると、HIP ランタイムのスレッドが足りなくなって遅くなります。
 
+- **ビルドの最適化レベル:** Windows のツールチェーンによっては（TheRock ROCm 7.14.1 + CMake + Ninja、issue
+  [#3](https://github.com/zephel01/Abyss/issues/3) と [#49](https://github.com/zephel01/Abyss/issues/49)）、
+  `CMAKE_HIP_FLAGS_RELEASE` が空になります。v1.3.188 より前は、そのとき prompt の MMQ カーネルが -O0 でコンパイルされ、
+  生成は普通なのに prompt が 100 倍以上遅くなっていました。v1.3.188 からは、HIP のカーネル全部に `-O3 -DNDEBUG` が付きます。
+  エンジンのログと `--bench` には `MMQ kernels built optimized`（または `built WITHOUT optimization`）と出ます。
+  ビルドのフォルダを手で確かめるには（PowerShell、Abyss のフォルダで）:
+  ```
+  Select-String -Path build-hip\CMakeCache.txt -Pattern "^CMAKE_HIP_FLAGS"
+  Select-String -Path build-hip\build.ninja -Pattern "mmq-instance-q4_k" -Context 0,8 | Select-Object -First 1
+  ```
+  2 つ目の `FLAGS =` の行に `-O3` があれば大丈夫です。HIP のビルドを自分で configure するときは、
+  `-DCMAKE_HIP_FLAGS_RELEASE="-O3 -DNDEBUG"` を渡してください。
+- **hipBLASLt は使いません:** ROCm SDK 7.14.1 では、FP16 の `hipblasGemmEx` が rocBLAS から hipBLASLt に渡ったところで、
+  `amdhip64_7.dll` の中で落ちました（[#49](https://github.com/zephel01/Abyss/issues/49)。同じスタックが
+  [ROCm/rocm-libraries#8242](https://github.com/ROCm/rocm-libraries/issues/8242) にあります）。エンジンの prompt の行列積は
+  v1.3.182 から自前の GEMM で動きます。v1.3.188 からは、まだ hipBLAS に回る分のために、サーバーと `--bench` が Windows の
+  HIP エンジンを `ROCBLAS_USE_HIPBLASLT=0` で起動します。シェルか config の `"env"` で値を決めていれば、そちらが優先です。
+
 ビルドで起きた問題（MSVC 14.51 と TheRock 7.14.1 の `isgreater` の衝突など）は
 [AMD HIP（Maya）](../maya/AMD_HIP.md) の「Windows 11」にあります。
 
@@ -367,7 +385,7 @@ iGPU のない PC でも、R9700 と十分な RAM があれば、この 6 問を
 | （Windows）`ROCm's hipInfo sees no AMD GPU` と出る | ドライバが古い、または入っていない | Adrenalin を更新して再起動し、警告に出る hipInfo で確かめる |
 | （Windows）ビルドが `__device__ function 'isgreater' cannot overload ...` で止まる | MSVC 14.51 と TheRock 7.14.1 の衝突 | [AMD HIP（Maya）](../maya/AMD_HIP.md) の「Windows 11」の手順でヘッダを直す（[issue #2](https://github.com/zephel01/Abyss/issues/2) にスクリプトがある） |
 | （Windows）RAM が空いているのに、エキスパートが SSD から読まれる | ページファイルが小さく、コミット上限に当たっている | 「Windows」の「RAM の扱い」の設定 |
-| （Windows）生成は普通なのに、prompt が数 tok/s しか出ない（#49: RX 9060 XT、TheRock ROCm 7.14.1 で Qwen3.8-Flash-Next 16G64G が 9 tok/s、SenseNova-Loop-9B が 3 tok/s） | その環境では int8 の MMQ カーネルが 100〜400 倍ほど遅い。エンジンはまとめて読む最初の prompt（32 トークン以上）でほかのカーネルと測り比べ、自分で切り替える（ログに `the dense FFN's MMQ is slow` / `expert kernels (...) -> the FP16 path` か `-> the own int8 GEMM` が出る。RDNA4 は FP16 経路になる） | 更新する。ログが `MMQ kept` のままで prompt が遅いときは、`STRATA_GLM_TIMING=1 STRATA_GLM_PREFILL_PROF=1` を付けて `STRATA_HIP_EXPERTS=fp16` と `=own` を試し、`GPU stages` の行を知らせてほしい（[マニュアル](../MANUAL.ja.md)） |
+| （Windows）生成は普通なのに、prompt が数 tok/s しか出ない（#49: RX 9060 XT、TheRock ROCm 7.14.1 で Qwen3.8-Flash-Next 16G64G が 9 tok/s、SenseNova-Loop-9B が 3 tok/s） | v1.3.188 より前に、`CMAKE_HIP_FLAGS_RELEASE` が空のままビルドしたエンジン。MMQ カーネルが -O0 でコンパイルされている（100 倍以上遅い。ログか `--bench` に `MMQ kernels built WITHOUT optimization` と出る）。エンジンは、まとめて読む最初の prompt（32 トークン以上）で MMQ をほかのカーネルと測り比べ、自分で切り替えもする（ログに `the dense FFN's MMQ is slow` / `expert kernels (...) -> the FP16 path` が出る） | v1.3.188 以降に更新し、セットアップをもう一度実行する（エンジンを作り直す）。上の「Windows」のとおりビルドを確かめる。`MMQ kernels built optimized` なのに prompt が遅いときは、`STRATA_GLM_TIMING=1 STRATA_GLM_PREFILL_PROF=1` を付けて実行し、`GPU stages` の行を知らせてほしい（[マニュアル](../MANUAL.ja.md)） |
 | ビルドが `ROCm's HIP compiler ... and hipBLAS are required` で止まる | 開発用パッケージがない、または `/opt/rocm` が別の版を指している | `amdrocm-core-dev10.0-<arch>` を入れる。または `ROCM_PATH=/opt/rocm/core-10.0` を設定する |
 | prompt が「7. 速度の目安」よりかなり遅い（R9700 で DeepSeek V4 の 16K の prompt が約 1,000 ではなく約 680 tok/s） | シェルの `GPU_MAX_HW_QUEUES=1`（R9700 向けの手順の設定）がエンジンに渡っていて、設定ファイルで上書きしていない | 設定ファイルの `env` に `"GPU_MAX_HW_QUEUES": "2"`（セットアップは書く）。「3. 環境変数」を参照 |
 | DeepSeek V4.1 で、エンジンのログに `iGPU lane: the late call ran 21-27 ms` が多い | エンジンが SSD を待っている間に iGPU が寝ていた（v1.3.40 より前は、ルーティングから 20 ms で keep-alive が止まっていた） | 更新する。または `STRATA_GLM_IGPU_POKE_MS=500` |

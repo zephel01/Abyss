@@ -188,6 +188,24 @@ What is different on Windows:
 - **Hybrid Intel CPUs:** `STRATA_GLM_CPU_PIN=0-15` puts the CPU lane's workers on the P-core threads. Do not limit
   the whole process to the P-cores, because that starves the HIP runtime's threads.
 
+- **The optimization level of the build.** Some Windows toolchains (TheRock ROCm 7.14.1 with CMake + Ninja, issues
+  [#3](https://github.com/zephel01/Abyss/issues/3) and [#49](https://github.com/zephel01/Abyss/issues/49)) leave
+  `CMAKE_HIP_FLAGS_RELEASE` empty. Before v1.3.188 the MMQ prompt kernels were then compiled at -O0 and read prompts
+  ~100x+ slower, while decode was normal. Since v1.3.188 every HIP kernel gets `-O3 -DNDEBUG`, and the engine's log
+  and `--bench` say `MMQ kernels built optimized` (or `built WITHOUT optimization`). To check a build folder by hand
+  (PowerShell, in the Abyss folder):
+  ```
+  Select-String -Path build-hip\CMakeCache.txt -Pattern "^CMAKE_HIP_FLAGS"
+  Select-String -Path build-hip\build.ninja -Pattern "mmq-instance-q4_k" -Context 0,8 | Select-Object -First 1
+  ```
+  The `FLAGS =` line of the second must contain `-O3`. A HIP build configured by hand can pass
+  `-DCMAKE_HIP_FLAGS_RELEASE="-O3 -DNDEBUG"`.
+- **hipBLASLt is off.** With ROCm SDK 7.14.1, an FP16 `hipblasGemmEx` crashed inside `amdhip64_7.dll` once rocBLAS
+  handed it to hipBLASLt ([#49](https://github.com/zephel01/Abyss/issues/49); the same stack in
+  [ROCm/rocm-libraries#8242](https://github.com/ROCm/rocm-libraries/issues/8242)). The engine's prompt products run
+  on its own GEMM since v1.3.182, and since v1.3.188 the server and `--bench` start HIP engines on Windows with
+  `ROCBLAS_USE_HIPBLASLT=0` for what still goes to hipBLAS. A value set in the shell or the config's `"env"` wins.
+
 Build problems seen so far, such as MSVC 14.51 colliding with TheRock 7.14.1 over `isgreater`, are in
 [AMD HIP (Maya)](../maya/AMD_HIP.md), section "Windows 11".
 
@@ -358,7 +376,7 @@ windows are pipelined in two groups on the two hardware queues - another reason 
 | (Windows) setup says `ROCm's hipInfo sees no AMD GPU` | the driver is old or missing | update Adrenalin, restart, and check with the hipInfo the warning names |
 | (Windows) the build stops at `__device__ function 'isgreater' cannot overload ...` | MSVC 14.51 against TheRock 7.14.1 | patch the headers as [AMD HIP (Maya)](../maya/AMD_HIP.md) "Windows 11" says ([issue #2](https://github.com/zephel01/Abyss/issues/2) has a script) |
 | (Windows) experts are read from the SSD while RAM is free | the pagefile is small and the commit limit is hit | the settings under "RAM" in "Windows" |
-| (Windows) Decode is fine, but prompts read at a few tokens/s (#49: Qwen3.8-Flash-Next 16G64G 9 tok/s, SenseNova-Loop-9B 3 tok/s on an RX 9060 XT, TheRock ROCm 7.14.1) | the int8 MMQ kernels run ~100-400x slower with that toolchain. The engine times them against its other kernels at the first batched prompt (32+ tokens) and switches by itself (log lines `the dense FFN's MMQ is slow` / `expert kernels (...) -> the FP16 path` or `-> the own int8 GEMM`; RDNA4 cards take the FP16 path) | update; if the log still shows `MMQ kept` with slow prompts, try `STRATA_HIP_EXPERTS=fp16` and `=own` with `STRATA_GLM_TIMING=1 STRATA_GLM_PREFILL_PROF=1` and report the `GPU stages` line ([manual](../MANUAL.md)) |
+| (Windows) Decode is fine, but prompts read at a few tokens/s (#49: Qwen3.8-Flash-Next 16G64G 9 tok/s, SenseNova-Loop-9B 3 tok/s on an RX 9060 XT, TheRock ROCm 7.14.1) | an engine built before v1.3.188 with an empty `CMAKE_HIP_FLAGS_RELEASE`: its MMQ kernels were compiled at -O0 (~100x+ slower; the log or `--bench` says `MMQ kernels built WITHOUT optimization`). The engine also times MMQ against its other kernels at the first batched prompt (32+ tokens) and switches by itself (log lines `the dense FFN's MMQ is slow` / `expert kernels (...) -> the FP16 path`) | update to v1.3.188 or newer and run setup again (it rebuilds the engine); check the build as "Windows" above says. If prompts stay slow with `MMQ kernels built optimized`, run with `STRATA_GLM_TIMING=1 STRATA_GLM_PREFILL_PROF=1` and report the `GPU stages` line ([manual](../MANUAL.md)) |
 | The build stops at `ROCm's HIP compiler ... and hipBLAS are required` | no development package, or `/opt/rocm` points at another version | install `amdrocm-core-dev10.0-<arch>`, or set `ROCM_PATH=/opt/rocm/core-10.0` |
 | Prompts far below "What to expect" (an R9700's 16K DeepSeek V4 prompt ~680 tok/s instead of ~1,000) | `GPU_MAX_HW_QUEUES=1` from the shell reaches the engine (an R9700 guide's setting) and the config does not set it | `"GPU_MAX_HW_QUEUES": "2"` in the config's `env` (setup writes it); see "3. Environment variables" |
 | DeepSeek V4.1: the engine log shows many `iGPU lane: the late call ran 21-27 ms` | the iGPU slept while the engine waited on the SSD (before v1.3.40 the keep-alive stopped 20 ms after a route) | update, or set `STRATA_GLM_IGPU_POKE_MS=500` |
