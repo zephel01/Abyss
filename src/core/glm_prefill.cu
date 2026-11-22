@@ -2055,6 +2055,10 @@ bool Glm5Model::prefill_lend(std::string& err) {
                      (unsigned long long) (S->dropped - dropped0), (unsigned long long) (S->moved - moved0));
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
     nv_zero_staging(S, F->nv_guard, F->cs);
+    // STRATA_GLM_PREFILL_POISON=1 (debug, issue #54): the carved region filled with 0xFF bytes (NaN floats, int -1)
+    // once lent, so a buffer the prompt reads before writing shows as a non-finite route or output, not a small shift
+    static const bool poison = [] { const char* v = getenv("STRATA_GLM_PREFILL_POISON"); return v != nullptr && std::atoi(v) != 0; }();
+    if (poison && S->region != nullptr && F->nv_guard == 0) cudaMemsetAsync(S->region, 0xFF, S->carved, F->cs);
     mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used + mmq::ids_pad(S->T_bound), F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
     if (S->ev_pfree) cudaEventRecord(S->ev_pfree, F->cs);
@@ -4167,11 +4171,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // STRATA_HIP_EXPERTS=auto (hip_experts): the first MoE layer of the first batched prompt whose experts MMQ reads,
     // before its route, times its routed experts on MMQ, on the own int8 GEMM (not on RDNA4: hip_gfx12) and on the FP16
     // path (run_blas_dq's steps) - resident experts of the pool, the chunk's mean rows an expert (32-128), rows of this
-    // layer's x - each warmed once, then timed once.  Another path is taken when MMQ takes more than 1.5x its time and
-    // its output agrees with MMQ's (relative L2 under 0.02 for the own GEMM: the same integers in another order; under
-    // 0.1 for the FP16 path: it does not round the activations to 8 bits - a kernel that computes something else on
-    // this GPU is never taken).  The cost is bounded where MMQ is the slow one (~390x in #49: 1.4 s for one dense
-    // layer): 4 experts first, and the full 32 only when MMQ took under 5 ms for those.  It writes only the MoE
+    // layer's x - each warmed once, then timed (the fastest of three).  Every path's output is measured against the
+    // host's own product of four of those rows (not against MMQ's: #54), every 8-bit path's row also against a sound
+    // FP16 path's, and only a sound path - finite, within 0.1 of the reference, no row off - is taken: another path
+    // when MMQ takes more than 1.5x its time, the FP16 path also when it is no slower and closer to the reference,
+    // and any sound one when MMQ is not.  The cost is bounded where MMQ is the slow one (~390x in #49: 1.4 s for one
+    // dense layer): 4 experts first, and the full 32 only when MMQ took under 5 ms for those.  It writes only the MoE
     // buffers the layer's route and products write again (OUTP, OUTPc / GUX, Xq, Hq, row_tok, bounds) and w16.
     // false: this layer cannot be timed (EXL3, two gate/up types, NVFP4's scales, no MMQ for its types, no resident
     // expert) - the next MoE layer is.
@@ -4324,17 +4329,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         };
-        // each path: warmed once, timed once, its output kept for the comparison with MMQ's
-        std::vector<float> ref, out;
+        // each path: warmed once, then timed up to three times (the fastest kept: one timing of a ~0.5 ms product moved
+        // the pick across the margin from run to run, #54), its output kept for the comparison with the reference
+        std::vector<float> o_mmq, o_own, o_f16;
         const auto timed = [&](const std::function<void()>& fn, std::vector<float>& keep, float& ms) {
             cudaEvent_t e0 = nullptr, e1 = nullptr;
             bool ok = cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
             if (ok) {
                 fn();
-                cudaEventRecord(e0, s);
-                fn();
-                cudaEventRecord(e1, s);
-                ok = cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+                ms = 0;
+                for (int rep = 0; ok && rep < 3; ++rep) {
+                    float t = 0;
+                    cudaEventRecord(e0, s);
+                    fn();
+                    cudaEventRecord(e1, s);
+                    ok = cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&t, e0, e1) == cudaSuccess;
+                    if (ok) ms = rep == 0 ? t : std::min(ms, t);
+                    if (ok && t >= 5.0f) break;   // (a slow path is not run again)
+                }
             }
             if (e0) cudaEventDestroy(e0);
             if (e1) cudaEventDestroy(e1);
@@ -4345,49 +4357,164 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (!ok) cudaGetLastError();
             return ok;
         };
-        const auto rel = [&](const std::vector<float>& a, const std::vector<float>& b) {
-            double num = 0, den = 0;
-            for (size_t i = 0; i < a.size(); ++i) {
-                const double d = (double) a[i] - b[i];
-                num += d * d;
-                den += (double) b[i] * b[i];
-            }
-            return std::isfinite(num) && std::isfinite(den) && den > 0 ? std::sqrt(num / den) : 1e30;
-        };
         static const double scale = [] {   // (a test hook: MMQ's time multiplied)
             const char* v = getenv("STRATA_HIP_EXPERTS_CHECK_SCALE");
             return v != nullptr ? std::max(0.0, std::atof(v)) : 1.0;
         }();
         float t_mmq = 0, t_own = 0, t_f16 = 0;
-        double tm = 0, r_own = -1, r_f16 = -1;
+        double tm = 0;
+        bool ran_mmq = false, ran_own = false, ran_f16 = false;
         for (;;) {
             t_mmq = t_own = t_f16 = 0;
-            r_own = r_f16 = -1;
-            if (!timed(run_mmq, ref, t_mmq)) return keep_mmq("MMQ did not run");
+            ran_mmq = timed(run_mmq, o_mmq, t_mmq);
             tm = (double) t_mmq * scale;
-            if (own_ok && timed(run_own, out, t_own)) r_own = rel(out, ref);
-            if (f16_ok && timed(run_f16, out, t_f16)) r_f16 = rel(out, ref);
-            if (n == n_full || tm >= 5.0) break;   // (a slow MMQ is not run again on 8x the experts)
+            ran_own = own_ok && timed(run_own, o_own, t_own);
+            ran_f16 = f16_ok && timed(run_f16, o_f16, t_f16);
+            if (n == n_full || !ran_mmq || tm >= 5.0) break;   // (a slow MMQ is not run again on 8x the experts)
             n = n_full;
             nrows = n * R;
         }
-        const bool own_good = r_own >= 0 && r_own < 0.02, f16_good = r_f16 >= 0 && r_f16 < 0.1;
+        if (!ran_mmq && !ran_f16 && !ran_own) return keep_mmq("no kernel ran");
+        // THE REFERENCE (#54): each path is measured against the host's own product of a few of those rows - the
+        // blocks decoded to floats (qt::to_float), gate/up, the SwiGLU and the down summed in double - never against
+        // another candidate: a broken MMQ made the FP16 path look wrong (rel 1.0) and was kept.  The rows: the last
+        // two of the first expert and the first two of the second (where one expert's tiles meet the next's), or the
+        // first four of a single expert.  A path is sound when every output it wrote is finite and those rows are
+        // within 0.1 (relative L2; the 8-bit paths sit at ~1e-2, FP16 at ~1e-3)
+        std::vector<int> ref_rows;
+        if (n >= 2 && R >= 2) ref_rows = {R - 2, R - 1, R, R + 1};
+        else
+            for (int r = 0; r < std::min(R, 4); ++r) ref_rows.push_back(r);
+        std::vector<double> ref((size_t) ref_rows.size() * E, 0.0);
+        bool ref_ok = true;
+        {
+            const auto* tgu = strata::qt::traits(Ly.gu_type);
+            const auto* tup = strata::qt::traits(Ly.up_type);
+            const auto* tdn = strata::qt::traits(Ly.d_type);
+            ref_ok = tgu != nullptr && tup != nullptr && tdn != nullptr && tgu->to_float != nullptr &&
+                     tup->to_float != nullptr && tdn->to_float != nullptr;
+            const size_t rs_gu = strata::qt::row_size(Ly.gu_type, E), rs_up = strata::qt::row_size(Ly.up_type, E),
+                         rs_dn = strata::qt::row_size(Ly.d_type, nff);
+            std::vector<uint8_t> blob(stride);
+            std::vector<float> wrow((size_t) std::max<int64_t>(E, nff)), hcol;
+            for (int e = 0; ref_ok && e <= ref_rows.back() / R; ++e) {
+                std::vector<size_t> mine;   // (indices into ref_rows of this expert's rows)
+                for (size_t k = 0; k < ref_rows.size(); ++k)
+                    if (ref_rows[k] / R == e) mine.push_back(k);
+                if (mine.empty()) continue;
+                ref_ok = cudaMemcpy(blob.data(), wb + (size_t) e * stride, stride, cudaMemcpyDeviceToHost) == cudaSuccess;
+                std::vector<float> xs(mine.size() * (size_t) E);
+                for (size_t q = 0; ref_ok && q < mine.size(); ++q)
+                    ref_ok = cudaMemcpy(xs.data() + q * E, S->x + (size_t) rt[(size_t) ref_rows[mine[q]]] * E,
+                                        (size_t) E * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (!ref_ok) break;
+                // h[q][c] = swiglu(gate_c . x_q, up_c . x_q) as gb::swiglu_rows (float, the clamp)
+                hcol.assign(mine.size() * (size_t) nff, 0.0f);
+                std::vector<double> gsum(mine.size());
+                for (int c = 0; c < nff; ++c) {
+                    tgu->to_float(blob.data() + (size_t) c * rs_gu, wrow.data(), E);
+                    for (size_t q = 0; q < mine.size(); ++q) {
+                        double a = 0;
+                        for (int k = 0; k < E; ++k) a += (double) wrow[(size_t) k] * xs[q * E + k];
+                        gsum[q] = a;
+                    }
+                    tup->to_float(blob.data() + up_off + (size_t) c * rs_up, wrow.data(), E);
+                    for (size_t q = 0; q < mine.size(); ++q) {
+                        double a = 0;
+                        for (int k = 0; k < E; ++k) a += (double) wrow[(size_t) k] * xs[q * E + k];
+                        const float lim = g.swiglu_exp;
+                        const float gv = std::fmin((float) gsum[q], lim), uv = std::fmin(std::fmax((float) a, -lim), lim);
+                        hcol[q * nff + c] = gv / (1.0f + std::exp(-gv)) * uv;
+                    }
+                }
+                for (int r = 0; r < E; ++r) {
+                    tdn->to_float(blob.data() + Ly.down_off + (size_t) r * rs_dn, wrow.data(), nff);
+                    for (size_t q = 0; q < mine.size(); ++q) {
+                        double a = 0;
+                        for (int k = 0; k < nff; ++k) a += (double) wrow[(size_t) k] * hcol[q * nff + k];
+                        ref[mine[q] * E + r] = a;
+                    }
+                }
+            }
+            for (double v : ref) ref_ok = ref_ok && std::isfinite(v);
+        }
+        // a path's error on the reference rows (-1: it did not run; 1e30: a non-finite output anywhere)
+        const auto ref_err = [&](bool ran, const std::vector<float>& o) -> double {
+            if (!ran) return -1;
+            for (float v : o)
+                if (!std::isfinite(v)) return 1e30;
+            if (!ref_ok) return 0;   // (no reference: finite is all that is known)
+            double num = 0, den = 0;
+            for (size_t k = 0; k < ref_rows.size(); ++k)
+                for (int j = 0; j < E; ++j) {
+                    const double d = (double) o[(size_t) ref_rows[k] * E + j] - ref[k * E + j];
+                    num += d * d;
+                    den += ref[k * E + j] * ref[k * E + j];
+                }
+            return den > 0 && std::isfinite(num) ? std::sqrt(num / den) : 1e30;
+        };
+        double r_mmq = ref_err(ran_mmq, o_mmq), r_own = ref_err(ran_own, o_own);
+        const double r_f16 = ref_err(ran_f16, o_f16);
+        const auto sound = [](double r) { return r >= 0 && r < 0.1; };
+        const bool f16_good = sound(r_f16);
+        // the other rows: with the FP16 path sound (its own products, not the 8-bit kernels'), every row an 8-bit path
+        // wrote is held to it, so a tile the reference rows miss (the issue's few tokens of a chunk) is seen too.  The
+        // worst row counts: within 0.25 (the 8-bit paths' worst rows sat at ~3e-2 on V4.1's IQ1_S experts)
+        int bad_mmq = 0, bad_own = 0;
+        const auto row_check = [&](bool ran, const std::vector<float>& o, double& r, int& bad) {
+            if (!ran || !f16_good || r < 0 || r >= 1e29) return;
+            for (int q = 0; q < nrows; ++q) {
+                double num = 0, den = 0;
+                for (int j = 0; j < E; ++j) {
+                    const double a = o[(size_t) q * E + j], b = o_f16[(size_t) q * E + j];
+                    num += (a - b) * (a - b);
+                    den += b * b;
+                }
+                const double rr = den > 0 ? std::sqrt(num / den) : (num > 0 ? 1.0 : 0.0);
+                if (!(rr < 0.25)) ++bad;
+            }
+            if (bad > 0) r = std::max(r, 0.1);
+        };
+        row_check(ran_mmq, o_mmq, r_mmq, bad_mmq);
+        row_check(ran_own, o_own, r_own, bad_own);
+        const bool mmq_good = sound(r_mmq), own_good = sound(r_own);
+        // the pick: a sound MMQ stays unless another sound path takes under 2/3 of its time; the FP16 path also when it
+        // is no slower and closer to the reference (it does not round the activations to 8 bits: on V4.1's short
+        // prompts it ran 0.34 against MMQ's 0.45 ms, a ratio that sat at the old 1.5x mark and flipped run to run).
+        // MMQ unsound: the fastest sound other path, else MMQ (nothing better is known; the log says so)
         int pick = kXpMmq;
-        if (own_good && (double) t_own * 1.5 < tm) pick = kXpOwn;
-        if (f16_good && (double) t_f16 * 1.5 < tm && (pick != kXpOwn || t_f16 < t_own)) pick = kXpFp16;
+        if (mmq_good) {
+            if (own_good && (double) t_own * 1.5 < tm) pick = kXpOwn;
+            const bool f16_wins = (double) t_f16 * 1.5 < tm || ((double) t_f16 <= tm && r_f16 < r_mmq);
+            if (f16_good && f16_wins && (pick != kXpOwn || t_f16 < t_own)) pick = kXpFp16;
+        } else if (own_good || f16_good) {
+            pick = own_good && (!f16_good || t_own < t_f16) ? kXpOwn : kXpFp16;
+        }
         hip_xp_alt_f16() = f16_good;
         hip_xp_alt_own() = own_good;
         hip_experts() = pick;
         S->xp_checked = true;
-        char so[80], sf[64];
-        if (r_own >= 0) std::snprintf(so, sizeof so, "own GEMM %.2f ms (rel %.1e)", t_own, r_own);
+        const auto fmt_err = [&](double r, int bad, char* b, size_t nb) {
+            if (r >= 1e29) std::snprintf(b, nb, "non-finite");
+            else if (bad > 0) std::snprintf(b, nb, "%d of %d rows off the FP16 path's", bad, nrows);
+            else std::snprintf(b, nb, "err %.1e", r);
+        };
+        char sm[96], so[128], sf[64], em[48], eo[48], ef[48];
+        fmt_err(r_mmq, bad_mmq, em, sizeof em);
+        fmt_err(r_own, bad_own, eo, sizeof eo);
+        fmt_err(r_f16, 0, ef, sizeof ef);
+        if (ran_mmq) std::snprintf(sm, sizeof sm, "MMQ %.2f ms (%s)", tm, em);
+        else std::snprintf(sm, sizeof sm, "MMQ -");
+        if (ran_own) std::snprintf(so, sizeof so, "own GEMM %.2f ms (%s)", t_own, eo);
         else std::snprintf(so, sizeof so, "%s", hip_gfx12() ? "own GEMM - (RDNA4: untested, not timed)" : "own GEMM -");
-        if (r_f16 >= 0) std::snprintf(sf, sizeof sf, "FP16 %.2f ms (rel %.1e)", t_f16, r_f16);
+        if (ran_f16) std::snprintf(sf, sizeof sf, "FP16 %.2f ms (%s)", t_f16, ef);
         else std::snprintf(sf, sizeof sf, "FP16 -");
         const std::string ty = std::string(strata::qt::type_name(Ly.gu_type)) + "/" + strata::qt::type_name(Ly.d_type);
-        std::fprintf(stderr, "glm prefill: HIP%d expert kernels (layer %d, %d experts x %d rows, %s): MMQ %.2f ms, %s, "
-                             "%s -> %s (STRATA_HIP_EXPERTS=mmq / own / fp16 fixes it)\n", dev_, il, n, R, ty.c_str(),
-                     tm, so, sf, pick == kXpOwn ? "the own int8 GEMM" : pick == kXpFp16 ? "the FP16 path" : "MMQ kept");
+        std::fprintf(stderr, "glm prefill: HIP%d expert kernels (layer %d, %d experts x %d rows, %s; error against the "
+                             "host's reference rows): %s, %s, %s -> %s%s (STRATA_HIP_EXPERTS=mmq / own / fp16 fixes it)\n",
+                     dev_, il, n, R, ty.c_str(), sm, so, sf,
+                     pick == kXpOwn ? "the own int8 GEMM" : pick == kXpFp16 ? "the FP16 path" : "MMQ kept",
+                     !mmq_good && pick == kXpMmq ? " - no path agreed with the reference" : "");
         return true;
     };
 #endif
