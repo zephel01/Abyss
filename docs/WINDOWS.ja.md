@@ -451,7 +451,7 @@ RTX 4090 では、DeepSeek V4 は DSpark の下書きモデルなしの方が速
 | AMD: 初回に `rocm-sdk init` で数分止まって見える | 初回は約 3 GB を展開する | 待つ。2 回目からは確認だけ | #43、#49 |
 | AMD: `ROCm's hipInfo sees no AMD GPU` | ドライバが古いか、入っていない | Adrenalin を更新して再起動 | - |
 | AMD: CMake の HIP コンパイラのテストが `__device__ function 'isgreater' cannot overload __host__ __device__ function 'isgreater'` で止まる | Visual Studio 2026（MSVC 14.51）と ROCm SDK 7.14.1 の Clang 23 のヘッダの衝突 | v1.3.131 以降はセットアップが SDK のヘッダを自動で直す。`ABYSS_NO_ROCM_HEADER_FIX` が設定されていないか確認。セットアップがファイルを書けないときは、`.venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\lib\clang\23\include\__clang_hip_runtime_wrapper.h` の `#include <__clang_cuda_math_forward_declares.h>` を、最初の `#include <cmath>` のすぐ上に移す | #2、#43 |
-| AMD: ビルドが `glm_prefill.cu` の `float* OUT = M.OUTP;` で `error: expected unqualified-id` になって止まる | `<windows.h>` が `OUT` を空のマクロとして定義していて、v1.3.186 で入った HIP 専用の関数が変数に `OUT` という名前を使っている。**v1.3.188 でも残っている** | まだ直っていない。#49 と次のリリースを待つ | #49 |
+| AMD: ビルドが `glm_prefill.cu` の `float* OUT = M.OUTP;` で `error: expected unqualified-id` になって止まる | `<windows.h>` が `OUT` を空のマクロとして定義していて、v1.3.186 で入った HIP 専用の関数が変数に `OUT` という名前を使っていた（v1.3.186〜v1.3.188） | v1.3.189 で直った。更新してセットアップをやり直す | #49 |
 | AMD: ビルド中に警告が何百も出る（`-Wsign-compare`、`-Wunused-function` など） | 正常 | 何もしなくてよい | #49 |
 | AMD: 生成は普通なのに、プロンプトの読み込みが数 tok/s（SenseNova 3、Qwen3.8 9 tok/s） | v1.3.188 より前のエンジンで、MMQ のカーネルが `-O0` でビルドされていた | 更新してセットアップをもう一度。[4.4](#44-ビルドが最適化されているか確かめる) の方法で確かめる | #3、#43、#49 |
 | AMD: 何もかも極端に遅い（1 tok/s 前後） | 全カーネルが `-O0`（v1.3.29 より前） | 更新 | #3 |
@@ -488,5 +488,5 @@ RTX 4090 では、DeepSeek V4 は DSpark の下書きモデルなしの方が速
 - Windows での NVIDIA のビルド済みエンジン（CI でビルドと確認はしているが、利用者の報告はまだ無い）。
 - NVIDIA で自分でビルドするときに「x64 Native Tools Command Prompt」が要るかどうか（報告者はどう実行したかを書いていない）。
 - Windows での AMD の 2 枚構成、Ryzen AI Max の iGPU だけでの実行、RX 9070 / R9700、RX 7000 の同系統のカード。
-- v1.3.186〜v1.3.188 の AMD のビルド（[9 章](#9-トラブル対応) の `OUT` の行）。そのため、v1.3.188 の `-O3` の修正も実機では未確認。
+- v1.3.189 の AMD のビルド（[9 章](#9-トラブル対応) の `OUT` の直し）と、v1.3.188 の `-O3` の直しの実機での動作。どちらも、Windows のマクロをまねて Linux で確かめただけです。
 - ウイルス対策（Microsoft Defender）や SmartScreen の警告、Windows のパスの長さの制限: 問題の報告はまだありません。

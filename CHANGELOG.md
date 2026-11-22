@@ -9,6 +9,26 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.189 - 2026-11-22
+
+Windows AMD builds of v1.3.186-v1.3.188 stopped in `glm_prefill.cu` ("expected unqualified-id", #49): a HIP-only
+block named a variable `OUT`, which `<windows.h>` defines as an empty macro, and the Windows CI builds CUDA only.
+Renamed, and a test now fails on any `IN` / `OUT` / `OPTIONAL` name in the sources (checked on Linux by compiling the
+file with those macros empty: the old file gives the reported errors, the new one builds). New Windows 11 setup guide
+for NVIDIA and AMD: [docs/WINDOWS.md](docs/WINDOWS.md) ([日本語](docs/WINDOWS.ja.md)). The CUDA and Linux code is
+unchanged, the same bits as v1.3.188.
+
+### Fixed
+
+- HIP on Windows: the build no longer stops at `float* OUT` in `src/core/glm_prefill.cu` (#49);
+  `tools/test_win_macros.py` guards the names Windows defines as empty macros.
+
+### Docs
+
+- `docs/WINDOWS.md` / `docs/WINDOWS.ja.md`: requirements, NVIDIA (prebuilt engine or own build), AMD (TheRock ROCm
+  SDK 7.14.1 in `.venv`), picking a config, first run and `--bench`, the page file, a troubleshooting table with the
+  issue numbers, and how to report; linked from README and docs/amd.
+
 ## v1.3.188 - 2026-11-22
 
 Windows AMD builds compiled the MMQ kernels without optimization (-O0): prompts on those kernels ran hundreds of times

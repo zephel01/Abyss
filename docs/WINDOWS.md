@@ -459,7 +459,7 @@ more as expert slots (#46). The engine turns DSpark on by itself only on 48 GB+ 
 | AMD: the first run sits at `rocm-sdk init` for minutes | it unpacks about 3 GB the first time | wait; later runs only check | #43, #49 |
 | AMD: `ROCm's hipInfo sees no AMD GPU` | the driver is old or missing | update Adrenalin, restart | - |
 | AMD: CMake's HIP compiler test stops at `__device__ function 'isgreater' cannot overload __host__ __device__ function 'isgreater'` | Visual Studio 2026 (MSVC 14.51) against ROCm SDK 7.14.1's Clang 23 headers | v1.3.131+ fixes the SDK header by itself; check that `ABYSS_NO_ROCM_HEADER_FIX` is not set. When the setup cannot write the file: in `.venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\lib\clang\23\include\__clang_hip_runtime_wrapper.h` move `#include <__clang_cuda_math_forward_declares.h>` to just above the first `#include <cmath>` | #2, #43 |
-| AMD: the build stops in `glm_prefill.cu` with `error: expected unqualified-id` at `float* OUT = M.OUTP;` | `<windows.h>` defines `OUT` as an empty macro, and a v1.3.186 HIP-only function names a variable `OUT`. **Still in v1.3.188** | not fixed yet: watch #49 / the next release | #49 |
+| AMD: the build stops in `glm_prefill.cu` with `error: expected unqualified-id` at `float* OUT = M.OUTP;` | `<windows.h>` defines `OUT` as an empty macro, and a v1.3.186 HIP-only function named a variable `OUT` (v1.3.186-v1.3.188) | fixed in v1.3.189: update and run setup again | #49 |
 | AMD: hundreds of warnings during the build (`-Wsign-compare`, `-Wunused-function`, ...) | normal | none | #49 |
 | AMD: decode is fine, prompts read at a few tok/s (SenseNova 3, Qwen3.8 9 tok/s) | an engine from before v1.3.188 whose MMQ kernels were built at `-O0` | update, run the setup again, check as in [4.4](#44-check-that-the-build-is-optimized) | #3, #43, #49 |
 | AMD: very slow everything (~1 tok/s) | every kernel at `-O0` (before v1.3.29) | update | #3 |
@@ -496,6 +496,6 @@ The files have no host name, user name or folder path; read them before you past
 - The prebuilt NVIDIA engine on Windows (built and checked by CI; no user report yet).
 - Whether an NVIDIA own build needs the "x64 Native Tools Command Prompt" (the reporters did not say how they ran it).
 - An AMD two-card split, the Ryzen AI Max iGPU alone, RX 9070 / R9700 and the RX 7000 siblings on Windows.
-- The AMD build of v1.3.186-v1.3.188 (see the `OUT` row in [section 9](#9-troubleshooting)), and so the v1.3.188 `-O3`
-  fix on a real Windows box.
+- The AMD build of v1.3.189 (the `OUT` fix, see [section 9](#9-troubleshooting)) and the v1.3.188 `-O3` fix on a real
+  Windows box: both were checked on Linux only, with the Windows macros imitated.
 - Antivirus (Microsoft Defender) or SmartScreen prompts, and Windows' long-path limit: nobody has reported a problem.
