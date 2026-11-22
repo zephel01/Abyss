@@ -9,6 +9,16 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.190 - 2026-11-22
+
+Long prompts on 16 GB cards: `STRATA_GLM_PREFILL_DENSE_TIER=1` (opt-in, #53) lends the dense weights' VRAM to the
+prompt path, so the prompt chunk grows and the experts are streamed fewer times (V4.1 UD-IQ2_XXS on an RTX 5090
+capped at 16 GB: 128K prompts 413 -> 1,374 tok/s, 250K 445 -> 1,662, needles all found, decode the same). The HIP
+expert-kernel check (#54) now measures every path against a host reference instead of MMQ's own output, so a broken
+MMQ is not kept and the pick no longer flips at the margin. The Windows guide now lists the RX 9060 XT confirmation of
+v1.3.189. Inkling 2 Mini gets an exact verify window with prompt-lookup drafts (`STRATA_INK_DRAFT=1`, opt-in:
+edit tasks +14%, Japanese +9%, the same tokens). With nothing set, CUDA gives the same bits as v1.3.189 (7-config md5 check).
+
 ### Added
 
 - `STRATA_GLM_PREFILL_DENSE_TIER=1` (opt-in, off by default; DeepSeek V4 / V4.1, GLM-5.3 and the qwen35moe models on one GPU; issue #53): a prompt longer
@@ -19,6 +29,33 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   the tier at the old chunk; its tokens match `=0`'s bit for bit on V4, V4.1, GLM-5.3 and Ornith 35B / 122B). The idea is the issue reporter's prototype; the
   code is Abyss's own (`src/core/glm_prefill.cu`, `DenseTier`). With the setting unset nothing changes (the same bits
   as v1.3.189).
+- `STRATA_INK_DRAFT=1` (opt-in, off by default; Inkling 2 Mini, CUDA, one GPU): a verify window for Inkling - the
+  token and up to 5 prompt-lookup drafts through the 48 layer applications (24 layers, the core looped 3 times) at
+  once, every column computed as the token alone (the dense GEMVs `mvn_mv`, the norms a row, each row's attention
+  split as at its own position, the short-convolution states read during the window and moved past the kept tokens
+  only), so greedy answers are the same tokens with and without it (md5 equal on code / prose / Japanese / edit
+  prompts, 512 tokens, short and 8K context). RTX 5090, UD-Q4_K_XL, short context: an edit task 131.5 -> 150.2 tok/s
+  (+14%, 64% of the drafts kept), Japanese 131.1 -> 142.9 (+9%), code +1%, prose the same; at 8K the edit task
+  112.9 -> 116.4 (+3%), code 114.1 -> 111.2 (-2.5%, few drafts kept) - hence opt-in. With the
+  setting unset the decode is the same as before (the same bits).
+- `STRATA_GLM_PREFILL_POISON=1` (debug, #54): the prompt path's lent buffer is filled with 0xFF bytes once lent, so a
+  buffer read before it is written shows up as a non-finite route or output instead of a small shift.
+
+### Fixed
+
+- HIP, the first-prompt expert-kernel check (`STRATA_HIP_EXPERTS=auto`, #54): each path (MMQ, own int8 GEMM, FP16)
+  is now measured against the host's own product of four of the timed rows (blocks decoded to floats, sums in
+  double), not against MMQ's output, and every row an 8-bit path wrote is also held to a sound FP16 path's. A path
+  with a non-finite output, more than 0.1 off the reference, or any row more than 0.25 off FP16 is not taken. The
+  timing is the fastest of three runs after a warm-up, and the FP16 path is also taken when it is no slower than MMQ
+  and closer to the reference, so a pick at the 1.5x margin no longer flips from run to run. The log line gives each
+  path's time and error. CUDA is unchanged (the same bits as v1.3.189).
+
+### Docs
+
+- `docs/WINDOWS.md` / `docs/WINDOWS.ja.md`: v1.3.189 confirmed on Windows 11 with an RX 9060 XT (Adrenalin 26.11.2):
+  the build passes with the MMQ kernels optimized, Qwen3.8 16G64G 2K prompts 9 -> 391 tok/s, SenseNova-Loop-9B 8K
+  prompts 1,014 tok/s (#49).
 
 ### Changed
 

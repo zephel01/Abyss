@@ -3,7 +3,7 @@
 [日本語](WINDOWS.ja.md)
 
 How to install and run Abyss on Windows 11, with an NVIDIA GeForce or an AMD Radeon card. This page is written for
-v1.3.188.
+v1.3.189.
 
 **Read this first.** We develop and test Abyss on Linux. There is no Windows PC here, so nothing on this page was run
 on Windows by us. The steps come from the setup's code and from what users reported in GitHub issues; each report is
@@ -42,7 +42,7 @@ Reported on Windows so far:
 | RTX 4090 24 GB + 96 GB RAM, own build (MSVC + CUDA) | DeepSeek V4 Flash 0731 (#31, #46), Qwen3.8-Flash-Next UD-Q4_K_XL (#39) |
 | 2x RTX 5060 Ti 16 GB + 128 GB RAM, own build, CUDA 13.3 | GLM-5.3-Flash (#40) |
 | RX 7900 XT 20 GB + 128 GB RAM, ROCm SDK 7.14.1 | DeepSeek V4 0731, V4.1 (#2-#6, #9, #12) |
-| RX 9060 XT 16 GB + 64 GB RAM, ROCm SDK 7.14.1, VS 2026 Build Tools (MSVC 14.51) | Ornith-1.5-122B, Qwen3.8-Flash-Next 12G32G / 16G64G, SenseNova-Loop-9B (#43, #47, #49) |
+| RX 9060 XT 16 GB + 64 GB RAM, ROCm SDK 7.14.1, VS 2026 Build Tools (MSVC 14.51), Adrenalin 26.11.2; v1.3.189 builds and runs (MMQ built optimized) | Ornith-1.5-122B, Qwen3.8-Flash-Next 12G32G / 16G64G, SenseNova-Loop-9B (#43, #47, #49) |
 
 The prebuilt NVIDIA engine on Windows: **not reported yet**.
 
@@ -313,7 +313,8 @@ The setup picks the size for your PC when you leave out `--quant`: it shows `thi
 - Every size and model, with speed and quality: the [README](../README.md) ("Pick a model for your PC") and
   [docs/MODELS](MODELS.md). 8-12 GB cards: [docs/SMALL-VRAM](SMALL-VRAM.md).
 - Numbers users reported on Windows, for reference (`--bench` decode): RX 9060 XT 16 GB + 64 GB, Ornith-122B 16-17
-  tok/s (#43), Qwen3.8 12G32G 28 tok/s (#47), Qwen3.8 16G64G 22 tok/s (#49); RTX 4090 + 96 GB, DeepSeek V4 0731 37-39
+  tok/s (#43), Qwen3.8 12G32G 28 tok/s (#47), Qwen3.8 16G64G 22 tok/s (#49; 23.1 on v1.3.189, where 2K prompts went 9 -> 391 tok/s), SenseNova-Loop-9B 31.7
+  tok/s with 8K prompts at 1,014 tok/s (#49, v1.3.189, Adrenalin 26.11.2); RTX 4090 + 96 GB, DeepSeek V4 0731 37-39
   tok/s without the DSpark drafter (#46).
 
 ## 6. Start, measure, tune
@@ -496,6 +497,4 @@ The files have no host name, user name or folder path; read them before you past
 - The prebuilt NVIDIA engine on Windows (built and checked by CI; no user report yet).
 - Whether an NVIDIA own build needs the "x64 Native Tools Command Prompt" (the reporters did not say how they ran it).
 - An AMD two-card split, the Ryzen AI Max iGPU alone, RX 9070 / R9700 and the RX 7000 siblings on Windows.
-- The AMD build of v1.3.189 (the `OUT` fix, see [section 9](#9-troubleshooting)) and the v1.3.188 `-O3` fix on a real
-  Windows box: both were checked on Linux only, with the Windows macros imitated.
 - Antivirus (Microsoft Defender) or SmartScreen prompts, and Windows' long-path limit: nobody has reported a problem.

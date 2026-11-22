@@ -2,7 +2,7 @@
 
 [English](WINDOWS.md)
 
-Windows 11 に Abyss を入れて動かす手順です。NVIDIA の GeForce と AMD の Radeon の両方を扱います。v1.3.188 の時点の内容です。
+Windows 11 に Abyss を入れて動かす手順です。NVIDIA の GeForce と AMD の Radeon の両方を扱います。v1.3.189 の時点の内容です。
 
 **最初に読んでください。** Abyss の開発と確認は Linux で行っています。こちらには Windows の PC がないため、このページの手順をこちらで
 Windows 上で実行したことはありません。手順はセットアップのコードと、利用者が GitHub の issue に書いてくれた報告をもとにしています。
@@ -41,7 +41,7 @@ Windows 上で実行したことはありません。手順はセットアップ
 | RTX 4090 24 GB + RAM 96 GB、自分でビルド（MSVC + CUDA） | DeepSeek V4 Flash 0731（#31、#46）、Qwen3.8-Flash-Next UD-Q4_K_XL（#39） |
 | RTX 5060 Ti 16 GB × 2 + RAM 128 GB、自分でビルド、CUDA 13.3 | GLM-5.3-Flash（#40） |
 | RX 7900 XT 20 GB + RAM 128 GB、ROCm SDK 7.14.1 | DeepSeek V4 0731、V4.1（#2〜#6、#9、#12） |
-| RX 9060 XT 16 GB + RAM 64 GB、ROCm SDK 7.14.1、VS 2026 Build Tools（MSVC 14.51） | Ornith-1.5-122B、Qwen3.8-Flash-Next 12G32G / 16G64G、SenseNova-Loop-9B（#43、#47、#49） |
+| RX 9060 XT 16 GB + RAM 64 GB、ROCm SDK 7.14.1、VS 2026 Build Tools（MSVC 14.51）、Adrenalin 26.11.2。v1.3.189 でビルドと実行を確認（MMQ が最適化してビルドされた） | Ornith-1.5-122B、Qwen3.8-Flash-Next 12G32G / 16G64G、SenseNova-Loop-9B（#43、#47、#49） |
 
 Windows での NVIDIA のビルド済みエンジン: **報告なし**。
 
@@ -307,7 +307,8 @@ AMD について、Linux も含めた詳しい説明: [docs/amd](amd/README.ja.m
 - すべてのサイズとモデル、速さと品質: [README](../README.ja.md) の「PC に合うモデル」の表と [docs/MODELS](MODELS.ja.md)。
   8〜12 GB のカード: [docs/SMALL-VRAM](SMALL-VRAM.ja.md)。
 - Windows の利用者が報告した数字（参考。`--bench` の生成の速さ）: RX 9060 XT 16 GB + 64 GB で Ornith-122B が 16〜17 tok/s（#43）、
-  Qwen3.8 12G32G が 28 tok/s（#47）、Qwen3.8 16G64G が 22 tok/s（#49）。RTX 4090 + 96 GB で DeepSeek V4 0731 が DSpark の下書きモデル
+  Qwen3.8 12G32G が 28 tok/s（#47）、Qwen3.8 16G64G が 22 tok/s（#49。v1.3.189 では 23.1 tok/s、2K のプロンプトの読み込みは 9 → 391 tok/s）、
+  SenseNova-Loop-9B が 31.7 tok/s で 8K のプロンプトが 1,014 tok/s（#49、v1.3.189、Adrenalin 26.11.2）。RTX 4090 + 96 GB で DeepSeek V4 0731 が DSpark の下書きモデル
   なしで 37〜39 tok/s（#46）。
 
 ## 6. 起動と計測
@@ -488,5 +489,4 @@ RTX 4090 では、DeepSeek V4 は DSpark の下書きモデルなしの方が速
 - Windows での NVIDIA のビルド済みエンジン（CI でビルドと確認はしているが、利用者の報告はまだ無い）。
 - NVIDIA で自分でビルドするときに「x64 Native Tools Command Prompt」が要るかどうか（報告者はどう実行したかを書いていない）。
 - Windows での AMD の 2 枚構成、Ryzen AI Max の iGPU だけでの実行、RX 9070 / R9700、RX 7000 の同系統のカード。
-- v1.3.189 の AMD のビルド（[9 章](#9-トラブル対応) の `OUT` の直し）と、v1.3.188 の `-O3` の直しの実機での動作。どちらも、Windows のマクロをまねて Linux で確かめただけです。
 - ウイルス対策（Microsoft Defender）や SmartScreen の警告、Windows のパスの長さの制限: 問題の報告はまだありません。

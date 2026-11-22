@@ -127,6 +127,7 @@ STRATA_GLM_PREFILL_LIGHT_CHECK  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_LIGHT_LAYER  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_MB  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_MIN  # src/core/glm_prefill.cu
+STRATA_GLM_PREFILL_POISON  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_PRED_T  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_SERIAL  # src/core/glm_prefill.cu
 STRATA_GLM_PREFILL_SH_LATE  # src/core/glm_prefill.cu

@@ -44,16 +44,39 @@ void check(const char* what) {
 }
 
 // ---------------------------------------------------------------- norms
-__global__ void rms_rows_kernel(const float* __restrict__ x, int64_t xs, const float* __restrict__ gamma, float eps,
-                                int n, float* __restrict__ y, int64_t ys) {
-    __shared__ float sh[32];
-    const float* xr = x + (int64_t) blockIdx.x * xs;
-    float* yr = y + (int64_t) blockIdx.x * ys;
+// a row's rms (the block's 256 threads): rms_rows_kernel's, and the verify window's controller inputs (ctrl_cat_n)
+__device__ __forceinline__ void rms_row(const float* __restrict__ xr, const float* __restrict__ gamma, float eps, int n,
+                                        float* __restrict__ yr, float* sh) {
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     ss = block_sum(ss, sh);
     const float inv = rsqrtf(ss / (float) n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = gamma != nullptr ? xr[i] * inv * gamma[i] : xr[i] * inv;
+}
+__global__ void rms_rows_kernel(const float* __restrict__ x, int64_t xs, const float* __restrict__ gamma, float eps,
+                                int n, float* __restrict__ y, int64_t ys) {
+    __shared__ float sh[32];
+    const float* xr = x + (int64_t) blockIdx.x * xs;
+    float* yr = y + (int64_t) blockIdx.x * ys;
+    rms_row(xr, gamma, eps, n, yr, sh);
+}
+// grid (T, n, 2): controller c's row t - z 0 rms(cur), z 1 rms(msg) - into cat + c cat_c + t 2E (+ E)
+__global__ void ctrl_cat_n_kernel(CtrlRows a, int E) {
+    __shared__ float sh[32];
+    const int t = blockIdx.x, c = blockIdx.y, z = blockIdx.z;
+    const float* xr = z == 0 ? a.cur[c] + (int64_t) t * a.cs : a.msg + (int64_t) c * E + (int64_t) t * a.ms;
+    rms_row(xr, nullptr, 1e-6f, E, a.cat + (int64_t) c * a.cat_c + (int64_t) t * 2 * E + (int64_t) z * E, sh);
+}
+// grid (E / 256, T, n): ctrl_apply_kernel's step for controller c
+__global__ void ctrl_apply_n_kernel(CtrlRows a, int E) {
+    const int t = blockIdx.y, c = blockIdx.z;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= E) return;
+    const float cv = a.cur[c][(int64_t) t * a.cs + i], m = a.msg[(int64_t) c * E + (int64_t) t * a.ms + i];
+    const float* g = a.g + (int64_t) c * a.gf_c;
+    const float* f = a.f + (int64_t) c * a.gf_c;
+    const float fv = tanhf(f[(int64_t) t * E + i]), gv = tanhf(g[(int64_t) t * E + i]);
+    a.out[c][(int64_t) t * E + i] = (cv - fv * cv) + gv * m;
 }
 
 // ---------------------------------------------------------------- the depth attention
@@ -213,7 +236,9 @@ __global__ void conv_state_kernel(const float* __restrict__ in, int64_t is, floa
     for (int k = 0; k < 3; ++k) state[(size_t) c * 3 + k] = v[k];
 }
 
-// conv_kernel's channel c over T rows in order (the decode's fused post_proj_kernel runs the same function)
+// conv_kernel's channel c over T rows in order (the decode's fused post_proj_kernel runs the same function; the
+// verify window's conv_win_kernel too, with kKeep: the state read, not written - conv_commit moves it later)
+template <bool kKeep = false>
 __device__ __forceinline__ void conv_channel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
                                              const float* __restrict__ dw, int64_t dws, int head_ch,
                                              float* __restrict__ state, int c, int T, float* __restrict__ out,
@@ -237,9 +262,42 @@ __device__ __forceinline__ void conv_channel(const float* __restrict__ in, int64
         x1 = x2;
         x2 = x3;
     }
+    if (kKeep) return;
     state[(size_t) c * 3 + 0] = x0;
     state[(size_t) c * 3 + 1] = x1;
     state[(size_t) c * 3 + 2] = x2;
+}
+// the verify window's: conv_kernel's rows over a state left as it is (in and out apart: the inputs stay for
+// conv_commit)
+__global__ void conv_win_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
+                                const float* __restrict__ dw, int64_t dws, int head_ch, float* __restrict__ state, int C,
+                                int T, float* __restrict__ out, int64_t os) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    conv_channel<true>(in, is, w, dw, dws, head_ch, state, c, T, out, os);
+}
+// the states after a window's first n rows: slot b's channel c (of C) from its last 3 inputs - the window's rows
+// (save + b * slot_floats, [part][tm][part channels], parts KV, KV, E, E) or the state's
+__global__ void conv_commit_kernel(float* const* __restrict__ states, const float* __restrict__ save, size_t slot_floats,
+                                   int KV, int E, int tm, int n) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;
+    const int C = 2 * KV + 2 * E;
+    if (c >= C) return;
+    float* st = states[b] + (size_t) c * 3;
+    int off, pc;
+    if (c < KV) { off = 0; pc = KV; }
+    else if (c < 2 * KV) { off = KV; pc = KV; }
+    else if (c < 2 * KV + E) { off = 2 * KV; pc = E; }
+    else { off = 2 * KV + E; pc = E; }
+    const float* sv = save + (size_t) b * slot_floats + (size_t) tm * off + (size_t) (c - off);
+    float v[3];
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int i = n + k;   // (the sequence: the state's 3, then the window's rows)
+        v[k] = i < 3 ? st[i] : sv[(size_t) (i - 3) * pc];
+    }
+#pragma unroll
+    for (int k = 0; k < 3; ++k) st[k] = v[k];
 }
 __global__ void conv_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
                             const float* __restrict__ dw, int64_t dws, int head_ch, float* __restrict__ state, int C, int T,
@@ -346,6 +404,33 @@ __global__ void post_proj_kernel(PostProj a) {
     }
 }
 
+// the verify window's post_proj over T rows (the state read, left; the raw k / v rows kept apart): a warp a KV head
+// (its channels' convs over the rows, then each row's k clip and cache rows), a (row, q head)'s clip or a (row, rel
+// head)'s - post_proj_kernel's functions
+__global__ void post_proj_rows_kernel(PostProj a, const float* __restrict__ kraw, const float* __restrict__ vraw, int T) {
+    const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (wid < a.Hkv) {
+        const int h = wid;
+        for (int d = lane; d < kD; d += 32) {
+            const int c = h * kD + d;
+            conv_channel<true>(kraw, a.KV, a.k_conv, a.kd, a.dws, kD, a.conv, c, T, a.kf, a.KV);
+            conv_channel<true>(vraw, a.KV, a.v_conv, a.vd, a.dws, kD, a.conv + (size_t) a.KV * 3, c, T, a.vf, a.KV);
+        }
+        __syncwarp();
+        for (int t = 0; t < T; ++t) {
+            clip_head(a.kf, a.KV, nullptr, kD, a.qk_clip, a.p, 0.0f, 0.0f, t, h, lane);
+            __syncwarp();
+            kv_store_head(a.kf, a.KV, a.vf, a.KV, a.eps, a.Hkv, a.p, a.ring, (__half*) a.kc, (__half*) a.vc, t, h, lane);
+        }
+    } else if (wid < a.Hkv + T * a.H) {
+        const int w = wid - a.Hkv;
+        clip_head(a.qf, a.HD, a.q_clip, kD, a.qk_clip, a.p, a.lf, a.alpha, w / a.H, w % a.H, lane);
+    } else if (wid < a.Hkv + 2 * T * a.H) {
+        const int w = wid - a.Hkv - T * a.H;
+        clip_head(a.rf, (int64_t) a.H * kRel, a.rel_clip, kRel, a.rel_clip_thr, a.p, a.lf, a.alpha, w / a.H, w % a.H, lane);
+    }
+}
+
 // ---------------------------------------------------------------- attention
 constexpr int kAttnWarps = 4;
 constexpr int kTile = 32 * kAttnWarps;   // keys a tile: a warp's 32
@@ -355,18 +440,27 @@ constexpr int kMaxG = 8;                 // q heads a KV head at most
 constexpr int kPart = kD + 2;
 
 // grid (splits, n_head_kv, T): block (split, kv head, row) runs the G q heads of the KV head over its key range
-template <int kG>
+// a row's split count: its keys over tiles, at most max_splits (the token path's choice for that row alone)
+__host__ __device__ __forceinline__ int attn_row_splits(int64_t nk, int max_splits) {
+    const int64_t n = (nk + kTile - 1) / kTile;
+    return (int) (n < 1 ? 1 : n > max_splits ? max_splits : n);
+}
+
+// kRows (the verify window's): each row its own split count, the one a token at that position alone gets - the same
+// key ranges, so the same sums (blocks past a row's count leave at once)
+template <int kG, bool kRows = false>
 __global__ void __launch_bounds__(kAttnWarps * 32) attn_part_kernel(
     const float* __restrict__ q, int64_t qs, const float* __restrict__ r, int64_t rs, const float* __restrict__ relb,
     int extent, const __half* __restrict__ kc, const __half* __restrict__ vc, int ring, int H, int Hkv, int64_t p0,
     int window, float scale, float* __restrict__ part, int max_splits, int f16) {
     const int split = blockIdx.x, kvh = blockIdx.y, t = blockIdx.z;
-    const int nsplit = gridDim.x;
     constexpr int G = kG;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int64_t p = p0 + t;
     const int64_t lo = window > 0 ? (p - window + 1 > 0 ? p - window + 1 : (int64_t) 0) : 0;
     const int64_t nk = p - lo + 1;
+    const int nsplit = kRows ? attn_row_splits(nk, max_splits) : (int) gridDim.x;
+    if (kRows && split >= nsplit) return;
     const int64_t per = (nk + nsplit - 1) / nsplit;
     const int64_t k0 = lo + (int64_t) split * per, k1 = (p + 1 < k0 + per ? p + 1 : k0 + per);
     __shared__ float s_r[kG][kRel];
@@ -506,10 +600,15 @@ __global__ void __launch_bounds__(kAttnWarps * 32) attn_part_kernel(
     }
 }
 
-// grid (H, T): the splits and the sink into out
+// grid (H, T): the splits and the sink into out (rows_p0 >= 0: the verify window's, each row its own split count)
 __global__ void attn_combine_kernel(const float* __restrict__ part, int nsplit, int max_splits, const float* __restrict__ sink,
-                                    int64_t ss, int H, float* __restrict__ out, int64_t os) {
+                                    int64_t ss, int H, float* __restrict__ out, int64_t os, int64_t rows_p0 = -1,
+                                    int window = 0) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    if (rows_p0 >= 0) {
+        const int64_t p = rows_p0 + t;
+        nsplit = attn_row_splits(window > 0 ? (p + 1 < window ? p + 1 : (int64_t) window) : p + 1, max_splits);
+    }
     const float* pr = part + ((size_t) t * H + h) * max_splits * kPart;
     const float sk = sink[(int64_t) t * ss + h];
     float M = sk;
@@ -933,6 +1032,41 @@ void conv_rows_par(const float* in, int64_t is, const float* w, const float* dw,
     check("conv_rows_par");
 }
 
+void conv_win(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
+              int C, int T, float* out, int64_t os, cudaStream_t s) {
+    if (T <= 0) return;
+    conv_win_kernel<<<(C + 127) / 128, 128, 0, s>>>(in, is, w, dw, dws, head_ch, state, C, T, out, os);
+    check("conv_win");
+}
+
+void post_proj_rows(const PostProj& a, const float* kraw, const float* vraw, int T, cudaStream_t s) {
+    if (T <= 0) return;
+    const int warps = a.Hkv + 2 * T * a.H;
+    post_proj_rows_kernel<<<(warps + 7) / 8, 256, 0, s>>>(a, kraw, vraw, T);
+    check("post_proj_rows");
+}
+
+void ctrl_cat_n(const CtrlRows& a, int n, int E, int T, cudaStream_t s) {
+    if (T <= 0 || n <= 0) return;
+    ctrl_cat_n_kernel<<<dim3((unsigned) T, (unsigned) n, 2), 256, 0, s>>>(a, E);
+    check("ctrl_cat_n");
+}
+
+void ctrl_apply_n(const CtrlRows& a, int n, int E, int T, cudaStream_t s) {
+    if (T <= 0 || n <= 0) return;
+    ctrl_apply_n_kernel<<<dim3((unsigned) ((E + 255) / 256), (unsigned) T, (unsigned) n), 256, 0, s>>>(a, E);
+    check("ctrl_apply_n");
+}
+
+void conv_commit(float* const* states_d, int n_slots, const float* save, size_t slot_floats, int KV, int E, int tm, int n,
+                 cudaStream_t s) {
+    if (n <= 0 || n_slots <= 0) return;
+    const int C = 2 * KV + 2 * E;
+    conv_commit_kernel<<<dim3((unsigned) ((C + 127) / 128), (unsigned) n_slots), 128, 0, s>>>(states_d, save, slot_floats,
+                                                                                              KV, E, tm, n);
+    check("conv_commit");
+}
+
 void post_proj(const PostProj& a, cudaStream_t s) {
     const int warps = a.Hkv + 2 * a.H;
     post_proj_kernel<<<(warps + 7) / 8, 256, 0, s>>>(a);
@@ -971,7 +1105,7 @@ size_t attn_part_floats(int T, int n_head, int max_splits) {
 
 void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* sink, int64_t ss, const float* rel_bias,
           int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, int T,
-          int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s) {
+          int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s, bool rows) {
     if (T <= 0) return;
     if (n_head % n_head_kv != 0 || n_head / n_head_kv > kMaxG) {
         std::fprintf(stderr, "inkling kernels: attn: %d heads over %d KV heads\n", n_head, n_head_kv);
@@ -984,8 +1118,12 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
     int ns = (int) std::min<int64_t>(max_splits, std::max<int64_t>(1, (nk + kTile - 1) / kTile));
     ns = std::max(1, ns);
     const dim3 grid((unsigned) ns, (unsigned) n_head_kv, (unsigned) T);
-#define INK_ATTN(GG) attn_part_kernel<GG><<<grid, kAttnWarps * 32, 0, s>>>(q, qs, r, rs, rel_bias, extent, \
-        (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, window, scale, part, max_splits, f16_env())
+#define INK_ATTN(GG) do { if (rows) attn_part_kernel<GG, true><<<grid, kAttnWarps * 32, 0, s>>>(q, qs, r, rs, rel_bias, \
+        extent, (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, window, scale, part, max_splits, \
+        f16_env()); \
+        else attn_part_kernel<GG><<<grid, kAttnWarps * 32, 0, s>>>(q, qs, r, rs, rel_bias, extent, \
+        (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, window, scale, part, max_splits, f16_env()); \
+        } while (0)
     switch (n_head / n_head_kv) {
         case 1: INK_ATTN(1); break;
         case 2: INK_ATTN(2); break;
@@ -997,7 +1135,8 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
     }
 #undef INK_ATTN
     check("attn_part");
-    attn_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, ns, max_splits, sink, ss, n_head, out, os);
+    attn_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, ns, max_splits, sink, ss, n_head, out, os,
+                                                                            rows ? p0 : -1, window);
     check("attn_combine");
 }
 

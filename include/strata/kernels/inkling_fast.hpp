@@ -49,6 +49,17 @@ void ctrl_apply(const float* cur, int64_t cs, const float* msg, int64_t ms, cons
 void conv_rows(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
                int C, int T, float* out, int64_t os, cudaStream_t s);
 
+/// The verify window's conv_rows: the same arithmetic a row, the state read but left as it is (in and out must not
+/// overlap - the window's inputs stay for conv_commit)
+void conv_win(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
+              int C, int T, float* out, int64_t os, cudaStream_t s);
+
+/// After a verify window: every slot's conv state ([K | V | attn post | ffn post] channels x 3, K / V KV channels,
+/// the posts E) moved past the window's first n rows - slot b's rows at save + b slot_floats, [part][tm][part's
+/// channels].  states_d: n_slots device pointers
+void conv_commit(float* const* states_d, int n_slots, const float* save, size_t slot_floats, int KV, int E, int tm, int n,
+                 cudaStream_t s);
+
 /// conv_rows over the T rows in parallel (the same arithmetic a row): out must not overlap in
 void conv_rows_par(const float* in, int64_t is, const float* w, const float* dw, int64_t dws, int head_ch, float* state,
                    int C, int T, float* out, int64_t os, cudaStream_t s);
@@ -77,6 +88,28 @@ struct PostProj {
 };
 void post_proj(const PostProj& a, cudaStream_t s);
 
+/// The verify window's post_proj over T rows at positions a.p ..: k / v convolved from kraw / vraw (rows KV apart)
+/// into a.kf / a.vf with the state read but left (conv_win's), the clips and the cache rows of every row - each row
+/// post_proj's arithmetic
+void post_proj_rows(const PostProj& a, const float* kraw, const float* vraw, int T, cudaStream_t s);
+
+/// The verify window's loop controllers, n of them over T rows in one launch each (ctrl_cat's / ctrl_apply's rows):
+/// controller c's current rows cur[c] + t cs, its message rows msg + c E + t ms; cat rows at cat + c cat_c + t 2E;
+/// g / f rows at g / f + c gf_c + t E; out rows out[c] + t E
+struct CtrlRows {
+    const float* cur[4] = {};
+    int64_t cs = 0;
+    const float* msg = nullptr;
+    int64_t ms = 0;
+    float* cat = nullptr;
+    int64_t cat_c = 0;
+    const float *g = nullptr, *f = nullptr;
+    int64_t gf_c = 0;
+    float* out[4] = {};
+};
+void ctrl_cat_n(const CtrlRows& a, int n, int E, int T, cudaStream_t s);
+void ctrl_apply_n(const CtrlRows& a, int n, int E, int T, cudaStream_t s);
+
 /// The scratch (floats) attn needs for T rows of n_head heads in up to max_splits key ranges.
 size_t attn_part_floats(int T, int n_head, int max_splits);
 
@@ -86,7 +119,8 @@ size_t attn_part_floats(int T, int n_head, int max_splits);
 /// r [T][H][kRel] (rs), sink [T][H] (ss); K / V of KV head h / (H / n_head_kv) from cache row j % ring.
 void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* sink, int64_t ss, const float* rel_bias,
           int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, int T,
-          int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s);
+          int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s,
+          bool rows = false);   // rows: each row the split count the token path gives its position (the verify window)
 
 /// attn for a prompt's rows (T of them at once) on tensor cores: the same math, S = q K^T and P V in FP16 with F32
 /// accumulation (P rounded to FP16), the bias as FP16 pairs (about F32).  False (nothing launched): the caller runs attn - AMD, a GPU
