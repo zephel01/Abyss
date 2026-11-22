@@ -235,63 +235,6 @@ class DSparkStep(unittest.TestCase):
         self.assertFalse(self.dst.with_name("drafter.gguf.sha256").exists())
 
 
-class InkDSparkStep(unittest.TestCase):
-    """ink_dspark_step (Inkling 2 Mini's DSpark drafter) against a config in a temporary folder: nothing downloaded,
-    a file on disk named in the config's env, --no-dspark takes it out, CUDA and one GPU only."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        d = Path(self.tmp.name)
-        self.mdir = d / "Abyss-data" / "models" / "unsloth" / "Inkling-2-Mini-GGUF" / "UD-Q4_K_XL"
-        self.mdir.mkdir(parents=True)
-        self.cfg = d / "abyss-inkling2mini-q4_k_xl.json"
-        self.cfg.write_text(json.dumps({"exe": "abyss", "env": {"STRATA_LANG": "ja-en"}}), encoding="utf-8")
-        self.gpu = [{"index": 0, "vram_gb": 32.0}]
-        self.dst = self.mdir.parent / "dspark" / A.INK_DSPARK_NAME
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def run_step(self, gpus=None, backend="cuda", **kw):
-        a = Namespace(dspark=False, no_dspark=kw.get("no_dspark", False), yes=True)
-        with mock.patch.object(A.S, "download", side_effect=AssertionError("no download")):
-            A.ink_dspark_step(a, self.mdir, self.cfg, gpus or self.gpu, backend)
-        return json.loads(self.cfg.read_text(encoding="utf-8"))["env"]
-
-    def put(self):
-        self.dst.parent.mkdir(parents=True, exist_ok=True)
-        self.dst.write_bytes(b"GGUF")
-
-    def test_off_without_the_file(self):
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
-
-    def test_on_when_the_file_is_there(self):
-        self.put()
-        env = self.run_step()
-        self.assertEqual(env["STRATA_INK_DSPARK"], str(self.dst))
-        self.assertEqual(env["STRATA_LANG"], "ja-en")   # the rest of the env stays
-
-    def test_the_file_beside_the_model_folder(self):
-        f = self.mdir.parent / A.INK_DSPARK_NAME
-        f.write_bytes(b"GGUF")
-        self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], str(f))
-
-    def test_a_config_that_names_one_keeps_it_and_no_dspark_takes_it_out(self):
-        conf = json.loads(self.cfg.read_text(encoding="utf-8"))
-        conf["env"]["STRATA_INK_DSPARK"] = "/elsewhere/d.gguf"
-        self.cfg.write_text(json.dumps(conf), encoding="utf-8")
-        self.put()
-        self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], "/elsewhere/d.gguf")
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step(no_dspark=True))
-        self.assertTrue(self.dst.exists())   # the file stays
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step(no_dspark=True))
-
-    def test_not_with_a_layer_split_or_amd(self):
-        self.put()
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step(gpus=self.gpu * 2))
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step(backend="hip"))
-
-
 class DFlash27Step(unittest.TestCase):
     """dflash27_step (Qwen3.8-27B's DFlash 2 drafter) against a config in a temporary folder, the drafter 'downloaded'
     from a local file: on by default where it fits, --no-dflash takes it out, --dflash sets it up where it does not."""

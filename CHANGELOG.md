@@ -29,10 +29,6 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   -> 209.3, prose 183.4 -> 235.5; after 165K: 98.0 -> 93.0 (the window's attention columns cost more there). The
   drafter takes 0.6 GB of VRAM. With the setting unset nothing loads and the decode is the same as before (7-config
   md5 check).
-- Inkling 2 Mini's DSpark drafter from the run config: `./setup-deepseek.sh --model inkling2mini` names
-  `dspark-Inkling-2-Mini-Q8_0.gguf` in the config's env (`STRATA_INK_DSPARK`) when the file is already on disk
-  (`<data>/models/unsloth/Inkling-2-Mini-GGUF/dspark/`, the Hugging Face repo's folder; setup does not download it),
-  so the server starts with it; `--no-dspark` takes it out (the file stays). NVIDIA, one GPU.
 
 ### Changed
 
