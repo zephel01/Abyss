@@ -561,6 +561,47 @@ class InklingThinkingOff(unittest.TestCase):
                                      "<|content_model_end_sampling|>"), ("", "Tokyo."))
 
 
+class InklingAnswerOpen(unittest.TestCase):
+    """Inkling 2 with thinking off and no tools: the prompt ends with the answer message's opening, so the model answers
+    at once (no English plan first) and the server reads everything after it as the answer."""
+
+    SRC = ('{%- set effort_map = {"none": 0.0, "high": 0.9} -%}'
+           "<|message_system|><|content_text|>Thinking effort level: "
+           "{{ effort_map[reasoning_effort] if reasoning_effort is defined and reasoning_effort else 0.9 }}"
+           "<|end_message|>{%- for m in messages -%}<|message_user|><|content_text|>{{ m.content }}<|end_message|>"
+           "{%- endfor -%}")
+
+    def render(self, effort=None, tools=None):
+        import tempfile
+        from serve.frontend import effort_kwargs
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(self.SRC, encoding="utf-8")
+            t = ChatTemplate(p)
+            self.assertTrue(t.ink)
+            return t.render([{"role": "user", "content": "hi"}], tools=tools, **effort_kwargs(effort))
+
+    def test_off_opens_the_answer(self):
+        self.assertTrue(self.render("none").endswith("hi<|end_message|><|message_model|><|content_text|>"))
+
+    def test_thinking_and_tools_leave_it_to_the_model(self):
+        self.assertTrue(self.render().endswith("hi<|end_message|>"))
+        self.assertTrue(self.render("high").endswith("hi<|end_message|>"))
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        self.assertTrue(self.render("none", tools).endswith("hi<|end_message|>"))
+
+    def test_opened_prompt_is_all_answer(self):
+        tok = InklingThinkingOff.InkTok()
+        svc = Service(MockEngine(tok, "Tokyo.<|end_message|><|content_model_end_sampling|>", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out = {"reasoning": "", "content": ""}
+        for kind, v in svc.run(tok.encode("hi<|message_model|><|content_text|>", parse_special=True), False, None, 200,
+                               {}, threading.Event()):
+            if kind == "event" and v.kind in out:
+                out[v.kind] += v.text
+        self.assertEqual((out["reasoning"], out["content"]), ("", "Tokyo."))
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""

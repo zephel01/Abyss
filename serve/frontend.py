@@ -58,6 +58,10 @@ def keep_past_thinking(source: str) -> str:
                                 "loop.index0 > ns.last_query_index %}", source)
 
 
+# Inkling 2's answer message opening: a prompt that ends with it (thinking off) has the model write the answer only
+INK_ANSWER_OPEN = "<|message_model|><|content_text|>"
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
@@ -105,10 +109,12 @@ class ChatTemplate:
         # goes into a system message "Thinking effort level: <n>"; thinking off is "none" (the model may still think
         # briefly - the server reads its messages either way)
         self.ink = "Thinking effort level" in self.source and "effort_map" in self.source
+        # (Inkling's thinking off, no tools: the prompt ends with the answer's opening - INK_ANSWER_OPEN - so the model
+        # answers at once instead of writing a short English plan first; with tools it chooses text or a call itself)
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
-        off = False
+        off = ink_open = False
         if self.dsv4:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
@@ -138,6 +144,7 @@ class ChatTemplate:
             ok = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
             kwargs["reasoning_effort"] = ("none" if off else raw if raw in ok else level if level in ok else None)
             off = False   # (no think block to close: the effort level says it)
+            ink_open = kwargs["reasoning_effort"] == "none" and not tools and add_generation_prompt
         elif self.glm_effort:
             kwargs.pop("effort_raw", None)
             off = kwargs.pop("enable_thinking", True) is False
@@ -152,6 +159,8 @@ class ChatTemplate:
                                    **kwargs)
         if off and add_generation_prompt and out.endswith("<think>"):
             out += "</think>"
+        if ink_open:
+            out += INK_ANSWER_OPEN
         return out
 
 
