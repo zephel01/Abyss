@@ -19,6 +19,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   the tier at the old chunk; its tokens match `=0`'s bit for bit on V4, V4.1, GLM-5.3 and Ornith 35B / 122B). The idea is the issue reporter's prototype; the
   code is Abyss's own (`src/core/glm_prefill.cu`, `DenseTier`). With the setting unset nothing changes (the same bits
   as v1.3.189).
+- `STRATA_GLM_PREFILL_POISON=1` (debug, #54): the prompt path's lent buffer is filled with 0xFF bytes once lent, so a
+  buffer read before it is written shows up as a non-finite route or output instead of a small shift.
+
+### Fixed
+
+- HIP, the first-prompt expert-kernel check (`STRATA_HIP_EXPERTS=auto`, #54): each path (MMQ, own int8 GEMM, FP16)
+  is now measured against the host's own product of four of the timed rows (blocks decoded to floats, sums in
+  double), not against MMQ's output, and every row an 8-bit path wrote is also held to a sound FP16 path's. A path
+  with a non-finite output, more than 0.1 off the reference, or any row more than 0.25 off FP16 is not taken. The
+  timing is the fastest of three runs after a warm-up, and the FP16 path is also taken when it is no slower than MMQ
+  and closer to the reference, so a pick at the 1.5x margin no longer flips from run to run. The log line gives each
+  path's time and error. CUDA is unchanged (the same bits as v1.3.189).
 
 ## v1.3.189 - 2026-11-22
 
