@@ -281,6 +281,5 @@ STRATA_HY4_DUMP_CACHE_AT  # src/core/hy4_fast_path.cu (debug: the position STRAT
 STRATA_HY4_ENG_VFIRST  # src/core/hy4_fast_path.cu (debug: the values-first n-gram order, for A/B only)
 STRATA_INK_F16  # src/kernels/cuda/inkling_fast.cu (debug: Inkling's attention with the bias (1) / the scaled q (2) rounded to FP16, an A/B against llama.cpp's flash attention)
 STRATA_INK_PREFILL  # src/core/inkling_fast_path.cu (Inkling's batched prompt path; 0: token by token)
-STRATA_INK_PREFILL_SUB  # src/core/inkling_fast_path.cu (Inkling prompt: the attention's sub-batch rows, 64 .. 2048, default 512)
 STRATA_INK_NV_OWN  # src/core/glm_prefill.cu (Inkling prompt: NVFP4 experts on the own int8 GEMM, default 1; 0: MMQ or the FP16 path)
 STRATA_INK_NV_DQ  # src/core/glm_prefill.cu (Inkling prompt: NVFP4 experts the own GEMM does not take through FP16 dequant + cuBLAS, default 1; 0: MMQ)

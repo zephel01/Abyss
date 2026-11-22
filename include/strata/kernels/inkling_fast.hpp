@@ -88,6 +88,16 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
           int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, int T,
           int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s);
 
+/// attn for a prompt's rows (T of them at once) on tensor cores: the same math, S = q K^T and P V in FP16 with F32
+/// accumulation (P rounded to FP16), the bias as FP16 pairs (about F32).  False (nothing launched): the caller runs attn - AMD, a GPU
+/// before sm_80, an unsupported head grouping, or STRATA_INK_PREFILL_ATTN=0.  max_splits: part's capacity.
+bool attn_prompt(const float* q, int64_t qs, const float* r, int64_t rs, const float* sink, int64_t ss,
+                 const float* rel_bias, int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head,
+                 int n_head_kv, int64_t p0, int T, int window, float scale, float* part, int max_splits, float* out,
+                 int64_t os, cudaStream_t s);
+/// Whether attn_prompt runs at all on this build and setting (CUDA, STRATA_INK_PREFILL_ATTN not 0).
+bool attn_prompt_on();
+
 /// o[t][i] *= sigmoid(g[t][i]), n floats a row (rows os / gs apart), T rows
 void gate_sigmoid(float* o, int64_t os, const float* g, int64_t gs, int n, int T, cudaStream_t s);
 

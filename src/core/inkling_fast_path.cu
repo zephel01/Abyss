@@ -533,10 +533,12 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
 // ---------------------------------------------------------------- the batched prompt path
 namespace {
 
-int ink_sub() {   // the attention's sub-batch (STRATA_INK_PREFILL_SUB, 64 .. 2048: a window ring's rows stay unread)
+// the attention's sub-batch (STRATA_INK_PREFILL_SUB, 64 .. 2048: a window ring's rows stay unread); 2048 with the
+// tensor-core attention (its blocks fill the GPU from 2048 rows: 8K prompt +8%, 32K +11% against 512), else 512
+int ink_sub() {
     static const int v = [] {
         const char* e = getenv("STRATA_INK_PREFILL_SUB");
-        return e != nullptr ? std::clamp(std::atoi(e), 64, 2048) : 512;
+        return e != nullptr ? std::clamp(std::atoi(e), 64, 2048) : ik::attn_prompt_on() ? 2048 : 512;
     }();
     return v;
 }
@@ -842,8 +844,12 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
         ik::kv_store(B.kc, KV, B.vc, KV, g.norm_eps, Hkv, pt, tn, S.ring, S.kc, S.vc, s);
         if (io.mark) io.mark(io.mark_ctx, "ink_conv", s);
         // ---- attention, gate, output, post conv
-        ik::attn(B.qf, HD, B.rf, H * ik::kRel, B.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring,
-                 H, Hkv, pt, tn, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), B.part, kPromptSplits, B.ao, HD, s);
+        if (!ik::attn_prompt(B.qf, HD, B.rf, H * ik::kRel, B.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc,
+                             S.vc, S.ring, H, Hkv, pt, tn, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), B.part,
+                             kPromptSplits, B.ao, HD, s))
+            ik::attn(B.qf, HD, B.rf, H * ik::kRel, B.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc,
+                     S.ring, H, Hkv, pt, tn, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), B.part, kPromptSplits, B.ao,
+                     HD, s);
         if (io.mark) io.mark(io.mark_ctx, "ink_attn_core", s);
         ik::gate_sigmoid(B.ao, HD, B.gl, HD, HD, tn, s);
         gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HD, s);

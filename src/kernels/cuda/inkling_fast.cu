@@ -525,6 +525,343 @@ __global__ void attn_combine_kernel(const float* __restrict__ part, int nsplit, 
     out[(int64_t) t * os + (size_t) h * kD + d] = A / L;
 }
 
+// ---------------------------------------------------------------- the prompt path's tensor-core attention
+// attn's math over a block of tokens at once: S = (scale q) K^T and O = P V on f16 tensor cores (F32 accumulation),
+// the relative bias added to S from small MMAs on FP16 pairs (about F32), an online softmax in registers.
+// mma.sync / ldmatrix / cp.async need sm_80; AMD compiles none of it (attn_prompt returns false: attn runs).
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
+#define STRATA_INK_TC 0
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#define STRATA_INK_TC 1
+#else
+#define STRATA_INK_TC 2   // (device code for an older sm: traps; the host refuses such a device)
+#endif
+
+#if STRATA_INK_TC != 0
+constexpr int kTcBK = 64;   // keys a tile
+constexpr int kTcTW = 40;   // a bias table row (floats): 32 keys + 8 (conflict-free reads)
+
+__device__ __forceinline__ void tc_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#if STRATA_INK_TC != 1
+    __trap();
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+__device__ __forceinline__ void tc_ldsm(uint32_t* r, const void* p) {
+#if STRATA_INK_TC != 1
+    __trap();
+#else
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+#endif
+}
+__device__ __forceinline__ void tc_ldsm_t(uint32_t* r, const void* p) {
+#if STRATA_INK_TC != 1
+    __trap();
+#else
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+#endif
+}
+__device__ __forceinline__ void tc_cp16(void* dst, const void* src, bool on) {
+#if STRATA_INK_TC != 1
+    __trap();
+#else
+    const unsigned d = (unsigned) __cvta_generic_to_shared(dst);
+    const int n = on ? 16 : 0;   // (0: zero-filled)
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(n));
+#endif
+}
+__device__ __forceinline__ void tc_commit() {
+#if STRATA_INK_TC == 1
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void tc_wait1() {
+#if STRATA_INK_TC == 1
+    asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
+}
+__device__ __forceinline__ uint32_t tc_h2(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+// a K / V tile row's 16-byte chunk c in shared memory (XOR-swizzled: ldmatrix's 8 rows hit 8 bank groups)
+__device__ __forceinline__ int tc_at(int key, int c) {
+    return key * kD + ((c ^ (key & 7)) << 3);
+}
+
+// grid (ceil(T / (16 MT)), n_head_kv, splits), G MT warps: block (b, kv head, split) runs tokens 16 MT b .. + 16 MT - 1
+// of the KV head's G q heads over the split's share of the block's key tiles (keys lo .. the last token's position);
+// warp w: q head w % G, tokens 16 (w / G) .. + 15 (an m16 tile).  K and V tiles (64 keys) stream through one shared
+// buffer each (cp.async: the next K loads during P V, the next V during the next S).  splits 1: the sink and the
+// division here, out written; else part rows (m, l, acc) for attn_combine_kernel.
+template <int G, int MT>
+__global__ void __launch_bounds__(G * MT * 32, 2) attn_tc_kernel(
+    const float* __restrict__ q, int64_t qs, const float* __restrict__ r, int64_t rs, const float* __restrict__ sink,
+    int64_t ss, const float* __restrict__ relb, int extent, const __half* __restrict__ kc, const __half* __restrict__ vc,
+    int ring, int H, int Hkv, int64_t p0, int T, int window, float scale, float* __restrict__ part, int max_splits,
+    float* __restrict__ out, int64_t os) {
+    constexpr int NW = G * MT, BQ = 16 * MT;
+    __shared__ __align__(128) __half sK[kTcBK * kD];
+    __shared__ __align__(128) __half sV[kTcBK * kD];
+    __shared__ __align__(16) float sB[NW][16 * kTcTW];
+    const int kvh = blockIdx.y, split = blockIdx.z, nsplit = gridDim.z;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = warp % G, mt = warp / G, h = kvh * G + g;
+    const int tf = blockIdx.x * BQ, tl = min(T, tf + BQ) - 1;
+    // (positions as int: a context of 2^31 tokens is far off)
+    const int pf = (int) p0 + tf, pl = (int) p0 + tl;
+    const int lo = window > 0 ? max(pf - window + 1, 0) : 0;
+    const int ntile = (int) ((pl - lo + kTcBK) / kTcBK);
+    const int per = (ntile + nsplit - 1) / nsplit;
+    const int i0 = split * per, i1 = min(ntile, i0 + per);
+    // the warp's tokens and this lane's two accumulator rows (tokens ra, ra + 8)
+    const int wt = tf + mt * 16;
+    const bool wact = wt <= tl;
+    const int wp0 = (int) p0 + wt, wp1 = (int) p0 + min(wt + 15, tl);
+    const int ra = wt + (lane >> 2), rb = ra + 8;
+    const int pa = (int) p0 + ra, pb = (int) p0 + rb;
+    const int qd = 2 * (lane & 3);
+    uint32_t qf[8][4];
+    {
+        const float* qa = q + (int64_t) min(ra, tl) * qs + (size_t) h * kD;
+        const float* qb = q + (int64_t) min(rb, tl) * qs + (size_t) h * kD;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int c = 16 * ks + qd;
+            qf[ks][0] = tc_h2(qa[c] * scale, qa[c + 1] * scale);
+            qf[ks][1] = tc_h2(qb[c] * scale, qb[c + 1] * scale);
+            qf[ks][2] = tc_h2(qa[c + 8] * scale, qa[c + 9] * scale);
+            qf[ks][3] = tc_h2(qb[c + 8] * scale, qb[c + 9] * scale);
+        }
+    }
+    float o[16][4];
+#pragma unroll
+    for (int n = 0; n < 16; ++n)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) o[n][e] = 0.0f;
+    float ma = -INFINITY, mb = -INFINITY, la = 0.0f, lb = 0.0f;
+    uint32_t rf[4], rl[4];   // r's A fragment (the warp's 16 tokens x kRel) in FP16, and what FP16 left out
+    {
+        const float* r0 = r + (int64_t) min(ra, tl) * rs + (size_t) h * kRel + qd;
+        const float* r1 = r + (int64_t) min(rb, tl) * rs + (size_t) h * kRel + qd;
+        const float v[4][2] = {{r0[0], r0[1]}, {r1[0], r1[1]}, {r0[8], r0[9]}, {r1[8], r1[9]}};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            rf[i] = tc_h2(v[i][0], v[i][1]);
+            const float2 hv = __half22float2(*reinterpret_cast<const __half2*>(&rf[i]));
+            rl[i] = tc_h2(v[i][0] - hv.x, v[i][1] - hv.y);
+        }
+    }
+    const auto load = [&](__half* dst, const __half* src, int j0) {
+        for (int i = threadIdx.x; i < kTcBK * 16; i += NW * 32) {
+            const int key = i >> 4, c = i & 15;
+            const int j = j0 + key;
+            const bool on = j <= pl;
+            tc_cp16(dst + tc_at(key, c), src + ((size_t) ((on ? j : lo) % ring) * Hkv + kvh) * kD + c * 8, on);
+        }
+    };
+    if (i0 < i1) load(sK, kc, lo + i0 * kTcBK);
+    tc_commit();
+    if (i0 < i1) load(sV, vc, lo + i0 * kTcBK);
+    tc_commit();
+    float* tb = sB[warp];
+    for (int it = i0; it < i1; ++it) {
+        const int j0 = lo + it * kTcBK, j1 = j0 + kTcBK - 1;
+        tc_wait1();
+        __syncthreads();   // K(it) in
+        // the warp's keys: wp1 at the most, wp0 - window + 1 at the least
+        const bool run = wact && j0 <= wp1 && (window <= 0 || j1 >= wp0 - window + 1);
+        uint32_t pf16[4][4];
+        if (run) {
+            // S = q K^T a half (32 keys) at a time, then the half's bias b(d) = r . rel_bias[d] (d < extent): for a
+            // quarter (16 keys) the 31 distances it spans, U[t][u] = r_t . rel_bias[D0 - 15 + u], 8 of them a
+            // m16n8k16 x 3 (r and rel_bias each as FP16 + its FP16 remainder, F32 sums) into shared memory, read back
+            // along the diagonals
+            float sc[8][4];
+            const bool bias = wp0 - j1 < extent;
+#pragma unroll
+            for (int hb = 0; hb < 2; ++hb) {
+#pragma unroll
+                for (int n = 4 * hb; n < 4 * hb + 4; ++n) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) sc[n][e] = 0.0f;
+#pragma unroll
+                    for (int kp = 0; kp < 4; ++kp) {
+                        uint32_t b[4];
+                        tc_ldsm(b, sK + tc_at(8 * n + (lane & 7), 4 * kp + (lane >> 3)));
+                        tc_mma(sc[n], qf[2 * kp], b[0], b[1]);
+                        tc_mma(sc[n], qf[2 * kp + 1], b[2], b[3]);
+                    }
+                }
+                if (bias) {
+#pragma unroll
+                    for (int qb = 2 * hb; qb < 2 * hb + 2; ++qb) {
+                        const int base = wp0 - j0 - 16 * qb - 15;   // U's column 0: d of token 0 x key 16 qb + 15
+                        float u[4][4];
+#pragma unroll
+                        for (int nt = 0; nt < 4; ++nt) {
+                            const int d = base + 8 * nt + (lane >> 2);
+                            float2 x0 = make_float2(0.0f, 0.0f), x1 = x0;
+                            if (d >= 0 && d < extent) {
+                                const float* rb = relb + (size_t) d * kRel + qd;
+                                x0 = __ldg(reinterpret_cast<const float2*>(rb));
+                                x1 = __ldg(reinterpret_cast<const float2*>(rb + 8));
+                            }
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) u[nt][e] = 0.0f;
+                            const uint32_t b0 = tc_h2(x0.x, x0.y), b1 = tc_h2(x1.x, x1.y);
+                            tc_mma(u[nt], rf, b0, b1);
+                            // + r's and rel_bias's FP16 remainders: about F32's products (FP16 alone: the 9K text's
+                            // KL 0.0046-0.0048 against 0.0039)
+                            const float2 h0 = __half22float2(*reinterpret_cast<const __half2*>(&b0));
+                            const float2 h1 = __half22float2(*reinterpret_cast<const __half2*>(&b1));
+                            tc_mma(u[nt], rl, b0, b1);
+                            tc_mma(u[nt], rf, tc_h2(x0.x - h0.x, x0.y - h0.y), tc_h2(x1.x - h1.x, x1.y - h1.y));
+                        }
+#pragma unroll
+                        for (int nt = 0; nt < 4; ++nt) {
+                            *reinterpret_cast<float2*>(tb + (lane >> 2) * kTcTW + 8 * nt + qd) =
+                                make_float2(u[nt][0], u[nt][1]);
+                            *reinterpret_cast<float2*>(tb + ((lane >> 2) + 8) * kTcTW + 8 * nt + qd) =
+                                make_float2(u[nt][2], u[nt][3]);
+                        }
+                        __syncwarp();
+                        // S[t][c] (c the key in the quarter) += U[t][t - c + 15]
+#pragma unroll
+                        for (int m = 0; m < 2; ++m)
+#pragma unroll
+                            for (int e = 0; e < 2; ++e) {
+                                const int c = 8 * m + qd + e, ta = lane >> 2;
+                                sc[2 * qb + m][e] += tb[ta * kTcTW + ta - c + 15];
+                                sc[2 * qb + m][2 + e] += tb[(ta + 8) * kTcTW + ta + 8 - c + 15];
+                            }
+                        __syncwarp();
+                    }
+                }
+            }
+            // the mask (causal, the window) unless every key is visible to every row of the warp
+            const bool all = j1 <= wp0 && (window <= 0 || j0 >= wp1 - window + 1);
+            if (!all) {
+#pragma unroll
+                for (int n = 0; n < 8; ++n)
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const int j = j0 + 8 * n + qd + e;
+                        if (j > pa || (window > 0 && j <= pa - window)) sc[n][e] = -INFINITY;
+                        if (j > pb || (window > 0 && j <= pb - window)) sc[n][2 + e] = -INFINITY;
+                    }
+            }
+            // the online softmax: a row's max over its quad
+            float xa = -INFINITY, xb = -INFINITY;
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                xa = fmaxf(xa, fmaxf(sc[n][0], sc[n][1]));
+                xb = fmaxf(xb, fmaxf(sc[n][2], sc[n][3]));
+            }
+#pragma unroll
+            for (int o2 = 1; o2 <= 2; o2 <<= 1) {
+                xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, o2));
+                xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, o2));
+            }
+            const float na = fmaxf(ma, xa), nb = fmaxf(mb, xb);
+            const float ua = na == -INFINITY ? 0.0f : na, ub = nb == -INFINITY ? 0.0f : nb;
+            const float fa = __expf(ma - ua), fb = __expf(mb - ub);
+            ma = na;
+            mb = nb;
+            float sa = 0.0f, sb = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const __half2 a0 = __floats2half2_rn(__expf(sc[2 * kk][0] - ua), __expf(sc[2 * kk][1] - ua));
+                const __half2 a1 = __floats2half2_rn(__expf(sc[2 * kk][2] - ub), __expf(sc[2 * kk][3] - ub));
+                const __half2 a2 = __floats2half2_rn(__expf(sc[2 * kk + 1][0] - ua), __expf(sc[2 * kk + 1][1] - ua));
+                const __half2 a3 = __floats2half2_rn(__expf(sc[2 * kk + 1][2] - ub), __expf(sc[2 * kk + 1][3] - ub));
+                const float2 f0 = __half22float2(a0), f1 = __half22float2(a1), f2 = __half22float2(a2),
+                             f3 = __half22float2(a3);
+                sa += f0.x + f0.y + f2.x + f2.y;   // (the sums of the FP16 weights P V multiplies)
+                sb += f1.x + f1.y + f3.x + f3.y;
+                pf16[kk][0] = *reinterpret_cast<const uint32_t*>(&a0);
+                pf16[kk][1] = *reinterpret_cast<const uint32_t*>(&a1);
+                pf16[kk][2] = *reinterpret_cast<const uint32_t*>(&a2);
+                pf16[kk][3] = *reinterpret_cast<const uint32_t*>(&a3);
+            }
+            la = la * fa + sa;
+            lb = lb * fb + sb;
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                o[n][0] *= fa;
+                o[n][1] *= fa;
+                o[n][2] *= fb;
+                o[n][3] *= fb;
+            }
+        }
+        __syncthreads();   // sK free
+        if (it + 1 < i1) load(sK, kc, j0 + kTcBK);
+        tc_commit();
+        tc_wait1();
+        __syncthreads();   // V(it) in
+        if (run) {
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk)
+#pragma unroll
+                for (int np = 0; np < 8; ++np) {
+                    uint32_t b[4];
+                    tc_ldsm_t(b, sV + tc_at(16 * kk + (lane & 7) + 8 * ((lane >> 3) & 1), 2 * np + (lane >> 4)));
+                    tc_mma(o[2 * np], pf16[kk], b[0], b[1]);
+                    tc_mma(o[2 * np + 1], pf16[kk], b[2], b[3]);
+                }
+        }
+        __syncthreads();   // sV free
+        if (it + 1 < i1) load(sV, vc, j0 + kTcBK);
+        tc_commit();
+    }
+    // the rows' sums over the quad
+#pragma unroll
+    for (int o2 = 1; o2 <= 2; o2 <<= 1) {
+        la += __shfl_xor_sync(0xffffffffu, la, o2);
+        lb += __shfl_xor_sync(0xffffffffu, lb, o2);
+    }
+    if (!wact) return;
+#pragma unroll
+    for (int hr = 0; hr < 2; ++hr) {
+        const int t = hr == 0 ? ra : rb;
+        if (t > tl) continue;
+        const float m = hr == 0 ? ma : mb, l = hr == 0 ? la : lb;
+        if (nsplit == 1) {
+            const float sk = sink[(int64_t) t * ss + h];
+            const float M = fmaxf(m, sk);
+            const float f = m == -INFINITY ? 0.0f : expf(m - M);
+            const float inv = 1.0f / (l * f + expf(sk - M));
+            float* orow = out + (int64_t) t * os + (size_t) h * kD;
+#pragma unroll
+            for (int n = 0; n < 16; ++n)
+                *reinterpret_cast<float2*>(orow + 8 * n + qd) =
+                    make_float2(o[n][2 * hr] * f * inv, o[n][2 * hr + 1] * f * inv);
+        } else {
+            float* pr = part + (((size_t) t * H + h) * max_splits + split) * kPart;
+            if ((lane & 3) == 0) {
+                pr[0] = m;
+                pr[1] = l;
+            }
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                pr[2 + 8 * n + qd] = o[n][2 * hr];
+                pr[3 + 8 * n + qd] = o[n][2 * hr + 1];
+            }
+        }
+    }
+}
+#endif  // STRATA_INK_TC != 0
+
 // ---------------------------------------------------------------- elementwise
 __global__ void gate_kernel(float* __restrict__ o, int64_t os, const float* __restrict__ g, int64_t gs, int n) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -662,6 +999,74 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
     check("attn_part");
     attn_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, ns, max_splits, sink, ss, n_head, out, os);
     check("attn_combine");
+}
+
+// STRATA_INK_PREFILL_ATTN=0: the prompt path's attention on attn (the token path's kernel) again
+static bool tc_env() {
+    static const bool v = [] {
+        const char* e = getenv("STRATA_INK_PREFILL_ATTN");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+bool attn_prompt_on() {
+#if STRATA_INK_TC == 0
+    return false;
+#else
+    return tc_env();
+#endif
+}
+
+bool attn_prompt(const float* q, int64_t qs, const float* r, int64_t rs, const float* sink, int64_t ss,
+                 const float* rel_bias, int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head,
+                 int n_head_kv, int64_t p0, int T, int window, float scale, float* part, int max_splits, float* out,
+                 int64_t os, cudaStream_t s) {
+#if STRATA_INK_TC == 0
+    (void) q, (void) qs, (void) r, (void) rs, (void) sink, (void) ss, (void) rel_bias, (void) extent, (void) kc;
+    (void) vc, (void) ring, (void) n_head, (void) n_head_kv, (void) p0, (void) T, (void) window, (void) scale;
+    (void) part, (void) max_splits, (void) out, (void) os, (void) s;
+    return false;
+#else
+    if (T <= 0) return true;
+    if (!tc_env() || n_head_kv <= 0 || n_head % n_head_kv != 0) return false;
+    static const int nsm = [] {
+        int dev = 0, major = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return major >= 8 ? std::max(1, n) : 0;
+    }();
+    if (nsm == 0) return false;
+    const int G = n_head / n_head_kv;
+    const int MT = G <= 3 ? 2 : 1;
+    const int BQ = 16 * MT;
+    const int nb = (T + BQ - 1) / BQ;
+    // the key splits: the blocks fill the GPU twice over, a split 4 tiles at the least
+    const int64_t span = window > 0 ? std::min<int64_t>(p0 + T, (int64_t) window + BQ) : p0 + T;
+    const int64_t tiles = (span + kTcBK - 1) / kTcBK;
+    const int64_t want = ((int64_t) 2 * nsm + (int64_t) nb * n_head_kv - 1) / ((int64_t) nb * n_head_kv);
+    const int ns = (int) std::max<int64_t>(1, std::min<int64_t>({(int64_t) max_splits, want, tiles / 4}));
+    const dim3 grid((unsigned) nb, (unsigned) n_head_kv, (unsigned) ns);
+#define INK_TC(GG, MM) attn_tc_kernel<GG, MM><<<grid, GG * MM * 32, 0, s>>>(q, qs, r, rs, sink, ss, rel_bias, extent, \
+        (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, T, window, scale, part, max_splits, out, os)
+    switch (G) {
+        case 1: INK_TC(1, 2); break;
+        case 2: INK_TC(2, 2); break;
+        case 3: INK_TC(3, 2); break;
+        case 4: INK_TC(4, 1); break;
+        case 6: INK_TC(6, 1); break;
+        default: return false;
+    }
+#undef INK_TC
+    check("attn_tc");
+    if (ns > 1) {
+        attn_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, ns, max_splits, sink, ss, n_head,
+                                                                               out, os);
+        check("attn_combine");
+    }
+    return true;
+#endif
 }
 
 void gate_sigmoid(float* o, int64_t os, const float* g, int64_t gs, int n, int T, cudaStream_t s) {
