@@ -85,8 +85,66 @@ struct PostProj {
     int64_t p;
     float qk_clip, rel_clip_thr, lf, alpha, eps;
     uint16_t *kc, *vc;
+    const int64_t* pd = nullptr;                // (non-null: the position read from this device word instead of p)
 };
 void post_proj(const PostProj& a, cudaStream_t s);
+
+/// A decode token's (T = 1) fused steps, one launch each and the same arithmetic as the calls they stand for
+/// (STRATA_INK_FUSE=0: those calls).  n_embd <= 4096, a multiple of 32.
+/// mix_tok: [pre] conv_rows of pre_in (E channels, taps pre_w, state pre_state) into pre_tmp and add_rows of it into
+/// pre_out (pre_add), or conv_rows into pre_out; then the mix (out [nq][E]); then [norm] rms_q8 of n_norm rows - row j from the
+/// mix's row (norm_rs ? j : 0), gamma[j] -> x[j] / xq[j] - or [cat] ctrl_cat of n_cat controllers: cur rows out + c
+/// cat_cs, msg rows msg + c E -> cat
+struct MixTok {
+    const float* pre_in = nullptr;
+    const float* pre_w = nullptr;
+    float* pre_state = nullptr;
+    float* pre_tmp = nullptr;
+    float* pre_out = nullptr;
+    bool pre_add = false;
+    States st;
+    const float* query = nullptr;
+    int nq = 0;
+    float* out = nullptr;
+    int n_norm = 0;
+    int norm_rs = 0;
+    const float* gamma[3] = {};
+    float* x[3] = {};
+    void* xq[3] = {};
+    float eps = 0.0f;
+    int n_cat = 0;
+    int64_t cat_cs = 0;
+    const float* msg = nullptr;
+    float* cat = nullptr;
+    float* part = nullptr;   // mix_tok_floats() of scratch (the chunks' partials)
+};
+size_t mix_tok_floats();
+void mix_tok(const MixTok& a, int n_embd, cudaStream_t s);
+
+/// ctrl_apply of n rows (cur rows cs apart, msg / g / f / out rows n_embd apart) and each row's rms_q8 with gamma[j]
+/// into x[j] / xq[j]
+struct CtrlTok {
+    const float* cur = nullptr;
+    int64_t cs = 0;
+    const float *msg = nullptr, *g = nullptr, *f = nullptr;
+    float* out = nullptr;
+    int n = 0;
+    const float* gamma[3] = {};
+    float* x[3] = {};
+    void* xq[3] = {};
+    float eps = 0.0f;
+};
+void ctrl_tok(const CtrlTok& a, int n_embd, cudaStream_t s);
+
+/// attn of one row (T = 1) followed by gate_sigmoid with gate and quantize_q8_1 into outq (out kept too); pd non-null:
+/// the position read from that device word (p0 still gives the split count)
+void attn_tok(const float* q, const float* r, const float* sink, const float* rel_bias, int extent, const uint16_t* kc,
+              const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, const int64_t* pd, int window,
+              float scale, float* part, int max_splits, const float* gate, float* out, void* outq, cudaStream_t s);
+/// The split count attn gives a row at position p (a graph's key)
+int attn_splits(int64_t p, int window, int max_splits);
+/// *d = p (a captured graph's position word, set before its launch)
+void set_pos(int64_t* d, int64_t p, cudaStream_t s);
 
 /// The verify window's post_proj over T rows at positions a.p ..: k / v convolved from kraw / vraw (rows KV apart)
 /// into a.kf / a.vf with the state read but left (conv_win's), the clips and the cache rows of every row - each row
