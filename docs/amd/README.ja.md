@@ -144,6 +144,7 @@ ROCm 7 と 10 はライブラリの名前が同じ（`libamdhip64.so.7` など�
 ### Windows
 
 Windows では手順が別になります（試験的。RX 7900 XT での報告があり、R9700 は未確認です）。
+インストールからトラブル対応までの Windows の手順: [docs/WINDOWS.ja.md](../WINDOWS.ja.md)。
 
 > **Visual Studio 2026（MSVC 14.51）+ ROCm SDK 7.14.1 で `'isgreater' cannot overload` が出る場合。** MSVC 14.51 の
 > `<cmath>` は `isgreater` 〜 `isunordered`、`isnormal`、`signbit` を `constexpr` にしました。そのため TheRock の
