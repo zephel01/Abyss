@@ -85,6 +85,18 @@ endforeach()
 target_compile_options(strata_hip_runtime INTERFACE
   "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<CONFIG:Debug>>>:-O3>"
   "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<CONFIG:Debug>>>:-DNDEBUG>")
+# ... and on every HIP target of the tree, not only those linking strata_hip_runtime: strata_mmq (llama.cpp's MMQ
+# kernels and the activation quantizer) links hip::host only, so with an empty CMAKE_HIP_FLAGS_RELEASE it was built
+# at -O0 - 1.6-3.3 KB of scratch a lane on every mul_mat_q kernel; one 1024-token dense layer 2841 ms against 4.6 ms
+# at -O3 on a Radeon 8060S; the RX 9060 XT's 1368 ms against FP16's 3.5 ms in #49.  (Directory scope: the targets
+# defined after this include.)
+add_compile_options(
+  "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<CONFIG:Debug>>>:-O3>"
+  "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<CONFIG:Debug>>>:-DNDEBUG>")
+if(NOT CMAKE_HIP_FLAGS_RELEASE MATCHES "-O")
+  message(STATUS "Strata HIP: CMAKE_HIP_FLAGS_RELEASE is '${CMAKE_HIP_FLAGS_RELEASE}' (no -O level) - every HIP "
+                 "target gets -O3 -DNDEBUG from cmake/hip_backend.cmake")
+endif()
 # Windows: the CRT's "unsafe function" notes on getenv / fopen / sscanf and the HIP runtime's nodiscard returns made
 # 300+ warnings a translation unit (issue #2)
 if(WIN32)
