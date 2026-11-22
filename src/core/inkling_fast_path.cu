@@ -103,6 +103,9 @@ struct Ink {
     // splits, window layers', the CPU-lane plan, the tail skip) - the kernel arguments that change between tokens
     int64_t* pos_d = nullptr;
     float* mixp = nullptr;   // (mix_tok's partials)
+    // the attention's small F32 projections (rel, sink, the conv taps) beside its Q8 ones: a side stream, fork / join
+    cudaStream_t side = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     struct TokGraph {
         CapturedGraph g;
         uint64_t requests = 0;   // (the routes it posts: FastState::expected)
@@ -331,6 +334,12 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
     K.aoq = take(HD / 32 * 36);
     K.pos_d = (int64_t*) take(64);
     K.mixp = (float*) take(ik::mix_tok_floats() * 4);
+    if (cudaStreamCreateWithFlags(&K.side, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&K.ev_fork, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&K.ev_join, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        K.side = nullptr;   // (no fork: the projections in one call)
+    }
     qwen35_state_ = K.base;   // (qwen35_reset / the snapshot see a fast-path state)
     std::fprintf(stderr, "inkling: CUDA%d %d layer applications a token (%d physical, layers %d-%d x %d), KV %.2f GB for "
                          "%lld tokens (window layers' rings %lld rows)\n",
@@ -345,6 +354,9 @@ void Glm5Model::ink_free() {
         std::fprintf(stderr, "inkling: CUDA%d token graphs: %llu captured, %llu runs\n", dev_,
                      (unsigned long long) fast_->ink->graph_caps, (unsigned long long) fast_->ink->graph_runs);
     fast_->ink->graphs.clear();   // (before the buffers they read)
+    if (fast_->ink->ev_fork != nullptr) cudaEventDestroy(fast_->ink->ev_fork);
+    if (fast_->ink->ev_join != nullptr) cudaEventDestroy(fast_->ink->ev_join);
+    if (fast_->ink->side != nullptr) cudaStreamDestroy(fast_->ink->side);
     if (fast_->ink->win != nullptr) {
         if (fast_->ink->win->base != nullptr) cudaFree(fast_->ink->win->base);
         delete fast_->ink->win;
@@ -561,7 +573,22 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
                 j[nj++] = {Ly.kcp.q, K.xq[i1], K.xn[i1], K.kd, nullptr, 1.0f, Ly.kcp.type, E, ik::kConv * Hkv};
                 j[nj++] = {Ly.vcp.q, K.xq[i2], K.xn[i2], K.vd, nullptr, 1.0f, Ly.vcp.type, E, ik::kConv * Hkv};
             }
-            if (!gf::mv(j, nj, s)) { err = "inkling: the attention projections"; return false; }
+            gf::MvJob jq[8], jf[8];
+            int nq8 = 0, nf32 = 0;
+            for (int i = 0; i < nj; ++i) (j[i].type == gf::kTypeF32 ? jf[nf32++] : jq[nq8++]) = j[i];
+            if (ftok && K.side != nullptr && !F->prof_on && nq8 > 0 && nf32 > 0) {
+                // (the F32 rows - rel, sink, the conv taps - on the side stream while the Q8 ones run: the same
+                // kernels a row, apart)
+                cudaEventRecord(K.ev_fork, s);
+                cudaStreamWaitEvent(K.side, K.ev_fork, 0);
+                if (!gf::mv(jf, nf32, K.side)) { err = "inkling: the attention projections (F32)"; return false; }
+                cudaEventRecord(K.ev_join, K.side);
+                if (!gf::mv(jq, nq8, s)) { err = "inkling: the attention projections"; return false; }
+                cudaStreamWaitEvent(s, K.ev_join, 0);
+            } else if (!gf::mv(j, nj, s)) {
+                err = "inkling: the attention projections";
+                return false;
+            }
             if (F->prof_on) F->mark("ink_proj");
             // ---- conv, clips, the caches
             float* conv = S.conv;
