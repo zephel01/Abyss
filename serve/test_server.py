@@ -902,6 +902,24 @@ class GpuChoice(unittest.TestCase):
             with mock.patch.dict(os.environ, {"GPU_MAX_HW_QUEUES": "1"}):
                 self.assertEqual(server.child_env({"gpu": [0], "backend": "hip"})["GPU_MAX_HW_QUEUES"], "1")   # the shell's
 
+    def test_hip_no_hipblaslt_on_windows(self):
+        """Windows HIP engines run rocBLAS without hipBLASLt unless the shell or the config sets it (#49)."""
+        from unittest import mock
+        from serve import server
+        with mock.patch.object(server, "amd_igpu_index", return_value=None), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ROCBLAS_USE_HIPBLASLT", None)
+            hip = {"gpu": [0], "backend": "hip"}
+            if os.name != "nt":
+                self.assertNotIn("ROCBLAS_USE_HIPBLASLT", server.child_env(hip))   # Linux: untouched
+            with mock.patch.object(server, "_WINDOWS_TEST", True):
+                self.assertEqual(server.child_env(hip)["ROCBLAS_USE_HIPBLASLT"], "0")
+                own = {**hip, "env": {"ROCBLAS_USE_HIPBLASLT": "1"}}
+                self.assertEqual(server.child_env(own)["ROCBLAS_USE_HIPBLASLT"], "1")   # the config's wins
+                self.assertNotIn("ROCBLAS_USE_HIPBLASLT", server.child_env({"gpu": [0]}))   # CUDA: untouched
+                with mock.patch.dict(os.environ, {"ROCBLAS_USE_HIPBLASLT": "1"}):
+                    self.assertEqual(server.child_env(hip)["ROCBLAS_USE_HIPBLASLT"], "1")   # the shell's
+
     def test_amd_igpu_index(self):
         import tempfile
         from serve.server import amd_igpu_index

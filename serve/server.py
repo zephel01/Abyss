@@ -1565,6 +1565,9 @@ def shipped_prior(cfg: dict) -> str:
     return ""
 
 
+_WINDOWS_TEST = False   # (tests: child_env as on Windows)
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -1581,6 +1584,11 @@ def child_env(cfg: dict) -> dict:
         # prompts 8K / 16K ran 586-650 / 676-684 tok/s on 1 (a setting R9700 guides spread against a MES firmware's
         # idle power; the same 12 W idle here either way), 653-737 / 748-756 on ROCm's 4 and 866-995 / 999-1,011 on 2
         env.setdefault("GPU_MAX_HW_QUEUES", "2")
+        # Windows: rocBLAS without hipBLASLt unless the shell or the config says otherwise - the FP16 hipblasGemmEx
+        # crashed in amdhip64_7.dll once rocBLAS handed it to hipBLASLt (RX 9060 XT, ROCm SDK 7.14.1, #49; the same
+        # stack in ROCm/rocm-libraries#8242 on 7.14 nightlies); only the products the own GEMM leaves to hipBLAS
+        if os.name == "nt" or _WINDOWS_TEST:
+            env.setdefault("ROCBLAS_USE_HIPBLASLT", "0")
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
