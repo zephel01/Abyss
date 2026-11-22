@@ -9,6 +9,32 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.191 - 2026-11-22
+
+Inkling 2 Mini long prompts run on a tensor-core attention kernel: 165K prompts 765 -> 5,298 tok/s and 255K 489 ->
+4,896 on an RTX 5090 (UD-Q4_K_XL), the KL the same, decode unchanged. Server fixes for Inkling 2 tool calls and
+thinking, and broken past tool-call arguments no longer fail a request (all models). Other models give the same bits
+as v1.3.190 (7-config md5 check). Ornith-1.5-397B 16G64G was checked with v1.3.190's dense tier
+(`STRATA_GLM_PREFILL_DENSE_TIER=1`, #53): `=2` matches `=0` bit for bit, and 77K prompts on a 16 GB card take 135.8
+-> 76.2 s at 128K and 145.0 -> 73.7 s at 256K (`--kv int8`), needles found, decode the same.
+
+### Changed
+
+- Inkling 2 Mini prompts on CUDA: the prompt path's attention runs on its own tensor-core kernel instead of the token
+  path's one-row-at-a-time kernel. A block of 32 tokens x the KV head's 3 q heads takes 64-key tiles of the FP16 cache
+  through shared memory (cp.async); S = q K^T and P V are f16 `mma.sync` with F32 sums and an online softmax in
+  registers; the relative bias comes from 3 small MMAs a 16-key quarter (r and the bias table split into FP16 + FP16
+  remainder, about F32); the sink, the causal mask and the 1,024-key window are Inkling's, and tiles outside a warp's
+  window are skipped. The attention's sub-batch goes 512 -> 2,048 rows with it (`STRATA_INK_PREFILL_SUB` still sets
+  it). RTX 5090, UD-Q4_K_XL all in VRAM: prompt 4K 3,650 -> 5,572 tok/s, 8K 3,784 -> 6,874, 32K 2,644 -> 7,795, 165K
+  765 -> 5,298, 255K 489 -> 4,896; decode unchanged (8K 130.0-130.6 vs 130.3-130.8 tok/s, 165K 71.8 vs 71.4, 255K 57.9 vs 57.6).
+  The bits change (sum order, q and P rounded to FP16), the KL does not: against llama.cpp's Q8_0 over the prompt
+  path's logits 0.0056 vs 0.0058 with the old kernel (`STRATA_DETERMINISTIC=1`, 3,071 positions); the 9K text
+  0.0044-0.0053 vs 0.0037-0.0045 (511 positions; the token path 0.0046, and the new kernel's distance from the old one,
+  KL 0.0044, is the old kernel's own run-to-run distance, 0.0041). A 128K prompt finds its 3 needles; 165K / 255K
+  summaries read right. `STRATA_INK_PREFILL_ATTN=0` restores the old kernel and the 512-row sub-batch (the old bits).
+  AMD keeps the old kernel. Other models give the same bits (7-config md5 check).
+
 ### Fixed
 
 - Inkling 2: a thinking message that comes after the answer's text or a tool call now goes to `reasoning_content`
@@ -67,23 +93,6 @@ edit tasks +14%, Japanese +9%, the same tokens). With nothing set, CUDA gives th
 - `docs/WINDOWS.md` / `docs/WINDOWS.ja.md`: v1.3.189 confirmed on Windows 11 with an RX 9060 XT (Adrenalin 26.11.2):
   the build passes with the MMQ kernels optimized, Qwen3.8 16G64G 2K prompts 9 -> 391 tok/s, SenseNova-Loop-9B 8K
   prompts 1,014 tok/s (#49).
-
-### Changed
-
-- Inkling 2 Mini prompts on CUDA: the prompt path's attention runs on its own tensor-core kernel instead of the token
-  path's one-row-at-a-time kernel. A block of 32 tokens x the KV head's 3 q heads takes 64-key tiles of the FP16 cache
-  through shared memory (cp.async); S = q K^T and P V are f16 `mma.sync` with F32 sums and an online softmax in
-  registers; the relative bias comes from 3 small MMAs a 16-key quarter (r and the bias table split into FP16 + FP16
-  remainder, about F32); the sink, the causal mask and the 1,024-key window are Inkling's, and tiles outside a warp's
-  window are skipped. The attention's sub-batch goes 512 -> 2,048 rows with it (`STRATA_INK_PREFILL_SUB` still sets
-  it). RTX 5090, UD-Q4_K_XL all in VRAM: prompt 4K 3,650 -> 5,572 tok/s, 8K 3,784 -> 6,874, 32K 2,644 -> 7,795, 165K
-  765 -> 5,298, 255K 489 -> 4,896; decode unchanged (8K 130.0-130.6 vs 130.3-130.8 tok/s, 165K 71.8 vs 71.4, 255K 57.9 vs 57.6).
-  The bits change (sum order, q and P rounded to FP16), the KL does not: against llama.cpp's Q8_0 over the prompt
-  path's logits 0.0056 vs 0.0058 with the old kernel (`STRATA_DETERMINISTIC=1`, 3,071 positions); the 9K text
-  0.0044-0.0053 vs 0.0037-0.0045 (511 positions; the token path 0.0046, and the new kernel's distance from the old one,
-  KL 0.0044, is the old kernel's own run-to-run distance, 0.0041). A 128K prompt finds its 3 needles; 165K / 255K
-  summaries read right. `STRATA_INK_PREFILL_ATTN=0` restores the old kernel and the 512-row sub-batch (the old bits).
-  AMD keeps the old kernel. Other models give the same bits (7-config md5 check).
 
 ## v1.3.189 - 2026-11-22
 
