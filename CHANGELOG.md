@@ -14,6 +14,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   address or garbage read past the embedding table; a drafter step (Qwen3.5/3.8 NextN, DSpark, GLM NextN) whose logits
   were NaN ends the drafts there. The embedding gathers, the draft confidence and DSpark's Markov row read zeros / 0
   for such an id. Finite logits give the same bits as before.
+- NVFP4 models: a file whose NVFP4 expert tensors lack their `.scale` tensors (`ffn_gate_up_exps.scale`,
+  `ffn_gate_exps.scale` / `ffn_up_exps.scale`, `ffn_down_exps.scale`) is refused at load with the names missing; it ran
+  unscaled before (every answer garbage, no message). The published Inkling 2 Mini files all carry them.
 
 ## v1.3.186 - 2026-11-22
 

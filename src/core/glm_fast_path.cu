@@ -1011,6 +1011,15 @@ bool Glm5Model::fast_setup(std::string& err) {
                                     cudaSuccess)
                                 missing += P + "NVFP4 scales (device) ";
                         }
+                    } else {
+                        // an NVFP4 expert tensor without its .scale (or gate's without up's): run unscaled, every
+                        // product would be off by the tensor's amax - a garbage answer with no message.  Refused
+                        std::string lack;
+                        if (gu_need && sg == nullptr) lack += fused ? " ffn_gate_up_exps.scale" : " ffn_gate_exps.scale";
+                        if (gu_need && !fused && su == nullptr) lack += " ffn_up_exps.scale";
+                        if (d_need && sd == nullptr) lack += " ffn_down_exps.scale";
+                        missing += P + "NVFP4 expert scales missing (" + lack.substr(1) +
+                                   ": the file is incomplete - re-download or re-convert it) ";
                     }
                 }
             }
