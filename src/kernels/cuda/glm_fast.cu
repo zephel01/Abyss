@@ -4260,8 +4260,8 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if (warp == 0) {
         // NVFP4: the expert's second-level scale (gate and up share it in NVIDIA's checkpoints; [2 * id] = theirs)
         float sc = 1.0f;
-        if constexpr (TG == 40)
-            if (d.nv_scale != nullptr && plan_id != nullptr && plan_id[ei] >= 0) sc = d.nv_scale[2 * plan_id[ei]];
+        // (any type: a requantized NVFP4 model keeps the scales on its i-quant experts; null for other models)
+        if (d.nv_scale != nullptr && plan_id != nullptr && plan_id[ei] >= 0) sc = d.nv_scale[2 * plan_id[ei]];
         if (limit < 0.0f) {
             q8_1_store_warp(situ_act(sc * sg[lane], sc * su[lane]), hq + (size_t) ei * (n_ff / 32) + chunk, lane);
         } else {
@@ -4333,9 +4333,8 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
         s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
         float w = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
         // NVFP4: the expert's down scale_2 ([2 * id + 1]) folds into its weight (the down sum is linear)
-        if constexpr (TD == 40)
-            if ((int) threadIdx.x < k && d.nv_scale != nullptr && plan_id != nullptr && plan_id[threadIdx.x] >= 0)
-                w *= d.nv_scale[2 * plan_id[threadIdx.x] + 1];
+        if ((int) threadIdx.x < k && d.nv_scale != nullptr && plan_id != nullptr && plan_id[threadIdx.x] >= 0)
+            w *= d.nv_scale[2 * plan_id[threadIdx.x] + 1];   // (any type, as the gate/up scale)
         s_w[threadIdx.x] = w;
     }
     __syncthreads();

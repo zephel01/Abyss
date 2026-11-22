@@ -33,6 +33,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   - `STRATA_HIP_EXPERTS=mmq / own / fp16` fixes the path without the check; `STRATA_HIP_EXPERTS_CHECK_SCALE` (test
     hook) multiplies the timed MMQ cost. CUDA is unchanged (7-config md5 check).
 
+- Fix (Inkling 2 Mini, unsloth's UD-IQ3_XXS / UD-IQ2_XXS): these files keep the per-expert scales of the NVFP4 model
+  on experts requantized to i-quants, and the engine applied them only to NVFP4 weights, so every answer was garbage
+  (KL 12). The scales now apply whatever the type; KL against the Q8_0: UD-IQ3_XXS 0.028, UD-IQ2_XXS 0.078. Their
+  prompts also run batched now (layers 20-22 keep attention in IQ3_XXS): RTX 5090, 4K prompt about 3,800 tok/s all in
+  VRAM; decode 136 / 140 tok/s, at an 8 GB VRAM cap 103 / 120. Other models give the same bits (7-config md5 check).
+
 ## v1.3.185 - 2026-11-22
 
 Inkling 2 Mini with thinking off: the English planning it still writes no longer lands in the answer. The engine is

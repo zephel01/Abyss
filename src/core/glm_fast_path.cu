@@ -978,28 +978,33 @@ bool Glm5Model::fast_setup(std::string& err) {
                 if (Ly.mixed() && (Ly.gu_type == 40 || Ly.up_type == 40))
                     missing += P + "NVFP4 gate/up of different types ";
                 // NVFP4 (type 40): the tensors' second-level scales (F32 [n_expert] each, ffn_*_exps.scale); gate and
-                // up must share theirs (NVIDIA's checkpoints do: one scale for the fused gate_up) - it sits inside
-                // the SiLU, so the kernels take one number for both
-                if (Ly.gu_type == 40 || Ly.d_type == 40) {
-                    F->nv_guard = kNvGuard;   // (set here, before the prompt path and the pool size their buffers)
+                // A requantized NVFP4 model (unsloth's Inkling UD-IQ2_XXS / UD-IQ3_XXS) keeps the scale tensors
+                // on gate_up / down of other types: they scale the product all the same, whatever the type
+                const bool fused = w_.count(P + "ffn_gate_up_exps.scale") != 0;
+                const bool has_sc = fused || w_.count(P + "ffn_gate_exps.scale") != 0 ||
+                                    w_.count(P + "ffn_down_exps.scale") != 0;
+                if (Ly.gu_type == 40 || Ly.d_type == 40 || has_sc) {
+                    if (Ly.gu_type == 40 || Ly.d_type == 40)
+                        F->nv_guard = kNvGuard;   // (set here, before the prompt path and the pool size their buffers)
                     // (a fused gate_up tensor - inkling - carries the one scale both share)
-                    const bool fused = w_.count(P + "ffn_gate_up_exps.scale") != 0;
                     const float* sg = f32(fused ? "ffn_gate_up_exps.scale" : "ffn_gate_exps.scale");
                     const float* su = f32(fused ? "ffn_gate_up_exps.scale" : "ffn_up_exps.scale");
                     const float* sd = f32("ffn_down_exps.scale");
-                    if (sg != nullptr && su != nullptr && sd != nullptr) {
+                    const bool gu_need = Ly.gu_type == 40 || sg != nullptr || su != nullptr;
+                    const bool d_need = Ly.d_type == 40 || sd != nullptr;
+                    if ((!gu_need || (sg != nullptr && su != nullptr)) && (!d_need || sd != nullptr)) {
                         const int NE = g.n_expert;
-                        std::vector<float> hg((size_t) NE), hu((size_t) NE), hd((size_t) NE);
-                        cudaMemcpy(hg.data(), sg, (size_t) NE * 4, cudaMemcpyDeviceToHost);
-                        cudaMemcpy(hu.data(), su, (size_t) NE * 4, cudaMemcpyDeviceToHost);
-                        cudaMemcpy(hd.data(), sd, (size_t) NE * 4, cudaMemcpyDeviceToHost);
+                        std::vector<float> hg((size_t) NE, 1.0f), hu((size_t) NE, 1.0f), hd((size_t) NE, 1.0f);
+                        if (sg != nullptr) cudaMemcpy(hg.data(), sg, (size_t) NE * 4, cudaMemcpyDeviceToHost);
+                        if (su != nullptr) cudaMemcpy(hu.data(), su, (size_t) NE * 4, cudaMemcpyDeviceToHost);
+                        if (sd != nullptr) cudaMemcpy(hd.data(), sd, (size_t) NE * 4, cudaMemcpyDeviceToHost);
                         if (hg != hu) {
                             missing += P + "NVFP4 gate/up scales differ (one SiLU-side scale per expert is supported) ";
                         } else {
                             Ly.nv_host.assign((size_t) 2 * NE, 1.0f);
                             for (int e = 0; e < NE; ++e) {
-                                if (Ly.gu_type == 40) Ly.nv_host[(size_t) 2 * e] = hg[(size_t) e];
-                                if (Ly.d_type == 40) Ly.nv_host[(size_t) 2 * e + 1] = hd[(size_t) e];
+                                if (sg != nullptr) Ly.nv_host[(size_t) 2 * e] = hg[(size_t) e];
+                                if (sd != nullptr) Ly.nv_host[(size_t) 2 * e + 1] = hd[(size_t) e];
                             }
                             if (cudaMalloc(&Ly.nv_scale, (size_t) 2 * NE * 4) != cudaSuccess ||
                                 cudaMemcpy(Ly.nv_scale, Ly.nv_host.data(), (size_t) 2 * NE * 4, cudaMemcpyHostToDevice) !=
