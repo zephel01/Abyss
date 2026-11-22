@@ -9,6 +9,14 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.192 - 2026-11-23
+
+Inkling 2 Mini decode is one CUDA graph a token with its small kernels fused: 131.8 -> 185.6 tok/s at a short context,
+8K 184.1, 165K 69.4 -> 94.4 on an RTX 5090 (UD-Q4_K_XL), the same tokens bit for bit. Inkling's DSpark drafter is in
+as an opt-in (`STRATA_INK_DSPARK`, exact): code and edit answers 219-237 tok/s, while prose, Japanese and long
+contexts are a little slower than without it - leave it off for those. Other models give the same bits as v1.3.191
+(7-config md5 check).
+
 ### Added
 
 - `STRATA_INK_DSPARK=<the drafter GGUF>` (opt-in, off by default; Inkling 2 Mini, CUDA, one GPU): unsloth's DSpark
