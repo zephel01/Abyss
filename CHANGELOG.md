@@ -19,11 +19,16 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   head (the hidden-out projection folded into a 256-wide factor at load), and take the drafts after the first from
   a Markov step over 1,024 candidates; ties go to the lower id, NaN scores lose. Prompt-lookup repeats are still
   tried first, and each window's width comes from the cost table and the drafts' calibrated confidence. The kept
-  tokens are the target's own: md5 equal with and without it on code / prose / Japanese / edit prompts at 512
-  tokens, short and 8K context. RTX 5090, UD-Q4_K_XL, median of 3 (off -> drafter): code 132.0 -> 185.2 tok/s
-  (+40%), prose 131.3 -> 147.7 (+12%), Japanese 131.1 -> 136.0 (+4%), edit 132.0 -> 213.6 (+62%); 8K code 132.6 ->
-  218.9 (+65%), 8K edit 132.4 -> 221.0 (+67%). The drafter takes 0.6 GB of VRAM and ~1.0 ms a step. With the setting
-  unset nothing loads and the decode is the same as before (7-config md5 check).
+  tokens are the target's own: md5 equal with and without it (and with prompt lookup) on code / prose / Japanese /
+  edit prompts at 512 tokens, short and 8K context. The taps on the token path are inside the token's CUDA graph
+  (below). A gate (`STRATA_INK_DSPARK_GATE`, default on) rests the drafter for 32 .. 512 steps when 16 drafted steps
+  gave fewer tokens a millisecond than the token alone (its ~1.1 ms a step against a ~5.4 ms graphed token). RTX
+  5090, UD-Q4_K_XL, 512 tokens, median of 3, with the token graph (off -> drafter): code 186.3 -> 221.1 tok/s (+19%),
+  edit 183.0 -> 219.0 (+20%), 8K code 183.9 -> 227.9 (+24%), 8K edit 183.7 -> 237.3 (+29%), prose 184.0 -> 178.1
+  (-3%), Japanese 183.8 -> 175.8 (-4%; without the gate 169.7 / 158.6); 1,024 tokens after an 8K prompt: code 183.7
+  -> 209.3, prose 183.4 -> 235.5; after 165K: 98.0 -> 93.0 (the window's attention columns cost more there). The
+  drafter takes 0.6 GB of VRAM. With the setting unset nothing loads and the decode is the same as before (7-config
+  md5 check).
 - Inkling 2 Mini's DSpark drafter from the run config: `./setup-deepseek.sh --model inkling2mini` names
   `dspark-Inkling-2-Mini-Q8_0.gguf` in the config's env (`STRATA_INK_DSPARK`) when the file is already on disk
   (`<data>/models/unsloth/Inkling-2-Mini-GGUF/dspark/`, the Hugging Face repo's folder; setup does not download it),
