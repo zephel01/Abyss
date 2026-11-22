@@ -697,9 +697,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     // so an expert's rows summed apart with what else was resident: the same prompt came out ~1e-6 apart with another
     // VRAM budget (a drafter loaded) or pool, and greedy answers parted later.  RTX 5090, Qwen3.8 16G64G: 8K / 32K
     // prompts 2,025 / 2,945 tok/s either way.  Set as 0: stream-k as before
-    // qwen4exp: PDL on by default on a discrete sm_120+ card too (pdl.hpp; STRATA_GLM_PDL=0: off).  Set before any
-    // launch of this model; other models leave the discrete-card default off
-    if (g_.q4x) strata::kernels::pdl_model_default_on();
+    // qwen4exp and Inkling 2: PDL on by default on a discrete sm_120+ card too (pdl.hpp; STRATA_GLM_PDL=0: off).  Set
+    // before any launch of this model; other models leave the discrete-card default off.  Inkling 2 Mini UD-Q4_K_XL,
+    // RTX 5090, with its token graph: 150.2 -> 162.8 tok/s, the same tokens
+    if (g_.q4x || g_.ink) strata::kernels::pdl_model_default_on();
     if (g_.q4x && getenv("STRATA_MMQ_WHOLE_K") == nullptr) {
 #if defined(_WIN32)
         _putenv_s("STRATA_MMQ_WHOLE_K", "1");

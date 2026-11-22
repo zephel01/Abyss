@@ -12,8 +12,8 @@
 // pdl_launch is a plain <<<>>> launch.
 //
 // Default: on for an integrated GPU of compute capability 9.0+ (DGX Spark's GB10: Qwen3.8 16G64G 25.0 -> 30.7 tok/s
-// without the drafter, 43.4 -> 46.5 with it) and for Qwen3.8 on a discrete sm_120+ card (RTX 5090: +7.8% without the
-// drafter); off for other discrete cards and models.  STRATA_GLM_PDL=0/1 sets it.
+// without the drafter, 43.4 -> 46.5 with it) and for Qwen3.8 / Inkling 2 on a discrete sm_120+ card (RTX 5090: +7.8%
+// without the drafter / +8.4%); off for other discrete cards and models.  STRATA_GLM_PDL=0/1 sets it.
 #pragma once
 
 #include <atomic>
@@ -82,7 +82,7 @@ inline bool pdl_enabled() {
             std::fprintf(stderr, "glm fast: CUDA%d programmatic dependent launch %s\n", dev,
                          on ? (env > 0 ? "on (STRATA_GLM_PDL=1)"
                                        : igpu ? "on (integrated GPU; STRATA_GLM_PDL=0: off)"
-                                              : "on (Qwen3.8 on sm_120+; STRATA_GLM_PDL=0: off)")
+                                              : "on (Qwen3.8 / Inkling 2 on sm_120+; STRATA_GLM_PDL=0: off)")
                             : "off (STRATA_GLM_PDL=1: needs sm_90 or newer)");
     }
     return on;
