@@ -35,6 +35,12 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(recs[1]["ms"], 30.0)
         self.assertNotIn("spec", recs[1])
 
+    def test_mmq_optimized_from_the_engine_line(self):
+        """#49: the MMQ kernels' build state from the engine's line (None without it)."""
+        self.assertTrue(A.mmq_optimized(["x", "glm prefill: CUDA0 MMQ kernels built optimized"]))
+        self.assertFalse(A.mmq_optimized(["glm prefill: CUDA0 MMQ kernels built WITHOUT optimization (-O0): ..."]))
+        self.assertIsNone(A.mmq_optimized(["glm prefill: CUDA0 chunks of 2048 tokens"]))
+
     def test_plan_share_from_the_cpu_lane_line(self):
         line = ("glm fast: CUDA0 CPU lane: 10 threads, an expert 0.357 ms on the CPU vs 0.322 ms over PCIe -> of 0..8 "
                 "RAM-tier experts the CPU takes {}")

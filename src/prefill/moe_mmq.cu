@@ -27,6 +27,20 @@ int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 
 bool built() { return true; }
 
+bool optimized() {
+#if defined(GGML_USE_HIP)
+#if defined(__OPTIMIZE__)
+    return true;
+#else
+    return false;
+#endif
+#elif defined(__CUDACC_DEBUG__)
+    return false;
+#else
+    return true;
+#endif
+}
+
 bool supported(int t) {
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:

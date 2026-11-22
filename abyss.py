@@ -2728,6 +2728,16 @@ PCIE_GEN = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}
 PCIE_LANE_GBS = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.97, 5: 3.94, 6: 7.88}   # per lane and direction
 
 
+def mmq_optimized(log_lines) -> bool | None:
+    """Whether the engine's MMQ kernels were built optimized, from its "MMQ kernels built ..." line (None: no line -
+    an engine without MMQ, or older).  An empty CMAKE_HIP_FLAGS_RELEASE built them at -O0 on Windows (#3, #49)."""
+    for x in log_lines:
+        m = re.search(r"MMQ kernels built (optimized|WITHOUT optimization)", x)
+        if m:
+            return m.group(1) == "optimized"
+    return None
+
+
 def plan_share(log_lines) -> float | None:
     """The PCIe share the engine started with, from its CPU-lane line ("of 0..8 RAM-tier experts the CPU takes
     k0 .. k8"): the sweep's share that gives the same plan (k = f - round(share f), as set_pcie_share builds it), else
@@ -3232,11 +3242,13 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
     uma = bool(found) and all(g.get("integrated") for g in found)   # (DGX Spark / GB10: no PCIe link to its memory)
     if uma:
         links = {k: "unified memory (no PCIe link)" for k in links} or {"GPU": "unified memory (no PCIe link)"}
+    mmq_opt = mmq_optimized(log_lines)
     summary = (f"Abyss v{version} | {name or cfg_path.stem} | {gpus} | "
                f"{'memory unified' if uma else 'PCIe ' + (', '.join(links.values()) or '?')} | RAM {total:.0f} GB | SSD "
                f"{f'{disk:.1f} GB/s' if disk else '?'} | decode {_mean(dec):.1f} tok/s"
                + (f" | prompt 8k {pre['8192 tokens']:.0f} tok/s" if "8192 tokens" in pre else "")
-               + f" | quality {q_txt.split(' (')[0]} | bottleneck: {verdict or '?'}")
+               + f" | quality {q_txt.split(' (')[0]} | bottleneck: {verdict or '?'}"
+               + (" | MMQ built without optimization (-O0)" if mmq_opt is False else ""))
     lines = ["### Abyss benchmark", "", summary, "",
              f"- date: {time.strftime('%Y-%m-%d %H:%M')}; setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}"
              f"{', backend ' + cfg.get('backend', 'cuda')}",
@@ -3245,6 +3257,10 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
              f"{f'{disk:.1f} GB/s' if disk else '? (not measured)'}",
              f"- PCIe while working: " + ("; ".join(f"{k} {v}" for k, v in links.items()) or "? (not readable here: an AMD "
                                                                                         "GPU on Windows, or no GPU found)"),
+             *([f"- engine build: the MMQ prompt kernels " + ("built optimized" if mmq_opt else
+                "built WITHOUT optimization (-O0) - prompts through them run ~100x+ slower; rebuild with "
+                "CMAKE_HIP_FLAGS_RELEASE=\"-O3 -DNDEBUG\" (docs/amd/README.md, \"Windows\")")]
+               if mmq_opt is not None else []),
              "", f"decode (writing the answer): mean {_mean(dec):.1f} tokens/s over {len(dec)} answers of 256 tokens "
                  "(greedy, thinking off)"]
     lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]

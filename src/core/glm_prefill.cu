@@ -1541,6 +1541,14 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                  (double) S->borrow_bytes / 1048576.0, (double) S->arena_bytes / 1048576.0,
                  (double) (w16_elems * 2 + w32_elems * 4) / 1048576.0, (double) S->gbuf_bytes / 1048576.0,
                  (double) S->pbuf_bytes / 1048576.0, S->NP, S->nland, (double) S->nland * (double) gstride / 1048576.0);
+    // whether the MMQ kernels were built optimized (abyss.py's --bench reads it): an empty CMAKE_HIP_FLAGS_RELEASE
+    // left them at -O0 on Windows, ~600x slower, while every other kernel ran at full speed (#3, #49)
+    if (mmq::built())
+        std::fprintf(stderr, "glm prefill: CUDA%d MMQ kernels %s\n", dev_,
+                     mmq::optimized() ? "built optimized"
+                                      : "built WITHOUT optimization (-O0): prompts through MMQ run ~100x+ slower - "
+                                        "rebuild with CMAKE_HIP_FLAGS_RELEASE=\"-O3 -DNDEBUG\" (docs/amd/README.md, "
+                                        "\"Windows\")");
     return true;
 }
 

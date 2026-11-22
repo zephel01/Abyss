@@ -48,6 +48,7 @@
 // A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
 namespace strata::prefill::mmq {
 bool built() { return false; }
+bool optimized() { return true; }
 bool supported(int) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }

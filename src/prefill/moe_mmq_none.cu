@@ -17,6 +17,7 @@ constexpr size_t kQ8Block = 4 * sizeof(float) + 128;   // (MMQ's activation bloc
 }  // namespace
 
 bool built() { return false; }
+bool optimized() { return true; }
 bool supported(int) { return false; }
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
     const int64_t qk = strata::qt::blck_size(t);

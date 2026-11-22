@@ -12,6 +12,9 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
+/// The MMQ kernels were compiled with optimization: HIP host and device code take one -O level (an empty
+/// CMAKE_HIP_FLAGS_RELEASE built them at -O0, ~600x slower, #49); CUDA's device code is optimized unless built with -G.
+bool optimized();
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
