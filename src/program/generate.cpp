@@ -1825,7 +1825,9 @@ static int glm_pack_generate(const Options& o) {
     // (V4.1 1017 too since its window is pipelined - dsv4_verify.cu verify_part_v41, 2026-11-14: JA256 against one
     // draft a window, the edit task 55.5 -> 71.5 tok/s +28.8%, swe-bench text 64.4 -> 77.1 +19.8%, prose +1.0 / -0.7%;
     // margin 1.10 - at 1.02 prose -0.9 / -1.4%)
-    const bool spec_adapt = spec_adapt_env >= 0 ? spec_adapt_env != 0 : ds_v4 || glm53 || model.geometry().v41;
+    // (Inkling 2 Mini's opt-in window, STRATA_INK_DRAFT=1: the repeats' adaptive windows too)
+    const bool spec_adapt = spec_adapt_env >= 0 ? spec_adapt_env != 0
+                                                : ds_v4 || glm53 || model.geometry().v41 || model.geometry().ink;
     // STRATA_DS4_SPEC_GATE_FRESH (the gate's and the cost table's warm-up, below): default on with the wider windows
     // (V4 0731, V4.1 1017, GLM-5.3-Flash's opt-in window); with one draft a window (STRATA_DS4_SPEC_ADAPT=0) the old
     // gate - there the fresh gate let more windows through on prose (V4.1 JA256: 9 against 4, 33% kept) and cost 4%

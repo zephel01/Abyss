@@ -19,6 +19,15 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   the tier at the old chunk; its tokens match `=0`'s bit for bit on V4, V4.1, GLM-5.3 and Ornith 35B / 122B). The idea is the issue reporter's prototype; the
   code is Abyss's own (`src/core/glm_prefill.cu`, `DenseTier`). With the setting unset nothing changes (the same bits
   as v1.3.189).
+- `STRATA_INK_DRAFT=1` (opt-in, off by default; Inkling 2 Mini, CUDA, one GPU): a verify window for Inkling - the
+  token and up to 5 prompt-lookup drafts through the 48 layer applications (24 layers, the core looped 3 times) at
+  once, every column computed as the token alone (the dense GEMVs `mvn_mv`, the norms a row, each row's attention
+  split as at its own position, the short-convolution states read during the window and moved past the kept tokens
+  only), so greedy answers are the same tokens with and without it (md5 equal on code / prose / Japanese / edit
+  prompts, 512 tokens, short and 8K context). RTX 5090, UD-Q4_K_XL, short context: an edit task 131.5 -> 150.2 tok/s
+  (+14%, 64% of the drafts kept), Japanese 131.1 -> 142.9 (+9%), code +1%, prose the same; at 8K the edit task
+  112.9 -> 116.4 (+3%), code 114.1 -> 111.2 (-2.5%, few drafts kept) - hence opt-in. With the
+  setting unset the decode is the same as before (the same bits).
 
 ## v1.3.189 - 2026-11-22
 
