@@ -1293,6 +1293,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // DSpark (STRATA_DS4_DSPARK): the drafter's weights and expert cache before the pool takes what is left
         if (!dspark_load(err)) return false;
         if (!dflash_load(err)) return false;   // (Qwen3.8's DFlash 2, STRATA_Q4X_DFLASH)
+        if (!inkd_load(err)) return false;     // (Inkling 2 Mini's DSpark, STRATA_INK_DSPARK)
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -4789,6 +4790,8 @@ void Glm5Model::fast_destroy() {
     dspark_destroy();
     dflash_report();
     dflash_destroy();
+    inkd_report();
+    inkd_destroy();
     prefill_destroy();
     q35d_destroy();
     ink_free();   // (inkling_fast_path.cu: its slots and scratch)
@@ -7849,6 +7852,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "dspark: the context commit";
         return false;
     }
+    if (inkd_ != nullptr && !inkd_commit(p, 1, false, F->cs)) {
+        err = "ink dspark: the context commit";
+        return false;
+    }
     if (next_port_ != nullptr) {
         // qwen4exp's split: the residual to the next part, which runs the rest (the head on the last part); the
         // token comes back from the last part
@@ -8217,6 +8224,7 @@ const char* Glm5Model::lane_kind() const {
 const char* Glm5Model::drafter_kind() const {
     if (dsp_ != nullptr) return "dspark";
     if (dfl_ != nullptr) return "dflash";
+    if (inkd_ != nullptr) return "dspark";
     if (chain_mtp_on()) return g_.q4x ? "mtp" : "nextn";
     return has_mtp() ? "mtp" : "none";
 }

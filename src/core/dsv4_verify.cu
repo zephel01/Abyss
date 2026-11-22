@@ -217,7 +217,7 @@ bool Glm5Model::verify_ready() const {
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
         // (inkling: its window opt-in - STRATA_INK_DRAFT=1, ink_window; one part, no prefetch / lookahead)
-        if (m->g_.ink && (!ink_draft_env() || m->split_next_ != nullptr || m != this)) return false;
+        if (m->g_.ink && (!(ink_draft_env() || inkd_ != nullptr) || m->split_next_ != nullptr || m != this)) return false;
         if (F != nullptr && m->g_.arch == 0) {
             // glm5-next: one part, the batched window (STRATA_GLM_WINDOW=1); its NextN block allowed (the drafter);
             // no prefetch / lookahead / deferral / refusal edit; no EXL3 layers (verify_moe runs the ggml experts)

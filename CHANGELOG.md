@@ -9,6 +9,22 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- `STRATA_INK_DSPARK=<the drafter GGUF>` (opt-in, off by default; Inkling 2 Mini, CUDA, one GPU): unsloth's DSpark
+  drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`) feeds the exact verify window of `STRATA_INK_DRAFT` (turned on with it).
+  The drafter's 3 layers read the target's layer inputs at visits 5 / 23 / 41 and its final normed row (taps on the
+  token path, the window and the batched prompt), keep their own context K/V (two 1,024-position windows and a global
+  layer of `STRATA_INK_DSPARK_CTX` positions, default 32,768), run one 8-row block a step, share the target's output
+  head (the hidden-out projection folded into a 256-wide factor at load), and take the drafts after the first from
+  a Markov step over 1,024 candidates; ties go to the lower id, NaN scores lose. Prompt-lookup repeats are still
+  tried first, and each window's width comes from the cost table and the drafts' calibrated confidence. The kept
+  tokens are the target's own: md5 equal with and without it on code / prose / Japanese / edit prompts at 512
+  tokens, short and 8K context. RTX 5090, UD-Q4_K_XL, median of 3 (off -> drafter): code 132.0 -> 185.2 tok/s
+  (+40%), prose 131.3 -> 147.7 (+12%), Japanese 131.1 -> 136.0 (+4%), edit 132.0 -> 213.6 (+62%); 8K code 132.6 ->
+  218.9 (+65%), 8K edit 132.4 -> 221.0 (+67%). The drafter takes 0.6 GB of VRAM and ~1.0 ms a step. With the setting
+  unset nothing loads and the decode is the same as before (7-config md5 check).
+
 ## v1.3.190 - 2026-11-22
 
 Long prompts on 16 GB cards: `STRATA_GLM_PREFILL_DENSE_TIER=1` (opt-in, #53) lends the dense weights' VRAM to the

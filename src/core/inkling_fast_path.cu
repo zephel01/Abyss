@@ -379,6 +379,8 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
     if (F->prof_on) F->mark("start");
     if (p == 0) ink_reset();   // (a new sequence: the conv states start at zero; the caches' rows are written first)
     else ink_win_commit(p);    // (a verify window not settled by spec_rewind: its columns up to p kept)
+    inkd_settle(p);            // (the DSpark drafter's: the same columns into its context before this token's taps)
+    int visit = 0;             // (the layer applications in order: the drafter's taps 5 / 23 / 41)
     int nb = 0;                // the next free residual buffer
     const auto fresh = [&]() -> float* { return K.hb[nb++ % Ink::kBufs]; };
     // the embedding row (fast_token left it in state_), rms-normed with token_embd_norm
@@ -420,6 +422,8 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
         const auto& Ly = K.L[(size_t) il];
         auto& S = K.S[(size_t) sl];
         const bool swa = Ly.swa;
+        if (inkd_ != nullptr) ink_tap(visit, h, E, 1, nullptr, false, s);   // (the residual entering the application)
+        ++visit;
         // ---- the attention's inputs
         const float* in[3] = {h, h, h};
         if (Ly.attn_rq != nullptr) {
@@ -543,6 +547,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
     // the head: the depth attention with output_res_query, output_norm -> head_x / head_xq
     ik::mix(states(blocks, h), K.out_rq, 1, E, 1, K.mixo, s);
     gf::rms_q8(K.mixo, nullptr, K.out_norm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    if (inkd_ != nullptr) ink_tap(48, F->head_x, E, 1, nullptr, false, s);   // (the drafter's tap 48)
     if (F->prof_on) F->mark("q35_head");
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -658,6 +663,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
     const auto fresh = [&]() -> float* { return W.hb[nb++ % Ink::kBufs]; };
     float* h = fresh();
     ik::rms_rows(io.emb, E, K.tok_norm, g.norm_eps, E, T, h, E, s);
+    int visit = 0;   // (the drafter's taps, as the token path's)
     Blocks blocks;
     const auto states = [&](const Blocks& b, const float* cur) {
         ik::States st;
@@ -706,6 +712,8 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         const auto& Ly = K.L[(size_t) il];
         auto& S = K.S[(size_t) sl];
         const bool swa = Ly.swa;
+        if (inkd_ != nullptr) ink_tap(visit, h, E, T, nullptr, false, s);
+        ++visit;
         // ---- the attention's inputs: in[j] rows ins apart
         const float* in[3] = {h, h, h};
         int64_t ins = E;
@@ -835,6 +843,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         if (!layer(il, il, il, nullptr)) return false;
     ik::mix(states(blocks, h), K.out_rq, 1, E, T, W.mixo, s);
     gf::rms_q8_rows(W.mixo, E, nullptr, 0, K.out_norm, g.norm_eps, E, io.head_x, E, io.head_xq, E / 32, T, s);
+    if (inkd_ != nullptr) ink_tap(48, io.head_x, E, T, nullptr, false, s);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         err = std::string("inkling verify: ") + cudaGetErrorString(e);
@@ -1075,6 +1084,7 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
     const bool has_msgs = pass > 0;
     const bool starts = il % g.ink_block == 0;
     float* hin = C.h;
+    if (inkd_ != nullptr) ink_tap(ia, hin, E, T, nullptr, true, s);   // (the DSpark drafter's taps 5 / 23 / 41)
     const float* ab[ik::kMaxStates];   // the attention mix's blocks
     const int an = C.bn;
     for (int i = 0; i < an; ++i) ab[i] = C.bl[i];
