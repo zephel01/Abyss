@@ -17,9 +17,6 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - NVFP4 models: a file whose NVFP4 expert tensors lack their `.scale` tensors (`ffn_gate_up_exps.scale`,
   `ffn_gate_exps.scale` / `ffn_up_exps.scale`, `ffn_down_exps.scale`) is refused at load with the names missing; it ran
   unscaled before (every answer garbage, no message). The published Inkling 2 Mini files all carry them.
-- Inkling 2 Mini, server: thinking off without tools ends the prompt with the answer message's opening
-  (`<|message_model|><|content_text|>`), so the model answers at once; before, it still wrote a short English plan
-  first (hidden as reasoning, but the wait was there). With tools the model still picks text or a call itself.
 - Inkling 2 Mini, server: tool calls. The model's call messages (`<|message_model|>NAME<|content_invoke_tool_json|>
   {"name": .., "args": {..}}<|end_message|>`) come back as ordinary tool calls on both APIs (several a turn too); one
   to an undeclared tool or with broken JSON stays text. Tool results are headed with their call's name for the
