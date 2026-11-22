@@ -100,6 +100,7 @@ cd ~/llm/apps/Abyss
 
 Windows 11 では `setup-deepseek.bat` をダブルクリック（同じオプションも使えます。例: `setup-deepseek.bat --model qwen38
 --download-model`）。そのあと `START-ABYSS.bat --config abyss-<名前>.json`（セットアップが表示した名前）で起動します。
+NVIDIA と AMD の詳しい手順と、つまずきやすい点: [docs/WINDOWS.ja.md](docs/WINDOWS.ja.md)。
 
 API で試す:
 

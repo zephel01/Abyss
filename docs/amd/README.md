@@ -139,6 +139,7 @@ options when the compiler changes. With those versions, delete `build-hip/` firs
 ### Windows
 
 Windows has its own steps (experimental: reported on an RX 7900 XT, not yet run on an R9700).
+The full Windows guide, from the install to troubleshooting: [docs/WINDOWS.md](../WINDOWS.md).
 
 > **Visual Studio 2026 (MSVC 14.51) + ROCm SDK 7.14.1: `'isgreater' cannot overload`.** MSVC 14.51's `<cmath>` makes
 > `isgreater` .. `isunordered`, `isnormal` and `signbit` `constexpr`, and the HIP headers of TheRock's 7.14.1 (Clang
