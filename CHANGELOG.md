@@ -9,6 +9,14 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.188 - 2026-11-22
+
+Windows AMD builds compiled the MMQ kernels without optimization (-O0): prompts on those kernels ran hundreds of times
+slower (#49: one dense layer 1,368 ms against 3.5 ms on FP16; the 8060S built the same way: 2,841 ms against 4.6 ms).
+Every HIP target now gets -O3, the log and `--bench` say whether the MMQ kernels were built optimized, and the server
+sets `ROCBLAS_USE_HIPBLASLT=0` on Windows AMD (hipBLASLt crash in ROCm 7.14). Other models give the same bits as
+v1.3.187 (7-config md5 check; HIP on the 8060S the same tokens).
+
 - AMD on Windows (#49): the MMQ prompt kernels were built at -O0 when the toolchain left `CMAKE_HIP_FLAGS_RELEASE`
   empty (TheRock ROCm 7.14.1 + CMake + Ninja, as in #3): the -O3 of v1.3.29 reached only the targets linking
   `strata_hip_runtime`, and `strata_mmq` does not. Every HIP target now gets `-O3 -DNDEBUG` outside Debug builds, and
