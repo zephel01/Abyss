@@ -14,10 +14,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Inkling 2 Mini decode on CUDA: a token is one CUDA graph (`STRATA_INK_GRAPH`, default on), its small kernels fused
   (`STRATA_INK_FUSE`), and programmatic dependent launch on for it on sm_120+ (`STRATA_GLM_PDL`) - the same tokens
   bit for bit. The fused kernels each run the arithmetic of the ones they replace: the depth-attention mix with the
-  norms after it (or the controllers' input norms) and the post convolution + residual add before it, the
-  controllers' apply with its norms, the attention's combine with the sigmoid gate and the q8_1; the attention reads a
+  norms after it (or the controllers' input norms) and the post convolution + residual add before it (two launches:
+  the chunk sums, then a block a row), the controllers' apply with its norms (a block a row), the attention's combine with the sigmoid gate and the q8_1; the attention reads a
   warp's 32 value rows at once instead of one after another (the same sums in the same order: 21 -> 9 us a layer at a
-  short context). 1,540 -> 890 kernels a token. RTX 5090, UD-Q4_K_XL, short context: 131.4 -> 162.8 tok/s. The
+  short context); the attention's small F32 projections run on a side stream beside the Q8 ones. 1,540 -> 1,020
+  kernels a token. RTX 5090, UD-Q4_K_XL, 512 tokens, median of 3: short context 131.8 -> 185.6 tok/s, 8K 130.9 ->
+  184.1, 165K 69.4 -> 94.4. The
   graph replays the same kernels with the position from a device word, one graph per attention split count; not
   with the profile marks, dumps, expert prefetch / lookahead, the expert helper or image rows. The verify window
   (`STRATA_INK_DRAFT=1`) gives the same tokens as without it. `STRATA_INK_GRAPH=0` / `STRATA_INK_FUSE=0` /
