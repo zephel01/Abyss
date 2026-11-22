@@ -14,8 +14,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 Windows AMD builds compiled the MMQ kernels without optimization (-O0): prompts on those kernels ran hundreds of times
 slower (#49: one dense layer 1,368 ms against 3.5 ms on FP16; the 8060S built the same way: 2,841 ms against 4.6 ms).
 Every HIP target now gets -O3, the log and `--bench` say whether the MMQ kernels were built optimized, and the server
-sets `ROCBLAS_USE_HIPBLASLT=0` on Windows AMD (hipBLASLt crash in ROCm 7.14). Other models give the same bits as
-v1.3.187 (7-config md5 check; HIP on the 8060S the same tokens).
+sets `ROCBLAS_USE_HIPBLASLT=0` on Windows AMD (hipBLASLt crash in ROCm 7.14). RDNA4 cards read prompts on the own
+GEMM's WMMA kernel by default (#49, RX 9070 XT: Ornith-1.5-122B 5K / 19K / 77K prompts 901 / 868 / 596 -> 1,612 /
+1,471 / 830 tok/s). Other models give the same bits as v1.3.187 (7-config md5 check; HIP on the 8060S the same tokens).
 
 - AMD on Windows (#49): the MMQ prompt kernels were built at -O0 when the toolchain left `CMAKE_HIP_FLAGS_RELEASE`
   empty (TheRock ROCm 7.14.1 + CMake + Ninja, as in #3): the -O3 of v1.3.29 reached only the targets linking
@@ -29,6 +30,11 @@ v1.3.187 (7-config md5 check; HIP on the 8060S the same tokens).
   crashed in `amdhip64_7.dll` through hipBLASLt on ROCm SDK 7.14.1, #49); a value in the shell or the config's
   `"env"` wins.
 - docs/amd (Windows): how to check a build's -O level, and the hipBLASLt note.
+- AMD RDNA4 (gfx1200 / gfx1201): the own GEMM's 16-bit products (the prompt path's dense projections) run on the WMMA
+  kernel by default instead of the plain FMA kernel (`STRATA_HIP_GEMM_WMMA12`, default on; `0` takes the plain one).
+  Measured by the #49 reporter on an RX 9070 XT (Linux, ROCm 10): `own_gemm_test --lib` 40 / 40 PASS, Ornith-1.5-122B
+  16G64G prompts 5K / 19K / 77K: 901 / 868 / 596 tok/s plain, 1,612 / 1,471 / 830 tok/s WMMA. The log says
+  `16-bit inputs: WMMA (gfx12)`. RDNA3 / RDNA3.5 (gfx11) and other cards are unchanged.
 
 ## v1.3.187 - 2026-11-22
 

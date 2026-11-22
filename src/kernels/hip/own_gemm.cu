@@ -11,11 +11,11 @@
 //            gfx11 (RDNA3 / 3.5, v_wmma_f32_16x16x16_{f16,bf16}): an operand lane l holds the 16 k of row l % 16 (both
 //              halves of the wave the same); D lane l holds D[2 e + l / 16][l % 16], e < 8.
 //            gfx12 (RDNA4, the _gfx12 forms): an operand lane l holds k 8 (l / 16) .. + 7 of row l % 16; D lane l
-//              holds D[8 (l / 16) + e][l % 16].  Built for gfx12 cards, but taken only with STRATA_HIP_GEMM_WMMA12=1
-//              until it has been run on one.
+//              holds D[8 (l / 16) + e][l % 16].  The gfx12 default since #49's RX 9070 XT run (own_gemm_test --lib
+//              40 / 40, prompts 1.4 - 1.8x the plain kernel); STRATA_HIP_GEMM_WMMA12=0 takes the plain one.
 //   plain - any input type, FMA in F32 on a tile of 16 R x 16 R outputs (16 x 16 threads, R x R each, strided by 16
 //          so that a row of threads reads and writes consecutive addresses), k in steps of 16 through LDS.  Its sum
-//          is the plain k order.  The default for F32 inputs, for gfx12 and for every other architecture.
+//          is the plain k order.  The default for F32 inputs and for every architecture without a WMMA kernel.
 // Both are deterministic (one fixed order a product, no atomics, no split k).
 #include "strata/hip_compat/hip_gemm.hpp"
 
@@ -385,14 +385,14 @@ Kern kern_of(int dev) {
         if (colon != std::string::npos) arch.resize(colon);
         if (env_on("STRATA_HIP_GEMM_PORTABLE")) k = Kern::plain;
         else if (arch.rfind("gfx11", 0) == 0) k = Kern::wmma11;
-        else if (arch.rfind("gfx12", 0) == 0 && env_on("STRATA_HIP_GEMM_WMMA12")) k = Kern::wmma12;
+        else if (arch.rfind("gfx12", 0) == 0 && !env_off("STRATA_HIP_GEMM_WMMA12")) k = Kern::wmma12;
     }
     g_kern[dev].store(1 + (int) k, std::memory_order_relaxed);
     if (!g_said[dev].exchange(true))
         std::fprintf(stderr, "hip gemm: HIP%d (%s) on the own GEMM - 16-bit inputs: %s, F32: plain%s\n", dev,
                      arch.c_str(),
-                     k == Kern::wmma11 ? "WMMA (gfx11)" : k == Kern::wmma12 ? "WMMA (gfx12, untested)" : "plain",
-                     arch.rfind("gfx12", 0) == 0 && k == Kern::plain ? " (STRATA_HIP_GEMM_WMMA12=1: the WMMA kernel)" : "");
+                     k == Kern::wmma11 ? "WMMA (gfx11)" : k == Kern::wmma12 ? "WMMA (gfx12)" : "plain",
+                     arch.rfind("gfx12", 0) == 0 && k == Kern::wmma12 ? " (STRATA_HIP_GEMM_WMMA12=0: the plain kernel)" : "");
     return k;
 }
 

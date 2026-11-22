@@ -68,12 +68,13 @@ ROCm reaches the GPU through the kernel's amdgpu driver and the `/dev/kfd` devic
 ROCm 10's packages are split by GPU architecture. **Install every architecture you will use.** On a GPU whose
 architecture is missing, rocBLAS and hipBLASLt find no kernels.
 
-> The prompt path's matrix products run on Abyss's own kernels on HIP (WMMA on RDNA3 / RDNA3.5, a plain kernel on
-> RDNA4 and other cards; `STRATA_HIP_OWN_GEMM` in the [manual](../MANUAL.md)), so rocBLAS / hipBLASLt are no longer
+> The prompt path's matrix products run on Abyss's own kernels on HIP (WMMA on RDNA3 / RDNA3.5 and RDNA4, a plain kernel
+> on other cards; `STRATA_HIP_OWN_GEMM` in the [manual](../MANUAL.md)), so rocBLAS / hipBLASLt are no longer
 > called during a run - issue #49 (Windows, TheRock ROCm 7.14.1) crashed inside them. The build still links hipBLAS
 > (headers, and the library path behind `STRATA_HIP_OWN_GEMM=0`). On a Radeon 8060S the own kernels read prompts
-> faster than hipBLAS did (Ornith-1.5-35B Q4_K_M, 2K / 16K prompts: 801 -> 1,320 / 600 -> 847 tok/s; GLM-5.3-Flash Maya-S-v2 IQ2_XXS 16K: 136 -> 248). On RDNA4 the WMMA kernel is opt-in
-> (`STRATA_HIP_GEMM_WMMA12=1`) until it has been run on such a card.
+> faster than hipBLAS did (Ornith-1.5-35B Q4_K_M, 2K / 16K prompts: 801 -> 1,320 / 600 -> 847 tok/s; GLM-5.3-Flash Maya-S-v2 IQ2_XXS 16K: 136 -> 248). On RDNA4 the WMMA kernel is the default
+> since #49's RX 9070 XT run (Ornith-1.5-122B 5K / 19K / 77K prompts: 901 / 868 / 596 -> 1,612 / 1,471 / 830 tok/s against the
+> plain kernel); `STRATA_HIP_GEMM_WMMA12=0` takes the plain one.
 
 1. Add the repository and its signing key as AMD's ROCm install guide describes. On the machine above,
    `/etc/apt/sources.list.d/amdrocm-stable.sources` reads:

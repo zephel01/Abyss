@@ -69,12 +69,13 @@ ROCm はカーネルの amdgpu ドライバと、ドライバが作る `/dev/kfd
 ROCm 10 のパッケージは GPU のアーキテクチャごとに分かれています。**使う GPU のアーキテクチャをすべて入れて
 ください。** 入っていないアーキテクチャの GPU では、rocBLAS / hipBLASLt のカーネルが読めません。
 
-> HIP ではプロンプト経路の行列積を Abyss 自前のカーネルで計算します（RDNA3 / RDNA3.5 は WMMA、RDNA4 とそのほかのカードは素の
+> HIP ではプロンプト経路の行列積を Abyss 自前のカーネルで計算します（RDNA3 / RDNA3.5 と RDNA4 は WMMA、そのほかのカードは素の
 > カーネル。[マニュアル](../MANUAL.ja.md) の `STRATA_HIP_OWN_GEMM`）。そのため実行中に rocBLAS / hipBLASLt は呼ばれません。
 > issue #49（Windows、TheRock ROCm 7.14.1）はこの中で落ちていました。ビルドは今も hipBLAS をリンクします（ヘッダーと、
 > `STRATA_HIP_OWN_GEMM=0` で使うライブラリ経路のため）。Radeon 8060S では自前カーネルの方が hipBLAS より速く prompt を読みます
-> （Ornith-1.5-35B Q4_K_M、2K / 16K の prompt: 801 -> 1,320 / 600 -> 847 tok/s。GLM-5.3-Flash Maya-S-v2 IQ2_XXS の 16K: 136 -> 248）。RDNA4 の WMMA カーネルは、実機で動かすまでは
-> `STRATA_HIP_GEMM_WMMA12=1` を付けたときだけ使います。
+> （Ornith-1.5-35B Q4_K_M、2K / 16K の prompt: 801 -> 1,320 / 600 -> 847 tok/s。GLM-5.3-Flash Maya-S-v2 IQ2_XXS の 16K: 136 -> 248）。RDNA4 も #49 の RX 9070 XT での結果から
+> WMMA カーネルが既定です（Ornith-1.5-122B の 5K / 19K / 77K の prompt: 素のカーネルの 901 / 868 / 596 -> 1,612 / 1,471 / 830 tok/s）。
+> `STRATA_HIP_GEMM_WMMA12=0` で素のカーネルに戻ります。
 
 1. AMD の ROCm インストールの説明に従って、リポジトリと署名鍵を登録します。上の PC の
    `/etc/apt/sources.list.d/amdrocm-stable.sources` は次のとおりです。
