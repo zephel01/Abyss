@@ -712,6 +712,10 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
                                   const int32_t* __restrict__ tokens, int64_t n_embd, float* __restrict__ y) {
     const int t = blockIdx.y;
     const int64_t b = blockIdx.x;
+    if (tokens[t] < 0 || tokens[t] == 0x7fffffff) {   // (no row: the argmax's "no pick" or a draft's -1 - zeros)
+        for (int i = threadIdx.x; i < QK_K; i += blockDim.x) y[(size_t) t * n_embd + b * QK_K + i] = 0.0f;
+        return;
+    }
     const uint8_t* row = table + (size_t) tokens[t] * row_bytes;
     dq_dispatch<float>(ty, row, b, y + (size_t) t * n_embd + b * QK_K, threadIdx.x);
 }

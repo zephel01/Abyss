@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- All models: logits that are all NaN no longer feed the argmax's "no pick" id (0x7fffffff) on as a token. The next
+  token stops the run with one message (`the logits at position N are NaN ... - stopping`) instead of an illegal
+  address or garbage read past the embedding table; a drafter step (Qwen3.5/3.8 NextN, DSpark, GLM NextN) whose logits
+  were NaN ends the drafts there. The embedding gathers, the draft confidence and DSpark's Markov row read zeros / 0
+  for such an id. Finite logits give the same bits as before.
+
 ## v1.3.186 - 2026-11-22
 
 HIP MoE prompts check their expert kernel once and leave MMQ where it is broken-slow (#49: Qwen3.8-Flash-Next 16G64G at

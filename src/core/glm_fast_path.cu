@@ -7946,6 +7946,11 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     if (g.ink) strata::kernels::ink::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
+    // STRATA_TEST_NAN_AT=<position> (a test): that position's logits all NaN - the token path must stop with one
+    // message, not read past the embedding table
+    static const long long nan_at = [] { const char* v = getenv("STRATA_TEST_NAN_AT"); return v ? std::atoll(v) : -1LL; }();
+    if (nan_at >= 0 && p == nan_at)
+        cudaMemsetAsync(tail->sc_ + tail->sc_logits, 0xff, (size_t) g.n_vocab * sizeof(float), FT->cs);
     // STRATA_Q4X_ARGMAX_MB (qwen4exp on CUDA, default on): the argmax over 128 blocks - the same index
 #if defined(STRATA_USE_HIP)
     static const bool am_mb = [] { const char* v = getenv("STRATA_Q4X_ARGMAX_MB"); return v != nullptr && std::atoi(v) != 0; }();
@@ -8005,6 +8010,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     last_tok_ = FT->tok_h[0];
+    if (!glmfast::token_ok(last_tok_, g.n_vocab, p, err)) return false;   // (every logit NaN: the argmax's "no pick")
     if (g.q4x && split_next_ == nullptr) q4x_ple_spec(last_tok_, pos_);   // (the next token's rows, if greedy)
     if (gp) fast_gap_mark(tw);
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
@@ -8086,6 +8092,7 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
         F->gap_sample += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
         ++F->gap_sample_n;
     }
+    if (!glmfast::token_ok(F->tok_h[0], g_.n_vocab, pos_ - 1, err)) return -1;
     return F->tok_h[0];
 }
 
@@ -8504,6 +8511,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             cudaSetDevice(TL->dev_);
             if (!glmfast::wait_event(TL->fast_->ev_done, "glm spec token", err)) return false;
             y = TL->fast_->tok_h[0];
+            if (!glmfast::token_ok(y, g_.n_vocab, pos_ - 1, err)) return false;
             if (strata::kernels::bias_banned(y)) {   // (enqueued before the bias set switched on)
                 y = TL->bias_repick(y, nullptr, sp, err);
                 if (y < 0) return false;
@@ -8524,6 +8532,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         if (!TL->fast_mtp(p, next, err)) return false;
         if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err) || !TL->fast_->route_ok(err)) return false;
         d = TL->fast_->mtp_tok_h[0];
+        if (d < 0 || d >= g_.n_vocab) d = 0;   // (the drafter's logits NaN - "no pick": a draft the token rejects)
         return true;
     };
     const auto check = [&]() -> bool {
@@ -9106,6 +9115,7 @@ int Glm5Model::part_token_wait(std::string& err) {
         return -1;
     }
     last_tok_ = F->tok_h[0];
+    if (!glmfast::token_ok(last_tok_, g_.n_vocab, pos_ - 1, err)) return -1;
     return last_tok_;
 }
 

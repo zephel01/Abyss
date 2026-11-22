@@ -265,6 +265,10 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     __shared__ float part[32];
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
+    if (ids[t] < 0 || ids[t] >= n_vocab) {   // (no token: probability 0)
+        if (threadIdx.x == 0) probs[t] = 0.0f;
+        return;
+    }
     const float m = l[ids[t]];
     float s = 0.0f;
     for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) s += __expf(l[i] - m);

@@ -1665,7 +1665,8 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
     }
     __syncthreads();
     if (hash != nullptr) {   // a hash-routed layer: the token's ids from the table, no selection
-        if (tid < k) s_ids[tid] = hash[(size_t) toks[t] * k + tid];
+        // (a window column whose token names no row - a draft's -1: the row of token 0, its output is rejected)
+        if (tid < k) s_ids[tid] = hash[(size_t) (toks[t] >= 0 && toks[t] != 0x7fffffff ? toks[t] : 0) * k + tid];
         __syncthreads();
     } else {
         topk_argmax(s_sel, E, k, s_ids, s_bv, s_bi);

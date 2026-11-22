@@ -1366,7 +1366,7 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp draft step", err)) return false;
         conf[k] = F->q35_mt_conf_h[0];
         n = k + 1;
-        if (conf[k] < stop_below) break;
+        if (!(conf[k] >= stop_below)) break;   // (NaN too: a step whose logits were NaN ends the chain)
         if (ple_pf && k + 1 < kmax) {   // (a kept draft with a step after it: the window may hold it)
             cudaMemcpy(&toks[k], F->q35_mt_tok + k, sizeof(int), cudaMemcpyDeviceToHost);
             pf_tok[k + 3] = toks[k];
@@ -1381,6 +1381,13 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         ss_drafted_ = true;
     }
     if (!F->route_ok(err)) return false;
+    // a step whose logits were all NaN left the argmax's "no pick" (0x7fffffff): the drafts end before it
+    for (int k = 0; k < n; ++k)
+        if (toks[k] < 0 || toks[k] >= g_.n_vocab) {
+            for (int j = k; j < n; ++j) conf[j] = 0.0f;
+            n = k;
+            break;
+        }
     for (int k = 0; k < n; ++k) drafts[k] = toks[k];
     // STRATA_GLM_WINDOW_JUNK=1 (a test of glm5-next's window): kmax random drafts, confidence 1 - windows whose drafts
     // are (nearly) all rejected, for STRATA_GLM_WINDOW_CHECK / _REWIND_CHECK

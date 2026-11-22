@@ -1923,7 +1923,9 @@ __global__ void __launch_bounds__(256) dspark_markov_kernel(const float* __restr
     __shared__ float sh[32];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int pv = *prev;
-    for (int i = tid; i < RANK; i += blockDim.x) s_m[i] = __half2float(w1[(size_t) pv * RANK + i]);
+    // (a previous draft outside the vocabulary - the argmax's "no pick" when every logit was NaN: no Markov row)
+    const bool pv_ok = pv >= 0 && pv < n_vocab;
+    for (int i = tid; i < RANK; i += blockDim.x) s_m[i] = pv_ok ? __half2float(w1[(size_t) pv * RANK + i]) : 0.0f;
     __syncthreads();
     if (blockIdx.x == 0) {
         float a = 0.0f;
@@ -1931,7 +1933,7 @@ __global__ void __launch_bounds__(256) dspark_markov_kernel(const float* __restr
         for (int i = tid; i < RANK; i += blockDim.x) a += cp[n_embd + i] * s_m[i];
         a = block_sum(a, sh);
         if (cb != nullptr) a += *cb;
-        if (tid == 0) *conf = 1.0f / (1.0f + expf(-a));
+        if (tid == 0) *conf = pv_ok ? 1.0f / (1.0f + expf(-a)) : 0.0f;
     }
     const int wpb = blockDim.x >> 5;
     if constexpr (F16W) {

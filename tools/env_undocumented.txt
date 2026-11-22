@@ -250,6 +250,7 @@ STRATA_STAGER_THREADS  # src/prefill/prefill.cpp
 STRATA_STATE_HASH  # src/program/generate.cpp
 STRATA_STATE_HASH_GDN  # src/prefill/prefill.cpp
 STRATA_TEST_CACHE_FAIL  # src/program/generate.cpp
+STRATA_TEST_NAN_AT  # src/core/glm_fast_path.cu
 STRATA_TG_FLUSH_US  # src/core/session.cpp
 STRATA_TOPK_OLD  # src/kernels/cuda/qsa_select.cu
 STRATA_TRACE  # src/prefill/prefill.cpp

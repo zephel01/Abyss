@@ -1682,7 +1682,8 @@ __global__ void __launch_bounds__(256) top_prob_kernel(const float* __restrict__
     float sum = 0.0f;
     for (int i = threadIdx.x; i < n; i += 256) sum += expf(l[i] - m);
     sum = block_sum256(sum, sred);
-    if (threadIdx.x == 0) out[0] = expf(l[tok[0]] - m) / sum;
+    // (a token outside the vocabulary - the argmax's "no pick" when every logit is NaN: probability 0, the chain stops)
+    if (threadIdx.x == 0) out[0] = tok[0] >= 0 && tok[0] < n ? expf(l[tok[0]] - m) / sum : 0.0f;
 }
 // ffn[t] *= sigmoid(x[t] . w): a block a row
 __global__ void __launch_bounds__(256) shexp_gate_rows_kernel(const float* __restrict__ x, const float* __restrict__ w,

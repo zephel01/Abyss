@@ -1255,6 +1255,9 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
     if (next_port_ != nullptr) next_port_->collect();
     cudaSetDevice(dev_);
     last_tok_ = next_port_ != nullptr ? win_tok_[(size_t) T - 1] : VT->tok_h[T - 1];
+    for (int t = 0; t < T; ++t)   // (a column whose logits were all NaN: the argmax's "no pick" - stop, once)
+        if (!glmfast::token_ok(next_port_ != nullptr ? win_tok_[(size_t) t] : VT->tok_h[t], g.n_vocab, p0 + t, err))
+            return false;
     if (gp) fast_gap_mark(tw);
     if (g.arch == 0 && !glm_window_check(toks, p0, err)) return false;   // (STRATA_GLM_WINDOW_CHECK; off: nothing)
     return true;

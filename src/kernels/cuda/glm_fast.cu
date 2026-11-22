@@ -2154,15 +2154,23 @@ __global__ void embed_streams_kernel(const float* __restrict__ emb, float* __res
 // token_embd rows for T tokens whose ids are read on the device (a host-mapped int or the argmax's output); the table
 // may be host-mapped (a few KB a row).  Q8_0: a thread a block of 32.  Q5_K: a thread a column l of a super-block
 // (ggml's dequantize_row_q5_K: 4 pairs of 32 per super-block).
+// a token id read on the device that names no row: the argmax's "no pick" (0x7fffffff, every logit NaN) or a
+// draft's -1.  Its row is zeros (the answer is broken already; reading table + 0x7fffffff rows was an illegal address)
+__device__ __forceinline__ bool emb_tok_bad(int t) { return t < 0 || t == 0x7fffffff; }
+
 __global__ void embed_q8_rows_kernel(const block_q8_0* __restrict__ table, const int* __restrict__ toks, int n_embd,
                                      float* __restrict__ out) {
     const int t = blockIdx.y;
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     const int nb = n_embd / 32;
     if (b >= nb) return;
+    float* y = out + (size_t) t * n_embd + (size_t) b * 32;
+    if (emb_tok_bad(toks[t])) {
+        for (int i = 0; i < 32; ++i) y[i] = 0.0f;
+        return;
+    }
     const block_q8_0* q = table + (size_t) toks[t] * nb + b;
     const float d = __half2float(q->d);
-    float* y = out + (size_t) t * n_embd + (size_t) b * 32;
 #pragma unroll
     for (int i = 0; i < 32; ++i) y[i] = d * (float) q->qs[i];
 }
@@ -2184,6 +2192,11 @@ __global__ void embed_q5k_rows_kernel(const block_q5_K* __restrict__ table, cons
     const int nsb = n_embd / 256;
     const int sb = i >> 5, l = i & 31;
     if (sb >= nsb) return;
+    if (emb_tok_bad(toks[t])) {   // (this thread's 8 values: 64 j + l and 64 j + 32 + l for Q4_K / Q5_K, the same set for Q6_K)
+        float* z = out + (size_t) t * n_embd + (size_t) sb * 256;
+        for (int j = 0; j < 8; ++j) z[32 * j + l] = 0.0f;
+        return;
+    }
     const block_q5_K* q = table + (size_t) toks[t] * nsb + sb;
     const float2 dm = __half22float2(q->dm);
     const float d = dm.x, dmin = dm.y;
@@ -2214,6 +2227,11 @@ __global__ void embed_q4k_rows_kernel(const block_q4_K* __restrict__ table, cons
     const int nsb = n_embd / 256;
     const int sb = i >> 5, l = i & 31;
     if (sb >= nsb) return;
+    if (emb_tok_bad(toks[t])) {   // (this thread's 8 values: 64 j + l and 64 j + 32 + l for Q4_K / Q5_K, the same set for Q6_K)
+        float* z = out + (size_t) t * n_embd + (size_t) sb * 256;
+        for (int j = 0; j < 8; ++j) z[32 * j + l] = 0.0f;
+        return;
+    }
     const block_q4_K* q = table + (size_t) toks[t] * nsb + sb;
     const float2 dm = __half22float2(q->dm);
     const float d = dm.x, dmin = dm.y;
@@ -2240,6 +2258,11 @@ __global__ void embed_q6k_rows_kernel(const block_q6_K* __restrict__ table, cons
     const int nsb = n_embd / 256;
     const int sb = i >> 5, l = i & 31;
     if (sb >= nsb) return;
+    if (emb_tok_bad(toks[t])) {   // (this thread's 8 values: 64 j + l and 64 j + 32 + l for Q4_K / Q5_K, the same set for Q6_K)
+        float* z = out + (size_t) t * n_embd + (size_t) sb * 256;
+        for (int j = 0; j < 8; ++j) z[32 * j + l] = 0.0f;
+        return;
+    }
     const block_q6_K* q = table + (size_t) toks[t] * nsb + sb;
     const float d = __half2float(*(const __half*) &q->d);
     float* y = out + (size_t) t * n_embd + (size_t) sb * 256;

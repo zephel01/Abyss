@@ -1015,6 +1015,15 @@ bool Glm5Model::dspark_draft(int32_t y, int32_t* drafts, float* conf, std::strin
         drafts[i] = D->res_tok[i];
         conf[i] = D->res_conf[i];
     }
+    // a step whose logits were all NaN left the argmax's "no pick" (0x7fffffff): the drafts end before it
+    for (int i = 0; i < kB; ++i)
+        if (drafts[i] < 0 || drafts[i] >= V || !(conf[i] == conf[i])) {
+            for (int j = i; j < kB; ++j) {
+                drafts[j] = -1;
+                conf[j] = 0.0f;
+            }
+            break;
+        }
     // STRATA_DS4_DSPARK_DUMP=<file> (debug): a line a draft - the position (y's), y, the context rows, the 5 drafts,
     // their confidences, then each stage's routes (row-major, k a row) - for bench/v41dsp/v41_probe.py --compare
     if (D->dump != nullptr) {

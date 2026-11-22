@@ -52,6 +52,15 @@ inline bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
     err = std::string(what) + ": " + cudaGetErrorString(e);
     return false;
 }
+// the next token from the device: outside [0, n_vocab) is the argmax's "no pick" (0x7fffffff) - every logit was NaN
+// (or -inf), the forward is broken.  An error (the caller reports it once and stops) rather than a token that reads
+// past the embedding table or prints garbage
+inline bool token_ok(int64_t tok, int64_t n_vocab, int64_t pos, std::string& err) {
+    if (tok >= 0 && tok < n_vocab) return true;
+    err = "the logits at position " + std::to_string(pos) + " are NaN (no finite value for the next token: got id " +
+          std::to_string(tok) + ") - stopping";
+    return false;
+}
 inline bool wait_event(cudaEvent_t ev, const char* what, std::string& err) {
     cudaError_t e;
     while ((e = cudaEventQuery(ev)) == cudaErrorNotReady) std::this_thread::yield();
