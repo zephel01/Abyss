@@ -9,6 +9,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.187 - 2026-11-22
+
+Two crash / garbage paths closed (all-NaN logits, NVFP4 files without their scales) and Inkling 2 Mini tool calls in
+the server. Other models give the same bits and speed as v1.3.186 (7-config md5 check).
+
 - All models: logits that are all NaN no longer feed the argmax's "no pick" id (0x7fffffff) on as a token. The next
   token stops the run with one message (`the logits at position N are NaN ... - stopping`) instead of an illegal
   address or garbage read past the embedding table; a drafter step (Qwen3.5/3.8 NextN, DSpark, GLM NextN) whose logits
