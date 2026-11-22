@@ -500,7 +500,12 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 args = fn.get("arguments")
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
-                    args = json.loads(args) if args.strip() else {}
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except ValueError:                  # (broken JSON in the client's history: kept as given)
+                        args = {"raw": fn.get("arguments")}
+                if args and not isinstance(args, dict):  # (a list or a number: not a mapping either)
+                    args = {"raw": fn.get("arguments")}
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
             out["tool_calls"] = calls
         if role == "assistant" and not out["content"] and not out.get("tool_calls") and not out.get("reasoning_content"):
@@ -970,14 +975,18 @@ class InklingCalls:
 
     HDR_MAX = 64                     # header tokens at most (a tool's name): more is not a header - text
 
-    def __init__(self, tok, mm: int, th: int, tx: int, em: int, invoke: int, parser: "OutputParser"):
+    def __init__(self, tok, mm: int, th: int, tx: int, em: int, invoke: int, parser: "OutputParser",
+                 invoke_text: int | None = None, error: int | None = None):
         self.tok, self.mm, self.th, self.tx, self.em, self.invoke = tok, mm, th, tx, em, invoke
+        # <|content_invoke_tool_text|> (a call written as text, not JSON: no call the API can carry - its message is
+        # read to the end and goes out as text) and <|content_tool_error|> (a text message: the caller shows it)
+        self.invoke_text, self.error = invoke_text, error
         self.parser = parser
-        self.state, self.hdr, self.body, self.name = "idle", [], [], ""
+        self.state, self.hdr, self.body, self.name, self.marker = "idle", [], [], "", INK_CALL
 
-    def start_call(self, name: str) -> None:
+    def start_call(self, name: str, marker: str = INK_CALL) -> None:
         """The prompt ended inside a call's header (a required call, ink_call_open): its JSON comes next."""
-        self.state, self.body, self.name = "json", [], name
+        self.state, self.body, self.name, self.marker = "json", [], name, marker
         self.parser.state, self.parser.lead = "content", True   # (a call message: any reasoning is over)
 
     def push(self, t: int) -> list[Event] | None:
@@ -989,13 +998,14 @@ class InklingCalls:
                 return []
             return None
         if self.state == "hdr":
-            if t == self.invoke:
-                self.start_call(self.tok.decode(self.hdr).strip())
+            if t == self.invoke or (t == self.invoke_text and t is not None):
+                self.start_call(self.tok.decode(self.hdr).strip(),
+                                INK_CALL if t == self.invoke else "<|content_invoke_tool_text|>")
                 return []
             if t == self.mm:                 # (an empty message: a new header)
                 self.hdr = []
                 return []
-            if t in (self.th, self.tx, self.em):
+            if t in (self.th, self.tx, self.em) or (t == self.error and t is not None):
                 self.state, self.hdr = "idle", []   # (a text / thinking message: its header, if any, is not text)
                 return None
             self.hdr.append(t)
@@ -1009,19 +1019,26 @@ class InklingCalls:
         return []
 
     def _close(self) -> list[Event]:
-        text, name = self.tok.decode(self.body), self.name
-        self.state, self.body, self.name = "idle", [], ""
+        text, name, marker = self.tok.decode(self.body), self.name, self.marker
+        self.state, self.body, self.name, self.marker = "idle", [], "", INK_CALL
         call = None
         try:
-            obj = json.loads(text)
+            obj = json.loads(text) if marker == INK_CALL else None
         except ValueError:
             obj = None
-        if isinstance(obj, dict) and isinstance(obj.get("args", {}), dict):
+        if isinstance(obj, dict):
+            # the template writes "args"; a model may write "arguments" / "parameters", or the object as a JSON string
+            args = next((obj[k] for k in ("args", "arguments", "parameters") if k in obj), {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args) if args.strip() else {}
+                except ValueError:
+                    args = None
             nm = obj.get("name") if isinstance(obj.get("name"), str) and obj.get("name") else name
-            if nm and self.parser._declared(nm):
-                call = ToolCall(name=nm, arguments=obj.get("args") or {})
+            if isinstance(args, dict) and nm and self.parser._declared(nm):
+                call = ToolCall(name=nm, arguments=args)
         if call is None:                     # (not a call this request can take: the text, as the parser would)
-            return [Event("content", name + INK_CALL + text)]
+            return [Event("content", name + marker + text)]
         if self.parser.no_calls:
             return [Event("calls_refused")]
         self.parser.state, self.parser.lead = "content", True

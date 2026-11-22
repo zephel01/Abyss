@@ -568,7 +568,8 @@ class InklingToolCalls(unittest.TestCase):
     class InkTok(ByteTokenizer):
         SPECIALS = ByteTokenizer.SPECIALS + ["<|message_model|>", "<|content_thinking|>", "<|content_text|>",
                                              "<|end_message|>", "<|content_model_end_sampling|>",
-                                             "<|content_invoke_tool_json|>"]
+                                             "<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>",
+                                             "<|content_tool_error|>"]
 
     TOOLS = [{"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]
 
@@ -629,6 +630,35 @@ class InklingToolCalls(unittest.TestCase):
         self.assertEqual([m.get("name") for m in named if m["role"] == "tool"], ["get_weather", "get_time"])
         self.assertEqual(named[1]["tool_calls"][0]["function"]["arguments"], {"city": "Tokyo"})   # an object
         self.assertNotIn("name", msgs[2])                                                          # (a copy)
+
+    def test_thinking_after_text_or_call_is_reasoning(self):
+        # the messages come in any order: a thinking message after the answer's text or a call is reasoning too
+        out = self.answer("<|message_model|><|content_text|>Checking.<|end_message|>"
+                          "<|message_model|><|content_thinking|>now the call<|end_message|>" + self.CALL +
+                          "<|message_model|><|content_thinking|>and done<|end_message|>"
+                          "<|message_model|><|content_text|>Sunny.<|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(out, {"reasoning": "now the calland done", "content": "Checking.Sunny.",
+                               "calls": [("get_weather", {"city": "Tokyo"})]})
+
+    def test_other_argument_keys(self):
+        for key in ("arguments", "parameters"):
+            out = self.answer(self.CALL.replace('"args"', '"' + key + '"') + "<|content_model_end_sampling|>")
+            self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})], key)
+        out = self.answer(self.CALL.replace('{"city":"Tokyo"}', '"{\\"city\\":\\"Tokyo\\"}"') +
+                          "<|content_model_end_sampling|>")
+        self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})])
+        out = self.answer(self.CALL.replace('{"city":"Tokyo"}', '"Tokyo"') + "<|content_model_end_sampling|>")
+        self.assertEqual(out["calls"], [])                                    # (a plain string: not arguments)
+
+    def test_tool_text_and_tool_error_messages_are_seen(self):
+        # <|content_invoke_tool_text|> (a call written as text) and <|content_tool_error|> are message kinds the
+        # template never writes: what the model puts in them is visible text, never dropped as a header
+        out = self.answer("<|message_model|>get_weather<|content_invoke_tool_text|>Tokyo<|end_message|>"
+                          "<|content_model_end_sampling|>")
+        self.assertEqual(out, {"reasoning": "", "content": "get_weather<|content_invoke_tool_text|>Tokyo", "calls": []})
+        out = self.answer("<|message_model|><|content_tool_error|>no such city<|end_message|>"
+                          "<|content_model_end_sampling|>")
+        self.assertEqual(out, {"reasoning": "", "content": "no such city", "calls": []})
 
 
 class ClientShapes(unittest.TestCase):

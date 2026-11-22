@@ -567,6 +567,16 @@ class ClientStops(unittest.TestCase):
                                                       {"role": "user", "content": "b"}]})
         self.assertEqual([m["role"] for m in msgs], ["user", "user"])
 
+    def test_malformed_past_arguments(self):
+        # a client's history with broken arguments in a past call: the request goes on, the text kept as given
+        from serve.frontend import openai_to_messages
+        calls = [{"id": str(i), "type": "function", "function": {"name": "f", "arguments": a}}
+                 for i, a in enumerate(['{"city": "Tok', '[1, 2]', '{"city":"Tokyo"}', ''])]
+        msgs, _, _ = openai_to_messages({"messages": [{"role": "user", "content": "a"},
+                                                      {"role": "assistant", "content": None, "tool_calls": calls}]})
+        self.assertEqual([c["function"]["arguments"] for c in msgs[1]["tool_calls"]],
+                         [{"raw": '{"city": "Tok'}, {"raw": "[1, 2]"}, {"city": "Tokyo"}, {}])
+
 
 class JsonMode(unittest.TestCase):
     """response_format json_object: the JSON alone, out of a code fence or the prose around it (Strata #762)."""
