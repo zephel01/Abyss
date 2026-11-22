@@ -112,6 +112,7 @@ struct Ink {
     };
     std::map<std::tuple<int, int, unsigned long long, int, float>, TokGraph> graphs;
     uint64_t graph_caps = 0, graph_runs = 0;
+    uint64_t graph_inkd = 0;   // (the DSpark taps' accumulators' generation the graphs were captured with)
     void* base = nullptr;
     size_t bytes = 0;
     std::vector<float*> owned;   // (unsloth's looped layout: the gathered message queries)
@@ -411,6 +412,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
     if (F->prof_on) F->mark("start");
     if (p == 0) ink_reset();   // (a new sequence: the conv states start at zero; the caches' rows are written first)
     else ink_win_commit(p);    // (a verify window not settled by spec_rewind: its columns up to p kept)
+    inkd_settle(p);            // (the DSpark drafter's: the same columns into its context before this token's taps)
     // STRATA_INK_GRAPH=0: the token's launches one by one.  Default: the whole token (48 layer applications and
     // the head's mix) replayed from one CUDA graph - the same kernels in the same order (the same bits), the position
     // read from a device word.  Not with the profile marks, dumps, prefetch / lookahead, the expert helper or images
@@ -422,6 +424,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
     const int64_t* pdv = graph ? K.pos_d : nullptr;
     const auto run = [&]() -> bool {
         int nb = 0;                // the next free residual buffer
+        int visit = 0;             // (the layer applications in order: the DSpark drafter's taps 5 / 23 / 41)
         const auto fresh = [&]() -> float* { return K.hb[nb++ % Ink::kBufs]; };
         // the embedding row (fast_token left it in state_), rms-normed with token_embd_norm
         float* h = fresh();
@@ -498,6 +501,11 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             const auto& Ly = K.L[(size_t) il];
             auto& S = K.S[(size_t) sl];
             const bool swa = Ly.swa;
+            if (inkd_ != nullptr && (visit == 5 || visit == 23 || visit == 41)) {
+                flush_pend();   // (the tap reads the residual entering the application: the deferred add first)
+                ink_tap(visit, h, E, 1, nullptr, false, s);
+            }
+            ++visit;
             const float* gm[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
             // ---- the attention's inputs
             const float* in[3] = {h, h, h};
@@ -766,6 +774,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             ik::mix(states(blocks, h), K.out_rq, 1, E, 1, K.mixo, s);
             gf::rms_q8(K.mixo, nullptr, K.out_norm, g.norm_eps, E, F->head_x, F->head_xq, s);
         }
+        if (inkd_ != nullptr) ink_tap(48, F->head_x, E, 1, nullptr, false, s);   // (the drafter's tap 48)
         if (F->prof_on) F->mark("q35_head");
         return true;
     };
@@ -780,6 +789,10 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
         ik::set_pos(K.pos_d, p, s);
         const auto key = std::make_tuple(ik::attn_splits(p, 0, ik::kMaxSplits), ik::attn_splits(p, g.n_swa, ik::kMaxSplits),
                                          F->cpu_plan, fast_skip_from(0), fast_skip_w(0));
+        if (inkd_acc_gen() != K.graph_inkd) {   // (the drafter's tap buffers moved: the graphs write the old ones)
+            K.graphs.clear();
+            K.graph_inkd = inkd_acc_gen();
+        }
         auto it = K.graphs.find(key);
         if (it == K.graphs.end()) {
             if (K.graphs.size() >= 96) K.graphs.clear();
@@ -810,6 +823,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             ++K.graph_caps;
         }
         if (!it->second.g.launch(s, err)) return false;
+        inkd_tok_taps();   // (the taps inside the graph: their rows' bookkeeping on the host)
         F->expected += it->second.requests;
         ++K.graph_runs;
     }
@@ -927,6 +941,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
     const auto fresh = [&]() -> float* { return W.hb[nb++ % Ink::kBufs]; };
     float* h = fresh();
     ik::rms_rows(io.emb, E, K.tok_norm, g.norm_eps, E, T, h, E, s);
+    int visit = 0;   // (the drafter's taps, as the token path's)
     Blocks blocks;
     const auto states = [&](const Blocks& b, const float* cur) {
         ik::States st;
@@ -975,6 +990,8 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         const auto& Ly = K.L[(size_t) il];
         auto& S = K.S[(size_t) sl];
         const bool swa = Ly.swa;
+        if (inkd_ != nullptr) ink_tap(visit, h, E, T, nullptr, false, s);
+        ++visit;
         // ---- the attention's inputs: in[j] rows ins apart
         const float* in[3] = {h, h, h};
         int64_t ins = E;
@@ -1104,6 +1121,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         if (!layer(il, il, il, nullptr)) return false;
     ik::mix(states(blocks, h), K.out_rq, 1, E, T, W.mixo, s);
     gf::rms_q8_rows(W.mixo, E, nullptr, 0, K.out_norm, g.norm_eps, E, io.head_x, E, io.head_xq, E / 32, T, s);
+    if (inkd_ != nullptr) ink_tap(48, io.head_x, E, T, nullptr, false, s);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         err = std::string("inkling verify: ") + cudaGetErrorString(e);
@@ -1346,6 +1364,7 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
     const bool has_msgs = pass > 0;
     const bool starts = il % g.ink_block == 0;
     float* hin = C.h;
+    if (inkd_ != nullptr) ink_tap(ia, hin, E, T, nullptr, true, s);   // (the DSpark drafter's taps 5 / 23 / 41)
     const float* ab[ik::kMaxStates];   // the attention mix's blocks
     const int an = C.bn;
     for (int i = 0; i < an; ++i) ab[i] = C.bl[i];

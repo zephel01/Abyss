@@ -2630,7 +2630,10 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_DS4_SPEC_COST");
                 return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
             }();
-            const bool d_cost = d_cost_env >= 0 ? d_cost_env != 0 : !model.dspark_ready();
+            // (Inkling 2 Mini's DSpark, STRATA_INK_DSPARK: on - its drafts' confidences calibrated against the windows'
+            // measured costs, up to its 7 drafts; the repeats' windows as without it)
+            const bool ink_dsp = model.ink_dspark_on();
+            const bool d_cost = d_cost_env >= 0 ? d_cost_env != 0 : !model.dspark_ready() || ink_dsp;
             // (2026-11-06) the tables live as long as the process - the same model, the same machine - instead of
             // starting over every request (a short request's choices came from a handful of samples); a width's cost is
             // the MEDIAN of its last 16 steps (one slow step - an SSD spell - moved the old running mean for many);
@@ -2779,7 +2782,7 @@ static int glm_pack_generate(const Options& o) {
                 dr.push(tok);
                 const bool d_timed = !cost_fresh || ++d_step > 16;
                 const int64_t p0 = model.position();
-                const int room = (int) std::min<int64_t>(d_max, o.max_context - p0 - 1);
+                const int room = (int) std::min<int64_t>(ink_dsp ? model.inkd_max() : d_max, o.max_context - p0 - 1);
                 const int room_rep = (int) std::min<int64_t>(rep_max, o.max_context - p0 - 1);
                 int32_t d[kNg];
                 float c[kNg];
@@ -2895,7 +2898,7 @@ static int glm_pack_generate(const Options& o) {
                         (use == 2 ? dfl_last : mtp_last) = dfl_steps;
                     }
                 }
-                const int room_s = use == 2 ? (int) std::min<int64_t>(dfl_max, o.max_context - p0 - 1) : room;
+                int room_s = use == 2 ? (int) std::min<int64_t>(dfl_max, o.max_context - p0 - 1) : room;
                 if (use != 0 && room_s > 0) {
                     // (speculative sampling: the NextN block's drafts only - DFlash 2 has no full-vocabulary q)
                     model.spec_sampling_set(ss_req && use == 1 ? &sp : nullptr);
@@ -2941,6 +2944,9 @@ static int glm_pack_generate(const Options& o) {
                         }
                         ++dfl_n;
                     } else {
+                        if (ink_dsp)   // (a draft the drafter did not make: -1, the ones after it too)
+                            for (int i = 0; i < room_s; ++i)
+                                if (d[i] < 0) { room_s = i; break; }
                         if (d_chain > 0.0) {
                             double pc = 1.0;
                             while (k < room_s && (pc *= c[k]) >= d_chain) ++k;

@@ -280,6 +280,8 @@ STRATA_HY4_ENG_ROW_EPS  # src/core/hy4_fast_path.cu (debug: the Engram row norm'
 STRATA_HY4_DUMP_CACHE  # src/core/hy4_fast_path.cu (debug: every layer's cache rows into this file at STRATA_HY4_DUMP_CACHE_AT)
 STRATA_HY4_DUMP_CACHE_AT  # src/core/hy4_fast_path.cu (debug: the position STRATA_HY4_DUMP_CACHE writes at)
 STRATA_HY4_ENG_VFIRST  # src/core/hy4_fast_path.cu (debug: the values-first n-gram order, for A/B only)
+STRATA_INK_DSPARK_DUMP  # src/core/ink_dspark.cu (debug: the Inkling DSpark drafter writes each step's anchor, drafts and confidences to this file)
+STRATA_INK_DSPARK_PROF  # src/core/ink_dspark.cu (debug: 1 times the drafter's phases on the device and prints the ms a draft at exit)
 STRATA_INK_F16  # src/kernels/cuda/inkling_fast.cu (debug: Inkling's attention with the bias (1) / the scaled q (2) rounded to FP16, an A/B against llama.cpp's flash attention)
 STRATA_INK_PREFILL  # src/core/inkling_fast_path.cu (Inkling's batched prompt path; 0: token by token)
 STRATA_INK_NV_OWN  # src/core/glm_prefill.cu (Inkling prompt: NVFP4 experts on the own int8 GEMM, default 1; 0: MMQ or the FP16 path)

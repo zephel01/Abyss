@@ -3640,6 +3640,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // dumps consume these rows, so keep their full path. STRATA_GLM_PREFILL_TAIL_SKIP=0 is the A/B baseline.
     const char* tail_env = getenv("STRATA_GLM_PREFILL_TAIL_SKIP");
     const bool tail_skip = !prefill_logits && l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 && dsp_ == nullptr && q4d_ == nullptr &&
+                           inkd_ == nullptr &&   // (Inkling's DSpark reads the last application's head rows)
                            (cb_dir == nullptr || !cb_dir[0]) && (tail_env == nullptr || std::atoi(tail_env) != 0);
     const auto dump_row = [&](const std::string& name, const float* rows, int width, int row = -1) {
         if (cb_dir == nullptr || !cb_dir[0]) return;
@@ -6748,6 +6749,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // add the last FFN themselves - this update, run with the hyper-connections' unset post / comb, broke R and with it
     // every prompt position's draft cache, so the drafter's confidences stayed under its threshold after a prompt)
     // qwen4exp, an earlier part of a split: the last FFN's combine into R, which the next part's first layer reads
+    if (inkd_ != nullptr && kv_cut < 0) {   // Inkling's DSpark: the head rows' tap (output_norm), the chunk's commit
+        ink_tap(48, ink_prompt_final(), E, T, w_.at("output_norm.weight"), true, s);
+        if (!inkd_commit(p0, T, true, s)) {
+            err = "ink dspark: the prompt's context commit";
+            return false;
+        }
+    }
     if (dfl_ != nullptr && kv_cut < 0) {   // DFlash 2: the chunk's last rows (up to its window) into its context
         const int n = std::min(T, 2048);
         if (!dflash_commit(p0 + T - n, n, true, s)) {

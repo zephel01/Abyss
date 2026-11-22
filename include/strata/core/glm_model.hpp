@@ -807,6 +807,26 @@ public:
     void dflash_settle();
     void dflash_window(int64_t p0, int T);
     bool dflash_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    // ---- Inkling 2 Mini's DSpark drafter (src/core/ink_dspark.cu, STRATA_INK_DSPARK=<its GGUF>, arch dflash): the
+    // same hooks (dspark_settle / dspark_window / dspark_reset / dspark_draft call these when it is loaded).  Its
+    // context: the residual entering layer applications 5 / 23 / 41 and the head's normed row (visit 48) of every
+    // position - ink_tap from the token path, the verify window and the prompt path, inkd_commit at the position
+    void* inkd_ = nullptr;
+    bool inkd_load(std::string& err);
+    void inkd_destroy();
+    void inkd_reset();
+    void inkd_report() const;
+    // rows of tap `visit` (5, 23, 41 the residual entering that application, 48 the head's row - normed with norm_w
+    // when not null): n rows ld floats apart, the token path's / a window's columns 0..n-1 or a prompt chunk's T = n
+    void ink_tap(int visit, const float* x, int64_t ld, int n, const float* norm_w, bool prompt, cudaStream_t s);
+    bool inkd_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
+    void inkd_settle(int64_t pos = -1);   // (the kept columns: up to pos, default pos_)
+    void inkd_window(int64_t p0, int T);
+    uint64_t inkd_acc_gen() const;   // (the taps' accumulators' generation: the token graphs hold their address)
+    void inkd_tok_taps();            // (a replayed token graph: the taps' row counts its capture set)
+    bool inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
+    bool ink_dspark_on() const { return inkd_ != nullptr; }
+    int inkd_max() const;   // (drafts a step at most: 7, STRATA_INK_DSPARK_N)
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);
     bool verify_moe_router(int il, int tb, int n, cudaStream_t s, std::string& err);   // (its first launch)
@@ -1073,7 +1093,7 @@ public:
     /// token, window (the kept columns) and prompt chunk by itself.  dspark_draft(y): the block at position() with y,
     /// the pending token -> 5 drafts and their confidences (host; waits for the device).  dspark_upload: the expert
     /// cache's copies the last draft planned - after the window is queued, so they run under it.
-    bool dspark_ready() const { return dsp_ != nullptr || dfl_ != nullptr || chain_mtp_on(); }
+    bool dspark_ready() const { return dsp_ != nullptr || dfl_ != nullptr || inkd_ != nullptr || chain_mtp_on(); }
     bool dflash_on() const { return dfl_ != nullptr; }   // DFlash2 (dflash2.cu): its walk applied the threshold
     // the dense qwen35 with both drafters (DFlash 2 and its NextN block): dspark_draft runs DFlash 2 while this is set,
     // the NextN chain otherwise (the decode picks a step's drafter by their measured rates)
