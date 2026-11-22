@@ -30,6 +30,7 @@
 // past it, and a ratio-2 slot parks a pair's first token in the pair's own entry (kV41PendRing).
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/kernels/inkling_fast.hpp"
 #include "strata/kernels/qsa27.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
@@ -215,7 +216,8 @@ bool Glm5Model::verify_ready() const {
     // MoE layers; the head's weights on the last
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
-        if (m->g_.ink) return false;   // (inkling: token by token - no window path yet)
+        // (inkling: its window opt-in - STRATA_INK_DRAFT=1, ink_window; one part, no prefetch / lookahead)
+        if (m->g_.ink && (!ink_draft_env() || m->split_next_ != nullptr || m != this)) return false;
         if (F != nullptr && m->g_.arch == 0) {
             // glm5-next: one part, the batched window (STRATA_GLM_WINDOW=1); its NextN block allowed (the drafter);
             // no prefetch / lookahead / deferral / refusal edit; no EXL3 layers (verify_moe runs the ggml experts)
@@ -796,7 +798,7 @@ bool Glm5Model::verify_moe_router(int il, int tb, int T, cudaStream_t s, std::st
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     const int nj = verify_sh_late() && FFs > 0 ? 1 : 3;
-    if (!(g.arch == 0 ? glm_mvn(j, nj, T, s) : g.q4x ? q4x_mvn(j, nj, T, s) : g.dsv4() ? ds_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
+    if (!(g.arch == 0 || g.ink ? glm_mvn(j, nj, T, s) : g.q4x ? q4x_mvn(j, nj, T, s) : g.dsv4() ? ds_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
     return true;
 }
 
@@ -863,7 +865,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
     }();
     bool routed = false;
-    if ((route_cols < 0 ? g.q4x : route_cols != 0) && T > 1 && (late || FFs == 0) && V->route_sync != nullptr &&
+    if ((route_cols < 0 ? g.q4x || g.ink : route_cols != 0) && T > 1 && (late || FFs == 0) && V->route_sync != nullptr &&
         !F->prof_on) {
         const int* hid[8] = {};
         for (int t = 0; t < T && t < 8; ++t)
@@ -888,7 +890,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         ++F->expected;
     }
     if (late) {
-        if (!(g.arch == 0 ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : g.dsv4() ? ds_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
+        if (!(g.arch == 0 || g.ink ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : g.dsv4() ? ds_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
         gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, g.swiglu_shexp, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
@@ -918,7 +920,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     // 5-column MTP windows shared set 3 among columns 3-5 until 2026-10-31; a launch a column reads each in time)
     if (g.qwen35() && Ly.sh_gate_w != nullptr) {   // the shared expert's gate logit a column (sigmoid below)
         gf::MvJob jg = {Ly.sh_gate_w, nullptr, V->x + (size_t) tb * E, V->q35_shg + tb, nullptr, 1.0f, gf::kTypeF32, E, 1};
-        if (!(g.q4x ? q4x_mvn(&jg, 1, T, s) : gf::mvn(&jg, 1, T, s))) { err = "qwen35 verify: the shared expert's gate"; return false; }
+        if (!(g.ink ? glm_mvn(&jg, 1, T, s) : g.q4x ? q4x_mvn(&jg, 1, T, s) : gf::mvn(&jg, 1, T, s))) { err = "qwen35 verify: the shared expert's gate"; return false; }
     }
     // STRATA_DS4_WIN_COLS_CHECK=1: every 16th group of columns also through a launch a column, compared bit by bit
     static const bool cols_chk = getenv("STRATA_DS4_WIN_COLS_CHECK") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_COLS_CHECK")) != 0;
@@ -934,7 +936,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         const char* v = getenv("STRATA_GLM_FETCH_COLS");
         return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
     }();
-    const bool fcols = (fetch_cols < 0 ? g.q4x : fetch_cols != 0) && cols && V->md_d != nullptr && !F->prof_on;
+    const bool fcols = (fetch_cols < 0 ? g.q4x || g.ink : fetch_cols != 0) && cols && V->md_d != nullptr && !F->prof_on;
     if (fcols) {
         if (F->stream_fetch)
             gf::moe_wait_fetch_cols(V->md_d + tb, T, E, k, Ly.blob, s, Ly.gu_bytes, Ly.dn_bytes, F->read_chunks,
@@ -1040,7 +1042,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
             const char* v = getenv("STRATA_GLM_CPU_WAIT_COLS");
             return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
         }();
-        if ((wait_cols < 0 ? g.q4x : wait_cols != 0) && T > 1 && T <= 8 && V->md[(size_t) tb].cpu_seq != nullptr) {
+        if ((wait_cols < 0 ? g.q4x || g.ink : wait_cols != 0) && T > 1 && T <= 8 && V->md[(size_t) tb].cpu_seq != nullptr) {
             gf::CpuWaitCols c;
             c.n = T;
             c.k = k;
@@ -1192,6 +1194,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         m->pos_ = pos_;
         ((VerifyBuf*) m->vb_)->T = T;
         if (!(g.arch == 0 ? m->verify_part_glm(toks, p0, err)
+              : g.ink ? m->verify_part_ink(toks, p0, err)
               : g.v41 ? m->verify_part_v41(toks, p0, err) : g.q4x ? m->verify_part_q4x(toks, p0, err)
               : g.qwen35() ? m->verify_part_q35(toks, p0, err)
                                                                        : m->verify_part(toks, p0, err))) return false;
@@ -1918,6 +1921,39 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
         cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
     }
     mark(4);
+    cudaEventRecord(V->done, s);
+    return true;
+}
+
+// inkling's (one part): ink_window's layers over the columns (inkling_fast_path.cu), then the head as the token path's
+// (output rows, the softcap, the argmax) a column
+bool Glm5Model::verify_part_ink(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int T = V->T;
+    InkWinIo io;
+    io.emb = V->emb;
+    io.x = V->x;
+    io.xq = V->xq;
+    io.ffn = V->ffn;
+    io.head_x = V->head_x;
+    io.head_xq = V->head_xq;
+    if (F->prof_on) F->mark("v_start");
+    if (!ink_window(toks, p0, io, err)) return false;
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) g.n_embd, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (!glm_mvn(&o, 1, T, s)) { err = "inkling verify: output head"; return false; }
+    strata::kernels::ink::softcap(V->logits, (int64_t) T * g.n_vocab, g.ink_softcap, s);
+    if (F->zero_copy) {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
+    } else {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
+        cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
+    }
+    if (F->prof_on) F->mark("v_head");
     cudaEventRecord(V->done, s);
     return true;
 }

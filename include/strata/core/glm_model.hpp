@@ -743,6 +743,21 @@ public:
     void ink_reset();
     void ink_snap_runs(std::vector<std::pair<void*, size_t>>& out) const;
     void ink_free();
+    // inkling's verify window (STRATA_INK_DRAFT=1, opt-in): the token path's 48 layer applications over T columns at
+    // once - every column the bits a token alone gets (glm_mvn, rms_q8_rows, the attention's splits a row as the
+    // token's, the conv states read but left: the window's inputs kept a slot, ink_win_commit moves the states past
+    // the kept columns at spec_rewind).  io: the window's buffers (dsv4_verify.cu's) - emb the columns' embedding
+    // rows, x / xq the MoE's input and ffn its output (verify_moe), head_x / head_xq the head's input (out)
+    struct InkWinIo {
+        const float* emb = nullptr;
+        float *x = nullptr, *ffn = nullptr, *head_x = nullptr;
+        void *xq = nullptr, *head_xq = nullptr;
+    };
+    static bool ink_draft_env();   // STRATA_INK_DRAFT (default 0)
+    bool ink_window(const std::vector<int32_t>& toks, int64_t p0, const InkWinIo& io, std::string& err);
+    void ink_win_commit(int64_t pos);   // (no window pending: nothing)
+    int64_t ink_win_p0_ = -1;           // the pending window's first position and width
+    int ink_win_T_ = 0;
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);
@@ -803,6 +818,7 @@ public:
     bool verify_part(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
     bool verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // deepseek41's (one part)
     bool verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen35moe's (one part)
+    bool verify_part_ink(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // inkling's (one part)
     void verify_rewind_q35(int64_t pos);   // qwen35moe: the recurrent states back to after the kept columns
     // glm5-next (GLM-5.3-Flash) on one part, STRATA_GLM_WINDOW=1 (dsv4_verify.cu): the token path's layers over the
     // columns - the dense GEMVs one mvn_mv launch (mv()'s bits), the KDA columns through the token path's own

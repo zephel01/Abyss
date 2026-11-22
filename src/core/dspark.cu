@@ -769,6 +769,7 @@ void Glm5Model::dspark_window(int64_t p0, int T) {
 }
 
 void Glm5Model::spec_rewind(int64_t pos) {
+    if (g_.ink) ink_win_commit(pos);   // (inkling: the conv states past the kept columns)
     if (g_.qwen35() && next_port_ != nullptr) {   // (qwen4exp's split: the later parts through the port)
         verify_rewind_q35(pos);
         next_port_->rewind(pos);
