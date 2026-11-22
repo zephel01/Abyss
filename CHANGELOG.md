@@ -9,6 +9,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- The dense tier (`STRATA_GLM_PREFILL_DENSE_TIER`, #53) works on packs whose layers' rows lie in two or more places -
+  the `tools/dense_overlay.py` packs (`iq_pack.py --first-wins`: the changed rows of every layer first, the head's
+  rows, then the rest of every layer), which stopped at "dense tier off: the layers' rows are not in layer order".
+  Each layer's rows are now a list of ranges (merged where they lie together) and each stretch of layers' rows can be
+  lent; rows outside the layers are never borrowed, and a pack whose rows lie in layer order is laid out as before.
+  `STRATA_GLM_PREFILL_DENSE_TIER_CHECK=1` also compares every row with its mapping after each prompt's write-back.
+  DeepSeek V4.1 UD-IQ2_XXS with a dense Q5_K overlay, an RTX 5090 capped at 16 GB, 44 GB RAM tier, iGPU off: 32K
+  prompts 263 -> 717 tokens/s (chunks of 4,864 -> 32,768), a 125K prompt at a 262,144 context 176.3 -> 113.0 s
+  (chunks of 14,848 -> 30,208), needles found, decode the same; `=2` gives `=0`'s tokens bit for bit.
+
 ## v1.3.191 - 2026-11-22
 
 Inkling 2 Mini long prompts run on a tensor-core attention kernel: 165K prompts 765 -> 5,298 tok/s and 255K 489 ->
