@@ -817,6 +817,7 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
             gb::f32_to_f16(B.xn[j], B.x16[j], (int64_t) tn * E, s);
         }
         const int i1 = nx == 1 ? 0 : 1, i2 = nx == 1 ? 0 : 2;
+        if (io.mark) io.mark(io.mark_ctx, "ink_mix", s);
         // ---- the projections
         if (!gemm16(io, Ly.q, HD, E, B.x16[0], E, B.qf, HD, tn, s, err) ||
             !gemm16(io, Ly.gate, HD, E, B.x16[0], E, B.gl, HD, tn, s, err) ||
@@ -839,9 +840,11 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
         ik::clip_heads(B.kc, KV, nullptr, D, Hkv, g.ink_qk_clip, pt, 0.0f, 0.0f, tn, s);
         ik::clip_heads(B.rf, H * ik::kRel, Ly.rel_clip, ik::kRel, H, g.ink_rel_clip, pt, lf, g.ink_log_alpha, tn, s);
         ik::kv_store(B.kc, KV, B.vc, KV, g.norm_eps, Hkv, pt, tn, S.ring, S.kc, S.vc, s);
+        if (io.mark) io.mark(io.mark_ctx, "ink_conv", s);
         // ---- attention, gate, output, post conv
         ik::attn(B.qf, HD, B.rf, H * ik::kRel, B.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring,
                  H, Hkv, pt, tn, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), B.part, kPromptSplits, B.ao, HD, s);
+        if (io.mark) io.mark(io.mark_ctx, "ink_attn_core", s);
         ik::gate_sigmoid(B.ao, HD, B.gl, HD, HD, tn, s);
         gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HD, s);
         if (!gemm16(io, Ly.o, E, HD, B.ao16, HD, B.tmp, E, tn, s, err)) return false;
