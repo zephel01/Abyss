@@ -9,6 +9,17 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- Inkling 2: a thinking message that comes after the answer's text or a tool call now goes to `reasoning_content`
+  (streamed and whole answers), as the first one does; before, it leaked into `content`.
+- Inkling 2: a tool call whose JSON names its arguments `"arguments"` or `"parameters"` (the template writes `"args"`),
+  or gives them as a JSON string, is read as the call; before, it became a call with no arguments, or text.
+- Inkling 2: `<|content_invoke_tool_text|>` (a call written as text) and `<|content_tool_error|>` messages are shown as
+  text; before, their header swallowed a short message.
+- All models: broken JSON (or a non-object) in the arguments of a past assistant tool call no longer fails the request;
+  the text is kept as `{"raw": ...}` in the rendered history.
+
 ## v1.3.190 - 2026-11-22
 
 Long prompts on 16 GB cards: `STRATA_GLM_PREFILL_DENSE_TIER=1` (opt-in, #53) lends the dense weights' VRAM to the

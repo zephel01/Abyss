@@ -1745,6 +1745,11 @@ class Service:
         self.ink_ids = [x[0] for x in ink] if all(ink) else None
         inv = _special_ids(INK_CALL) if self.ink_ids is not None else []
         self.ink_invoke_id = inv[0] if inv else None   # (its tool calls: InklingCalls)
+        # two more message kinds its template never writes: a call written as text (InklingCalls: text out) and a tool
+        # error (a text message) - without them their header swallowed a short message
+        more = [_special_ids(x) if self.ink_ids is not None else []
+                for x in ("<|content_invoke_tool_text|>", "<|content_tool_error|>")]
+        self.ink_more_ids = [x[0] if x else None for x in more]
         if self.ink_ids is not None:
             self.think_end_id = self.ink_ids[3]
             self.stop_ids.add(self.ink_ids[4])
@@ -2398,7 +2403,8 @@ class Service:
         # Inkling's call messages: read on the ids (InklingCalls), ahead of the text parser
         ink_calls = None
         if getattr(self, "ink_ids", None) is not None and getattr(self, "ink_invoke_id", None) is not None:
-            ink_calls = InklingCalls(self.tok, *self.ink_ids[:4], self.ink_invoke_id, parser)
+            ink_calls = InklingCalls(self.tok, *self.ink_ids[:4], self.ink_invoke_id, parser,
+                                     *getattr(self, "ink_more_ids", [None, None]))
         if ink_calls is not None and prefill.endswith(INK_CALL):
             ink_calls.start_call(prefill[len("<|message_model|>"):-len(INK_CALL)])
             pre_events = []
@@ -2537,10 +2543,22 @@ class Service:
                                     continue
                             if getattr(self, "ink_ids", None) is not None:   # (Inkling's message markers: not text)
                                 ink_mm, ink_th, ink_tx, ink_em = self.ink_ids[:4]
-                                if t == ink_tx and parser.state == "reasoning":
+                                ink_err = (getattr(self, "ink_more_ids", None) or [None, None])[1]
+                                is_tx = t == ink_tx or (t == ink_err and t is not None)   # (a tool error: text too)
+                                if is_tx and parser.state == "reasoning":
                                     parser.state, parser.lead, closed_by = "content", True, None
                                     continue
-                                if t in (ink_mm, ink_th, ink_tx) or (t == ink_em and parser.state != "reasoning"):
+                                if t == ink_th and parser.state == "content":
+                                    # a thinking message after text or a call (the messages come in any order): its
+                                    # text is reasoning to its <|end_message|>, as the first one's is
+                                    evs = parser.feed(held) if held else []
+                                    held = ""
+                                    evs += parser.finish()
+                                    for ev in evs:
+                                        yield "event", ev
+                                    parser.state, parser.lead = "reasoning", False
+                                    continue
+                                if is_tx or t in (ink_mm, ink_th) or (t == ink_em and parser.state != "reasoning"):
                                     continue
                             if model_opens:
                                 model_opens = False
