@@ -435,6 +435,40 @@ class GlmThinkingLevels(unittest.TestCase):
         self.assertEqual([budget_effort(n)["reasoning_effort"] for n in (1024, 4096, 16384)], ["low", "high", "max"])
 
 
+class InklingThinkingLevels(unittest.TestCase):
+    """Inkling 2's template maps reasoning_effort none / minimal / low / ... to 0.0 / 0.1 / 0.2 / ... (0.9 when
+    absent): "minimal" is the template's 0.1, not thinking off (which every other model keeps)."""
+
+    SRC = ('{%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, '
+           '"xhigh": 0.99, "max": 0.99} -%}'
+           "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}"
+           "Thinking effort level: {{ effort_map[eff] if eff is string else eff }}")
+
+    def render(self, effort=None):
+        import tempfile
+        from serve.frontend import effort_kwargs
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(self.SRC, encoding="utf-8")
+            t = ChatTemplate(p)
+            self.assertTrue(t.ink)
+            return t.render([{"role": "user", "content": "hi"}], **effort_kwargs(effort))
+
+    def test_levels(self):
+        self.assertEqual(self.render(), "Thinking effort level: 0.9")
+        self.assertEqual(self.render("none"), "Thinking effort level: 0.0")
+        self.assertEqual(self.render("minimal"), "Thinking effort level: 0.1")
+        self.assertEqual(self.render("low"), "Thinking effort level: 0.2")
+        self.assertEqual(self.render("medium"), "Thinking effort level: 0.7")
+        self.assertEqual(self.render("max"), "Thinking effort level: 0.99")
+        self.assertEqual(self.render(False), "Thinking effort level: 0.0")
+
+    def test_minimal_is_off_elsewhere(self):
+        from serve.frontend import effort_kwargs
+        self.assertIs(effort_kwargs("minimal")["enable_thinking"], False)
+        self.assertEqual(V41ThinkingLevels("test_levels").render("minimal")[:1], "C")   # DeepSeek: thinking off
+
+
 class V41ThinkingLevels(unittest.TestCase):
     """DeepSeek V4.1 1017's template takes reasoning_effort low / medium / high / max or an integer 1..100 (high when
     absent): the client's own value reaches it; other templates get the nearest of the server's levels."""
@@ -649,6 +683,26 @@ class InklingToolCalls(unittest.TestCase):
         self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})])
         out = self.answer(self.CALL.replace('{"city":"Tokyo"}', '"Tokyo"') + "<|content_model_end_sampling|>")
         self.assertEqual(out["calls"], [])                                    # (a plain string: not arguments)
+
+    def test_xml_call_in_a_text_message(self):
+        # Inkling drifts into the XML form (Basalt #540: 18 of 50 answers): a call for a declared tool, else text
+        xml = '<invoke name="get_weather">\n<parameter name="city">Tokyo</parameter>\n</invoke>'
+        out = self.answer("<|message_model|><|content_text|>Checking.\n" + xml + "<|end_message|>"
+                          "<|content_model_end_sampling|>")
+        self.assertEqual(out, {"reasoning": "", "content": "Checking.", "calls": [("get_weather", {"city": "Tokyo"})]})
+        out = self.answer("<|message_model|><|content_text|><tool_call>\n<function_calls>\n" + xml +
+                          "\n</function_calls>\n</tool_call><|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})])
+        out = self.answer("<|message_model|><|content_text|>" + xml.replace("get_weather", "rm_rf") +
+                          "<|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(out["calls"], [])
+
+    def test_xml_call_in_a_call_message(self):
+        xml = '<invoke name="get_weather">\n<parameter name="city">Osaka</parameter>\n</invoke>'
+        for marker in ("<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>"):
+            out = self.answer("<|message_model|>get_weather" + marker + xml + "<|end_message|>"
+                              "<|content_model_end_sampling|>")
+            self.assertEqual(out["calls"], [("get_weather", {"city": "Osaka"})], marker)
 
     def test_tool_text_and_tool_error_messages_are_seen(self):
         # <|content_invoke_tool_text|> (a call written as text) and <|content_tool_error|> are message kinds the

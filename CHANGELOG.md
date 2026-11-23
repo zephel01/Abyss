@@ -9,6 +9,22 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- Inkling 2 tokenizer: a piece that is itself a vocabulary entry is now that one token (`ignore_merges`, as the
+  model's tokenizer.json sets it). 337 entries the merges cannot build (`kwargs`, `について`, `ファイル`, `VBORw` in
+  base64 PNG data, `Aleksandr`, ...) came out as 2-4 tokens the model never saw; all 337 now give the official ids.
+  On our bench and repo texts 0-1.3% of lines changed (0.06% of Python lines, 0.29% of Japanese docs lines).
+  Packs made earlier need no re-export (the flag comes from the pre-tokenizer name).
+- Inkling 2: `reasoning_effort: "minimal"` is the template's 0.1 again; it was sent as "none" (0.0). Other models
+  keep "minimal" as thinking off.
+- Inkling 2: tool calls written in the XML form (`<invoke name="..."><parameter name="...">`, bare, in
+  `<function_calls>` or inside `<tool_call>`, also in a call message) are tool calls for a declared tool, streamed
+  or not; one in a code fence, or naming a tool the request did not declare, stays text.
+- Qwen-form tool calls: a string value that holds `</parameter></function></tool_call>` (a document about tool
+  calls) is kept whole instead of being cut there with the rest sent as text. The close counts as the value's text
+  when the call closes again before any new `<tool_call>`; a new call or the end of the answer makes it the call's.
+
 ## v1.3.193 - 2026-11-23
 
 The dense tier (`STRATA_GLM_PREFILL_DENSE_TIER=1`, #53) now works on packs made with `tools/dense_overlay.py`,

@@ -150,7 +150,9 @@ class ChatTemplate:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
             ok = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-            kwargs["reasoning_effort"] = ("none" if off else raw if raw in ok else level if level in ok else None)
+            # ("minimal" comes as thinking off plus its raw name: the template's 0.1, not "none")
+            kwargs["reasoning_effort"] = ("minimal" if raw == "minimal" else "none" if off else
+                                          raw if raw in ok else level if level in ok else None)
             off = False   # (no think block to close: the effort level says it)
             messages = ink_tool_names(messages)
         elif self.glm_effort:
@@ -221,6 +223,8 @@ def effort_kwargs(value) -> dict:
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
     level = EFFORT[key]
+    if key == "minimal":   # thinking off for every model but Inkling 2, whose template has its own "minimal" (0.1)
+        return {"enable_thinking": False, "effort_raw": key}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level, "effort_raw": key}
 
 
@@ -762,6 +766,46 @@ def parse_dsml_calls(body: str, schemas: dict | None = None) -> list[ToolCall]:
     return calls
 
 
+# An XML call some models drift into (Inkling 2 among them, its own form being a JSON call message):
+#   <function_calls>                                      (optional, also inside <tool_call>)
+#   <invoke name="NAME">
+#   <parameter name="P" string="true">VALUE</parameter>   (string="true|false" optional, as DSML's)
+#   </invoke>
+#   </function_calls>
+XML_CALLS, XML_CALLS_END = "<function_calls>", "</function_calls>"
+XML_INVOKE, XML_INVOKE_END = "<invoke", "</invoke>"
+_XML_INVOKE_OPEN = re.compile(r'<invoke\s+name\s*=\s*"([^"]*)"\s*>')
+_XML_FIND = re.compile(r"<function_calls>|<invoke(?=\s|\Z)")
+_XML_INVOKE = re.compile(r'<invoke\s+name\s*=\s*"([^"]*)"\s*>(.*?)</invoke>', re.S)
+_XML_PARAM = re.compile(r'<parameter\s+name\s*=\s*"([^"]*)"(?:\s+string\s*=\s*"(true|false)")?\s*>(.*?)</parameter>',
+                        re.S)
+
+
+def parse_xml_calls(body: str, schemas: dict | None = None) -> list[ToolCall]:
+    """The complete <invoke> elements of `body` -> their calls, in order; [] when there is none or one names a tool
+    the request did not declare (`schemas`: tool name -> declared tool; with none declared nothing is a call - this
+    is a fallback form, and a model quoting XML must not hand the client a call).  A value loses one leading and one
+    trailing newline (the layout around it); string="true" keeps it as written, else the schema decides (_arg_value)."""
+    if not schemas:
+        return []
+    calls = []
+    for m in _XML_INVOKE.finditer(body):
+        if m.group(1) not in schemas:
+            return []
+        props = ((schemas.get(m.group(1)) or {}).get("parameters") or {}).get("properties") or {}
+        args = {}
+        for pm in _XML_PARAM.finditer(m.group(2)):
+            value, types = pm.group(3), _declared_types(props.get(pm.group(1)))
+            if value.startswith("\n"):
+                value = value[1:]
+            if value.endswith("\n"):
+                value = value[:-1]
+            b = _as_bool(value, types)
+            args[pm.group(1)] = b if b is not None else value if pm.group(2) == "true" else _arg_value(value, types)
+        calls.append(ToolCall(name=m.group(1), arguments=args))
+    return calls
+
+
 _SCHEMA_DEPTH = 8          # anyOf / oneOf nesting looked into; deeper is "no schema"
 
 
@@ -906,6 +950,22 @@ def fix_call_open(body: str, names=()) -> str:
     return FUNC_START + m.group(1) + ">" + b[m.end():]
 
 
+# A Qwen-form value that holds the call's own closing tags (a document about tool calls, written with a tool call):
+# `</parameter></function></tool_call>` inside a call body is the value's text - the body reaches past such a triple
+# only when what follows it closes the call again before any new <tool_call> (OutputParser._qwen_close)
+_QWEN_INNER_CLOSE = re.compile(r"</parameter>\s*</function>\s*</tool_call>")
+_QWEN_BODY_TAIL = re.compile(r"</parameter>\s*</function>\s*\Z")
+
+
+def _close_prefix(s: str) -> bool:
+    """`s` may still grow into `</function></tool_call>` (spaces between): a streamed value cannot end before it."""
+    t = s.lstrip()
+    if not t.startswith("</function>"):
+        return "</function>".startswith(t)
+    u = t[len("</function>"):].lstrip()
+    return "</tool_call>".startswith(u) and u != "</tool_call>"
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """A call body -> ToolCall, in GLM's form (`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`, what GLM-5.x
     writes: issue #5) or Qwen's (`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>`).  Values are
@@ -947,6 +1007,8 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         pname = rest[:close]
         rest = rest[close + 1:]
         end = rest.find("</parameter>")
+        while end >= 0 and _QWEN_INNER_CLOSE.match(rest, end):   # (a closing triple inside the value: its text)
+            end = rest.find("</parameter>", end + 1)
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len("</parameter>"):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -1037,12 +1099,14 @@ class InklingCalls:
             nm = obj.get("name") if isinstance(obj.get("name"), str) and obj.get("name") else name
             if isinstance(args, dict) and nm and self.parser._declared(nm):
                 call = ToolCall(name=nm, arguments=args)
-        if call is None:                     # (not a call this request can take: the text, as the parser would)
+        # a call message whose body is the XML form (<invoke name=..><parameter name=..>), not JSON
+        calls = [call] if call is not None else parse_xml_calls(text, self.parser.schemas)
+        if not calls:                        # (not a call this request can take: the text, as the parser would)
             return [Event("content", name + marker + text)]
         if self.parser.no_calls:
             return [Event("calls_refused")]
         self.parser.state, self.parser.lead = "content", True
-        return [Event("tool_call", call=call)]
+        return [Event("tool_call", call=c) for c in calls]
 
     def finish(self) -> list[Event]:
         """The output ended inside a call message (no <|end_message|>): read what came."""
@@ -1054,8 +1118,13 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 think_token: bool = False, call_ends_think: bool = False, no_calls: bool = False):
+                 think_token: bool = False, call_ends_think: bool = False, no_calls: bool = False,
+                 xml_calls: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # xml_calls (Inkling 2): the answer may write a call in the XML form (<invoke name=..>, bare, in
+        # <function_calls> or in <tool_call>) - a call when it names a declared tool, else text (parse_xml_calls)
+        self.xml_calls = xml_calls
+        self.xml_end = XML_INVOKE_END                   # what ends the XML call being read
         # no_calls (tool_choice "none"): a call the model starts anyway is neither a call nor text - one
         # "calls_refused" event, and everything after it is dropped (the caller ends the answer there)
         self.no_calls = no_calls
@@ -1129,17 +1198,25 @@ class OutputParser:
         self.win = ""                # the body's tail not yet known to be free of the end tag
         self.seen = 0                # where `win` starts in the body
         self.bend = -1               # where the end tag starts in the body; -1: not there yet
+        # a Qwen-form call whose body ends with </parameter></function> at a </tool_call>: that close may be text of
+        # the last value (_qwen_close).  qmode None: not looked at yet, "real": the call ends there, "wait": decided
+        # by what follows (qtail, searched from qpos); qforce: the output ended - the close is real
+        self.qmode, self.qtail, self.qpos, self.qforce = None, "", 0, False
 
     def _body_end(self) -> str:
-        return DSML_ENDS[self.dsml_tag] if self.state == "dsml" else CALL_END
+        return DSML_ENDS[self.dsml_tag] if self.state == "dsml" else self.xml_end if self.state == "xml" else CALL_END
 
     def _body_push(self, text: str) -> None:
         """A piece of the call body (see _reset_body).  With stream_tools the scanner gets it too."""
         self.body.append(text)
         self.blen += len(text)
+        if self.bend >= 0:
+            self.qtail += text       # (past the end tag: what decides a Qwen-form close, see _qwen_close)
+            return
         if self.stream_tools and self.state == "call":
-            self.srest += text
-        if self.bend >= 0 or not text:
+            self.srest += text       # (the scanner sees the body only, never past its end tag)
+            self.sfed += len(text)
+        if not text:
             return
         end = self._body_end()
         self.win += text
@@ -1147,6 +1224,11 @@ class OutputParser:
         k = self.win.find(end)
         if k >= 0:
             self.bend = self.seen + k
+            self.qtail = self.win[k + len(end):]
+            if self.stream_tools and self.state == "call" and self.sfed > self.bend:
+                over = self.sfed - self.bend
+                self.srest = self.srest[:len(self.srest) - over] if len(self.srest) >= over else ""
+                self.sfed = self.bend
             return
         keep = len(end) - 1          # a suffix this long may be the start of the end tag
         if len(self.win) > keep:
@@ -1165,6 +1247,8 @@ class OutputParser:
 
     def _reset_scan(self):
         self.srest = ""              # the call body not yet consumed by the scanner (only the body: never past its end)
+        self.sfed = 0                # the body's characters given to srest so far
+        self.sfinal = False          # srest reaches the body's end (a closing triple at its end is the call's own)
         self.sraw = 0                # how far `srest` was searched for the end of a raw value
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
@@ -1281,6 +1365,18 @@ class OutputParser:
                     self.sval_started = True
                 self.scanned += len(rest)
                 end = rest.find(self.vend)
+                if end >= 0 and not self.glm:
+                    inner = _QWEN_INNER_CLOSE.match(rest, end)
+                    if inner:                    # the call's closing tags inside the value: its text (_qwen_close)
+                        args(json.dumps(rest[:inner.end()])[1:-1])
+                        take(inner.end())
+                        continue
+                    if not self.sfinal and _close_prefix(rest[end + len(self.vend):]):
+                        safe = end - 1 if end > 0 and rest[end - 1] == "\n" else end
+                        if safe > 0:             # (may still be one: the value up to the tag goes out)
+                            args(json.dumps(rest[:safe])[1:-1])
+                            take(safe)
+                        return out
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n") and not self.glm:
@@ -1395,7 +1491,7 @@ class OutputParser:
     def feed(self, delta: str, think_end: bool = False) -> list[Event]:
         if self.state == "refused":
             return []
-        if self.state in ("call", "dsml"):
+        if self.state in ("call", "dsml", "xml"):
             self._body_push(delta)       # (the text before a call is short: it goes out as it comes; a call's body is not)
         else:
             self.buf += delta
@@ -1461,22 +1557,25 @@ class OutputParser:
                         self.buf = ""
                         return out
                     self.buf, self.lead = stripped, False
-                i = self.buf.find(CALL_START)
-                hits = [(d, t) for t in DSML_ENDS for d in (self.buf.find(t),) if d >= 0]
-                d, dtag = min(hits) if hits else (-1, DSML_CALLS)
-                dsml = d >= 0 and (i < 0 or d < i)
-                if dsml:
-                    i = d
-                if i < 0:
+                hits = [(i, "call", CALL_START) for i in (self.buf.find(CALL_START),) if i >= 0]
+                hits += [(d, "dsml", t) for t in DSML_ENDS for d in (self.buf.find(t),) if d >= 0]
+                xml = self.xml_calls and bool(self.schemas)
+                if xml:
+                    m = _XML_FIND.search(self.buf)
+                    if m:
+                        hits.append((m.start(), "xml", XML_CALLS if m.group(0) == XML_CALLS else XML_INVOKE))
+                if not hits:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, DSML_CALLS, DSML41_CALLS))
+                    tags = (CALL_START, DSML_CALLS, DSML41_CALLS) + ((XML_CALLS, XML_INVOKE + " ") if xml else ())
+                    j = len(self.buf) - self._hold(self.buf, tags)
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
+                i, kind, tag = min(hits)
                 # Strata #1058: a <tool_call> inside a code fence or inline code of the answer is a quoted example -
                 # text, never a call (an example `rm -rf` must not run).  The text before it decides, so streamed and
                 # whole outputs agree; one at the top level, mid-sentence too, is a call as before.
@@ -1484,11 +1583,26 @@ class OutputParser:
                 self._track(self.buf[:i])
                 in_code = self._in_code()
                 self.fence, self.line, self.ticks = snap
-                tag = dtag if dsml else CALL_START
                 if in_code:
                     out.append(Event("content", self._track(self.buf[:i + len(tag)])))
                     self.buf = self.buf[i + len(tag):]
                     continue
+                if kind == "xml" and tag == XML_INVOKE:
+                    # a bare <invoke name="NAME">: a call only when its opening is complete and names a declared tool
+                    m = _XML_INVOKE_OPEN.match(self.buf, i)
+                    if m is None and ">" not in self.buf[i:] and len(self.buf) - i < self._THINK_NAME_HOLD:
+                        j = i                   # (the opening still arriving: the text before it goes out)
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                            self.buf = self.buf[j:]
+                        return out
+                    if m is None or m.group(1) not in self.schemas:
+                        k = i + len(tag) if m is None else m.end()
+                        out.append(Event("content", self._track(self.buf[:k])))
+                        self.buf = self.buf[k:]
+                        continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 # the call ends the line before it (its text went out without the newline): nothing of that line is
@@ -1498,10 +1612,26 @@ class OutputParser:
                     out.append(Event("calls_refused"))
                     self.state, self.buf = "refused", ""
                     return out
-                self.state = "dsml" if dsml else "call"
-                self.dsml_tag = dtag
-                rest, self.buf = self.buf[i + len(tag):], ""
+                self.state = kind
+                if kind == "dsml":
+                    self.dsml_tag = tag
+                if kind == "xml":               # (the body keeps its opening: parse_xml_calls reads the <invoke>s)
+                    self.xml_end = XML_CALLS_END if tag == XML_CALLS else XML_INVOKE_END
+                    rest, self.buf = self.buf[i:], ""
+                else:
+                    rest, self.buf = self.buf[i + len(tag):], ""
                 self._body_push(rest)
+            elif self.state == "xml":
+                if self.bend < 0:
+                    return out
+                end = self.xml_end
+                body, self.buf = self._body_take()
+                calls = parse_xml_calls(body + end, self.schemas)
+                if not calls:                       # (a malformed one is text, never a failed request)
+                    out.append(Event("content", self._track(body + end)))
+                for call in calls:
+                    out.append(Event("tool_call", call=call))
+                self.state, self.lead = "content", True
             elif self.state == "dsml":
                 if self.bend < 0:
                     return out
@@ -1516,10 +1646,14 @@ class OutputParser:
                 self.state, self.lead = "content", True
             else:
                 i = self.bend
+                if i >= 0 and self._qwen_close() is None:
+                    if self.stream_tools:
+                        out += self._scan()
+                    return out                    # (is that close the call's or its last value's: wait)
+                i = self.bend
                 if self.stream_tools:
                     if i >= 0:                    # scan only the body: the scanner never sees past its end tag
-                        over = self.blen - i
-                        self.srest = self.srest[:len(self.srest) - over] if len(self.srest) >= over else ""
+                        self.sfinal = True
                         out += self._scan()
                         out += self._close_scan()
                     else:
@@ -1534,7 +1668,11 @@ class OutputParser:
                     call = None
                 if call is not None and not self._declared(call.name):
                     call = None                     # a call to a tool the request did not declare: text
-                if call is None and self.scall is None:
+                xml_calls = parse_xml_calls(body, self.schemas) if call is None and self.scall is None and \
+                    self.xml_calls else []
+                if xml_calls:                       # <tool_call><function_calls><invoke name=..>..</tool_call>
+                    out += [Event("tool_call", call=c) for c in xml_calls]
+                elif call is None and self.scall is None:
                     out.append(Event("content", self._track(CALL_START + body)))
                 elif call is None:                  # already announced while streaming: close it as scanned
                     out.append(Event("tool_call", call=self.scall))
@@ -1545,11 +1683,54 @@ class OutputParser:
                 self._reset_scan()
                 self.state, self.lead = "content", True
 
+    def in_open_call(self) -> bool:
+        """Inside a tool call whose end tag has not come (a Qwen-form close still being decided is not open: the
+        call's tags are all there, and an end-of-turn token after them ends the turn)."""
+        return self.state in ("call", "dsml", "xml") and self.bend < 0
+
+    def _qwen_close(self) -> bool | None:
+        """At a </tool_call> (self.bend) of a Qwen-form call whose body ends with </parameter></function>: True when
+        that close is the call's, None while unknown.  The close is text of the last value (a document about tool
+        calls) when what follows closes the call again - </parameter></function></tool_call> - before any new
+        <tool_call>: the body then reaches to that later close (and it is looked at the same way).  A new <tool_call>
+        or the end of the output (qforce) makes it the call's own; so does any other body (GLM's form, no value)."""
+        while True:
+            if self.qmode is None:
+                whole = "".join(self.body)
+                head = fix_call_open(whole[:512], self.schemas).lstrip()
+                tail = whole[max(0, self.bend - 512):self.bend]
+                self.qmode = "wait" if head.startswith(FUNC_START) and _QWEN_BODY_TAIL.search(tail) else "real"
+            if self.qmode == "real" or self.qforce:
+                return True
+            t = self.qtail
+            lo = max(0, self.qpos - len(CALL_END))
+            c = t.find(CALL_START, lo)
+            e = t.find(CALL_END, lo)
+            while e >= 0 and (c < 0 or e < c):
+                if _QWEN_BODY_TAIL.search(t, max(0, e - 512), e):
+                    break
+                e = t.find(CALL_END, e + 1)
+            else:
+                if c >= 0:
+                    return True
+                self.qpos = len(t)
+                return None
+            # the close at bend was inside the value: the body goes on to the later one
+            nb = self.bend + len(CALL_END) + e
+            if self.stream_tools:
+                self.srest += "".join(self.body)[self.sfed:nb]
+                self.sfed = nb
+            self.bend, self.qtail, self.qpos = nb, t[e + len(CALL_END):], 0
+
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
         out = []
         if self.state == "refused":
             return out
+        if self.state == "call" and self.bend >= 0:   # a Qwen-form close still undecided: the output ended, it is real
+            self.qforce = True
+            out += self.feed("")
+            return out + self.finish()
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             out += self._close_scan()
@@ -1557,7 +1738,21 @@ class OutputParser:
             self._reset_body()
             self._reset_scan()
             return out
-        body = self._body_text() if self.state in ("call", "dsml") else self.buf
+        body = self._body_text() if self.state in ("call", "dsml", "xml") else self.buf
+        if self.state in ("call", "xml") and self.xml_calls:
+            # the output ended inside an XML call (no </invoke> / </function_calls> / </tool_call> after it): its
+            # complete <invoke>s are calls, what follows the last one text
+            calls = parse_xml_calls(body, self.schemas)
+            if calls:
+                out += [Event("tool_call", call=c) for c in calls]
+                tail = body[body.rfind(XML_INVOKE_END) + len(XML_INVOKE_END):]
+                tail = tail.replace(XML_CALLS_END, "").strip()
+                if tail:
+                    out.append(Event("content", self._track(tail)))
+                self.buf = ""
+                self._reset_body()
+                self.state = "content"
+                return out
         if body or self.state == "dsml":               # (a block that ended at its opening tag stays text too)
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = CALL_START + body if self.state == "call" else self.dsml_tag + body if self.state == "dsml" else body

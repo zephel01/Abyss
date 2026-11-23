@@ -2192,6 +2192,7 @@ class Service:
         kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}   # (the server's own keys: not the template's)
         if force is not None and tools:
             kwargs["enable_thinking"] = False
+            kwargs.pop("effort_raw", None)   # (a forced call does not think at any level, Inkling's "minimal" too)
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
         images = images_of(messages)
@@ -2375,7 +2376,7 @@ class Service:
         text and the answer goes on (STRATA_SOFT_END=<n> such tokens at most, default 16; 0 = an end token always ends
         it).  The engine's end guard closes a reasoning block at an end token first (STRATA_GLM_END_GUARD), so here it
         is mostly an end token in a tool call's arguments (a file that quotes a chat template)."""
-        return parser.state in ("reasoning", "call", "dsml")
+        return parser.state == "reasoning" or parser.in_open_call()
 
     @staticmethod
     def _soft_end_max() -> int:
@@ -2398,7 +2399,8 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                               think_token=self.think_end_id is not None,
                               call_ends_think=getattr(self, "call_ends_think", False),
-                              no_calls=(sampling or {}).get("_no_calls") is True)
+                              no_calls=(sampling or {}).get("_no_calls") is True,
+                              xml_calls=getattr(self, "ink_ids", None) is not None)   # (Inkling's XML calls)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         # Inkling's call messages: read on the ids (InklingCalls), ahead of the text parser
         ink_calls = None
