@@ -260,6 +260,7 @@ struct Options {
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
     std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as STRATA_GLM_PREFILL)
+    std::string parallel_arg;          ///< `--parallel N|auto` (Inkling: N requests decode together; STRATA_INK_PARALLEL)
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -460,6 +461,9 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
+                 "  --parallel N|auto    --serve, Inkling 2 Mini: N requests decode together (one pass through the\n"
+                 "                       weights a token for all of them; auto: as many as leave every expert in VRAM,\n"
+                 "                       at most 8; default 1)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
@@ -1729,6 +1733,655 @@ static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
     return 0;
 }
 
+// ---- --parallel N (Inkling 2 Mini): several requests decode together.  The model keeps N lanes - one conversation's
+// caches and conv states each (Glm5Model::ink_lane_use) - and every loop round runs one token of every decoding request
+// as ONE pass through the weights (ink_batch_step: a window whose rows are different conversations; each row the bits
+// its own token path gives).  Between rounds a prompt being read gets one chunk (STRATA_PAR_CHUNK tokens, 1024) - so a
+// new request never waits for the others to end, and the running streams pause one chunk's time at most.  A prompt
+// read while nothing decodes goes in one call, as without --parallel, and a request alone decodes on the token path:
+// its tokens and its speed are those of --parallel 1 (no drafter: the lanes would each need the drafter's context).
+// The wire: GEN lines carry rid=<n>; every line about a request is "@<rid> T <id>" / "@<rid> PP ..." / "@<rid> NOTE
+// ..." / "@<rid> DONE ..." / "@<rid> ERR ..."; "STOP <rid>" ends one request, a bare STOP all of them; "@<rid> QUEUED
+// <n>" says the request waits for a lane (n ahead of it).  Each lane keeps its last conversation's snapshot: a new
+// request takes the free lane whose conversation its prompt extends the furthest (an agent re-sending its context
+// reads only what is new).  Not here (one request at a time keeps them): the disk / RAM conversation slots, the
+// per-request uncensor / control-vector switches (the engine's defaults apply), penalties, images, LOGP.
+static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, ServeInput& in,
+                              const std::vector<int64_t>& eos, const strata::kernels::SamplerParams& sp_def) {
+    using clk = std::chrono::steady_clock;
+    namespace kn = strata::kernels;
+    const int64_t n_vocab = model.geometry().n_vocab;
+    const int NL = model.ink_par_;
+    const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
+    // the chunk a prompt reads between two decode rounds while others decode (smaller: smoother streams, a slower
+    // prompt); nothing decoding: the whole prompt in one call
+    // Default: the prompt path's own chunk - a prompt then goes in the same pieces whether others decode or not (a
+    // whole-prompt call splits at those boundaries too), so its answer does not depend on what else runs; another
+    // size moves the boundaries (the sums of a piece, the last bits of a long prompt's answer)
+    const int64_t chunk_busy = std::max<int64_t>(64, (int64_t) env_num("STRATA_PAR_CHUNK",
+                                                                       model.prefill_chunk() > 0 ? model.prefill_chunk() : 1024));
+    const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
+    const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
+    const int loop_long = (int) env_num("STRATA_GLM_LOOP_LONG", 1024);
+    const int pchunk = model.prefill_chunk();
+    const bool trace = env_num("STRATA_PAR_TRACE", 0) != 0;
+    // after a prompt chunk read while others decode, the decoding requests get this share of its time before the next
+    // chunk (0.5: a chunk of 300 ms, then 150 ms of decode rounds) - the streams keep moving through a long prompt, the
+    // prompt still gets two thirds of the GPU.  0: one decode round between chunks
+    const double share = std::max(0.0, env_num("STRATA_PAR_SHARE", 0.5));
+    clk::time_point owed_until = clk::now();   // (no chunk before this while requests decode)
+    std::map<std::string, std::shared_ptr<kn::BiasSet>> bias_sets;
+    std::deque<std::string> bias_order;
+
+    struct Req {
+        int64_t rid = 0;
+        int lane = -1;
+        std::vector<int32_t> prompt;
+        size_t read = 0, reuse = 0;           // prompt tokens in the lane's state; of them reused from its snapshot
+        int64_t max_new = 0, produced = 0;
+        kn::SamplerParams sp;
+        int64_t think_budget = 0;
+        int32_t think_end = -1;
+        bool end_guard_on = false;
+        std::vector<int64_t> ws_ids, end_ids, stop_ids;
+        std::vector<int32_t> think_close;
+        int64_t arg_open = -2, arg_close = -2;
+        bool arg_set = false;
+        const kn::BiasSet* bias = nullptr;
+        const kn::BiasSet* bias_ans = nullptr;
+        uint64_t ns = 0;
+        bool decoding = false;                // the prompt is in (but its last token): feed goes through the model
+        int32_t feed = -1;
+        bool in_think = false, think_closing = false, ans_guard = false, in_arg = false, stop = false;
+        const std::vector<int64_t>* guard = nullptr;   // the end guard's ids while armed
+        int32_t guard_tok = -1;
+        std::deque<int32_t> force_q;
+        std::vector<int> gen_hist, run_p;
+        int guard_fired = 0;
+        const char* finish = "length";
+        int64_t queued = -1;                  // (the place in the queue it was last told)
+        clk::time_point t0, t1;
+        double disk0 = 0.0;
+        const std::vector<int64_t>& stops(const std::vector<int64_t>& def) const { return stop_ids.empty() ? def : stop_ids; }
+    };
+    struct Lane {
+        std::shared_ptr<Req> req;            // null: free
+        std::vector<int32_t> snap;            // the tokens its snapshot holds (the last prompt but its last token)
+        uint64_t ns = 0;
+        uint64_t used = 0;                    // (least recently used first among equals)
+    };
+    std::vector<Lane> lanes((size_t) NL);
+    std::deque<std::shared_ptr<Req>> waiting;   // no free lane yet
+    std::deque<std::shared_ptr<Req>> reading;   // in a lane, its prompt being read (oldest first)
+    uint64_t use_n = 0;
+    bool quitting = false;
+    std::string err;
+
+    const auto say = [](const Req& r, const char* fmt, auto... args) {
+        std::printf("@%lld ", (long long) r.rid);
+        std::printf(fmt, args...);
+        std::printf("\n");
+    };
+    // a request ends: its DONE, its lane free (the lane keeps its snapshot)
+    const auto finish_req = [&](Req& r, const char* why) {
+        r.finish = why;
+        const auto t2 = clk::now();
+        const bool started = r.decoding;
+        const double prompt_ms = std::chrono::duration<double, std::milli>((started ? r.t1 : t2) - r.t0).count();
+        const double decode_ms = started ? std::chrono::duration<double, std::milli>(t2 - r.t1).count() : 0.0;
+        say(r, "DONE %lld %lld %.1f %.1f %s 0 0 %zu 0 0 0", (long long) r.produced, (long long) r.prompt.size(), prompt_ms,
+            decode_ms, r.finish, r.reuse);
+        std::fflush(stdout);
+        if (r.lane >= 0) lanes[(size_t) r.lane].req.reset();
+        for (auto it = reading.begin(); it != reading.end(); ++it)
+            if (it->get() == &r) { reading.erase(it); break; }
+    };
+    const auto fail_req = [&](Req& r, const std::string& e) {
+        say(r, "ERR %s", e.c_str());
+        std::fflush(stdout);
+        if (r.lane >= 0) {
+            lanes[(size_t) r.lane].req.reset();
+            lanes[(size_t) r.lane].snap.clear();   // (its state is not that conversation's any more)
+        }
+        for (auto it = reading.begin(); it != reading.end(); ++it)
+            if (it->get() == &r) { reading.erase(it); break; }
+    };
+    const auto find_req = [&](int64_t rid) -> std::shared_ptr<Req> {
+        for (auto& l : lanes)
+            if (l.req && l.req->rid == rid) return l.req;
+        for (auto& r : waiting)
+            if (r->rid == rid) return r;
+        return nullptr;
+    };
+    // a GEN line -> a request (nullptr + an ERR line when malformed)
+    const auto parse_gen = [&](std::istringstream& ss) -> std::shared_ptr<Req> {
+        auto r = std::make_shared<Req>();
+        r->sp = sp_def;
+        bool any_key = false, greedy_req = false, seeded = false, have_rid = false;
+        std::string tok2, ids, why;
+        ss >> r->max_new;
+        while (ss >> tok2) {
+            const size_t eq = tok2.find('=');
+            if (eq == std::string::npos) { ids = tok2; continue; }
+            const std::string k = tok2.substr(0, eq), v = tok2.substr(eq + 1);
+            std::string e;
+            if (k == "rid") { r->rid = std::atoll(v.c_str()); have_rid = true; }
+            else if (k == "temperature") {
+                r->sp.temperature = (float) std::atof(v.c_str());
+                if (r->sp.temperature <= 0.0f) greedy_req = true; else any_key = true;
+            }
+            else if (k == "top_p") { r->sp.top_p = (float) std::atof(v.c_str()); any_key = true; }
+            else if (k == "top_k") { r->sp.top_k = std::atoi(v.c_str()); any_key = true; }
+            else if (k == "min_p") { r->sp.min_p = (float) std::atof(v.c_str()); any_key = true; }
+            else if (k == "seed") { r->sp.seed = (uint64_t) std::atoll(v.c_str()); seeded = true; }
+            else if (k == "think_budget") r->think_budget = std::atoll(v.c_str());
+            else if (k == "think_end") r->think_end = std::atoi(v.c_str());
+            else if (k == "end_guard") r->end_guard_on = std::atoi(v.c_str()) != 0;
+            else if (k == "ws_ids") parse_i64_list(v.c_str(), r->ws_ids, e);
+            else if (k == "end_ids") parse_i64_list(v.c_str(), r->end_ids, e);
+            else if (k == "think_close") {
+                std::vector<int64_t> c;
+                parse_i64_list(v.c_str(), c, e);
+                for (int64_t x : c) if (x >= 0 && c.size() <= 96) r->think_close.push_back((int32_t) x);
+            }
+            else if (k == "arg_ids") {
+                std::vector<int64_t> a;
+                r->arg_set = true;
+                if (!v.empty() && parse_i64_list(v.c_str(), a, e) && a.size() == 2 && a[0] >= 0 && a[0] < n_vocab &&
+                    a[1] >= 0 && a[1] < n_vocab) {
+                    r->arg_open = a[0];
+                    r->arg_close = a[1];
+                }
+            }
+            else if (k == "stop_ids") {
+                if (!parse_i64_list(v.c_str(), r->stop_ids, e)) r->stop_ids.clear();
+                for (const int64_t x : r->stop_ids)
+                    if (x < 0 || x >= n_vocab) { r->stop_ids.clear(); break; }
+            }
+            else if (k == "bias" || k == "bias_answer") {
+                const auto it = bias_sets.find(v);
+                if (it == bias_sets.end()) why = "unknown bias set '" + v + "' (send BIAS first)";
+                else (k == "bias" ? r->bias : r->bias_ans) = it->second.get();
+            }
+            else if (k == "slot_ns") r->ns = std::strtoull(v.c_str(), nullptr, 16);
+            // (abl / cvec / pcie_frac / cpu_threads / spec / slot_sess / penalties: the engine's defaults here)
+        }
+        if (!have_rid) {
+            std::printf("ERR --parallel: a GEN line needs rid=<n>\n");
+            std::fflush(stdout);
+            return nullptr;
+        }
+        std::vector<int64_t> toks;
+        std::string e;
+        if (why.empty() && (r->max_new <= 0 || ids.empty() || !parse_i64_list(ids.c_str(), toks, e) || toks.empty()))
+            why = "empty prompt or max_new";
+        for (const int64_t t : toks)
+            if (why.empty() && (t < 0 || t >= n_vocab))
+                why = "token " + std::to_string(t) + " out of range [0, " + std::to_string(n_vocab) + ")";
+        if (why.empty() && (int64_t) toks.size() + 1 > o.max_context)
+            why = "the prompt (" + std::to_string(toks.size()) + " tokens) does not fit the context (" +
+                  std::to_string(o.max_context) + ")";
+        if (!why.empty()) {
+            say(*r, "ERR %s", why.c_str());
+            std::fflush(stdout);
+            return nullptr;
+        }
+        for (const int64_t t : toks) r->prompt.push_back((int32_t) t);
+        if (any_key) r->sp.greedy = false;
+        if (greedy_req) r->sp.greedy = true;
+        static uint64_t fresh_n = 0;
+        r->sp.seed = strata::program::request_seed(seeded, r->sp.seed, o.seed_given, o.seed, fresh_n,
+                                                   strata::program::request_seed_now());
+        r->in_think = r->think_end >= 0;
+        if (r->end_guard_on && r->in_think) {
+            r->guard = r->end_ids.empty() ? &r->stops(eos) : &r->end_ids;
+            r->guard_tok = r->think_end;
+        }
+        r->t0 = clk::now();
+        return r;
+    };
+    // the input so far: control lines now (STOP <rid>, BIAS), GEN into waiting; false: QUIT / end of input
+    const auto drain = [&](bool block) -> bool {
+        std::deque<std::string> got;
+        {
+            std::unique_lock<std::mutex> lk(in.mu);
+            if (block) in.cv.wait(lk, [&] { return !in.lines.empty() || in.eof || in.quit.load() || in.stop.load(); });
+            got.swap(in.lines);
+            if (got.empty() && (in.eof || in.quit.load())) quitting = true;
+        }
+        if (in.stop.exchange(false)) {   // a bare STOP: every request ends at its next step
+            for (auto& l : lanes) if (l.req) l.req->stop = true;
+            for (auto& r : waiting) r->stop = true;
+        }
+        if (in.wrap.load())
+            for (auto& l : lanes)
+                if (l.req && l.req->in_think && !l.req->think_closing) {
+                    auto& r = *l.req;
+                    r.force_q.assign(r.think_close.begin(), r.think_close.end());
+                    r.force_q.push_back(r.think_end);
+                    r.think_closing = true;
+                }
+        for (auto& line : got) {
+            std::istringstream ss(line);
+            std::string cmd;
+            ss >> cmd;
+            if (cmd == "QUIT") { quitting = true; continue; }
+            if (cmd == "STOP") {
+                int64_t rid = -1;
+                if (ss >> rid)
+                    if (auto r = find_req(rid)) r->stop = true;
+                continue;
+            }
+            if (cmd == "BIAS") {
+                std::string name, spec, extra, why;
+                ss >> name >> spec;
+                std::shared_ptr<kn::BiasSet> set;
+                if (name.empty() || spec.empty() || (ss >> extra)) why = "malformed BIAS line (BIAS <name> <id:value,...>)";
+                else set = kn::bias_parse(spec, (int) n_vocab, why);
+                if (set == nullptr) {
+                    std::printf("ERR %s\n", why.c_str());
+                } else {
+                    if (bias_sets.find(name) == bias_sets.end()) bias_order.push_back(name);
+                    bias_sets[name] = set;
+                    while (bias_order.size() > 64) {
+                        bool live = false;   // (a set a request still uses stays)
+                        for (auto& l : lanes)
+                            if (l.req && (l.req->bias == bias_sets[bias_order.front()].get() ||
+                                          l.req->bias_ans == bias_sets[bias_order.front()].get())) live = true;
+                        if (live) break;
+                        bias_sets.erase(bias_order.front());
+                        bias_order.pop_front();
+                    }
+                    std::printf("BIASOK %s %zu\n", name.c_str(), set->ids.size());
+                }
+                std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "GEN") {
+                if (auto r = parse_gen(ss)) waiting.push_back(r);
+                continue;
+            }
+            if (!cmd.empty()) {
+                std::printf("ERR %s is not available with --parallel\n", cmd.c_str());
+                std::fflush(stdout);
+            }
+        }
+        return !quitting;
+    };
+    // waiting requests into free lanes: the free lane whose conversation the prompt extends the furthest (its API key's),
+    // else the least recently used one
+    const auto admit = [&]() {
+        while (!waiting.empty()) {
+            auto r = waiting.front();
+            if (r->stop) {   // (stopped before it had a lane)
+                waiting.pop_front();
+                r->finish = "cancel";
+                finish_req(*r, "cancel");
+                continue;
+            }
+            int best = -1;
+            size_t best_len = 0;
+            for (int j = 0; j < NL; ++j) {
+                const Lane& l = lanes[(size_t) j];
+                if (l.req) continue;
+                size_t len = 0;
+                if (!l.snap.empty() && l.ns == r->ns && l.snap.size() < r->prompt.size() &&
+                    std::equal(l.snap.begin(), l.snap.end(), r->prompt.begin()) && getenv("STRATA_GLM_NO_REUSE") == nullptr)
+                    len = l.snap.size();
+                if (best < 0 || len > best_len || (len == best_len && l.used < lanes[(size_t) best].used)) {
+                    best = j;
+                    best_len = len;
+                }
+            }
+            if (best < 0) break;
+            waiting.pop_front();
+            r->lane = best;
+            r->reuse = best_len;
+            Lane& l = lanes[(size_t) best];
+            l.req = r;
+            l.used = ++use_n;
+            if (best_len == 0) l.snap.clear();
+            reading.push_back(r);
+        }
+        size_t ahead = 0;
+        bool said = false;
+        for (auto& r : waiting) {   // (a waiting request is told its place when it changes)
+            if (r->stop) continue;
+            if (r->queued != (int64_t) ahead) {
+                say(*r, "QUEUED %zu", ahead);
+                r->queued = (int64_t) ahead;
+                said = true;
+            }
+            ++ahead;
+        }
+        if (said) std::fflush(stdout);
+    };
+    // looping(w): the tail's repeating period (<= 32), 0 when none; looping_long: a block of 33..loop_long three times
+    const auto looping = [](const std::vector<int>& h, int w) -> int {
+        const int n = (int) h.size();
+        if (w <= 0 || n < w) return 0;
+        for (int per = 1; per <= 32 && per < w / 4; ++per) {
+            bool rep = true;
+            for (int i = n - w + per; i < n && rep; ++i) rep = h[(size_t) i] == h[(size_t) (i - per)];
+            if (rep) return per;
+        }
+        return 0;
+    };
+    const auto looping_long = [&](Req& r) -> int {
+        const int n = (int) r.gen_hist.size();
+        if (loop_long <= 32) return 0;
+        if (n == 1 || r.run_p.empty()) r.run_p.assign((size_t) loop_long + 1, 0);
+        const int tok = r.gen_hist[(size_t) n - 1], top = std::min(loop_long, n - 1);
+        int hit = 0;
+        for (int p = 33; p <= top; ++p) {
+            int& c = r.run_p[(size_t) p];
+            c = r.gen_hist[(size_t) (n - 1 - p)] == tok ? c + 1 : 0;
+            if (hit == 0 && c >= std::max(2 * p, 256)) hit = p;
+        }
+        return hit;
+    };
+    const auto close_think = [](Req& r) {
+        r.force_q.assign(r.think_close.begin(), r.think_close.end());
+        r.force_q.push_back(r.think_end);
+        r.think_closing = true;
+    };
+    // a picked token (its row's logits at d_row): forced / guarded, emitted, the request's checks; false: it ended
+    const auto take = [&](Req& r, int tok, const float* d_row) -> bool {
+        if (!r.force_q.empty()) {
+            tok = r.force_q.front();
+            r.force_q.pop_front();
+        } else if (r.guard != nullptr) {
+            bool fired = false;
+            const bool hit = std::find(r.guard->begin(), r.guard->end(), (int64_t) tok) != r.guard->end();
+            if (hit) {
+                tok = model.guard_row_pick(d_row, tok, *r.guard, r.guard_tok, fired);
+                r.guard = nullptr;   // (once)
+            }
+            if (fired)
+                say(r, "NOTE the turn ended %s: the model was kept going",
+                    r.ans_guard ? "with no answer after the reasoning" : "inside the reasoning");
+        }
+        r.sp.counter += 1;
+        say(r, "T %d", tok);
+        ++r.produced;
+        strata::core::progress_at("decode: after token", r.produced);
+        strata::core::progress_beat();
+        r.gen_hist.push_back(tok);
+        const std::vector<int64_t>& stops = r.stops(eos);
+        if (r.in_think && tok != r.think_end && !r.think_closing) {
+            int per = looping(r.gen_hist, loop_w_think);
+            if (const int lp = looping_long(r); per == 0) per = lp;
+            if (per != 0) {
+                close_think(r);
+                char m[200];
+                std::snprintf(m, sizeof m, "thinking was repeating a %d-token pattern (%d tokens in): closed, answering", per,
+                              (int) r.produced);
+                std::fprintf(stderr, "glm loop guard (request %lld): %s\n", (long long) r.rid, m);
+                say(r, "NOTE %s", m);
+                r.gen_hist.clear();
+            }
+        } else if (!r.in_think) {
+            if (r.ans_guard && std::find(r.ws_ids.begin(), r.ws_ids.end(), (int64_t) tok) == r.ws_ids.end()) {
+                r.guard = nullptr;
+                r.ans_guard = false;
+            }
+            const int kArgValue = r.arg_set ? (int) r.arg_open : -2, kArgValueEnd = r.arg_set ? (int) r.arg_close : -2;
+            const int kUser = stops.empty() ? -1 : (int) stops.front();
+            if (tok == kArgValue) r.in_arg = true;
+            if (tok == kArgValueEnd) r.in_arg = false;
+            if (const int per = looping(r.gen_hist, loop_w_answer)) {
+                char m[240];
+                if (r.guard_fired == 0) {
+                    r.force_q.assign(1, r.in_arg ? kArgValueEnd : kUser);
+                    std::snprintf(m, sizeof m, "the answer was repeating a %d-token pattern (%d tokens in): %s", per,
+                                  (int) r.produced, r.in_arg ? "the tool call's argument was closed there" : "the turn was ended there");
+                } else {
+                    std::snprintf(m, sizeof m, "the answer kept repeating a %d-token pattern (%d tokens in): ended", per,
+                                  (int) r.produced);
+                }
+                std::fprintf(stderr, "glm loop guard (request %lld): %s\n", (long long) r.rid, m);
+                say(r, "NOTE %s", m);
+                r.gen_hist.clear();
+                if (r.guard_fired++ > 0) {
+                    r.finish = "length";
+                    return false;
+                }
+            }
+        }
+        if (r.in_think && tok != r.think_end && !r.think_closing &&
+            ((r.think_budget > 0 && r.produced >= r.think_budget) || in.wrap.load())) {
+            close_think(r);
+        } else if (r.in_think && tok == r.think_end) {
+            r.in_think = false;
+            r.think_closing = false;
+            r.gen_hist.clear();
+            if (r.end_guard_on) {
+                r.guard = r.end_ids.empty() ? &stops : &r.end_ids;
+                r.guard_tok = -1;
+                r.ans_guard = true;
+            } else {
+                r.guard = nullptr;
+            }
+        }
+        for (const int64_t e : stops)
+            if (e == tok) {
+                r.finish = "stop";
+                return false;
+            }
+        if (r.stop) {
+            r.finish = "cancel";
+            return false;
+        }
+        if (r.produced >= r.max_new) return false;
+        if (model.ink_lane_pos(r.lane) + 1 > o.max_context) {   // (the context is full: the answer ends there)
+            r.finish = "length";
+            return false;
+        }
+        r.feed = tok;
+        return true;
+    };
+    const auto bias_of = [](const Req& r) { return r.in_think || r.bias_ans == nullptr ? r.bias : r.bias_ans; };
+
+    std::fprintf(stderr, "maya generate: --parallel %d: GEN <max_new> rid=<n> [keys] <ids>; the requests decode together "
+                         "(prompt chunks of %lld tokens between decode rounds)\n", NL, (long long) chunk_busy);
+    struct BusyScope {
+        bool on = false;
+        void set(bool b) {
+            if (b == on) return;
+            on = b;
+            strata::core::progress().busy.store(b);
+            strata::core::progress_at(b ? "the requests" : "idle");
+        }
+        ~BusyScope() { set(false); }
+    } busy;
+    // every lane's snapshot buffer (pinned host memory, ~0.5 GB at 16K) allocated now: its first allocation took ~70 ms,
+    // which a request's first prompt on a lane paid while the others waited.  (An empty snapshot: nothing to reuse.)
+    for (int j = NL - 1; j >= 0; --j)
+        if (!model.ink_lane_use(j, err) || !model.snapshot_save())
+            std::fprintf(stderr, "maya generate: --parallel: lane %d's snapshot buffer: %s\n", j,
+                         err.empty() ? "not allocated (no conversation reuse on it)" : err.c_str());
+    std::vector<int> bl;
+    std::vector<int32_t> bt;
+    std::vector<Req*> br;
+    for (;;) {
+        bool any = !waiting.empty();
+        for (auto& l : lanes) any = any || (bool) l.req;
+        busy.set(any);
+        if (!drain(!any) && !any) break;
+        admit();
+        if (quitting) {   // QUIT / end of input: the requests in flight end now (as a STOP would)
+            for (auto& l : lanes) if (l.req) l.req->stop = true;
+        }
+        // ---- a decode round: every request whose prompt is in, one token each
+        br.clear();
+        for (auto& l : lanes)
+            if (l.req && l.req->decoding) br.push_back(l.req.get());
+        {   // (a request stopped while decoding: ends before its next token)
+            std::vector<Req*> keep;
+            for (Req* r : br) {
+                if (r->stop) finish_req(*r, "cancel");
+                else keep.push_back(r);
+            }
+            br.swap(keep);
+        }
+        if (!br.empty()) {
+            bool ok = true;
+            if (br.size() == 1) {   // (alone: the token path, as --parallel 1)
+                Req& r = *br[0];
+                std::vector<float> lg;
+                ok = model.ink_lane_use(r.lane, err) && model.forward({r.feed}, lg, err);
+                if (ok) {
+                    kn::bias_activate(bias_of(r));
+                    const int tok = model.sample_token(r.sp, err);
+                    if (tok < 0) ok = false;
+                    else if (!take(r, tok, model.device_logits())) finish_req(r, r.finish);
+                }
+            } else {
+                bl.clear();
+                bt.clear();
+                for (Req* r : br) {
+                    bl.push_back(r->lane);
+                    bt.push_back(r->feed);
+                }
+                ok = model.ink_batch_step(bl.data(), bt.data(), (int) br.size(), err);
+                for (size_t t = 0; ok && t < br.size(); ++t) {
+                    Req& r = *br[t];
+                    kn::bias_activate(bias_of(r));
+                    const int tok = model.ink_batch_pick((int) t, r.sp, err);
+                    if (tok < 0) { ok = false; break; }
+                    if (!take(r, tok, model.ink_batch_row((int) t))) finish_req(r, r.finish);
+                }
+            }
+            kn::bias_activate(nullptr);
+            if (!ok) {   // (the model failed under every request in the round: the engine ends - the server restarts it)
+                for (Req* r : br) fail_req(*r, err);
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                return 1;
+            }
+            std::fflush(stdout);
+        }
+        // ---- a prompt chunk: the oldest request still reading (all of it when nothing decodes)
+        for (size_t i = 0; i < reading.size();)   // (stopped while waiting to read: ended here)
+            if (reading[i]->stop) finish_req(*reading[i], "cancel");
+            else ++i;
+        bool decoding_any = false;
+        for (auto& l : lanes) decoding_any = decoding_any || (l.req && l.req->decoding);
+        if (!reading.empty() && decoding_any && clk::now() < owed_until && !quitting) continue;   // (the decode's share)
+        if (!reading.empty()) {
+            // the oldest prompt, but a short one (what is left of it fits one chunk) goes first: a follow-up question
+            // must not wait behind another request's 32K context (it waited 7-9 s).  A long prompt's chunks keep their
+            // boundaries (they start where it was read up to), so its answer does not change
+            size_t pick = 0;
+            for (size_t i = 0; i < reading.size(); ++i) {
+                const Req& q = *reading[i];
+                const size_t left = q.prompt.size() - 1 - (q.read > 0 ? q.read : q.reuse);
+                if (left <= (size_t) chunk_busy) { pick = i; break; }
+            }
+            auto rp = reading[pick];
+            Req& r = *rp;
+            Lane& L = lanes[(size_t) r.lane];
+            bool decoding_now = false;
+            for (auto& l : lanes) decoding_now = decoding_now || (l.req && l.req->decoding);
+            // STRATA_PAR_TRACE=1: a line a prompt chunk - its stages' times (the lane switch, the conversation restored
+            // or reset, the read, the snapshot), the time the running streams waited for it
+            const auto tc0 = clk::now();
+            double t_restore = 0.0, t_read = 0.0, t_snap = 0.0;
+            const auto ms_since = [](clk::time_point a) { return std::chrono::duration<double, std::milli>(clk::now() - a).count(); };
+            if (!model.ink_lane_use(r.lane, err)) {
+                fail_req(r, err);
+                continue;
+            }
+            const double t_lane = ms_since(tc0);
+            const size_t read0 = r.read;
+            if (r.read == 0) {   // the first chunk: the lane's conversation restored, or the lane reset
+                const auto tr = clk::now();
+                bool restored = false;
+                if (r.reuse > 0) restored = model.snapshot_restore() && model.position() == (int64_t) r.reuse;
+                if (!restored) {
+                    r.reuse = 0;
+                    model.reset();
+                }
+                r.read = r.reuse;
+                r.disk0 = model.fast_stats().disk_ms;
+                t_restore = ms_since(tr);
+            }
+            const size_t last = r.prompt.size() - 1;   // (the last token goes with the first decode round)
+            const size_t room = last - r.read;
+            bool ok = true;
+            if (room > 0) {
+                const size_t n = decoding_now ? std::min<size_t>(room, (size_t) chunk_busy) : room;
+                const auto trd = clk::now();
+                std::vector<int32_t> part(r.prompt.begin() + (long) r.read, r.prompt.begin() + (long) (r.read + n));
+                const auto pp_line = [&](size_t done) {
+                    const double ms = std::chrono::duration<double, std::milli>(clk::now() - r.t0).count();
+                    say(r, "PP %zu %zu %.1f %.1f %zu %.1f", r.read + done, r.prompt.size(), ms,
+                        (double) (r.read + done - r.reuse) / (ms / 1000.0 + 1e-9), r.reuse,
+                        model.fast_stats().disk_ms - r.disk0);
+                    std::fflush(stdout);
+                };
+                if (pchunk > 0 && n >= 32) {
+                    model.prefill_progress = [&](int64_t done, int64_t) {
+                        pp_line((size_t) done);
+                        // (a STOP of this request while its prompt is read)
+                        std::lock_guard<std::mutex> lk(in.mu);
+                        for (const auto& l : in.lines)
+                            if (l == "STOP " + std::to_string(r.rid) || l == "QUIT") r.stop = true;
+                        return !r.stop && !in.stop.load();
+                    };
+                    // (the snapshot's next token: the NextN block's caches read it - the chunk's following token)
+                    err.clear();
+                    ok = model.prefill(part, err, r.prompt[r.read + n]);
+                    model.prefill_progress = nullptr;
+                    if (!ok && err == "cancelled") {
+                        L.snap.clear();
+                        r.stop = true;
+                        finish_req(r, "cancel");
+                        continue;
+                    }
+                }
+                if (!(pchunk > 0 && n >= 32) || (!ok && err.empty())) {   // (the token path: a short part, or declined)
+                    ok = true;
+                    std::vector<float> lg;
+                    for (size_t i = 0; ok && i < n; i += 8) {
+                        std::vector<int32_t> p8(part.begin() + (long) i, part.begin() + (long) std::min(n, i + 8));
+                        ok = model.forward(p8, lg, err);
+                    }
+                }
+                if (!ok) {
+                    fail_req(r, err);
+                    continue;
+                }
+                r.read += n;
+                t_read = ms_since(trd);
+                pp_line(0);
+            }
+            if (r.read == last) {   // the prompt is in: the snapshot (this conversation's next request), then decode
+                const auto ts = clk::now();
+                const bool saved = model.snapshot_save();
+                t_snap = ms_since(ts);
+                if (saved) {
+                    L.snap.assign(r.prompt.begin(), r.prompt.end() - 1);
+                    L.ns = r.ns;
+                } else {
+                    L.snap.clear();
+                }
+                r.feed = r.prompt.back();
+                r.decoding = true;
+                r.t1 = clk::now();
+                reading.erase(reading.begin() + (long) pick);
+            }
+            if (decoding_now) owed_until = clk::now() + std::chrono::microseconds((int64_t) (share * ms_since(tc0) * 1000.0));
+            if (trace)
+                std::fprintf(stderr, "par trace: request %lld lane %d tokens %zu-%zu of %zu%s: lane %.1f ms, %s %.1f, read %.1f, "
+                                     "snapshot %.1f, total %.1f ms (%s)\n", (long long) r.rid, r.lane, read0, r.read,
+                             r.prompt.size(), r.reuse > 0 ? " (reused)" : "", t_lane, r.reuse > 0 ? "restore" : "reset",
+                             t_restore, t_read, t_snap, ms_since(tc0), decoding_now ? "others decoding" : "alone");
+        }
+    }
+    return 0;
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -1806,6 +2459,19 @@ static int glm_pack_generate(const Options& o) {
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
     // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
+    // --parallel N|auto (Inkling 2 Mini): N lanes, the requests decode together (glm_parallel_serve).  The drafters work on
+    // one conversation's context: off with more than one lane (a request alone then decodes token by token)
+    if (!o.parallel_arg.empty()) set_env("STRATA_INK_PARALLEL", o.parallel_arg.c_str());
+    if (o.serve && strata::core::Glm5Model::ink_parallel_env() != 1)
+        for (const char* k : {"STRATA_INK_DSPARK", "STRATA_INK_DRAFT"})
+            if (const char* v = std::getenv(k); v != nullptr && *v != 0 && std::strcmp(v, "0") != 0) {
+                std::fprintf(stderr, "NOTE: --parallel: %s is not used (the drafter reads one conversation)\n", k);
+#if defined(_WIN32)
+                _putenv_s(k, "");
+#else
+                unsetenv(k);
+#endif
+            }
     if (!o.uncensor.empty() && o.abl_build.empty()) {
         // Both options select an ABL input; reject a conflict instead of silently replacing one.
         const char* env_abl = std::getenv("STRATA_GLM_ABL");
@@ -3644,6 +4310,11 @@ static int glm_pack_generate(const Options& o) {
     // the serve wire contract (serve/server.py): READY <max_context> [stop] once, then GEN <max_new>
     // [<key>=<value> ...] <id,id,...> lines - the sampling keys are per request and the ids are the LAST
     // token.  "stop" is NOT advertised: a request runs to its end (no mid-request cancel in M3.1).
+    if (model.ink_par_ > 1) {   // (--parallel: the requests decode together - its own loop and wire, par=N)
+        std::printf("READY %lld stop par=%d\n", (long long) o.max_context, model.ink_par_);
+        std::fflush(stdout);
+        return glm_parallel_serve(model, o, *serve_in, eos, sp);
+    }
     std::printf("READY %lld stop\n", (long long) o.max_context);
     std::fprintf(stderr, "maya generate: glm5-next serve (M3.1): GEN <max_new> [keys] <ids>, GENI <max_new> [keys] "
                          "<embeddings> <ids>; QUIT to end\n");
@@ -4230,6 +4901,7 @@ int main(int argc, char** argv) {
                 o.prefill_arg = "32768";
             }
         }
+        else if (a == "--parallel") o.parallel_arg = next("--parallel");
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));

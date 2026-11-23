@@ -95,6 +95,20 @@ void clip_heads(float* x, int64_t xs, const float* scale, int dim, int H, float 
 void kv_store(const float* k, int64_t ks, const float* v, int64_t vs, float eps, int n_head_kv, int64_t p0, int T,
               int ring, uint16_t* kc, uint16_t* vc, cudaStream_t s);
 
+/// The batched decode (several conversations in one window, a row each - Glm5Model::ink_batch_step): row t's position
+/// pos[t] and, for the layer application being run, its K / V cache and its conv state (device arrays of the rows)
+struct BatchRows {
+    const int64_t* pos = nullptr;
+    uint16_t* const* kc = nullptr;
+    uint16_t* const* vc = nullptr;
+    float* const* conv = nullptr;
+};
+
+/// conv_rows of T rows, each its own conversation's single step: row t from in + t is over the state st[t] + soff
+/// (updated as conv_rows updates it), into out + t os - conv_rows' arithmetic a row (no dynamic taps)
+void conv_batch(const float* in, int64_t is, const float* w, float* const* st, int64_t soff, int C, int T, float* out,
+                int64_t os, cudaStream_t s);
+
 /// A decode token's (T = 1) conv_rows of k and v (the head's channels: head_ch = 128), clip_heads of q, k and rel and
 /// kv_store in one launch - the same arithmetic as those calls one after another (STRATA_INK_FUSE=0: those calls)
 struct PostProj {
@@ -145,6 +159,10 @@ struct MixTok {
     bool pre_rows = false;
     int64_t out_rs = 0;
     int pre_s = -1;   // (set by mix_tok: the state that is pre_out, -1 none)
+    // the batched decode's (rows from different conversations): pre_bs non-null - row t's pre step is conv_rows' one
+    // step over its own state pre_bs[t] + pre_bso (updated), from pre_in's row t, then the add into pre_out's row t
+    float* const* pre_bs = nullptr;
+    int64_t pre_bso = 0;
     // mix_norm's (no pre step, no norm / cat): rms_rows of n_rn rows - job j the mix's row (rn_rs ? j : 0), gamma
     // rn_g[j], eps -> rn_y[j] row t (n_embd apart) and its FP16 copy rn_h[j] (null: none)
     int n_rn = 0;
@@ -188,6 +206,10 @@ void set_pos(int64_t* d, int64_t p, cudaStream_t s);
 /// into a.kf / a.vf with the state read but left (conv_win's), the clips and the cache rows of every row - each row
 /// post_proj's arithmetic
 void post_proj_rows(const PostProj& a, const float* kraw, const float* vraw, int T, cudaStream_t s);
+/// post_proj over T rows of T conversations (BatchRows): row t's raw k / v at kraw / vraw + t KV convolved over its own
+/// state b.conv[t] (updated) into a.kf / a.vf + t KV, its q / rel rows HD / H kRel apart, its clips at b.pos[t], its
+/// cache rows into b.kc[t] / b.vc[t] - post_proj's arithmetic a row
+void post_proj_batch(const PostProj& a, const BatchRows& b, const float* kraw, const float* vraw, int T, cudaStream_t s);
 
 /// The verify window's loop controllers, n of them over T rows in one launch each (ctrl_cat's / ctrl_apply's rows):
 /// controller c's current rows cur[c] + t cs, its message rows msg + c E + t ms; cat rows at cat + c cat_c + t 2E;
@@ -217,7 +239,9 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
           int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, int T,
           int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s,
           bool rows = false,    // rows: each row the split count the token path gives its position (the verify window)
-          const int64_t* p0d = nullptr);   // (rows: non-null, p0 read from this device word - p0 still gives the grid)
+          const int64_t* p0d = nullptr,    // (rows: non-null, p0 read from this device word - p0 still gives the grid)
+          const BatchRows* br = nullptr);  // (rows: row t at br->pos[t] over br->kc[t] / vc[t] - p0 + T - 1 the grid's
+                                           // last position: the rows' largest)
 
 /// attn for a prompt's rows (T of them at once) on tensor cores: the same math, S = q K^T and P V in FP16 with F32
 /// accumulation (P rounded to FP16), the bias as FP16 pairs (about F32).  False (nothing launched): the caller runs attn - AMD, a GPU

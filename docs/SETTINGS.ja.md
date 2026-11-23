@@ -159,6 +159,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `thinking_budget` | 思考の上限トークン数（既定 32768、0 で上限なし） | `16384` |
 | `env` | エンジンの細かい設定（環境変数）。一覧は [MANUAL: 設定項目](MANUAL.ja.md#設定項目)。例は RAM 123 GB の機械で RAM 層を固定する値（66。94 GB の機械なら 60。設定しなければ空き RAM から決まる） | `{"STRATA_GLM_RAM_GB": "66"}` |
 | `uncensor` | 無検閲化のファイル（[UNCENSOR](UNCENSOR.ja.md)） | `".../dsv4.abl"` |
+| `parallel` | Inkling 2 Mini: いくつのリクエストを同時に decode するか（`"auto"`: 全 expert が VRAM に残る範囲で最大 8。既定 1 = 1 本ずつ）。1 本ごとに自分の KV キャッシュを起動時に確保する（[MANUAL: 複数のリクエストを同時に](MANUAL.ja.md#複数のリクエストを同時にparallelinkling-2-miniベータ)）。ほかのモデルは無視する | `4` |
 
 **GPU**
 

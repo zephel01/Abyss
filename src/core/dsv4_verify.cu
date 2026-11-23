@@ -147,7 +147,8 @@ struct VerifyBuf {
     // batched window only): a set a column up to kScrSets + 1 columns, so their SSD reads stay apart until the
     // column-batched expert launches read them (V4's pipelined window keeps 3 sets)
     static constexpr int kScrSets = 5;
-    unsigned long long* scr_set[kScrSets + 1] = {};
+    static constexpr int kScrMax = Glm5Model::kVerifyMax - 1;   // (inkling: a set every column of an 8-wide window)
+    unsigned long long* scr_set[kScrMax + 1] = {};
     int n_scr = 0;
     // deepseek41, a column each: its two pre buffers ([0, 4) the attention side's, [4, 8) the FFN side's - the lagged
     // collapse), its index scores (ctx + 1), block maxima, chosen blocks and candidate mask (fast_dsv41_attn's v41_*)
@@ -217,7 +218,9 @@ bool Glm5Model::verify_ready() const {
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
         // (inkling: its window opt-in - STRATA_INK_DRAFT=1, ink_window; one part, no prefetch / lookahead)
-        if (m->g_.ink && (!(ink_draft_env() || inkd_ != nullptr) || m->split_next_ != nullptr || m != this)) return false;
+        // (--parallel's lanes: the batch steps are windows too - ink_batch_step)
+        if (m->g_.ink && (!(ink_draft_env() || inkd_ != nullptr || ink_par_ > 1) || m->split_next_ != nullptr || m != this))
+            return false;
         if (F != nullptr && m->g_.arch == 0) {
             // glm5-next: one part, the batched window (STRATA_GLM_WINDOW=1); its NextN block allowed (the drafter);
             // no prefetch / lookahead / deferral / refusal edit; no EXL3 layers (verify_moe runs the ggml experts)
@@ -463,7 +466,10 @@ bool Glm5Model::verify_alloc(std::string& err) {
     const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;
     // (sets for up to 4 groups: the 8-column window keeps 4 columns' worth, 192 MB a 8 MB blob)
     // (deepseek41, qwen35moe / qwen4exp: their windows are batched only - a set a column, up to kScrSets + 1 columns)
-    const int NS = std::min(TM - 1, g.v41 || g.qwen35() || g.arch == 0 ? (int) VerifyBuf::kScrSets : 3);
+    // (inkling: every column its own set, so a full 8-row window - --parallel's batch above all - runs its experts in
+    // the column-batched launches too; 7 columns and more went a launch a column, 4 launches each a layer)
+    const int NS = std::min(TM - 1, g.ink ? (int) VerifyBuf::kScrMax
+                                          : g.v41 || g.qwen35() || g.arch == 0 ? (int) VerifyBuf::kScrSets : 3);
     V->scr_set[0] = fast_->md.scratch;
     if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * KS * sstride) == cudaSuccess) {
         for (int k = 1; k <= NS && ok; ++k) {
@@ -3334,6 +3340,34 @@ bool Glm5Model::verify_logits(int i, std::vector<float>& out, std::string& err) 
         return false;
     }
     return true;
+}
+
+// the batched decode's row t after ink_batch_step (one part, no port): its argmax (re-picked when the bias set bans it), or
+// a draw of its own sampler over its row alone - fast_sample's launch on that row (the token path's draw for it)
+const float* Glm5Model::ink_batch_row(int t) const {
+    const auto* V = (const VerifyBuf*) vb_;
+    return V != nullptr && t >= 0 && t < V->T ? V->logits + (size_t) t * g_.n_vocab : nullptr;
+}
+
+int Glm5Model::ink_batch_pick(int t, strata::kernels::SamplerParams& sp, std::string& err) {
+    auto* V = (VerifyBuf*) vb_;
+    FastState* F = fast_;
+    if (V == nullptr || F == nullptr || t < 0 || t >= V->T || t >= 32) {
+        err = "inkling batch: no such row";
+        return -1;
+    }
+    float* row = V->logits + (size_t) t * g_.n_vocab;
+    if (sp.greedy) {
+        const int tok = V->tok_h[t];
+        return strata::kernels::bias_banned(tok) ? bias_repick(tok, row, sp, err) : tok;
+    }
+    int* pick = F->zero_copy ? V->tok_hd + 32 + t : V->tok + 32 + t;
+    strata::kernels::sample_tokens(row, 1, (int) g_.n_vocab, nullptr, 0, sp, pick, F->cs);
+    if (!F->zero_copy) cudaMemcpyAsync(V->tok_h + 32 + t, V->tok + 32 + t, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "inkling batch sampler", err)) return -1;
+    const int tok = V->tok_h[32 + t];
+    if (!glmfast::token_ok(tok, g_.n_vocab, 0, err)) return -1;
+    return tok;
 }
 
 int Glm5Model::verify_sample(int i, strata::kernels::SamplerParams& sp, std::string& err) {

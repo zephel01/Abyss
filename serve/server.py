@@ -646,6 +646,9 @@ class StrataEngine:
             write_run_marker(self.run_marker, self.proc.pid, self.model_path)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.parallel = 1                # requests the engine decodes together (READY ... par=N)
+        self._tls = threading.local()    # (parallel: each request thread's own DONE figures)
+        self._last = {}
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -684,8 +687,12 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                # par=N (--parallel, Inkling): N requests decode together - lines about a request come as "@<rid> ..."
+                self.parallel = next((int(x[4:]) for x in f[2:] if x.startswith("par=") and x[4:].isdigit()), 1)
                 break
         loading.set()
+        if self.parallel > 1:
+            self._start_demux()
         if self.max_context <= 0:
             clear_run_marker(self.run_marker)
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
@@ -752,6 +759,56 @@ class StrataEngine:
         else:
             args += ["--max-context", str(int(n))]
         self.spawn = (exe, args, cwd, log, env)
+
+    @property
+    def last(self):
+        """The last DONE's figures.  With par > 1 the requests run side by side: each request's thread sees its own
+        (None before its first DONE), so a request never takes another's figures for its own."""
+        if getattr(self, "parallel", 1) > 1:
+            return getattr(self._tls, "last", None)
+        return self._last
+
+    @last.setter
+    def last(self, v):
+        self._last = v
+        if getattr(self, "_tls", None) is not None:
+            self._tls.last = v
+
+    def _start_demux(self):
+        """par > 1: one thread reads the engine's lines and hands each "@<rid> ..." line to that request's queue; the
+        others (BIASOK, ERR of a control line, NOTE) go to `misc`, which command() reads.  The end of the output reaches
+        every queue."""
+        self._routes: dict[int, queue.Queue] = {}
+        self._routes_lock = threading.Lock()
+        self._cmd_lock = threading.Lock()
+        self._rids = itertools.count(1)
+        self.misc: queue.Queue = queue.Queue()
+        src = self.lines
+
+        def run():
+            while True:
+                line = src.get()
+                if line is None:
+                    with self._routes_lock:
+                        for q in self._routes.values():
+                            q.put(None)
+                        self._routes_closed = True
+                    self.misc.put(None)
+                    return
+                if line.startswith("@"):
+                    rid, _, rest = line[1:].partition(" ")
+                    with self._routes_lock:
+                        q = self._routes.get(int(rid)) if rid.isdigit() else None
+                    if q is not None:
+                        q.put(rest)
+                    continue
+                if line.startswith("NOTE "):
+                    print("[abyss] " + line[5:].strip(), flush=True)
+                    continue
+                self.misc.put(line)
+
+        self._routes_closed = False
+        threading.Thread(target=run, daemon=True).start()
 
     def _pump(self, proc, lines):
         for line in proc.stdout:
@@ -1000,6 +1057,9 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        if getattr(self, "parallel", 1) > 1:
+            yield from self._generate_par(ids, max_new, sampling, cancel, embeddings)
+            return
         self.progress = None
         self.prefill_tok_s_mean = None
         self.prompt_reused = self.prompt_disk_ms = None
@@ -1092,9 +1152,109 @@ class StrataEngine:
                         self._parse_done(line)
                         break
 
+    def _generate_par(self, ids, max_new, sampling, cancel, embeddings=None):
+        """generate() on a par > 1 engine: the request's GEN carries rid=<n>, its lines come from its own queue
+        (_start_demux), STOP <rid> stops it alone.  Other requests run meanwhile."""
+        if embeddings:
+            raise EngineError("images are not available with \"parallel\" above 1 (set \"parallel\": 1 in the config)")
+        self.progress = None
+        self.prefill_tok_s_mean = None
+        self.prompt_reused = self.prompt_disk_ms = None
+        self.notes = []
+        rid = next(self._rids)
+        q: queue.Queue = queue.Queue()
+        with self._routes_lock:
+            closed = self._routes_closed
+            if not closed:
+                self._routes[rid] = q
+        if closed:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        head = f"GEN {int(max_new)} rid={rid}{self.sampling_keys(sampling or {})}"
+        done = False
+        try:
+            try:
+                with self._cmd_lock:                     # (one writer at a time on the pipe)
+                    self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                    self.proc.stdin.flush()
+            except OSError:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            heard, stall = time.monotonic(), {}
+            while True:
+                try:
+                    line = q.get(timeout=10)
+                except queue.Empty:
+                    if cancel.is_set():
+                        return
+                    if ENGINE_STALL_S > 0:
+                        why = self._stall_check(heard, stall)
+                        if why:
+                            done = True
+                            self._end(why)
+                            raise EngineDied(why)
+                    yield None
+                    continue
+                if line is None:
+                    done = True
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                heard = time.monotonic()
+                stall.clear()
+                if line.startswith("T "):
+                    if cancel.is_set():
+                        return
+                    yield int(line[2:])
+                elif line.startswith("PP ") or line.startswith("QUEUED"):
+                    if line.startswith("PP "):
+                        self._parse_pp(line)
+                    if cancel.is_set():
+                        return
+                    yield None
+                elif line.startswith("NOTE "):
+                    print("[abyss] " + line[5:].strip(), flush=True)
+                    self.notes.append(line[5:].strip())
+                elif line.startswith("DONE"):
+                    self._parse_done(line)
+                    done = True
+                    return
+                elif line.startswith("ERR"):
+                    done = True
+                    msg = line[4:].strip()
+                    if cuda_context_lost(msg):
+                        self._end(f"the engine's CUDA context is lost ({msg}); ending it")
+                        raise EngineDied(f"the engine's CUDA context is lost: {msg}")
+                    raise EngineError(msg)
+        finally:
+            if not done:                                 # the consumer stopped early: this request alone stops
+                try:
+                    with self._cmd_lock:
+                        self.proc.stdin.write(f"STOP {rid}\n")
+                        self.proc.stdin.flush()
+                except OSError:
+                    pass
+                drain_s = env_seconds("STRATA_ENGINE_DRAIN_S", 120)
+                end = time.monotonic() + (drain_s if drain_s > 0 else 1e9)
+                while time.monotonic() < end:
+                    try:
+                        line = q.get(timeout=10)
+                    except queue.Empty:
+                        continue
+                    if line is None or line.startswith("ERR"):
+                        break
+                    if line.startswith("DONE"):
+                        self._parse_done(line)
+                        break
+            with self._routes_lock:
+                self._routes.pop(rid, None)
+
     def command(self, line: str, expect: str, timeout: float = 60.0) -> str:
         """One control line between requests (the GLM engine's VLEND / VRECLAIM) -> its answer line; ValueError on
-        the engine's ERR or no answer.  The caller holds the service's FIFO, so no request is reading the lines."""
+        the engine's ERR or no answer.  The caller holds the service's FIFO, so no request is reading the lines.
+        (par > 1: requests run meanwhile - the answer comes from the control lines' queue, one command at a time.)"""
+        if getattr(self, "parallel", 1) > 1:
+            with self._cmd_lock:
+                return self._command(line, expect, timeout, self.misc)
+        return self._command(line, expect, timeout, self.lines)
+
+    def _command(self, line: str, expect: str, timeout: float, src) -> str:
         try:
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()
@@ -1103,7 +1263,7 @@ class StrataEngine:
         end = time.time() + timeout
         while True:
             try:
-                got = self.lines.get(timeout=max(0.1, end - time.time()))
+                got = src.get(timeout=max(0.1, end - time.time()))
             except queue.Empty:
                 raise ValueError(f"the engine did not answer {line.split()[0]}") from None
             if got is None:
@@ -1148,6 +1308,8 @@ class StrataEngine:
             self.proc.stdin.flush()
             end = time.monotonic() + wait
             src = getattr(self, "lines", None)          # after start-up the pump thread owns stdout: read its queue
+            if getattr(self, "parallel", 1) > 1:        # (par > 1: the demux thread reads it; its leftovers here)
+                src = self.misc
             while self.proc.poll() is None and time.monotonic() < end:
                 if src is not None:
                     try:
@@ -1515,6 +1677,10 @@ def engine_args(cfg: dict) -> list[str]:
     # "uncensor": <file.abl> (--abl-build's, docs/MANUAL): the refusal-direction edit, switched per request ("uncensor")
     if cfg.get("uncensor") and "--uncensor" not in args:
         args += ["--uncensor", str(cfg["uncensor"])]
+    # "parallel": N or "auto" (Inkling 2 Mini): N requests decode together (--parallel; other models ignore it)
+    par = cfg.get("parallel")
+    if par not in (None, "", 1, "1") and "--parallel" not in args:
+        args += ["--parallel", str(par)]
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     return args
@@ -1783,7 +1949,8 @@ class Service:
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.fifo = threading.Lock()
+        # the engine's turn: one request at a time, or the engine's par=N together (EngineGate.shared)
+        self.fifo = EngineGate(lambda: getattr(self.engine, "parallel", 1))
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.quit = threading.Event()    # POST /api/shutdown: main() ends the server (cut_in_flight, then the engine)
         self.quit_force = False          # ... killing the engine instead of asking it to end
@@ -2533,7 +2700,7 @@ class Service:
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            with self.fifo:
+            with self.fifo.shared():
                 with self.status_lock:
                     self.status["queued"] -= 1
                 if self.stopping:
@@ -2794,7 +2961,7 @@ class Service:
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[abyss] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                self.status["busy"] = False
+                self.status["busy"] = self.fifo.active > 1   # (--parallel: the others still run)
         for ev in (ink_calls.finish() if ink_calls is not None else []) + parser.finish():
             yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -3404,6 +3571,74 @@ def is_loopback(addr: str) -> bool:
     return ip.is_loopback or (ip.version == 6 and ip.ipv4_mapped is not None and ip.ipv4_mapped.is_loopback)
 
 
+class EngineGate:
+    """The engine's FIFO.  `with gate:` / acquire() / release() hold it alone (a lock, as before: reloads, image
+    encodes, shutdown wait for every request to end).  `with gate.shared():` is a request's turn: up to slots() requests
+    hold it together (the engine's par=N, --parallel), in arrival order; with one slot it is the lock.  A waiting
+    exclusive holder lets no new request in, so a reload is not starved by a stream of requests."""
+
+    def __init__(self, slots=lambda: 1):
+        self.slots = slots
+        self.cv = threading.Condition()
+        self.active = 0                  # requests holding it
+        self.excl = False
+        self.excl_waiting = 0
+        self._tickets = itertools.count()
+        self._serving = 0                # the next request ticket let in (arrival order)
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        end = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+        with self.cv:
+            self.excl_waiting += 1
+            try:
+                while self.excl or self.active > 0:
+                    if not blocking:
+                        return False
+                    left = None if end is None else end - time.monotonic()
+                    if left is not None and left <= 0:
+                        return False
+                    self.cv.wait(left)
+                self.excl = True
+                return True
+            finally:
+                self.excl_waiting -= 1
+                self.cv.notify_all()
+
+    def release(self):
+        with self.cv:
+            self.excl = False
+            self.cv.notify_all()
+
+    def locked(self) -> bool:
+        with self.cv:
+            return self.excl or self.active > 0
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+    @contextlib.contextmanager
+    def shared(self):
+        with self.cv:
+            me = next(self._tickets)
+            while (self.excl or self.excl_waiting > 0 or self._serving != me or
+                   self.active >= max(1, int(self.slots() or 1))):
+                self.cv.wait()
+            self._serving += 1
+            self.active += 1
+            self.cv.notify_all()
+        try:
+            yield self
+        finally:
+            with self.cv:
+                self.active -= 1
+                self.cv.notify_all()
+
+
 def cut_in_flight(svc: Service, engine, wait_s: float = 15.0, force: bool = False) -> str:
     """POST /api/shutdown: the request in flight ends now instead of being wrapped up - STOP (its answer is cut at the
     next step), then up to `wait_s` for it to let go of the FIFO.  An engine that does not get there (a runaway: stuck
@@ -3736,8 +3971,10 @@ def make_handler(svc: Service):
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
                     with svc.status_lock:
                         busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                    n_par = max(1, int(getattr(svc.engine, "parallel", 1) or 1))
+                    active = svc.fifo.active if n_par > 1 else int(busy)
+                    slots = [{"id": i, "n_ctx": svc.engine.max_context, "is_processing": i < active} for i in range(n_par)]
+                    self._json(200, slots if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -3838,7 +4075,7 @@ def make_handler(svc: Service):
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = svc.shared.get("max_tokens", -1)
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
-                     "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
+                     "total_slots": max(1, int(getattr(svc.engine, "parallel", 1) or 1)), "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": False,
                      "is_sleeping": False}
             if getattr(svc.engine, "model_path", None):

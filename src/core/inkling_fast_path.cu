@@ -115,7 +115,7 @@ struct Ink {
         CapturedGraph g;
         uint64_t requests = 0;   // (the routes it posts: FastState::expected)
     };
-    std::map<std::tuple<int, int, unsigned long long, int, float>, TokGraph> graphs;
+    std::map<std::tuple<int, int, unsigned long long, int, float, int>, TokGraph> graphs;   // (+ the lane: its caches)
     uint64_t graph_caps = 0, graph_runs = 0;
     // the verify window in one CUDA graph too (STRATA_INK_WIN_GRAPH): a graph per (width, the last column's full /
     // window layers' attention splits, the CPU-lane plan, the tail skip, the routes' by-value settings); the first
@@ -126,11 +126,33 @@ struct Ink {
         bool bad = false;
         int seen = 0;   // (windows of this key launched before its capture)
     };
-    std::map<std::tuple<int, int, int, unsigned long long, int, float, uint64_t>, WinGraph> wgraphs;
+    std::map<std::tuple<int, int, int, unsigned long long, int, float, uint64_t, int>, WinGraph> wgraphs;   // (+ batch)
     uint64_t wgraph_caps = 0, wgraph_runs = 0, wgraph_eager = 0, wgraph_bad = 0;
     uint64_t graph_inkd = 0;   // (the DSpark taps' accumulators' generation the graphs were captured with)
     void* base = nullptr;
     size_t bytes = 0;
+    // the batched decode (--parallel N, STRATA_INK_PARALLEL): N lanes, each one conversation's slots (lane 0's in base,
+    // the others' in their own allocation) and, while another lane is the model's, its sequence state (the position,
+    // the snapshot's buffer and position, the last argmax) - ink_lane_use swaps them in
+    struct Lane {
+        std::vector<Slot> S;
+        void* mem = nullptr;   // (lanes 1..: the slots' allocation)
+        int64_t pos = 0, snap_pos = -1, snap_pend = -1, snap_done = -1, pend_pos = -1, row_done = -1;
+        void* snap_h = nullptr;
+        int last_tok = -1;
+    };
+    std::vector<Lane> lanes;
+    int lane = 0;
+    // the batch window's table (ink_batch_step: a row a lane): pos[8], then per slot kc[8], vc[8], conv[8] - on the device
+    // (the window's graph reads it at these addresses) and its pinned host copy
+    void* bt_d = nullptr;
+    void* bt_h = nullptr;
+    int64_t* bt_pos = nullptr;
+    uint16_t** bt_kc = nullptr;
+    uint16_t** bt_vc = nullptr;
+    float** bt_conv = nullptr;
+    bool batch = false;          // (ink_window: the batch mode - each column its own lane)
+    int64_t batch_pmax = 0;      // (the batch's largest position: the attention's grid)
     std::vector<float*> owned;   // (unsloth's looped layout: the gathered message queries)
     std::set<const void*> packed;   // (the controller tensors ink_ctl_pack turned BF16: never twice)
     int ctl_packed = 0, ctl_kept = 0;
@@ -478,6 +500,65 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
         K.side = nullptr;   // (no fork: the projections in one call)
     }
     qwen35_state_ = K.base;   // (qwen35_reset / the snapshot see a fast-path state)
+    // ---- the batched decode's lanes (--parallel N / auto, STRATA_INK_PARALLEL): lane 0 the slots above, each further
+    // lane the same slots in its own allocation, before the expert pool takes what is left.  As many as leave every
+    // expert in VRAM with 3 GB to spare (the verify window, the graphs, the pool's spare slots) besides the prompt
+    // path's own region (STRATA_PAR_PREFILL_MB), at most 8 - auto that many, a larger --parallel N is cut to it: with
+    // an expert outside VRAM the requests' answers change (measured: 5 lanes at 40960 tokens left the pool at 128 of
+    // 128 slots a layer with 584 experts in RAM, and every answer differed from the one alone)
+    {
+        size_t lane_b = 0;
+        for (int sl = 0; sl < NS; ++sl)
+            lane_b += 2 * ink_al((size_t) K.S[(size_t) sl].ring * KV * 2) + ink_al(K.conv_floats * 4);
+        const int want = ink_parallel_env();
+        int n = want;
+        size_t expert_b = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (Ly.moe)
+                expert_b += (size_t) g.n_expert * glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type);
+        }
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const char* pmb = getenv("STRATA_PAR_PREFILL_MB");
+        const long own_mb = want == 1 ? 0 : pmb != nullptr ? std::max(0L, std::atol(pmb)) : 2048L;
+        const size_t spare = ((size_t) 3 << 30) + ((size_t) own_mb << 20);
+        const int fit = free_b > expert_b + spare ? (int) std::min<size_t>(64, (free_b - expert_b - spare) / std::max<size_t>(1, lane_b)) : 0;
+        n = want < 0 ? fit : std::min(want, fit);
+        if (want > 1 && fit < want)
+            std::fprintf(stderr, "NOTE: --parallel %d: %d lane%s (more would push experts out of VRAM and change the "
+                                 "answers; a smaller --max-context leaves room for more)\n", want, std::max(1, fit),
+                         fit == 1 ? "" : "s");
+        n = std::max(1, std::min(n, kVerifyMax));
+        K.lanes.assign(1, Ink::Lane{});
+        K.lanes[0].S = K.S;
+        for (int j = 1; j < n; ++j) {
+            Ink::Lane L;
+            if (cudaMalloc(&L.mem, lane_b) != cudaSuccess) {
+                cudaGetLastError();
+                std::fprintf(stderr, "inkling: CUDA%d only %d of %d parallel lanes allocated (%.2f GB each)\n", dev_, j, n,
+                             (double) lane_b / 1073741824.0);
+                break;
+            }
+            cudaMemset(L.mem, 0, lane_b);
+            uint8_t* la = (uint8_t*) L.mem;
+            const auto ltake = [&](size_t b) { uint8_t* q = la; la += ink_al(b); return q; };
+            L.S.assign((size_t) NS, Ink::Slot{});
+            for (int sl = 0; sl < NS; ++sl) {
+                auto& S = L.S[(size_t) sl];
+                S.ring = K.S[(size_t) sl].ring;
+                S.kc = (uint16_t*) ltake((size_t) S.ring * KV * 2);
+                S.vc = (uint16_t*) ltake((size_t) S.ring * KV * 2);
+                S.conv = (float*) ltake(K.conv_floats * 4);
+            }
+            K.lanes.push_back(std::move(L));
+        }
+        ink_par_ = (int) K.lanes.size();
+        if (want != 1 || ink_par_ > 1)
+            std::fprintf(stderr, "inkling: CUDA%d %d parallel lane%s (%s; %.2f GB of caches each for %lld tokens; every "
+                                 "expert in VRAM leaves room for %d)%s\n", dev_, ink_par_, ink_par_ == 1 ? "" : "s",
+                         want < 0 ? "auto" : "--parallel", (double) lane_b / 1073741824.0, (long long) ctx, fit, "");
+    }
     if (K.ctl_packed + K.ctl_kept > 0)
         std::fprintf(stderr, "inkling: CUDA%d the loop controllers' rows BF16 (STRATA_INK_CTL_BF16): %d tensors, %d kept F32 "
                              "(a value not BF16)\n", dev_, K.ctl_packed, K.ctl_kept);
@@ -507,6 +588,13 @@ void Glm5Model::ink_free() {
         delete fast_->ink->win;
     }
     if (fast_->ink->base != nullptr) cudaFree(fast_->ink->base);
+    for (size_t j = 0; j < fast_->ink->lanes.size(); ++j) {   // (the lanes: their slots; the snapshots not live here)
+        auto& L = fast_->ink->lanes[j];
+        if (L.mem != nullptr) cudaFree(L.mem);
+        if ((int) j != fast_->ink->lane && L.snap_h != nullptr && L.snap_h != q35_snap_h_) cudaFreeHost(L.snap_h);
+    }
+    if (fast_->ink->bt_d != nullptr) cudaFree(fast_->ink->bt_d);
+    if (fast_->ink->bt_h != nullptr) cudaFreeHost(fast_->ink->bt_h);
     for (float* p : fast_->ink->owned) cudaFree(p);
     if (qwen35_state_ == fast_->ink->base) qwen35_state_ = nullptr;
     delete fast_->ink;
@@ -520,16 +608,25 @@ void Glm5Model::ink_reset() {
     for (auto& S : F->ink->S) cudaMemsetAsync(S.conv, 0, F->ink->conv_floats * 4, F->cs);
 }
 
-void Glm5Model::ink_snap_runs(std::vector<std::pair<void*, size_t>>& out) const {
+void Glm5Model::ink_snap_runs(std::vector<std::pair<void*, size_t>>& out, std::vector<size_t>* used, int64_t pos) const {
     const FastState* F = fast_;
     if (F == nullptr || F->ink == nullptr) return;
     const size_t KV = (size_t) g_.attn_head_kv * g_.head_dim;
     for (size_t sl = 0; sl < F->ink->S.size(); ++sl) {
         const auto& S = F->ink->S[sl];
         out.emplace_back(S.conv, F->ink->conv_floats * 4);
+        if (used) used->push_back(out.back().second);
         if (F->ink->L[(size_t) g_.ink_phys((int) sl)].swa) {   // (a window layer's ring: rows a later position overwrites)
             out.emplace_back(S.kc, (size_t) S.ring * KV * 2);
             out.emplace_back(S.vc, (size_t) S.ring * KV * 2);
+            // (the rows a conversation at `pos` has written: position p is row p % ring, so below a full ring only the
+            // first pos rows hold anything - a short prompt's snapshot moves those, not the whole 3,072-row ring;
+            // the rows past them are written again before any attention reads them)
+            if (used) {
+                const size_t rows = pos < 0 ? (size_t) S.ring : (size_t) std::min<int64_t>(pos, S.ring);
+                used->push_back(rows * KV * 2);
+                used->push_back(rows * KV * 2);
+            }
         }
     }
 }
@@ -929,7 +1026,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
         if (F->copy2 != nullptr) F->bg_drain(s, SIZE_MAX, 3, F->copy2);
         ik::set_pos(K.pos_d, p, s);
         const auto key = std::make_tuple(ik::attn_splits(p, 0, ik::kMaxSplits), ik::attn_splits(p, g.n_swa, ik::kMaxSplits),
-                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0));
+                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), K.lane);
         if (inkd_acc_gen() != K.graph_inkd) {   // (the drafter's tap buffers moved: the graphs write the old ones)
             K.graphs.clear();
             K.wgraphs.clear();
@@ -998,6 +1095,141 @@ void Glm5Model::ink_win_commit(int64_t pos) {
     Ink::Win& W = *F->ink->win;
     const int KV = g_.attn_head_kv * g_.head_dim;
     ik::conv_commit(W.states_d, (int) F->ink->S.size(), W.save, W.slot_floats, KV, g_.n_embd, kVerifyMax, n, F->cs);
+}
+
+// ---------------------------------------------------------------- the batched decode (--parallel)
+int Glm5Model::ink_parallel_env() {
+    static const int n = [] {
+        const char* v = getenv("STRATA_INK_PARALLEL");
+        if (v == nullptr || *v == 0) return 1;
+        if (std::strcmp(v, "auto") == 0) return -1;
+        return std::max(1, std::atoi(v));
+    }();
+    return n;
+}
+
+int64_t Glm5Model::ink_lane_pos(int j) const {
+    const Ink* K = fast_ != nullptr ? fast_->ink : nullptr;
+    if (K == nullptr || j < 0 || j >= (int) K->lanes.size()) return -1;
+    return j == K->lane ? pos_ : K->lanes[(size_t) j].pos;
+}
+
+int Glm5Model::ink_lane() const {
+    const Ink* K = fast_ != nullptr ? fast_->ink : nullptr;
+    return K != nullptr ? K->lane : 0;
+}
+
+// the live lane's sequence state back into its Lane (the model's fields hold it while it is the model's)
+static void ink_lane_park(Ink& K, int64_t pos, int64_t snap_pos, void* snap_h, int64_t snap_pend, int64_t snap_done,
+                          int64_t pend_pos, int64_t row_done, int last_tok) {
+    auto& L = K.lanes[(size_t) K.lane];
+    L.S = K.S;
+    L.pos = pos;
+    L.snap_pos = snap_pos;
+    L.snap_h = snap_h;
+    L.snap_pend = snap_pend;
+    L.snap_done = snap_done;
+    L.pend_pos = pend_pos;
+    L.row_done = row_done;
+    L.last_tok = last_tok;
+}
+
+bool Glm5Model::ink_lane_use(int j, std::string& err) {
+    FastState* F = fast_;
+    Ink* K = F != nullptr ? F->ink : nullptr;
+    if (K == nullptr || j < 0 || j >= (int) K->lanes.size()) {
+        err = "inkling: no lane " + std::to_string(j);
+        return false;
+    }
+    if (j == K->lane) return true;
+    if (ink_win_p0_ >= 0) ink_win_commit(pos_);   // (a window pending on the old lane: settled there)
+    cudaStreamSynchronize(F->cs);
+    ink_lane_park(*K, pos_, snap_pos_, q35_snap_h_, q35_snap_pend_, q35_snap_done_, q35_pend_pos_, q35_row_done_, last_tok_);
+    const auto& L = K->lanes[(size_t) j];
+    K->S = L.S;
+    pos_ = L.pos;
+    snap_pos_ = L.snap_pos;
+    q35_snap_h_ = L.snap_h;
+    q35_snap_pend_ = L.snap_pend;
+    q35_snap_done_ = L.snap_done;
+    q35_pend_pos_ = L.pend_pos;
+    q35_row_done_ = L.row_done;
+    last_tok_ = L.last_tok;
+    K->lane = j;
+    if (K->win != nullptr) {   // (the verify window's conv state table: this lane's)
+        std::vector<float*> st(K->S.size());
+        for (size_t sl = 0; sl < st.size(); ++sl) st[sl] = K->S[sl].conv;
+        cudaMemcpy(K->win->states_d, st.data(), st.size() * sizeof(float*), cudaMemcpyHostToDevice);
+    }
+    return true;
+}
+
+bool Glm5Model::ink_batch_step(const int* lanes, const int32_t* toks, int n, std::string& err) {
+    FastState* F = fast_;
+    Ink* K = F != nullptr ? F->ink : nullptr;
+    if (K == nullptr || n < 2 || n > kVerifyMax || n > (int) K->lanes.size()) {
+        err = "inkling batch: 2.." + std::to_string(std::min<int>(kVerifyMax, K ? (int) K->lanes.size() : 0)) + " lanes";
+        return false;
+    }
+    if (inkd_ != nullptr) {
+        err = "inkling batch: not with the DSpark drafter";
+        return false;
+    }
+    const int TM = kVerifyMax, NS = (int) K->S.size();
+    if (ink_win_p0_ >= 0) ink_win_commit(pos_);   // (a window pending on the live lane: settled before it is parked)
+    if (K->bt_d == nullptr) {
+        const size_t b = 64 + (size_t) 3 * NS * TM * sizeof(void*);
+        if (cudaMalloc(&K->bt_d, b) != cudaSuccess || cudaHostAlloc(&K->bt_h, b, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            err = "inkling batch: the batch table did not allocate";
+            return false;
+        }
+        cudaMemset(K->bt_d, 0, b);
+        std::memset(K->bt_h, 0, b);
+        uint8_t* d = (uint8_t*) K->bt_d;
+        K->bt_pos = (int64_t*) d;
+        K->bt_kc = (uint16_t**) (d + 64);
+        K->bt_vc = K->bt_kc + (size_t) NS * TM;
+        K->bt_conv = (float**) (K->bt_vc + (size_t) NS * TM);
+    }
+    ink_lane_park(*K, pos_, snap_pos_, q35_snap_h_, q35_snap_pend_, q35_snap_done_, q35_pend_pos_, q35_row_done_, last_tok_);
+    uint8_t* h = (uint8_t*) K->bt_h;
+    int64_t* hpos = (int64_t*) h;
+    uint16_t** hkc = (uint16_t**) (h + 64);
+    uint16_t** hvc = hkc + (size_t) NS * TM;
+    float** hconv = (float**) (hvc + (size_t) NS * TM);
+    int64_t pmax = 0;
+    for (int t = 0; t < n; ++t) {
+        const int l = lanes[t];
+        if (l < 0 || l >= (int) K->lanes.size()) { err = "inkling batch: lane " + std::to_string(l); return false; }
+        for (int u = 0; u < t; ++u)
+            if (lanes[u] == l) { err = "inkling batch: lane " + std::to_string(l) + " twice"; return false; }
+        const auto& L = K->lanes[(size_t) l];
+        if (L.pos + 1 > max_ctx_) { err = "inkling batch: lane " + std::to_string(l) + " is at the context's end"; return false; }
+        hpos[t] = L.pos;
+        pmax = std::max(pmax, L.pos);
+        for (int sl = 0; sl < NS; ++sl) {
+            hkc[(size_t) sl * TM + t] = L.S[(size_t) sl].kc;
+            hvc[(size_t) sl * TM + t] = L.S[(size_t) sl].vc;
+            hconv[(size_t) sl * TM + t] = L.S[(size_t) sl].conv;
+        }
+    }
+    cudaMemcpyAsync(K->bt_d, K->bt_h, 64 + (size_t) 3 * NS * TM * sizeof(void*), cudaMemcpyHostToDevice, F->cs);
+    K->batch = true;
+    K->batch_pmax = pmax;
+    const int64_t live = pos_;
+    pos_ = 0;   // (verify() reads the window from pos_: the batch's positions are the table's)
+    const bool ok = verify(std::vector<int32_t>(toks, toks + n), err);
+    K->batch = false;
+    pos_ = live;
+    last_tok_ = K->lanes[(size_t) K->lane].last_tok;
+    if (!ok) return false;
+    for (int t = 0; t < n; ++t) {
+        auto& L = K->lanes[(size_t) lanes[t]];
+        L.pos += 1;
+        if (lanes[t] == K->lane) pos_ = L.pos;
+    }
+    return true;
 }
 
 bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const InkWinIo& io, std::string& err) {
@@ -1074,10 +1306,28 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
     }
     Ink::Win& W = *K.win;
     if (T < 1 || T > TM) { err = "inkling verify: the window's width"; return false; }
-    ink_win_commit(p0);   // (an earlier window not settled: its columns before p0 kept)
-    if (!inkd_flush()) { err = "ink dspark: the deferred rows' commit"; return false; }
-    ink_win_p0_ = p0;
-    ink_win_T_ = T;
+    // the batch mode (ink_batch_step): each column its own lane's - its position, caches and conv states from the batch
+    // table, every state updated as the token path updates it (nothing to commit later), no drafter taps
+    const bool bt = K.batch;
+    if (bt && (!win_fuse || inkd_ != nullptr || K.bt_d == nullptr)) {
+        err = "inkling batch: needs STRATA_INK_FUSE on and no drafter";
+        return false;
+    }
+    if (!bt) {
+        ink_win_commit(p0);   // (an earlier window not settled: its columns before p0 kept)
+        if (!inkd_flush()) { err = "ink dspark: the deferred rows' commit"; return false; }
+        ink_win_p0_ = p0;
+        ink_win_T_ = T;
+    }
+    const int64_t p_last = bt ? K.batch_pmax : p0 + T - 1;   // (the attention's grid: the largest row position)
+    const auto rows_of = [&](int sl) {   // (the batch table's rows of slot sl)
+        ik::BatchRows b;
+        b.pos = K.bt_pos;
+        b.kc = K.bt_kc + (size_t) sl * TM;
+        b.vc = K.bt_vc + (size_t) sl * TM;
+        b.conv = K.bt_conv + (size_t) sl * TM;
+        return b;
+    };
     const auto slot_save = [&](int sl, int part) {   // (part 0 K, 1 V, 2 attn post, 3 ffn post)
         const size_t off = part == 0 ? 0 : part == 1 ? (size_t) KV : part == 2 ? (size_t) 2 * KV : (size_t) 2 * KV + E;
         return W.save + (size_t) sl * W.slot_floats + (size_t) TM * off;
@@ -1165,11 +1415,16 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
             mt.pre_out = pend.pre_out;
             mt.pre_add = true;
             mt.pre_rows = true;
+            mt.pre_bs = pend.pre_bs;
+            mt.pre_bso = pend.pre_bso;
             pend.pre_in = nullptr;
         };
         const auto flush_pend = [&] {   // (a reader of h without a fused mix: the two launches)
             if (pend.pre_in == nullptr) return;
-            ik::conv_win(pend.pre_in, E, pend.pre_w, nullptr, 0, E, pend.pre_state, E, T, pend.pre_tmp, E, s);
+            if (pend.pre_bs != nullptr)
+                ik::conv_batch(pend.pre_in, E, pend.pre_w, pend.pre_bs, pend.pre_bso, E, T, pend.pre_tmp, E, s);
+            else
+                ik::conv_win(pend.pre_in, E, pend.pre_w, nullptr, 0, E, pend.pre_state, E, T, pend.pre_tmp, E, s);
             ik::add_rows(pend.pre_out, E, pend.pre_tmp, E, E, T, s);
             pend.pre_in = nullptr;
         };
@@ -1251,7 +1506,8 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
                                 Ly.q_clip, Ly.rel_clip, (int64_t) ik::kConv * Hkv, KV, HD, H, Hkv, S.ring, p0, g.ink_qk_clip,
                                 g.ink_rel_clip, lf, g.ink_log_alpha, g.norm_eps, S.kc, S.vc};
                 pp.pd = pdv;
-                ik::post_proj_rows(pp, kraw, vraw, T, s);
+                if (bt) ik::post_proj_batch(pp, rows_of(sl), kraw, vraw, T, s);
+                else ik::post_proj_rows(pp, kraw, vraw, T, s);
             } else {
                 ik::conv_win(kraw, KV, Ly.k_conv, swa ? nullptr : W.kd, ik::kConv * Hkv, D, conv, KV, T, W.kf, KV, s);
                 ik::conv_win(vraw, KV, Ly.v_conv, swa ? nullptr : W.vd, ik::kConv * Hkv, D, conv + (size_t) KV * 3, KV, T, W.vf,
@@ -1262,9 +1518,10 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
                 ik::kv_store(W.kf, KV, W.vf, KV, g.norm_eps, Hkv, p0, T, S.ring, S.kc, S.vc, s);
             }
             // ---- attention (a row's keys up to its own position, its own split count), gate, output, post conv
+            const ik::BatchRows br = bt ? rows_of(sl) : ik::BatchRows();
             ik::attn(W.qf, HD, W.rf, H * ik::kRel, W.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring, H,
-                     Hkv, p0, T, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), W.part, ik::kMaxSplits, W.ao, HD, s, true,
-                     pdv);
+                     Hkv, bt ? p_last - (T - 1) : p0, T, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), W.part,
+                     ik::kMaxSplits, W.ao, HD, s, true, bt ? nullptr : pdv, bt ? &br : nullptr);
             ik::gate_sigmoid(W.ao, HD, W.gl, HD, HD, T, s);
             gf::quantize_q8_1(W.ao, W.aoq, T * HD, s);
             float* praw = slot_save(sl, 2);
@@ -1280,6 +1537,10 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
                 mt.pre_state = conv_post;
                 mt.pre_tmp = W.tmp;
                 mt.pre_rows = true;
+                if (bt) {
+                    mt.pre_bs = K.bt_conv + (size_t) sl * TM;
+                    mt.pre_bso = (int64_t) 2 * KV * 3;
+                }
                 if (starts) {
                     if (blocks.n + 1 >= ik::kMaxStates) { err = "inkling verify: too many residual blocks"; return false; }
                     blocks.p[blocks.n++] = h;
@@ -1307,15 +1568,19 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
                 pend.pre_state = conv + (size_t) (2 * KV + E) * 3;
                 pend.pre_tmp = W.tmp;
                 pend.pre_out = h;
+                pend.pre_bs = bt ? K.bt_conv + (size_t) sl * TM : nullptr;
+                pend.pre_bso = (int64_t) (2 * KV + E) * 3;
                 return true;
             }
             if (starts) {
                 if (blocks.n + 1 >= ik::kMaxStates) { err = "inkling verify: too many residual blocks"; return false; }
                 blocks.p[blocks.n++] = h;
                 h = fresh();
-                ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, h, E, s);
+                if (bt) ik::conv_batch(praw, E, Ly.post_conv, K.bt_conv + (size_t) sl * TM, (int64_t) 2 * KV * 3, E, T, h, E, s);
+                else ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, h, E, s);
             } else {
-                ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, W.tmp, E, s);
+                if (bt) ik::conv_batch(praw, E, Ly.post_conv, K.bt_conv + (size_t) sl * TM, (int64_t) 2 * KV * 3, E, T, W.tmp, E, s);
+                else ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, W.tmp, E, s);
                 ik::add_rows(h, E, W.tmp, E, E, T, s);
             }
             // ---- the FFN
@@ -1336,6 +1601,8 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
             pend.pre_state = conv + (size_t) (2 * KV + E) * 3;
             pend.pre_tmp = W.tmp;
             pend.pre_out = h;
+            pend.pre_bs = bt ? K.bt_conv + (size_t) sl * TM : nullptr;
+            pend.pre_bso = (int64_t) (2 * KV + E) * 3;
             if (!wfuse) flush_pend();
             return true;
         };
@@ -1418,9 +1685,9 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         const uint64_t sig = (uint64_t) (uintptr_t) (F->expert_helper && F->expert_helper->active &&
                                                      !F->expert_helper->failed ? F->expert_helper->owned_d : nullptr) * 2u +
                              (F->tail_skip_disk ? 1u : 0u);
-        const int64_t p1 = p0 + T - 1;
+        const int64_t p1 = p_last;
         const auto key = std::make_tuple(T, ik::attn_rows_grid(p1, 0, ik::kMaxSplits), ik::attn_rows_grid(p1, g.n_swa, ik::kMaxSplits),
-                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), sig);
+                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), sig, bt ? 1 : 0);
         // (a key's first windows as launches: a capture costs ~13 ms - RTX 5090, ~1,450 nodes - and a replay saves
         // ~0.6, so a width seen a few times only is not captured)
         // STRATA_INK_WIN_CAP_AFTER=<n> (default 6): the windows of a key launched before its capture

@@ -891,15 +891,18 @@ bool Glm5Model::q35_snap_copy(bool restore) {
         }
     }
     uint8_t* at = (uint8_t*) q35_snap_h_;
-    const auto run = [&](void* d, size_t b) {
-        cudaMemcpyAsync(restore ? d : at, restore ? at : d, b, restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
-                        F->cs);
+    const auto run = [&](void* d, size_t b, size_t n = SIZE_MAX) {   // (n: the bytes moved, from the run's start)
+        n = std::min(n, b);
+        if (n > 0)
+            cudaMemcpyAsync(restore ? d : at, restore ? at : d, n, restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
+                            F->cs);
         at += b;
     };
-    if (g.ink) {
+    if (g.ink) {   // (the window rings' written rows only: the snapshot's position - this one's, or the one restored)
         std::vector<std::pair<void*, size_t>> runs;
-        ink_snap_runs(runs);
-        for (const auto& r : runs) run(r.first, r.second);
+        std::vector<size_t> used;
+        ink_snap_runs(runs, &used, restore ? snap_pos_ : pos_);
+        for (size_t i = 0; i < runs.size(); ++i) run(runs[i].first, runs[i].second, used[i]);
     }
     for (int il = l0_; il < l1_ && !g.ink; ++il) {
         const auto& Ly = F->L[(size_t) il];

@@ -160,6 +160,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | `thinking_budget` | the most tokens a thinking block may take (default 32768; 0 = no cap) | `16384` |
 | `env` | fine engine settings (environment variables); the list is in [MANUAL: Settings](MANUAL.md#settings). The example fixes the RAM tier for a 123 GB box (66; 60 on a 94 GB box; unset = sized from the free RAM) | `{"STRATA_GLM_RAM_GB": "66"}` |
 | `uncensor` | an uncensoring file ([UNCENSOR](UNCENSOR.md)) | `".../dsv4.abl"` |
+| `parallel` | Inkling 2 Mini: how many requests are decoded together (`"auto"`: as many as leave every expert in VRAM, at most 8; default 1 = one at a time). Each gets its own KV cache, allocated at start ([MANUAL: Several requests at once](MANUAL.md#several-requests-at-once-parallel-inkling-2-mini-beta)); other models ignore it | `4` |
 
 **GPUs**
 

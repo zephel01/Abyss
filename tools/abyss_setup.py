@@ -534,7 +534,7 @@ def hip_engine(a):
 # the run config's server settings (serve/server.py reads them; the user sets them by hand): --rewrite-config writes
 # the model's part again and keeps these (Maya #1089: a setup run again lost the port, the API key and the host)
 SERVER_KEYS = ("port", "host", "api_key", "allow_shutdown", "reasoning_effort", "thinking_budget", "fit_max_tokens",
-               "mcp", "mcp_servers", "mcpServers")
+               "mcp", "mcp_servers", "mcpServers", "parallel")
 
 
 def write_config(name: str, pack: Path, ctx: int, port: int | None, rewrite: bool, gpus=None,

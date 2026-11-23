@@ -377,6 +377,10 @@ public:
     /// model can close its reasoning and end the turn at once: an empty answer.  nullptr: off.
     void end_guard(const std::vector<int64_t>* ids, int32_t replace) { guard_ids_ = ids; guard_tok_ = replace; }
     bool end_guard_fired() { const bool f = guard_fired_; guard_fired_ = false; return f; }
+    /// The end guard's pick on a logits row the caller names (device memory) with the caller's ids and replacement -
+    /// the batched decode's guards, a request each (end_guard_pick's logic; fired: the pick was replaced)
+    int32_t guard_row_pick(const float* d_row, int32_t sampled, const std::vector<int64_t>& ids, int32_t replace,
+                           bool& fired);
 
 private:
     bool step(int32_t token, std::string& err);   // one token through all layers
@@ -741,7 +745,8 @@ public:
     bool ink_alloc(size_t& bytes, bool place, uint8_t*& at, std::string& err);
     bool fast_ink_layers(int64_t p, std::string& err);
     void ink_reset();
-    void ink_snap_runs(std::vector<std::pair<void*, size_t>>& out) const;
+    void ink_snap_runs(std::vector<std::pair<void*, size_t>>& out, std::vector<size_t>* used = nullptr,
+                       int64_t pos = -1) const;
     void ink_free();
     // inkling's verify window (STRATA_INK_DRAFT=1, opt-in): the token path's 48 layer applications over T columns at
     // once - every column the bits a token alone gets (glm_mvn, rms_q8_rows, the attention's splits a row as the
@@ -767,6 +772,19 @@ public:
     bool graph_cap_ = false;
     int64_t ink_win_p0_ = -1;           // the pending window's first position and width
     int ink_win_T_ = 0;
+    // ---- the batched decode (--parallel N, inkling; inkling_fast_path.cu): N lanes, each one conversation's state (its
+    // slots' caches and conv states, its position, its snapshot).  ink_lane_use(j) makes lane j the model's sequence -
+    // prefill, forward and the snapshot then work on it as on the one sequence before; ink_batch_step runs one token of
+    // each of n distinct lanes (2..kVerifyMax) as one window - every row the bits that lane's token path gives - and
+    // moves each lane on; ink_batch_pick(t, sp) is row t's token then (greedy: its argmax; else its sampler, a row)
+    static int ink_parallel_env();      // STRATA_INK_PARALLEL (--parallel): 1 default, -1 auto
+    int ink_par_ = 1;                   // the lanes allocated
+    int ink_lane() const;
+    int64_t ink_lane_pos(int j) const;
+    bool ink_lane_use(int j, std::string& err);
+    bool ink_batch_step(const int* lanes, const int32_t* toks, int n, std::string& err);
+    int ink_batch_pick(int t, strata::kernels::SamplerParams& sp, std::string& err);
+    const float* ink_batch_row(int t) const;   // (row t's logits on the device, after ink_batch_step)
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);

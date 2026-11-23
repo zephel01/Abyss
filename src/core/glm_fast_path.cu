@@ -1300,8 +1300,24 @@ bool Glm5Model::fast_setup(std::string& err) {
             cudaMemcpy(F->md.scratch, sp.data(), sp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
         }
         // the batched prompt path: its sizes (it borrows the pool's tail, see below); qwen35moe has none yet (its
-        // prompts go through the token path)
-        if (!prefill_setup(err)) return false;
+        // prompts go through the token path).  Inkling with --parallel lanes: a region of its own for the session
+        // instead (STRATA_PAR_PREFILL_MB, 2048 MB) - a prompt read while other requests decode must not take experts
+        // out of VRAM: every borrow sent the tail's experts to RAM and back (~1 GB over the bus, the running streams
+        // stalled ~150 ms for a 40-token prompt).  0: borrow as alone
+        const bool own_pf = g.ink && ink_par_ > 1 && [] {
+            const char* v = getenv("STRATA_PAR_PREFILL_MB");
+            return v == nullptr || std::atoi(v) > 0;
+        }();
+        if (own_pf && getenv("STRATA_GLM_PREFILL_MB") == nullptr) {
+            const char* v = getenv("STRATA_PAR_PREFILL_MB");
+            const std::string mb = v != nullptr ? v : "2048";
+#if defined(_WIN32)
+            _putenv_s("STRATA_GLM_PREFILL_MB", mb.c_str());
+#else
+            setenv("STRATA_GLM_PREFILL_MB", mb.c_str(), 1);
+#endif
+        }
+        if (!(own_pf ? prefill_setup_own(err) : prefill_setup(err))) return false;
         // DSpark (STRATA_DS4_DSPARK): the drafter's weights and expert cache before the pool takes what is left
         if (!dspark_load(err)) return false;
         if (!dflash_load(err)) return false;   // (Qwen3.8's DFlash 2, STRATA_Q4X_DFLASH)
