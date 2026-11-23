@@ -1826,6 +1826,35 @@ int32_t Glm5Model::end_guard_pick(int32_t sampled) {
     return best;
 }
 
+// end_guard_pick's choice on a given logits row (device: the token path's sampler row, or a batch row - ink_batch_row)
+// with the guard's ids and replacement passed in (the batched decode keeps a guard per request); fired: it replaced
+int32_t Glm5Model::guard_row_pick(const float* d_row, int32_t sampled, const std::vector<int64_t>& ids, int32_t replace,
+                                  bool& fired) {
+    fired = false;
+    if (std::find(ids.begin(), ids.end(), (int64_t) sampled) == ids.end()) return sampled;
+    if (replace >= 0) {
+        std::fprintf(stderr, "glm end guard: the turn ended inside the reasoning: closed it instead\n");
+        fired = true;
+        return replace;
+    }
+    std::vector<float> row((size_t) g_.n_vocab);
+    if (d_row == nullptr || cudaMemcpy(row.data(), d_row, row.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return sampled;
+    const float ls = row[(size_t) sampled];
+    int above = 0;
+    for (const float v : row) above += v > ls;
+    if (above >= 64) return sampled;
+    int32_t best = -1;
+    for (int64_t t = 0; t < g_.n_vocab; ++t) {
+        if (std::find(ids.begin(), ids.end(), t) != ids.end()) continue;
+        if (best < 0 || row[(size_t) t] > row[(size_t) best]) best = (int32_t) t;
+    }
+    if (best < 0) return sampled;
+    std::fprintf(stderr, "glm end guard: the turn ended with no answer after the reasoning: token %d instead\n", best);
+    fired = true;
+    return best;
+}
+
 int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
     // the fast path already ran the greedy argmax on the device at the end of the forward
     if (fast_ != nullptr && sp.greedy && last_tok_ >= 0)   // (re-picked when made before the bias set switched on)

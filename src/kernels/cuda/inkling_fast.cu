@@ -466,6 +466,49 @@ __global__ void __launch_bounds__(kD) post_proj_rows_kernel(PostProj a, const fl
     }
 }
 
+// the batched decode's conv_rows: grid (C / 128, T), row t one step over its own state (conv_kernel's T = 1 step)
+__global__ void conv_batch_kernel(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
+                                  float* const* __restrict__ st, int64_t soff, int C, float* __restrict__ out, int64_t os) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= C) return;
+    conv_channel(in + (int64_t) t * is, is, w, nullptr, 0, C, st[t] + soff, c, 1, out + (int64_t) t * os, os);
+}
+
+// the batched decode's post_proj: grid (post_proj_kernel's blocks, T) - block (b, t) post_proj_kernel's block b on row
+// t, which is its own conversation (its position, its conv state, its caches)
+__global__ void __launch_bounds__(kD) post_proj_batch_kernel(PostProj a, BatchRows br, const float* __restrict__ kraw,
+                                                               const float* __restrict__ vraw) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
+    const int t = blockIdx.y;
+    const int64_t p = br.pos[t];
+    const int lane = threadIdx.x & 31;
+    float* kf = a.kf + (int64_t) t * a.KV;
+    float* vf = a.vf + (int64_t) t * a.KV;
+    if ((int) blockIdx.x < a.Hkv) {
+        const int h = blockIdx.x;
+        const int c = h * kD + (int) threadIdx.x;
+        float* conv = br.conv[t];
+        conv_channel(kraw + (int64_t) t * a.KV, a.KV, a.k_conv, a.kd != nullptr ? a.kd + (int64_t) t * a.dws : nullptr,
+                     a.dws, kD, conv, c, 1, kf, a.KV);
+        conv_channel(vraw + (int64_t) t * a.KV, a.KV, a.v_conv, a.vd != nullptr ? a.vd + (int64_t) t * a.dws : nullptr,
+                     a.dws, kD, conv + (size_t) a.KV * 3, c, 1, vf, a.KV);
+        __syncthreads();
+        if (threadIdx.x >= 32) return;
+        clip_head(kf, a.KV, nullptr, kD, a.qk_clip, p, 0.0f, 0.0f, 0, h, lane);
+        __syncwarp();
+        kv_store_head(kf, a.KV, vf, a.KV, a.eps, a.Hkv, p, a.ring, (__half*) br.kc[t], (__half*) br.vc[t], 0, h, lane);
+        return;
+    }
+    const int wid = ((int) blockIdx.x - a.Hkv) * (kD / 32) + (int) (threadIdx.x >> 5);
+    if (wid < a.H) {
+        clip_head(a.qf + (int64_t) t * a.HD, a.HD, a.q_clip, kD, a.qk_clip, p, a.lf, a.alpha, 0, wid, lane);
+    } else if (wid < 2 * a.H) {
+        clip_head(a.rf + (int64_t) t * a.H * kRel, (int64_t) a.H * kRel, a.rel_clip, kRel, a.rel_clip_thr, p, a.lf,
+                  a.alpha, 0, wid - a.H, lane);
+    }
+}
+
 // ---------------------------------------------------------------- attention
 constexpr int kAttnWarps = 4;
 constexpr int kTile = 32 * kAttnWarps;   // keys a tile: a warp's 32
@@ -487,7 +530,8 @@ template <int kG, bool kRows = false>
 __global__ void __launch_bounds__(kAttnWarps * 32) attn_part_kernel(
     const float* __restrict__ q, int64_t qs, const float* __restrict__ r, int64_t rs, const float* __restrict__ relb,
     int extent, const __half* __restrict__ kc, const __half* __restrict__ vc, int ring, int H, int Hkv, int64_t p0,
-    int window, float scale, float* __restrict__ part, int max_splits, int f16, const int64_t* __restrict__ p0d = nullptr) {
+    int window, float scale, float* __restrict__ part, int max_splits, int f16, const int64_t* __restrict__ p0d = nullptr,
+    BatchRows br = BatchRows()) {
     STRATA_PDL_ENTRY();
     // (kRows: grid (T, splits, n_head_kv) - a split's rows next to each other, so the window's columns read the same
     // keys at about the same time and the L2 serves the later ones; the blocks compute what they did before)
@@ -495,7 +539,12 @@ __global__ void __launch_bounds__(kAttnWarps * 32) attn_part_kernel(
     const int t = kRows ? (int) blockIdx.x : (int) blockIdx.z;
     constexpr int G = kG;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int64_t p = (p0d != nullptr ? *p0d : p0) + t;   // (p0d: a captured graph's token)
+    // (p0d: a captured graph's token; br: the batched decode - row t its own conversation's position and caches)
+    const int64_t p = kRows && br.pos != nullptr ? br.pos[t] : (p0d != nullptr ? *p0d : p0) + t;
+    if (kRows && br.pos != nullptr) {
+        kc = (const __half*) br.kc[t];
+        vc = (const __half*) br.vc[t];
+    }
     const int64_t lo = window > 0 ? (p - window + 1 > 0 ? p - window + 1 : (int64_t) 0) : 0;
     const int64_t nk = p - lo + 1;
     const int nsplit = kRows ? attn_row_splits(nk, max_splits) : (int) gridDim.x;   // (kRows: the row's own count)
@@ -672,11 +721,12 @@ __global__ void __launch_bounds__(kAttnWarps * 32) attn_part_kernel(
 // grid (H, T): the splits and the sink into out (rows_p0 >= 0: the verify window's, each row its own split count)
 __global__ void attn_combine_kernel(const float* __restrict__ part, int nsplit, int max_splits, const float* __restrict__ sink,
                                     int64_t ss, int H, float* __restrict__ out, int64_t os, int64_t rows_p0 = -1,
-                                    int window = 0, const int64_t* __restrict__ rows_p0d = nullptr) {
+                                    int window = 0, const int64_t* __restrict__ rows_p0d = nullptr,
+                                    const int64_t* __restrict__ rows_pos = nullptr) {
     STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    if (rows_p0 >= 0) {   // (rows_p0d: a captured window's first position, from the device word)
-        const int64_t p = (rows_p0d != nullptr ? *rows_p0d : rows_p0) + t;
+    if (rows_p0 >= 0) {   // (rows_p0d: a captured window's first position, from the device word; rows_pos: a row's own)
+        const int64_t p = rows_pos != nullptr ? rows_pos[t] : (rows_p0d != nullptr ? *rows_p0d : rows_p0) + t;
         nsplit = attn_row_splits(window > 0 ? (p + 1 < window ? p + 1 : (int64_t) window) : p + 1, max_splits);
     }
     const float* pr = part + ((size_t) t * H + h) * max_splits * kPart;
@@ -1130,7 +1180,17 @@ __global__ void __launch_bounds__(kMixChunk) mix_tok_part_kernel(MixTok a, int E
     const int i = c * kMixChunk + threadIdx.x;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int t = blockIdx.y;   // (the verify window's row, a.rows of them; a token: 0)
-    if (a.pre_in != nullptr && i < E) {
+    if (a.pre_in != nullptr && i < E && a.pre_bs != nullptr) {   // (the batched decode: mix_pre's step, row t)
+        float* st = a.pre_bs[t] + a.pre_bso + (size_t) i * 3;
+        const float x0 = st[0], x1 = st[1], x2 = st[2], x3 = a.pre_in[(int64_t) t * E + i];
+        const float* w = a.pre_w + (size_t) i * 4;
+        const float v = conv_step(x0, x1, x2, x3, w[0], w[1], w[2], w[3], nullptr, 1.0f / sqrtf(5.0f));
+        st[0] = x1;
+        st[1] = x2;
+        st[2] = x3;
+        float* o = a.pre_out + (int64_t) t * E + i;
+        *o = a.pre_add ? *o + v : v;
+    } else if (a.pre_in != nullptr && i < E) {
         if (a.rows > 1 || a.pre_rows) {   // (the window's conv_win: rows 0 .. t over the state left as it is)
             const float v = conv_row_keep(a.pre_in, E, a.pre_w, a.pre_state, i, t);
             if (a.pre_add) a.pre_out[(int64_t) t * E + i] += v;   // (add_rows' add of conv_win's row)
@@ -1277,6 +1337,19 @@ __device__ __forceinline__ float ld_cg(const float* p) {
 // mix_tok_fused_kernel's pre step on element i of row t: mix_tok_part_kernel's (conv_channel's T = 1 step, or
 // conv_row_keep's row; then the add), the same arithmetic; returns the value written to pre_out
 __device__ __forceinline__ float mix_pre(const MixTok& a, int E, int i, int t) {
+    if (a.pre_bs != nullptr) {   // (the batched decode: row t its own conversation's step - the token path's, below)
+        float* st = a.pre_bs[t] + a.pre_bso + (size_t) i * 3;
+        const float x0 = st[0], x1 = st[1], x2 = st[2], x3 = a.pre_in[(int64_t) t * E + i];
+        const float* w = a.pre_w + (size_t) i * 4;
+        const float v = conv_step(x0, x1, x2, x3, w[0], w[1], w[2], w[3], nullptr, 1.0f / sqrtf(5.0f));
+        st[0] = x1;
+        st[1] = x2;
+        st[2] = x3;
+        float* o = a.pre_out + (int64_t) t * E + i;
+        const float h = a.pre_add ? *o + v : v;
+        *o = h;
+        return h;
+    }
     if (a.rows > 1 || a.pre_rows) {
         const float v = conv_row_keep(a.pre_in, E, a.pre_w, a.pre_state, i, t);
         float* o = a.pre_out + (int64_t) t * E + i;
@@ -2177,6 +2250,22 @@ void post_proj_rows(const PostProj& a, const float* kraw, const float* vraw, int
     check("post_proj_rows");
 }
 
+void post_proj_batch(const PostProj& a, const BatchRows& b, const float* kraw, const float* vraw, int T, cudaStream_t s) {
+    if (T <= 0) return;
+    const int blocks = a.Hkv + (2 * a.H + kD / 32 - 1) / (kD / 32);
+    strata::kernels::pdl_launch(post_proj_batch_kernel, dim3((unsigned) blocks, (unsigned) T), dim3(kD), 0, s, a, b, kraw,
+                                vraw);
+    check("post_proj_batch");
+}
+
+void conv_batch(const float* in, int64_t is, const float* w, float* const* st, int64_t soff, int C, int T, float* out,
+                int64_t os, cudaStream_t s) {
+    if (T <= 0) return;
+    strata::kernels::pdl_launch(conv_batch_kernel, dim3((unsigned) ((C + 127) / 128), (unsigned) T), dim3(128), 0, s, in,
+                                is, w, st, soff, C, out, os);
+    check("conv_batch");
+}
+
 void ctrl_cat_n(const CtrlRows& a, int n, int E, int T, cudaStream_t s) {
     if (T <= 0 || n <= 0) return;
     strata::kernels::pdl_launch(ctrl_cat_n_kernel, dim3((unsigned) T, (unsigned) n, 2), dim3(256), 0, s, a, E);
@@ -2237,8 +2326,9 @@ size_t attn_part_floats(int T, int n_head, int max_splits) {
 void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* sink, int64_t ss, const float* rel_bias,
           int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, int T,
           int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s, bool rows,
-          const int64_t* p0d) {
+          const int64_t* p0d, const BatchRows* br) {
     if (T <= 0) return;
+    const BatchRows bb = br != nullptr ? *br : BatchRows();
     if (n_head % n_head_kv != 0 || n_head / n_head_kv > kMaxG) {
         std::fprintf(stderr, "inkling kernels: attn: %d heads over %d KV heads\n", n_head, n_head_kv);
         return;
@@ -2254,7 +2344,7 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
     const dim3 grid_rows((unsigned) T, (unsigned) ns, (unsigned) n_head_kv);   // (kRows: a split's rows adjacent)
 #define INK_ATTN(GG) do { if (rows) strata::kernels::pdl_launch(attn_part_kernel<GG, true>, grid_rows, dim3(kAttnWarps * 32), \
         0, s, q, qs, r, rs, rel_bias, extent, (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, \
-        window, scale, part, max_splits, f16_env(), p0d); \
+        window, scale, part, max_splits, f16_env(), p0d, bb); \
         else attn_part_kernel<GG><<<grid, kAttnWarps * 32, 0, s>>>(q, qs, r, rs, rel_bias, extent, \
         (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, window, scale, part, max_splits, f16_env()); \
         } while (0)
@@ -2271,7 +2361,8 @@ void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* s
     check("attn_part");
     if (rows)
         strata::kernels::pdl_launch(attn_combine_kernel, dim3((unsigned) n_head, (unsigned) T), dim3(kD), 0, s,
-                                    (const float*) part, ns, max_splits, sink, ss, n_head, out, os, p0, window, p0d);
+                                    (const float*) part, ns, max_splits, sink, ss, n_head, out, os,
+                                    bb.pos != nullptr ? std::max<int64_t>(p0, 0) : p0, window, p0d, bb.pos);
     else
         attn_combine_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, ns, max_splits, sink, ss, n_head,
                                                                                 out, os);
@@ -2388,7 +2479,7 @@ void attn_tok(const float* q, const float* r, const float* sink, const float* re
     const int64_t qs = (int64_t) n_head * kD, rs = (int64_t) n_head * kRel;
 #define INK_ATTN(GG) strata::kernels::pdl_launch(attn_part_kernel<GG>, grid, dim3(kAttnWarps * 32), 0, s, q, qs, r, rs, \
         rel_bias, extent, (const __half*) kc, (const __half*) vc, ring, n_head, n_head_kv, p0, window, scale, part, \
-        max_splits, f16_env(), pd)
+        max_splits, f16_env(), pd, BatchRows())
     switch (n_head / n_head_kv) {
         case 1: INK_ATTN(1); break;
         case 2: INK_ATTN(2); break;
