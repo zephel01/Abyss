@@ -1152,18 +1152,19 @@ What you can expect (RTX 5090, UD-Q4_K_XL, greedy, 512 tokens; `bench/batch/driv
 | what runs | each request's tok/s | time to first token | longest pause between tokens |
 | --- | ---: | ---: | ---: |
 | one request | 196 | 0.04-0.06 s | 9 ms |
-| 2 at once | 127-129 | 0.01-0.09 s | 12-42 ms |
-| 4 at once | 90-92 | 0.01-0.14 s | 15-54 ms |
-| 8 at once | 58-61 | 0.01-0.28 s | 20-52 ms |
-| two chats, the second 0.5 s later | 140 each | 0.01-0.02 s | 8-11 ms |
-| a 1,024-token answer while four short questions come and go | 154 (the long one), 128-129 | 0.01-0.03 s | 8-12 ms |
-| three streams when an 8K-token prompt arrives | 83 (the three) | 1.5 s (the 8K one; alone 1.0 s) | 164 ms (the three) |
-| an agent's two 8K contexts 0.3 s apart + a short question | 99-125 | 0.15 / 1.5 / 0.8 s | 158 ms |
-| the same 8K conversation's next turn (its lane kept it) | 191 | 0.18 s | 5 ms |
-| one of three cancelled after 50 tokens | 125-127 (the other two) | - | 48 ms |
-| 40960 tokens, 4 lanes: a 16K context, a 32K one 0.5 s later, a short question 1 s later | 65 / 139 / 42 | 2.4 / 7.9 / 1.5 s | 209 ms (while the 32K prompt is read) |
+| 2 at once | 128-129 | 0.05-0.11 s | 12 ms |
+| 4 at once | 90-92 | 0.01-0.20 s | 15-17 ms |
+| 8 at once | 59-62 | 0.01-0.49 s | 21 ms |
+| one every second, four in all | 106-131 | 0.01-0.04 s | 12 ms |
+| two chats, the second 0.5 s later | 139 each | 0.01-0.03 s | 8 ms |
+| a 1,024-token answer while four short questions come and go | 154 (the long one), 127-129 | 0.01-0.03 s | 8-10 ms |
+| three streams when an 8K-token prompt arrives | 83-84 (the three) | 1.45 s (the 8K one; alone 1.03 s) | 37 ms (the three) |
+| an agent's 8K context (its lane kept it), another 8K 0.3 s later, a short question | 99 / 122 / 88 | 0.15 / 1.29 / 0.23 s | 35 ms |
+| the same 8K conversation's next turn (its lane kept it) | 190 | 0.18 s | 8 ms |
+| one of three cancelled after 50 tokens | 125-127 (the other two) | - | 15 ms |
+| 40960 tokens, 4 lanes: a 16K context, a 32K one 0.5 s later, a short question 1 s later | 61 / 124 / 29 | 2.5 / 7.1 / 1.5 s | 38 ms (while the 32K prompt is read) |
 
-All the requests together: 2 at once 252 tok/s, 4 at once 342, 8 at once 453 (one request: 196).
+All the requests together: 2 at once 251 tok/s, 4 at once 342, 8 at once 450 (one request: 196).
 
 - **Every answer is the same as alone.** A row of the shared step computes exactly what the request alone computes
   (its own positions, caches and sums in the same order), so each concurrent answer is bit for bit the one it gives
@@ -1172,7 +1173,7 @@ All the requests together: 2 at once 252 tok/s, 4 at once 342, 8 at once 453 (on
   `"parallel": 1` it goes in one 32K piece, so there its answer can differ in the last bits (as with another `--prefill`
   chunk). A request alone decodes on the usual token path.
 - **A new request joins at once.** Its prompt is read between decode steps: a short prompt costs the running streams
-  one pause of ~40 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and
+  one pause of ~12-20 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and
   inside each chunk the running streams take a decode step after every 8 of its 48 layer passes (`STRATA_PAR_YIELD`) -
   the chunk's sums do not change, the streams pause ~35 ms at most (161 ms before) while an 8K prompt is read, and the
   8K prompt's first token comes as soon (1.44 s; 1.50 before). The finished prompt's conversation is copied off the
