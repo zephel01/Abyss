@@ -9,6 +9,25 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- **Several requests at once (Inkling 2 Mini, beta, opt-in).** `"parallel": N` in the run config (or `--parallel N` /
+  `auto`) lets the engine decode up to 8 requests together: one pass through the weights a step serves every running
+  request, each row computing exactly what that request computes alone - every concurrent answer is bit for bit its
+  answer alone (md5 checked on every request of the measurements), and a request alone runs the usual token path.
+  A new request joins at once (its prompt is read between decode steps, in 1,024-token chunks with half of each chunk's
+  time given back to the running streams), a cancelled request ends alone, each request's lane keeps its conversation
+  for the next turn, and every lane is allocated at start (no out-of-memory later; a request beyond N waits in the
+  queue). The server's `/slots` and `/props` report N slots. RTX 5090, UD-Q4_K_XL, 512 tokens: one request 196 tok/s; 2 at once 127-129 each (252 together), 4 at once 90-92 (342), 8 at once 58-61 (453); a new request's first token 0.01-0.3 s while others run, and the running streams' longest pause 8-54 ms (164 ms while an 8K prompt is read). Default 1:
+  unchanged. Not with the drafters, images, per-request uncensor switches or penalties (see the manual).
+
+### Changed
+
+- **Inkling 2 Mini's verify window** gives each of its 8 columns its own expert scratch set, so 7- and 8-wide windows
+  run their experts in the column-batched launches too (same bits; also DSpark's widest windows).
+- **Inkling 2 Mini's conversation snapshot** moves only the window rings' rows the conversation has written: a short
+  prompt's snapshot ~75 ms -> about 2 ms on PCIe Gen4 x4 (the whole 3,072-row rings, ~0.5 GB, went over the bus before).
+
 ## v1.3.196 - 2026-11-23
 
 Inkling 2 Mini is faster with the same tokens: the loop controllers as BF16 and the depth-attention mix in one launch

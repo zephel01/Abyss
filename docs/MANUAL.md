@@ -1137,6 +1137,50 @@ GLM-5.3-Flash, in place from their safetensors; [docs/exl3/README.md](exl3/READM
   top-1 63.3-63.7% against Maya-S-v2-IQ2_XXS's 1.634 / 62.3%, at 18.8 ms a token against 15.4 (v1.3.36: the iGPU's
   trellis decode by `v_sad_u8` and `v_dot2_f32_f16`; 22.4 in v1.3.35).
 
+## Several requests at once (`"parallel"`, Inkling 2 Mini, beta)
+
+By default the server answers one request at a time and queues the rest. With Inkling 2 Mini (every expert in VRAM)
+the engine can run several together: `"parallel": 4` in the run config (or `--parallel 4` in `args`; `"auto"` picks as
+many as leave every expert in VRAM, at most 8). Each request gets a lane of its own (its KV cache and short-convolution
+states, ~0.97 GB per 16K tokens of `--max-context`), allocated at start, so a busy server does not run out of memory
+later; a request beyond N waits in the queue (FIFO).
+
+What you can expect (RTX 5090, UD-Q4_K_XL, greedy, 512 tokens; `bench/batch/drive.py` in Abyss-tools):
+
+| what runs | each request's tok/s | time to first token | longest pause between tokens |
+| --- | ---: | ---: | ---: |
+| one request | 196 | 0.04-0.06 s | 9 ms |
+| 2 at once | 127-129 | 0.01-0.09 s | 12-42 ms |
+| 4 at once | 90-92 | 0.01-0.14 s | 15-54 ms |
+| 8 at once | 58-61 | 0.01-0.28 s | 20-52 ms |
+| two chats, the second 0.5 s later | 140 each | 0.01-0.02 s | 8-11 ms |
+| a 1,024-token answer while four short questions come and go | 154 (the long one), 128-129 | 0.01-0.03 s | 8-12 ms |
+| three streams when an 8K-token prompt arrives | 83 (the three) | 1.5 s (the 8K one; alone 1.0 s) | 164 ms (the three) |
+| an agent's two 8K contexts 0.3 s apart + a short question | 99-125 | 0.15 / 1.5 / 0.8 s | 158 ms |
+| the same 8K conversation's next turn (its lane kept it) | 191 | 0.18 s | 5 ms |
+| one of three cancelled after 50 tokens | 125-127 (the other two) | - | 48 ms |
+
+All the requests together: 2 at once 252 tok/s, 4 at once 342, 8 at once 453 (one request: 196).
+
+- **Every answer is the same as alone.** A row of the shared step computes exactly what the request alone computes
+  (its own positions, caches and sums in the same order), so each concurrent answer is bit for bit the one it gives
+  alone (md5 checked on every request above), and the same as with `"parallel": 1` for prompts up to the prompt
+  path's chunk (1,280 tokens on a 32 GB card). A longer prompt is read in those chunks whatever else runs - with
+  `"parallel": 1` it goes in one 32K piece, so there its answer can differ in the last bits (as with another `--prefill`
+  chunk). A request alone decodes on the usual token path.
+- **A new request joins at once.** Its prompt is read between decode steps: a short prompt costs the running streams
+  one pause of ~40 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and after each
+  chunk the running streams get half its time (`STRATA_PAR_SHARE`, 0.5) - they slow down while a long prompt is
+  read, they do not stop.
+- **Conversation reuse per lane.** A finished request's lane keeps its conversation; a new request takes the free lane
+  whose conversation its prompt continues (an agent sending its context again reads only what is new).
+- **Cancelling** one request (the client disconnects) ends only that one.
+- Not with `"parallel"` above 1: the drafters (`STRATA_INK_DRAFT`, `STRATA_INK_DSPARK`; they read one conversation),
+  images, the per-request uncensor / control-vector switches (the engine's defaults apply), penalties and the disk /
+  RAM conversation slots. The prompt path gets a 2 GB region of its own (`STRATA_PAR_PREFILL_MB`) instead of borrowing
+  the expert pool's tail, so a 16K prompt read alone is somewhat slower than with `"parallel": 1`.
+- Other models ignore the key for now (one request at a time).
+
 ## Memory and speed
 
 The engine fills the GPU's free VRAM with experts (after the dense weights, 6.2 GB for UD-Q2_K_XL, the caches and the
@@ -1526,6 +1570,11 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_INK_WIN_GRAPH` | 1 | Inkling 2 Mini's verify window (`STRATA_INK_DRAFT` / `STRATA_INK_DSPARK`): the window's 48 layer applications and its head replayed from one CUDA graph a (width, attention split grid) - the same kernels in the same order (the same bits). A key is captured after its 6th window (a capture costs ~13 ms), the attention's split grid rounded up to a power of two (8 at the least) so long contexts need few graphs. Not with the profile marks, dumps, expert prefetch / lookahead, the expert helper or image rows. `0`: the kernels launched one by one |
 | `STRATA_INK_WIN_CAP_AFTER` | 6 | the verify windows of a graph key launched one by one before the key's capture (`STRATA_INK_WIN_GRAPH`; a capture ~13 ms) |
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini prompts (CUDA, sm_80 and newer): the prompt path's attention on a tensor-core kernel (a block of tokens x a tile of keys, FP16 products with F32 sums, the relative bias as FP16 pairs - about F32 -, out-of-window tiles skipped) and a 2,048-row attention sub-batch (`STRATA_INK_PREFILL_SUB` overrides). RTX 5090, UD-Q4_K_XL: 8K prompt 3,784 -> 6,874 tok/s, 165K 765 -> 5,298. The sum order and q / P rounded to FP16 change the bits, not the KL against llama.cpp. `0`: the token path's kernel a row at a time and 512-row sub-batches (the old bits). AMD always uses that one |
+| `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini, `--serve`: requests decoded together (`N`, or `auto`: as many as leave every expert in VRAM with 3 GB to spare, at most 8); the run config's `"parallel"`. See [Several requests at once](#several-requests-at-once-parallel-inkling-2-mini-beta) |
+| `STRATA_PAR_CHUNK` | the prompt path's chunk | `"parallel"` above 1: the prompt tokens read between two decode steps while other requests decode (1,280 on a 32 GB card with `STRATA_PAR_PREFILL_MB` 2048). Smaller: shorter pauses for the running streams, a slower prompt - and a long prompt's pieces then depend on whether others decode, so its answer's last bits can too |
+| `STRATA_PAR_SHARE` | 0.5 | `"parallel"` above 1: after a prompt chunk, the running requests decode for this share of the chunk's time before the next chunk (0: one decode step between chunks) |
+| `STRATA_PAR_PREFILL_MB` | 2048 | `"parallel"` above 1: the prompt path's own VRAM region (MB), allocated at start instead of borrowing the expert pool's tail - a borrow moved the tail's experts to RAM and back while the other requests waited (~150 ms for a 40-token prompt). 0: borrow as with one request |
+| `STRATA_PAR_TRACE` | unset | `1`: a line a prompt chunk with its stages' times (lane switch, conversation restored or reset, the read, the snapshot) |
 | `STRATA_DS4_SPEC_GROUP` | half the window | the pipelined window's columns a group (v1.3.43); the default makes two groups of ceil(T / 2) |
 | `STRATA_DS4_WIN_COLS` | on | a window group's VRAM-resident experts in one gate/up and one down launch for all its columns instead of a launch a column (v1.3.43; bit-identical: `STRATA_DS4_WIN_COLS_CHECK=1` compares every 16th group with a launch a column); `0`: a launch a column |
 | `STRATA_GLM_CPU_MULTI` | on | a batched verify window's CPU-lane experts of a layer in one call for all its columns, a weight row decoded once for all of them (v1.3.43; bit-identical); `0`: a call a column |
