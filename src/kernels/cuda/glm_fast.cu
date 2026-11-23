@@ -5401,12 +5401,16 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
 // the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
 // of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
 // hc3's widths: 4096 (32 blocks); with HIP DeepSeek V4.1's 5120 too (40 blocks, its lagged collapse; HC3V41-NUMBERS,
-// STRATA_GLM_HC3_V41=0: hc2 as before).  NVIDIA keeps hc2 for V4.1 (not measured there)
+// STRATA_GLM_HC3_V41=0: hc2 as before).  NVIDIA keeps hc2 for V4.1 unless STRATA_GLM_HC3_V41=1: an RTX 5090 ran
+// V4.1 JA256 4% faster with it, but the 8 held-out sequences' KL went up on 7 of 8 (0.3815 -> 0.3839), so it is opt-in
 static bool hc3_width(int n_embd) {
 #if defined(STRATA_USE_HIP)
-    static const bool v41 = [] { const char* v = getenv("STRATA_GLM_HC3_V41"); return v == nullptr || std::atoi(v) != 0; }();
-    if (v41 && n_embd == 5120) return true;
+    constexpr bool v41_default = true;
+#else
+    constexpr bool v41_default = false;
 #endif
+    static const bool v41 = [] { const char* v = getenv("STRATA_GLM_HC3_V41"); return v == nullptr ? v41_default : std::atoi(v) != 0; }();
+    if (v41 && n_embd == 5120) return true;
     return n_embd == 4096;
 }
 

@@ -2980,6 +2980,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     static const bool lprof = getenv("STRATA_GLM_LANE_PROF") != nullptr;
     struct LProf {
         uint64_t n = 0, ne = 0, qx = 0, run = 0, sum = 0, wake = 0, busy = 0, thr = 0, hw = 0, gu_end = 0, tail = 0;
+        double bytes = 0;   // (each call's experts x its own layer's blob: layers of mixed types differ in size)
     };
     static thread_local LProf lp;
     static std::atomic<uint64_t> lp_call{0};
@@ -3186,6 +3187,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         const int64_t t3 = lp_now();
         ++lp.n;
         lp.ne += (uint64_t) ne;
+        lp.bytes += (double) ne * (double) Ly.blob;
         lp.qx += (uint64_t) (lp_t1 - lp_t0);
         lp.run += (uint64_t) (lp_t2 - lp_t1);
         lp.sum += (uint64_t) (t3 - lp_t2);
@@ -3203,7 +3205,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
                          dev_, (unsigned long long) lp.n, (double) lp.ne / n, lp.qx / n / 1e3, lp.run / n / 1e3,
                          lp.wake / n / 1e3, lp.thr / n, 100.0 * (double) lp.busy / std::max(1.0, (double) lp.run * (double) threads),
                          lp.hw / n / 1e3, lp.gu_end / n / 1e3, lp.tail / n / 1e3, lp.sum / n / 1e3,
-                         (double) lp.ne * (double) Ly.blob / std::max(1.0, (double) (lp.qx + lp.run + lp.sum)));
+                         lp.bytes / std::max(1.0, (double) (lp.qx + lp.run + lp.sum)));
             lp = LProf{};
         }
     }
