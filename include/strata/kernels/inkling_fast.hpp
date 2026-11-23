@@ -126,6 +126,7 @@ struct MixTok {
     int rows = 1;
     bool pre_rows = false;
     int64_t out_rs = 0;
+    int pre_s = -1;   // (set by mix_tok: the state that is pre_out, -1 none)
 };
 size_t mix_tok_floats();
 void mix_tok(const MixTok& a, int n_embd, cudaStream_t s);

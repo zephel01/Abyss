@@ -25,6 +25,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ### Changed
 
+- Inkling 2 Mini decode: the depth-attention mix (with the post convolution before it and the norms or controller
+  input norms after it) is one launch instead of two - the chunk blocks' sums, the softmax and the weighted sums,
+  then the norms in the last blocks, waiting for each other through a counter - with every sum added in the old
+  order, so the tokens are the same (md5 on 6 prompts with and without the verify window and DSpark). RTX 5090,
+  UD-Q4_K_XL, server, median of 3: prose 189.8 -> 195.0 tok/s, code 189.7 -> 195.1. `STRATA_INK_MIX1=0`: the two
+  launches. HIP keeps the two.
 - Windows only: the VRAM left free beside the expert pool is 2 GB on a CUDA card above 12.5 GB (was 1.5 GB) and 1.5
   GB on a smaller card, for Qwen3.8 (q4x) and for the dense path's `--vram-reserve-mib` default (was 700 MB), so a
   browser or the desktop taking VRAM after the load is less likely to push the NVIDIA driver into its Sysmem
