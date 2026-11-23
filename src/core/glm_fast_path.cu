@@ -8288,6 +8288,8 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
     if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
+    // (the glm5 layers' draft step - fast_mtp's DSA attention, the KDA state backups: not the qwen35 family's, #55)
+    if (g_.qwen35()) return false;
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;

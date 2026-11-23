@@ -48,6 +48,15 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Qwen-form tool calls: a string value that holds `</parameter></function></tool_call>` (a document about tool
   calls) is kept whole instead of being cut there with the rest sent as text. The close counts as the value's text
   when the call closes again before any new `<tool_call>`; a new call or the end of the answer makes it the call's.
+- qwen35moe (Ornith-1.5-122B, Ornith-1.5-35B-A3B and the other qwen35-family models; Qwen3.8's split has its own path)
+  split across GPUs (#55): every generation stopped at "qwen35moe: output_norm.weight". The head's tensors live on the
+  last part only, but every part looked them up after its layers. An earlier part now adds its last FFN to the
+  residual and hands it on, and the last part computes the head. The prompt path had the same gap without an error: an
+  earlier part handed on its rows without their last FFN, so the next part's caches were wrong. It now adds the FFN
+  before the hand-off. A qwen35moe split runs without drafts: the NextN block is not loaded there (nothing reads it -
+  the drafts' verify window is one part's, and the split's pipelined speculative decode is glm5's only). Two and three
+  parts on one RTX 5090 (`STRATA_GLM_SPLIT_SAME=1`): Ornith-1.5-35B-A3B and Ornith-1.5-122B give the unsplit
+  drafts-off run's tokens bit for bit. One-GPU runs give the same bits as v1.3.193 (7-config md5 check).
 
 ## v1.3.193 - 2026-11-23
 

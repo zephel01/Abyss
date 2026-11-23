@@ -6909,6 +6909,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
     }
     if (!tail_skip && g.q4x && l1_ < g.n_layers && kv_cut < 0) q4_mix(l1_ - 1, 0, S->ffn, S->post, nullptr, true);
+    // the other qwen35 family on a split's earlier part (#55): the rows' residual takes the last FFN here - the next
+    // part's first layer reads R as it is (one device adds it at the next layer's norm, the same float sum)
+    if (g.qwen35() && !g.q4x && !g.ink && l1_ < g.n_layers && kv_cut < 0)
+        strata::kernels::ink::add_rows(S->R, (int64_t) 4 * E, S->ffn, E, E, T, s);
     if (!tail_skip && !g.qwen35() && !g.is_hy4() && kv_cut < 0) {   // (hy4: each layer added its own; inkling is qwen35)
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
