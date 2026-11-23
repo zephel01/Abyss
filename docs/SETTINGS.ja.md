@@ -157,7 +157,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `sampling` | リクエストが指定しないときの既定値。`temperature`、`top_p`、`top_k`、`min_p`、`presence_penalty`、`repetition_penalty`、`frequency_penalty`、`penalty_last_n`、`seed`。リクエストに書いた値が優先 | `{"temperature": 1.0, "top_p": 0.95}` |
 | `reasoning_effort` | 思考の既定の深さ（`none`、`low`、`high`、`max`） | `"high"` |
 | `thinking_budget` | 思考の上限トークン数（既定 32768、0 で上限なし） | `16384` |
-| `env` | エンジンの細かい設定（環境変数）。一覧は [MANUAL: 設定項目](MANUAL.ja.md#設定項目) | `{"STRATA_GLM_RAM_GB": "60"}` |
+| `env` | エンジンの細かい設定（環境変数）。一覧は [MANUAL: 設定項目](MANUAL.ja.md#設定項目)。例は RAM 123 GB の機械で RAM 層を固定する値（66。94 GB の機械なら 60。設定しなければ空き RAM から決まる） | `{"STRATA_GLM_RAM_GB": "66"}` |
 | `uncensor` | 無検閲化のファイル（[UNCENSOR](UNCENSOR.ja.md)） | `".../dsv4.abl"` |
 
 **GPU**

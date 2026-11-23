@@ -158,7 +158,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | `sampling` | defaults for requests that leave them out: `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty`, `frequency_penalty`, `penalty_last_n`, `seed`. A request's own value wins | `{"temperature": 1.0, "top_p": 0.95}` |
 | `reasoning_effort` | the default thinking depth (`none`, `low`, `high`, `max`) | `"high"` |
 | `thinking_budget` | the most tokens a thinking block may take (default 32768; 0 = no cap) | `16384` |
-| `env` | fine engine settings (environment variables); the list is in [MANUAL: Settings](MANUAL.md#settings) | `{"STRATA_GLM_RAM_GB": "60"}` |
+| `env` | fine engine settings (environment variables); the list is in [MANUAL: Settings](MANUAL.md#settings). The example fixes the RAM tier for a 123 GB box (66; 60 on a 94 GB box; unset = sized from the free RAM) | `{"STRATA_GLM_RAM_GB": "66"}` |
 | `uncensor` | an uncensoring file ([UNCENSOR](UNCENSOR.md)) | `".../dsv4.abl"` |
 
 **GPUs**

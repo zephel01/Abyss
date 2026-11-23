@@ -762,6 +762,10 @@ measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model c
   Engram tables and the dense weights. On an RTX 5090 + 94 GB RAM ~57% of the experts are resident (VRAM ~2,300, a
   60 GB RAM tier ~6,500); the rest and every Engram row (48 a token, 264 bytes each) are read from the GGUF. Keep it
   on the fastest NVMe you have, and leave ~25 GB of RAM to the page cache (`STRATA_GLM_RAM_GB=60` on a 94 GB box).
+  60 is for a 94 GB box only: with more RAM give the tier more, or leave the variable unset (sized from the free RAM).
+  On a 123 GB box (RTX 5090, GLM-5.3-Flash Maya-S-v2 IQ2_XXS, ~80 GB of experts) 60 left experts on the SSD at long
+  contexts; 66 cut the SSD waits from 5-7 to 0.2-2 ms a token and decode went 37.8 -> 50.7 tok/s at 60K, 40.3 -> 49.5
+  at 125K and 33.3 -> 42.1 at 250K, with 44 GB or more of memory still available.
 - **Speed is the SSD's.** A token that reads no expert from the SSD takes 13-15 ms; each read adds ~3-4 ms at
   3.4 GB/s. With `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` (a route's 4th-6th experts left out when they
   are only on disk; KL 0.229 -> 0.240 against the unquantized model) decode is ~28 tok/s, 17.7 without; swe-bench

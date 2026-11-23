@@ -9,6 +9,15 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.196 - 2026-11-23
+
+Inkling 2 Mini is faster with the same tokens: the loop controllers as BF16 and the depth-attention mix in one launch
+together take decode 189.8 -> 197.6 tok/s (+4.1%) and the 16K prompt 8373 -> 9053 tok/s (+8.1%) on an RTX 5090
+(server, median of 3). GLM-5.3-Flash's 16K prompt +11.8% (plan tables through a host-mapped kernel), DeepSeek V4.1
+decode +2.2% (the SSD kept awake for the Engram rows). A config's `"gpu"` takes a card's UUID, and
+`abyss --list-gpus` lists the cards. A qwen35 layer split reuses the conversation again (#55). Other models give the
+same bits as v1.3.195 (7-config md5 check).
+
 ### Added
 
 - **GPUs by UUID.** A config's `"gpu"` (and the server's `--gpu`) also takes a card's UUID or a unique start of it
@@ -71,6 +80,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   mHC read as hc3 on CUDA. RTX 5090, V4.1 JA256, p4k + 512 tokens, n-gram drafts off: decode median 65.1 -> 67.9
   tok/s (+4%), but the KL on the 8 held-out sequences went up on 7 of 8 (mean 0.3815 -> 0.3839), so it stays opt-in.
   Documented in the manual.
+
+### Docs
+
+- MANUAL / SETTINGS no longer point bigger-RAM boxes to `STRATA_GLM_RAM_GB=60` (a 94 GB box's value). On a 123 GB
+  box (RTX 5090, GLM-5.3-Flash Maya-S-v2 IQ2_XXS) 60 left experts on the SSD at long contexts; 66 cut the SSD waits
+  from 5-7 to 0.2-2 ms a token: decode 37.8 -> 50.7 tok/s at 60K, 40.3 -> 49.5 at 125K, 33.3 -> 42.1 at 250K. No
+  default changed (unset, the tier is sized from the free RAM).
 
 ## v1.3.195 - 2026-11-23
 
