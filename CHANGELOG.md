@@ -9,6 +9,16 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- `STRATA_INK_FP4ACT=1` / `2` (opt-in, lossy; default `0` = the exact path, same bits): Inkling 2 Mini prompts on
+  CUDA sm_120 (RTX 50 series) multiply the NVFP4 experts with FP4 activations on the block-scaled FP4 tensor cores
+  (`mma.sync ... kind::mxf4nvf4`) - one FP4 term a value (`1`) or two (`2`: the first term's residual quantized the
+  same way, about 8 bits) - with gate/up, the experts' scales and the SwiGLU in one product. RTX 5090, UD-Q4_K_XL,
+  16K prompt: 9,075 -> 13,122 tok/s (`1`) / 11,798 (`2`). Prompt-path KL against the llama.cpp Q8_0 reference:
+  0.0056 exact, 0.0141 (`1`), 0.0059 (`2`; the Japanese segment 0.0059 -> 0.0077). HIP and other GPUs keep the exact
+  path.
+
 ### Fixed
 
 - A prompt chunk given by hand (`--prefill N` / `STRATA_GLM_PREFILL=N`) is held to 32768 tokens, the auto limit, with

@@ -5876,11 +5876,34 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // (inkling: its SITU in swiglu_rows - the split products, not the fused epilogue)
         const bool own_gu = own_gate_up(Ly, g) && !g.ink, own_dn = own_down(Ly, g),
                    own_split = own_gu_split(Ly, g) || (own_gate_up(Ly, g) && g.ink);
+        // STRATA_INK_FP4ACT=1 / 2 (opt-in, lossy; default 0 = the exact int8 path): inkling's NVFP4 experts with FP4
+        // activations, one term / two (x ~ q1 + q2, the residual's term), on sm_120a's block-scaled FP4 tensor cores
+        // (own::fp4_built: CUDA sm_120 only).  The row scales in Xs / Hs, the codes in Xq / Hq (their bytes fit).
+        const auto fp4_terms = [] {   // (read once, at the first inkling NVFP4 layer)
+          static const int on = [] {
+            const char* v = getenv("STRATA_INK_FP4ACT");
+            const int t = v != nullptr ? std::atoi(v) : 0;
+            if (t != 1 && t != 2) return 0;
+            if (!own::fp4_built()) {
+                std::fprintf(stderr, "glm prefill: STRATA_INK_FP4ACT=%d needs CUDA sm_120 with sm_120a code: the exact path\n", t);
+                return 0;
+            }
+            std::fprintf(stderr, "glm prefill: inkling's NVFP4 experts take FP4 activations (%d term%s, lossy - STRATA_INK_FP4ACT)\n",
+                         t, t == 2 ? "s" : "");
+            return t;
+          }();
+          return on;
+        };
+        const int fp4t = g.ink && nvl && own_split && own_dn && Ly.gu_type == 40 && Ly.up_type == 40 && Ly.d_type == 40 &&
+                                 own::fp4_usable(nff, E) && own::fp4_usable(E, nff) &&
+                                 own::fp4_act_bytes(W, E, 2) <= act_bytes(W, E) && own::fp4_act_bytes(W, nff, 2) <= act_bytes(W, nff)
+                             ? fp4_terms() : 0;
         static const char* own_dump = getenv("STRATA_PROMPT_OWN_DUMP");
         static const int own_dump_layer = getenv("STRATA_PROMPT_OWN_DUMP_LAYER") ? std::atoi(getenv("STRATA_PROMPT_OWN_DUMP_LAYER")) : -1;
         static bool own_dumped = false;
 #else
         const bool own_gu = false, own_dn = false, own_split = false;
+        const int fp4t = 0;
 #endif
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
@@ -5890,6 +5913,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const int dn_over = (int) glmfast::mmq_down_over(Ly.d_type, nff);   // (expert_stride leaves room for it)
         const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
+            // (FP4 activations: the set's matrices on 4 bytes - the kernels' loads; else this set stays exact)
+            const int f4 = fp4t > 0 && (((uintptr_t) wbase | stride | Ly.down_off | (size_t) mmq::matrix_bytes(Ly.gu_type, nff, E)) & 3) == 0 ? fp4t : 0;
             for (int i0 = 0; i0 < n_exp;) {
                 int i1 = i0 + 1;   // (one expert never has more rows than T <= W)
                 while (i1 < n_exp && hb[i1 + 1] - hb[i0] <= W) ++i1;
@@ -5939,7 +5964,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     os.host_bounds = hb + i0;
                     os.row0 = a;
                     os.rows = nrows;
-                    if (own_gu || own_split)
+                    if (f4 > 0) {
+                        own::Fp4Fold fold;   // (the experts' gate/up scales into the row scales: no nv_scale_rows)
+                        fold.ids = M.ids;
+                        fold.pos = M.pos;
+                        fold.k = K;
+                        fold.nv = Ly.nv_scale;
+                        fold.row_base = r0 + a;
+                        own::fp4_quantize(S->x, M.row_tok + r0 + a, M.Xq, M.Xs, E, E, nrows, f4, s, &fold);
+                    }
+                    else if (own_gu || own_split)
                         own::quantize(S->x, M.row_tok + r0 + a, M.Xq, E, E, nrows, s,
                                       own::needs_sums(Ly.gu_type) || own::needs_sums(Ly.up_type));
                     else
@@ -5980,13 +6014,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         os.xq = M.Xq;
                         os.ld = 2 * nff;
                         os.dst = GU;
-                        S->oq->down(os, Ly.gu_type, nff, E, 0, s);
-                        os.dst = GU + nff;
-                        S->oq->down(os, Ly.up_type, nff, E, Ly.mixed() ? Ly.gu_bytes : mmq::matrix_bytes(Ly.gu_type, nff, E), s);
-                        if (nvl)
+                        const size_t up_off = Ly.mixed() ? Ly.gu_bytes : mmq::matrix_bytes(Ly.gu_type, nff, E);
+                        if (f4 > 0) {   // (gate, up, their scales and the SwiGLU in one product: h in GU's first n_ff)
+                            if (!S->oq->fp4(os, M.Xs, f4, nff, E, 0, s, true, up_off, g.swiglu_exp)) {
+                                std::fprintf(stderr, "glm prefill: the FP4 experts' gate/up did not fit\n");
+                                std::exit(1);
+                            }
+                        } else {
+                            S->oq->down(os, Ly.gu_type, nff, E, 0, s);
+                            os.dst = GU + nff;
+                            S->oq->down(os, Ly.up_type, nff, E, up_off, s);
+                        }
+                        if (nvl && f4 == 0)
                             gb::nv_scale_rows(GU, M.ids, M.pos, T * K, r0 + a, r0 + a + nrows, 2 * nff, 2 * nff,
                                               Ly.nv_scale, s);
-                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+                        if (f4 == 0) gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
 #endif
                     } else if (glu) {
                         S->mq->run_glu(gu, g.swiglu_exp, s);   // (h in each row's first n_ff floats, as below)
@@ -6014,12 +6056,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     S->mark("x_gate_up", s);
 #if defined(STRATA_MOE_OWN)
                     if (own_dn) {
-                        own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s, own::needs_sums(Ly.d_type));
+                        if (f4 > 0)
+                            own::fp4_quantize(GU, nullptr, M.Hq, M.Hs, nff, 2 * nff, nrows, f4, s);
+                        else
+                            own::quantize(GU, nullptr, M.Hq, nff, 2 * nff, nrows, s, own::needs_sums(Ly.d_type));
                         S->mark("x_quant", s);
                         os.xq = M.Hq;
                         os.dst = M.OUTP + (size_t) o * E;
                         os.ld = E;
-                        S->oq->down(os, Ly.d_type, E, nff, Ly.down_off, s);
+                        if (f4 > 0) {
+                            if (!S->oq->fp4(os, M.Hs, f4, E, nff, Ly.down_off, s)) {
+                                std::fprintf(stderr, "glm prefill: the FP4 experts' down did not fit\n");
+                                std::exit(1);
+                            }
+                        } else
+                            S->oq->down(os, Ly.d_type, E, nff, Ly.down_off, s);
                         S->mark("x_down", s);
                         i0 = i1;
                         continue;
