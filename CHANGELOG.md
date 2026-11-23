@@ -9,6 +9,15 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.195 - 2026-11-23
+
+Setup turns on Inkling 2 Mini's DSpark drafter again when its file is on disk: with v1.3.194's verify window graph it
+wins on code, edits, Japanese answer text (181.1 -> 237.6 tok/s at 1,024 tokens on an RTX 5090) and after long
+prompts, and loses 1-3% only on English thinking and prose - the same tokens bit for bit. `--prefill 0` keeps every
+expert in VRAM when they fit (Inkling 182.4 -> 188.8 tok/s). Hardening from a review of Strata v0.2.20's fixes (prompt
+chunk cap, NVFP4 scale guard, CPU code kept to its instruction set, Windows VRAM margin). Other models give the same
+bits as v1.3.194 (7-config md5 check).
+
 ### Fixed
 
 - `--prefill 0` on a discrete card that holds every expert keeps them all in VRAM. The pool stopped at one slot per
