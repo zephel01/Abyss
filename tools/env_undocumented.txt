@@ -104,7 +104,6 @@ STRATA_GLM_NO_STAGE  # src/core/glm_model.cu
 STRATA_GLM_NSYS  # src/core/glm_fast_path.cu
 STRATA_GLM_NUMA  # src/core/glm_fast_path.cu
 STRATA_GLM_PIPE  # src/core/glm_model.cu
-STRATA_GLM_POOL_GB  # src/core/glm_fast_path.cu
 STRATA_GLM_POOL_SLOTS0  # src/core/glm_model.cu
 STRATA_GLM_POOL_STATS  # src/core/glm_model.cu
 STRATA_GLM_PREFETCH  # src/core/glm_model.cu

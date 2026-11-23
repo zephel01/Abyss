@@ -17,6 +17,7 @@
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
 #include "shard_io.hpp"
+#include "glm_pool_pin.hpp"
 #include "strata/core/knobs.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/core/glm_model.hpp"
@@ -1418,6 +1419,32 @@ bool Glm5Model::fast_setup(std::string& err) {
             avail = std::min(avail, room);
             avail_top = std::min(avail_top, room);
         }
+        // the budget kept per card + pack + config (glm_pool_pin.hpp): every start carves the same pool, whatever
+        // other processes hold today (a discrete card; STRATA_GLM_POOL_GB or STRATA_GLM_POOL_PIN=0 skip it)
+        std::string pin_key;
+        poolpin::Choice pin{};
+        const poolpin::Mode pin_mode = poolpin::mode();
+        if (!F->unified_memory && pin_mode != poolpin::Mode::Off && getenv("STRATA_GLM_POOL_GB") == nullptr &&
+            !pack_dir_.empty()) {
+            pin_key = poolpin::key(dev_, total_b, l0_, lt_, (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_));
+            pin = poolpin::decide(avail, poolpin::load_mib(poolpin::file_for(pack_dir_), pin_key) << 20,
+                                  pin_mode == poolpin::Mode::Reset);
+            const double G = 1073741824.0;
+            if (pin.why == poolpin::kSaved)
+                std::fprintf(stderr, "glm fast: CUDA%d expert pool budget %.2f GB kept from pool_pin.txt (%.2f GB free for "
+                                     "it now; STRATA_GLM_POOL_PIN=reset learns it again)\n",
+                             dev_, (double) pin.budget / G, (double) avail / G);
+            else if (pin.why == poolpin::kShort)
+                std::fprintf(stderr, "glm fast: CUDA%d the kept expert pool budget %.2f GB does not fit the %.2f GB free "
+                                     "now (another process holds VRAM?) - this start is sized from what is free; the kept one stays\n",
+                             dev_, (double) pin.saved / G, (double) avail / G);
+            else if (pin.why == poolpin::kGrew)
+                std::fprintf(stderr, "glm fast: CUDA%d %.2f GB free for the expert pool, %.2f GB above the kept budget - "
+                                     "sized from this start and kept\n",
+                             dev_, (double) avail / G, (double) (avail - pin.saved) / G);
+            avail = pin.budget;
+            avail_top = pin.budget;
+        }
         // a layer's slot stride: MMQ-addressable (glmfast::expert_stride), so the prompt path multiplies the pool
         // partition in place
         const auto slot_stride = [&](int il) {
@@ -1769,6 +1796,17 @@ bool Glm5Model::fast_setup(std::string& err) {
         { std::array<int, gf::kMaxK> none; none.fill(-1); F->pred_of.assign((size_t) NL, none); }
         std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
                      dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
+        // (the pool is carved: keep the budget it came from when it was sized from this start - never a refused one)
+        // (a kept budget that did not fit stays: a squeeze that passes - another engine, a game - must not shrink
+        // every later start's pool; a start inside the squeeze is sized from its own free VRAM and says so)
+        if (!pin_key.empty() && pin.why != poolpin::kSaved && pin.why != poolpin::kShort) {
+            char note[96];
+            std::snprintf(note, sizeof note, "%d-%d slots/layer", nmin, nmax);
+            const bool ok = poolpin::save_mib(poolpin::file_for(pack_dir_), pin_key, pin.budget >> 20, note);
+            std::fprintf(stderr, "glm fast: CUDA%d expert pool budget %.2f GB %s %s\n", dev_,
+                         (double) pin.budget / 1073741824.0, ok ? "kept in" : "could not be kept in (read-only?)",
+                         poolpin::file_for(pack_dir_).c_str());
+        }
         // qwen35moe / laguna with FP16 attention caches: the pool is short of the experts and --kv int8 would free at
         // least 1 GB and 10% of it - say so once (the default stays FP16)
         if (q35_kv8_b_ > 0 && q35_kv8_b_ < q35_kv_b_ && nmax < g.n_expert && F->pool_slots > 0 && !ekv_on()) {
