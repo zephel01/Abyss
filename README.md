@@ -258,10 +258,10 @@ in VRAM, no iGPU lane, Abyss v1.3.191-1.3.194. Every answer below is bit for bit
 
 | Decode (512 tokens, median of 3) | Without the drafter | DSpark drafter (`STRATA_INK_DSPARK`) |
 | --- | :---: | :---: |
-| Code / edits | 182-185 tok/s | **223-241 tok/s** |
-| 8K context, code / edits | 183 tok/s | **237-245 tok/s** |
-| Prose / Japanese | 183 tok/s | 178-180 tok/s (leave it off) |
-| After a 165K prompt (1,024 tokens) | 97 tok/s | **108-158 tok/s** |
+| Code / edits | 182-185 tok/s | **217-222 tok/s** |
+| 8K context, code / edits | 183 tok/s | **232-235 tok/s** |
+| Prose / Japanese | 182-183 tok/s | 180-183 tok/s (about even) |
+| After a 165K prompt (1,024 tokens) | 97-98 tok/s | **112-116 tok/s** |
 
 | Prompts | 4K | 8K | 32K | 165K | 255K |
 | --- | :---: | :---: | :---: | :---: | :---: |
@@ -275,7 +275,7 @@ in VRAM, no iGPU lane, Abyss v1.3.191-1.3.194. Every answer below is bit for bit
 | Japanese facts (40 questions x 3) | 593 of 666 facts (Q8_0 593) | UD-IQ3_XXS 589, UD-IQ2_XXS 552 |
 | KL against llama.cpp's Q8_0 | 0.0058 (Japanese 0.0066) | UD-IQ3_XXS 0.028, UD-IQ2_XXS 0.078 |
 
-The drafter wins where text repeats (code, edits, long contexts) and loses 1-3% on prose and Japanese, so it stays
+The drafter wins where text repeats (code, edits, long contexts) and is about even on prose and Japanese (up to 2% slower on Japanese), so it stays
 opt-in. For 8-12 GB GPUs, UD-IQ3_XXS (11.7 GB) keeps nearly the same Japanese quality; UD-IQ2_XXS loses clearly.
 
 </details>

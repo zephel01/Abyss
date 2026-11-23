@@ -9,6 +9,14 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.194 - 2026-11-23
+
+Inkling 2 Mini's verify window runs from CUDA graphs with fused kernels, so its opt-in DSpark drafter
+(`STRATA_INK_DSPARK`) now also wins after long prompts (165K: 97-98 -> 112-116 tok/s) and is about even on prose and
+Japanese, with code / edits at 217-235 tok/s on an RTX 5090 - the same tokens bit for bit. Fixes: Inkling 2's tokenizer
+(`ignore_merges`), `reasoning_effort: "minimal"` and XML-form tool calls; Qwen-form tool-call values holding closing
+tags; qwen35moe (Ornith) split across GPUs (#55). Other models give the same bits as v1.3.193 (7-config md5 check).
+
 ### Changed
 
 - Inkling 2 Mini's verify window (`STRATA_INK_DRAFT` / `STRATA_INK_DSPARK`) runs from one CUDA graph a width and
