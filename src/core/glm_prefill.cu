@@ -1799,7 +1799,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     return true;
 }
 
-size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
+// (a region of its own - prefill_setup_own, Inkling's --parallel lanes - borrows nothing: the pool keeps no tail for it)
+size_t Glm5Model::prefill_borrow_bytes() const { return pf_ != nullptr && !pf_->own ? pf_->borrow_bytes : 0; }
 
 // the dense qwen35's prompt scratch q35d_place may lend between prompts: the own region and the MMQ buffers up to
 // their iota (which stays)
@@ -1904,6 +1905,11 @@ size_t Glm5Model::prefill_trim_prestage(size_t max_borrow) {
 bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
     PrefillState* S = pf_;
     if (S == nullptr) return true;
+    // a region of its own stays the prompt's: the pool's setup (and vision_reclaim) bind the tail they lay out, and
+    // with Inkling's --parallel lanes that bound the prompt's buffers over the tail's experts with no lend_tail - on a
+    // pool that cuts the tail from the experts' slots (an RTX 3090, 24 GB) each prompt wrote over experts the decode
+    // still read, and the answers changed from start to start (the 5090's tail sat on top, empty)
+    if (S->own && S->region != nullptr) return true;
     if (bytes < S->borrow_bytes) {
         err = "glm prefill: the lendable tail (" + std::to_string(bytes >> 20) + " MB) is smaller than the prompt path (" +
               std::to_string(S->borrow_bytes >> 20) + " MB)";
