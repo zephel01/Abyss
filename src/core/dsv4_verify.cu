@@ -1941,18 +1941,21 @@ bool Glm5Model::verify_part_ink(const std::vector<int32_t>& toks, int64_t p0, st
     io.head_x = V->head_x;
     io.head_xq = V->head_xq;
     if (F->prof_on) F->mark("v_start");
+    io.tail = [&](std::string& e2) -> bool {   // (inside the window's graph when it has one)
+        const WSlot& ow = ws_map_.at("output.weight");
+        gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) g.n_embd, g.n_vocab};
+        if (ow.type == 0) o.w = ow.f32;
+        if (!glm_mvn(&o, 1, T, s)) { e2 = "inkling verify: output head"; return false; }
+        strata::kernels::ink::softcap(V->logits, (int64_t) T * g.n_vocab, g.ink_softcap, s);
+        if (F->zero_copy) {
+            for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
+        } else {
+            for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
+            cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
+        }
+        return true;
+    };
     if (!ink_window(toks, p0, io, err)) return false;
-    const WSlot& ow = ws_map_.at("output.weight");
-    gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) g.n_embd, g.n_vocab};
-    if (ow.type == 0) o.w = ow.f32;
-    if (!glm_mvn(&o, 1, T, s)) { err = "inkling verify: output head"; return false; }
-    strata::kernels::ink::softcap(V->logits, (int64_t) T * g.n_vocab, g.ink_softcap, s);
-    if (F->zero_copy) {
-        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
-    } else {
-        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
-        cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
-    }
     if (F->prof_on) F->mark("v_head");
     cudaEventRecord(V->done, s);
     return true;

@@ -32,7 +32,10 @@ void rms_rows(const float* x, int64_t xs, const float* gamma, float eps, int n, 
 
 /// The depth attention: the states normalised (rms, eps 1e-6, no gamma), each query's softmax over them of
 /// q . state / sqrt(n_embd), the weighted sum of the NORMALISED states.  query [nq][n_embd]; out [T][nq][n_embd]
-void mix(const States& st, const float* query, int nq, int n_embd, int T, float* out, cudaStream_t s);
+void mix(const States& st, const float* query, int nq, int n_embd, int T, float* out, cudaStream_t s,
+         float* part = nullptr);   // part: mix_part_floats(T, n_embd) of the caller's scratch (null: a shared one, grown
+                                   // on demand - not for a captured graph, whose address must stay)
+size_t mix_part_floats(int T, int n_embd);
 
 /// The loop controller's input: cat[t] = [rms(cur[t]) | rms(msg[t])] (2 n_embd, eps 1e-6, no gamma).  cur row t at
 /// cur + t cs, msg row t at msg + t ms; cat [T][2 n_embd]
@@ -116,7 +119,13 @@ struct MixTok {
     int64_t cat_cs = 0;
     const float* msg = nullptr;
     float* cat = nullptr;
-    float* part = nullptr;   // mix_tok_floats() of scratch (the chunks' partials)
+    float* part = nullptr;   // mix_tok_floats() of scratch (the chunks' partials; rows > 1: mix_part_floats(rows, ..))
+    // the verify window's (rows > 1, up to 8, no controllers): row t of the states at st.p[s] + t st.stride, of out at
+    // out + t out_rs, of x[j] / xq[j] n_embd apart; the pre step conv_win's (the state read, left: row t from pre_in's
+    // rows 0 .. t), then add_rows' add (pre_add) or into pre_out; pre_rows: that kind with one row
+    int rows = 1;
+    bool pre_rows = false;
+    int64_t out_rs = 0;
 };
 size_t mix_tok_floats();
 void mix_tok(const MixTok& a, int n_embd, cudaStream_t s);
@@ -143,10 +152,13 @@ void attn_tok(const float* q, const float* r, const float* sink, const float* re
               float scale, float* part, int max_splits, const float* gate, float* out, void* outq, cudaStream_t s);
 /// The split count attn gives a row at position p (a graph's key)
 int attn_splits(int64_t p, int window, int max_splits);
+/// The split grid attn(rows) launches for a window whose last row is at p_last: the last row's count rounded up to a
+/// power of two, 8 at the least (each row still its own count - a captured window's graph key)
+int attn_rows_grid(int64_t p_last, int window, int max_splits);
 /// *d = p (a captured graph's position word, set before its launch)
 void set_pos(int64_t* d, int64_t p, cudaStream_t s);
 
-/// The verify window's post_proj over T rows at positions a.p ..: k / v convolved from kraw / vraw (rows KV apart)
+/// The verify window's post_proj over T rows at positions a.p .. (a.pd non-null: from that device word): k / v convolved from kraw / vraw (rows KV apart)
 /// into a.kf / a.vf with the state read but left (conv_win's), the clips and the cache rows of every row - each row
 /// post_proj's arithmetic
 void post_proj_rows(const PostProj& a, const float* kraw, const float* vraw, int T, cudaStream_t s);
@@ -178,7 +190,8 @@ size_t attn_part_floats(int T, int n_head, int max_splits);
 void attn(const float* q, int64_t qs, const float* r, int64_t rs, const float* sink, int64_t ss, const float* rel_bias,
           int extent, const uint16_t* kc, const uint16_t* vc, int ring, int n_head, int n_head_kv, int64_t p0, int T,
           int window, float scale, float* part, int max_splits, float* out, int64_t os, cudaStream_t s,
-          bool rows = false);   // rows: each row the split count the token path gives its position (the verify window)
+          bool rows = false,    // rows: each row the split count the token path gives its position (the verify window)
+          const int64_t* p0d = nullptr);   // (rows: non-null, p0 read from this device word - p0 still gives the grid)
 
 /// attn for a prompt's rows (T of them at once) on tensor cores: the same math, S = q K^T and P V in FP16 with F32
 /// accumulation (P rounded to FP16), the bias as FP16 pairs (about F32).  False (nothing launched): the caller runs attn - AMD, a GPU

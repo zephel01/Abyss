@@ -752,10 +752,19 @@ public:
         const float* emb = nullptr;
         float *x = nullptr, *ffn = nullptr, *head_x = nullptr;
         void *xq = nullptr, *head_xq = nullptr;
+        std::function<bool(std::string&)> tail;   // (the head's launches after the layers: in the window's graph too)
     };
     static bool ink_draft_env();   // STRATA_INK_DRAFT (default 0)
     bool ink_window(const std::vector<int32_t>& toks, int64_t p0, const InkWinIo& io, std::string& err);
     void ink_win_commit(int64_t pos);   // (no window pending: nothing)
+    // a CUDA graph was captured since the last call (inkling's token / window graphs): the step's time is not the
+    // step's cost - the callers' cost tables leave it out
+    bool graph_captured() {
+        const bool c = graph_cap_;
+        graph_cap_ = false;
+        return c;
+    }
+    bool graph_cap_ = false;
     int64_t ink_win_p0_ = -1;           // the pending window's first position and width
     int ink_win_T_ = 0;
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
@@ -823,7 +832,7 @@ public:
     void inkd_settle(int64_t pos = -1);   // (the kept columns: up to pos, default pos_)
     void inkd_window(int64_t p0, int T);
     uint64_t inkd_acc_gen() const;   // (the taps' accumulators' generation: the token graphs hold their address)
-    void inkd_tok_taps();            // (a replayed token graph: the taps' row counts its capture set)
+    void inkd_tok_taps(int n = 1);   // (a replayed token / window graph of n rows: the taps' row counts its capture set)
     bool inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     bool ink_dspark_on() const { return inkd_ != nullptr; }
     int inkd_max() const;   // (drafts a step at most: 7, STRATA_INK_DSPARK_N)

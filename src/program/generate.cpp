@@ -2782,6 +2782,13 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_INK_DSPARK_GATE");
                 return v == nullptr || std::atoi(v) != 0;
             }();
+            // STRATA_INK_DSPARK_GATE_EARLY=<n> (default 4; 0 off): a measure that after n drafted steps is below 0.85 of
+            // the single token's rate ends there as a loss - prose / Japanese steps that keep no draft lose clearly,
+            // and 16 of them a measure cost ~3% of a 512-token answer
+            static const int ink_early = [] {
+                const char* v = std::getenv("STRATA_INK_DSPARK_GATE_EARLY");
+                return v == nullptr ? 4 : std::max(0, std::atoi(v));
+            }();
             const bool ink_gate = ink_dsp && ink_gate_env;
             int ink_skip = 0, ink_back = 0, ink_n = 0, ink_skips = 0;
             double ink_tok = 0.0, ink_ms = 0.0;
@@ -2789,8 +2796,15 @@ static int glm_pack_generate(const Options& o) {
                 if (!ink_gate) return;
                 ink_tok += toks;
                 ink_ms += ms;
-                if (++ink_n < 16 || cw_n[1] == 0 || cw[1] <= 0.0) return;
-                if (ink_tok / ink_ms < 1.0 / cw[1]) {   // (drafting lost: off for a while, longer each time)
+                ++ink_n;
+                if (cw_n[1] == 0 || cw[1] <= 0.0) return;
+                const bool early = ink_early > 0 && ink_n >= ink_early && ink_n < 16 && ink_tok / ink_ms < 0.85 / cw[1];
+                if (ink_n < 16 && !early) return;
+                static const bool ink_glog = std::getenv("STRATA_INK_DSPARK_GATE_LOG") != nullptr;   // (a measure's end)
+                if (ink_glog)
+                    std::fprintf(stderr, "ink gate: pos %lld: %d steps %.2f tok/ms vs %.2f%s\n", (long long) model.position(),
+                                 ink_n, ink_tok / ink_ms, 1.0 / cw[1], early ? " (early)" : "");
+                if (early || ink_tok / ink_ms < 1.0 / cw[1]) {   // (drafting lost: off for a while, longer each time)
                     ink_skip = 32 << ink_back;
                     ink_back = std::min(ink_back + 1, 4);
                     ++ink_skips;
@@ -3073,12 +3087,13 @@ static int glm_pack_generate(const Options& o) {
                     ng_learn();
                     cal_learn();
                     dfl_learn();
-                    if (d_timed) cw_add(1, m1);
+                    const bool capd = model.graph_captured();   // (a step that captured a graph: not its cost)
+                    if (d_timed && !capd) cw_add(1, m1);
                     // (a drafter's step that kept no draft: one token; with both drafters every step counts - the two
                     // rates are compared, not set against the window table)
                     if ((copy || dfl_both) && use != 0 && (d_timed || dfl_both))   // (rate_add: the timed ones)
                         rate_add(1.0, std::max(1e-3, ms_since(td)));
-                    if (use != 0) ink_gate_add(1.0, std::max(1e-3, ms_since(td)));
+                    if (use != 0 && !capd) ink_gate_add(1.0, std::max(1e-3, ms_since(td)));
                     continue;
                 }
                 win.assign(1, (int32_t) tok);
@@ -3143,9 +3158,10 @@ static int glm_pack_generate(const Options& o) {
                 const double mw = ms_since(tw);
                 if ((copy || dfl_both) && !rep && use != 0 && (d_timed || dfl_both))   // (its tokens over its drafting + window time)
                     rate_add((double) came.size(), std::max(1e-3, ms_since(td)));
-                if (!rep && use != 0) ink_gate_add((double) came.size(), std::max(1e-3, ms_since(td)));
+                const bool capd = model.graph_captured();   // (a window that captured its graph: not its cost)
+                if (!rep && use != 0 && !capd) ink_gate_add((double) came.size(), std::max(1e-3, ms_since(td)));
                 ms_win += mw;
-                if (d_timed) cw_add(k + 1, mw);
+                if (d_timed && !capd) cw_add(k + 1, mw);
                 // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
                 static const int d_log = [] {
                     const char* v = std::getenv("STRATA_DS4_DSPARK_LOG");

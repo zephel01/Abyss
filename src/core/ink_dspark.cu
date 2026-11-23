@@ -921,12 +921,12 @@ uint64_t Glm5Model::inkd_acc_gen() const {
     return D == nullptr ? 0 : D->acc_gen;
 }
 
-void Glm5Model::inkd_tok_taps() {   // (a replayed token graph: its taps' bookkeeping, as ink_tap's first sets it)
+void Glm5Model::inkd_tok_taps(int n) {   // (a replayed token / window graph: its taps' bookkeeping, as ink_tap's first sets it)
     auto* D = (IkState*) inkd_;
     if (D == nullptr) return;
-    D->tap_n = 1;
-    D->tap_ng = std::min(1, D->rows_g);
-    D->tap_nl = 1;
+    D->tap_n = n;
+    D->tap_ng = std::min(n, D->rows_g);
+    D->tap_nl = std::min(n, kTail);
     D->tap_prompt = false;
 }
 

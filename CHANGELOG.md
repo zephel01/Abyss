@@ -9,6 +9,23 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Changed
+
+- Inkling 2 Mini's verify window (`STRATA_INK_DRAFT` / `STRATA_INK_DSPARK`) runs from one CUDA graph a width and
+  attention split grid (`STRATA_INK_WIN_GRAPH`, default on), its head and argmax inside the graph; a key is captured
+  after its 6th window and the split grid is rounded up to a power of two (8 at the least), so a long answer needs a
+  few graphs. The window's small kernels are fused as the token path's (`STRATA_INK_FUSE`): a mix and its norms in two
+  launches, the post conv and the FFN's add folded into the next mix; its attention rows of one split lie together
+  (L2 reuse at long contexts), its KV-head post-projection a block of threads, and its launches use PDL. Same kernels'
+  arithmetic, the same tokens bit for bit (off / lookup / dspark md5s equal, and equal to v1.3.193's). A 2-column
+  window 9.2 -> 7.9 ms (RTX 5090, prose). With the drafter (RTX 5090, UD-Q4_K_XL, median of 3, 512 tokens): code
+  223.4 tok/s, edit 241.2, 8K code 236.8, 8K edit 244.5 (without it 182-185); 1,024 tokens after a 165K prompt prose
+  97.4 -> 108.7 and code 97.2 -> 117-158, which were 98.0 -> 93.0 in v1.3.193. Prose 183.0 -> 180.4 and Japanese
+  182.8 -> 177.8 still lose a little, so the drafter stays opt-in.
+- The DSpark gate (`STRATA_INK_DSPARK_GATE`) ends a measure early as a loss when its first 4 drafted steps run below
+  0.85 of the single token's rate (`STRATA_INK_DSPARK_GATE_EARLY`), and steps that captured a CUDA graph are left out
+  of the cost tables and the gate. `STRATA_INK_DSPARK_GATE_LOG=1` prints each measure.
+
 ## v1.3.193 - 2026-11-23
 
 The dense tier (`STRATA_GLM_PREFILL_DENSE_TIER=1`, #53) now works on packs made with `tools/dense_overlay.py`,

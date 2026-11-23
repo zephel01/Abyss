@@ -94,6 +94,7 @@ struct Ink {
         float *qf = nullptr, *gl = nullptr, *kf = nullptr, *vf = nullptr, *rf = nullptr, *sk = nullptr, *kd = nullptr,
               *vd = nullptr, *ao = nullptr, *tmp = nullptr, *part = nullptr;
         void* aoq = nullptr;
+        float* mixp = nullptr;       // (mix's partials: the window's own - a graph keeps the address)
         float* save = nullptr;       // [slot][...]
         size_t slot_floats = 0;
         float** states_d = nullptr;  // the slots' conv states (device pointers)
@@ -112,6 +113,17 @@ struct Ink {
     };
     std::map<std::tuple<int, int, unsigned long long, int, float>, TokGraph> graphs;
     uint64_t graph_caps = 0, graph_runs = 0;
+    // the verify window in one CUDA graph too (STRATA_INK_WIN_GRAPH): a graph per (width, the last column's full /
+    // window layers' attention splits, the CPU-lane plan, the tail skip, the routes' by-value settings); the first
+    // position from pos_d.  bad: its capture failed - that key's windows stay launches
+    struct WinGraph {
+        CapturedGraph g;
+        uint64_t requests = 0;
+        bool bad = false;
+        int seen = 0;   // (windows of this key launched before its capture)
+    };
+    std::map<std::tuple<int, int, int, unsigned long long, int, float, uint64_t>, WinGraph> wgraphs;
+    uint64_t wgraph_caps = 0, wgraph_runs = 0, wgraph_eager = 0, wgraph_bad = 0;
     uint64_t graph_inkd = 0;   // (the DSpark taps' accumulators' generation the graphs were captured with)
     void* base = nullptr;
     size_t bytes = 0;
@@ -354,7 +366,12 @@ void Glm5Model::ink_free() {
     if (!fast_->ink->graphs.empty() || fast_->ink->graph_caps > 0)
         std::fprintf(stderr, "inkling: CUDA%d token graphs: %llu captured, %llu runs\n", dev_,
                      (unsigned long long) fast_->ink->graph_caps, (unsigned long long) fast_->ink->graph_runs);
+    if (fast_->ink->wgraph_caps + fast_->ink->wgraph_eager > 0)
+        std::fprintf(stderr, "inkling: CUDA%d window graphs: %llu captured (%llu refused), %llu runs, %llu windows launched\n",
+                     dev_, (unsigned long long) fast_->ink->wgraph_caps, (unsigned long long) fast_->ink->wgraph_bad,
+                     (unsigned long long) fast_->ink->wgraph_runs, (unsigned long long) fast_->ink->wgraph_eager);
     fast_->ink->graphs.clear();   // (before the buffers they read)
+    fast_->ink->wgraphs.clear();
     if (fast_->ink->ev_fork != nullptr) cudaEventDestroy(fast_->ink->ev_fork);
     if (fast_->ink->ev_join != nullptr) cudaEventDestroy(fast_->ink->ev_join);
     if (fast_->ink->side != nullptr) cudaStreamDestroy(fast_->ink->side);
@@ -791,6 +808,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
                                          F->cpu_plan, fast_skip_from(0), fast_skip_w(0));
         if (inkd_acc_gen() != K.graph_inkd) {   // (the drafter's tap buffers moved: the graphs write the old ones)
             K.graphs.clear();
+            K.wgraphs.clear();
             K.graph_inkd = inkd_acc_gen();
         }
         auto it = K.graphs.find(key);
@@ -821,6 +839,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             F->expected = e0;
             it = K.graphs.emplace(key, std::move(tg)).first;
             ++K.graph_caps;
+            graph_cap_ = true;
         }
         if (!it->second.g.launch(s, err)) return false;
         inkd_tok_taps();   // (the taps inside the graph: their rows' bookkeeping on the host)
@@ -883,7 +902,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         add((size_t) TM * H * ik::kRel * 4); add((size_t) TM * H * 4); add((size_t) TM * Hkv * ik::kConv * 4);
         add((size_t) TM * Hkv * ik::kConv * 4); add((size_t) TM * HD * 4); add((size_t) TM * E * 4);
         add(ik::attn_part_floats(TM, H, ik::kMaxSplits) * 4); add((size_t) TM * q8h);
-        add((size_t) NS * slot_floats * 4); add((size_t) NS * sizeof(float*));
+        add((size_t) NS * slot_floats * 4); add((size_t) NS * sizeof(float*)); add(ik::mix_part_floats(TM, E) * 4);
         if (R > 256) { delete W; err = "inkling verify: the controllers' rank"; return false; }
         if (cudaMalloc(&W->base, bytes) != cudaSuccess) {
             cudaGetLastError();
@@ -921,6 +940,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         W->save = (float*) take((size_t) NS * slot_floats * 4);
         W->slot_floats = slot_floats;
         W->states_d = (float**) take((size_t) NS * sizeof(float*));
+        W->mixp = (float*) take(ik::mix_part_floats(TM, E) * 4);
         std::vector<float*> st((size_t) NS);
         for (int sl = 0; sl < NS; ++sl) st[(size_t) sl] = K.S[(size_t) sl].conv;
         cudaMemcpy(W->states_d, st.data(), st.size() * sizeof(float*), cudaMemcpyHostToDevice);
@@ -937,191 +957,398 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
         const size_t off = part == 0 ? 0 : part == 1 ? (size_t) KV : part == 2 ? (size_t) 2 * KV : (size_t) 2 * KV + E;
         return W.save + (size_t) sl * W.slot_floats + (size_t) TM * off;
     };
-    int nb = 0;
-    const auto fresh = [&]() -> float* { return W.hb[nb++ % Ink::kBufs]; };
-    float* h = fresh();
-    ik::rms_rows(io.emb, E, K.tok_norm, g.norm_eps, E, T, h, E, s);
-    int visit = 0;   // (the drafter's taps, as the token path's)
-    Blocks blocks;
-    const auto states = [&](const Blocks& b, const float* cur) {
-        ik::States st;
-        for (int i = 0; i < b.n; ++i) st.p[i] = b.p[i];
-        st.p[b.n] = cur;
-        st.n = b.n + 1;
-        st.stride = E;
-        return st;
-    };
-    // the controllers c0 .. c0 + n - 1 of physical layer il on T columns: controller c's current rows at cur[c]
-    // (rows cs apart), its message rows at msg + c E (rows ms apart), out[c] [T][E] - the token path's control(): its
-    // mv() calls' jobs (n downs, then 2n gains / forgets) with the columns through glm_mvn
-    const auto control = [&](int il, int c0, int n, const float* const* cur, int64_t cs, const float* msg, int64_t ms,
-                             float* const* out) -> bool {
-        const auto& Ly = K.L[(size_t) il];
-        ik::CtrlRows cr;
-        for (int c = 0; c < n; ++c) {
-            cr.cur[c] = cur[c];
-            cr.out[c] = out[c];
-        }
-        cr.cs = cs;
-        cr.msg = msg;
-        cr.ms = ms;
-        cr.cat = W.cat;
-        cr.cat_c = (int64_t) TM * 2 * E;
-        cr.g = W.cg;
-        cr.f = W.cf;
-        cr.gf_c = (int64_t) TM * E;
-        ik::ctrl_cat_n(cr, n, E, T, s);
-        gf::MvJob j[8];
-        for (int c = 0; c < n; ++c)
-            j[c] = {Ly.down[c0 + c], nullptr, W.cat + (size_t) c * TM * 2 * E, W.lo + (size_t) c * TM * R, nullptr, 1.0f,
-                    gf::kTypeF32, 2 * E, R};
-        if (!glm_mvn(j, n, T, s)) { err = "inkling verify: a controller's down"; return false; }
-        for (int c = 0; c < n; ++c) {
-            j[2 * c] = {Ly.gain[c0 + c], nullptr, W.lo + (size_t) c * TM * R, W.cg + (size_t) c * TM * E, nullptr, 1.0f,
-                        gf::kTypeF32, R, E};
-            j[2 * c + 1] = {Ly.forget[c0 + c], nullptr, W.lo + (size_t) c * TM * R, W.cf + (size_t) c * TM * E, nullptr,
-                            1.0f, gf::kTypeF32, R, E};
-        }
-        if (!glm_mvn(j, 2 * n, T, s)) { err = "inkling verify: a controller's gain / forget"; return false; }
-        ik::ctrl_apply_n(cr, n, E, T, s);
-        return true;
-    };
-    const auto layer = [&](int il, int ip, int sl, const float* msgs) -> bool {
-        const auto& Ly = K.L[(size_t) il];
-        auto& S = K.S[(size_t) sl];
-        const bool swa = Ly.swa;
-        if (inkd_ != nullptr) ink_tap(visit, h, E, T, nullptr, false, s);
-        ++visit;
-        // ---- the attention's inputs: in[j] rows ins apart
-        const float* in[3] = {h, h, h};
-        int64_t ins = E;
-        if (Ly.attn_rq != nullptr) {
-            const int nq = swa ? 1 : 3;
-            ik::mix(states(blocks, h), Ly.attn_rq, nq, E, T, W.mixo, s);
-            for (int j = 0; j < 3; ++j) in[j] = W.mixo + (size_t) (swa ? 0 : j) * E;
-            ins = (int64_t) nq * E;
-        }
-        if (msgs != nullptr) {
-            float* const outs[3] = {W.cin[0], W.cin[1], W.cin[2]};
-            if (!control(il, 0, 3, in, ins, msgs, 4 * (int64_t) E, outs)) return false;
-            for (int j = 0; j < 3; ++j) in[j] = W.cin[j];
-            ins = E;
-        }
-        const int nx = swa && msgs == nullptr ? 1 : 3;
-        {
-            const float* gm[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
-            for (int j = 0; j < nx; ++j)
-                gf::rms_q8_rows(const_cast<float*>(in[j]), ins, nullptr, 0, gm[j], g.norm_eps, E, W.xn[j], E, W.xq[j],
-                                E / 32, T, s);
-        }
-        const int i1 = nx == 1 ? 0 : 1, i2 = nx == 1 ? 0 : 2;
-        // ---- the projections (k / v straight into the slot's window inputs)
-        float* kraw = slot_save(sl, 0);
-        float* vraw = slot_save(sl, 1);
-        gf::MvJob j[8];
-        int nj = 0;
-        j[nj++] = {Ly.q.q, W.xq[0], W.xn[0], W.qf, nullptr, 1.0f, Ly.q.type, E, HD};
-        j[nj++] = {Ly.gate.q, W.xq[0], W.xn[0], W.gl, nullptr, 1.0f, Ly.gate.type, E, HD};
-        j[nj++] = {Ly.rel.q, W.xq[0], W.xn[0], W.rf, nullptr, 1.0f, Ly.rel.type, E, H * ik::kRel};
-        j[nj++] = {Ly.sink.q, W.xq[0], W.xn[0], W.sk, nullptr, 1.0f, Ly.sink.type, E, H};
-        j[nj++] = {Ly.k.q, W.xq[i1], W.xn[i1], kraw, nullptr, 1.0f, Ly.k.type, E, KV};
-        j[nj++] = {Ly.v.q, W.xq[i2], W.xn[i2], vraw, nullptr, 1.0f, Ly.v.type, E, KV};
-        if (!swa) {
-            j[nj++] = {Ly.kcp.q, W.xq[i1], W.xn[i1], W.kd, nullptr, 1.0f, Ly.kcp.type, E, ik::kConv * Hkv};
-            j[nj++] = {Ly.vcp.q, W.xq[i2], W.xn[i2], W.vd, nullptr, 1.0f, Ly.vcp.type, E, ik::kConv * Hkv};
-        }
-        if (!glm_mvn(j, nj, T, s)) { err = "inkling verify: the attention projections"; return false; }
-        // ---- conv (the state read, left), clips, the caches' rows p0 .. p0 + T - 1
-        float* conv = S.conv;
-        const float lf = swa ? 0.0f : g.ink_log_floor;
-        if (win_fuse) {   // (one launch, the same functions as the six below)
-            ik::PostProj pp{W.qf, W.kf, W.vf, W.rf, conv, swa ? nullptr : W.kd, swa ? nullptr : W.vd, Ly.k_conv, Ly.v_conv,
-                            Ly.q_clip, Ly.rel_clip, (int64_t) ik::kConv * Hkv, KV, HD, H, Hkv, S.ring, p0, g.ink_qk_clip,
-                            g.ink_rel_clip, lf, g.ink_log_alpha, g.norm_eps, S.kc, S.vc};
-            ik::post_proj_rows(pp, kraw, vraw, T, s);
-        } else {
-            ik::conv_win(kraw, KV, Ly.k_conv, swa ? nullptr : W.kd, ik::kConv * Hkv, D, conv, KV, T, W.kf, KV, s);
-            ik::conv_win(vraw, KV, Ly.v_conv, swa ? nullptr : W.vd, ik::kConv * Hkv, D, conv + (size_t) KV * 3, KV, T, W.vf,
-                         KV, s);
-            ik::clip_heads(W.qf, HD, Ly.q_clip, D, H, g.ink_qk_clip, p0, lf, g.ink_log_alpha, T, s);
-            ik::clip_heads(W.kf, KV, nullptr, D, Hkv, g.ink_qk_clip, p0, 0.0f, 0.0f, T, s);
-            ik::clip_heads(W.rf, H * ik::kRel, Ly.rel_clip, ik::kRel, H, g.ink_rel_clip, p0, lf, g.ink_log_alpha, T, s);
-            ik::kv_store(W.kf, KV, W.vf, KV, g.norm_eps, Hkv, p0, T, S.ring, S.kc, S.vc, s);
-        }
-        // ---- attention (a row's keys up to its own position, its own split count), gate, output, post conv
-        ik::attn(W.qf, HD, W.rf, H * ik::kRel, W.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring, H,
-                 Hkv, p0, T, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), W.part, ik::kMaxSplits, W.ao, HD, s, true);
-        ik::gate_sigmoid(W.ao, HD, W.gl, HD, HD, T, s);
-        gf::quantize_q8_1(W.ao, W.aoq, T * HD, s);
-        float* praw = slot_save(sl, 2);
-        gf::MvJob o = {Ly.o.q, W.aoq, W.ao, praw, nullptr, 1.0f, Ly.o.type, HD, E};
-        if (!glm_mvn(&o, 1, T, s)) { err = "inkling verify: attn_output"; return false; }
-        const bool starts = ip % g.ink_block == 0;
-        float* conv_post = conv + (size_t) 2 * KV * 3;
-        if (starts) {
-            if (blocks.n + 1 >= ik::kMaxStates) { err = "inkling verify: too many residual blocks"; return false; }
-            blocks.p[blocks.n++] = h;
-            h = fresh();
-            ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, h, E, s);
-        } else {
-            ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, W.tmp, E, s);
-            ik::add_rows(h, E, W.tmp, E, E, T, s);
-        }
-        // ---- the FFN
-        ik::mix(states(blocks, h), Ly.ffn_rq, 1, E, T, W.mixo, s);
-        const float* fin = W.mixo;
-        if (msgs != nullptr) {
-            const float* cur[1] = {fin};
-            float* const outs[1] = {W.cin[0]};
-            if (!control(il, 3, 1, cur, E, msgs + (size_t) 3 * E, 4 * (int64_t) E, outs)) return false;
-            fin = W.cin[0];
-        }
-        gf::rms_q8_rows(const_cast<float*>(fin), E, nullptr, 0, Ly.ffn_norm, g.norm_eps, E, io.x, E, io.xq, E / 32, T, s);
-        if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
-        float* fraw = slot_save(sl, 3);
-        cudaMemcpyAsync(fraw, io.ffn, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
-        ik::conv_win(fraw, E, Ly.ffn_conv, nullptr, 0, E, conv + (size_t) (2 * KV + E) * 3, E, T, W.tmp, E, s);
-        ik::add_rows(h, E, W.tmp, E, E, T, s);
-        return true;
-    };
-    const int lo = g.ink_passes > 1 ? g.ink_lo : g.n_layers, hi = g.ink_passes > 1 ? g.ink_hi : g.n_layers;
-    for (int il = 0; il < lo; ++il)
-        if (!layer(il, il, il, nullptr)) return false;
-    if (lo < hi) {
-        float* prelude = h;
-        const Blocks prelude_blocks = blocks;
-        const float* bank_blocks[ik::kMaxStates];
-        int bank_n = 0;
-        const float* bank_out = nullptr;
-        for (int pass = 0; pass < g.ink_passes; ++pass) {
-            if (pass > 0) {
-                bank_n = 0;
-                for (int i = prelude_blocks.n + 1; i < blocks.n; ++i) bank_blocks[bank_n++] = blocks.p[i];
-                bank_out = h;
-                h = prelude;
-                blocks = prelude_blocks;
+    // STRATA_INK_WIN_GRAPH=0: the window's launches one by one.  Default: the window's layers and the head (io.tail)
+    // replayed from one CUDA graph a (width, the attention's split counts, the routes' settings) - the same kernels in
+    // the same order (the same bits), the first position read from a device word (pos_d, as the token graph's).  Not
+    // with the profile marks, dumps, STRATA_INK_FUSE=0, prefetch / lookahead, the expert helper, a hash-routed layer
+    // or the experts' column check
+    static const bool wg_env = [] { const char* v = getenv("STRATA_INK_WIN_GRAPH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool wg_dumps = getenv("GLM_CB_DIR") != nullptr || getenv("GLM_DUMP_H") != nullptr ||
+                                 (getenv("STRATA_DS4_WIN_COLS_CHECK") != nullptr && std::atoi(getenv("STRATA_DS4_WIN_COLS_CHECK")) != 0);
+    bool hashed = false;
+    for (const auto& Lf : F->L) hashed = hashed || Lf.tid2eid != nullptr;
+    const bool wgraph = wg_env && !wg_dumps && !hashed && win_fuse && K.pos_d != nullptr && !F->prof_on && F->max_pf == 0 &&
+                        F->n_ahead == 0 && !F->cur_img && !(F->expert_helper && F->expert_helper->active) &&
+                        split_next_ == nullptr && next_port_ == nullptr;
+    const int64_t* pdv = wgraph ? K.pos_d : nullptr;
+    const auto run = [&]() -> bool {
+        int nb = 0;
+        const auto fresh = [&]() -> float* { return W.hb[nb++ % Ink::kBufs]; };
+        float* h = fresh();
+        ik::rms_rows(io.emb, E, K.tok_norm, g.norm_eps, E, T, h, E, s);
+        int visit = 0;   // (the drafter's taps, as the token path's)
+        Blocks blocks;
+        const auto states = [&](const Blocks& b, const float* cur) {
+            ik::States st;
+            for (int i = 0; i < b.n; ++i) st.p[i] = b.p[i];
+            st.p[b.n] = cur;
+            st.n = b.n + 1;
+            st.stride = E;
+            return st;
+        };
+        // the controllers c0 .. c0 + n - 1 of physical layer il on T columns: controller c's current rows at cur[c]
+        // (rows cs apart), its message rows at msg + c E (rows ms apart), out[c] [T][E] - the token path's control(): its
+        // mv() calls' jobs (n downs, then 2n gains / forgets) with the columns through glm_mvn
+        const auto control = [&](int il, int c0, int n, const float* const* cur, int64_t cs, const float* msg, int64_t ms,
+                                 float* const* out) -> bool {
+            const auto& Ly = K.L[(size_t) il];
+            ik::CtrlRows cr;
+            for (int c = 0; c < n; ++c) {
+                cr.cur[c] = cur[c];
+                cr.out[c] = out[c];
             }
-            for (int ip = lo; ip < hi; ++ip) {
-                const int sl = pass == 0 ? ip : g.n_layers + (pass - 1) * (hi - lo) + (ip - lo);
-                const float* msgs = nullptr;
-                if (pass > 0) {
-                    ik::States st;
-                    for (int i = 0; i < bank_n; ++i) st.p[i] = bank_blocks[i];
-                    st.p[bank_n] = bank_out;
-                    st.n = bank_n + 1;
-                    st.stride = E;
-                    ik::mix(st, K.L[(size_t) ip].msg_q, kCtrl, E, T, W.msgs, s);
-                    msgs = W.msgs;
+            cr.cs = cs;
+            cr.msg = msg;
+            cr.ms = ms;
+            cr.cat = W.cat;
+            cr.cat_c = (int64_t) TM * 2 * E;
+            cr.g = W.cg;
+            cr.f = W.cf;
+            cr.gf_c = (int64_t) TM * E;
+            ik::ctrl_cat_n(cr, n, E, T, s);
+            gf::MvJob j[8];
+            for (int c = 0; c < n; ++c)
+                j[c] = {Ly.down[c0 + c], nullptr, W.cat + (size_t) c * TM * 2 * E, W.lo + (size_t) c * TM * R, nullptr, 1.0f,
+                        gf::kTypeF32, 2 * E, R};
+            if (!glm_mvn(j, n, T, s)) { err = "inkling verify: a controller's down"; return false; }
+            for (int c = 0; c < n; ++c) {
+                j[2 * c] = {Ly.gain[c0 + c], nullptr, W.lo + (size_t) c * TM * R, W.cg + (size_t) c * TM * E, nullptr, 1.0f,
+                            gf::kTypeF32, R, E};
+                j[2 * c + 1] = {Ly.forget[c0 + c], nullptr, W.lo + (size_t) c * TM * R, W.cf + (size_t) c * TM * E, nullptr,
+                                1.0f, gf::kTypeF32, R, E};
+            }
+            if (!glm_mvn(j, 2 * n, T, s)) { err = "inkling verify: a controller's gain / forget"; return false; }
+            ik::ctrl_apply_n(cr, n, E, T, s);
+            return true;
+        };
+        // fused (STRATA_INK_FUSE, as the token path's): a mix and its norms in two launches over the rows (mix_tok's
+        // rows), the post conv + add in the mix after it, the FFN's post conv + add (pend) in the next mix that reads h
+        const bool wfuse = win_fuse && E % 32 == 0 && E <= 4096 && T <= 8;
+        ik::MixTok pend;
+        const auto take_pend = [&](ik::MixTok& mt) {
+            if (pend.pre_in == nullptr) return;
+            mt.pre_in = pend.pre_in;
+            mt.pre_w = pend.pre_w;
+            mt.pre_state = pend.pre_state;
+            mt.pre_tmp = pend.pre_tmp;
+            mt.pre_out = pend.pre_out;
+            mt.pre_add = true;
+            mt.pre_rows = true;
+            pend.pre_in = nullptr;
+        };
+        const auto flush_pend = [&] {   // (a reader of h without a fused mix: the two launches)
+            if (pend.pre_in == nullptr) return;
+            ik::conv_win(pend.pre_in, E, pend.pre_w, nullptr, 0, E, pend.pre_state, E, T, pend.pre_tmp, E, s);
+            ik::add_rows(pend.pre_out, E, pend.pre_tmp, E, E, T, s);
+            pend.pre_in = nullptr;
+        };
+        const auto layer = [&](int il, int ip, int sl, const float* msgs) -> bool {
+            const auto& Ly = K.L[(size_t) il];
+            auto& S = K.S[(size_t) sl];
+            const bool swa = Ly.swa;
+            if (inkd_ != nullptr && (visit == 5 || visit == 23 || visit == 41)) {
+                flush_pend();   // (the tap reads the residual entering the application)
+                ink_tap(visit, h, E, T, nullptr, false, s);
+            }
+            ++visit;
+            // ---- the attention's inputs: in[j] rows ins apart
+            const float* in[3] = {h, h, h};
+            int64_t ins = E;
+            const bool fin_mix = wfuse && Ly.attn_rq != nullptr && msgs == nullptr;
+            const float* gm0[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
+            if (!fin_mix) flush_pend();
+            if (fin_mix) {   // (the mix and the norms in two launches)
+                ik::MixTok mt;
+                mt.part = W.mixp;
+                take_pend(mt);
+                mt.st = states(blocks, h);
+                mt.query = Ly.attn_rq;
+                mt.nq = swa ? 1 : 3;
+                mt.out = W.mixo;
+                mt.out_rs = (int64_t) mt.nq * E;
+                mt.rows = T;
+                mt.eps = g.norm_eps;
+                mt.n_norm = swa ? 1 : 3;
+                mt.norm_rs = swa ? 0 : 1;
+                for (int j = 0; j < mt.n_norm; ++j) {
+                    mt.gamma[j] = gm0[j];
+                    mt.x[j] = W.xn[j];
+                    mt.xq[j] = W.xq[j];
                 }
-                if (!layer(ip, ip, sl, msgs)) return false;
+                ik::mix_tok(mt, E, s);
+            } else if (Ly.attn_rq != nullptr) {
+                const int nq = swa ? 1 : 3;
+                ik::mix(states(blocks, h), Ly.attn_rq, nq, E, T, W.mixo, s, W.mixp);
+                for (int j = 0; j < 3; ++j) in[j] = W.mixo + (size_t) (swa ? 0 : j) * E;
+                ins = (int64_t) nq * E;
             }
+            if (msgs != nullptr) {
+                float* const outs[3] = {W.cin[0], W.cin[1], W.cin[2]};
+                if (!control(il, 0, 3, in, ins, msgs, 4 * (int64_t) E, outs)) return false;
+                for (int j = 0; j < 3; ++j) in[j] = W.cin[j];
+                ins = E;
+            }
+            const int nx = swa && msgs == nullptr ? 1 : 3;
+            if (!fin_mix) {
+                const float* const* gm = gm0;
+                for (int j = 0; j < nx; ++j)
+                    gf::rms_q8_rows(const_cast<float*>(in[j]), ins, nullptr, 0, gm[j], g.norm_eps, E, W.xn[j], E, W.xq[j],
+                                    E / 32, T, s);
+            }
+            const int i1 = nx == 1 ? 0 : 1, i2 = nx == 1 ? 0 : 2;
+            // ---- the projections (k / v straight into the slot's window inputs)
+            float* kraw = slot_save(sl, 0);
+            float* vraw = slot_save(sl, 1);
+            gf::MvJob j[8];
+            int nj = 0;
+            j[nj++] = {Ly.q.q, W.xq[0], W.xn[0], W.qf, nullptr, 1.0f, Ly.q.type, E, HD};
+            j[nj++] = {Ly.gate.q, W.xq[0], W.xn[0], W.gl, nullptr, 1.0f, Ly.gate.type, E, HD};
+            j[nj++] = {Ly.rel.q, W.xq[0], W.xn[0], W.rf, nullptr, 1.0f, Ly.rel.type, E, H * ik::kRel};
+            j[nj++] = {Ly.sink.q, W.xq[0], W.xn[0], W.sk, nullptr, 1.0f, Ly.sink.type, E, H};
+            j[nj++] = {Ly.k.q, W.xq[i1], W.xn[i1], kraw, nullptr, 1.0f, Ly.k.type, E, KV};
+            j[nj++] = {Ly.v.q, W.xq[i2], W.xn[i2], vraw, nullptr, 1.0f, Ly.v.type, E, KV};
+            if (!swa) {
+                j[nj++] = {Ly.kcp.q, W.xq[i1], W.xn[i1], W.kd, nullptr, 1.0f, Ly.kcp.type, E, ik::kConv * Hkv};
+                j[nj++] = {Ly.vcp.q, W.xq[i2], W.xn[i2], W.vd, nullptr, 1.0f, Ly.vcp.type, E, ik::kConv * Hkv};
+            }
+            if (!glm_mvn(j, nj, T, s)) { err = "inkling verify: the attention projections"; return false; }
+            // ---- conv (the state read, left), clips, the caches' rows p0 .. p0 + T - 1
+            float* conv = S.conv;
+            const float lf = swa ? 0.0f : g.ink_log_floor;
+            if (win_fuse) {   // (one launch, the same functions as the six below)
+                ik::PostProj pp{W.qf, W.kf, W.vf, W.rf, conv, swa ? nullptr : W.kd, swa ? nullptr : W.vd, Ly.k_conv, Ly.v_conv,
+                                Ly.q_clip, Ly.rel_clip, (int64_t) ik::kConv * Hkv, KV, HD, H, Hkv, S.ring, p0, g.ink_qk_clip,
+                                g.ink_rel_clip, lf, g.ink_log_alpha, g.norm_eps, S.kc, S.vc};
+                pp.pd = pdv;
+                ik::post_proj_rows(pp, kraw, vraw, T, s);
+            } else {
+                ik::conv_win(kraw, KV, Ly.k_conv, swa ? nullptr : W.kd, ik::kConv * Hkv, D, conv, KV, T, W.kf, KV, s);
+                ik::conv_win(vraw, KV, Ly.v_conv, swa ? nullptr : W.vd, ik::kConv * Hkv, D, conv + (size_t) KV * 3, KV, T, W.vf,
+                             KV, s);
+                ik::clip_heads(W.qf, HD, Ly.q_clip, D, H, g.ink_qk_clip, p0, lf, g.ink_log_alpha, T, s);
+                ik::clip_heads(W.kf, KV, nullptr, D, Hkv, g.ink_qk_clip, p0, 0.0f, 0.0f, T, s);
+                ik::clip_heads(W.rf, H * ik::kRel, Ly.rel_clip, ik::kRel, H, g.ink_rel_clip, p0, lf, g.ink_log_alpha, T, s);
+                ik::kv_store(W.kf, KV, W.vf, KV, g.norm_eps, Hkv, p0, T, S.ring, S.kc, S.vc, s);
+            }
+            // ---- attention (a row's keys up to its own position, its own split count), gate, output, post conv
+            ik::attn(W.qf, HD, W.rf, H * ik::kRel, W.sk, H, Ly.rel_bias, swa ? g.n_swa : g.ink_extent, S.kc, S.vc, S.ring, H,
+                     Hkv, p0, T, swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), W.part, ik::kMaxSplits, W.ao, HD, s, true,
+                     pdv);
+            ik::gate_sigmoid(W.ao, HD, W.gl, HD, HD, T, s);
+            gf::quantize_q8_1(W.ao, W.aoq, T * HD, s);
+            float* praw = slot_save(sl, 2);
+            gf::MvJob o = {Ly.o.q, W.aoq, W.ao, praw, nullptr, 1.0f, Ly.o.type, HD, E};
+            if (!glm_mvn(&o, 1, T, s)) { err = "inkling verify: attn_output"; return false; }
+            const bool starts = ip % g.ink_block == 0;
+            float* conv_post = conv + (size_t) 2 * KV * 3;
+            if (wfuse && msgs == nullptr) {   // the post conv (+ the add), the FFN's mix and its norm in two launches
+                ik::MixTok mt;
+                mt.part = W.mixp;
+                mt.pre_in = praw;
+                mt.pre_w = Ly.post_conv;
+                mt.pre_state = conv_post;
+                mt.pre_tmp = W.tmp;
+                mt.pre_rows = true;
+                if (starts) {
+                    if (blocks.n + 1 >= ik::kMaxStates) { err = "inkling verify: too many residual blocks"; return false; }
+                    blocks.p[blocks.n++] = h;
+                    h = fresh();
+                }
+                mt.pre_out = h;
+                mt.pre_add = !starts;
+                mt.st = states(blocks, h);
+                mt.query = Ly.ffn_rq;
+                mt.nq = 1;
+                mt.out = W.mixo;
+                mt.out_rs = E;
+                mt.rows = T;
+                mt.eps = g.norm_eps;
+                mt.n_norm = 1;
+                mt.gamma[0] = Ly.ffn_norm;
+                mt.x[0] = io.x;
+                mt.xq[0] = io.xq;
+                ik::mix_tok(mt, E, s);
+                if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+                float* fraw = slot_save(sl, 3);
+                cudaMemcpyAsync(fraw, io.ffn, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+                pend.pre_in = fraw;
+                pend.pre_w = Ly.ffn_conv;
+                pend.pre_state = conv + (size_t) (2 * KV + E) * 3;
+                pend.pre_tmp = W.tmp;
+                pend.pre_out = h;
+                return true;
+            }
+            if (starts) {
+                if (blocks.n + 1 >= ik::kMaxStates) { err = "inkling verify: too many residual blocks"; return false; }
+                blocks.p[blocks.n++] = h;
+                h = fresh();
+                ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, h, E, s);
+            } else {
+                ik::conv_win(praw, E, Ly.post_conv, nullptr, 0, E, conv_post, E, T, W.tmp, E, s);
+                ik::add_rows(h, E, W.tmp, E, E, T, s);
+            }
+            // ---- the FFN
+            ik::mix(states(blocks, h), Ly.ffn_rq, 1, E, T, W.mixo, s, W.mixp);
+            const float* fin = W.mixo;
+            if (msgs != nullptr) {
+                const float* cur[1] = {fin};
+                float* const outs[1] = {W.cin[0]};
+                if (!control(il, 3, 1, cur, E, msgs + (size_t) 3 * E, 4 * (int64_t) E, outs)) return false;
+                fin = W.cin[0];
+            }
+            gf::rms_q8_rows(const_cast<float*>(fin), E, nullptr, 0, Ly.ffn_norm, g.norm_eps, E, io.x, E, io.xq, E / 32, T, s);
+            if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
+            float* fraw = slot_save(sl, 3);
+            cudaMemcpyAsync(fraw, io.ffn, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            pend.pre_in = fraw;   // (the token path's order: the next reader of h adds it)
+            pend.pre_w = Ly.ffn_conv;
+            pend.pre_state = conv + (size_t) (2 * KV + E) * 3;
+            pend.pre_tmp = W.tmp;
+            pend.pre_out = h;
+            if (!wfuse) flush_pend();
+            return true;
+        };
+        const int lo = g.ink_passes > 1 ? g.ink_lo : g.n_layers, hi = g.ink_passes > 1 ? g.ink_hi : g.n_layers;
+        for (int il = 0; il < lo; ++il)
+            if (!layer(il, il, il, nullptr)) return false;
+        if (lo < hi) {
+            float* prelude = h;
+            const Blocks prelude_blocks = blocks;
+            const float* bank_blocks[ik::kMaxStates];
+            int bank_n = 0;
+            const float* bank_out = nullptr;
+            for (int pass = 0; pass < g.ink_passes; ++pass) {
+                if (pass > 0) {
+                    bank_n = 0;
+                    for (int i = prelude_blocks.n + 1; i < blocks.n; ++i) bank_blocks[bank_n++] = blocks.p[i];
+                    bank_out = h;
+                    h = prelude;
+                    blocks = prelude_blocks;
+                }
+                for (int ip = lo; ip < hi; ++ip) {
+                    const int sl = pass == 0 ? ip : g.n_layers + (pass - 1) * (hi - lo) + (ip - lo);
+                    const float* msgs = nullptr;
+                    if (pass > 0) {
+                        ik::States st;
+                        for (int i = 0; i < bank_n; ++i) st.p[i] = bank_blocks[i];
+                        st.p[bank_n] = bank_out;
+                        st.n = bank_n + 1;
+                        st.stride = E;
+                        flush_pend();   // (bank_out may be the residual the last FFN adds to)
+                        ik::mix(st, K.L[(size_t) ip].msg_q, kCtrl, E, T, W.msgs, s, W.mixp);
+                        msgs = W.msgs;
+                    }
+                    if (!layer(ip, ip, sl, msgs)) return false;
+                }
+            }
+        }
+        for (int il = hi; il < g.n_layers; ++il)
+            if (!layer(il, il, il, nullptr)) return false;
+        if (wfuse) {   // the head's mix + output_norm in two launches (the last FFN's add first)
+            ik::MixTok mt;
+            mt.part = W.mixp;
+            take_pend(mt);
+            mt.st = states(blocks, h);
+            mt.query = K.out_rq;
+            mt.nq = 1;
+            mt.out = W.mixo;
+            mt.out_rs = E;
+            mt.rows = T;
+            mt.eps = g.norm_eps;
+            mt.n_norm = 1;
+            mt.gamma[0] = K.out_norm;
+            mt.x[0] = io.head_x;
+            mt.xq[0] = io.head_xq;
+            ik::mix_tok(mt, E, s);
+        } else {
+            flush_pend();
+            ik::mix(states(blocks, h), K.out_rq, 1, E, T, W.mixo, s, W.mixp);
+            gf::rms_q8_rows(W.mixo, E, nullptr, 0, K.out_norm, g.norm_eps, E, io.head_x, E, io.head_xq, E / 32, T, s);
+        }
+        if (inkd_ != nullptr) ink_tap(48, io.head_x, E, T, nullptr, false, s);
+        if (io.tail && !io.tail(err)) return false;
+        return true;
+    };
+    if (!wgraph) {
+        ++K.wgraph_eager;
+        if (!run()) return false;
+    } else {
+        // (as the token graph: no paced tier copies from inside the layers - whatever is queued goes now)
+        F->kda_graph_on = true;
+        F->bg_drain(s, SIZE_MAX);
+        if (F->copy2 != nullptr) F->bg_drain(s, SIZE_MAX, 3, F->copy2);
+        ik::set_pos(K.pos_d, p0, s);   // (the graph's position; a refused key's launches read it too)
+        if (inkd_acc_gen() != K.graph_inkd) {   // (the drafter's tap buffers moved: the graphs write the old ones)
+            K.graphs.clear();
+            K.wgraphs.clear();
+            K.graph_inkd = inkd_acc_gen();
+        }
+        // (the routes' by-value settings, as verify_part_q4x's key: the helper's table, the disk tail skip)
+        const uint64_t sig = (uint64_t) (uintptr_t) (F->expert_helper && F->expert_helper->active &&
+                                                     !F->expert_helper->failed ? F->expert_helper->owned_d : nullptr) * 2u +
+                             (F->tail_skip_disk ? 1u : 0u);
+        const int64_t p1 = p0 + T - 1;
+        const auto key = std::make_tuple(T, ik::attn_rows_grid(p1, 0, ik::kMaxSplits), ik::attn_rows_grid(p1, g.n_swa, ik::kMaxSplits),
+                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), sig);
+        // (a key's first windows as launches: a capture costs ~13 ms - RTX 5090, ~1,450 nodes - and a replay saves
+        // ~0.6, so a width seen a few times only is not captured)
+        constexpr int kCapAfter = 6;
+        auto it = K.wgraphs.find(key);
+        if (it == K.wgraphs.end()) {
+            if (K.wgraphs.size() >= 128) K.wgraphs.clear();
+            it = K.wgraphs.emplace(key, Ink::WinGraph()).first;
+        }
+        if (!it->second.bad && !it->second.g.valid() && ++it->second.seen <= kCapAfter) {
+            ++K.wgraph_eager;
+            if (!run()) return false;
+        } else if (!it->second.bad && !it->second.g.valid()) {
+            Ink::WinGraph& wg = it->second;
+            const uint64_t e0 = F->expected;
+            bool ok = wg.g.begin(s, err);
+            if (ok) {
+                {   // (PDL on: the graph keeps the launches' programmatic edges)
+                    strata::kernels::PdlCapture pc(strata::kernels::pdl_enabled());
+                    ok = run();
+                }
+                const cudaError_t ce = cudaGetLastError();
+                if (!ok || ce != cudaSuccess) {
+                    cudaGraph_t junk = nullptr;
+                    cudaStreamEndCapture(s, &junk);
+                    if (junk) cudaGraphDestroy(junk);
+                    cudaGetLastError();
+                    ok = false;
+                } else {
+                    ok = wg.g.end(s, err);
+                    cudaGetLastError();
+                }
+            } else {
+                cudaGetLastError();
+            }
+            wg.requests = F->expected - e0;
+            F->expected = e0;
+            if (!ok) {   // (this key's windows: launches - the same kernels)
+                std::fprintf(stderr, "inkling: the window graph (%d columns) did not capture%s%s - launches\n", T,
+                             err.empty() ? "" : ": ", err.c_str());
+                err.clear();
+                wg.bad = true;
+                ++K.wgraph_bad;
+            } else {
+                ++K.wgraph_caps;
+            }
+            graph_cap_ = true;
+        }
+        if (it->second.seen <= kCapAfter && !it->second.g.valid() && !it->second.bad) {
+            // (launched above)
+        } else if (it->second.bad) {
+            ++K.wgraph_eager;
+            if (!run()) return false;
+        } else {
+            if (!it->second.g.launch(s, err)) return false;
+            inkd_tok_taps(T);   // (the taps inside the graph: their rows' bookkeeping on the host)
+            F->expected += it->second.requests;
+            ++K.wgraph_runs;
         }
     }
-    for (int il = hi; il < g.n_layers; ++il)
-        if (!layer(il, il, il, nullptr)) return false;
-    ik::mix(states(blocks, h), K.out_rq, 1, E, T, W.mixo, s);
-    gf::rms_q8_rows(W.mixo, E, nullptr, 0, K.out_norm, g.norm_eps, E, io.head_x, E, io.head_xq, E / 32, T, s);
-    if (inkd_ != nullptr) ink_tap(48, io.head_x, E, T, nullptr, false, s);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         err = std::string("inkling verify: ") + cudaGetErrorString(e);
