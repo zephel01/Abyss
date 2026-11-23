@@ -1624,9 +1624,16 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
         // ---- the attention's inputs
         const float* in[3] = {hin + (size_t) t0 * E, hin + (size_t) t0 * E, hin + (size_t) t0 * E};
         int64_t ins = E;
+        const int nx = swa && !has_msgs ? 1 : 3;
+        const float* gm[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
+        bool normed = false;   // (the norms and the FP16 copies done with the mix: ik::mix_norm)
         if (Ly.attn_rq != nullptr) {
             const int nq = swa ? 1 : 3;
-            ik::mix(rows_of(ab, an, hin, t0, E), Ly.attn_rq, nq, E, tn, B.mixo, s);
+            void* x16[3] = {B.x16[0], B.x16[1], B.x16[2]};
+            if (!has_msgs)
+                normed = ik::mix_norm(rows_of(ab, an, hin, t0, E), Ly.attn_rq, nq, E, tn, B.mixo, nx, !swa, gm,
+                                      g.norm_eps, B.xn, x16, s);
+            if (!normed) ik::mix(rows_of(ab, an, hin, t0, E), Ly.attn_rq, nq, E, tn, B.mixo, s);
             for (int j = 0; j < 3; ++j) in[j] = B.mixo + (size_t) (swa ? 0 : j) * E;
             ins = (int64_t) nq * E;
         }
@@ -1646,9 +1653,7 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
             for (int j = 0; j < 3; ++j) in[j] = B.cin[j];
             ins = E;
         }
-        const int nx = swa && !has_msgs ? 1 : 3;
-        const float* gm[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
-        for (int j = 0; j < nx; ++j) {
+        for (int j = 0; j < nx && !normed; ++j) {
             ik::rms_rows(in[j], ins, gm[j], g.norm_eps, E, tn, B.xn[j], E, s);
             gb::f32_to_f16(B.xn[j], B.x16[j], (int64_t) tn * E, s);
         }
@@ -1690,20 +1695,25 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
         if (!gemm16(io, Ly.o, E, HD, B.ao16, HD, B.tmp, E, tn, s, err)) return false;
         if (io.mark) io.mark(io.mark_ctx, "ink_attn", s);
         float* conv_post = conv + (size_t) 2 * KV * 3;
-        if (starts) {   // (the attention's output starts the next block)
-            ik::conv_rows_par(B.tmp, E, Ly.post_conv, nullptr, 0, E, conv_post, E, tn, hout + (size_t) t0 * E, E, s);
-        } else {
-            ik::conv_rows_par(B.tmp, E, Ly.post_conv, nullptr, 0, E, conv_post, E, tn, B.tmp2, E, s);
-            ik::add_rows(hout + (size_t) t0 * E, E, B.tmp2, E, E, tn, s);
-        }
-        // ---- the FFN's input
-        ik::mix(rows_of(C.bl, C.bn, hout, t0, E), Ly.ffn_rq, 1, E, tn, B.mixo, s);
+        // ---- the post conv (+ the add; the attention's output starts the next block) and the FFN's input
+        ik::PromptPre pre;
+        pre.in = B.tmp;
+        pre.w = Ly.post_conv;
+        pre.state = conv_post;
+        pre.out = hout + (size_t) t0 * E;
+        pre.tmp = B.tmp2;
+        pre.add = !starts;
+        float* xo = io.x + (size_t) t0 * E;
+        if (!has_msgs && ik::mix_norm(rows_of(C.bl, C.bn, hout, t0, E), Ly.ffn_rq, 1, E, tn, B.mixo, 1, false,
+                                      &Ly.ffn_norm, g.norm_eps, &xo, nullptr, s, &pre))
+            continue;
+        ik::mix(rows_of(C.bl, C.bn, hout, t0, E), Ly.ffn_rq, 1, E, tn, B.mixo, s, nullptr, &pre);
         const float* fin = B.mixo;
         if (has_msgs) {
             if (!control(3, fin, E, B.msgs + (size_t) 3 * E, 4 * (int64_t) E, B.cin[0])) return false;
             fin = B.cin[0];
         }
-        ik::rms_rows(fin, E, Ly.ffn_norm, g.norm_eps, E, tn, io.x + (size_t) t0 * E, E, s);
+        ik::rms_rows(fin, E, Ly.ffn_norm, g.norm_eps, E, tn, xo, E, s);
     }
     gb::f32_to_f16(io.x, io.x16, (int64_t) T * E, s);
     const cudaError_t e = cudaGetLastError();

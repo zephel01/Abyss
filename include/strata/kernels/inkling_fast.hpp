@@ -32,10 +32,28 @@ void rms_rows(const float* x, int64_t xs, const float* gamma, float eps, int n, 
 
 /// The depth attention: the states normalised (rms, eps 1e-6, no gamma), each query's softmax over them of
 /// q . state / sqrt(n_embd), the weighted sum of the NORMALISED states.  query [nq][n_embd]; out [T][nq][n_embd]
+/// pre (prompts): first conv_rows_par of pre->in (n_embd channels, taps w, state) into pre->out's T rows - add: into
+/// tmp, then add_rows into out - where out's rows are one of the states (row t at out + t n_embd)
+struct PromptPre {
+    const float* in = nullptr;
+    const float* w = nullptr;
+    float* state = nullptr;
+    float* out = nullptr;
+    float* tmp = nullptr;
+    bool add = false;
+};
 void mix(const States& st, const float* query, int nq, int n_embd, int T, float* out, cudaStream_t s,
-         float* part = nullptr);   // part: mix_part_floats(T, n_embd) of the caller's scratch (null: a shared one, grown
+         float* part = nullptr,    // part: mix_part_floats(T, n_embd) of the caller's scratch (null: a shared one, grown
                                    // on demand - not for a captured graph, whose address must stay)
+         const PromptPre* pre = nullptr);
 size_t mix_part_floats(int T, int n_embd);
+
+/// mix (out written as there) and then rms_rows of n rows (1..3): job j the mix's row (rs ? j : 0) with gamma[j] -> y[j]
+/// (T rows, n_embd apart) and, y16 non-null with y16[j] non-null, its f32_to_f16 copy - the same arithmetic as mix +
+/// rms_rows + f32_to_f16, one launch (+ pre's step first).  false (nothing run): not this shape, or STRATA_INK_MIX1=0
+bool mix_norm(const States& st, const float* query, int nq, int n_embd, int T, float* out, int n, bool rs,
+              const float* const* gamma, float eps, float* const* y, void* const* y16, cudaStream_t s,
+              const PromptPre* pre = nullptr);
 
 /// The loop controller's input: cat[t] = [rms(cur[t]) | rms(msg[t])] (2 n_embd, eps 1e-6, no gamma).  cur row t at
 /// cur + t cs, msg row t at msg + t ms; cat [T][2 n_embd]
@@ -127,6 +145,13 @@ struct MixTok {
     bool pre_rows = false;
     int64_t out_rs = 0;
     int pre_s = -1;   // (set by mix_tok: the state that is pre_out, -1 none)
+    // mix_norm's (no pre step, no norm / cat): rms_rows of n_rn rows - job j the mix's row (rn_rs ? j : 0), gamma
+    // rn_g[j], eps -> rn_y[j] row t (n_embd apart) and its FP16 copy rn_h[j] (null: none)
+    int n_rn = 0;
+    int rn_rs = 0;
+    const float* rn_g[3] = {};
+    float* rn_y[3] = {};
+    void* rn_h[3] = {};
 };
 size_t mix_tok_floats();
 void mix_tok(const MixTok& a, int n_embd, cudaStream_t s);

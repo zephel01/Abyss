@@ -31,6 +31,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   order, so the tokens are the same (md5 on 6 prompts with and without the verify window and DSpark). RTX 5090,
   UD-Q4_K_XL, server, median of 3: prose 189.8 -> 195.0 tok/s, code 189.7 -> 195.1. `STRATA_INK_MIX1=0`: the two
   launches. HIP keeps the two.
+- Inkling 2 Mini prompts (128 rows and more a step): the depth-attention mix, the post convolution and residual add
+  before it and the norms and FP16 copies after it are one launch a row instead of several, every sum in the old
+  order, so the tokens are the same (md5 on the 8K code and edit prompts, with and without the verify window and
+  DSpark). RTX 5090, UD-Q4_K_XL, server, median of 3: 16K prompt prose 8343 -> 9074 tok/s (+8.8%), code 8383 -> 9083
+  (+8.4%), 2,048 tokens 6845 -> 7278 (+6.3%), 512 tokens 3303 -> 3386 (+2.5%); shorter prompts keep the old launches.
+  `STRATA_INK_MIX1=0` turns this off too. HIP keeps the old launches.
 - Windows only: the VRAM left free beside the expert pool is 2 GB on a CUDA card above 12.5 GB (was 1.5 GB) and 1.5
   GB on a smaller card, for Qwen3.8 (q4x) and for the dense path's `--vram-reserve-mib` default (was 700 MB), so a
   browser or the desktop taking VRAM after the load is less likely to push the NVIDIA driver into its Sysmem

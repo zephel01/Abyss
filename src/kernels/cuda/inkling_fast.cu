@@ -1577,6 +1577,152 @@ __global__ void __launch_bounds__(1024) mix_tok_fused_kernel(MixTok a, int E, in
     }
 }
 
+// conv_par_kernel's value of channel c, row t (no dynamic taps): the same arithmetic
+__device__ __forceinline__ float conv_par_one(const float* __restrict__ in, int64_t is, const float* __restrict__ w,
+                                              const float* __restrict__ state, int c, int t) {
+    float xv[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int tt = t - 3 + k;
+        xv[k] = tt >= 0 ? in[(int64_t) tt * is + c] : state[(size_t) c * 3 + (3 + tt)];
+    }
+    const float x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+    const float w0 = w[(size_t) c * 4 + 0], w1 = w[(size_t) c * 4 + 1], w2 = w[(size_t) c * 4 + 2], w3 = w[(size_t) c * 4 + 3];
+    const float scale = 1.0f / sqrtf(5.0f);
+    float o = x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3;
+    return (x3 + o) * scale;
+}
+
+// grid rows x 256 (prompts): mix_part_kernel + mix_out_kernel of row t in one block (mix_norm: + rms_rows with gamma +
+// f32_to_f16; a PromptPre: conv_par_kernel's rows of pre_in into pre_out, + add_kernel's add, first), every sum in
+// their order.  Chunk after chunk, element c 256 + tid on thread tid: the
+// chunk's states and queries into xs, the chunk's 8 warps' sums as warp_sum would (lane0_tree, a thread a (warp,
+// sum)) added warp after warp, and those added chunk after chunk (mix_out_kernel's part loop) - the states read
+// once for the sums; the softmax of query q a state a thread (mix_out_kernel's thread 0 code); the weighted sums,
+// thread tid's elements tid + 256 c (the states read again) - rms_rows' layout, so the norms' sums of squares are
+// added on the way in its order, then its block_sum and the scaled rows.  nr: the rows (the queries).
+__global__ void __launch_bounds__(kMixChunk) mix_rows_kernel(MixTok a, int E, int nr) {
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
+    __shared__ float xs[kMaxStates + 4][kMixChunk + 1];
+    __shared__ float wp[kMixChunk / 32][kMixSums];
+    __shared__ float red[kMixSums];
+    __shared__ float lx[4][kMaxStates];
+    __shared__ float w[4][kMaxStates];
+    __shared__ float inv[kMaxStates];
+    __shared__ float sh[3][32];
+    const int tid = threadIdx.x, t = blockIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int S = a.st.n, nq = a.nq;
+    const int nc = (E + kMixChunk - 1) / kMixChunk;
+    const int K = S * (1 + nq);   // (the sums: S squares, then S dots a query)
+    const int ks = tid % kMaxStates, kq = tid / kMaxStates - 1;
+    const bool k_on = tid < kMixSums && ks < S && kq < nq;
+    float acc = 0.0f;   // (thread k: sum k, the chunks' added in order)
+    for (int c = 0; c < nc; ++c) {
+        const int i = c * kMixChunk + tid;
+        const bool in = i < E;
+        float h = 0.0f;
+        if (a.pre_in != nullptr && in) {   // (the pre step: row t of pre_out, the state pre_s)
+            const float v = conv_par_one(a.pre_in, E, a.pre_w, a.pre_state, i, t);
+            float* o = a.pre_out + (int64_t) t * E + i;
+            h = a.pre_add ? *o + v : v;
+            *o = h;
+        }
+#pragma unroll
+        for (int s = 0; s < kMaxStates; ++s)
+            xs[s][tid] = in && s < S ? (s == a.pre_s ? h : a.st.p[s][(int64_t) t * a.st.stride + i]) : 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) xs[kMaxStates + q][tid] = in && q < nq ? a.query[(size_t) q * E + i] : 0.0f;
+        __syncthreads();
+        for (int g = tid; g < (kMixChunk / 32) * K; g += kMixChunk) {
+            const int ww = g / K, kk = g % K;
+            const int s = kk % S, q = kk / S - 1;   // (q -1: the square)
+            const float* xr = &xs[s][ww * 32];
+            const float* yr = q < 0 ? xr : &xs[kMaxStates + q][ww * 32];
+            float p[32];
+#pragma unroll
+            for (int l = 0; l < 32; ++l) p[l] = __fmul_rn(yr[l], xr[l]);
+            wp[ww][q < 0 ? s : kMaxStates + q * kMaxStates + s] = lane0_tree(p);
+        }
+        __syncthreads();
+        if (k_on) {
+            float pc = 0.0f;
+#pragma unroll
+            for (int k = 0; k < kMixChunk / 32; ++k) pc += wp[k][tid];
+            acc += pc;
+        }
+    }
+    if (k_on) red[tid] = acc;
+    __syncthreads();
+    if (tid < S) inv[tid] = rsqrtf(red[tid] / (float) E + 1e-6f);
+    __syncthreads();
+    const int qs_ = tid / kMaxStates, ss_ = tid % kMaxStates;   // (the softmax: query qs_'s state ss_)
+    const bool sm_on = qs_ < nr && ss_ < S;
+    if (sm_on) lx[qs_][ss_] = red[kMaxStates + qs_ * kMaxStates + ss_] * inv[ss_] * (1.0f / sqrtf((float) E));
+    __syncthreads();
+    float ex = 0.0f;
+    if (sm_on) {
+        float m = -INFINITY;
+        for (int s = 0; s < S; ++s) m = fmaxf(m, lx[qs_][s]);
+        ex = expf(lx[qs_][ss_] - m);
+    }
+    __syncthreads();
+    if (sm_on) lx[qs_][ss_] = ex;
+    __syncthreads();
+    if (sm_on) {
+        float zz = 0.0f;
+        for (int s = 0; s < S; ++s) zz += lx[qs_][s];
+        w[qs_][ss_] = ex / zz;
+    }
+    __syncthreads();
+    const int nn = a.n_rn;
+    float ss[3] = {0.0f, 0.0f, 0.0f};   // (rms_row's sums of squares, job j's row)
+    float* orow = a.out + (int64_t) t * a.out_rs;
+    for (int c = 0; c < nc; ++c) {
+        const int i = c * kMixChunk + tid;
+        if (i >= E) break;
+        float v[kMaxStates];
+#pragma unroll
+        for (int s = 0; s < kMaxStates; ++s) v[s] = s < S ? a.st.p[s][(int64_t) t * a.st.stride + i] * inv[s] : 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (q >= nr) break;
+            float oo = 0.0f;
+#pragma unroll
+            for (int s = 0; s < kMaxStates; ++s)
+                if (s < S) oo += w[q][s] * v[s];
+            orow[(size_t) q * E + i] = oo;
+#pragma unroll
+            for (int j = 0; j < 3; ++j)
+                if (j < nn && q == (a.rn_rs ? j : 0)) ss[j] = __fmaf_rn(oo, oo, ss[j]);   // (rms_row's FFMA: a shared
+                                                                                        // oo * oo would be FMUL + FADD)
+        }
+    }
+    if (nn == 0) return;
+    // rms_row's block_sum of each job's row (the block's 256 threads)
+#pragma unroll
+    for (int j = 0; j < 3; ++j) ss[j] = warp_sum(ss[j]);
+    if (lane == 0)
+#pragma unroll
+        for (int j = 0; j < 3; ++j) sh[j][warp] = ss[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        if (j >= nn) break;
+        float tt = lane < kMixChunk / 32 ? sh[j][lane] : 0.0f;
+        tt = warp_sum(tt);
+        const float iv = rsqrtf(tt / (float) E + a.eps);
+        const float* xr = orow + (size_t) (a.rn_rs ? j : 0) * E;
+        const float* gm = a.rn_g[j];
+        float* yr = a.rn_y[j] + (int64_t) t * E;
+        __half* yh = a.rn_h[j] != nullptr ? (__half*) a.rn_h[j] + (int64_t) t * E : nullptr;
+        for (int i = tid; i < E; i += kMixChunk) {
+            const float y = xr[i] * iv * gm[i];
+            yr[i] = y;
+            if (yh != nullptr) yh[i] = __float2half(y);
+        }
+    }
+}
+
 // grid n x 1024: row j's ctrl_apply_kernel step and its rms_q8 with gamma[j]
 __global__ void __launch_bounds__(1024) ctrl_tok_kernel(CtrlTok a, int E) {
     STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
@@ -1632,7 +1778,7 @@ void rms_rows(const float* x, int64_t xs, const float* gamma, float eps, int n, 
     check("rms_rows");
 }
 
-// STRATA_INK_MIX1=0: the decode token's mix in two launches (part + rows) instead of one (HIP: always the two)
+// STRATA_INK_MIX1=0: the mix's two launches (part + out / rows) instead of one (HIP: always the two)
 bool mix1_on() {
 #if defined(__HIP_PLATFORM_AMD__)
     return false;
@@ -1665,10 +1811,50 @@ unsigned* mix_counters() {
 
 size_t mix_part_floats(int T, int n_embd) { return (size_t) T * ((n_embd + kMixChunk - 1) / kMixChunk) * kMixSums; }
 
-void mix(const States& st, const float* query, int nq, int n_embd, int T, float* out, cudaStream_t s, float* part) {
+// mix_rows_kernel's rows at least: fewer go the two launches, whose chunks a row fill the GPU better (RTX 5090: the
+// same at 128 rows, the one launch +1% at 256, +3% at 512, +6% at 2,048)
+constexpr int kMixRowsMin = 128;
+int mix_rows_min() { return kMixRowsMin; }
+
+// a PromptPre into the MixTok (pre_s: the state that is pre_out's rows); false: not this shape
+bool prompt_pre(MixTok& a, const PromptPre* pre, int n_embd) {
+    if (pre == nullptr) return true;
+    a.pre_in = pre->in;
+    a.pre_w = pre->w;
+    a.pre_state = const_cast<float*>(pre->state);
+    a.pre_out = pre->out;
+    a.pre_add = pre->add;
+    a.pre_s = -1;
+    for (int i = 0; i < a.st.n; ++i)
+        if (a.st.p[i] == pre->out && a.st.stride == n_embd) a.pre_s = i;
+    return a.pre_s >= 0;
+}
+
+void mix(const States& st, const float* query, int nq, int n_embd, int T, float* out, cudaStream_t s, float* part,
+         const PromptPre* pre) {
     if (T <= 0 || st.n <= 0 || st.n > kMaxStates || nq < 1 || nq > 4) {
         std::fprintf(stderr, "inkling kernels: mix: %d states, %d queries (1..%d, 1..4)\n", st.n, nq, kMaxStates);
         return;
+    }
+    if (mix1_on() && n_embd <= 1024 * kTokK && T >= mix_rows_min()) {   // (one launch, a block a row: mix_rows_kernel)
+        MixTok a;
+        a.st = st;
+        a.query = query;
+        a.nq = nq;
+        a.out = out;
+        a.rows = T;
+        a.out_rs = (int64_t) nq * n_embd;
+        if (prompt_pre(a, pre, n_embd)) {
+            strata::kernels::pdl_launch(mix_rows_kernel, dim3((unsigned) T), dim3(kMixChunk), 0, s, a, n_embd, nq);
+            if (pre != nullptr) conv_state_kernel<<<(n_embd + 127) / 128, 128, 0, s>>>(pre->in, n_embd, const_cast<float*>(pre->state), n_embd, T);
+            check("mix");
+            return;
+        }
+    }
+    if (pre != nullptr) {   // (the pre step's kernels as before)
+        conv_rows_par(pre->in, n_embd, pre->w, nullptr, 0, n_embd, const_cast<float*>(pre->state), n_embd, T,
+                      pre->add ? pre->tmp : pre->out, n_embd, s);
+        if (pre->add) add_rows(pre->out, n_embd, pre->tmp, n_embd, n_embd, T, s);
     }
     const int nc = (n_embd + kMixChunk - 1) / kMixChunk;
     if (part == nullptr) part = mix_scratch((size_t) T * nc * kMixSums);
@@ -1679,6 +1865,34 @@ void mix(const States& st, const float* query, int nq, int n_embd, int T, float*
     strata::kernels::pdl_launch(mix_part_kernel, dim3((unsigned) nc, (unsigned) T), dim3(kMixChunk), 0, s, st, query, nq, n_embd, part);
     strata::kernels::pdl_launch(mix_out_kernel, dim3((unsigned) nc, (unsigned) T), dim3(kMixChunk), 0, s, st, (const float*) part, nq, n_embd, out);
     check("mix");
+}
+
+bool mix_norm(const States& st, const float* query, int nq, int n_embd, int T, float* out, int n, bool rs,
+              const float* const* gamma, float eps, float* const* y, void* const* y16, cudaStream_t s,
+              const PromptPre* pre) {
+    if (!mix1_on() || n_embd > 1024 * kTokK || n_embd % 32 != 0 || T < mix_rows_min() || st.n <= 0 || st.n > kMaxStates || nq < 1 ||
+        nq > 4 || n < 1 || n > 3 || (rs && n > nq))
+        return false;
+    MixTok a;
+    a.st = st;
+    a.query = query;
+    a.nq = nq;
+    a.out = out;
+    a.rows = T;
+    a.out_rs = (int64_t) nq * n_embd;
+    a.eps = eps;
+    a.n_rn = n;
+    a.rn_rs = rs ? 1 : 0;
+    for (int j = 0; j < n; ++j) {
+        a.rn_g[j] = gamma[j];
+        a.rn_y[j] = y[j];
+        a.rn_h[j] = y16 != nullptr ? y16[j] : nullptr;
+    }
+    if (!prompt_pre(a, pre, n_embd)) return false;
+    strata::kernels::pdl_launch(mix_rows_kernel, dim3((unsigned) T), dim3(kMixChunk), 0, s, a, n_embd, rs ? n : 1);
+    if (pre != nullptr) conv_state_kernel<<<(n_embd + 127) / 128, 128, 0, s>>>(pre->in, n_embd, const_cast<float*>(pre->state), n_embd, T);
+    check("mix_norm");
+    return true;
 }
 
 void ctrl_cat(const float* cur, int64_t cs, const float* msg, int64_t ms, int n_embd, int T, float* cat, cudaStream_t s) {
