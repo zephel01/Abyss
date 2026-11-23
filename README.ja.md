@@ -248,6 +248,36 @@ RAM 層 60 GB、モデルは NVMe（3.4 GB/s）、Abyss v1.3.31:
 
 </details>
 
+<details>
+<summary><b>Inkling 2 Mini</b></summary>
+
+unsloth の [Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) `UD-Q4_K_XL`（17.6 GB）、RTX 5090、
+すべて VRAM、iGPU レーンなし、Abyss v1.3.191〜1.3.194。下の答えは、ドラフトモデルありとなしでビットまで同じ。
+
+| 生成（512 トークン、3 回の中央値） | ドラフトモデルなし | DSpark ドラフトモデル（`STRATA_INK_DSPARK`） |
+| --- | :---: | :---: |
+| コード・編集 | 182〜185 tok/s | **223〜241 tok/s** |
+| 8K の文脈、コード・編集 | 183 tok/s | **237〜245 tok/s** |
+| 文章・日本語 | 183 tok/s | 178〜180 tok/s（オフのままがよい） |
+| 165K のプロンプトのあと（1,024 トークン） | 97 tok/s | **108〜158 tok/s** |
+
+| プロンプト | 4K | 8K | 32K | 165K | 255K |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| tok/s | 5,572 | 6,874〜8,300 | 7,795〜8,150 | 5,298 | 4,896 |
+
+| 品質 | Inkling 2 Mini UD-Q4_K_XL | 比較 |
+| --- | :---: | :---: |
+| 採点付きコーディング 8 問（llmbench） | 8 問中 8 問 ×3 回、品質 84.1〜84.9、172〜174 tok/s | V4.1 UD-IQ2_XXS 8 問中 8 問、85.7、22.9 tok/s |
+| 難しいコーディング 10 問 | 10 問中 8〜9 問、品質 76.6〜80.2 | V4.1 UD-IQ2_XXS 10 問中 10 問、78.8。Qwen3.8 NVFP4 10 問中 8 問、76.1 |
+| 7 ターンのツールのセッション | 呼び出し 21〜28 回、名前・JSON・キーの誤り 0 | V4.1 21〜27 回 |
+| 日本語の事実（40 問 ×3） | 666 個中 593 個（Q8_0 も 593） | UD-IQ3_XXS 589、UD-IQ2_XXS 552 |
+| llama.cpp の Q8_0 に対する KL | 0.0058（日本語 0.0066） | UD-IQ3_XXS 0.028、UD-IQ2_XXS 0.078 |
+
+ドラフトモデルは、同じ文字列が繰り返される場面（コード、編集、長い文脈）で速く、文章と日本語では 1〜3% 遅いので、
+オプトインのまま。8〜12 GB の GPU なら、UD-IQ3_XXS（11.7 GB）で日本語の品質はほぼ同じ。UD-IQ2_XXS ははっきり落ちる。
+
+</details>
+
 ## ✨ 特長
 
 - **50〜280 GB の MoE を GPU 1 枚で** — DeepSeek V4（284B）と V4.1、GLM-5.3-Flash、Qwen3.8-Flash-Next、Ornith-1.5 / Qwen3.5-122B。エキスパートを VRAM・pinned RAM・SSD に分けて置き、どれを先に載せるかは使い方から学ぶ
@@ -327,6 +357,7 @@ RAM 層 60 GB、モデルは NVMe（3.4 GB/s）、Abyss v1.3.31:
 | | peasantsmith の Maya-S / Maya-M / Maya-L | 53.0 / 68.4 / 89.5 GB ＋ 表 | テンソルの型は Maya-XS と同じ。未確認 |
 | | nace-ai の [Q3_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF)（Engram の表は IQ4_NL で各ファイルの中。v1.3.178） | 107.5 GB | 同じ条件で計測済み: 生成 40.5 tok/s（CPU で計算するエキスパートが多い）。日本語の事実問題 80 中 76。nll は日本語 4K の文で 3.91（Maya-XS 4.17）、日英コードの組で 1.75（Maya-XS 1.58） |
 | | nace-ai の [Q4_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF) | 127.2 GB | 未確認 |
+| Inkling 2 Mini（Thinking Machines、ループする 128x1.8B の MoE、`inkling2`。[MANUAL](docs/MANUAL.ja.md)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)（`--model inkling2mini`、v1.3.183）。8〜12 GB の GPU には UD-IQ3_XXS。DSpark ドラフトモデル `dspark-Inkling-2-Mini-Q8_0.gguf`（`STRATA_INK_DSPARK`、オプトイン） | 17.6 GB | RTX 5090 で計測（すべて VRAM）: 生成 183〜185 tok/s（ドラフトモデルありでコード・編集 223〜245）、プロンプト 8K 約 6,900〜8,300 / 165K 5,298 tok/s、llama.cpp の Q8_0 比 KL 0.0058、コーディング 8 問中 8 問 ×3 回（品質 84.1〜84.9）、ツール呼び出しの誤り 0（[数字](#-性能)） |
 
 自作ファイルの以前の名前（ファイルの中身は同じ）: LDLQ 132G / 139G = DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G、Compact JA256 =
 DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G、IQ3_XXS-B = Ornith-1.5-122B-IQ3_XXS-16G64G、IQ3_XXS-B2 = Qwen3.5-122B-A10B-IQ3_XXS-16G64G、

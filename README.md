@@ -250,6 +250,36 @@ run broke at task 35 on the 16K bug fixed in v1.3.32. Details:
 
 </details>
 
+<details>
+<summary><b>Inkling 2 Mini</b></summary>
+
+unsloth's [Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) `UD-Q4_K_XL` (17.6 GB), RTX 5090, all
+in VRAM, no iGPU lane, Abyss v1.3.191-1.3.194. Every answer below is bit for bit the same with and without the drafter.
+
+| Decode (512 tokens, median of 3) | Without the drafter | DSpark drafter (`STRATA_INK_DSPARK`) |
+| --- | :---: | :---: |
+| Code / edits | 182-185 tok/s | **223-241 tok/s** |
+| 8K context, code / edits | 183 tok/s | **237-245 tok/s** |
+| Prose / Japanese | 183 tok/s | 178-180 tok/s (leave it off) |
+| After a 165K prompt (1,024 tokens) | 97 tok/s | **108-158 tok/s** |
+
+| Prompts | 4K | 8K | 32K | 165K | 255K |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| tok/s | 5,572 | 6,874-8,300 | 7,795-8,150 | 5,298 | 4,896 |
+
+| Quality | Inkling 2 Mini UD-Q4_K_XL | For comparison |
+| --- | :---: | :---: |
+| 8 graded coding tasks (llmbench) | 8 of 8 x 3, quality 84.1-84.9, 172-174 tok/s | V4.1 UD-IQ2_XXS 8 of 8, 85.7, 22.9 tok/s |
+| 10 hard coding tasks | 8-9 of 10, quality 76.6-80.2 | V4.1 UD-IQ2_XXS 10 of 10, 78.8; Qwen3.8 NVFP4 8 of 10, 76.1 |
+| 7-turn tool session | 21-28 calls, 0 bad names / JSON / keys | V4.1 21-27 calls |
+| Japanese facts (40 questions x 3) | 593 of 666 facts (Q8_0 593) | UD-IQ3_XXS 589, UD-IQ2_XXS 552 |
+| KL against llama.cpp's Q8_0 | 0.0058 (Japanese 0.0066) | UD-IQ3_XXS 0.028, UD-IQ2_XXS 0.078 |
+
+The drafter wins where text repeats (code, edits, long contexts) and loses 1-3% on prose and Japanese, so it stays
+opt-in. For 8-12 GB GPUs, UD-IQ3_XXS (11.7 GB) keeps nearly the same Japanese quality; UD-IQ2_XXS loses clearly.
+
+</details>
+
 ## ✨ Highlights
 
 - **A 50-280 GB MoE on one card** — DeepSeek V4 (284B) and V4.1, GLM-5.3-Flash, Qwen3.8-Flash-Next, Ornith-1.5 /
@@ -341,6 +371,7 @@ run broke at task 35 on the 16K bug fixed in v1.3.32. Details:
 | | peasantsmith's Maya-S / Maya-M / Maya-L | 53.0 / 68.4 / 89.5 GB + the table | same tensor types as Maya-XS, untested |
 | | nace-ai [Q3_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF) (the Engram table as IQ4_NL inside the shards; v1.3.178) | 107.5 GB | measured the same way: decode 40.5 tok/s (more experts on the CPU), Japanese facts 76 of 80, nll on a Japanese 4K text 3.91 (Maya-XS 4.17), on a JA / EN / code set 1.75 (Maya-XS 1.58) |
 | | nace-ai [Q4_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF) | 127.2 GB | untested |
+| Inkling 2 Mini (Thinking Machines, a looped 128x1.8B MoE, `inkling2`; [MANUAL](docs/MANUAL.md)) | unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`--model inkling2mini`, v1.3.183); UD-IQ3_XXS for 8-12 GB GPUs; its DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf` (`STRATA_INK_DSPARK`, opt-in) | 17.6 GB | measured on an RTX 5090 (all in VRAM): decode 183-185 tok/s (223-245 on code / edits with the drafter), prompts 8K ~6,900-8,300 / 165K 5,298 tok/s, KL 0.0058 against llama.cpp's Q8_0, coding 8 of 8 x 3 (quality 84.1-84.9), tool calls 0 errors ([numbers](#-performance)) |
 
 Earlier names of our files (the files did not change): LDLQ 132G / 139G = DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G,
 Compact JA256 = DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G, IQ3_XXS-B = Ornith-1.5-122B-IQ3_XXS-16G64G, IQ3_XXS-B2 =
