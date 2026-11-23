@@ -1312,7 +1312,247 @@ __global__ void attn_combine_gq_kernel(const float* __restrict__ part, int nspli
     q81_store_warp(o, outq + i / 32, d & 31);
 }
 
+// ---------------------------------------------------------------- the loop controllers' BF16 GEMVs (ctl_mv)
+struct CtlBatch {
+    CtlJob j[kMaxCtlJobs];
+    int blk_end[kMaxCtlJobs];
+    int n;
+    int pf;
+};
+// a warp's share of a weight row into L2 (glm_fast's mv_prefetch_l2): weights only - nothing an earlier kernel
+// writes - so before the PDL wait, the row's first lines arriving while the kernel before finishes.  A hint
+__device__ __forceinline__ void ctl_prefetch(const void* w, size_t bytes, int lane) {
+#if defined(__CUDA_ARCH__) && !defined(STRATA_USE_HIP)
+    const char* c = (const char*) w;
+    for (size_t o = (size_t) lane * 128; o < bytes; o += (size_t) 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(c + o));
+#else
+    (void) w;
+    (void) bytes;
+    (void) lane;
+#endif
+}
+// a warp a row, rows (blockDim / 32) a block: glm_fast's F32 sums (row_dot_f32 / mvn_kernel_f's F32 branch) on the
+// rows' BF16 halves - the four weights a step widened to the F32 values they were, the same products and adds in the
+// same order, then warp_sum and mv's alpha * s + 0 (alpha 1).  IT > 0: a lane's IT steps (float4 index lane + 32 i,
+// i < IT, n_in <= 128 IT) unrolled whole, every load issued before the sums (the down's 36 steps a lane: 9 trips to
+// memory in a 4-step unroll).  Loading the weights into registers before the PDL wait was slower (RTX 5090: the
+// controllers' GEMVs 276 -> 344 us a token).  IT 0: the plain loop
+template <int NC, int IT>
+__global__ void __launch_bounds__(256) ctl_mv_kernel(const __grid_constant__ CtlBatch b) {
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const CtlJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int row = (bid - blk0) * (int) (blockDim.x >> 5) + (int) (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= J.n_out) return;   // (no global access before this: an exit is the trigger)
+    const uint2* r4 = (const uint2*) (J.w + (size_t) row * J.n_in);
+    const int n4 = J.n_in / 4;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    if constexpr (IT > 0) {
+        if (b.pf) ctl_prefetch(r4, (size_t) J.n_in * 2, lane);
+        STRATA_PDL_ENTRY();   // (pdl.hpp: before any read of what an earlier kernel writes)
+        uint2 wr[IT];
+#pragma unroll
+        for (int i = 0; i < IT; ++i) {
+            const int k = lane + 32 * i;
+            wr[i] = k < n4 ? r4[k] : make_uint2(0u, 0u);
+        }
+        // (the activation loads unconditional - a step past the row reads its last float4 and adds nothing - so they
+        // issue together rather than one branch at a time)
+#pragma unroll
+        for (int i = 0; i < IT; ++i) {
+            const int k = lane + 32 * i;
+            const bool in = k < n4;
+            const int kk = in ? k : n4 - 1;
+            const uint2 v = wr[i];
+            const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u);
+            const float w2 = __uint_as_float(v.y << 16), w3 = __uint_as_float(v.y & 0xffff0000u);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const float4 xx = ((const float4*) (J.x + (size_t) c * J.n_in))[kk];
+                const float t = w0 * xx.x + w1 * xx.y + w2 * xx.z + w3 * xx.w;
+                acc[c] = in ? acc[c] + t : acc[c];
+            }
+        }
+    } else {
+        if (b.pf) ctl_prefetch(r4, (size_t) J.n_in * 2, lane);
+        STRATA_PDL_ENTRY();   // (pdl.hpp: before any read of what an earlier kernel writes)
+#pragma unroll 4
+        for (int k = lane; k < n4; k += 32) {
+            const uint2 v = r4[k];
+            const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u);
+            const float w2 = __uint_as_float(v.y << 16), w3 = __uint_as_float(v.y & 0xffff0000u);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const float4 xx = ((const float4*) (J.x + (size_t) c * J.n_in))[k];
+                acc[c] += w0 * xx.x + w1 * xx.y + w2 * xx.z + w3 * xx.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0) J.y[(size_t) c * J.n_out + row] = 1.0f * v + 0.0f;
+    }
+}
+// ... SPLIT warps a row (STRATA_INK_CTL_SPLIT, opt-in): warp p sums float4 steps [p n4 / SPLIT, (p + 1) n4 / SPLIT)
+// lane-strided, then warp 0 adds the parts in order - another sum order than the F32 GEMV's (not the same bits)
+template <int NC, int SPLIT>
+__global__ void __launch_bounds__(256) ctl_mv_split_kernel(const __grid_constant__ CtlBatch b) {
+    __shared__ float part[SPLIT][NC];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const CtlJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int row = bid - blk0;   // (a block a row)
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const uint2* r4 = (const uint2*) (J.w + (size_t) row * J.n_in);
+    const int n4 = J.n_in / 4, k0 = n4 * warp / SPLIT, k1 = n4 * (warp + 1) / SPLIT;
+    if (b.pf) ctl_prefetch(r4 + k0, (size_t) (k1 - k0) * 8, lane);
+    STRATA_PDL_ENTRY();   // (pdl.hpp: before any read of what an earlier kernel writes)
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+#pragma unroll 4
+    for (int k = k0 + lane; k < k1; k += 32) {
+        const uint2 v = r4[k];
+        const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u);
+        const float w2 = __uint_as_float(v.y << 16), w3 = __uint_as_float(v.y & 0xffff0000u);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float4 xx = ((const float4*) (J.x + (size_t) c * J.n_in))[k];
+            acc[c] += w0 * xx.x + w1 * xx.y + w2 * xx.z + w3 * xx.w;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0) part[warp][c] = v;
+    }
+    __syncthreads();
+    if (warp == 0 && lane < NC) {
+        float t = 0.0f;
+#pragma unroll
+        for (int p = 0; p < SPLIT; ++p) t += part[p][lane];
+        J.y[(size_t) lane * J.n_out + row] = t;
+    }
+}
+// four F32 values -> their BF16 high halves (element 2i the low half of word i); bad: a low half was not zero
+__global__ void ctl_pack_kernel(const uint4* __restrict__ x, uint2* __restrict__ y, int64_t n4, int* bad) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const uint4 u = x[i];
+    if (((u.x | u.y | u.z | u.w) & 0xffffu) != 0u) *bad = 1;
+    y[i] = make_uint2((u.x >> 16) | (u.y & 0xffff0000u), (u.z >> 16) | (u.w & 0xffff0000u));
+}
+__global__ void ctl_unpack_kernel(const uint2* __restrict__ x, uint4* __restrict__ y, int64_t n4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const uint2 v = x[i];
+    y[i] = make_uint4(v.x << 16, v.x & 0xffff0000u, v.y << 16, v.y & 0xffff0000u);
+}
+
 }  // namespace
+
+bool ctl_mv(const CtlJob* jobs, int n, int nc, int rpb, cudaStream_t s, int split) {
+    if (n <= 0 || n > kMaxCtlJobs || nc < 1 || (rpb != 1 && rpb != 2 && rpb != 4 && rpb != 8)) return false;
+    if (split == 2 || split == 4 || split == 8) {   // (opt-in: another sum order)
+        const int pf = strata::kernels::pdl_enabled() ? 1 : 0;
+        for (int c0 = 0; c0 < nc; c0 += 8) {
+            const int m = std::min(8, nc - c0);
+            CtlBatch b{};
+            int acc = 0;
+            for (int i = 0; i < n; ++i) {
+                b.j[i] = jobs[i];
+                b.j[i].x = jobs[i].x + (size_t) c0 * jobs[i].n_in;
+                b.j[i].y = jobs[i].y + (size_t) c0 * jobs[i].n_out;
+                acc += jobs[i].n_out;
+                b.blk_end[i] = acc;
+            }
+            b.n = n;
+            b.pf = pf;
+            const dim3 grid((unsigned) acc), block((unsigned) (32 * split));
+#define INK_CTLS(SP)                                                                                        \
+            switch (m) {                                                                                    \
+                case 1: strata::kernels::pdl_launch(ctl_mv_split_kernel<1, SP>, grid, block, 0, s, b); break; \
+                case 2: strata::kernels::pdl_launch(ctl_mv_split_kernel<2, SP>, grid, block, 0, s, b); break; \
+                case 3: strata::kernels::pdl_launch(ctl_mv_split_kernel<3, SP>, grid, block, 0, s, b); break; \
+                case 4: strata::kernels::pdl_launch(ctl_mv_split_kernel<4, SP>, grid, block, 0, s, b); break; \
+                case 5: strata::kernels::pdl_launch(ctl_mv_split_kernel<5, SP>, grid, block, 0, s, b); break; \
+                case 6: strata::kernels::pdl_launch(ctl_mv_split_kernel<6, SP>, grid, block, 0, s, b); break; \
+                case 7: strata::kernels::pdl_launch(ctl_mv_split_kernel<7, SP>, grid, block, 0, s, b); break; \
+                default: strata::kernels::pdl_launch(ctl_mv_split_kernel<8, SP>, grid, block, 0, s, b); break; \
+            }
+            if (split == 2) { INK_CTLS(2) } else if (split == 4) { INK_CTLS(4) } else { INK_CTLS(8) }
+#undef INK_CTLS
+        }
+        check("ctl_mv (split)");
+        return true;
+    }
+    for (int i = 0; i < n; ++i)
+        if (jobs[i].n_in % 4 != 0 || jobs[i].n_out <= 0) return false;
+    const int pf = strata::kernels::pdl_enabled() ? 1 : 0;
+    int it = 0;
+    for (int i = 0; i < n; ++i) it = std::max(it, (jobs[i].n_in / 4 + 31) / 32);
+    for (int c0 = 0; c0 < nc; c0 += 8) {   // (runs of up to 8 columns: a column's sum does not depend on the run)
+        const int m = std::min(8, nc - c0);
+        CtlBatch b{};
+        int acc = 0;
+        for (int i = 0; i < n; ++i) {
+            b.j[i] = jobs[i];
+            b.j[i].x = jobs[i].x + (size_t) c0 * jobs[i].n_in;
+            b.j[i].y = jobs[i].y + (size_t) c0 * jobs[i].n_out;
+            acc += (jobs[i].n_out + rpb - 1) / rpb;
+            b.blk_end[i] = acc;
+        }
+        b.n = n;
+        b.pf = pf;
+        const dim3 grid((unsigned) acc), block((unsigned) (32 * rpb));
+#define INK_CTL(IT)                                                                                   \
+        switch (m) {                                                                                  \
+            case 1: strata::kernels::pdl_launch(ctl_mv_kernel<1, IT>, grid, block, 0, s, b); break;   \
+            case 2: strata::kernels::pdl_launch(ctl_mv_kernel<2, IT>, grid, block, 0, s, b); break;   \
+            case 3: strata::kernels::pdl_launch(ctl_mv_kernel<3, IT>, grid, block, 0, s, b); break;   \
+            case 4: strata::kernels::pdl_launch(ctl_mv_kernel<4, IT>, grid, block, 0, s, b); break;   \
+            case 5: strata::kernels::pdl_launch(ctl_mv_kernel<5, IT>, grid, block, 0, s, b); break;   \
+            case 6: strata::kernels::pdl_launch(ctl_mv_kernel<6, IT>, grid, block, 0, s, b); break;   \
+            case 7: strata::kernels::pdl_launch(ctl_mv_kernel<7, IT>, grid, block, 0, s, b); break;   \
+            default: strata::kernels::pdl_launch(ctl_mv_kernel<8, IT>, grid, block, 0, s, b); break;  \
+        }
+        // (the steps a lane of the call's longest row, rounded up to a compiled count; longer: the plain loop)
+        switch (it <= 1 ? 1 : it <= 2 ? 2 : it <= 4 ? 4 : it <= 8 ? 8 : it <= 16 ? 16 : it <= 36 ? 36 : 0) {
+            case 1: INK_CTL(1) break;
+            case 2: INK_CTL(2) break;
+            case 4: INK_CTL(4) break;
+            case 8: INK_CTL(8) break;
+            case 16: INK_CTL(16) break;
+            case 36: INK_CTL(36) break;
+            default: INK_CTL(0) break;
+        }
+#undef INK_CTL
+    }
+    check("ctl_mv");
+    return true;
+}
+
+void ctl_pack(const float* x, uint16_t* y, int64_t n, int* bad, cudaStream_t s) {
+    const int64_t n4 = n / 4;
+    if (n4 <= 0) return;
+    ctl_pack_kernel<<<(unsigned) ((n4 + 255) / 256), 256, 0, s>>>((const uint4*) x, (uint2*) y, n4, bad);
+    check("ctl_pack");
+}
+
+void ctl_unpack(const uint16_t* x, float* y, int64_t n, cudaStream_t s) {
+    const int64_t n4 = n / 4;
+    if (n4 <= 0) return;
+    ctl_unpack_kernel<<<(unsigned) ((n4 + 255) / 256), 256, 0, s>>>((const uint2*) x, (uint4*) y, n4);
+    check("ctl_unpack");
+}
 
 void rms_rows(const float* x, int64_t xs, const float* gamma, float eps, int n, int T, float* y, int64_t ys,
               cudaStream_t s) {

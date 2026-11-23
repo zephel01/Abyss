@@ -31,6 +31,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   Fallback (host RAM, silently slow). docs/WINDOWS turns that fallback off in the NVIDIA Control Panel. Linux and
   HIP are unchanged. Not built on Windows.
 
+- Inkling 2 Mini: the loop controllers' rows (unsloth's F32 down / gain / forget, 144 tensors) are kept as BF16 on
+  the GPU. Every value in them is a BF16 value (checked per tensor at load; a tensor with any other value stays
+  F32), and their GEMVs add the same products in the same order as before, so the output is the same bits (Inkling
+  md5 and the KL rows unchanged). RTX 5090, UD-Q4_K_XL, server mode: decode 189.7 -> 193.0 tok/s, the 16K prompt
+  unchanged. `STRATA_INK_CTL_BF16=0` keeps the F32 rows; AMD keeps them unless it is `1`. `STRATA_INK_CTL_SPLIT=4`
+  (opt-in, another sum order: KL 0.005687 -> 0.005681) splits the controllers' down rows over 4 warps: 195.4 tok/s.
+
 ## v1.3.194 - 2026-11-23
 
 Inkling 2 Mini's verify window runs from CUDA graphs with fused kernels, so its opt-in DSpark drafter

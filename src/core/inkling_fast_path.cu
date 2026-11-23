@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -63,6 +64,9 @@ struct Ink {
         // forget (rank -> E) - F32 rows
         const float* msg_q = nullptr;
         const float *down[kCtrl] = {}, *gain[kCtrl] = {}, *forget[kCtrl] = {};
+        // (STRATA_INK_CTL_BF16: bf[c][0 down / 1 gain / 2 forget] - that tensor's rows now BF16, packed into the first
+        // half of its F32 arena span at the same pointer: ink_ctl_pack)
+        bool bf[kCtrl][3] = {};
     };
     std::vector<Layer> L;
     struct Slot {
@@ -128,6 +132,8 @@ struct Ink {
     void* base = nullptr;
     size_t bytes = 0;
     std::vector<float*> owned;   // (unsloth's looped layout: the gathered message queries)
+    std::set<const void*> packed;   // (the controller tensors ink_ctl_pack turned BF16: never twice)
+    int ctl_packed = 0, ctl_kept = 0;
     // the batched prompt's cursor through a chunk's applications (ink_prompt_*): the token path's bookkeeping, over
     // the chunk's rows (each residual buffer T rows of E)
     struct Cursor {
@@ -148,6 +154,123 @@ struct Ink {
 };
 
 // ---------------------------------------------------------------- weights
+namespace {
+// STRATA_INK_CTL_BF16: the loop controllers' rows as BF16 (ink_ctl_pack).  Unset: on with CUDA, off with HIP (its
+// numbers not checked there yet); 0 keeps the F32 rows, 1 packs them on HIP too
+bool ink_ctl_bf16_on() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_INK_CTL_BF16");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
+    return on;
+}
+// a controller tensor's GEMV shape: r 0 down (2E -> rank), 1 gain / 2 forget (rank -> E)
+void ctl_shape(int r, int E, int R, int& n_in, int& n_out) {
+    n_in = r == 0 ? 2 * E : R;
+    n_out = r == 0 ? R : E;
+}
+// the rows a block ctl_mv gets: the down's 64 rows over 32 blocks (one warp a row either way: the same sums)
+int ctl_rpb(int n_out) { return n_out <= 256 ? 2 : 8; }
+// a controller GEMV call: the BF16 tensors' jobs through ik::ctl_mv, the F32 ones through f32 (mv / glm_mvn) - each
+// launch only when it has jobs.  bf[i]: job i's rows are BF16
+template <class F32Go>
+bool ctl_go(const gf::MvJob* j, const bool* bf, int n, int nc, cudaStream_t s, F32Go&& f32) {
+    gf::MvJob jf[gf::kMaxMvJobs];
+    ik::CtlJob jb[ik::kMaxCtlJobs];
+    int nf = 0, nb = 0;
+    for (int i = 0; i < n; ++i) {
+        if (bf[i]) jb[nb++] = ik::CtlJob{(const uint16_t*) j[i].w, j[i].xf, j[i].y, j[i].n_in, j[i].n_out};
+        else jf[nf++] = j[i];
+    }
+    // STRATA_INK_CTL_SPLIT=2/4/8 (opt-in, another sum order): the down's rows (the calls of <= 256-row jobs) that many
+    // warps a row
+    static const int split = [] { const char* v = getenv("STRATA_INK_CTL_SPLIT"); return v == nullptr ? 1 : std::atoi(v); }();
+    if (nb > 0 && !ik::ctl_mv(jb, nb, nc, ctl_rpb(jb[0].n_out), s, jb[0].n_out <= 256 ? split : 1)) return false;
+    if (nf > 0 && !f32(jf, nf)) return false;
+    return true;
+}
+}  // namespace
+
+// The controllers of physical layer il to BF16 where every value is one (STRATA_INK_CTL_BF16): each tensor's high
+// halves packed into the first half of its own F32 span (the arena keeps its size; the GEMVs read half the bytes),
+// a tensor with any non-zero low half left F32.  STRATA_INK_CTL_CHECK=1: each packed tensor's GEMV (1 and 3 columns)
+// against the F32 one on the same random inputs first, bit for bit, said in the log
+static void ink_ctl_pack(Ink& K, int il, int E, int R) {
+    auto& Ly = K.L[(size_t) il];
+    static const bool chk = [] { const char* v = getenv("STRATA_INK_CTL_CHECK"); return v != nullptr && std::atoi(v) != 0; }();
+    const size_t most = (size_t) 2 * E * R;
+    uint16_t* tmp = nullptr;
+    int* bad = nullptr;
+    float *xs = nullptr, *ya = nullptr, *yb = nullptr;
+    if (cudaMalloc(&tmp, most * 2) != cudaSuccess || cudaMalloc(&bad, sizeof(int)) != cudaSuccess ||
+        (chk && (cudaMalloc(&xs, 3 * (size_t) 2 * E * 4) != cudaSuccess || cudaMalloc(&ya, 3 * (size_t) E * 4) != cudaSuccess ||
+                 cudaMalloc(&yb, 3 * (size_t) E * 4) != cudaSuccess))) {
+        cudaGetLastError();
+        std::fprintf(stderr, "inkling: blk.%d controllers: no scratch for the BF16 rows - kept F32\n", il);
+        cudaFree(tmp); cudaFree(bad); cudaFree(xs); cudaFree(ya); cudaFree(yb);
+        return;
+    }
+    if (chk) {   // (inputs: a fixed LCG in [-1, 1))
+        std::vector<float> hx(3 * (size_t) 2 * E);
+        uint32_t st = 12345u + (uint32_t) il;
+        for (float& v : hx) {
+            st = st * 1664525u + 1013904223u;
+            v = (float) (st >> 8) / 8388608.0f - 1.0f;
+        }
+        cudaMemcpy(xs, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+    }
+    int kept = 0, packed = 0, same = 0, diff = 0;
+    for (int c = 0; c < kCtrl; ++c)
+        for (int r = 0; r < 3; ++r) {
+            const float* w = r == 0 ? Ly.down[c] : r == 1 ? Ly.gain[c] : Ly.forget[c];
+            if (w == nullptr || Ly.bf[c][r]) continue;
+            if (K.packed.count(w) != 0) {   // (a tensor another layer shares: packed already)
+                Ly.bf[c][r] = true;
+                continue;
+            }
+            int n_in = 0, n_out = 0;
+            ctl_shape(r, E, R, n_in, n_out);
+            const size_t n = (size_t) n_in * n_out;
+            int hb = 0;
+            cudaMemset(bad, 0, sizeof(int));
+            ik::ctl_pack(w, tmp, (int64_t) n, bad, 0);
+            if (cudaMemcpy(&hb, bad, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess || hb != 0) {
+                cudaGetLastError();
+                ++kept;
+                continue;
+            }
+            if (chk) {
+                for (int nc = 1; nc <= 3; nc += 2) {
+                    gf::MvJob jf{w, nullptr, xs, ya, nullptr, 1.0f, gf::kTypeF32, n_in, n_out};
+                    const ik::CtlJob jb{tmp, xs, yb, n_in, n_out};
+                    cudaMemset(ya, 0xff, 3 * (size_t) E * 4);
+                    cudaMemset(yb, 0x7f, 3 * (size_t) E * 4);
+                    const bool ok = (nc == 1 ? gf::mv(&jf, 1, 0) : gf::mvn_mv(&jf, 1, nc, 0)) &&
+                                    ik::ctl_mv(&jb, 1, nc, ctl_rpb(n_out), 0);
+                    std::vector<uint32_t> a((size_t) nc * n_out), b2((size_t) nc * n_out);
+                    cudaMemcpy(a.data(), ya, a.size() * 4, cudaMemcpyDeviceToHost);
+                    cudaMemcpy(b2.data(), yb, b2.size() * 4, cudaMemcpyDeviceToHost);
+                    if (ok && a == b2) ++same;
+                    else ++diff;
+                }
+            }
+            cudaMemcpy((void*) w, tmp, n * 2, cudaMemcpyDeviceToDevice);
+            Ly.bf[c][r] = true;
+            K.packed.insert(w);
+            ++packed;
+        }
+    cudaDeviceSynchronize();
+    cudaFree(tmp); cudaFree(bad); cudaFree(xs); cudaFree(ya); cudaFree(yb);
+    K.ctl_packed += packed;
+    K.ctl_kept += kept;
+    if (chk)
+        std::fprintf(stderr, "inkling: blk.%d controllers' BF16 GEMVs against the F32 ones: %d same, %d differ\n", il, same, diff);
+}
+
 void Glm5Model::ink_bind(int il, std::string& missing) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -226,6 +349,7 @@ void Glm5Model::ink_bind(int il, std::string& missing) {
             Ly.gain[c] = f32((b + "gain.weight").c_str());
             Ly.forget[c] = f32((b + "forget.weight").c_str());
         }
+        if (ink_ctl_bf16_on() && missing.empty()) ink_ctl_pack(K, il, g.n_embd, g.ink_rank);
         if (!root) {
             Ly.msg_q = f32("loop_msg_query.weight");
         } else {
@@ -354,6 +478,9 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
         K.side = nullptr;   // (no fork: the projections in one call)
     }
     qwen35_state_ = K.base;   // (qwen35_reset / the snapshot see a fast-path state)
+    if (K.ctl_packed + K.ctl_kept > 0)
+        std::fprintf(stderr, "inkling: CUDA%d the loop controllers' rows BF16 (STRATA_INK_CTL_BF16): %d tensors, %d kept F32 "
+                             "(a value not BF16)\n", dev_, K.ctl_packed, K.ctl_kept);
     std::fprintf(stderr, "inkling: CUDA%d %d layer applications a token (%d physical, layers %d-%d x %d), KV %.2f GB for "
                          "%lld tokens (window layers' rings %lld rows)\n",
                  dev_, NS, g.n_layers, g.ink_lo, g.ink_hi - 1, g.ink_passes, (double) kv_bytes / 1073741824.0,
@@ -456,44 +583,40 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             st.stride = E;
             return st;
         };
+        // a controller's two GEMV launches (fused: ctrl_cat came with the mix, ctrl_apply comes with the norms); the
+        // rows BF16 where ink_ctl_pack packed them (ctl_go: the same sums as the F32 GEMV's)
+        const auto ctrl_mv = [&](int il, int c0, int n) -> bool {
+            const auto& Ly = K.L[(size_t) il];
+            const auto f32 = [&](const gf::MvJob* jj, int m) { return gf::mv(jj, m, s); };
+            gf::MvJob j[8];
+            bool bf[8] = {};
+            for (int c = 0; c < n; ++c) {
+                j[c] = {Ly.down[c0 + c], nullptr, K.cat + (size_t) c * 2 * E, K.lo + (size_t) c * R, nullptr, 1.0f,
+                        gf::kTypeF32, 2 * E, R};
+                bf[c] = Ly.bf[c0 + c][0];
+            }
+            if (!ctl_go(j, bf, n, 1, s, f32)) { err = "inkling: a controller's down"; return false; }
+            for (int c = 0; c < n; ++c) {
+                j[2 * c] = {Ly.gain[c0 + c], nullptr, K.lo + (size_t) c * R, K.cg + (size_t) c * E, nullptr, 1.0f,
+                            gf::kTypeF32, R, E};
+                j[2 * c + 1] = {Ly.forget[c0 + c], nullptr, K.lo + (size_t) c * R, K.cf + (size_t) c * E, nullptr, 1.0f,
+                                gf::kTypeF32, R, E};
+                bf[2 * c] = Ly.bf[c0 + c][1];
+                bf[2 * c + 1] = Ly.bf[c0 + c][2];
+            }
+            if (!ctl_go(j, bf, 2 * n, 1, s, f32)) { err = "inkling: a controller's gain / forget"; return false; }
+            return true;
+        };
         // the controller c of physical layer il: out = control(cur, msg) (cat -> down -> tanh(gain), tanh(forget))
         // controllers c0 .. c0 + n - 1 of physical layer il on n rows at once (cur rows cs apart - 0: one row for all -,
         // msg rows E apart, out rows E apart): out = control(cur, msg) (cat -> down -> tanh(gain), tanh(forget))
         const auto control = [&](int il, int c0, int n, const float* cur, int64_t cs, const float* msg, float* out) -> bool {
-            const auto& Ly = K.L[(size_t) il];
             ik::ctrl_cat(cur, cs, msg, E, E, n, K.cat, s);
-            gf::MvJob j[8];
-            for (int c = 0; c < n; ++c)
-                j[c] = {Ly.down[c0 + c], nullptr, K.cat + (size_t) c * 2 * E, K.lo + (size_t) c * R, nullptr, 1.0f,
-                        gf::kTypeF32, 2 * E, R};
-            if (!gf::mv(j, n, s)) { err = "inkling: a controller's down"; return false; }
-            for (int c = 0; c < n; ++c) {
-                j[2 * c] = {Ly.gain[c0 + c], nullptr, K.lo + (size_t) c * R, K.cg + (size_t) c * E, nullptr, 1.0f,
-                            gf::kTypeF32, R, E};
-                j[2 * c + 1] = {Ly.forget[c0 + c], nullptr, K.lo + (size_t) c * R, K.cf + (size_t) c * E, nullptr, 1.0f,
-                                gf::kTypeF32, R, E};
-            }
-            if (!gf::mv(j, 2 * n, s)) { err = "inkling: a controller's gain / forget"; return false; }
+            if (!ctrl_mv(il, c0, n)) return false;
             ik::ctrl_apply(cur, cs, msg, E, K.cg, K.cf, E, n, out, E, s);
             return true;
         };
-        // (fused: a controller's two GEMV launches; ctrl_cat came with the mix, ctrl_apply comes with the norms)
-        const auto ctrl_mv = [&](int il, int c0, int n) -> bool {
-            const auto& Ly = K.L[(size_t) il];
-            gf::MvJob j[8];
-            for (int c = 0; c < n; ++c)
-                j[c] = {Ly.down[c0 + c], nullptr, K.cat + (size_t) c * 2 * E, K.lo + (size_t) c * R, nullptr, 1.0f,
-                        gf::kTypeF32, 2 * E, R};
-            if (!gf::mv(j, n, s)) { err = "inkling: a controller's down"; return false; }
-            for (int c = 0; c < n; ++c) {
-                j[2 * c] = {Ly.gain[c0 + c], nullptr, K.lo + (size_t) c * R, K.cg + (size_t) c * E, nullptr, 1.0f,
-                            gf::kTypeF32, R, E};
-                j[2 * c + 1] = {Ly.forget[c0 + c], nullptr, K.lo + (size_t) c * R, K.cf + (size_t) c * E, nullptr, 1.0f,
-                                gf::kTypeF32, R, E};
-            }
-            if (!gf::mv(j, 2 * n, s)) { err = "inkling: a controller's gain / forget"; return false; }
-            return true;
-        };
+
         // fused: the FFN's post conv + residual add rides the next mix that reads h (pend: its operands)
         ik::MixTok pend;
         const auto take_pend = [&](ik::MixTok& mt) {
@@ -1008,18 +1131,24 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
             cr.f = W.cf;
             cr.gf_c = (int64_t) TM * E;
             ik::ctrl_cat_n(cr, n, E, T, s);
+            const auto f32 = [&](const gf::MvJob* jj, int m) { return glm_mvn(jj, m, T, s); };
             gf::MvJob j[8];
-            for (int c = 0; c < n; ++c)
+            bool bf[8] = {};
+            for (int c = 0; c < n; ++c) {
                 j[c] = {Ly.down[c0 + c], nullptr, W.cat + (size_t) c * TM * 2 * E, W.lo + (size_t) c * TM * R, nullptr, 1.0f,
                         gf::kTypeF32, 2 * E, R};
-            if (!glm_mvn(j, n, T, s)) { err = "inkling verify: a controller's down"; return false; }
+                bf[c] = Ly.bf[c0 + c][0];
+            }
+            if (!ctl_go(j, bf, n, T, s, f32)) { err = "inkling verify: a controller's down"; return false; }
             for (int c = 0; c < n; ++c) {
                 j[2 * c] = {Ly.gain[c0 + c], nullptr, W.lo + (size_t) c * TM * R, W.cg + (size_t) c * TM * E, nullptr, 1.0f,
                             gf::kTypeF32, R, E};
                 j[2 * c + 1] = {Ly.forget[c0 + c], nullptr, W.lo + (size_t) c * TM * R, W.cf + (size_t) c * TM * E, nullptr,
                                 1.0f, gf::kTypeF32, R, E};
+                bf[2 * c] = Ly.bf[c0 + c][1];
+                bf[2 * c + 1] = Ly.bf[c0 + c][2];
             }
-            if (!glm_mvn(j, 2 * n, T, s)) { err = "inkling verify: a controller's gain / forget"; return false; }
+            if (!ctl_go(j, bf, 2 * n, T, s, f32)) { err = "inkling verify: a controller's gain / forget"; return false; }
             ik::ctrl_apply_n(cr, n, E, T, s);
             return true;
         };
@@ -1463,11 +1592,20 @@ bool gemm16(const Glm5Model::Hy4PromptIo& io, const WSlot& w, int N, int Kd, con
     }
     return true;
 }
-// Y[t][N] = X[t][Kd] (ldx) . W[N][Kd]^T in F32 (the controllers' F32 rows)
-bool gemm32(const Glm5Model::Hy4PromptIo& io, const float* W, int N, int Kd, const float* X, int ldx, float* Y, int Tn,
-            std::string& err) {
+// Y[t][N] = X[t][Kd] (ldx) . W[N][Kd]^T in F32 (the controllers' F32 rows; bf: W holds them as BF16 - widened back
+// to the same F32 values in the weight scratch first, so the SGEMM is the one it was)
+bool gemm32(const Glm5Model::Hy4PromptIo& io, const float* W, bool bf, int N, int Kd, const float* X, int ldx, float* Y,
+            int Tn, cudaStream_t s, std::string& err) {
     if (Tn <= 0) return true;
     const float one = 1.0f, zero = 0.0f;
+    if (bf) {
+        if (io.w16 == nullptr || io.w16_elems < 2 * (int64_t) N * Kd) {
+            err = "inkling prompt: the weight scratch is smaller than a controller's rows";
+            return false;
+        }
+        ik::ctl_unpack((const uint16_t*) W, (float*) io.w16, (int64_t) N * Kd, s);
+        W = (const float*) io.w16;
+    }
     return blas_ok(cublasSgemm((cublasHandle_t) io.blas, CUBLAS_OP_T, CUBLAS_OP_N, N, Tn, Kd, &one, W, Kd, X, ldx, &zero,
                                Y, N),
                    "sgemm", err);
@@ -1632,9 +1770,9 @@ bool Glm5Model::ink_prompt_layer(int ia, int64_t p0, int T, const Hy4PromptIo& i
         }
         const auto control = [&](int c, const float* cur, int64_t cs, const float* msg, int64_t ms, float* out) -> bool {
             ik::ctrl_cat(cur, cs, msg, ms, E, tn, B.cat, s);
-            if (!gemm32(io, Ly.down[c], R, 2 * E, B.cat, 2 * E, B.lo, tn, err) ||
-                !gemm32(io, Ly.gain[c], E, R, B.lo, R, B.cg, tn, err) ||
-                !gemm32(io, Ly.forget[c], E, R, B.lo, R, B.cf, tn, err))
+            if (!gemm32(io, Ly.down[c], Ly.bf[c][0], R, 2 * E, B.cat, 2 * E, B.lo, tn, s, err) ||
+                !gemm32(io, Ly.gain[c], Ly.bf[c][1], E, R, B.lo, R, B.cg, tn, s, err) ||
+                !gemm32(io, Ly.forget[c], Ly.bf[c][2], E, R, B.lo, R, B.cf, tn, s, err))
                 return false;
             ik::ctrl_apply(cur, cs, msg, ms, B.cg, B.cf, E, tn, out, E, s);
             return true;
