@@ -11,6 +11,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ### Fixed
 
+- `--prefill 0` on a discrete card that holds every expert keeps them all in VRAM. The pool stopped at one slot per
+  expert, and each layer's three spare slots came out of those, so three experts a layer stayed in RAM (Inkling 2
+  Mini on an RTX 5090: 72 experts, 99.4-99.9% VRAM hits); the spares now get their own slots when they fit, as with
+  `--prefill auto`'s prompt tail on top. Inkling 2 Mini prose, `--prefill 0`: 182.4 -> 188.8 tok/s, same tokens bit
+  for bit. `--prefill auto` (the server's default) and unified memory are unchanged.
 - A prompt chunk given by hand (`--prefill N` / `STRATA_GLM_PREFILL=N`) is held to 32768 tokens, the auto limit, with
   a `NOTE:` line on stderr. Many prompt kernels carry the chunk's token count in their grid's y/z size, whose limit is
   65535: a chunk of 65536 tokens or more (possible on a large-VRAM or unified-memory box) failed those launches.
