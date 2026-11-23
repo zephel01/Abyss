@@ -29,6 +29,14 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   `inkling2_loop` files with per-layer mixed stock llama.cpp types. Unsloth's Inkling DSpark drafter fits them too;
   setup names it when it is on disk where `--model inkling2mini` keeps it (greedy answers the same tokens, md5 checked).
 
+- `STRATA_INK_FP4ACT=1` / `2` (opt-in, lossy; default `0` = the exact path, same bits): Inkling 2 Mini prompts on
+  CUDA sm_120 (RTX 50 series) multiply the NVFP4 experts with FP4 activations on the block-scaled FP4 tensor cores
+  (`mma.sync ... kind::mxf4nvf4`) - one FP4 term a value (`1`) or two (`2`: the first term's residual quantized the
+  same way, about 8 bits) - with gate/up, the experts' scales and the SwiGLU in one product. RTX 5090, UD-Q4_K_XL,
+  16K prompt: 9,075 -> 13,122 tok/s (`1`) / 11,798 (`2`). Prompt-path KL against the llama.cpp Q8_0 reference:
+  0.0056 exact, 0.0141 (`1`), 0.0059 (`2`; the Japanese segment 0.0059 -> 0.0077). HIP and other GPUs keep the exact
+  path.
+
 ### Changed
 
 - **Inkling 2 Mini's verify window** gives each of its 8 columns its own expert scratch set, so 7- and 8-wide windows

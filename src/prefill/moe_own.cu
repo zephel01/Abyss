@@ -1227,4 +1227,96 @@ void Context::down(const Set& s, int type, int64_t n_embd, int64_t n_ff, size_t 
     run<false>(s, type, a, tiles_, (cudaStream_t) stream);
 }
 
+// ---------------------------------------------------------------- FP4 activations (STRATA_INK_FP4ACT, opt-in, lossy)
+#if !defined(__HIPCC__)
+}  // namespace strata::prefill::own
+#include <cuda_fp8.h>
+namespace strata::prefill::own {
+#include "moe_fp4.cuh"
+
+bool fp4_built() {
+    static const bool on = [] {
+        if (device_cc() != 120) return false;   // (sm_120 only: GB10's sm_121 has its own code, not built here)
+        int* d = nullptr;
+        int h = 0;
+        if (cudaMalloc(&d, sizeof(int)) != cudaSuccess) return false;
+        fp4::has_kernel<<<1, 1>>>(d);
+        const bool ok = cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess;
+        cudaFree(d);
+        cudaGetLastError();
+        return ok && h == 1;   // (the binary has sm_120a code: the block-scaled MMA)
+    }();
+    return on;
+}
+size_t fp4_act_bytes(int64_t rows, int64_t cols, int terms) {
+    return (size_t) terms * ((size_t) rows * (size_t) (cols / 2) + (size_t) rows * (size_t) (cols / 16));
+}
+bool fp4_usable(int64_t rows_out, int64_t K) { return rows_out % fp4::kTM == 0 && K % 128 == 0 && K <= 4096; }
+void fp4_quantize(const float* x, const int32_t* ids, void* xq, float* row_scale, int64_t cols, int64_t ld, int64_t rows,
+                  int terms, void* stream, const Fp4Fold* fold) {
+    if (rows <= 0) return;
+    const bool search = true;   // (the last term's block scale of the least squared error: KL 0.0153 -> 0.0141, 0.0063 -> 0.0059)
+    fp4::quant_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
+        x, ids, (uint8_t*) xq, row_scale, (int) cols, ld, rows, terms, search, fold ? fold->ids : nullptr,
+        fold ? fold->pos : nullptr, fold ? fold->k : 0, fold ? fold->nv : nullptr, fold ? fold->row_base : 0);
+    ck(cudaGetLastError(), "fp4 quantize");
+}
+namespace {
+template <int TERMS, int TN, int NST, bool GLU> void fp4_launch(const fp4::Args& a, int tiles, cudaStream_t s) {
+    constexpr int smem = fp4::Smem<TERMS, TN>::stage * NST;
+    static_assert(!GLU || smem >= 4 * 2 * (TN / 16) * 4 * 32 * 4, "fp4: the GLU exchange fits the stages");
+    static bool set = false;
+    if (!set) {
+        ck(cudaFuncSetAttribute(fp4::gemm_kernel<TERMS, TN, NST, GLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "fp4 smem");
+        set = true;
+    }
+    fp4::gemm_kernel<TERMS, TN, NST, GLU><<<dim3((unsigned) (a.N / (GLU ? fp4::kTM / 2 : fp4::kTM)), (unsigned) tiles), 256, smem, s>>>(a);
+    ck(cudaGetLastError(), "fp4 gemm");
+}
+}  // namespace
+bool Context::fp4(const Set& s, const float* row_scale, int terms, int64_t rows_out, int64_t K, size_t off, void* stream,
+                  bool glu, size_t up_off, float limit) {
+    if (s.n <= 0 || s.rows <= 0) return true;
+    if (!fp4_usable(rows_out, K) || (terms != 1 && terms != 2) || ((((uintptr_t) s.w + off) | s.stride | up_off) & 3) != 0)
+        return false;
+    constexpr int TN = 128;
+    for (int e0 = 0; e0 < s.n; e0 += fp4::kMaxSet) {   // (the tile prefix rides in the arguments: kMaxSet experts a launch)
+        const int n = std::min(s.n - e0, fp4::kMaxSet);
+        fp4::Args a{};
+        a.w = (const uint8_t*) s.w + off + (size_t) e0 * s.stride;
+        a.stride = s.stride;
+        a.bounds = s.bounds + e0;
+        a.n = n;
+        a.row0 = s.row0;
+        a.xq = (const uint8_t*) s.xq;
+        a.rs = row_scale;
+        a.rows = s.rows;
+        a.K = (int) K;
+        a.N = (int) rows_out;
+        a.dst = s.dst;
+        a.ld = s.ld;
+        a.up_off = up_off;
+        a.limit = limit;
+        int t = 0;
+        for (int e = 0; e < n; ++e) {
+            a.tiles[e] = t;
+            t += (s.host_bounds[e0 + e + 1] - s.host_bounds[e0 + e] + TN - 1) / TN;
+        }
+        a.tiles[n] = t;
+        if (t == 0) continue;
+        if (terms == 1)
+            glu ? fp4_launch<1, TN, 2, true>(a, t, (cudaStream_t) stream) : fp4_launch<1, TN, 2, false>(a, t, (cudaStream_t) stream);
+        else
+            glu ? fp4_launch<2, TN, 2, true>(a, t, (cudaStream_t) stream) : fp4_launch<2, TN, 2, false>(a, t, (cudaStream_t) stream);
+    }
+    return true;
+}
+#else   // (HIP: no FP4 tensor cores here - the exact path)
+bool fp4_built() { return false; }
+size_t fp4_act_bytes(int64_t, int64_t, int) { return 0; }
+bool fp4_usable(int64_t, int64_t) { return false; }
+void fp4_quantize(const float*, const int32_t*, void*, float*, int64_t, int64_t, int64_t, int, void*, const Fp4Fold*) {}
+bool Context::fp4(const Set&, const float*, int, int64_t, int64_t, size_t, void*, bool, size_t, float) { return false; }
+#endif
+
 }  // namespace strata::prefill::own
