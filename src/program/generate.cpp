@@ -2270,7 +2270,7 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
         if (!reading.empty() && decoding_any && clk::now() < owed_until && !quitting) continue;   // (the decode's share)
         if (!reading.empty()) {
             // the oldest prompt, but a short one (what is left of it fits one chunk) goes first: a follow-up question
-            // must not wait behind another request's 32K context (it waited 9.4 s).  A long prompt's chunks keep their
+            // must not wait behind another request's 32K context (it waited 7-9 s).  A long prompt's chunks keep their
             // boundaries (they start where it was read up to), so its answer does not change
             size_t pick = 0;
             for (size_t i = 0; i < reading.size(); ++i) {

@@ -1080,8 +1080,11 @@ safetensors からそのまま読む。詳しくは [docs/exl3/README.md](exl3/R
 
 既定ではサーバーはリクエストを 1 本ずつ答え、残りは待たせる。Inkling 2 Mini（全 expert が VRAM）では、エンジンが
 複数をまとめて動かせる: 実行設定に `"parallel": 4`（または `args` に `--parallel 4`。`"auto"` は全 expert が VRAM に
-残る範囲で最大 8）。リクエストごとに自分の lane（KV キャッシュと短い畳み込みの状態、`--max-context` 16K トークンあたり
-約 0.97 GB）を起動時に確保するので、混んできてから VRAM が足りなくなることはない。N 本を超えたリクエストは待ち行列（先着順）に入る。
+残る範囲で最大 8。それより大きい N はそこまで減らす: expert が VRAM の外に出ると答えが変わるため）。リクエストごとに
+自分の lane（KV キャッシュと短い畳み込みの状態、`--max-context` 16K トークンあたり約 0.97 GB）を起動時に確保するので、
+混んできてから VRAM が足りなくなることはない。N 本を超えたリクエストは待ち行列（先着順）に入る。32 GB のカードで
+16K トークンなら 8 本、40960 なら 4 本。短いプロンプトは長いプロンプトの残りより先に読むので、短い質問が他の
+リクエストの 32K の文脈の後ろで待たされることはない。
 
 目安（RTX 5090、UD-Q4_K_XL、greedy、512 トークン。Abyss-tools の `bench/batch/drive.py`）:
 
@@ -1097,6 +1100,7 @@ safetensors からそのまま読む。詳しくは [docs/exl3/README.md](exl3/R
 | エージェントの 8K 文脈 2 本（0.3 s 差）+ 短い質問 | 99-125 | 0.15 / 1.5 / 0.8 s | 158 ms |
 | 同じ 8K の会話の次のターン（lane が会話を保持） | 191 | 0.18 s | 5 ms |
 | 3 本中 1 本を 50 トークンでキャンセル | 125-127（残り 2 本） | - | 48 ms |
+| 40960 トークン・4 本: 16K の文脈、0.5 s 後に 32K、1 s 後に短い質問 | 65 / 139 / 42 | 2.4 / 7.9 / 1.5 s | 209 ms（32K を読んでいる間） |
 
 全リクエストの合計: 同時 2 本 252 tok/s、4 本 342、8 本 453（1 本だけ 196）。
 
@@ -1499,7 +1503,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_INK_WIN_GRAPH` | 1 | Inkling 2 Mini の verify window（`STRATA_INK_DRAFT` / `STRATA_INK_DSPARK`）: 窓の 48 回の層の適用と head を、（幅, attention の split の格子）ごとに 1 本の CUDA graph で流す。同じ kernel を同じ順に（結果は bit まで同じ）。キーごとに 6 回目の窓の後で記録する（記録 1 回で約 13 ms）。split の格子は 2 のべき乗に切り上げ（最小 8）、長い文脈でも graph は少なくて済む。プロファイルの印、dump、エキスパートの先読み、expert helper、画像の行があるときは使わない。`0`: kernel を 1 本ずつ起動 |
 | `STRATA_INK_WIN_CAP_AFTER` | 6 | graph のキーごとに、記録する前に 1 本ずつ起動する verify window の数（`STRATA_INK_WIN_GRAPH`。記録 1 回で約 13 ms） |
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini のプロンプト（CUDA、sm_80 以降）: プロンプト経路の attention をテンソルコアの kernel で（トークンのブロック x キーのタイル、FP16 の積を F32 で足す、相対バイアスは FP16 2 つに分けて F32 相当、窓の外のタイルは飛ばす）。attention のサブバッチは 2,048 行（`STRATA_INK_PREFILL_SUB` で変えられる）。RTX 5090、UD-Q4_K_XL で 8K プロンプト 3,784 → 6,874 tok/s、165K 765 → 5,298。足す順番と q / P の FP16 丸めでビットは変わるが、llama.cpp に対する KL は変わらない。`0`: トークン経路の kernel で 1 行ずつ、サブバッチ 512 行（前のビット）。AMD は常にこちら |
-| `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini、`--serve`: まとめて decode するリクエストの数（`N`、または `auto`: 全 expert が VRAM に残り 3 GB 余る範囲で最大 8）。実行設定の `"parallel"`。[複数のリクエストを同時に](#複数のリクエストを同時にparallelinkling-2-miniベータ) を参照 |
+| `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini、`--serve`: まとめて decode するリクエストの数（`N`、または `auto`: 全 expert が VRAM に残り、3 GB とプロンプト経路の領域が余る範囲で最大 8。それより大きい `N` はそこまで減らす）。実行設定の `"parallel"`。[複数のリクエストを同時に](#複数のリクエストを同時にparallelinkling-2-miniベータ) を参照 |
 | `STRATA_PAR_CHUNK` | プロンプト経路の chunk | `"parallel"` が 2 以上: 他のリクエストが decode 中のとき、decode の合間に読むプロンプトのトークン数（`STRATA_PAR_PREFILL_MB` 2048 の 32 GB のカードで 1,280）。小さくすると走っているストリームの止まる時間が短くなり、プロンプトは遅くなる。また長いプロンプトの区切りがほかの decode の有無で変わるので、答えの最後のビットも変わりうる |
 | `STRATA_PAR_SHARE` | 0.5 | `"parallel"` が 2 以上: プロンプトの chunk のあと、その chunk にかかった時間のこの割合だけ走っているリクエストを decode してから次の chunk へ（0: chunk の間に decode 1 ステップ） |
 | `STRATA_PAR_PREFILL_MB` | 2048 | `"parallel"` が 2 以上: プロンプト経路専用の VRAM 領域（MB）を起動時に確保し、expert pool の尾を借りない。借りると尾の expert が RAM へ行って戻り、その間ほかのリクエストが待った（40 トークンのプロンプトで約 150 ms）。0: 1 本のときと同じく借りる |

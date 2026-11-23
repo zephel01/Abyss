@@ -501,8 +501,11 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
     }
     qwen35_state_ = K.base;   // (qwen35_reset / the snapshot see a fast-path state)
     // ---- the batched decode's lanes (--parallel N / auto, STRATA_INK_PARALLEL): lane 0 the slots above, each further
-    // lane the same slots in its own allocation, before the expert pool takes what is left.  auto: as many as leave
-    // every expert in VRAM with 3 GB to spare (the prompt path's buffers, the verify window, the graphs), at most 8
+    // lane the same slots in its own allocation, before the expert pool takes what is left.  As many as leave every
+    // expert in VRAM with 3 GB to spare (the verify window, the graphs, the pool's spare slots) besides the prompt
+    // path's own region (STRATA_PAR_PREFILL_MB), at most 8 - auto that many, a larger --parallel N is cut to it: with
+    // an expert outside VRAM the requests' answers change (measured: 5 lanes at 40960 tokens left the pool at 128 of
+    // 128 slots a layer with 584 experts in RAM, and every answer differed from the one alone)
     {
         size_t lane_b = 0;
         for (int sl = 0; sl < NS; ++sl)
@@ -517,9 +520,15 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
         }
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const size_t spare = (size_t) 3 << 30;
+        const char* pmb = getenv("STRATA_PAR_PREFILL_MB");
+        const long own_mb = want == 1 ? 0 : pmb != nullptr ? std::max(0L, std::atol(pmb)) : 2048L;
+        const size_t spare = ((size_t) 3 << 30) + ((size_t) own_mb << 20);
         const int fit = free_b > expert_b + spare ? (int) std::min<size_t>(64, (free_b - expert_b - spare) / std::max<size_t>(1, lane_b)) : 0;
-        if (want < 0) n = std::max(1, fit);
+        n = want < 0 ? fit : std::min(want, fit);
+        if (want > 1 && fit < want)
+            std::fprintf(stderr, "NOTE: --parallel %d: %d lane%s (more would push experts out of VRAM and change the "
+                                 "answers; a smaller --max-context leaves room for more)\n", want, std::max(1, fit),
+                         fit == 1 ? "" : "s");
         n = std::max(1, std::min(n, kVerifyMax));
         K.lanes.assign(1, Ink::Lane{});
         K.lanes[0].S = K.S;
@@ -548,8 +557,7 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
         if (want != 1 || ink_par_ > 1)
             std::fprintf(stderr, "inkling: CUDA%d %d parallel lane%s (%s; %.2f GB of caches each for %lld tokens; every "
                                  "expert in VRAM leaves room for %d)%s\n", dev_, ink_par_, ink_par_ == 1 ? "" : "s",
-                         want < 0 ? "auto" : "--parallel", (double) lane_b / 1073741824.0, (long long) ctx, fit,
-                         want > fit ? " - the expert pool will not hold every expert" : "");
+                         want < 0 ? "auto" : "--parallel", (double) lane_b / 1073741824.0, (long long) ctx, fit, "");
     }
     if (K.ctl_packed + K.ctl_kept > 0)
         std::fprintf(stderr, "inkling: CUDA%d the loop controllers' rows BF16 (STRATA_INK_CTL_BF16): %d tensors, %d kept F32 "

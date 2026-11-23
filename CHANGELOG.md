@@ -18,7 +18,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   A new request joins at once (its prompt is read between decode steps, in 1,024-token chunks with half of each chunk's
   time given back to the running streams), a cancelled request ends alone, each request's lane keeps its conversation
   for the next turn, and every lane is allocated at start (no out-of-memory later; a request beyond N waits in the
-  queue). The server's `/slots` and `/props` report N slots. RTX 5090, UD-Q4_K_XL, 512 tokens: one request 196 tok/s; 2 at once 127-129 each (252 together), 4 at once 90-92 (342), 8 at once 58-61 (453); a new request's first token 0.01-0.3 s while others run, and the running streams' longest pause 8-54 ms (164 ms while an 8K prompt is read). Default 1:
+  queue). The server's `/slots` and `/props` report N slots. RTX 5090, UD-Q4_K_XL, 512 tokens: one request 196 tok/s; 2 at once 127-129 each (252 together), 4 at once 90-92 (342), 8 at once 58-61 (453); a new request's first token 0.01-0.3 s while others run, and the running streams' longest pause 8-54 ms (164 ms while an 8K prompt is read). The lane count is cut to what leaves every expert in VRAM (an expert outside it
+  changes the answers): 8 at 16K tokens, 4 at 40960 on a 32 GB card. A short prompt is read before the rest of a long one
+  (a question 1 s after a 32K context: first token 9.4 s -> 1.5 s). Default 1:
   unchanged. Not with the drafters, images, per-request uncensor switches or penalties (see the manual).
 
 ### Changed
