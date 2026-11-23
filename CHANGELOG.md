@@ -9,6 +9,24 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- **Inkling 2 Mini abliterated (orcarouter's Mix GGUFs).** `./setup-deepseek.sh --model inkling2mini-abl` sets up
+  [orcarouter/Inkling-2-Mini-abliterated-GGUF](https://huggingface.co/orcarouter/Inkling-2-Mini-abliterated-GGUF):
+  `Mix-16G` (15.7 GB, the default) or `--quant Mix-12G` (11.6 GB), both all in VRAM on a 16-24 GB GPU. They are
+  `inkling2_loop` files with per-layer mixed stock llama.cpp types. Unsloth's Inkling DSpark drafter fits them too;
+  setup names it when it is on disk where `--model inkling2mini` keeps it (greedy answers the same tokens, md5 checked).
+
+### Fixed
+
+- **Inkling Mix-16G stopped at load** with `unresolved weights: blk.N.ffn_down_exps.scale`: an NVFP4 expert tensor's
+  second-level scale was required on both expert tensors of the layer. Mix-16G has NVFP4 gate/up with its scale over
+  IQ4_NL / Q5_1 down experts without one. Each scale is now looked up on its own; an NVFP4 tensor without its scale is
+  still refused.
+- **Mix-16G prompts ran token by token** (7 layers with NVFP4 gate/up over Q5_1 down: the prompt path covered neither
+  pair). Q5_1 experts now go through the prompt MMQ in a layer the FP16 path cannot take whole. RTX 3090, 7,217-token
+  prompt: ~100 -> 1,700-1,930 tok/s. Layers and models the prompt path already took keep their kernels and bits.
+
 ## v1.3.196 - 2026-11-23
 
 Inkling 2 Mini is faster with the same tokens: the loop controllers as BF16 and the depth-attention mix in one launch

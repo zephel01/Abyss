@@ -276,6 +276,16 @@ class InkDSparkStep(unittest.TestCase):
         f.write_bytes(b"GGUF")
         self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], str(f))
 
+    def test_the_abliterated_model_uses_unsloths_drafter(self):
+        # (--model inkling2mini-abl: orcarouter's repo has no drafter; unsloth's folder beside it serves it)
+        self.put()
+        self.mdir = self.mdir.parents[2] / "orcarouter" / "Inkling-2-Mini-abliterated-GGUF" / "Mix-16G"
+        self.mdir.mkdir(parents=True)
+        self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], str(self.dst))
+        m = A.MODELS["inkling2mini-abl"]
+        self.assertEqual(m["prefix_tmpl"].format(q=m["quant"]), "Inkling-2-Mini-abliterated-Mix-16G.")
+        self.assertIn("Mix-12G", m["quants"])
+
     def test_a_config_that_names_one_keeps_it_and_no_dspark_takes_it_out(self):
         conf = json.loads(self.cfg.read_text(encoding="utf-8"))
         conf["env"]["STRATA_INK_DSPARK"] = "/elsewhere/d.gguf"

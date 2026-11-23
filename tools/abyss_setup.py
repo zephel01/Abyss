@@ -12,6 +12,8 @@
     ./setup-deepseek.sh --model laguna       Laguna-S-2.1 (poolside, 118B-A8B), unsloth's UD-IQ4_XS for a 16-32 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model inkling2mini  Inkling 2 Mini (Thinking Machines, 128x1.8B looped MoE), unsloth's UD-Q4_K_XL
                                              for a 12-32 GB GPU + 32 GB RAM (text only)
+    ./setup-deepseek.sh --model inkling2mini-abl  the same model abliterated, orcarouter's Mix-16G (--quant Mix-12G: the
+                                             11.6 GB file) for a 12-24 GB GPU + 32 GB RAM (text only)
     ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for an 8 GB+ GPU (FFN partly in RAM under ~20 GB)
     ./setup-deepseek.sh --model qwen35-9b-qsa  Qwen3.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model ornith-9b-qsa  Ornith-1.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
@@ -43,8 +45,8 @@ What it does:
   6. the run config abyss-<name>.json and the start script run-abyss-<name>.sh in the Abyss folder
   7. the DSpark drafter (V4 only; asked when the config is new, or --dspark): bleysg's GGUF of DeepSeek's block drafter into
      <data>/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF, its path in the config's env (STRATA_DS4_DSPARK)
-     (inkling2mini: unsloth's dspark-Inkling-2-Mini-Q8_0.gguf, not downloaded - when it is on disk, its path in the
-     config's env, STRATA_INK_DSPARK; --no-dspark takes it out)
+     (inkling2mini / inkling2mini-abl: unsloth's dspark-Inkling-2-Mini-Q8_0.gguf, not downloaded - when it is on
+     disk, its path in the config's env, STRATA_INK_DSPARK; --no-dspark takes it out)
   8. the Abyss-tools folder (abyss.sh start / stop / status / update / log / models) from ops/abyss-tools/
 
 The data folder defaults to Abyss-data beside Abyss, the tools folder to Abyss-tools beside it.  The helpers (the PC
@@ -202,6 +204,14 @@ MODELS = {
                      "folder": "", "prefix_tmpl": "Inkling-2-Mini-{q}.", "model_name": "inkling-2-mini",
                      "prefix": "inkling2mini", "title": "Inkling 2 Mini", "env": {}, "gb": 18, "pack_args": [],
                      "sampling": {"temperature": 1.0, "top_k": 50}},
+    # Inkling 2 Mini abliterated (orcarouter, 2026-11-24): the same inkling2_loop layout with mixed stock llama.cpp types
+    # (Mix-16G: NVFP4 / IQ4_XS / Q5_K gate_up over IQ4_NL / Q5_1 down; Mix-12G: IQ2_XXS..IQ3_S gate_up over IQ4_NL down),
+    # one file a quant at the repo's top level.  All in VRAM on a 16-24 GB GPU; unsloth's drafter fits it too
+    "inkling2mini-abl": {"repo": "orcarouter/Inkling-2-Mini-abliterated-GGUF", "quant": "Mix-16G",
+                         "quants": ("Mix-16G", "Mix-12G"), "folder": "", "prefix_tmpl": "Inkling-2-Mini-abliterated-{q}.",
+                         "model_name": "inkling-2-mini-abliterated", "prefix": "inkling2mini-abl",
+                         "title": "Inkling 2 Mini abliterated", "env": {}, "gb": 16, "pack_args": [],
+                         "sampling": {"temperature": 1.0, "top_k": 50}},
     # Qwen3.8-27B (a dense qwen35: every layer a dense FFN, no experts): unsloth's GGUFs, one file a quant at the repo's
     # top level, NextN drafter from the file.  This first version runs the whole file in one GPU's VRAM (no RAM tier,
     # no layer split): "vram" is the GPU size each context needs (dense_context).  2026-11-12, RTX 5090, UD-Q4_K_XL:
@@ -677,8 +687,11 @@ def ink_dspark_step(a, mdir: Path, cfg: Path, gpus, backend: str) -> None:
     if backend != "cuda" or len(gpus) > 1:
         S.ok("DSpark drafter: NVIDIA and one GPU only")
         return
+    # (the abliterated model's repo has no drafter: unsloth's, where --model inkling2mini keeps it, serves it too)
+    ud = mdir.parents[2] / "unsloth" / "Inkling-2-Mini-GGUF"
     found = next((p for p in (mdir.parent / "dspark" / INK_DSPARK_NAME, mdir.parent / INK_DSPARK_NAME,
-                              mdir / INK_DSPARK_NAME) if p.is_file()), None)
+                              mdir / INK_DSPARK_NAME, ud / "dspark" / INK_DSPARK_NAME, ud / INK_DSPARK_NAME)
+                  if p.is_file()), None)
     if found is None:
         S.ok(f"DSpark drafter: off - put unsloth's {INK_DSPARK_NAME} (the repo's dspark/ folder) in "
              f"{mdir.parent / 'dspark'} and run setup again, or name it in the config's env (STRATA_INK_DSPARK)")
@@ -1113,10 +1126,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1143,7 +1156,7 @@ def main() -> int:
                     "the config: drafts checked a step at a time, ~+28%% on swe-bench tasks on an AI PRO R9700 (~6.5 GB "
                     "of VRAM; one GPU, DeepSeek V4 Flash 0731). Asked when the config is new")
     ap.add_argument("--no-dspark", action="store_true", help="turn the DSpark drafter off in the config (the file stays; "
-                    "inkling2mini: its drafter, turned on when the file is on disk)")
+                    "inkling2mini / inkling2mini-abl: its drafter, turned on when the file is on disk)")
     ap.add_argument("--dflash", action="store_true", help="(qwen38) download the DFlash 2 drafter (0.65 GB) and turn it on "
                     "in the config instead of the MTP layer: faster code and lists, slower prose (docs/MANUAL.md, "
                     "Qwen3.8-Flash-Next); one GPU.  (qwen38-27b) set up its DFlash 2 drafter (1.14 GB) also where it does "
@@ -1217,9 +1230,10 @@ def main() -> int:
     elif a.model == "laguna":
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: a 16 GB GPU + 64 GB RAM holds every expert; "
              "less reads from the SSD)")
-    elif a.model == "inkling2mini":
-        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: all in VRAM on a 24-32 GB GPU; a 12-16 GB "
-             "GPU + 32 GB RAM holds the rest in RAM)")
+    elif a.model in ("inkling2mini", "inkling2mini-abl"):
+        gb = {"Mix-12G": 12}.get(quant, model["gb"])   # (the abliterated Mix-12G: 11.6 GB, all in VRAM on a 16 GB GPU)
+        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{gb} GB: all in VRAM on a {16 if gb < 17 else 24}-32 GB GPU; "
+             "a 12-16 GB GPU + 32 GB RAM holds the rest in RAM)")
     elif a.model == "ornith35":
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: VRAM + RAM hold it all on an 8-16 GB GPU + "
              "32 GB RAM PC)")
@@ -1328,7 +1342,7 @@ def main() -> int:
         S.ok("DSpark drafter: off - zephel01's V4 GGUFs run faster without it on a discrete GPU (--dspark turns it on)")
     elif a.model == "v4":
         dspark_step(a, data, cfg, fresh, had, gpus, backend)
-    elif a.model == "inkling2mini":
+    elif a.model in ("inkling2mini", "inkling2mini-abl"):
         ink_dspark_step(a, mdir, cfg, gpus, backend)
     else:
         S.ok("DSpark drafter: set up for DeepSeek V4 only" + (" (V4.1: by hand, docs/deepseek41/README.md)" if a.model == "v41"
