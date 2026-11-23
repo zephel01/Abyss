@@ -41,6 +41,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   DSpark). RTX 5090, UD-Q4_K_XL, server, median of 3: 16K prompt prose 8343 -> 9074 tok/s (+8.8%), code 8383 -> 9083
   (+8.4%), 2,048 tokens 6845 -> 7278 (+6.3%), 512 tokens 3303 -> 3386 (+2.5%); shorter prompts keep the old launches.
   `STRATA_INK_MIX1=0` turns this off too. HIP keeps the old launches.
+- Prompts: each MoE layer's plan tables (a few KB) go to the GPU through a kernel that reads them host-mapped instead
+  of a copy. The copy queued on the single host-to-device copy engine behind the prestage copies still running for
+  that layer, so the GPU and the CPU lane both waited ~60 ms a layer, and the staging ring then stalled behind the
+  resident experts. GLM-5.3-Flash (Maya-S-v2 IQ2_XXS) 16K prompt on an RTX 5090 at Gen4 x4: 1591 -> 1779 tok/s
+  (+11.8%); DeepSeek V4 0731 and V4.1 unchanged (their adaptive prestage leaves little in flight). Same output bits.
+  `STRATA_GLM_PREFILL_PLAN_COPY=1` restores the copies.
 
 ## v1.3.195 - 2026-11-23
 

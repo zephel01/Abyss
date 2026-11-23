@@ -1655,8 +1655,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     }
     if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_counts, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
-        cudaHostAlloc((void**) &S->h_base, 4096 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**) &S->h_bounds, 8192 * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
+        cudaHostAlloc((void**) &S->h_base, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc((void**) &S->h_bounds, 8192 * sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "glm prefill: CUDA%d pinned staging did not allocate - token by token\n", dev_);
         prefill_destroy();
@@ -5796,10 +5796,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 psrc.push_back(S->pbuf + (size_t) (-1 - seeds[q].src) * P.stride);
             }
         if (!pidx.empty()) seed_down(pidx, S->ev_pready);
-        cudaMemcpyAsync(M.base, S->h_base, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, s);
-        cudaMemcpyAsync(M.bounds, S->h_bounds, (size_t) nb * sizeof(int), cudaMemcpyHostToDevice, s);
-        if (n_light > 0)
-            cudaMemcpyAsync(M.bounds + kLightOff, h_light, (size_t) 3 * n_light * sizeof(int), cudaMemcpyHostToDevice, s);
+        // the plan's tables go up as a kernel reading them host-mapped, not as copies: a copy queues on the one
+        // host-to-device copy engine behind the prestage copies still running (the mixer shorter than them), and the
+        // scatter, the products and the CPU lane's x waited for it - GLM-5.3 16K: ~60 ms a layer with the GPU idle,
+        // then the staging ring stalled behind the residents.  The same bytes.  STRATA_GLM_PREFILL_PLAN_COPY=1: copies
+        static const bool plan_copy = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_PLAN_COPY");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (plan_copy) {
+            cudaMemcpyAsync(M.base, S->h_base, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, s);
+            cudaMemcpyAsync(M.bounds, S->h_bounds, (size_t) nb * sizeof(int), cudaMemcpyHostToDevice, s);
+            if (n_light > 0)
+                cudaMemcpyAsync(M.bounds + kLightOff, h_light, (size_t) 3 * n_light * sizeof(int), cudaMemcpyHostToDevice, s);
+        } else {
+            strata::kernels::copy_i32_from_mapped(M.base, S->h_base, NE, s);
+            strata::kernels::copy_i32_from_mapped(M.bounds, S->h_bounds, nb, s);
+            if (n_light > 0) strata::kernels::copy_i32_from_mapped(M.bounds + kLightOff, h_light, 3 * n_light, s);
+        }
         if (n_light > 0 && xact) {
             if (S->xl_ptrs_d == nullptr &&
                 !glmfast::cuda_ok(cudaMalloc((void**) &S->xl_ptrs_d, (size_t) kLightMax * sizeof(unsigned long long)),
