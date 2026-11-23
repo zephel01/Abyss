@@ -9,6 +9,16 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+- **GPUs by UUID.** A config's `"gpu"` (and the server's `--gpu`) also takes a card's UUID or a unique start of it
+  (`"gpu": ["GPU-88044da7"]`, as `nvidia-smi -L` prints it; AMD: `rocm-smi --showuniqueid`), besides the numbers,
+  which keep working. GPU numbers follow the PCI bus order and move when a card is attached or removed: an RTX 3090 on
+  USB4 at bus 03 became number 0 and `"gpu": [0]` ran on it instead of the RTX 5090 at bus c5. The new
+  `abyss --list-gpus` prints every card's number, UUID, PCI address and name from the runtime itself; the launchers
+  turn a UUID into today's number with it at every start and set `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` by
+  number as before (a UUID no card has, or one that matches several, stops the start with the cards found). The
+  engine names each card it runs on at start: `CUDA0 = NVIDIA GeForce RTX 5090 (UUID GPU-88044da7, PCI
+  0000:c5:00.0)`. Setup still writes numbers. AMD on Windows: whether the driver reports a UUID is unchecked.
+
 ## v1.3.195 - 2026-11-23
 
 Setup turns on Inkling 2 Mini's DSpark drafter again when its file is on disk: with v1.3.194's verify window graph it

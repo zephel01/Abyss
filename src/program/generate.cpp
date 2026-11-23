@@ -54,6 +54,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/logpos.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/gpu_ident.hpp"
 #include "strata/program/conv_slots.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -360,6 +361,8 @@ void usage() {
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
+                 "  --list-gpus          list this PC's GPUs (index, UUID, PCI bus id, name; CUDA in PCI bus order)\n"
+                 "                       and end - the launchers turn a config's GPU UUID into the index with it\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --glm-pack DIR       a GLM-5.3-Flash pack (M3.1): the verified Glm5Model runner behind the\n"
                  "                       same wire contract (T <id> / DONE; --serve reads GEN lines)\n"
@@ -4052,6 +4055,8 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    for (int i = 1; i < argc; ++i)   // (before anything touches the GPU: the cards, and nothing else)
+        if (std::strcmp(argv[i], "--list-gpus") == 0) return strata::program::list_gpus();
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -4359,6 +4364,16 @@ int main(int argc, char** argv) {
         if (env_mb != nullptr && mb != env_mb)
             std::fprintf(stderr, "NOTE: --vram-reserve-mib %s overrides STRATA_GLM_RESERVE_MB=%s\n", mb.c_str(), env_mb);
         set_env("STRATA_GLM_RESERVE_MB", mb.c_str());
+    }
+    // which card each device number is - the numbers move when a card is attached or removed, the UUID does not: CUDA0,
+    // and with a layer split or helper caches every visible device (the launchers leave visible only the config's)
+    {
+        int n_vis = 0;
+        if (cudaGetDeviceCount(&n_vis) != cudaSuccess) n_vis = 0;
+        cudaGetLastError();
+        const bool several = !o.layer_split.empty() || !o.split_device.empty() || o.expert_cache_remote[0] > 0 ||
+                             o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        for (int d = 0; d < (several ? n_vis : std::min(n_vis, 1)); ++d) strata::program::print_gpu_line(d);
     }
     // ---- the glm5-next pack path (M3.1): BEFORE every qwen4exp-shaped check below (this driver's
     // session/graph machinery is qwen4exp's; a GLM pack runs the verified Glm5Model runner instead,

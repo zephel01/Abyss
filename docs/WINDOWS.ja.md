@@ -277,7 +277,8 @@ Select-String -Path build-hip\build.ninja -Pattern "mmq-instance-q4_k" -Context 
 
 - **iGPU レーンはありません。** RAM 段のエキスパートは CPU が計算します。Ryzen AI Max に単体のカードをつないだ場合も同じです。
 - **GPU の番号** は ROCm の `hipInfo` の番号です。`"gpu_pci"` は使いません。カードを足したり外したりしたら、セットアップをもう一度
-  実行してください。
+  実行してください。`"gpu"` にはカードの UUID も書けます（`build-hip\abyss.exe --list-gpus` で一覧が出ます）。ただし Windows の
+  AMD ドライバが UUID を返すかはまだ確かめていません。返さないカードは一覧で `-` と出るので、番号で指定してください。
 - **`--bench` の `PCIe ?`。** Windows では AMD のカードの PCIe のリンクを読めません（#43、#47、#49）。ベンチのほかの部分は使えます。
 - **`HSA_OVERRIDE_GFX_VERSION`** は Linux の設定で、Windows では何もしません。
 - **Ryzen AI Max だけで動かす場合:** Windows は iGPU にメモリを決まった量だけ割り当てます。その量が Windows 側の RAM より少ないと

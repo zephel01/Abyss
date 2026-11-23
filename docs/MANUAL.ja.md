@@ -354,6 +354,13 @@ LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin/libggml-base.so \
 サーバーのオプション: `--host 0.0.0.0` でほかのマシンからの接続を受け付ける（必ず `--api-key <secret>` も付ける）、
 `--open` でブラウザを開く、`--gpu 0` で GPU を選ぶ。
 
+**どのカードで動くか。** GPU の番号は PCI バスの順で、カードを付けたり外したりすると変わる（バス番号の若い USB4 / OCuLink の
+カードが先になる）。設定の `"gpu"`（と `--gpu`）には、カードの UUID（1 枚に決まれば先頭だけでよい）も書ける:
+`"gpu": ["GPU-88044da7"]`（UUID は `nvidia-smi -L` で表示される。AMD は `rocm-smi --showuniqueid`）。
+`build/abyss --list-gpus` は、エンジンから見える全カードの番号・UUID・PCI アドレス・名前を表示する。サーバーは起動のたびに
+これで UUID を今の番号に直す（どのカードにもない UUID なら、見つかったカードを示して起動を止める）。エンジンのログには、
+使うカードごとに `CUDA0 = NVIDIA GeForce RTX 5090 (UUID GPU-88044da7, PCI 0000:c5:00.0)` の行が出る。セットアップは今のところ番号を書く。
+
 ## 使い方
 
 - **ブラウザ:** `http://127.0.0.1:8082/` でチャット、エキスパートの配置と GPU のモニター、設定。

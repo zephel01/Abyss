@@ -359,6 +359,14 @@ GPU, then every expert is read into the VRAM and RAM tiers (about 20 s at 4 GB/s
 Server options: `--host 0.0.0.0` to accept other machines (always with `--api-key <secret>`), `--open` opens the page
 in the browser, `--gpu 0` picks the GPU.
 
+**Which card is which.** GPU numbers follow the PCI bus order, and they move when a card is attached or removed (a
+USB4 / OCuLink card at a lower bus number comes first). `"gpu"` in the config (and `--gpu`) also takes a card's UUID,
+or a unique start of it: `"gpu": ["GPU-88044da7"]` (`nvidia-smi -L` prints the UUIDs; AMD: `rocm-smi
+--showuniqueid`). `build/abyss --list-gpus` lists every card the engine sees with its number, UUID, PCI address and
+name; the server turns the UUID into today's number with it at every start (a UUID no card has stops the start with
+the cards found). The engine's log names each card it runs on: `CUDA0 = NVIDIA GeForce RTX 5090 (UUID GPU-88044da7,
+PCI 0000:c5:00.0)`. Setup still writes numbers.
+
 ## Using it
 
 - **Browser:** `http://127.0.0.1:8082/` - chat, a live monitor of the expert tiers and the GPU, settings.

@@ -758,6 +758,9 @@ def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
     sel = cfg.get("gpu")
+    if isinstance(sel, list) and any(isinstance(x, str) and not x.strip().isdigit() for x in sel):
+        import serve.server as SV                        # (a card named by UUID: its number now)
+        sel = SV.gpu_list(cfg)
     gl = [gpu_info(i) or {} for i in sel] if isinstance(sel, list) else [gpu_info(sel) or {}]
     g = {"name": " + ".join(x.get("name", "?") for x in gl), "vram_gb": sum(x.get("vram_gb", 0) for x in gl)}
     a = cfg.get("args", [])
