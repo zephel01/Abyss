@@ -282,7 +282,9 @@ The `FLAGS =` line of the second must contain `-O3`.
 
 - **No iGPU lane.** The CPU computes the RAM-tier experts, also with a Ryzen AI Max beside a discrete card.
 - **GPU numbers** are those of ROCm's `hipInfo`. `"gpu_pci"` is not used. After adding or removing a card, run the
-  setup again.
+  setup again. A card can also be named by its UUID in `"gpu"` (`build-hip\abyss.exe --list-gpus` lists them);
+  whether AMD's driver on Windows reports one is not checked yet - a card without one is listed with `-` and is named
+  by its number.
 - **`PCIe ?` in `--bench`.** The PCIe link cannot be read for an AMD card on Windows (#43, #47, #49). The rest of the
   benchmark works.
 - **`HSA_OVERRIDE_GFX_VERSION`** is a Linux setting; it does nothing on Windows.

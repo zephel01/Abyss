@@ -1397,14 +1397,115 @@ def trained_context(model_dir) -> int | None:
         return None
 
 
-def gpu_list(cfg: dict) -> list[int]:
-    """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
-    numbers them; [] when it names none."""
+class GpuSelectError(ValueError):
+    """A config's "gpu" names a card by UUID that this PC does not have (or that matches several)."""
+
+
+def _uuid_key(s: str) -> str:
+    """A GPU UUID as compared: lower case, without "GPU-" / "0x" and dashes (nvidia-smi -L prints GPU-88044da7-d824-...,
+    rocm-smi --showuniqueid 0x1f5e..., rocminfo / the engine GPU-1f5e...: the same card's id either way)."""
+    t = str(s).strip().lower()
+    for p in ("gpu-", "0x"):
+        if t.startswith(p):
+            t = t[len(p):]
+    return t.replace("-", "")
+
+
+def parse_gpu_listing(text: str) -> list[dict]:
+    """`abyss --list-gpus`'s rows: index <tab> uuid <tab> pci <tab> name (lines starting with # are comments; uuid
+    "-" when the card reports none)."""
+    out = []
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        f = line.rstrip("\r\n").split("\t")
+        if len(f) < 4 or not f[0].strip().isdigit():
+            continue
+        out.append({"index": int(f[0]), "uuid": "" if f[1].strip() == "-" else f[1].strip(),
+                    "pci": f[2].strip(), "name": f[3].strip()})
+    return out
+
+
+def describe_gpus(devices: list[dict]) -> str:
+    return "\n".join(f"  {d['index']}: {d['name']}  UUID {d['uuid'] or '(none reported)'}  PCI {d['pci']}"
+                     for d in devices) or "  (no GPU found)"
+
+
+def resolve_gpu_items(items: list, devices: list[dict] | None) -> list[int]:
+    """The config's "gpu" entries as the index the visible-devices variable takes: an index as it is; a UUID (or a
+    unique prefix of one) as the index of the one listed card it names.  `devices` is the engine's listing (None: not
+    readable)."""
+    out = []
+    for x in items:
+        if isinstance(x, int) or str(x).strip().isdigit():
+            out.append(int(x))
+            continue
+        want = _uuid_key(x)
+        if devices is None:
+            raise GpuSelectError(f'the config names GPU "{x}" by UUID, but the engine could not list this PC\'s GPUs '
+                                 f'(abyss --list-gpus): use its number instead ("gpu": [0])')
+        hits = [d for d in devices if want and d["uuid"] and _uuid_key(d["uuid"]).startswith(want)]
+        if len(hits) == 1:
+            out.append(hits[0]["index"])
+            continue
+        what = "matches several GPUs" if hits else "matches no GPU on this PC"
+        none = "" if any(d["uuid"] for d in devices) or not devices else (
+            "\n  (these cards report no UUID - AMD on Windows may not: name the card by its number)")
+        raise GpuSelectError(f'the config\'s GPU "{x}" {what}; the GPUs found:\n{describe_gpus(devices)}{none}')
+    return out
+
+
+def list_gpus(exe: str, lib_dirs=None) -> list[dict] | None:
+    """This PC's GPUs as the engine numbers them (`abyss --list-gpus`: the runtime's own listing, CUDA in PCI bus
+    order); None when the engine does not run.  Read fresh every time: cards come and go between runs."""
+    env = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")}
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    dirs = [d for d in lib_dirs or [] if Path(d).is_dir()]
+    if dirs:
+        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+        env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+    try:
+        r = subprocess.run([str(exe), "--list-gpus"], env=env, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_gpu_listing(r.stdout) if r.returncode == 0 else None
+
+
+_GPU_RESOLVED: dict = {}   # (this process only: a new run lists the cards again)
+
+
+def gpu_items(cfg: dict) -> list:
+    """The config's "gpu" entries as written: ints, and UUID strings."""
     g = cfg.get("gpu")
-    if g is None or g == "":
+    if g is None or g == "" or g is False:
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
-    return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+    return [x if isinstance(x, int) else str(x).strip() for x in items if str(x).strip() != ""]
+
+
+def gpu_by_uuid(cfg: dict) -> bool:
+    """Whether the config names any GPU by UUID."""
+    return any(not (isinstance(x, int) or str(x).isdigit()) for x in gpu_items(cfg))
+
+
+def gpu_list(cfg: dict) -> list[int]:
+    """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
+    numbers them (PCI bus order); [] when it names none.  An entry may also be the card's UUID or a unique prefix of
+    it ("GPU-88044da7", nvidia-smi -L; AMD: rocm-smi --showuniqueid), which names the same card when others are
+    attached or removed: the engine's listing turns it into today's number (GpuSelectError when it names none)."""
+    items = gpu_items(cfg)
+    if not gpu_by_uuid(cfg):
+        return [int(x) for x in items]
+    key = (str(cfg.get("exe")), tuple(map(str, items)))
+    if key not in _GPU_RESOLVED:
+        devices = list_gpus(cfg["exe"], cfg.get("lib_dirs")) if cfg.get("exe") else None
+        _GPU_RESOLVED[key] = resolve_gpu_items(items, devices)
+        if devices:
+            by = {d["index"]: d for d in devices}
+            for x, i in zip(items, _GPU_RESOLVED[key]):
+                if not (isinstance(x, int) or str(x).isdigit()):
+                    print(f"[abyss] GPU {x} is {(by.get(i) or {}).get('name', '?')} (number {i} now)", flush=True)
+    return list(_GPU_RESOLVED[key])
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -1457,7 +1558,7 @@ def hip_gpu_list(cfg: dict) -> list[int]:
     buses): setup also writes their PCI addresses ("gpu_pci"), which name the same cards whatever their numbers."""
     gpus = gpu_list(cfg)
     want = cfg.get("gpu_pci")
-    if not want:
+    if not want or gpu_by_uuid(cfg):    # (a UUID names the card itself: already this boot's number)
         return gpus
     nodes = amd_gpu_nodes()
     by_pci = {g["pci"]: g["index"] for g in nodes}
@@ -4225,7 +4326,8 @@ def main() -> int:
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
-                                  "(\"0,2\"; also \"gpu\" in the config)")
+                                  "(\"0,2\"), or a card's UUID / a unique prefix of it (\"GPU-88044da7\", nvidia-smi -L); "
+                                  "also \"gpu\" in the config")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
@@ -4243,6 +4345,11 @@ def main() -> int:
     apply_server_env(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    if a.engine == "strata" and cfg:
+        try:                                            # a GPU named by UUID: this PC's number for it, or why not
+            gpu_list(cfg)
+        except GpuSelectError as e:
+            ap.error(str(e))
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: the port, bound now - /health
         httpd = bind_early(a.host, a.port, {            # says "loading" and how far until the engine is ready

@@ -165,7 +165,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 
 | Key | Meaning | Example |
 | --- | --- | --- |
-| `gpu` | the GPU number(s); several split the layers (the first is the main card) | `[0]`, `[0, 1]` |
+| `gpu` | the GPU number(s); several split the layers (the first is the main card). An entry may also be the card's UUID or a unique start of it (`nvidia-smi -L` prints it; AMD: `rocm-smi --showuniqueid`; `build/abyss --list-gpus` lists every card with its number, UUID and PCI address): a number moves when a card is attached or removed (a USB4 card at a lower PCI bus comes first), the UUID does not. Setup writes numbers | `[0]`, `[0, 1]`, `["GPU-88044da7"]` |
 | `layer_split` | with several GPUs, the first layer of each later GPU's share; default `"auto"` | `"18"`, `"16,32"` |
 | `backend` | `"hip"` for AMD; left out for NVIDIA | `"hip"` |
 | `gpu_pci` | AMD: the GPUs' PCI addresses, so the same cards are used when a reboot renumbers them (setup writes it) | `["0000:c7:00.0"]` |

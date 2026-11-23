@@ -9,6 +9,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- **GPUs by UUID.** A config's `"gpu"` (and the server's `--gpu`) also takes a card's UUID or a unique start of it
+  (`"gpu": ["GPU-88044da7"]`, as `nvidia-smi -L` prints it; AMD: `rocm-smi --showuniqueid`), besides the numbers,
+  which keep working. GPU numbers follow the PCI bus order and move when a card is attached or removed: an RTX 3090 on
+  USB4 at bus 03 became number 0 and `"gpu": [0]` ran on it instead of the RTX 5090 at bus c5. The new
+  `abyss --list-gpus` prints every card's number, UUID, PCI address and name from the runtime itself; the launchers
+  turn a UUID into today's number with it at every start and set `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` by
+  number as before (a UUID no card has, or one that matches several, stops the start with the cards found). The
+  engine names each card it runs on at start: `CUDA0 = NVIDIA GeForce RTX 5090 (UUID GPU-88044da7, PCI
+  0000:c5:00.0)`. Setup still writes numbers. AMD on Windows: whether the driver reports a UUID is unchecked.
+
 ### Fixed
 
 - A layer split of a qwen35-family model (Ornith, Qwen3.5) reuses the conversation in the model again: a chat's next
@@ -56,8 +68,9 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   the first table's rows ready 836-1,038 -> 616-807 us a token, decode median 64.0 -> 65.4 tok/s. Same outputs.
   `STRATA_DS41_ENGRAM_PROF=1` (diagnostic) prints the background reader's timings every 256 tokens.
 - `STRATA_GLM_HC3_V41` is read on NVIDIA too (default off there, on with HIP as before): `1` runs DeepSeek V4.1's
-  mHC read as hc3 on CUDA. RTX 5090, V4.1 JA256, p4k + 512 tokens, n-gram drafts off: decode median 65.1 -> 67.9 tok/s (+4%), but the KL on the
-  8 held-out sequences went up on 7 of 8 (mean 0.3815 -> 0.3839), so it stays opt-in. Documented in the manual.
+  mHC read as hc3 on CUDA. RTX 5090, V4.1 JA256, p4k + 512 tokens, n-gram drafts off: decode median 65.1 -> 67.9
+  tok/s (+4%), but the KL on the 8 held-out sequences went up on 7 of 8 (mean 0.3815 -> 0.3839), so it stays opt-in.
+  Documented in the manual.
 
 ## v1.3.195 - 2026-11-23
 

@@ -1548,7 +1548,7 @@ def refresh_engine(cfg: dict) -> None:
             warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
             return
         pc = {"rocm": str(root), "archs": meta["archs"],
-              "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
+              "gpus": [{"index": i} for i in cfg_gpus(cfg) or [0]]}
         if WIN and meta.get("lib_dirs"):
             pc["rocm_bin"] = meta["lib_dirs"][0]
         compile_engine_hip(pc, llama, src, soft=True)
@@ -1559,7 +1559,7 @@ def refresh_engine(cfg: dict) -> None:
         warn("the compiler or llama.cpp's source it was built with is gone: starting the engine compiled before "
              f"({ME} --setup --rebuild compiles it again)")
         return
-    gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
+    gpu_ids = meta.get("gpu_ids") or cfg_gpus(cfg) or [0]
     compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True)
 
 
@@ -2130,7 +2130,7 @@ def gpu_link_driver(cfg: dict, found: dict) -> tuple[str, str]:
     driver.  NVIDIA: nvidia-smi's maximum link (the current one trains down to Gen1 when the card is idle, so it is no
     key); AMD: the narrowest maximum on the way from the card to its root port (sysfs), the amdgpu module's version.
     "?" where there is no card or no tool - the key then says so, and two "?" match each other."""
-    sel = list(cfg.get("gpu") or [])
+    sel = cfg_gpus(cfg)
     links, drivers = [], []
     if cfg.get("backend") == "hip":
         for pci in cfg.get("gpu_pci") or []:
@@ -2156,7 +2156,7 @@ def hardware_key(cfg: dict) -> str:
     and an OCuLink x4, or a driver update, changes what the tuning measured (Maya #419's idea), and the old result was
     reused as if nothing had changed."""
     found = {g["index"]: g for g in S.gpus() or []}
-    sel = [found.get(i) or {} for i in cfg.get("gpu") or []]
+    sel = [found.get(i) or {} for i in cfg_gpus(cfg)]
     a = cfg.get("args") or []
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a[:-1] else "?"
     quant = (cfg.get("installer") or {}).get("quant") or cfg.get("model_name", "?")
@@ -2246,7 +2246,7 @@ def busy_gpus(cfg: dict) -> list:
             used[int(i)] = int(float(m))
         except ValueError:
             pass
-    return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
+    return [(i, used[i]) for i in cfg_gpus(cfg) if used.get(i, 0) > 1024]
 
 
 def calibrate_config(cfg_path: Path) -> bool:
@@ -2348,9 +2348,10 @@ def gpu_tune(a) -> int:
     if a.gpus or a.gpu is not None:
         gpus = [int(g) for g in str(a.gpus or a.gpu).split(",") if g.strip().isdigit()]
     else:
-        gpus = sorted({int(g) for p in cfgs for g in (read_json(p).get("gpu") or [0])}) or [0]
+        gpus = sorted({g for p in cfgs for g in (cfg_gpus(read_json(p)) or [0])}) or [0]
     cfg0 = read_json(cfgs[0]) if cfgs else {}
     env = {k: v for k, v in os.environ.items() if k not in GPU_TUNE_KEYS}   # (the engine's own choice, not an override)
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"            # --device N as nvidia-smi and the configs number the cards
     for k, v in (cfg0.get("env") or {}).items():
         if k in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
             env[k] = str(v)
@@ -2380,7 +2381,7 @@ def gpu_tune(a) -> int:
     changed = []
     for p in cfgs:
         c = read_json(p)
-        on = [int(x) for x in c.get("gpu") or [0]]
+        on = cfg_gpus(c) or [0]
         if not all(x in results for x in on):
             continue
         want = {}
@@ -3330,6 +3331,16 @@ def os_name() -> str:
     if WIN:
         name = f"Windows {platform.version()}"
     return name + (" (WSL)" if S.is_wsl() else "")
+
+
+def cfg_gpus(cfg: dict) -> list[int]:
+    """The config's GPUs as numbers (serve/server.py's gpu_list: a UUID entry turned into this PC's number now); a UUID
+    that names no card stops here with the cards found."""
+    import serve.server as SV
+    try:
+        return SV.gpu_list(cfg)
+    except SV.GpuSelectError as e:
+        fail(str(e), 'name the card by one of the UUIDs above, or by its number ("gpu": [0])')
 
 
 def check_gpus(cfg: dict) -> list:
