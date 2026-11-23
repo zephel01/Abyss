@@ -9,33 +9,52 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.197 - 2026-11-24
+
+Inkling 2 Mini serves several requests at once (opt-in `"parallel"`, beta): on an RTX 5090 one request 196 tok/s, 4 at
+once 90-92 each (342 together), 8 at once 58-61 (453), every concurrent answer the same as the request alone (md5).
+orcarouter's Inkling-2-Mini-abliterated Mix GGUFs run (`--model inkling2mini-abl`; Mix-16G's load and prompt path
+fixed). `STRATA_INK_FP4ACT=2` (opt-in, lossy, RTX 50) takes Inkling's 16K prompt 9,075 -> 11,798 tok/s at KL 0.0059
+(exact 0.0056). The defaults give the same bits as v1.3.196 (Inkling 6 prompts x 3 modes, 7-config md5 check).
+
 ### Added
 
 - **Several requests at once (Inkling 2 Mini, beta, opt-in).** `"parallel": N` in the run config (or `--parallel N` /
   `auto`) lets the engine decode up to 8 requests together: one pass through the weights a step serves every running
   request, each row computing exactly what that request computes alone - every concurrent answer is bit for bit its
-  answer alone (md5 checked on every request of the measurements), and a request alone runs the usual token path.
-  A new request joins at once (its prompt is read between decode steps, in 1,024-token chunks with half of each chunk's
-  time given back to the running streams), a cancelled request ends alone, each request's lane keeps its conversation
-  for the next turn, and every lane is allocated at start (no out-of-memory later; a request beyond N waits in the
-  queue). The server's `/slots` and `/props` report N slots. RTX 5090, UD-Q4_K_XL, 512 tokens: one request 196 tok/s; 2 at once 127-129 each (252 together), 4 at once 90-92 (342), 8 at once 58-61 (453); a new request's first token 0.01-0.3 s while others run, and the running streams' longest pause 8-54 ms (164 ms while an 8K prompt is read). The lane count is cut to what leaves every expert in VRAM (an expert outside it
-  changes the answers): 8 at 16K tokens, 4 at 40960 on a 32 GB card. A short prompt is read before the rest of a long one
-  (a question 1 s after a 32K context: first token 9.4 s -> 1.5 s). Default 1:
-  unchanged. Not with the drafters, images, per-request uncensor switches or penalties (see the manual).
+  answer alone (md5 checked on every request of the measurements), and a request alone runs the usual token path. A
+  new request joins at once (its prompt is read between decode steps, in the prompt path's chunks with half of each
+  chunk's time given back to the running streams), a cancelled request ends alone, each request's lane keeps its
+  conversation for the next turn, and every lane is allocated at start (no out-of-memory later; a request beyond N
+  waits in the queue). The server's `/slots` and `/props` report N slots. RTX 5090, UD-Q4_K_XL, 512 tokens: one
+  request 196 tok/s; 2 at once 127-129 each (252 together), 4 at once 90-92 (342), 8 at once 58-61 (453); a new
+  request's first token 0.01-0.3 s while others run, and the running streams' longest pause 8-54 ms (164 ms while an
+  8K prompt is read). The lane count is cut to what leaves every expert in VRAM (an expert outside it changes the
+  answers): 8 at 16K tokens, 4 at 40960 on a 32 GB card. A short prompt is read before the rest of a long one (a
+  question 1 s after a 32K context: first token 1.5 s, 9.4 s in arrival order). A prompt longer than the prompt path's
+  chunk (1,280 tokens on a 32 GB card) is read in those chunks, so its answer can differ in the last bits from
+  `"parallel": 1` (one 32K piece; only the sum order differs, as with another `--prefill` chunk) - and is the same
+  alone or among others. Default 1: unchanged. Not with the drafters, images, per-request uncensor switches or
+  penalties (see the manual).
 
 - **Inkling 2 Mini abliterated (orcarouter's Mix GGUFs).** `./setup-deepseek.sh --model inkling2mini-abl` sets up
   [orcarouter/Inkling-2-Mini-abliterated-GGUF](https://huggingface.co/orcarouter/Inkling-2-Mini-abliterated-GGUF):
   `Mix-16G` (15.7 GB, the default) or `--quant Mix-12G` (11.6 GB), both all in VRAM on a 16-24 GB GPU. They are
   `inkling2_loop` files with per-layer mixed stock llama.cpp types. Unsloth's Inkling DSpark drafter fits them too;
-  setup names it when it is on disk where `--model inkling2mini` keeps it (greedy answers the same tokens, md5 checked).
+  setup names it when it is on disk where `--model inkling2mini` keeps it (greedy answers the same tokens, md5
+  checked). RTX 5090, code 512 tokens: Mix-16G 194.5 tok/s (DSpark 275.4), Mix-12G 215.2 (287.7); a 7,217-token prompt
+  7,265 / 7,787 tok/s. KL against the original model's Q8_0 0.112 (16G) / 0.130 (12G) is the abliteration's: llama.cpp
+  on the same files gives 0.113 / 0.129, and Abyss against llama.cpp on the same file is 0.0117 / 0.0071.
 
-- `STRATA_INK_FP4ACT=1` / `2` (opt-in, lossy; default `0` = the exact path, same bits): Inkling 2 Mini prompts on
-  CUDA sm_120 (RTX 50 series) multiply the NVFP4 experts with FP4 activations on the block-scaled FP4 tensor cores
-  (`mma.sync ... kind::mxf4nvf4`) - one FP4 term a value (`1`) or two (`2`: the first term's residual quantized the
-  same way, about 8 bits) - with gate/up, the experts' scales and the SwiGLU in one product. RTX 5090, UD-Q4_K_XL,
-  16K prompt: 9,075 -> 13,122 tok/s (`1`) / 11,798 (`2`). Prompt-path KL against the llama.cpp Q8_0 reference:
-  0.0056 exact, 0.0141 (`1`), 0.0059 (`2`; the Japanese segment 0.0059 -> 0.0077). HIP and other GPUs keep the exact
-  path.
+- **FP4 activations for Inkling 2 Mini prompts (opt-in, lossy).** `STRATA_INK_FP4ACT=1` / `2` (default `0` = the exact
+  path, the same bits as before): prompts on CUDA sm_120 (RTX 50 series) multiply the NVFP4 experts with FP4
+  activations on the block-scaled FP4 tensor cores (`mma.sync ... kind::mxf4nvf4`) - one FP4 term a value (`1`) or two
+  (`2`: the first term's residual quantized the same way, about 8 bits) - with gate/up, the experts' scales and the
+  SwiGLU in one product. RTX 5090, UD-Q4_K_XL, server, 16K prompt, median of 6: 9,075 -> 13,122 tok/s (`1`, +45%) /
+  11,798 (`2`, +30%). Prompt-path KL against the llama.cpp Q8_0 reference (3,071 positions): 0.0056 exact, 0.0141
+  (`1`), 0.0059 (`2`; the Japanese third 0.0059 -> 0.0077, and on three Japanese-only texts `2` is 0.0048 off the
+  exact path, as on mixed text). Hidden-test coding 5/5, 8K / 32K needles and Japanese answers alike on all three. `2`
+  is the one to use; decode, the verify window and DSpark are unchanged. HIP and other GPUs keep the exact path.
 
 ### Changed
 
