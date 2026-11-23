@@ -7853,7 +7853,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "dspark: the context commit";
         return false;
     }
-    if (inkd_ != nullptr && !inkd_commit(p, 1, false, F->cs)) {
+    if (inkd_ != nullptr && !inkd_tok_end(p, F->cs)) {
         err = "ink dspark: the context commit";
         return false;
     }

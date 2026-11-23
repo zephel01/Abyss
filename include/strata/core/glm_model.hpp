@@ -827,7 +827,14 @@ public:
     void inkd_report() const;
     // rows of tap `visit` (5, 23, 41 the residual entering that application, 48 the head's row - normed with norm_w
     // when not null): n rows ld floats apart, the token path's / a window's columns 0..n-1 or a prompt chunk's T = n
-    void ink_tap(int visit, const float* x, int64_t ld, int n, const float* norm_w, bool prompt, cudaStream_t s);
+    // (pend: a single token's tap - its row the deferred rows' next, from the device word inkd_tok_begin sets)
+    void ink_tap(int visit, const float* x, int64_t ld, int n, const float* norm_w, bool prompt, cudaStream_t s,
+                 bool pend = false);
+    // the single tokens' rows deferred (STRATA_INK_DSPARK_DEFER): inkd_tok_begin before the token's taps, inkd_tok_end
+    // after them (the old per-token commit when off); inkd_flush commits the deferred rows (a draft, a window, a prompt)
+    void inkd_tok_begin(int64_t p, const int64_t* pos_d);   // (pos_d: the token graph's position word, else null)
+    bool inkd_tok_end(int64_t p, cudaStream_t s);
+    bool inkd_flush();
     bool inkd_commit(int64_t p0, int n, bool prompt, cudaStream_t s);
     void inkd_settle(int64_t pos = -1);   // (the kept columns: up to pos, default pos_)
     void inkd_window(int64_t p0, int T);

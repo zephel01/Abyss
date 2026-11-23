@@ -439,6 +439,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
                        !(F->expert_helper && F->expert_helper->active) && split_next_ == nullptr &&
                        next_port_ == nullptr && getenv("GLM_DUMP_H") == nullptr;
     const int64_t* pdv = graph ? K.pos_d : nullptr;
+    inkd_tok_begin(p, pdv);   // (the drafter's rows deferred: this token's row - from the graph's position word)
     const auto run = [&]() -> bool {
         int nb = 0;                // the next free residual buffer
         int visit = 0;             // (the layer applications in order: the DSpark drafter's taps 5 / 23 / 41)
@@ -520,7 +521,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             const bool swa = Ly.swa;
             if (inkd_ != nullptr && (visit == 5 || visit == 23 || visit == 41)) {
                 flush_pend();   // (the tap reads the residual entering the application: the deferred add first)
-                ink_tap(visit, h, E, 1, nullptr, false, s);
+                ink_tap(visit, h, E, 1, nullptr, false, s, true);
             }
             ++visit;
             const float* gm[3] = {swa ? Ly.attn_norm : Ly.qn, swa ? Ly.attn_norm : Ly.kn, swa ? Ly.attn_norm : Ly.vn};
@@ -791,7 +792,7 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             ik::mix(states(blocks, h), K.out_rq, 1, E, 1, K.mixo, s);
             gf::rms_q8(K.mixo, nullptr, K.out_norm, g.norm_eps, E, F->head_x, F->head_xq, s);
         }
-        if (inkd_ != nullptr) ink_tap(48, F->head_x, E, 1, nullptr, false, s);   // (the drafter's tap 48)
+        if (inkd_ != nullptr) ink_tap(48, F->head_x, E, 1, nullptr, false, s, true);   // (the drafter's tap 48)
         if (F->prof_on) F->mark("q35_head");
         return true;
     };
@@ -951,6 +952,7 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
     Ink::Win& W = *K.win;
     if (T < 1 || T > TM) { err = "inkling verify: the window's width"; return false; }
     ink_win_commit(p0);   // (an earlier window not settled: its columns before p0 kept)
+    if (!inkd_flush()) { err = "ink dspark: the deferred rows' commit"; return false; }
     ink_win_p0_ = p0;
     ink_win_T_ = T;
     const auto slot_save = [&](int sl, int part) {   // (part 0 K, 1 V, 2 attn post, 3 ffn post)
@@ -1292,7 +1294,11 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
                                          F->cpu_plan, fast_skip_from(0), fast_skip_w(0), sig);
         // (a key's first windows as launches: a capture costs ~13 ms - RTX 5090, ~1,450 nodes - and a replay saves
         // ~0.6, so a width seen a few times only is not captured)
-        constexpr int kCapAfter = 6;
+        // STRATA_INK_WIN_CAP_AFTER=<n> (default 6): the windows of a key launched before its capture
+        static const int kCapAfter = [] {
+            const char* v = getenv("STRATA_INK_WIN_CAP_AFTER");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 6;
+        }();
         auto it = K.wgraphs.find(key);
         if (it == K.wgraphs.end()) {
             if (K.wgraphs.size() >= 128) K.wgraphs.clear();

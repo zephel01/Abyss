@@ -25,6 +25,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - The DSpark gate (`STRATA_INK_DSPARK_GATE`) ends a measure early as a loss when its first 4 drafted steps run below
   0.85 of the single token's rate (`STRATA_INK_DSPARK_GATE_EARLY`), and steps that captured a CUDA graph are left out
   of the cost tables and the gate. `STRATA_INK_DSPARK_GATE_LOG=1` prints each measure.
+- The DSpark drafter's context rows of single tokens are deferred (`STRATA_INK_DSPARK_DEFER`, default on): they wait
+  in its accumulators (up to 64 rows, the token graph's taps write the row from its position word) and are committed
+  in one pass before the next draft, verify window or prompt chunk, instead of ~12 small launches behind every token.
+  The same rows, the same drafts (dump compared position by position), the same tokens (md5). Where the gate rests the
+  drafter the commits mostly go (RTX 5090, deterministic prose 175.1 -> 176.3 tok/s); the drafter loaded but resting
+  still costs ~0.8% (deterministic prose 179.0 -> 177.6: its four taps in the token graph). Test knobs:
+  `STRATA_INK_DSPARK_GATE_FIRST`, `STRATA_INK_DSPARK_GATE_AFTER0`, `STRATA_INK_WIN_CAP_AFTER` (as before by default).
 
 ## v1.3.193 - 2026-11-23
 

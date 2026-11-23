@@ -26,6 +26,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include "strata/qtypes.hpp"
 
@@ -90,6 +91,14 @@ struct IkState {
     uint64_t acc_gen = 0;            // (acc_g reallocated: the token graphs that write it are captured again)
     int tap_n = 0, tap_ng = 0, tap_nl = 0;   // the rows being accumulated: all, layer 1's (last), the others' (last)
     bool tap_prompt = false;
+    // the deferred single tokens' rows (STRATA_INK_DSPARK_DEFER): positions pend_p0 .. pend_p0 + pend_n - 1 in the
+    // accumulators' rows 0 .. pend_n - 1; roff_d the next token's row (its taps read it)
+    bool defer = false;
+    int64_t pend_p0 = 0;
+    int pend_n = 0;
+    int64_t* roff_d = nullptr;       // (roff_d[0]: the row, launches one by one; roff_d[1]: pend_p0, the graphs' base)
+    const int64_t *tap_pa = nullptr, *tap_pb = nullptr;   // the token's taps' row: *tap_pa - *tap_pb (tap_pb null: 0)
+    uint64_t flushes = 0;
     // a commit's pass
     float *cf = nullptr, *kk = nullptr, *vv = nullptr;
     void* cq = nullptr;
@@ -188,9 +197,12 @@ __global__ void __launch_bounds__(256) k_rms(const float* __restrict__ x, int64_
 // mix) of row r - (n - nl); j == 0 sets them
 __global__ void __launch_bounds__(256) k_tap(const float* __restrict__ x, int64_t ld, int n, const float* __restrict__ nw,
                                              float eps, int E, int j, int ng, int nl, float* __restrict__ acc_g,
-                                             float* __restrict__ acc_l, Alpha al) {
+                                             float* __restrict__ acc_l, Alpha al, const int64_t* __restrict__ pa,
+                                             const int64_t* __restrict__ pb) {
+    STRATA_PDL_ENTRY();   // (the token / window graphs' launches: PDL, as the kernels around it)
     __shared__ float sh[32];
     const int r = blockIdx.x;
+    const int ro = pa != nullptr ? (int) (*pa - (pb != nullptr ? *pb : 0)) : 0;   // (a deferred token: its row past the others)
     const float* xr = x + (size_t) r * ld;
     float sc = 1.0f;
     if (nw != nullptr) {
@@ -199,7 +211,7 @@ __global__ void __launch_bounds__(256) k_tap(const float* __restrict__ x, int64_
         ss = block_sum(ss, sh);
         sc = rsqrtf(ss / (float) E + eps);
     }
-    const int rg = r - (n - ng), rl = r - (n - nl);
+    const int rg = r - (n - ng) + ro, rl = r - (n - nl) + ro;
     for (int i = threadIdx.x; i < E; i += 256) {
         const float v = nw != nullptr ? xr[i] * sc * nw[i] : xr[i];
         if (rg >= 0) {
@@ -213,6 +225,11 @@ __global__ void __launch_bounds__(256) k_tap(const float* __restrict__ x, int64_
             d[2 * (size_t) E] = (j == 0 ? 0.0f : d[2 * (size_t) E]) + al.a[3][j] * v;
         }
     }
+}
+
+__global__ void k_set_i64(int64_t* d, int64_t v) {
+    STRATA_PDL_ENTRY();
+    *d = v;
 }
 
 // per head (blockIdx.x) of row blockIdx.y, 128 threads: rms * w (w null: none), NEOX RoPE at position pos0 + row
@@ -783,6 +800,7 @@ bool Glm5Model::inkd_load(std::string& err) {
     fb(D->kk, (size_t) 2 * kCh * kKVD);
     fb(D->vv, (size_t) 2 * kCh * kKVD);
     fb(D->frnn, E);
+    D->roff_d = (int64_t*) dev(64);
     fb(D->x, (size_t) kNB * E);
     fb(D->xn, (size_t) kNB * E);
     bb(D->xq, (size_t) kNB * E / 32 * kQ8);
@@ -815,6 +833,11 @@ bool Glm5Model::inkd_load(std::string& err) {
          cudaHostAlloc((void**) &D->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
     if (!ok) return refuse("the pinned buffers");
     if (const char* v = getenv("STRATA_INK_DSPARK_DUMP"); v != nullptr && v[0]) D->dump = std::fopen(v, "w");
+    // STRATA_INK_DSPARK_DEFER=0: every single token's context rows committed right after it, as before.  Default:
+    // they wait in the accumulators (up to 64 rows) and go in one pass before the next draft / window / prompt chunk -
+    // the per-token commit (~12 small launches behind the token, ~1% of a token's time) mostly gone where the gate
+    // keeps the drafter off; the drafter's context the same rows
+    if (const char* v = getenv("STRATA_INK_DSPARK_DEFER"); v == nullptr || std::atoi(v) != 0) D->defer = true;
     if (const char* v = getenv("STRATA_INK_DSPARK_PROF"); v != nullptr && std::atoi(v) != 0) {
         D->prof = true;
         for (cudaEvent_t& e : D->ev) D->prof = D->prof && cudaEventCreate(&e) == cudaSuccess;
@@ -846,10 +869,10 @@ int Glm5Model::inkd_max() const {
 void Glm5Model::inkd_report() const {
     const auto* D = (const IkState*) inkd_;
     if (D == nullptr || D->drafts == 0) return;
-    std::fprintf(stderr, "ink dspark: %llu drafts, %.2f ms each (host to results); %llu context commits, %llu prompt rows"
-                         " (%llu past the global layer's buffer)\n",
+    std::fprintf(stderr, "ink dspark: %llu drafts, %.2f ms each (host to results); %llu context commits (%llu of deferred rows), "
+                         "%llu prompt rows (%llu past the global layer's buffer)\n",
                  (unsigned long long) D->drafts, D->ms_draft / (double) D->drafts, (unsigned long long) D->commits,
-                 (unsigned long long) D->prompt_rows, (unsigned long long) D->prompt_cut);
+                 (unsigned long long) D->flushes, (unsigned long long) D->prompt_rows, (unsigned long long) D->prompt_cut);
     if (D->prof) {
         static const char* names[IkState::kPh] = {"block", "layer 0", "layer 1", "layer 2", "head", "markov"};
         std::fprintf(stderr, "ink dspark: device ms a draft -");
@@ -865,6 +888,7 @@ void Glm5Model::inkd_report() const {
 void Glm5Model::inkd_reset() {
     auto* D = (IkState*) inkd_;
     if (D == nullptr) return;
+    inkd_flush();
     D->win_p0 = -1;
     // a restored snapshot (pos_ inside the context): the rows before it are still this sequence's
     if (pos_ > 0 && pos_ <= D->ctx_end) {
@@ -879,12 +903,18 @@ void Glm5Model::inkd_reset() {
 }
 
 // ------------------------------------------------------------------------------------------------ the context
-void Glm5Model::ink_tap(int visit, const float* x, int64_t ld, int n, const float* norm_w, bool prompt, cudaStream_t s) {
+void Glm5Model::ink_tap(int visit, const float* x, int64_t ld, int n, const float* norm_w, bool prompt, cudaStream_t s,
+                        bool pend) {
     auto* D = (IkState*) inkd_;
     if (D == nullptr || n <= 0) return;
     const int j = visit == 5 ? 0 : visit == 23 ? 1 : visit == 41 ? 2 : visit == 48 ? 3 : -1;
     if (j < 0) return;
     const int E = g_.n_embd;
+    if (j == 0 && !pend && D->pend_n > 0) {   // (other rows over the deferred ones: those committed first)
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cs);
+        if (cs == cudaStreamCaptureStatusNone) inkd_flush();
+    }
     if (j == 0) {   // (the rows' first tap: how many of them the accumulators hold)
         int ng = n;
         if (prompt && n > D->rows_g) {   // (a long chunk: acc_g grown - halving while the VRAM refuses)
@@ -913,7 +943,9 @@ void Glm5Model::ink_tap(int visit, const float* x, int64_t ld, int n, const floa
         D->tap_prompt = prompt;
     }
     if (n != D->tap_n) return;   // (a tap of other rows than the first one's: a mismatch - not taken)
-    k_tap<<<n, 256, 0, s>>>(x, ld, n, norm_w, g_.norm_eps, E, j, D->tap_ng, D->tap_nl, D->acc_g, D->acc_l, D->al);
+    const bool pd = pend && D->defer && n == 1;
+    strata::kernels::pdl_launch(k_tap, dim3((unsigned) n), dim3(256), 0, s, x, ld, n, norm_w, g_.norm_eps, E, j, D->tap_ng,
+                                D->tap_nl, D->acc_g, D->acc_l, D->al, pd ? D->tap_pa : nullptr, pd ? D->tap_pb : nullptr);
 }
 
 uint64_t Glm5Model::inkd_acc_gen() const {
@@ -999,6 +1031,51 @@ bool Glm5Model::inkd_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
     return cudaGetLastError() == cudaSuccess;
 }
 
+void Glm5Model::inkd_tok_begin(int64_t p, const int64_t* pos_d) {
+    auto* D = (IkState*) inkd_;
+    if (D == nullptr || !D->defer) return;
+    if (D->pend_n > 0 && p < D->pend_p0 + D->pend_n) D->pend_n = (int) std::max<int64_t>(0, p - D->pend_p0);   // (a rewind)
+    if (D->pend_n > 0 && (p != D->pend_p0 + D->pend_n || D->pend_n >= std::min(64, D->rows_g))) inkd_flush();
+    const bool fresh = D->pend_n == 0;
+    if (fresh) D->pend_p0 = p;
+    if (pos_d != nullptr) {   // (the graph: the row from its position word less the first deferred one's - set once)
+        if (fresh || D->tap_pb != D->roff_d + 1)
+            strata::kernels::pdl_launch(k_set_i64, dim3(1), dim3(1), 0, fast_->cs, D->roff_d + 1, D->pend_p0);
+        D->tap_pa = pos_d;
+        D->tap_pb = D->roff_d + 1;
+    } else {
+        strata::kernels::pdl_launch(k_set_i64, dim3(1), dim3(1), 0, fast_->cs, D->roff_d, (int64_t) D->pend_n);
+        D->tap_pa = D->roff_d;
+        D->tap_pb = nullptr;
+    }
+}
+
+bool Glm5Model::inkd_tok_end(int64_t p, cudaStream_t s) {
+    auto* D = (IkState*) inkd_;
+    if (D == nullptr) return true;
+    if (!D->defer) return inkd_commit(p, 1, false, s);
+    if (D->tap_n != 1 || D->tap_prompt || p != D->pend_p0 + D->pend_n) {   // (no taps for it: as the commit's mismatch)
+        if (!inkd_flush()) return false;
+        return inkd_commit(p, 1, false, s);
+    }
+    ++D->pend_n;
+    D->tap_n = 0;
+    return true;
+}
+
+bool Glm5Model::inkd_flush() {
+    auto* D = (IkState*) inkd_;
+    if (D == nullptr || D->pend_n <= 0) return true;
+    const int n = D->pend_n;
+    D->pend_n = 0;
+    D->tap_n = n;
+    D->tap_ng = std::min(n, D->rows_g);
+    D->tap_nl = std::min(n, kTail);
+    D->tap_prompt = false;
+    ++D->flushes;
+    return inkd_commit(D->pend_p0, n, false, fast_->cs);
+}
+
 void Glm5Model::inkd_settle(int64_t pos) {
     auto* D = (IkState*) inkd_;
     if (D == nullptr || D->win_p0 < 0) return;
@@ -1035,6 +1112,7 @@ bool Glm5Model::inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string&
     cudaStream_t s = F->cs;
     const auto t0 = std::chrono::steady_clock::now();
     inkd_settle();
+    if (!inkd_flush()) { err = "ink dspark: the deferred rows' commit"; return false; }
     const int64_t pos = pos_;
     if (D->ctx_end != pos || D->frnn_pos != pos - 1) return true;   // (no context for this position: no drafts)
     const int E = g.n_embd, V = D->V, FF = D->ff, ND = D->n_max;

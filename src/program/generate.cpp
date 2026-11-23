@@ -2789,8 +2789,18 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_INK_DSPARK_GATE_EARLY");
                 return v == nullptr ? 4 : std::max(0, std::atoi(v));
             }();
+            // STRATA_INK_DSPARK_GATE_FIRST=<n>: the answer's first n drafter steps go without it (one token at a time)
+            static const int ink_first = [] {
+                const char* v = std::getenv("STRATA_INK_DSPARK_GATE_FIRST");
+                return v == nullptr ? 0 : std::max(0, std::atoi(v));
+            }();
+            // STRATA_INK_DSPARK_GATE_AFTER0=<n>: a drafted step that kept no draft skips the drafter for the next n steps
+            static const int ink_after0 = [] {
+                const char* v = std::getenv("STRATA_INK_DSPARK_GATE_AFTER0");
+                return v == nullptr ? 0 : std::max(0, std::atoi(v));
+            }();
             const bool ink_gate = ink_dsp && ink_gate_env;
-            int ink_skip = 0, ink_back = 0, ink_n = 0, ink_skips = 0;
+            int ink_skip = ink_gate ? ink_first : 0, ink_back = 0, ink_n = 0, ink_skips = 0;
             double ink_tok = 0.0, ink_ms = 0.0;
             const auto ink_gate_add = [&](double toks, double ms) {
                 if (!ink_gate) return;
@@ -3094,6 +3104,7 @@ static int glm_pack_generate(const Options& o) {
                     if ((copy || dfl_both) && use != 0 && (d_timed || dfl_both))   // (rate_add: the timed ones)
                         rate_add(1.0, std::max(1e-3, ms_since(td)));
                     if (use != 0 && !capd) ink_gate_add(1.0, std::max(1e-3, ms_since(td)));
+                    if (ink_gate && use != 0 && ink_skip == 0) ink_skip = ink_after0;   // (nothing kept: a short pause)
                     continue;
                 }
                 win.assign(1, (int32_t) tok);
