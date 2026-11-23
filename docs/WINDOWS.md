@@ -410,6 +410,12 @@ The RX 7900 XT + 128 GB tuning that kept every expert of DeepSeek V4 in VRAM + R
 a 64 GB page file, `STRATA_GLM_RAM_HEADROOM_GB=4`, `STRATA_GLM_RESERVE_MB=512` (only when no display is attached to
 that card) and `--prefill 8192`.
 
+### NVIDIA: turn off the Sysmem Fallback
+
+In the NVIDIA Control Panel, Manage 3D settings, set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
+With the default, the driver moves VRAM allocations to host RAM without an error once the card is full (a browser or
+the desktop took some), and decode slows down a lot. Abyss on Windows keeps 1.5-2 GB of VRAM free (v1.3.195+) for the same reason.
+
 ### Pinned memory that runs out before the RAM
 
 The GPU driver can refuse more pinned memory before the RAM is full:

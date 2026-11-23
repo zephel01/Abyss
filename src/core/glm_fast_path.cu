@@ -520,10 +520,21 @@ inline int default_reserve_mb(size_t total_b, bool q4x = false) {
     (void) q4x;
     return kVramReserveMb;
 #else
+#if defined(_WIN32)
+    // Windows (WDDM): the compositor and browsers take VRAM after the load, and the NVIDIA driver then moves
+    // allocations to host RAM without an error (CUDA Sysmem Fallback).  Keep 2 GB free beside a pool on a card above
+    // 12.5 GB, 1.5 GB (the low end of 1.5-2) on a smaller card or for q4x, where each pool slot counts for more.
+    constexpr int kWinBigMb = 2048, kWinSmallMb = 1536;
+    if (q4x) return kWinSmallMb;
+    const double wcap = strata::core::env_num("STRATA_GLM_VRAM_GB", 0.0, 0.0, 65536.0) * 1073741824.0;
+    const double wcard = wcap > 0.0 && wcap < (double) total_b ? wcap : (double) total_b;
+    return wcard > 12.5 * 1073741824.0 ? kWinBigMb : kWinSmallMb;
+#else
     if (q4x) return 700;
     const double cap = strata::core::env_num("STRATA_GLM_VRAM_GB", 0.0, 0.0, 65536.0) * 1073741824.0;
     const double card = cap > 0.0 && cap < (double) total_b ? cap : (double) total_b;
     return card > 12.5 * 1073741824.0 ? kVramReserveMb : 700;
+#endif
 #endif
 }
 

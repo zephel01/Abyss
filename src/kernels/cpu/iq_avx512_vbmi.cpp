@@ -21,6 +21,7 @@
 // AVX-512 F / BW / VL / VNNI / VBMI (cpu_avx512_ok(): Ice Lake, Zen 4 and later).  This file is built with those
 // flags: nothing in it runs before that check (no initializers at namespace scope; the tables are built on the
 // first call).
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/lane_q81.hpp"
 #include "lane_q81_impl.hpp"
@@ -824,7 +825,9 @@ bool iq4nl_512_on() { return iq4nl_512.load(std::memory_order_relaxed); }
 }  // namespace
 
 bool lane_q81_vbmi_type(int type) noexcept {
-    return (type == 16 || type == 17 || type == 18 || type == 19 || type == 22 || (type == 20 && iq4nl_512_on())) &&
+    // the CPU is checked here too (not only by the callers): this file's AVX-512 code must never run without it
+    return cpu_avx512_ok() &&
+           (type == 16 || type == 17 || type == 18 || type == 19 || type == 22 || (type == 20 && iq4nl_512_on())) &&
            iq512v_ready();
 }
 

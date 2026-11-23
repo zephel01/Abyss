@@ -402,6 +402,13 @@ RX 7900 XT + 128 GB で DeepSeek V4 のエキスパートを全部 VRAM と RAM 
 ページファイル 64 GB、`STRATA_GLM_RAM_HEADROOM_GB=4`、`STRATA_GLM_RESERVE_MB=512`（そのカードに画面をつないでいないときだけ）、
 `--prefill 8192`。
 
+### NVIDIA: Sysmem Fallback を切る
+
+NVIDIA コントロールパネルの「3D 設定の管理」で「CUDA - システム メモリ フォールバック ポリシー」(CUDA - Sysmem Fallback Policy)
+を「システム メモリ フォールバックを優先しない」(Prefer No Sysmem Fallback) にします。既定のままだと、カードが満杯になったとき
+(ブラウザやデスクトップが VRAM を使った後など) ドライバーがエラーなしで VRAM の確保をホスト RAM に回し、decode が大きく遅くなります。
+Abyss も同じ理由で、Windows では VRAM を 1.5〜2 GB 空けておきます (v1.3.195 以降)。
+
 ### RAM より先に固定メモリが尽きる場合
 
 GPU のドライバが、RAM が埋まる前に固定メモリの確保を断ることがあります。

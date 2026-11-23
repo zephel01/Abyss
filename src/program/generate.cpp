@@ -245,7 +245,11 @@ struct Options {
     bool no_fast_select = false;       ///< plan v0.3 P7 A/B: FP64 row scores + bit-serial cell top-k
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
+#if defined(_WIN32)
+    int vram_reserve_mib = 1536;       // WDDM: leave room so the NVIDIA driver does not fall back to host RAM
+#else
     int vram_reserve_mib = 700;
+#endif
     /// --vram-reserve-mib given on the command line: it also sets STRATA_GLM_RESERVE_MB, the reserve the GLM runner's
     /// expert pool (GLM-5.3, Qwen3.8, DeepSeek V4/V4.1 packs) keeps free - one knob on every path (issue #39)
     bool vram_reserve_given = false;

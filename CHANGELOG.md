@@ -20,6 +20,16 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - `lane_q81_impl.hpp`'s inline helpers sit in an anonymous namespace (as `own_dot_body.hpp`'s), so the AVX-512 and
   the AVX2 / baseline CPU files that include it each keep their own copy: the linker can no longer pick an AVX-512
   out-of-line body for an AVX2 caller. Same code today (all inlined at -O1 and up).
+- `lane_q81_vbmi_type` also checks `cpu_avx512_ok()` itself (before building its tables), so the AVX-512 VBMI path
+  can never run on a CPU without it, whatever the caller checked. Same behavior on every CPU that has it.
+
+### Changed
+
+- Windows only: the VRAM left free beside the expert pool is 2 GB on a CUDA card above 12.5 GB (was 1.5 GB) and 1.5
+  GB on a smaller card, for Qwen3.8 (q4x) and for the dense path's `--vram-reserve-mib` default (was 700 MB), so a
+  browser or the desktop taking VRAM after the load is less likely to push the NVIDIA driver into its Sysmem
+  Fallback (host RAM, silently slow). docs/WINDOWS turns that fallback off in the NVIDIA Control Panel. Linux and
+  HIP are unchanged. Not built on Windows.
 
 ## v1.3.194 - 2026-11-23
 
