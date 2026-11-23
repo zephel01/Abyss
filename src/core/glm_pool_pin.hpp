@@ -5,7 +5,7 @@
 // processes hold.  On an RTX 5090, ~0.12 GB more held elsewhere moved DeepSeek V4.1 Compact JA256 from 68 to 67 slots a
 // layer, and V4.1 (no placement-independent expert products) then answered differently from the 5th token on
 // (worklog 2026-11-23_v41ja-md5-change: md5 55e1d3f2d4 at 68, 3906291bef at 67).  So the first start keeps its budget,
-// rounded down to 32 MiB, in <pack>/pool_pin.txt under a key of the card (UUID, VRAM), the layers, the bytes this
+// rounded down to 1 MiB, in <pack>/pool_pin.txt under a key of the card (UUID, VRAM), the layers, the bytes this
 // process holds before the pool (dense weights, KV and state: the context and the KV type), the build and the settings
 // that move the VRAM (cap, reserve, drafters); every later start with the same key carves the same pool:
 //   - the saved budget is used while it is at most 256 MiB above what is free now (the excess comes out of the
@@ -16,7 +16,7 @@
 // STRATA_GLM_POOL_PIN=0 turns it off (every start sizes the pool from its free VRAM, as before v1.3.198);
 // STRATA_GLM_POOL_PIN=reset learns this key's budget again (or delete pool_pin.txt beside the pack).
 // STRATA_GLM_POOL_GB (an explicit budget) and unified memory (the pool is RAM there) skip it.
-// (The idea - a keyed file of 32 MiB steps beside the pack - follows Maya's VRAM reserve file; the code is Abyss's.)
+// (The idea - a keyed budget file beside the pack - follows Maya's VRAM reserve file; the code is Abyss's.)
 #pragma once
 
 #include "strata/program/gpu_ident.hpp"
@@ -35,7 +35,8 @@
 
 namespace strata::core::poolpin {
 
-constexpr size_t kStep = (size_t) 32 << 20;    // the budget's unit
+constexpr size_t kStep = (size_t) 1 << 20;     // the budget's unit (32 MiB steps cost Ornith-1.5-35B one slot
+                                               // a layer on a 16 GB cap, 155 -> 154: 84.0 against 85.2 tok/s)
 constexpr size_t kSlack = (size_t) 256 << 20;  // how far above the free VRAM a saved budget is still used
 constexpr size_t kGrow = (size_t) 1 << 30;     // free VRAM this far above the saved budget learns it again
 
