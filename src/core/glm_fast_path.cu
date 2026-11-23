@@ -999,9 +999,15 @@ bool Glm5Model::fast_setup(std::string& err) {
                     if (Ly.gu_type == 40 || Ly.d_type == 40)
                         F->nv_guard = kNvGuard;   // (set here, before the prompt path and the pool size their buffers)
                     // (a fused gate_up tensor - inkling - carries the one scale both share)
-                    const float* sg = f32(fused ? "ffn_gate_up_exps.scale" : "ffn_gate_exps.scale");
-                    const float* su = f32(fused ? "ffn_gate_up_exps.scale" : "ffn_up_exps.scale");
-                    const float* sd = f32("ffn_down_exps.scale");
+                    // (each scale is optional on its own: orcarouter's Inkling Mix-16G has NVFP4 gate_up with its
+                    // .scale over IQ4_NL / Q5_1 down experts with none - a tensor the type needs is checked below)
+                    const auto f32opt = [&](const char* n) -> const float* {
+                        const auto it = w_.find(P + n);
+                        return it == w_.end() ? nullptr : it->second;
+                    };
+                    const float* sg = f32opt(fused ? "ffn_gate_up_exps.scale" : "ffn_gate_exps.scale");
+                    const float* su = f32opt(fused ? "ffn_gate_up_exps.scale" : "ffn_up_exps.scale");
+                    const float* sd = f32opt("ffn_down_exps.scale");
                     const bool gu_need = Ly.gu_type == 40 || sg != nullptr || su != nullptr;
                     const bool d_need = Ly.d_type == 40 || sd != nullptr;
                     if ((!gu_need || (sg != nullptr && su != nullptr)) && (!d_need || sd != nullptr)) {

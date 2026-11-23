@@ -1146,9 +1146,17 @@ static bool own_dense(int type, int64_t rows, int64_t cols) {
 static bool int8_dense(int type, int64_t rows, int64_t cols) { return mmq::supported(type) || own_dense(type, rows, cols); }
 // the layer's experts are multiplied quantized on the int8 tensor cores: each product by MMQ or by the own GEMM
 // (a build without MMQ, STRATA_MMQ=OFF: the own GEMM alone; the layers it does not cover take the FP16 path)
+static bool deq_expert_type(int t);
+// an expert matrix MMQ reads.  Q5_1 (orcarouter's Inkling Mix-16G down experts, under NVFP4 gate/up) only in a layer the
+// FP16 path cannot take whole (NVFP4 is not decoded there): a layer it can take keeps it, the bits it gave before
+template <class L> static bool mmq_expert(int t, const L& Ly) {
+    return mmq::supported(t) ||
+           (t == 7 && mmq::built() &&
+            !(deq_expert_type(Ly.gu_type) && deq_expert_type(Ly.up_type) && deq_expert_type(Ly.d_type)));
+}
 template <class L> static bool int8_layer(const L& Ly, const Glm5Geometry& g) {
-    return ((mmq::supported(Ly.gu_type) && mmq::supported(Ly.up_type)) || own_gate_up(Ly, g) || own_gu_split(Ly, g)) &&
-           (mmq::supported(Ly.d_type) || own_down(Ly, g));
+    return ((mmq_expert(Ly.gu_type, Ly) && mmq_expert(Ly.up_type, Ly)) || own_gate_up(Ly, g) || own_gu_split(Ly, g)) &&
+           (mmq_expert(Ly.d_type, Ly) || own_down(Ly, g));
 }
 // inkling's NVFP4 experts where the own GEMM does not take them (own_type_l): run_blas_dq's FP16 products, not
 // MMQ's (STRATA_INK_NV_DQ=0: MMQ)

@@ -96,6 +96,19 @@ in one NVIDIA GPU's VRAM (UD-Q4_K_XL: a 24 GB+ GPU), it also fetches z-lab's DFl
 against Hugging Face's SHA-256) and names it in the config (`STRATA_Q35_DFLASH`); `--no-dflash` skips it (or takes it
 out of a config), `--dflash` sets it up on a smaller GPU too ([the drafter](#qwen38-27b-dense)).
 
+Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
+(15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
+as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
+at 16G, IQ2_XXS-IQ3_S gate-up over IQ4_NL down at 12G). Unsloth's Inkling DSpark drafter works with them (greedy gives
+the same tokens with it, md5 checked); the setup names it when it is on disk where `--model inkling2mini` keeps it.
+RTX 5090: decode 195 / 215 tok/s (16G / 12G; 275 / 288 with the drafter on code), a 7,217-token prompt 7,265 / 7,787
+tok/s; RTX 3090 (all in VRAM): decode 104 / 114 tok/s, the same prompt 1,700-1,930 / 2,950 tok/s:
+
+```sh
+./setup-deepseek.sh --model inkling2mini-abl --download-model                  # Inkling-2-Mini-abliterated-Mix-16G (15.7 GB)
+./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G (11.6 GB)
+```
+
 Qwen3.5-9B QSA, a small dense model with a QSA indexer (zephel01's, BETA; [Qwen3.5-9B QSA](#qwen35-9b-qsa)): the whole
 file goes on one GPU of 11 GB or more, which holds a context up to 128K (measured with the VRAM capped at 11 GB). The setup
 stops on a smaller GPU before downloading anything. Q4_K_M (5.9 GB) is the default, `--quant Q8_0` (9.9 GB) the other

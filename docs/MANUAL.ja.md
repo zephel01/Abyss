@@ -93,6 +93,19 @@ UD-IQ2_XXS、UD-IQ2_XS、UD-IQ2_S）では、unsloth の別ファイル（`MTP/m
 SHA-256 で確認）も取ってきて、設定に書く（`STRATA_Q35_DFLASH`）。`--no-dflash` で取らない（設定にあれば外す）。
 `--dflash` で小さい GPU でも入れる（[下書き役](#qwen38-27bdense)）。
 
+Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
+か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
+llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
+IQ2_XXS〜IQ3_S、down が IQ4_NL）。unsloth の Inkling 用 DSpark drafter がそのまま使える（使っても greedy の token は同じ。
+md5 で確認）。`--model inkling2mini` が置く場所にそのファイルがあれば、セットアップが設定に書く。
+RTX 5090: decode 195 / 215 tok/s（16G / 12G。code で drafter ありなら 275 / 288）、7,217 トークンのプロンプト 7,265 / 7,787 tok/s。
+RTX 3090（全部 VRAM）: decode 104 / 114 tok/s、同じプロンプト 1,700〜1,930 / 2,950 tok/s:
+
+```sh
+./setup-deepseek.sh --model inkling2mini-abl --download-model                  # Inkling-2-Mini-abliterated-Mix-16G（15.7 GB）
+./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G（11.6 GB）
+```
+
 QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BETA。[Qwen3.5-9B QSA](#qwen35-9b-qsa)）は、ファイル全体を
 11 GB 以上の GPU 1 枚に載せる。その GPU で 128K までの文脈が動く（VRAM を 11 GB に制限して計測）。それより小さい GPU では
 何もダウンロードする前に止まる。既定は Q4_K_M（5.9 GB）、もう 1 つは `--quant Q8_0`（9.9 GB。メモリは未計測で、

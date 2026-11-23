@@ -23,12 +23,28 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   (a question 1 s after a 32K context: first token 9.4 s -> 1.5 s). Default 1:
   unchanged. Not with the drafters, images, per-request uncensor switches or penalties (see the manual).
 
+- **Inkling 2 Mini abliterated (orcarouter's Mix GGUFs).** `./setup-deepseek.sh --model inkling2mini-abl` sets up
+  [orcarouter/Inkling-2-Mini-abliterated-GGUF](https://huggingface.co/orcarouter/Inkling-2-Mini-abliterated-GGUF):
+  `Mix-16G` (15.7 GB, the default) or `--quant Mix-12G` (11.6 GB), both all in VRAM on a 16-24 GB GPU. They are
+  `inkling2_loop` files with per-layer mixed stock llama.cpp types. Unsloth's Inkling DSpark drafter fits them too;
+  setup names it when it is on disk where `--model inkling2mini` keeps it (greedy answers the same tokens, md5 checked).
+
 ### Changed
 
 - **Inkling 2 Mini's verify window** gives each of its 8 columns its own expert scratch set, so 7- and 8-wide windows
   run their experts in the column-batched launches too (same bits; also DSpark's widest windows).
 - **Inkling 2 Mini's conversation snapshot** moves only the window rings' rows the conversation has written: a short
   prompt's snapshot ~75 ms -> about 2 ms on PCIe Gen4 x4 (the whole 3,072-row rings, ~0.5 GB, went over the bus before).
+
+### Fixed
+
+- **Inkling Mix-16G stopped at load** with `unresolved weights: blk.N.ffn_down_exps.scale`: an NVFP4 expert tensor's
+  second-level scale was required on both expert tensors of the layer. Mix-16G has NVFP4 gate/up with its scale over
+  IQ4_NL / Q5_1 down experts without one. Each scale is now looked up on its own; an NVFP4 tensor without its scale is
+  still refused.
+- **Mix-16G prompts ran token by token** (7 layers with NVFP4 gate/up over Q5_1 down: the prompt path covered neither
+  pair). Q5_1 experts now go through the prompt MMQ in a layer the FP16 path cannot take whole. RTX 3090, 7,217-token
+  prompt: ~100 -> 1,700-1,930 tok/s. Layers and models the prompt path already took keep their kernels and bits.
 
 ## v1.3.196 - 2026-11-23
 
