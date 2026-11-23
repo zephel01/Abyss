@@ -9,6 +9,15 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Faster
+
+- Prompts: each MoE layer's plan tables (a few KB) go to the GPU through a kernel that reads them host-mapped instead
+  of a copy. The copy queued on the single host-to-device copy engine behind the prestage copies still running for
+  that layer, so the GPU and the CPU lane both waited ~60 ms a layer, and the staging ring then stalled behind the
+  resident experts. GLM-5.3-Flash (Maya-S-v2 IQ2_XXS) 16K prompt on an RTX 5090 at Gen4 x4: 1591 -> 1779 tok/s
+  (+11.8%); DeepSeek V4 0731 and V4.1 unchanged (their adaptive prestage leaves little in flight). Same output bits.
+  `STRATA_GLM_PREFILL_PLAN_COPY=1` restores the copies.
+
 ## v1.3.195 - 2026-11-23
 
 Setup turns on Inkling 2 Mini's DSpark drafter again when its file is on disk: with v1.3.194's verify window graph it
