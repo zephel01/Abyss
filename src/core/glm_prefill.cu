@@ -1422,7 +1422,16 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     const std::string mode = prefill_mode();
     const bool is_auto = mode == "auto";
     const int64_t auto_max = n_parts_ == 1 ? 32768 : 8192;
-    const int64_t ceiling = is_auto ? auto_max : (int64_t) std::atoll(mode.c_str());
+    int64_t ceiling = is_auto ? auto_max : (int64_t) std::atoll(mode.c_str());
+    // (a hand-given N is held to 32768, the auto limit: many prompt kernels carry the chunk's token count in
+    // gridDim.y/z, whose 65535 a chunk of 65536 or more passes - the launch fails)
+    if (ceiling > 32768) {
+        static bool noted = false;
+        if (!noted) std::fprintf(stderr, "NOTE: --prefill %lld is over 32768, the largest prompt chunk - using 32768\n",
+                                 (long long) ceiling);
+        noted = true;
+        ceiling = 32768;
+    }
     // the pool to come: `per` slots a layer over the tier layers, as fast_setup sizes it from the same free VRAM
     size_t dev_free = 0, dev_total = 0;
     cudaMemGetInfo(&dev_free, &dev_total);
@@ -5418,7 +5427,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                           kc::lane_q81_act_bytes(E) <= kc::kNativeActBytes &&
                           kc::lane_q81_act_bytes(nff) <= kc::kNativeHBytes;
         const int light_rows = xact ? xrows_env
-                               : light_fit && lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && (light_layer < 0 || il == light_layer)
+                               : light_fit && lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && !Ly.mixed() && Ly.nv_host.empty() &&
+                                     Ly.nv_scale == nullptr && (light_layer < 0 || il == light_layer)
                                    ? light_env : 0;
         if (xact && S->xl_ptrs_h.empty()) S->xl_ptrs_h.resize((size_t) kLightMax);
         int n_light = 0, rows_mmq = 0;

@@ -6,6 +6,9 @@
 #include <cstring>
 
 namespace strata::kernels::cpu::q81 {
+// (an anonymous namespace, as own_dot_body.hpp's: AVX-512 (iq_avx512_vbmi) and AVX2/baseline (lane_q81*) translation
+// units include this, and each keeps its own copy - one inline function's out-of-line body never serves both)
+namespace {
 
 // A Q81 activation of n values: q[n] int8 | d[n/32] float | s[n/32] float | b8[n/8] int16 (sums of 8 codes)
 struct View {
@@ -88,11 +91,13 @@ inline float lane_expf(float x) {
     return p * bits_f((uint32_t) (k + 127) << 23);
 }
 
+}  // namespace
 }  // namespace strata::kernels::cpu::q81
 
 #if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))   // (MSVC: /arch:AVX2 has FMA but defines no __FMA__)
 #include <immintrin.h>
 namespace strata::kernels::cpu::q81 {
+namespace {
 // A row's dot in the DEVICE's float order (glm_fast rows_dot): call j (one 32-value q8_1 block: the weight's and the
 // activation's scale product times the integer sum as a float) goes to lane j % 32, each lane FMA-accumulates its
 // calls in order (nvcc contracts `acc += x * y`), then warp_sum's butterfly (lanes ^16, ^8, ^4, ^2, ^1).  The rows keep
@@ -105,5 +110,6 @@ inline float dev_sum(const __m256* c4) {
     r = _mm_add_ss(r, _mm_movehdup_ps(r));                                                      // ^1
     return _mm_cvtss_f32(r);
 }
+}  // namespace
 }  // namespace strata::kernels::cpu::q81
 #endif

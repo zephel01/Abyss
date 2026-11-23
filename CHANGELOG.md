@@ -9,6 +9,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- A prompt chunk given by hand (`--prefill N` / `STRATA_GLM_PREFILL=N`) is held to 32768 tokens, the auto limit, with
+  a `NOTE:` line on stderr. Many prompt kernels carry the chunk's token count in their grid's y/z size, whose limit is
+  65535: a chunk of 65536 tokens or more (possible on a large-VRAM or unified-memory box) failed those launches.
+- The non-exact light expert kernel of the prompt path (`rows_experts`) no longer takes a layer with NVFP4 per-expert
+  scales (`.scale`); such a layer goes through the expert sets, which apply them. No current GGUF reaches this case
+  (it needs IQ2_XXS / IQ3_XXS / IQ1_S gate/up and down with `.scale`); same bits on every model.
+- `lane_q81_impl.hpp`'s inline helpers sit in an anonymous namespace (as `own_dot_body.hpp`'s), so the AVX-512 and
+  the AVX2 / baseline CPU files that include it each keep their own copy: the linker can no longer pick an AVX-512
+  out-of-line body for an AVX2 caller. Same code today (all inlined at -O1 and up).
+
 ## v1.3.194 - 2026-11-23
 
 Inkling 2 Mini's verify window runs from CUDA graphs with fused kernels, so its opt-in DSpark drafter
