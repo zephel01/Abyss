@@ -2162,11 +2162,11 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
     }
     // the NextN draft block: the last part of a two-part split carries it (load_pack), from the model's GGUF or
-    // STRATA_GLM_MTP_GGUF's; the pipelined decode drafts with it once a token
+    // STRATA_GLM_MTP_GGUF's; the pipelined decode drafts with it once a token (qwen35moe: not on a split - #55)
     bool mtp = false;
     double mtp_dense = 0;
     std::unique_ptr<strata::GgufFile> extra;
-    if (fast && n == 2 && getenv("STRATA_GLM_NO_MTP") == nullptr) {
+    if (fast && n == 2 && getenv("STRATA_GLM_NO_MTP") == nullptr && !(g.qwen35() && !g.q4x)) {
         const std::string P = "blk." + std::to_string(L) + ".";
         const char* mg = getenv("STRATA_GLM_MTP_GGUF");
         if (find(P + "nextn.eh_proj.weight") == nullptr && mg != nullptr && mg[0] != '\0') try {
@@ -4125,7 +4125,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                      own ? " (instead of the model's own)" : "");
     }
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
+    // (qwen35moe on a split: no reader - its drafts verify in the one-part window and decode_spec is glm5's - #55)
+    const bool q35_split = g_.qwen35() && !g_.q4x && n_parts_ > 1;
+    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr && !q35_split &&
         (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr || (g_.arch == 0 && l0_ == 0 && glm_window_nextn_env()))) {
         // (glm5-next on one part with STRATA_GLM_WINDOW=1: the block drafts for the verify window, dsv4_verify.cu)   // any split: the speculative decode runs on 2+ parts; qwen35moe: its drafter
         if (!load_mtp(gfs, err)) return false;

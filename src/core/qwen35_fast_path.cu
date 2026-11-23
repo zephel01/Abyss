@@ -2006,6 +2006,14 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
             q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
         }
     }
+    // a split's earlier part (#55): R += the last FFN only - the next part's first layer reads R as it is, and the
+    // head's tensors (output_norm, output) live on the last part, which computes the head
+    if (l1_ < g.n_layers) {
+        strata::kernels::add_inplace(state_, F->ffn, g.n_embd, s);
+        if (dumps) q35_dump(s, "l_out", l1_ - 1, state_, g.n_embd);
+        { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen35moe: ") + cudaGetErrorString(e); return false; } }
+        return true;
+    }
     // the head: R += the last FFN, x = rms(R) * output_norm -> head_x / head_xq (fast_token runs the output rows)
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "qwen35moe: output_norm.weight"; return false; }
@@ -2071,6 +2079,18 @@ bool Glm5Model::fast_loop_layers(int64_t p, std::string& err) {
         if (!fast_dense_ffn(il, err)) return false;
         abl_out(il, 1, F->ffn, 1, E, s);
         if (dumps) q35_dump(s, "ffn_out", il, F->ffn, E);
+    }
+    // a split's earlier part (#55): R += the last FFN only, the head on the last part (a boundary inside the looped
+    // block would leave its second stream behind: the hop carries state_ alone)
+    if (l1_ < g.n_layers) {
+        if (g.kind(l1_ - 1) != 0 || g.kind(l1_) != 0) {
+            err = "sensenova_loop: a layer split boundary inside the looped block (layer " + std::to_string(l1_) + ")";
+            return false;
+        }
+        strata::kernels::add_inplace(state_, F->ffn, E, s);
+        if (dumps) q35_dump(s, "l_out", l1_ - 1, state_, E);
+        { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("sensenova_loop: ") + cudaGetErrorString(e); return false; } }
+        return true;
     }
     // the head (the last layer is a plain one): R += the last FFN, x = rms(R) * output_norm
     const auto nw = w_.find("output_norm.weight");
