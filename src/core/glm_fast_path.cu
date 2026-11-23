@@ -8732,13 +8732,26 @@ void Glm5Model::snap_pool_copy(bool restore) {
 }
 
 bool Glm5Model::snapshot_save() {
-    if (g_.qwen35()) {   // (no layer splits for qwen35moe)
-        if (split_next_ != nullptr || !q35_snap_copy(false)) {
+    if (g_.qwen35()) {
+        // every part's own layers (a layer split: issue #55 - the second turn re-read the whole conversation); qwen4exp's
+        // split keeps its later parts behind the port, which has no snapshot call: none there
+        if (next_port_ != nullptr) {
             snap_pos_ = -1;
             return false;
         }
-        snap_pos_ = pos_;
-        return true;
+        bool ok = true;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (ok && m->q35_snap_copy(false)) {
+                m->snap_pos_ = pos_;
+            } else {
+                ok = false;
+            }
+        }
+        cudaSetDevice(dev_);
+        if (!ok)
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
+        return ok;
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
@@ -8790,8 +8803,18 @@ bool Glm5Model::snapshot_save() {
 
 bool Glm5Model::snapshot_restore() {
     if (g_.qwen35()) {
-        if (split_next_ != nullptr || snap_pos_ < 0 || !q35_snap_copy(true)) return false;
-        pos_ = snap_pos_;
+        if (next_port_ != nullptr) return false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) return false;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!m->q35_snap_copy(true)) {
+                cudaSetDevice(dev_);
+                return false;
+            }
+            m->pos_ = snap_pos_;
+        }
+        cudaSetDevice(dev_);
         dspark_reset();
         return true;
     }

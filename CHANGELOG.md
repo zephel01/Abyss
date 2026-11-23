@@ -9,6 +9,17 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- A layer split of a qwen35-family model (Ornith, Qwen3.5) reuses the conversation in the model again: a chat's next
+  turn read the whole conversation from the start (#55: Ornith-1.5-122B split [0,24) / [24,48), second turn
+  `cache_n` 0 / `prompt_n` 2707, against 2675 / 32 unsplit). The state saved before the prompt's last token (the
+  delta-net states and conv rows the next turn starts from) covered one part only and was skipped on a split; every
+  part now saves and restores its own layers. On one RTX 5090 split in two parts
+  (`STRATA_GLM_SPLIT_SAME=1`), Ornith-1.5-35B-A3B and Ornith-1.5-122B 24G64G: second turn `cache_n` 1600 /
+  `prompt_n` 64-70 split as unsplit, with the same answers as the unsplit run. Qwen3.8's split (its later parts
+  behind a port) still reads the conversation again; GLM-5.3 and DeepSeek V4 splits already reused it.
+
 ## v1.3.195 - 2026-11-23
 
 Setup turns on Inkling 2 Mini's DSpark drafter again when its file is on disk: with v1.3.194's verify window graph it
