@@ -98,7 +98,8 @@ Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
 IQ2_XXS〜IQ3_S、down が IQ4_NL）。unsloth の Inkling 用 DSpark drafter がそのまま使える（使っても greedy の token は同じ。
 md5 で確認）。`--model inkling2mini` が置く場所にそのファイルがあれば、セットアップが設定に書く。
-RTX 3090（全部 VRAM）: decode 104 / 114 tok/s（16G / 12G）、7,217 トークンのプロンプト 1,700〜1,930 / 2,950 tok/s:
+RTX 5090: decode 195 / 215 tok/s（16G / 12G。code で drafter ありなら 275 / 288）、7,217 トークンのプロンプト 7,265 / 7,787 tok/s。
+RTX 3090（全部 VRAM）: decode 104 / 114 tok/s、同じプロンプト 1,700〜1,930 / 2,950 tok/s:
 
 ```sh
 ./setup-deepseek.sh --model inkling2mini-abl --download-model                  # Inkling-2-Mini-abliterated-Mix-16G（15.7 GB）
