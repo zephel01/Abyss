@@ -20,6 +20,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - `lane_q81_impl.hpp`'s inline helpers sit in an anonymous namespace (as `own_dot_body.hpp`'s), so the AVX-512 and
   the AVX2 / baseline CPU files that include it each keep their own copy: the linker can no longer pick an AVX-512
   out-of-line body for an AVX2 caller. Same code today (all inlined at -O1 and up).
+- Images in tool results (#41, fixed in v1.3.126) are now tested through the whole prompt path, not only the request
+  conversion: Anthropic `tool_result` blocks with one or two images, text and images mixed with a top-level image next
+  to them, and OpenAI `role: "tool"` image parts each reach the prompt as image rows with the Qwen and the GLM-5.3
+  templates; a server started without the image encoder answers such a request with its "without the vision encoder"
+  error. Checked again on main: no image is dropped (the GLM-5.3, Qwen3.x, Hy4 and V4.1 templates render them;
+  Inkling 2 Mini has no image path and gets that error). No code change.
 
 ## v1.3.194 - 2026-11-23
 

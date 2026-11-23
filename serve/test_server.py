@@ -276,6 +276,87 @@ class ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class ToolResultImages(unittest.TestCase):
+    """#41: an image inside a tool result (Anthropic tool_result blocks, OpenAI role "tool" image parts) reaches the
+    prompt as an image, through the whole path (conversion, the model's template, the image rows); a server without the
+    image encoder says so (a 400), it never drops the picture silently."""
+
+    class GlmTok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<|begin_of_image|>", "<|image|>", "<|end_of_image|>"]
+
+    IMG = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}}
+    TOOLS = [{"name": "read_image", "description": "Read an image file",
+              "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+
+    def anthropic(self, result, extra=()):
+        from serve.frontend import anthropic_to_messages
+        return anthropic_to_messages({"tools": self.TOOLS, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Open check.png"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "read_image",
+                                               "input": {"path": "check.png"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": result}, *extra]}]})
+
+    def openai(self, parts):
+        from serve.frontend import openai_to_messages
+        return openai_to_messages({"messages": [
+            {"role": "user", "content": "Open check.png"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "read_image", "arguments": "{\"path\": \"check.png\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": parts}]})
+
+    def rows(self, converted, template, tok, vision=True):
+        """-> (the prompt's image rows, the prompt as text): every image is 3 rows (FakeVision)."""
+        import tempfile
+        msgs, tools, kwargs = converted
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(template),
+                          vision=ImageMarkers.FakeVision(d) if vision else None)
+            glm = "<|begin_of_image|>" in svc.template.source
+            pad = tok.encode("<|image|>" if glm else "<|image_pad|>", parse_special=True)[0]
+            ids, _, _ = svc.prepare(msgs, tools, kwargs)
+            if svc.embeddings.path:
+                svc.embeddings.path.unlink(missing_ok=True)
+            return ids.count(pad), tok.decode(ids)
+
+    def templates(self):
+        return [("qwen", ROOT / "serve/chat_template.jinja", ByteTokenizer()),
+                ("glm", ROOT / "tools/glm_chat_template.jinja", self.GlmTok())]
+
+    def test_anthropic_tool_result_images(self):
+        for name, tpl, tok in self.templates():
+            with self.subTest(template=name):
+                self.assertEqual(self.rows(self.anthropic([self.IMG]), tpl, tok)[0], 3)
+                self.assertEqual(self.rows(self.anthropic([self.IMG, self.IMG]), tpl, tok)[0], 6)
+
+    def test_anthropic_mixed_text_and_images(self):
+        for name, tpl, tok in self.templates():
+            with self.subTest(template=name):
+                n, text = self.rows(self.anthropic(
+                    [{"type": "text", "text": "Read image file check.png [image/png, 640x360]"}, self.IMG],
+                    extra=[{"type": "text", "text": "and this one"}, self.IMG]), tpl, tok)
+                self.assertEqual(n, 6)   # the tool's image and the top-level one next to it
+                self.assertIn("Read image file check.png", text)
+                self.assertIn("and this one", text)
+                self.assertLess(text.index("Read image file"), text.index("and this one"))
+                n, text = self.rows(self.anthropic("plain result"), tpl, tok)   # text only: unchanged
+                self.assertEqual(n, 0)
+                self.assertIn("plain result", text)
+
+    def test_openai_tool_message_images(self):
+        url = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}}
+        for name, tpl, tok in self.templates():
+            with self.subTest(template=name):
+                n, text = self.rows(self.openai([{"type": "text", "text": "Screenshot"}, url]), tpl, tok)
+                self.assertEqual(n, 3)
+                self.assertIn("Screenshot", text)
+
+    def test_without_the_encoder_a_clear_error(self):
+        for name, tpl, tok in self.templates():
+            with self.subTest(template=name):
+                with self.assertRaisesRegex(ValueError, "without the vision encoder"):
+                    self.rows(self.anthropic([self.IMG]), tpl, tok, vision=False)
+
+
 class V41ImageMarkers(unittest.TestCase):
     """DeepSeek V4.1: an image is one <｜deepseek_image｜> token in the prompt, expanded to the encoder's n rows; the same
     text typed inside a message stays text.  (A GGUF template prints a message's content as it is.)"""
