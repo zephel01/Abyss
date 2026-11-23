@@ -870,6 +870,12 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         const char* v = getenv("STRATA_GLM_ROUTE_COLS");
         return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
     }();
+    // STRATA_GLM_ROUTE_QUIET (default on for inkling): a launch whose columns write no shared state (every expert
+    // resident, no CPU lane) routes them all at once - the same plans and requests (gf::moe_route_cols' quiet)
+    static const int route_quiet = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_QUIET");
+        return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
+    }();
     bool routed = false;
     if ((route_cols < 0 ? g.q4x || g.ink : route_cols != 0) && T > 1 && (late || FFs == 0) && V->route_sync != nullptr &&
         !F->prof_on) {
@@ -880,7 +886,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                                     k, g.w_scale, g.norm_w != 0, il, V->x + (size_t) tb * E, (size_t) E,
                                     V->md.data() + tb, T, V->route_sync, s, fast_skip_from(il),
                                     lane ? F->cpu_plan : 0ull, promote_min, pf_rank, g.gating, hid, fast_skip_w(il),
-                                    F->tail_skip_disk ? 1 : 0);
+                                    F->tail_skip_disk ? 1 : 0, route_quiet < 0 ? g.ink : route_quiet != 0);
         if (routed) F->expected += T;
     }
     for (int t = tb; t < tb + T && !routed; ++t) {
