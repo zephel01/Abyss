@@ -785,6 +785,15 @@ public:
     bool ink_batch_step(const int* lanes, const int32_t* toks, int n, std::string& err);
     int ink_batch_pick(int t, strata::kernels::SamplerParams& sp, std::string& err);
     const float* ink_batch_row(int t) const;   // (row t's logits on the device, after ink_batch_step)
+    // the lanes' snapshots off the decode's stream (--parallel): snapshot_save then moves the rows on a copy stream and
+    // returns at once - the other lanes decode while an 8K conversation's ~0.5 GB crosses the bus; the lane itself
+    // must not run (its next token overwrites ring rows being copied) until ink_lane_snap_ready(j); a restore or reset
+    // of the lane waits for it (ink_lane_snap_wait)
+    bool ink_snap_async_ = false;
+    bool ink_lane_snap_ready(int j);
+    void ink_lane_snap_wait(int j);
+    cudaStream_t ink_snap_begin();             // (q35_snap_copy: the copy stream, after the decode stream's work)
+    void ink_snap_end();                       // (q35_snap_copy: the current lane's copy marked pending)
     // a verify window's columns (toks[0..T) at p0..): their Engram rows read and uploaded before the layers (the n-gram
     // history advances over them), then column t's add at layer il into its streams R
     bool dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std::string& err);
@@ -1285,6 +1294,10 @@ public:
     /// Called (from any thread) when a chunk has gone through every layer: (positions done, total); false cancels
     /// the prompt (prefill then returns false with err "cancelled" and the sequence must be reset).
     std::function<bool(int64_t, int64_t)> prefill_progress;
+    /// Inkling --parallel: called on the host before each layer application past the first (its index); the caller
+    /// may run other lanes' decode steps there (same stream: they run between two of the prompt's layers, which then
+    /// go on unchanged) and must leave this lane in use.  false: the prompt fails (err from the hook's own message)
+    std::function<bool(int)> prefill_layer_hook;
     // Optional V4.1 single-device consumer of each prefilled row, in position order.
     std::function<bool(int64_t, const std::vector<float>&, std::string&)> prefill_logits;
     /// Debug: every half's sequence state (KDA states + conv histories, DSA caches) to <path>.<half>.bin, with the

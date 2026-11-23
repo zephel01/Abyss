@@ -4685,6 +4685,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const int il_next = g.ink ? (ia + 1 < n_app ? g.ink_app_phys(ia + 1) : l1_) : il + 1;
         progress_at("the prompt: layer", ia);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
+        if (g.ink && ia > l0_ && prefill_layer_hook && !prefill_layer_hook(ia)) {   // (--parallel: others' decode)
+            if (err.empty()) err = "the decode between the prompt's layers failed";
+            return false;
+        }
         if (kv_cut >= 0 && il > kv_cut) break;
         // (the dense tier: this layer's rows back in a layer buffer, the next one's on their way - DenseTier)
         if (S->dt_on && !dt_layer(il, il + 1 < n_app && !(kv_cut >= 0 && il + 1 > kv_cut) ? il + 1 : -1, err))

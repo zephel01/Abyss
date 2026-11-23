@@ -1172,9 +1172,11 @@ All the requests together: 2 at once 252 tok/s, 4 at once 342, 8 at once 453 (on
   `"parallel": 1` it goes in one 32K piece, so there its answer can differ in the last bits (as with another `--prefill`
   chunk). A request alone decodes on the usual token path.
 - **A new request joins at once.** Its prompt is read between decode steps: a short prompt costs the running streams
-  one pause of ~40 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and after each
-  chunk the running streams get half its time (`STRATA_PAR_SHARE`, 0.5) - they slow down while a long prompt is
-  read, they do not stop.
+  one pause of ~40 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and
+  inside each chunk the running streams take a decode step after every 8 of its 48 layer passes (`STRATA_PAR_YIELD`) -
+  the chunk's sums do not change, the streams pause ~35 ms at most (161 ms before) while an 8K prompt is read, and the
+  8K prompt's first token comes as soon (1.44 s; 1.50 before). The finished prompt's conversation is copied off the
+  card while the others go on (`STRATA_PAR_SNAP_ASYNC`; the copy of an 8K conversation took ~75 ms).
 - **Conversation reuse per lane.** A finished request's lane keeps its conversation; a new request takes the free lane
   whose conversation its prompt continues (an agent sending its context again reads only what is new).
 - **Cancelling** one request (the client disconnects) ends only that one.
@@ -1575,7 +1577,9 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini prompts (CUDA, sm_80 and newer): the prompt path's attention on a tensor-core kernel (a block of tokens x a tile of keys, FP16 products with F32 sums, the relative bias as FP16 pairs - about F32 -, out-of-window tiles skipped) and a 2,048-row attention sub-batch (`STRATA_INK_PREFILL_SUB` overrides). RTX 5090, UD-Q4_K_XL: 8K prompt 3,784 -> 6,874 tok/s, 165K 765 -> 5,298. The sum order and q / P rounded to FP16 change the bits, not the KL against llama.cpp. `0`: the token path's kernel a row at a time and 512-row sub-batches (the old bits). AMD always uses that one |
 | `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini, `--serve`: requests decoded together (`N`, or `auto`: as many as leave every expert in VRAM with 3 GB plus the prompt path's region to spare, at most 8; a larger `N` is cut to that); the run config's `"parallel"`. See [Several requests at once](#several-requests-at-once-parallel-inkling-2-mini-beta) |
 | `STRATA_PAR_CHUNK` | the prompt path's chunk | `"parallel"` above 1: the prompt tokens read between two decode steps while other requests decode (1,280 on a 32 GB card with `STRATA_PAR_PREFILL_MB` 2048). Smaller: shorter pauses for the running streams, a slower prompt - and a long prompt's pieces then depend on whether others decode, so its answer's last bits can too |
-| `STRATA_PAR_SHARE` | 0.5 | `"parallel"` above 1: after a prompt chunk, the running requests decode for this share of the chunk's time before the next chunk (0: one decode step between chunks) |
+| `STRATA_PAR_YIELD` | 8 | `"parallel"` above 1: inside a prompt chunk read while other requests decode, a decode step for them after every this many of the chunk's 48 layer passes (the chunk's sums unchanged). Smaller: shorter pauses, a slower prompt (4: 23 ms p99 pauses, the 8K prompt 1.84 s; 12: 48 ms, 1.31 s). 0: off (a whole chunk, then `STRATA_PAR_SHARE`) |
+| `STRATA_PAR_SHARE` | 0 (0.5 with `STRATA_PAR_YIELD=0`) | `"parallel"` above 1: after a prompt chunk, the running requests decode for this share of the chunk's time before the next chunk (0: one decode step between chunks) |
+| `STRATA_PAR_SNAP_ASYNC` | 1 | `"parallel"` above 1: a finished prompt's conversation (for its lane's next request) copied to host memory on a copy stream while the other requests decode; the request itself starts once the copy is done. 0: on the decode's stream (every stream waits, ~75 ms for an 8K conversation) |
 | `STRATA_PAR_PREFILL_MB` | 2048 | `"parallel"` above 1: the prompt path's own VRAM region (MB), allocated at start instead of borrowing the expert pool's tail - a borrow moved the tail's experts to RAM and back while the other requests waited (~150 ms for a 40-token prompt). 0: borrow as with one request |
 | `STRATA_PAR_TRACE` | unset | `1`: a line a prompt chunk with its stages' times (lane switch, conversation restored or reset, the read, the snapshot) |
 | `STRATA_DS4_SPEC_GROUP` | half the window | the pipelined window's columns a group (v1.3.43); the default makes two groups of ceil(T / 2) |

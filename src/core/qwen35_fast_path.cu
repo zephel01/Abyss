@@ -891,11 +891,17 @@ bool Glm5Model::q35_snap_copy(bool restore) {
         }
     }
     uint8_t* at = (uint8_t*) q35_snap_h_;
+    // (inkling --parallel: a save on the lanes' copy stream, the decode's stream going on - ink_snap_begin; a restore
+    // waits for the lane's copy in flight)
+    cudaStream_t cs = F->cs;
+    if (g.ink && restore) ink_lane_snap_wait(ink_lane());
+    if (g.ink && !restore)
+        if (cudaStream_t ss = ink_snap_begin()) cs = ss;
     const auto run = [&](void* d, size_t b, size_t n = SIZE_MAX) {   // (n: the bytes moved, from the run's start)
         n = std::min(n, b);
         if (n > 0)
             cudaMemcpyAsync(restore ? d : at, restore ? at : d, n, restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
-                            F->cs);
+                            cs);
         at += b;
     };
     if (g.ink) {   // (the window rings' written rows only: the snapshot's position - this one's, or the one restored)
@@ -925,6 +931,10 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     } else {
         q35_snap_pend_ = q35_pend_pos_;
         q35_snap_done_ = q35_row_done_;
+    }
+    if (cs != F->cs) {   // (the copy in flight: the lane waits for it, the others decode)
+        ink_snap_end();
+        return true;
     }
     return cudaStreamSynchronize(F->cs) == cudaSuccess;
 }

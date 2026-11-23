@@ -1768,7 +1768,13 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
     // after a prompt chunk read while others decode, the decoding requests get this share of its time before the next
     // chunk (0.5: a chunk of 300 ms, then 150 ms of decode rounds) - the streams keep moving through a long prompt, the
     // prompt still gets two thirds of the GPU.  0: one decode round between chunks
-    const double share = std::max(0.0, env_num("STRATA_PAR_SHARE", 0.5));
+    // inside a prompt chunk read while others decode: a decode round before every STRATA_PAR_YIELD-th of its 48 layer
+    // applications (the chunk's sums unchanged: the prompt's layers and the decode steps take turns on one stream) -
+    // the streams' pause while a long prompt is read is a slice of a chunk, not all of it (RTX 5090, three streams
+    // while an 8K prompt is read: longest pause 161 -> 37 ms, the 8K prompt's first token 1.50 -> 1.44 s).  0: off
+    const int yield_k = std::max(0, (int) env_num("STRATA_PAR_YIELD", 8));
+    // (with the rounds inside the chunks, none owed after it: STRATA_PAR_SHARE 0 then)
+    const double share = std::max(0.0, env_num("STRATA_PAR_SHARE", yield_k > 0 ? 0.0 : 0.5));
     clk::time_point owed_until = clk::now();   // (no chunk before this while requests decode)
     std::map<std::string, std::shared_ptr<kn::BiasSet>> bias_sets;
     std::deque<std::string> bias_order;
@@ -2200,22 +2206,27 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
         if (!model.ink_lane_use(j, err) || !model.snapshot_save())
             std::fprintf(stderr, "maya generate: --parallel: lane %d's snapshot buffer: %s\n", j,
                          err.empty() ? "not allocated (no conversation reuse on it)" : err.c_str());
+    // ---- a decode round: every request whose prompt is in, one token each (false: the model failed under every
+    // request in the round - the engine ends, the server restarts it)
+    // the lanes' snapshots on a copy stream from now on (STRATA_PAR_SNAP_ASYNC=0: on the decode's, as alone): an 8K
+    // conversation's ~0.5 GB took ~75 ms, every stream paused for it
+    model.ink_snap_async_ = env_num("STRATA_PAR_SNAP_ASYNC", 1) != 0;
     std::vector<int> bl;
     std::vector<int32_t> bt;
     std::vector<Req*> br;
-    for (;;) {
-        bool any = !waiting.empty();
-        for (auto& l : lanes) any = any || (bool) l.req;
-        busy.set(any);
-        if (!drain(!any) && !any) break;
-        admit();
-        if (quitting) {   // QUIT / end of input: the requests in flight end now (as a STOP would)
-            for (auto& l : lanes) if (l.req) l.req->stop = true;
-        }
-        // ---- a decode round: every request whose prompt is in, one token each
+    const auto decode_round = [&]() -> bool {
         br.clear();
+        int held = -1;   // (a lane whose snapshot is still crossing the bus: it joins the round after)
         for (auto& l : lanes)
-            if (l.req && l.req->decoding) br.push_back(l.req.get());
+            if (l.req && l.req->decoding) {
+                if (model.ink_lane_snap_ready(l.req->lane)) br.push_back(l.req.get());
+                else held = l.req->lane;
+            }
+        if (br.empty() && held >= 0 && reading.empty()) {   // (nothing else to run: wait for it)
+            model.ink_lane_snap_wait(held);
+            for (auto& l : lanes)
+                if (l.req && l.req->decoding && model.ink_lane_snap_ready(l.req->lane)) br.push_back(l.req.get());
+        }
         {   // (a request stopped while decoding: ends before its next token)
             std::vector<Req*> keep;
             for (Req* r : br) {
@@ -2257,10 +2268,22 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
                 for (Req* r : br) fail_req(*r, err);
                 std::printf("ERR %s\n", err.c_str());
                 std::fflush(stdout);
-                return 1;
+                return false;
             }
             std::fflush(stdout);
         }
+        return true;
+    };
+    for (;;) {
+        bool any = !waiting.empty();
+        for (auto& l : lanes) any = any || (bool) l.req;
+        busy.set(any);
+        if (!drain(!any) && !any) break;
+        admit();
+        if (quitting) {   // QUIT / end of input: the requests in flight end now (as a STOP would)
+            for (auto& l : lanes) if (l.req) l.req->stop = true;
+        }
+        if (!decode_round()) return 1;
         // ---- a prompt chunk: the oldest request still reading (all of it when nothing decodes)
         for (size_t i = 0; i < reading.size();)   // (stopped while waiting to read: ended here)
             if (reading[i]->stop) finish_req(*reading[i], "cancel");
@@ -2296,6 +2319,7 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
             const size_t read0 = r.read;
             if (r.read == 0) {   // the first chunk: the lane's conversation restored, or the lane reset
                 const auto tr = clk::now();
+                model.ink_lane_snap_wait(r.lane);   // (its last snapshot's copy, if still in flight)
                 bool restored = false;
                 if (r.reuse > 0) restored = model.snapshot_restore() && model.position() == (int64_t) r.reuse;
                 if (!restored) {
@@ -2329,10 +2353,22 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
                             if (l == "STOP " + std::to_string(r.rid) || l == "QUIT") r.stop = true;
                         return !r.stop && !in.stop.load();
                     };
+                    bool fatal = false;
+                    if (decoding_now && yield_k > 0)
+                        model.prefill_layer_hook = [&](int ia) {
+                            if (ia % yield_k != 0) return true;
+                            if (!decode_round()) {
+                                fatal = true;
+                                return false;
+                            }
+                            return model.ink_lane_use(r.lane, err);
+                        };
                     // (the snapshot's next token: the NextN block's caches read it - the chunk's following token)
                     err.clear();
                     ok = model.prefill(part, err, r.prompt[r.read + n]);
                     model.prefill_progress = nullptr;
+                    model.prefill_layer_hook = nullptr;
+                    if (fatal) return 1;
                     if (!ok && err == "cancelled") {
                         L.snap.clear();
                         r.stop = true;

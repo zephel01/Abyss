@@ -1110,8 +1110,10 @@ safetensors からそのまま読む。詳しくは [docs/exl3/README.md](exl3/R
   プロンプトは、ほかに何が動いていてもその chunk ごとに読む。`"parallel": 1` では 32K を 1 回で読むので、そこでは
   答えの最後のビットが違うことがある（`--prefill` の chunk を変えたときと同じ）。1 本だけのときは通常の token の経路で decode する。
 - **新しいリクエストはすぐ合流する。** プロンプトは decode の合間に読む: 短いプロンプトなら走っているストリームの停止は
-  1 回約 40 ms。長いプロンプトは chunk（`STRATA_PAR_CHUNK`、プロンプト経路の chunk、1 つ約 160 ms）に分けて読み、chunk のたびに
-  その時間の半分（`STRATA_PAR_SHARE`、0.5）を走っているストリームに回す。長いプロンプトを読む間は遅くなるが、止まらない。
+  1 回約 40 ms。長いプロンプトは chunk（`STRATA_PAR_CHUNK`、プロンプト経路の chunk、1 つ約 160 ms）に分けて読み、chunk の中でも
+  48 層の 8 層ごとに走っているストリームの decode を 1 ステップ挟む（`STRATA_PAR_YIELD`）。chunk の和は変わらず、8K のプロンプトを
+  読む間の止まりは最長約 35 ms（前は 161 ms）、8K の最初のトークンも同じくらい早い（1.44 s。前は 1.50 s）。読み終えた会話の
+  コピー（8K で約 75 ms）は他のストリームを止めずに裏で行う（`STRATA_PAR_SNAP_ASYNC`）。
 - **会話の再利用は lane ごと。** 終わったリクエストの lane はその会話を持ち続け、新しいリクエストは「そのプロンプトが続きに
   なっている会話」を持つ空き lane に入る（エージェントが同じ文脈を送り直しても、新しい部分だけ読む）。
 - **キャンセル**（クライアントの切断）はその 1 本だけを止める。
@@ -1505,7 +1507,9 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini のプロンプト（CUDA、sm_80 以降）: プロンプト経路の attention をテンソルコアの kernel で（トークンのブロック x キーのタイル、FP16 の積を F32 で足す、相対バイアスは FP16 2 つに分けて F32 相当、窓の外のタイルは飛ばす）。attention のサブバッチは 2,048 行（`STRATA_INK_PREFILL_SUB` で変えられる）。RTX 5090、UD-Q4_K_XL で 8K プロンプト 3,784 → 6,874 tok/s、165K 765 → 5,298。足す順番と q / P の FP16 丸めでビットは変わるが、llama.cpp に対する KL は変わらない。`0`: トークン経路の kernel で 1 行ずつ、サブバッチ 512 行（前のビット）。AMD は常にこちら |
 | `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini、`--serve`: まとめて decode するリクエストの数（`N`、または `auto`: 全 expert が VRAM に残り、3 GB とプロンプト経路の領域が余る範囲で最大 8。それより大きい `N` はそこまで減らす）。実行設定の `"parallel"`。[複数のリクエストを同時に](#複数のリクエストを同時にparallelinkling-2-miniベータ) を参照 |
 | `STRATA_PAR_CHUNK` | プロンプト経路の chunk | `"parallel"` が 2 以上: 他のリクエストが decode 中のとき、decode の合間に読むプロンプトのトークン数（`STRATA_PAR_PREFILL_MB` 2048 の 32 GB のカードで 1,280）。小さくすると走っているストリームの止まる時間が短くなり、プロンプトは遅くなる。また長いプロンプトの区切りがほかの decode の有無で変わるので、答えの最後のビットも変わりうる |
-| `STRATA_PAR_SHARE` | 0.5 | `"parallel"` が 2 以上: プロンプトの chunk のあと、その chunk にかかった時間のこの割合だけ走っているリクエストを decode してから次の chunk へ（0: chunk の間に decode 1 ステップ） |
+| `STRATA_PAR_YIELD` | 8 | `"parallel"` が 2 以上: 他のリクエストが decode 中に読むプロンプトの chunk の中で、48 層のこの数ごとにそれらの decode を 1 ステップ挟む（chunk の和は変わらない）。小さいほど止まりは短く、プロンプトは遅い（4: p99 23 ms、8K 1.84 s。12: 48 ms、1.31 s）。0: 無効（chunk 全部のあと `STRATA_PAR_SHARE`） |
+| `STRATA_PAR_SHARE` | 0（`STRATA_PAR_YIELD=0` なら 0.5） | `"parallel"` が 2 以上: プロンプトの chunk のあと、その chunk にかかった時間のこの割合だけ走っているリクエストを decode してから次の chunk へ（0: chunk の間に decode 1 ステップ） |
+| `STRATA_PAR_SNAP_ASYNC` | 1 | `"parallel"` が 2 以上: 読み終えたプロンプトの会話（その lane の次のリクエスト用）を、他のリクエストの decode 中にコピー用 stream でホストへ写す。そのリクエスト自身はコピーが終わってから始まる。0: decode の stream で（全ストリームが待つ。8K の会話で約 75 ms） |
 | `STRATA_PAR_PREFILL_MB` | 2048 | `"parallel"` が 2 以上: プロンプト経路専用の VRAM 領域（MB）を起動時に確保し、expert pool の尾を借りない。借りると尾の expert が RAM へ行って戻り、その間ほかのリクエストが待った（40 トークンのプロンプトで約 150 ms）。0: 1 本のときと同じく借りる |
 | `STRATA_PAR_TRACE` | 未設定 | `1`: プロンプトの chunk ごとに、各段階の時間（lane の切り替え、会話の復元かリセット、読み込み、snapshot）を 1 行出す |
 | `STRATA_DS4_SPEC_GROUP` | 窓の半分 | pipelined の窓の 1 グループの列数（v1.3.43）。既定は ceil(T / 2) 列ずつの 2 グループ |

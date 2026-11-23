@@ -140,7 +140,11 @@ struct Ink {
         int64_t pos = 0, snap_pos = -1, snap_pend = -1, snap_done = -1, pend_pos = -1, row_done = -1;
         void* snap_h = nullptr;
         int last_tok = -1;
+        cudaEvent_t snap_ev = nullptr;   // (its snapshot's copy, when one is in flight: snap_busy)
+        bool snap_busy = false;
     };
+    cudaStream_t snap_s = nullptr;   // (the lanes' snapshot copies: ink_snap_begin)
+    cudaEvent_t snap_go = nullptr;
     std::vector<Lane> lanes;
     int lane = 0;
     // the batch window's table (ink_batch_step: a row a lane): pos[8], then per slot kc[8], vc[8], conv[8] - on the device
@@ -583,6 +587,13 @@ void Glm5Model::ink_free() {
     if (fast_->ink->ev_fork != nullptr) cudaEventDestroy(fast_->ink->ev_fork);
     if (fast_->ink->ev_join != nullptr) cudaEventDestroy(fast_->ink->ev_join);
     if (fast_->ink->side != nullptr) cudaStreamDestroy(fast_->ink->side);
+    if (fast_->ink->snap_s != nullptr) {
+        cudaStreamSynchronize(fast_->ink->snap_s);
+        cudaStreamDestroy(fast_->ink->snap_s);
+    }
+    if (fast_->ink->snap_go != nullptr) cudaEventDestroy(fast_->ink->snap_go);
+    for (auto& L : fast_->ink->lanes)
+        if (L.snap_ev != nullptr) cudaEventDestroy(L.snap_ev);
     if (fast_->ink->win != nullptr) {
         if (fast_->ink->win->base != nullptr) cudaFree(fast_->ink->win->base);
         delete fast_->ink->win;
@@ -1162,6 +1173,57 @@ bool Glm5Model::ink_lane_use(int j, std::string& err) {
         cudaMemcpy(K->win->states_d, st.data(), st.size() * sizeof(float*), cudaMemcpyHostToDevice);
     }
     return true;
+}
+
+cudaStream_t Glm5Model::ink_snap_begin() {
+    FastState* F = fast_;
+    Ink* K = F != nullptr ? F->ink : nullptr;
+    if (K == nullptr || !ink_snap_async_ || K->lanes.size() < 2) return nullptr;
+    auto& L = K->lanes[(size_t) K->lane];
+    if (K->snap_s == nullptr) {
+        if (cudaStreamCreateWithFlags(&K->snap_s, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&K->snap_go, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            ink_snap_async_ = false;   // (the copies on the decode's stream, as before)
+            return nullptr;
+        }
+    }
+    if (L.snap_ev == nullptr && cudaEventCreateWithFlags(&L.snap_ev, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    ink_lane_snap_wait(K->lane);   // (the lane's buffer: its previous copy done)
+    cudaEventRecord(K->snap_go, F->cs);
+    cudaStreamWaitEvent(K->snap_s, K->snap_go, 0);
+    return K->snap_s;
+}
+
+void Glm5Model::ink_snap_end() {
+    Ink* K = fast_->ink;
+    auto& L = K->lanes[(size_t) K->lane];
+    cudaEventRecord(L.snap_ev, K->snap_s);
+    L.snap_busy = true;
+}
+
+bool Glm5Model::ink_lane_snap_ready(int j) {
+    Ink* K = fast_ != nullptr ? fast_->ink : nullptr;
+    if (K == nullptr || j < 0 || j >= (int) K->lanes.size()) return true;
+    auto& L = K->lanes[(size_t) j];
+    if (!L.snap_busy) return true;
+    const cudaError_t e = cudaEventQuery(L.snap_ev);
+    if (e == cudaErrorNotReady) return false;
+    if (e != cudaSuccess) cudaGetLastError();
+    L.snap_busy = false;
+    return true;
+}
+
+void Glm5Model::ink_lane_snap_wait(int j) {
+    Ink* K = fast_ != nullptr ? fast_->ink : nullptr;
+    if (K == nullptr || j < 0 || j >= (int) K->lanes.size()) return;
+    auto& L = K->lanes[(size_t) j];
+    if (!L.snap_busy) return;
+    cudaEventSynchronize(L.snap_ev);
+    L.snap_busy = false;
 }
 
 bool Glm5Model::ink_batch_step(const int* lanes, const int32_t* toks, int n, std::string& err) {
