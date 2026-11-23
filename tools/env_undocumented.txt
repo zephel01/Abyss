@@ -75,7 +75,6 @@ STRATA_GLM_EXPERT_HELPER_RESYNC  # src/core/glm_fast_path.cu (docs/EXPERT_HELPER
 STRATA_GLM_EXPERT_HELPER_SAME_GPU  # src/core/glm_expert_helper.hpp (docs/EXPERT_HELPER.md)
 STRATA_GLM_HC1  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_HC2  # src/kernels/cuda/glm_fast.cu
-STRATA_GLM_HC3_V41  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_HC_GRAM  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_IGPU_CAL_WAIT_S  # src/core/glm_fast_path.cu
 STRATA_GLM_IGPU_CHUNK_MB  # src/core/glm_fast_path.cu

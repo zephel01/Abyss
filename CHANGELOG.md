@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Changed
+
+- `STRATA_GLM_HC3_V41` is read on NVIDIA too (default off there, on with HIP as before): `1` runs DeepSeek V4.1's
+  mHC read as hc3 on CUDA. RTX 5090, V4.1 JA256, p4k + 512 tokens, n-gram drafts off: decode median 65.1 -> 67.9 tok/s (+4%), but the KL on the
+  8 held-out sequences went up on 7 of 8 (mean 0.3815 -> 0.3839), so it stays opt-in. Documented in the manual.
+
 ### Fixed
 
 - `STRATA_GLM_LANE_PROF`'s GB/s counts each call's experts at their own layer's size. It used the size of the layer
