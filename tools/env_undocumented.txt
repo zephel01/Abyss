@@ -19,6 +19,7 @@ STRATA_DBG_NAN  # src/core/verify.cpp
 STRATA_DEBUG  # serve/mcp.py
 STRATA_DECODE_TIMING  # src/program/generate.cpp
 STRATA_DEC_BATCH  # src/core/verify.cpp
+STRATA_DS41_ENGRAM_PROF  # src/core/dsv41_fast_path.cu
 STRATA_DS41_ENGRAM_THREADS  # src/core/dsv41_fast_path.cu
 STRATA_DS4_ATTN_CHECK  # src/kernels/cuda/dsv4_fast.cu
 STRATA_DS4_DSPARK_DUMP  # src/core/dspark.cu

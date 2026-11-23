@@ -197,6 +197,14 @@ struct V41Engram {
     std::shared_ptr<EngStore> s_cur, s_next;
     std::unique_ptr<EngPool> s_pool;
     bool s_started = false;
+    // the drive KEPT AWAKE between tokens (STRATA_DS41_ENGRAM_KEEPAWAKE, Linux): an NVMe drive idle for the ~20 ms
+    // between two tokens' row reads answers the next ones 3-4x slower (bench/v41fable/rdlat: a 4 KiB random read p50
+    // 140 us back to back, 440 us after 20 ms idle, p90 330 -> 1,800 us), and layer 1 waits on them.  One thread
+    // reads one 4 KiB block of table 0 (O_DIRECT: the device, not the page cache) every interval while tokens come;
+    // the rows (and so the sums) are untouched
+    std::string path[2];
+    std::atomic<int64_t> last_tok_ns{0};
+    bool ka_started = false;
 };
 
 float e4m3(uint8_t b) {
@@ -244,6 +252,7 @@ bool engram_open(const std::string& pack, V41Engram& E, std::string& err) {
                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr);
             if (E.h[k] == INVALID_HANDLE_VALUE) { err = "deepseek41: cannot open the Engram table in " + path; return false; }
 #else
+            E.path[k] = path;
             E.fd[k] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
             if (E.fd[k] < 0) { err = "deepseek41: cannot open the Engram table in " + path; return false; }
             posix_fadvise(E.fd[k], 0, 0, POSIX_FADV_RANDOM);   // (264-byte rows at random: no readahead)
@@ -588,6 +597,61 @@ bool engram_rows(V41Engram& E, int32_t tok, int64_t p, uint64_t* rows, std::stri
     return true;
 }
 
+// STRATA_DS41_ENGRAM_PROF=1 (diagnostic): a decode token's background read timed - from the token's hand-over to the
+// reader's wake, to table 0's rows (layer 1 waits on them) and table 1's, and each row read from the table file;
+// percentiles printed every 256 tokens
+bool eng_prof_on() {
+    static const bool on = getenv("STRATA_DS41_ENGRAM_PROF") != nullptr;
+    return on;
+}
+int64_t eng_now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct EngProf {
+    std::mutex m;
+    std::vector<float> wake, t0, t1, reads, rmax0, miss0;
+    std::atomic<int64_t> rmax{0};
+    std::atomic<int> nmiss{0};
+    int64_t handed = 0;
+};
+EngProf& eng_prof() {
+    static EngProf P;
+    return P;
+}
+void eng_prof_read(int64_t ns) {
+    EngProf& P = eng_prof();
+    int64_t cur = P.rmax.load(std::memory_order_relaxed);
+    while (ns > cur && !P.rmax.compare_exchange_weak(cur, ns, std::memory_order_relaxed)) {
+    }
+    P.nmiss.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> l(P.m);
+    P.reads.push_back((float) (ns / 1e3));
+}
+void eng_prof_print() {
+    EngProf& P = eng_prof();
+    const auto pc = [](std::vector<float> v, char* out, size_t n) {
+        if (v.empty()) { std::snprintf(out, n, "-"); return; }
+        std::sort(v.begin(), v.end());
+        double m = 0;
+        for (float x : v) m += x;
+        const auto q = [&](double f) { return v[std::min(v.size() - 1, (size_t) (f * (double) v.size()))]; };
+        std::snprintf(out, n, "p50 %.0f p90 %.0f p99 %.0f max %.0f mean %.0f", q(0.5), q(0.9), q(0.99), v.back(),
+                      m / (double) v.size());
+    };
+    char a[128], b[128], c[128], d[128], e[128];
+    pc(P.wake, a, sizeof a);
+    pc(P.t0, b, sizeof b);
+    pc(P.t1, c, sizeof c);
+    pc(P.reads, d, sizeof d);
+    pc(P.rmax0, e, sizeof e);
+    double mi = 0;
+    for (float x : P.miss0) mi += x;
+    std::fprintf(stderr, "engram prof: %zu tokens (us) | wake %s | table 0 done %s | table 1 done %s | a row read (%zu) %s | "
+                         "table 0's slowest read %s | table 0 misses %.1f a token\n",
+                 P.t0.size(), a, b, c, P.reads.size(), d, e, mi / (double) std::max<size_t>(1, P.miss0.size()));
+    P.wake.clear(); P.t0.clear(); P.t1.clear(); P.reads.clear(); P.rmax0.clear(); P.miss0.clear();
+}
+
 // n bytes of table k's file at byte at (64-bit: the tables sit past 100 GB) -> dst
 static bool engram_read(V41Engram& E, int k, uint64_t at, uint8_t* dst, size_t n) {
     size_t done = 0;
@@ -659,10 +723,12 @@ bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err)
     if (hit) {
         E.hits.fetch_add(1, std::memory_order_relaxed);
     } else {
+        const int64_t r0 = eng_prof_on() ? eng_now() : 0;
         if (!engram_read(E, k, E.off[k] + row * (uint64_t) RB, raw, (size_t) RB)) {
             err = "deepseek41: Engram row read failed";
             return false;
         }
+        if (eng_prof_on()) eng_prof_read(eng_now() - r0);
         E.misses.fetch_add(1, std::memory_order_relaxed);
         if (E.cmask != 0) {
             std::lock_guard<std::mutex> l(E.stripe[slot & 255]);
@@ -688,10 +754,17 @@ void engram_async_loop(V41Engram* E) {
         float* dst = E->a_dst;
         unsigned int* flag = E->a_flag;
         const unsigned int seq = E->a_seq;
+        const bool prof = eng_prof_on() && E->a_T == 0;   // (decode tokens only)
+        const int64_t handed = prof ? eng_prof().handed : 0, woke = prof ? eng_now() : 0;
         l.unlock();
         std::string e;
         bool ok = true;
+        int64_t done[2] = {0, 0};
         for (int k = 0; k < 2; ++k) {
+            if (prof && k == 0) {
+                eng_prof().rmax.store(0, std::memory_order_relaxed);
+                eng_prof().nmiss.store(0, std::memory_order_relaxed);
+            }
             if (ok && !engram_rows_par(*E, T * kEngCols, rows.data() + (size_t) k * T * kEngCols, k, nullptr,
                                        dst + (size_t) k * T * kEngCols * kEngDim, e))
                 ok = false;
@@ -699,11 +772,77 @@ void engram_async_loop(V41Engram* E) {
             // even on a failure: the layer's kernel spins on this flag (engram_wait) and must not hang the GPU; the
             // failure reaches the host at the token's end (dsv41_engram_ok) and the token's answer is an error
             std::atomic_ref<unsigned int>(flag[k]).store(seq, std::memory_order_release);
+            if (prof) done[k] = eng_now();
+            if (prof && k == 0) {
+                EngProf& P = eng_prof();
+                std::lock_guard<std::mutex> pl(P.m);
+                P.rmax0.push_back((float) (P.rmax.load() / 1e3));
+                P.miss0.push_back((float) P.nmiss.load());
+            }
+        }
+        if (prof) {
+            EngProf& P = eng_prof();
+            {
+                std::lock_guard<std::mutex> pl(P.m);
+                P.wake.push_back((float) ((woke - handed) / 1e3));
+                P.t0.push_back((float) ((done[0] - handed) / 1e3));
+                P.t1.push_back((float) ((done[1] - handed) / 1e3));
+            }
+            if (P.t0.size() >= 256) eng_prof_print();
         }
         l.lock();
         if (!ok && !E->a_bad) { E->a_bad = true; E->a_err = e; }
         E->a_busy = false;
         E->acv.notify_all();
+    }
+}
+
+// STRATA_DS41_ENGRAM_KEEPAWAKE: the keep-awake read's interval in us (default 1000; 0: off).  Reads only while
+// decode tokens come (the last one handed over under 200 ms ago), then sleeps until the next.  RTX 5090 + Lexar
+// NM790, V4.1 JA256, p4k + 512 tokens: table 0's rows ready mean 836-1,038 -> 616-807 us a token, 63.9-64.7 ->
+// 65.0-66.2 tok/s (medians 64.0 -> 65.4, 3 / 4 runs)
+int engram_keepawake_us() {
+    static const int us = (int) strata::core::env_num("STRATA_DS41_ENGRAM_KEEPAWAKE", 1000, 0, 100000);
+    return us;
+}
+int64_t eng_mono_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void engram_keepawake_loop(V41Engram* E, int us) {
+#ifndef _WIN32
+    const int fd = ::open(E->path[0].c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    if (fd < 0) return;   // (a file system without O_DIRECT: no keep-awake, the reads as before)
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, 4096) != 0) { ::close(fd); return; }
+    const uint64_t lo = E->off[0] / 4096, n = std::max<uint64_t>(1, E->rows[0] * (uint64_t) E->row_bytes / 4096);
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    for (;;) {
+        const int64_t idle = eng_mono_ns() - E->last_tok_ns.load(std::memory_order_relaxed);
+        if (idle > 200000000ll) {   // (no tokens: wait for the next one)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        if (pread(fd, buf, 4096, (off_t) ((lo + x % n) * 4096)) < 0 && errno != EINTR) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(us));
+    }
+    free(buf);
+    ::close(fd);
+#else
+    (void) E;
+    (void) us;
+#endif
+}
+void engram_keepawake_note(V41Engram* E) {   // (called with E->am held)
+    E->last_tok_ns.store(eng_mono_ns(), std::memory_order_relaxed);
+    if (!E->ka_started) {
+        E->ka_started = true;
+        const int us = engram_keepawake_us();
+#ifndef _WIN32
+        if (us > 0) std::thread(engram_keepawake_loop, E, us).detach();
+#else
+        (void) us;
+#endif
     }
 }
 
@@ -915,6 +1054,8 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
         E->a_dst = F->v41_eng_h;
         E->a_flag = F->v41_eng_flag;
         E->a_seq = F->v41_eng_seq;
+        if (eng_prof_on()) eng_prof().handed = eng_now();
+        engram_keepawake_note(E);
         E->a_have = true;
         E->a_busy = true;
         if (!E->a_started) {   // (a detached std::thread is never joinable: testing that started one a token, #20)
@@ -1086,6 +1227,7 @@ bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std:
         E->a_dst = F->v41_pblk_h;
         E->a_flag = F->v41_eng_flag;
         E->a_seq = F->v41_eng_seq;
+        engram_keepawake_note(E);
         E->a_have = true;
         E->a_busy = true;
         if (!E->a_started) {

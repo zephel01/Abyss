@@ -11,6 +11,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ### Changed
 
+- DeepSeek V4.1 on Linux keeps the SSD awake between decode tokens (`STRATA_DS41_ENGRAM_KEEPAWAKE`, default a 4 KiB
+  read every 1000 us while tokens come, `0` off): an NVMe drive idle for the ~15 ms between two tokens' Engram row
+  reads answered them 3-4x slower, and layer 1 waits on them. RTX 5090 + Lexar NM790, V4.1 JA256, p4k + 512 tokens:
+  the first table's rows ready 836-1,038 -> 616-807 us a token, decode median 64.0 -> 65.4 tok/s. Same outputs.
+  `STRATA_DS41_ENGRAM_PROF=1` (diagnostic) prints the background reader's timings every 256 tokens.
 - `STRATA_GLM_HC3_V41` is read on NVIDIA too (default off there, on with HIP as before): `1` runs DeepSeek V4.1's
   mHC read as hc3 on CUDA. RTX 5090, V4.1 JA256, p4k + 512 tokens, n-gram drafts off: decode median 65.1 -> 67.9 tok/s (+4%), but the KL on the
   8 held-out sequences went up on 7 of 8 (mean 0.3815 -> 0.3839), so it stays opt-in. Documented in the manual.
