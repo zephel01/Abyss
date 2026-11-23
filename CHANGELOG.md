@@ -9,6 +9,12 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- `STRATA_GLM_LANE_PROF`'s GB/s counts each call's experts at their own layer's size. It used the size of the layer
+  the 4,096th call landed on, so a model whose layers mix expert types (DeepSeek V4.1 Compact JA256) printed a
+  misleading 65.6 -> 97.9 GB/s "slow start": the time an expert takes was the same in both halves. Diagnostic only.
+
 ## v1.3.195 - 2026-11-23
 
 Setup turns on Inkling 2 Mini's DSpark drafter again when its file is on disk: with v1.3.194's verify window graph it
