@@ -1511,6 +1511,15 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "evicts none\n", dev_, k_extra);
             }
         }
+        // no tail (--prefill 0) on a discrete card that holds every expert: `per` stops at n_expert, but a layer's
+        // spares take kSpares of its slots, so kSpares experts a layer stayed in RAM (Inkling 2 Mini: 72, 99.9% hits,
+        // 176.6 against 187.7 tok/s with the tail on top).  Give the spares their own slots when they fit.  (Unified
+        // memory keeps n_expert: full_unified_pool holds every expert there without spares)
+        if (k_extra == 0 && !F->unified_memory && per >= g.n_expert &&
+            (size_t) (g.n_expert + gf::kSpares) * stride_sum <= avail_top) {
+            per = g.n_expert + gf::kSpares;
+            avail = std::max(avail, (size_t) per * stride_sum);
+        }
         // the slots PER LAYER: uniform, or - with the pack's expert_counts.txt (tools/glm_expert_prior.py) - by routing
         // share: every layer gets a floor, then each further slot goes to the layer whose next-most-routed expert serves
         // the largest share of its lookups (early layers spread their routing wide and gain the most).

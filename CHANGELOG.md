@@ -9,8 +9,22 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.195 - 2026-11-23
+
+Setup turns on Inkling 2 Mini's DSpark drafter again when its file is on disk: with v1.3.194's verify window graph it
+wins on code, edits, Japanese answer text (181.1 -> 237.6 tok/s at 1,024 tokens on an RTX 5090) and after long
+prompts, and loses 1-3% only on English thinking and prose - the same tokens bit for bit. `--prefill 0` keeps every
+expert in VRAM when they fit (Inkling 182.4 -> 188.8 tok/s). Hardening from a review of Strata v0.2.20's fixes (prompt
+chunk cap, NVFP4 scale guard, CPU code kept to its instruction set, Windows VRAM margin). Other models give the same
+bits as v1.3.194 (7-config md5 check).
+
 ### Fixed
 
+- `--prefill 0` on a discrete card that holds every expert keeps them all in VRAM. The pool stopped at one slot per
+  expert, and each layer's three spare slots came out of those, so three experts a layer stayed in RAM (Inkling 2
+  Mini on an RTX 5090: 72 experts, 99.4-99.9% VRAM hits); the spares now get their own slots when they fit, as with
+  `--prefill auto`'s prompt tail on top. Inkling 2 Mini prose, `--prefill 0`: 182.4 -> 188.8 tok/s, same tokens bit
+  for bit. `--prefill auto` (the server's default) and unified memory are unchanged.
 - A prompt chunk given by hand (`--prefill N` / `STRATA_GLM_PREFILL=N`) is held to 32768 tokens, the auto limit, with
   a `NOTE:` line on stderr. Many prompt kernels carry the chunk's token count in their grid's y/z size, whose limit is
   65535: a chunk of 65536 tokens or more (possible on a large-VRAM or unified-memory box) failed those launches.
@@ -25,6 +39,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ### Changed
 
+- Setup turns on Inkling 2 Mini's DSpark drafter again: `./setup-deepseek.sh --model inkling2mini` names
+  `dspark-Inkling-2-Mini-Q8_0.gguf` in the config's env (`STRATA_INK_DSPARK`) when the file is already on disk
+  (`<data>/models/unsloth/Inkling-2-Mini-GGUF/dspark/`, the Hugging Face repo's folder; setup does not download it);
+  `--no-dspark` takes it out (the file stays). NVIDIA, one GPU. With v1.3.194's verify window graph it wins on code,
+  edits, Japanese answer text (181.1 -> 237.6 tok/s at 1,024 tokens) and after long prompts (165K 97-98 -> 112-120);
+  only English thinking and prose lose 1-3%. v1.3.194's "Japanese 183.1 -> 180.0" was a 512-token run that is
+  mostly English thinking.
 - Windows only: the VRAM left free beside the expert pool is 2 GB on a CUDA card above 12.5 GB (was 1.5 GB) and 1.5
   GB on a smaller card, for Qwen3.8 (q4x) and for the dense path's `--vram-reserve-mib` default (was 700 MB), so a
   browser or the desktop taking VRAM after the load is less likely to push the NVIDIA driver into its Sysmem
