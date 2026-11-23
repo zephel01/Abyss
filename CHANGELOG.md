@@ -18,6 +18,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   unchanged. `STRATA_INK_CTL_BF16=0` keeps the F32 rows; AMD keeps them unless it is `1`. `STRATA_INK_CTL_SPLIT=2/4`
   (opt-in, another sum order) splits the controllers' down rows over 2 / 4 warps: `2` 193.0 tok/s (no gain), `4`
   195.1 tok/s with KL 0.005687 -> 0.005681 but Japanese 0.0068 -> 0.0071, so neither is the default.
+- Inkling 2 Mini decode: the depth-attention mix (with the post convolution before it and the norms or controller
+  input norms after it) is one launch instead of two - the chunk blocks' sums, the softmax and the weighted sums,
+  then the norms in the last blocks, waiting for each other through a counter - with every sum added in the old
+  order, so the tokens are the same (md5 on 6 prompts with and without the verify window and DSpark). RTX 5090,
+  UD-Q4_K_XL, server, median of 3: prose 189.8 -> 195.0 tok/s, code 189.7 -> 195.1. `STRATA_INK_MIX1=0`: the two
+  launches. HIP keeps the two.
+- Inkling 2 Mini prompts (128 rows and more a step): the depth-attention mix, the post convolution and residual add
+  before it and the norms and FP16 copies after it are one launch a row instead of several, every sum in the old
+  order, so the tokens are the same (md5 on the 8K code and edit prompts, with and without the verify window and
+  DSpark). RTX 5090, UD-Q4_K_XL, server, median of 3: 16K prompt prose 8343 -> 9074 tok/s (+8.8%), code 8383 -> 9083
+  (+8.4%), 2,048 tokens 6845 -> 7278 (+6.3%), 512 tokens 3303 -> 3386 (+2.5%); shorter prompts keep the old launches.
+  `STRATA_INK_MIX1=0` turns this off too. HIP keeps the old launches.
 
 ## v1.3.195 - 2026-11-23
 
