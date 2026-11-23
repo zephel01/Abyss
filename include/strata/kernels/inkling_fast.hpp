@@ -212,4 +212,26 @@ void add_rows(float* h, int64_t hs, const float* a, int64_t as, int n, int T, cu
 /// x = cap tanh(x / cap), n floats (cap <= 0: nothing)
 void softcap(float* x, int64_t n, float cap, cudaStream_t s);
 
+/// The loop controllers' GEMVs on BF16 rows (STRATA_INK_CTL_BF16): unsloth's GGUF stores the controllers in F32, but
+/// every value there is a BF16 value (the low 16 bits zero), so the rows are kept as their high halves - the same
+/// values, half the bytes.  y[c][r] = W[r] . x[c] for nc columns (x column c at x + c n_in, y at y + c n_out), each
+/// output summed exactly as glm_fast's F32 GEMV sums it (row_dot_f32 / mvn_kernel_f: a warp a row, a lane's chain of
+/// four products a step at float4 index lane + 32 i, the xor tree, then 1 * s + 0): the same bits.  rpb: rows (warps)
+/// a block - the order of a row's sum does not depend on it.  n_in % 4 == 0.
+struct CtlJob {
+    const uint16_t* w = nullptr;
+    const float* x = nullptr;
+    float* y = nullptr;
+    int n_in = 0, n_out = 0;
+};
+constexpr int kMaxCtlJobs = 8;
+/// split 2 / 4 / 8 (STRATA_INK_CTL_SPLIT, opt-in): that many warps a row, each a contiguous share of the steps, the
+/// parts added in order - another sum order (not the F32 GEMV's bits; rpb unused)
+bool ctl_mv(const CtlJob* jobs, int n, int nc, int rpb, cudaStream_t s, int split = 1);
+/// BF16 rows from F32 ones by their high halves (n % 4 == 0); *bad (a device int, not cleared here) gets 1 when any
+/// value's low half is not zero - that tensor stays F32
+void ctl_pack(const float* x, uint16_t* y, int64_t n, int* bad, cudaStream_t s);
+/// ... and back (the prompt path's cuBLAS SGEMM takes the F32 rows: the same values as the GGUF's)
+void ctl_unpack(const uint16_t* x, float* y, int64_t n, cudaStream_t s);
+
 }  // namespace strata::kernels::ink
