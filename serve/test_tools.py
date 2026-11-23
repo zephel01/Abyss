@@ -865,5 +865,121 @@ class StreamSockets(unittest.TestCase):
         self.assertTrue(handler.disable_nagle_algorithm)     # (socketserver sets TCP_NODELAY on each connection)
 
 
+
+def run_all(text, tools=TOOLS, xml_calls=False):
+    """(calls as (name, arguments), content) for `text` fed whole and in 1 / 3 / 7 / 29-character pieces, with and
+    without stream_tools - all must agree, and a streamed call's tool_args must be its arguments' JSON."""
+    seen = set()
+    for step in (None, 1, 3, 7, 29):
+        for st in (False, True):
+            p = OutputParser(thinking=False, tools=tools, stream_tools=st, xml_calls=xml_calls)
+            ev = []
+            for i in range(0, len(text), step or len(text)):
+                ev += p.feed(text[i:i + (step or len(text))])
+            ev += p.finish()
+            streamed = {}
+            for e in ev:
+                if e.kind == "tool_args":
+                    streamed[e.call.id] = streamed.get(e.call.id, "") + e.text
+            for c in calls(ev):
+                if c.id in streamed:
+                    assert json.loads(streamed[c.id]) == c.arguments, (step, streamed[c.id], c.arguments)
+            seen.add((json.dumps([(c.name, c.arguments) for c in calls(ev)]), content(ev)))
+    assert len(seen) == 1, seen
+    got, text_out = seen.pop()
+    return [tuple(x) for x in json.loads(got)], text_out
+
+
+WRITE = [{"name": "write", "parameters": {"type": "object", "properties": {
+    "path": {"type": "string"}, "content": {"type": "string"}, "n": {"type": "integer"}}}}]
+QCALL = "<tool_call>\n<function=write>\n<parameter=path>\n%s\n</parameter>\n<parameter=content>\n%s\n</parameter>\n" \
+        "</function>\n</tool_call>"
+INNER = "</parameter>\n</function>\n</tool_call>"
+
+
+class QwenClosingTagsInValue(unittest.TestCase):
+    """Basalt #533's case: a string value holding the call's own closing tags (a document about tool calls) was cut
+    there and the rest went out as text.  A closing triple inside the body is value text when what follows closes the
+    call again before any new <tool_call>; otherwise the call ends at the first close, as before."""
+
+    def test_value_keeps_the_tags(self):
+        doc = "Example of a call:\n" + INNER + "\nend of doc"
+        self.assertEqual(run_all(QCALL % ("a.md", doc), WRITE), ([("write", {"path": "a.md", "content": doc})], ""))
+
+    def test_two_inner_closes_and_one_at_the_end(self):
+        doc = "A\n" + INNER + "\nB " + INNER
+        self.assertEqual(run_all(QCALL % ("a", doc), WRITE), ([("write", {"path": "a", "content": doc})], ""))
+
+    def test_calls_and_text_after_a_call_unchanged(self):
+        two = QCALL % ("a", "x") + "\n" + QCALL % ("b", "y")
+        self.assertEqual(run_all(two, WRITE), ([("write", {"path": "a", "content": "x"}),
+                                                ("write", {"path": "b", "content": "y"})], ""))
+        self.assertEqual(run_all(QCALL % ("a", "x") + "\nAll done.", WRITE),
+                         ([("write", {"path": "a", "content": "x"})], "All done."))
+        # a value with the triple, then a second call: the next <tool_call> decides that close was the call's own
+        doc = "E " + INNER + " z"
+        self.assertEqual(run_all(QCALL % ("a", doc) + "\n" + QCALL % ("b", "y"), WRITE),
+                         ([("write", {"path": "a", "content": doc}), ("write", {"path": "b", "content": "y"})], ""))
+
+    def test_other_forms_unchanged(self):
+        self.assertEqual(run_all("<tool_call>\n<function=write>\n<parameter=n>\n3\n</parameter>\n</function>\n"
+                                 "</tool_call>", WRITE), ([("write", {"n": 3})], ""))
+        self.assertEqual(run_all("<tool_call>\n<function=write>\n</function>\n</tool_call>after", WRITE),
+                         ([("write", {})], "after"))
+        self.assertEqual(run_all("<tool_call>write<arg_key>path</arg_key><arg_value>a</arg_value></tool_call>", WRITE),
+                         ([("write", {"path": "a"})], ""))
+        self.assertEqual(run_all(QWEN), ([("get_weather", {"city": "Paris", "days": 3})], ""))
+
+    def test_parse_tool_call(self):
+        body = "<function=write>\n<parameter=content>\nA\n" + INNER + "\nB\n</parameter>\n</function>\n"
+        self.assertEqual(parse_tool_call(body, WRITE[0]).arguments, {"content": "A\n" + INNER + "\nB"})
+
+    def test_an_end_token_after_the_close_ends_the_turn(self):
+        # the close is still being decided, but the call's tags are all there: not an open call (soft end)
+        p = OutputParser(thinking=False, tools=WRITE, stream_tools=True)
+        p.feed(QCALL % ("a", "x"))
+        self.assertFalse(p.in_open_call())
+        p = OutputParser(thinking=False, tools=WRITE, stream_tools=True)
+        p.feed(QCALL[:40])
+        self.assertTrue(p.in_open_call())
+
+
+class XmlCalls(unittest.TestCase):
+    """The XML call form (<invoke name=..><parameter name=..>, bare, in <function_calls> or in <tool_call>) - Inkling 2
+    drifts into it (Basalt #540: 18 of 50 answers).  A call only for a declared tool, outside code, with xml_calls."""
+
+    def test_bare_invoke(self):
+        x = 'Let me write it.\n<invoke name="write">\n<parameter name="path">a.md</parameter>\n' \
+            '<parameter name="n">3</parameter>\n</invoke>\nDone.'
+        self.assertEqual(run_all(x, WRITE, True), ([("write", {"path": "a.md", "n": 3})], "Let me write it.Done."))
+
+    def test_function_calls_block_and_string_attr(self):
+        x = '<function_calls>\n<invoke name="write">\n<parameter name="path" string="true">a.md</parameter>\n' \
+            '</invoke>\n<invoke name="write">\n<parameter name="content">\nline\n</parameter>\n</invoke>\n' \
+            '</function_calls>'
+        self.assertEqual(run_all(x, WRITE, True), ([("write", {"path": "a.md"}), ("write", {"content": "line"})], ""))
+
+    def test_inside_tool_call(self):
+        x = '<tool_call>\n<function_calls>\n<invoke name="write">\n<parameter name="path">a</parameter>\n' \
+            '</invoke>\n</function_calls>\n</tool_call>'
+        self.assertEqual(run_all(x, WRITE, True), ([("write", {"path": "a"})], ""))
+
+    def test_unterminated(self):
+        x = '<function_calls>\n<invoke name="write">\n<parameter name="path">a</parameter>\n</invoke>'
+        self.assertEqual(run_all(x, WRITE, True), ([("write", {"path": "a"})], ""))
+
+    def test_text_cases(self):
+        undeclared = '<invoke name="rm">\n<parameter name="path">/</parameter>\n</invoke>'
+        self.assertEqual(run_all(undeclared, WRITE, True), ([], undeclared))
+        fenced = '```xml\n<invoke name="write">\n<parameter name="path">a</parameter>\n</invoke>\n```'
+        self.assertEqual(run_all(fenced, WRITE, True), ([], fenced))
+        x = 'I <invoked> it'
+        self.assertEqual(run_all(x, WRITE, True), ([], x))
+        # without xml_calls (every model but Inkling) the form stays text
+        x = '<invoke name="write">\n<parameter name="path">a</parameter>\n</invoke>'
+        self.assertEqual(run_all(x, WRITE, False), ([], x))
+        # and with no tools declared nothing is a call
+        self.assertEqual(run_all(x, None, True), ([], x))
+
 if __name__ == "__main__":
     unittest.main()

@@ -140,8 +140,9 @@ class Tokenizer:
         if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
                              "hy_v4, inkling2" % pre)
-        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
-        self.ignore_merges = pre in ("glm4", "glm5")
+        # glm4/glm5 and inkling2 set ignore_merges: an exact vocab hit emits the whole pre-token piece (Inkling 2's
+        # tokenizer.json sets it; its o200k vocabulary has entries the merges cannot build - chffff, Aleksandr, VBORw)
+        self.ignore_merges = pre in ("glm4", "glm5", "inkling2")
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -159,7 +160,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
+        self._re = regex.compile(GLM_PATTERN if pre in ("glm4", "glm5") else QWEN35_PATTERN)
         # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
         seq = (JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna"
                else GPT4O_PATTERNS if pre == "inkling2" else None)
@@ -422,10 +423,14 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else (list(JOYAI_PATTERNS) if tk.pre in ("joyai-llm", "hy_v4")
-                                                              else QWEN35_PATTERN),
+        # (named by `pre`, not by ignore_merges: inkling2 sets the flag but splits the GPT-4o way)
+        "pre_pattern": (GLM_PATTERN if tk.pre in ("glm4", "glm5") else list(JOYAI_PATTERNS) if tk.pre in ("joyai-llm", "hy_v4")
+                        else list(LAGUNA_PATTERNS) if tk.pre == "laguna" else list(GPT4O_PATTERNS) if tk.pre == "inkling2"
+                        else QWEN35_PATTERN),
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
-                               "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
+                               "glm4/glm5 set ignore_merges)" if tk.pre in ("glm4", "glm5") else
+                               "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (inkling2; its tokenizer.json sets "
+                               "ignore_merges)" if tk.pre == "inkling2" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
