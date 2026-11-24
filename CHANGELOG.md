@@ -24,6 +24,11 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   without the image rows); a picture encodes in 23-42 ms, a whole answer with one picture took 1.1-2.4 s; all three
   answered right (the counts, the text word for word, the chart's values). The encoder starts when a picture comes, in
   2.91 GB the engine lends it (4096 image tokens). Text-only output is unchanged (Ling md5 on 4 prompts as v1.3.201).
+  Five pictures whose answer depends on where things are (the square left of the red one, the shape above the circle,
+  a 3x3 letter grid's bottom-right cell, the word in the bottom-right corner, the top-right quadrant): all five
+  answered right through the server; in the float64 forward the right answer's probability is the same or higher
+  under HF's rule than under Qwen-VL's (0.9962 vs 0.9764 on the corner word, within 0.0001 on the other four) - both
+  rules answer right, since the vision tower's own 2-D rotary already places the patches.
 
 ### Fixed
 

@@ -170,8 +170,12 @@ bar chart Jan 120 / Feb 260 / Mar 180):
 
 The picture's rows take HF's `get_rope_index` positions, which differ from Qwen-VL's: the grid is centred on the
 picture's own position and the text after it goes on one position later (Qwen-VL: from the corner, and the text after it
-max(width, height) later). On these answers the two rules differ by KL 0.006 in the float64 forward, the size of the
-engine's own error, so the short check above does not separate them; the rule follows the HF code.
+max(width, height) later). On the answers above the two rules differ by KL 0.006 in the float64 forward, the size of
+the engine's own error. Five pictures whose answer depends on where things are (the square left of the red one, the
+shape above the circle, a 3x3 letter grid's bottom-right cell, the word in a corner, a quadrant's colour): all five
+right through the server; in the float64 forward the right answer is as likely or more likely under HF's rule (corner
+word 0.9962 against 0.9764 under Qwen-VL's, the other four within 0.0001). Both rules answer right: the vision tower's
+own 2-D rotary already places the patches, and the rule follows the HF code.
 
 ### Qwen3.8-Flash-Next (qwen4exp)
 
