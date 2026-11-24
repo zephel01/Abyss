@@ -9,6 +9,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.200 - 2026-11-24
+
+Inkling 2 Mini's DSpark drafter is on by default when its file is on disk and it leaves the expert pool as it is: on an
+RTX 5090 code 195 -> 215 tok/s, edits 196 -> 219-224, the answer after a 7.8K prompt 190 -> 273, the same answers
+(greedy md5); prose and Japanese within -1.2%. Where its VRAM would push experts into RAM it stays off and says so.
+Other models give the same bits as v1.3.199 (7-config md5; Inkling 18 md5 and `--parallel` md5 on the 5090 and a 3090).
+
 ### Changed
 
 - **Inkling 2 Mini's DSpark drafter is on by default** when unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf` is on disk where
