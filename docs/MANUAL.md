@@ -1165,18 +1165,19 @@ What you can expect (RTX 5090, UD-Q4_K_XL, greedy, 512 tokens; `bench/batch/driv
 | what runs | each request's tok/s | time to first token | longest pause between tokens |
 | --- | ---: | ---: | ---: |
 | one request | 196 | 0.04-0.06 s | 9 ms |
-| 2 at once | 127-129 | 0.01-0.09 s | 12-42 ms |
-| 4 at once | 90-92 | 0.01-0.14 s | 15-54 ms |
-| 8 at once | 58-61 | 0.01-0.28 s | 20-52 ms |
-| two chats, the second 0.5 s later | 140 each | 0.01-0.02 s | 8-11 ms |
-| a 1,024-token answer while four short questions come and go | 154 (the long one), 128-129 | 0.01-0.03 s | 8-12 ms |
-| three streams when an 8K-token prompt arrives | 83 (the three) | 1.5 s (the 8K one; alone 1.0 s) | 164 ms (the three) |
-| an agent's two 8K contexts 0.3 s apart + a short question | 99-125 | 0.15 / 1.5 / 0.8 s | 158 ms |
-| the same 8K conversation's next turn (its lane kept it) | 191 | 0.18 s | 5 ms |
-| one of three cancelled after 50 tokens | 125-127 (the other two) | - | 48 ms |
-| 40960 tokens, 4 lanes: a 16K context, a 32K one 0.5 s later, a short question 1 s later | 65 / 139 / 42 | 2.4 / 7.9 / 1.5 s | 209 ms (while the 32K prompt is read) |
+| 2 at once | 128-129 | 0.05-0.11 s | 12 ms |
+| 4 at once | 90-92 | 0.01-0.20 s | 15-17 ms |
+| 8 at once | 59-62 | 0.01-0.49 s | 21 ms |
+| one every second, four in all | 106-131 | 0.01-0.04 s | 12 ms |
+| two chats, the second 0.5 s later | 139 each | 0.01-0.03 s | 8 ms |
+| a 1,024-token answer while four short questions come and go | 154 (the long one), 127-129 | 0.01-0.03 s | 8-10 ms |
+| three streams when an 8K-token prompt arrives | 83-84 (the three) | 1.45 s (the 8K one; alone 1.03 s) | 37 ms (the three) |
+| an agent's 8K context (its lane kept it), another 8K 0.3 s later, a short question | 99 / 122 / 88 | 0.15 / 1.29 / 0.23 s | 35 ms |
+| the same 8K conversation's next turn (its lane kept it) | 190 | 0.18 s | 8 ms |
+| one of three cancelled after 50 tokens | 125-127 (the other two) | - | 15 ms |
+| 40960 tokens, 4 lanes: a 16K context, a 32K one 0.5 s later, a short question 1 s later | 61 / 124 / 29 | 2.5 / 7.1 / 1.5 s | 38 ms (while the 32K prompt is read) |
 
-All the requests together: 2 at once 252 tok/s, 4 at once 342, 8 at once 453 (one request: 196).
+All the requests together: 2 at once 251 tok/s, 4 at once 342, 8 at once 450 (one request: 196).
 
 - **Every answer is the same as alone.** A row of the shared step computes exactly what the request alone computes
   (its own positions, caches and sums in the same order), so each concurrent answer is bit for bit the one it gives
@@ -1185,9 +1186,11 @@ All the requests together: 2 at once 252 tok/s, 4 at once 342, 8 at once 453 (on
   `"parallel": 1` it goes in one 32K piece, so there its answer can differ in the last bits (as with another `--prefill`
   chunk). A request alone decodes on the usual token path.
 - **A new request joins at once.** Its prompt is read between decode steps: a short prompt costs the running streams
-  one pause of ~40 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and after each
-  chunk the running streams get half its time (`STRATA_PAR_SHARE`, 0.5) - they slow down while a long prompt is
-  read, they do not stop.
+  one pause of ~12-20 ms; a long one is read in chunks (`STRATA_PAR_CHUNK`, the prompt path's chunk, ~160 ms each), and
+  inside each chunk the running streams take a decode step after every 8 of its 48 layer passes (`STRATA_PAR_YIELD`) -
+  the chunk's sums do not change, the streams pause ~35 ms at most (161 ms before) while an 8K prompt is read, and the
+  8K prompt's first token comes as soon (1.44 s; 1.50 before). The finished prompt's conversation is copied off the
+  card while the others go on (`STRATA_PAR_SNAP_ASYNC`; the copy of an 8K conversation took ~75 ms).
 - **Conversation reuse per lane.** A finished request's lane keeps its conversation; a new request takes the free lane
   whose conversation its prompt continues (an agent sending its context again reads only what is new).
 - **Cancelling** one request (the client disconnects) ends only that one.
@@ -1588,7 +1591,9 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini prompts (CUDA, sm_80 and newer): the prompt path's attention on a tensor-core kernel (a block of tokens x a tile of keys, FP16 products with F32 sums, the relative bias as FP16 pairs - about F32 -, out-of-window tiles skipped) and a 2,048-row attention sub-batch (`STRATA_INK_PREFILL_SUB` overrides). RTX 5090, UD-Q4_K_XL: 8K prompt 3,784 -> 6,874 tok/s, 165K 765 -> 5,298. The sum order and q / P rounded to FP16 change the bits, not the KL against llama.cpp. `0`: the token path's kernel a row at a time and 512-row sub-batches (the old bits). AMD always uses that one |
 | `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini, `--serve`: requests decoded together (`N`, or `auto`: as many as leave every expert in VRAM with 3 GB plus the prompt path's region to spare, at most 8; a larger `N` is cut to that); the run config's `"parallel"`. See [Several requests at once](#several-requests-at-once-parallel-inkling-2-mini-beta) |
 | `STRATA_PAR_CHUNK` | the prompt path's chunk | `"parallel"` above 1: the prompt tokens read between two decode steps while other requests decode (1,280 on a 32 GB card with `STRATA_PAR_PREFILL_MB` 2048). Smaller: shorter pauses for the running streams, a slower prompt - and a long prompt's pieces then depend on whether others decode, so its answer's last bits can too |
-| `STRATA_PAR_SHARE` | 0.5 | `"parallel"` above 1: after a prompt chunk, the running requests decode for this share of the chunk's time before the next chunk (0: one decode step between chunks) |
+| `STRATA_PAR_YIELD` | 8 | `"parallel"` above 1: inside a prompt chunk read while other requests decode, a decode step for them after every this many of the chunk's 48 layer passes (the chunk's sums unchanged). Smaller: shorter pauses, a slower prompt (4: 23 ms p99 pauses, the 8K prompt 1.84 s; 12: 48 ms, 1.31 s). 0: off (a whole chunk, then `STRATA_PAR_SHARE`) |
+| `STRATA_PAR_SHARE` | 0 (0.5 with `STRATA_PAR_YIELD=0`) | `"parallel"` above 1: after a prompt chunk, the running requests decode for this share of the chunk's time before the next chunk (0: one decode step between chunks) |
+| `STRATA_PAR_SNAP_ASYNC` | 1 | `"parallel"` above 1: a finished prompt's conversation (for its lane's next request) copied to host memory on a copy stream while the other requests decode; the request itself starts once the copy is done. 0: on the decode's stream (every stream waits, ~75 ms for an 8K conversation) |
 | `STRATA_PAR_PREFILL_MB` | 2048 | `"parallel"` above 1: the prompt path's own VRAM region (MB), allocated at start instead of borrowing the expert pool's tail - a borrow moved the tail's experts to RAM and back while the other requests waited (~150 ms for a 40-token prompt). 0: borrow as with one request |
 | `STRATA_PAR_TRACE` | unset | `1`: a line a prompt chunk with its stages' times (lane switch, conversation restored or reset, the read, the snapshot) |
 | `STRATA_INK_FP4ACT` | 0 | Inkling 2 Mini prompts, **lossy, opt-in** (CUDA sm_120 - RTX 50 series - only, with the sm_120a code the default build has): the NVFP4 experts (layers 0-19; the Q8_0 layers 20-23 stay on MMQ) with FP4 activations on the block-scaled FP4 tensor cores, gate/up with the experts' scales and the SwiGLU in one product. `1`: one FP4 term a value (E2M1 codes under a UE4M3 scale a 16 values, a float scale a row); `2`: two terms (the first term's residual quantized the same way, x ~ q1 + q2: about 8 bits). `0` (the default) keeps the exact int8 path, the same bits as before. RTX 5090, UD-Q4_K_XL, server, 16K prompt, median of 6: prose 9,075 -> 13,122 tok/s (`1`, +45%) / 11,798 (`2`, +30%), code 9,064 -> 13,117 / 11,792. Prompt-path KL against the llama.cpp Q8_0 reference (3,071 positions; the Japanese third in parentheses): exact 0.0056 (0.0059), `1` 0.0141 (0.0144), `2` 0.0059 (0.0077); top-1 96.9% / 95.5% / 96.7%. Decode, the verify window and DSpark are unchanged. Elsewhere (HIP, other GPUs) a line on stderr and the exact path |

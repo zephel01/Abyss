@@ -1807,7 +1807,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     return true;
 }
 
-size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
+// (a region of its own - prefill_setup_own, Inkling's --parallel lanes - borrows nothing: the pool keeps no tail for it)
+size_t Glm5Model::prefill_borrow_bytes() const { return pf_ != nullptr && !pf_->own ? pf_->borrow_bytes : 0; }
 
 // the dense qwen35's prompt scratch q35d_place may lend between prompts: the own region and the MMQ buffers up to
 // their iota (which stays)
@@ -1912,6 +1913,11 @@ size_t Glm5Model::prefill_trim_prestage(size_t max_borrow) {
 bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
     PrefillState* S = pf_;
     if (S == nullptr) return true;
+    // a region of its own stays the prompt's: the pool's setup (and vision_reclaim) bind the tail they lay out, and
+    // with Inkling's --parallel lanes that bound the prompt's buffers over the tail's experts with no lend_tail - on a
+    // pool that cuts the tail from the experts' slots (an RTX 3090, 24 GB) each prompt wrote over experts the decode
+    // still read, and the answers changed from start to start (the 5090's tail sat on top, empty)
+    if (S->own && S->region != nullptr) return true;
     if (bytes < S->borrow_bytes) {
         err = "glm prefill: the lendable tail (" + std::to_string(bytes >> 20) + " MB) is smaller than the prompt path (" +
               std::to_string(S->borrow_bytes >> 20) + " MB)";
@@ -4693,6 +4699,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const int il_next = g.ink ? (ia + 1 < n_app ? g.ink_app_phys(ia + 1) : l1_) : il + 1;
         progress_at("the prompt: layer", ia);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
+        if (g.ink && ia > l0_ && prefill_layer_hook && !prefill_layer_hook(ia)) {   // (--parallel: others' decode)
+            if (err.empty()) err = "the decode between the prompt's layers failed";
+            return false;
+        }
         if (kv_cut >= 0 && il > kv_cut) break;
         // (the dense tier: this layer's rows back in a layer buffer, the next one's on their way - DenseTier)
         if (S->dt_on && !dt_layer(il, il + 1 < n_app && !(kv_cut >= 0 && il + 1 > kv_cut) ? il + 1 : -1, err))
