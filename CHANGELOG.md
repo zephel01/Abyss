@@ -7,10 +7,26 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.203 - 2026-11-25
+
+AtomicChat's Inkling 2 Mini GGUF (`Inkling-2-Mini-AD-Q4_K`, 16.5 GB) packs and runs: on 12-16 GB cards it decodes
+12-15% faster than unsloth's UD-Q4_K_XL (more of it fits in VRAM), at about twice the KL. Unsloth replaced its Inkling
+DSpark drafter on 2026-11-23 with a newer layout under the same name, which Abyss does not read yet: the engine and
+setup now say so in one line and name the old file (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`), which the engine also finds
+on its own. CLI outputs give the same bits as v1.3.202 (7-config md5, Inkling 18 md5, Ling 4 md5).
 
 ### Fixed
 
+- Inkling 2 Mini's DSpark drafter: unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf` has been, since 2026-11-23, mainline
+  llama.cpp's newer dflash layout (58 tensors, 504 MB: `markov_w2`, `ctx_mix`, no `dspark_fuse`); the layout Abyss
+  reads is kept there as `dspark-Inkling-2-Mini-Q8_0_Old.gguf` (54 tensors, 402 MB). The engine refused the new file
+  with a line about a missing tensor, easy to miss, and ran slower without a drafter. Now: `ink dspark: not loaded -
+  <file> is the newer dflash drafter layout (markov_w2, no dspark_fuse), which Abyss does not read yet - use unsloth's
+  dspark-Inkling-2-Mini-Q8_0_Old.gguf (beside the pack, or STRATA_INK_DSPARK=<file>), or run without a drafter
+  (STRATA_INK_DSPARK=0)`, and the engine runs on without it (the same tokens). The engine's search beside the pack
+  (and setup's) looks for the `_Old` name first in each place; setup warns when the file it finds is the newer layout
+  and names the old one. A `dspark-Inkling-2-Mini-Q8_0.gguf` downloaded before 2026-11-23 is the old layout and loads
+  as before. The new layout itself is not read yet
 - Inkling 2 Mini GGUFs whose loop controllers (`loop_{q,k,v,ffn}_ctrl_{down,gain,forget}`, 144 tensors in layers
   6-17) are Q8_0 - AtomicChat's `Inkling-2-Mini-AD-Q4_K` (16.5 GB; Q4_K gate-up, Q5_0 down experts) - pack: the
   packer refused them (`... is Q8_0: not on the inkling native set`). They are now dequantized into dense.bin as F32 -
@@ -22,7 +38,7 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   VRAM 198.3 tok/s (UD-Q4_K_XL 194.6), `STRATA_GLM_VRAM_GB=16` 177.5 (154.8), `=12` 142.0 (127.0); the 4K prompt 6,310 /
   2,698 / 2,104 tok/s (5,823 / 2,099 / 1,475). KL against Abyss's own run of the ggml-org Q8_0 (3,071 positions, token
   path): 0.0108 (EN 0.0100, JA 0.0121, code 0.0086), same top-1 96.0%; UD-Q4_K_XL the same way 0.0058 (0.0050 / 0.0070
-  / 0.0045), 97.5%. Unsloth's DSpark drafter (`STRATA_INK_DSPARK=<file>`) works with it: a code prompt 199.7 ->
+  / 0.0045), 97.5%. Unsloth's old-layout DSpark drafter (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `STRATA_INK_DSPARK=<file>`) works with it: a code prompt 199.7 ->
   237.8 tok/s, the same tokens (md5)
 
 ## v1.3.202 - 2026-11-24
