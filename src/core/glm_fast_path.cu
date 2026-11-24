@@ -1445,23 +1445,41 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             const auto w = shape(avail, avail_top), wo = shape(av0, at0);
             const double G = 1073741824.0;
-            if (w == wo) {
+            // STRATA_INK_DSPARK_POOL_LOSS=<percent> (default 0: only an unchanged pool, v1.3.200's rule; opt-in): the
+            // share of the expert pool's slots a layer the drafter may take and stay loaded.  Measured (#58, 2-3 reps):
+            // with 8 it stays on an RTX 3090 at --max-context 262144 (102 -> 96 slots) and on a 5090 held to 24 / 20 /
+            // 16 GB (101 -> 94 at 262144, 117 -> 112 / 83 -> 77 at 65536): code, edits, 8K prompts, reasoning answers and
+            // 250K prompts +9-52%, Japanese +4-18%, 128K -4 to +12%, but prose -1 to -6% (the smaller pool alone -2 to
+            // -4%) and a short prompt 0.15-0.25 s longer on the 3090 (the pool), so it is not the default
+            static const double loss_max = [] {
+                const char* v = getenv("STRATA_INK_DSPARK_POOL_LOSS");
+                return v == nullptr ? 0.0 : std::max(0.0, std::atof(v));
+            }();
+            const double loss = wo.first > 0 ? 100.0 * (double) (wo.first - w.first) / (double) wo.first : 0.0;
+            if (w == wo || (w.second == wo.second && loss <= loss_max)) {
                 const std::string path = inkd_find();
 #if defined(_WIN32)
                 _putenv_s("STRATA_INK_DSPARK", path.c_str());
 #else
                 setenv("STRATA_INK_DSPARK", path.c_str(), 1);   // (the kept pool budget's key: as with the file named)
 #endif
-                std::fprintf(stderr, "ink dspark: on - found beside the pack, the expert pool the same with it (%d slots "
-                                     "a layer%s; %.2f GB; STRATA_INK_DSPARK=0 turns it off)\n", w.first,
-                             w.second ? ", every expert with the prompt tail on top" : "", (double) db / G);
+                if (w == wo)
+                    std::fprintf(stderr, "ink dspark: on - found beside the pack, the expert pool the same with it (%d "
+                                         "slots a layer%s; %.2f GB; STRATA_INK_DSPARK=0 turns it off)\n", w.first,
+                                 w.second ? ", every expert with the prompt tail on top" : "", (double) db / G);
+                else
+                    std::fprintf(stderr, "ink dspark: on - found beside the pack, its %.2f GB from the expert pool (%d -> %d "
+                                         "slots a layer, %.1f%% <= STRATA_INK_DSPARK_POOL_LOSS %.0f%%; the gate drafts only "
+                                         "where it pays; STRATA_INK_DSPARK=0 turns it off)\n", (double) db / G, wo.first,
+                                 w.first, loss, loss_max);
             } else {
                 inkd_destroy();
                 avail = av0;
                 avail_top = at0;
                 std::fprintf(stderr, "ink dspark: off - its %.2f GB would come out of the expert pool (%d -> %d slots a "
-                                     "layer%s; STRATA_INK_DSPARK=<file> loads it anyway)\n", (double) db / G, wo.first,
-                             w.first, wo.second && !w.second ? ", the prompt tail no longer on top" : "");
+                                     "layer%s, %.1f%%; STRATA_INK_DSPARK_POOL_LOSS=<percent> keeps it up to that share, "
+                                     "STRATA_INK_DSPARK=<file> loads it anyway)\n", (double) db / G, wo.first, w.first,
+                             wo.second && !w.second ? ", the prompt tail no longer on top" : "", loss);
             }
         }
         // the budget kept per card + pack + config (glm_pool_pin.hpp): every start carves the same pool, whatever

@@ -18,6 +18,26 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Qwen3.5 / Qwen3.8, Ornith, Laguna and Ling: the same for their kept expert pool budget - their attention caches and
   states sit outside what the key counted, so the key now names the context length and the `--kv` cache format. The
   first start after the update learns the budget once again.
+- Inkling 2 Mini DSpark gate (`STRATA_INK_DSPARK_GATE`): the single token's rate it sets drafting against is now
+  measured on plain steps (`STRATA_INK_DSPARK_PROBE`, default 256: 8 steps without the drafter early in the answer, then
+  after every 256 drafted steps). It used the single tokens between windows, which run among the windows' experts and
+  were twice as slow after a 32K prompt on a 24 GB pool (16.5 against 7.9 ms), so losing drafts passed as wins. RTX
+  5090 held to 24 GB (`STRATA_GLM_VRAM_GB=24`), `--max-context 262144`, drafter named, a 32K prose prompt, 512 tokens:
+  96.6 tok/s before (1 run), now 123.3 / 127.9 / 134.1 against 132.5 / 131.6 / 131.1 without the drafter and
+  127.8 / 127.0 / 126.8 with it loaded but never drafting (what is left is its smaller expert pool). Greedy answers are
+  the same tokens (Inkling 18 md5 on sm_120 and sm_86).
+
+### Added
+
+- `STRATA_INK_DSPARK_POOL_LOSS=<percent>` (opt-in, default 0 = v1.3.200's rule, #58): the Inkling drafter found beside
+  the pack stays loaded when it takes at most this share of the expert pool's slots a layer. Measured with 8
+  (non-deterministic greedy, 2 runs each unless said): RTX 3090 at `--max-context 262144` (102 -> 96 slots) code
+  92.3-93.0 -> 118.2-125.6 tok/s, a ~3K-token reasoning answer 93.9-94.1 -> 133.0-142.6, edits +31-40%, Japanese
+  +4-17%, 8K prompts +9-28%; RTX 5090 held to 24 GB at 262144 (101 -> 94) 250K prompts prose 74.3-74.6 -> 87.5-92.6,
+  code 71.8 -> 84.6-102.7, 128K -4 to +12%; held to 20 / 16 GB at 65536 (117 -> 112 / 83 -> 77, 1 run) code +44 / +26%,
+  8K code +32 / +27%. But prose loses: 3090 90.6-90.7 -> 87.4-89.4, 5090 at 20 GB 176.4 -> 168.3 and at 16 GB 142.5
+  -> 133.7 (medians of 3; the smaller pool alone -2 to -4%), and a short prompt takes 0.15-0.25 s longer on the 3090
+  (the pool, not the drafter), so it stays opt-in. `STRATA_INK_DSPARK=<file>` still loads the drafter whatever the VRAM.
 
 ## v1.3.201 - 2026-11-24
 
