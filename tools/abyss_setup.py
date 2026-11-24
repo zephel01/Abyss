@@ -695,16 +695,28 @@ def dspark_step(a, data: Path, cfg: Path, fresh: bool, had: str | None, gpus, ba
 # 0.6 GB in VRAM; src/core/ink_dspark.cu, CUDA, one GPU).  Setup does not download it.  The engine finds it itself
 # beside the pack (inkd_find: the hf layout next to the model's folder, or the folder itself) and keeps it when the
 # expert pool comes out the same with it; the config's env names it only by hand (STRATA_INK_DSPARK=<file>: loaded
-# whatever the VRAM) or turns it off (=0, --no-dspark)
+# whatever the VRAM) or turns it off (=0, --no-dspark).  Since 2026-11-23 unsloth's file under INK_DSPARK_NAME is a
+# newer dflash layout (markov_w2, no dspark_fuse) the engine does not read yet; the layout it reads is kept there as
+# INK_DSPARK_OLD (the repo's top folder), which the engine prefers when both are in one place
 INK_DSPARK_NAME = "dspark-Inkling-2-Mini-Q8_0.gguf"
+INK_DSPARK_OLD = "dspark-Inkling-2-Mini-Q8_0_Old.gguf"
 
 
 def ink_dspark_found(mdir: Path) -> Path | None:
-    """Where the engine finds the drafter for a pack in mdir (the same places, ink_dspark.cu's inkd_find)."""
+    """Where the engine finds the drafter for a pack in mdir (the same places and order, ink_dspark.cu's inkd_find)."""
     ud = mdir.parents[2] / "unsloth" / "Inkling-2-Mini-GGUF"
-    return next((p for p in (mdir.parent / "dspark" / INK_DSPARK_NAME, mdir.parent / INK_DSPARK_NAME,
-                             mdir / INK_DSPARK_NAME, ud / "dspark" / INK_DSPARK_NAME, ud / INK_DSPARK_NAME)
-                 if p.is_file()), None)
+    return next((d / n for d in (mdir.parent / "dspark", mdir.parent, mdir, ud / "dspark", ud)
+                 for n in (INK_DSPARK_OLD, INK_DSPARK_NAME) if (d / n).is_file()), None)
+
+
+def ink_dspark_new_layout(p: Path) -> bool:
+    """True for unsloth's newer dflash drafter (2026-11-23: markov_w2, no dspark_fuse), which the engine skips."""
+    try:
+        import gguf_io
+        names = {t.name for t in gguf_io.Reader(p, data=False).tensors}
+    except Exception:
+        return False
+    return "markov_w2.weight" in names and "dspark_fuse.weight" not in names
 
 
 def ink_dspark_step(a, mdir: Path, cfg: Path, gpus, backend: str) -> None:
@@ -749,8 +761,13 @@ def ink_dspark_step(a, mdir: Path, cfg: Path, gpus, backend: str) -> None:
              "when the experts fit beside it")
         return
     if found is None:
-        S.ok(f"DSpark drafter: off - put unsloth's {INK_DSPARK_NAME} (the repo's dspark/ folder) in "
+        S.ok(f"DSpark drafter: off - put unsloth's {INK_DSPARK_OLD} (the repo's top folder) in "
              f"{mdir.parent / 'dspark'} and the engine loads it")
+        return
+    if ink_dspark_new_layout(found):
+        S.warn(f"DSpark drafter: {found} is the newer drafter layout (unsloth's file under this name since "
+               f"2026-11-23), which Abyss does not read yet - the engine runs without a drafter; put unsloth's "
+               f"{INK_DSPARK_OLD} beside it and the engine loads that one")
         return
     S.ok(f"DSpark drafter: on ({found}; the engine keeps it when the experts fit beside it, --no-dspark turns it off)")
 

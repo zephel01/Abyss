@@ -317,6 +317,29 @@ class InkDSparkStep(unittest.TestCase):
         self.name("/elsewhere/d.gguf")
         self.assertNotIn("STRATA_INK_DSPARK", self.run_step(backend="hip"))
 
+    def drafter(self, f: Path, names) -> Path:
+        import numpy as np
+        import gguf_io
+        f.parent.mkdir(parents=True, exist_ok=True)
+        w = gguf_io.Writer(f, arch="dflash")
+        for n in names:
+            w.add_tensor(n, [4], "F32", np.zeros(4, np.float32))
+        return w.write()
+
+    def test_the_old_file_wins_and_the_newer_layout_is_named(self):
+        # (unsloth, 2026-11-23: dspark-Inkling-2-Mini-Q8_0.gguf became the newer dflash layout, the old one _Old)
+        new = self.drafter(self.dst, ["markov_w1.weight", "markov_w2.weight", "markov_w2.bias", "mask_embd.weight"])
+        self.assertTrue(A.ink_dspark_new_layout(new))
+        with mock.patch.object(A.S, "warn") as warn:
+            self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
+        self.assertIn(A.INK_DSPARK_OLD, warn.call_args[0][0])
+        old = self.drafter(self.dst.with_name(A.INK_DSPARK_OLD), ["markov_w1.weight", "dspark_fuse.weight"])
+        self.assertFalse(A.ink_dspark_new_layout(old))
+        self.assertEqual(A.ink_dspark_found(self.mdir), old)
+        with mock.patch.object(A.S, "warn") as warn:
+            self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
+        warn.assert_not_called()
+
 
 class DFlash27Step(unittest.TestCase):
     """dflash27_step (Qwen3.8-27B's DFlash 2 drafter) against a config in a temporary folder, the drafter 'downloaded'

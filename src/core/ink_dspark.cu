@@ -576,6 +576,9 @@ int64_t env_i(const char* n, int64_t def) {
 // finds unsloth's drafter there too)
 std::string Glm5Model::inkd_find() const {
     namespace fs = std::filesystem;
+    // unsloth's file under kName is the newer dflash layout since 2026-11-23 (inkd_load says so and runs without
+    // it); the layout read here is kept there as kOld, which wins when both sit in one place
+    static const char* kOld = "dspark-Inkling-2-Mini-Q8_0_Old.gguf";
     static const char* kName = "dspark-Inkling-2-Mini-Q8_0.gguf";
     if (pack_dir_.empty()) return "";
     std::error_code ec;
@@ -583,9 +586,12 @@ std::string Glm5Model::inkd_find() const {
     if (ec) return "";
     const fs::path ud = fs::path("unsloth") / "Inkling-2-Mini-GGUF";
     for (int up = 0; up < 6 && !d.empty(); ++up) {
-        for (const fs::path& c : {d / kName, d / "dspark" / kName, d / ud / "dspark" / kName, d / ud / kName,
-                                  d / "models" / ud / "dspark" / kName, d / "models" / ud / kName})
-            if (fs::is_regular_file(c, ec) && fs::file_size(c, ec) > ((uintmax_t) 100 << 20)) return c.string();
+        for (const fs::path& sub : {fs::path(), fs::path("dspark"), ud / "dspark", ud, fs::path("models") / ud / "dspark",
+                                    fs::path("models") / ud})
+            for (const char* n : {kOld, kName}) {
+                const fs::path c = d / sub / n;
+                if (fs::is_regular_file(c, ec) && fs::file_size(c, ec) > ((uintmax_t) 100 << 20)) return c.string();
+            }
         if (d == d.parent_path()) break;
         d = d.parent_path();
     }
@@ -652,6 +658,10 @@ bool Glm5Model::inkd_load(std::string& err) {
     };
     const strata::MetaValue* arch = G.get("general.architecture");
     if (arch == nullptr || arch->s != "dflash") return refuse("not a dflash GGUF");
+    if (G.find("dspark_fuse.weight") == nullptr && G.find("markov_w2.weight") != nullptr)   // (unsloth's since 11-23)
+        return refuse(std::string(path) + " is the newer dflash drafter layout (markov_w2, no dspark_fuse), which Abyss "
+                      "does not read yet - use unsloth's dspark-Inkling-2-Mini-Q8_0_Old.gguf (beside the pack, or "
+                      "STRATA_INK_DSPARK=<file>), or run without a drafter (STRATA_INK_DSPARK=0)");
     const strata::MetaValue* tl = G.get("dflash.target_layers");
     static const int kTaps[4] = {5, 23, 41, 48};
     bool taps_ok = tl != nullptr && tl->items.size() == 4;
