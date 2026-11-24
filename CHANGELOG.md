@@ -9,6 +9,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.201 - 2026-11-24
+
+Ling-3.2-air (inclusionAI) runs as a text-only beta from bartowski's public Q4_K_M as it is: on an RTX 5090 + RAM a 4K
+prompt 2,061 tok/s and decode 142.8 tok/s, 16K 3,092 / 120.7; several conversations kept apart (a thread coming back
+answers in 2.1-3.8 s instead of 7.1-19.2 s, the same answers). Other models give the same bits as v1.3.200 (7-config
+md5, Inkling 18 md5).
+
 Ling-3.2-air (inclusionAI, `bailingmoe3`: 42 layers - 35 KDA linear-attention layers and 7 MLA layers -, 512 experts,
 top-8 with group-limited routing) runs as a text-only beta, from bartowski's public Q4_K_M as it is.
 
