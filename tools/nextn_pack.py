@@ -19,19 +19,37 @@ import time
 import numpy as np
 
 
+def q4_0_to_q5_0(data) -> np.ndarray:
+    """Q4_0 blocks -> Q5_0 blocks with the same values: a Q4_0 block's d with codes c - 8 (c in 0..15) is Q5_0's d
+    with codes c + 8 - 16; Q5_0 keeps the low 4 bits in the same nibbles and the fifth bit of element j in qh bit j."""
+    b4 = np.asarray(data, dtype=np.uint8).reshape(-1, 18)
+    d, qs = b4[:, :2], b4[:, 2:]
+    lo = (qs & 15).astype(np.uint16) + 8
+    hi = (qs >> 4).astype(np.uint16) + 8
+    codes = np.concatenate([lo, hi], axis=1)           # [blocks][32]: elements 0..15 then 16..31
+    bit = ((codes >> 4) & 1).astype(np.uint32)
+    qh = (bit << np.arange(32, dtype=np.uint32)).sum(axis=1, dtype=np.uint32)
+    out = np.empty((b4.shape[0], 22), dtype=np.uint8)
+    out[:, :2] = d
+    out[:, 2:6] = qh.astype("<u4").view(np.uint8).reshape(-1, 4)
+    out[:, 6:] = ((lo & 15) | ((hi & 15) << 4)).astype(np.uint8)
+    return out.reshape(-1)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", required=True, help="the model's first shard (or its only file)")
     ap.add_argument("--out", required=True, help="the NextN GGUF to write")
-    ap.add_argument("--experts", default="q4_k", help="the routed experts' type: q4_k (default), q5_k, q6_k, or q8_0 (as stored)")
+    ap.add_argument("--experts", default="q4_k", help="the routed experts' type: q4_k (default), q5_k, q6_k, q8_0 (as "
+                    "stored), or q5_0 (from Q4_0 experts: the same values, repacked here - no ggml)")
     ap.add_argument("--ggml-lib", default="", help="libggml-base.so (.dylib / ggml-base.dll) with ggml_quantize_chunk")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import gguf_io as G
 
-    want = {"q4_k": 12, "q5_k": 13, "q6_k": 14, "q8_0": 8}.get(a.experts.lower())
+    want = {"q4_k": 12, "q5_k": 13, "q6_k": 14, "q8_0": 8, "q5_0": 6}.get(a.experts.lower())
     if want is None:
-        print("--experts: q4_k, q5_k, q6_k or q8_0")
+        print("--experts: q4_k, q5_k, q6_k, q8_0 or q5_0")
         return 2
     first = G.Reader(a.gguf)
     arch = first.get("general.architecture")
@@ -60,7 +78,10 @@ def main() -> int:
         return 1
     # ggml's quantizer, when an expert tensor changes type (a NeedsLlamaCpp error otherwise)
     lib = None
-    if any(t.name.endswith("_exps.weight") and t.type != want for t in tensors):
+    if want == 6 and any(t.name.endswith("_exps.weight") and t.type not in (2, 6) for t in tensors):
+        print("--experts q5_0 repacks Q4_0 experts only")
+        return 1
+    if want != 6 and any(t.name.endswith("_exps.weight") and t.type != want for t in tensors):
         try:
             lib = G.ggml_lib(a.ggml_lib)
         except G.NeedsLlamaCpp as e:
@@ -96,7 +117,11 @@ def main() -> int:
     total = 0
     for t in tensors:
         data, qt = t.data, t.type
-        if t.name.endswith("_exps.weight") and qt != want:
+        if t.name.endswith("_exps.weight") and qt == 2 and want == 6:
+            data = q4_0_to_q5_0(data)
+            print("%s: Q4_0 -> Q5_0 (the same values), %.1f MB" % (t.name, data.nbytes / 1e6), flush=True)
+            qt = 6
+        elif t.name.endswith("_exps.weight") and qt != want:
             t0 = time.time()
             n_per_row = int(t.shape[0])
             f32 = np.ascontiguousarray(G.dequantize(data, qt), dtype=np.float32)

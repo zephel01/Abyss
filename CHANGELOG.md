@@ -102,6 +102,22 @@ same bits as v1.3.201 (7-config md5, Inkling 18 md5, Ling 4 md5); a server's new
   97.1% -> 97.0%), Qwen3.8 UD-IQ3_XXS 3.53e-3 -> 3.62e-3 (97.5% -> 97.8%). Its first token comes ~55 ms later at
   9-10K tokens (1,752-1,766 -> 1,805-1,818 ms); the CLI is unchanged (7-config md5).
 
+### Added
+
+- Ling-3.2-air (opt-in, `STRATA_LING_MTP=1`): the GGUF's NextN block (blk.42) drafts one token a step and a verify
+  window checks it against the model, so the kept tokens are the model's (greedy, `STRATA_DETERMINISTIC=1`: md5 with
+  the drafter equal to without it on code / prose / ja / edit after 4K and 16K, 8 of 8 at K=1 and 8 of 8 at K=3; MTP
+  off equal to v1.3.201 8 of 8). The block comes from a separate file written once by
+  `tools/nextn_pack.py --experts q5_0` (2.11 GB; bartowski's Q4_0 experts repacked to Q5_0 with the same values, no
+  ggml). Drafts a window: `STRATA_Q35_MTP_K`, 1 for Ling. RTX 5090 + RAM (STRATA_GLM_RAM_GB=89, the 5090 serving 66%
+  of the expert reads), bartowski Q4_K_M, 512 greedy tokens, median of 3 runs each under the CPU lock: decode against
+  off code 4K 109.2 -> 112.7, prose 4K 114.3 -> 121.4, ja 4K 128.8 -> 139.4, edit 4K 105.3 -> 121.2, code 16K
+  109.4 -> 126.7, prose 16K 109.6 -> 112.6, ja 16K 124.8 -> 133.4, edit 16K 105.2 -> 116.4 tok/s (+3 to +16%, 70-92%
+  of drafts accepted); 2 or 3 drafts a window -5 to +15%. Prompts 6-8% slower (4K 1,361 -> 1,274 tok/s, 16K 2,702 ->
+  2,496: the block's cache rows). Server (one request at a time, the same 8 prompts): decode +0.4 to +11%, time to
+  the first token +0.14 to +0.47 s, stream gaps p95 12-19 -> 16-23 ms (edit 30-43 ms). Off by default: measured on
+  this one box only, and the file is an extra setup step.
+
 ## v1.3.201 - 2026-11-24
 
 Ling-3.2-air (inclusionAI) runs as a text-only beta from bartowski's public Q4_K_M as it is: on an RTX 5090 + RAM a 4K

@@ -39,6 +39,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/laguna_fast.hpp"
+#include "strata/kernels/ling_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -169,6 +170,7 @@ struct VerifyBuf {
           *q35_q = nullptr, *q35_ao = nullptr, *q35_shg = nullptr, *q35_part = nullptr;
     float* lag_part = nullptr;                // laguna: the attention's key-split scratch over the columns
     void *q35_yq = nullptr, *q35_aoq = nullptr;
+    float* lg_scr = nullptr;                  // ling: a column's KDA prep out (q | k | v) and its log decay (4 d_inner)
     // qwen4exp, a column each: the hyper-connection's normed streams (and q8_1), low rank, gates and the two injects;
     // the PLE's embedding rows, keys, values, postops scratch (q4_ple_qn ends as the rows the conv history takes - the
     // rewind replays the kept ones onto the history kept before the window, q4_ple_snap); the QSA indexer's raw keys,
@@ -236,9 +238,12 @@ bool Glm5Model::verify_ready() const {
         if ((m->g_.v41 || m->g_.qwen35()) && F->defer) return false;   // (no deferral)
         // (one part; qwen4exp's window crosses a split as its token does: verify_part_q4x's hop)
         if ((m->g_.v41 || (m->g_.qwen35() && !m->g_.q4x)) && (m->split_next_ != nullptr || m != this)) return false;
+        // (ling: the window only with its NextN drafter - STRATA_LING_MTP - so nothing changes without it; one part,
+        // no refusal edit)
+        if (m->g_.ling && (m->mtp_il_ < 0 || m->split_next_ != nullptr || m != this || m->abl_loaded())) return false;
         for (int il = m->l0_; il < m->l1_; ++il)
-            if (!F->L[(size_t) il].moe && !m->g_.q35_dense() && !m->g_.laguna)   // (the dense qwen35: every layer
-                return false;                                                    // dense; laguna: layer 0)
+            if (!F->L[(size_t) il].moe && !m->g_.q35_dense() && !m->g_.laguna && !m->g_.ling)   // (the dense qwen35:
+                return false;                                           // every layer dense; laguna, ling: the lead)
     }
     const Glm5Model* tail = verify_tail();
     const auto it = tail->ws_map_.find("output.weight");
@@ -327,8 +332,14 @@ bool Glm5Model::verify_alloc(std::string& err) {
         f(V->q35_qf, 2 * HD); f(V->q35_k, KV); f(V->q35_v, KV); f(V->q35_q, HD); f(V->q35_ao, HD); b(V->q35_aoq, HD / 32 * kQ8);
         f(V->q35_shg, 1);
         ok = ok && cudaMalloc((void**) &V->q35_part,
-                              q35::attn_window_floats(g.n_head, (int) D, (int) std::max<int64_t>(max_ctx_, 1), (int) TM) *
+                              (g.ling ? (size_t) 64   // (ling: its MLA attends with ling_sc_ / ling_part_)
+                                      : q35::attn_window_floats(g.n_head, (int) D, (int) std::max<int64_t>(max_ctx_, 1), (int) TM)) *
                                   sizeof(float)) == cudaSuccess;
+        if (ok && g.ling) {   // ling: a column's KDA scratch, the dense lead layers' FFN rows
+            ok = cudaMalloc((void**) &V->lg_scr, (size_t) 4 * g.d_inner() * sizeof(float)) == cudaSuccess;
+            f(V->glm_dg, (size_t) g.n_ff_dense); f(V->glm_du, (size_t) g.n_ff_dense);
+            b(V->glm_dhq, (size_t) g.n_ff_dense / 32 * kQ8);
+        }
     }
     if (ok && g.q4x) {
         const size_t HE = (size_t) g.hc * E, LR = (size_t) g.hc_lr, ID = (size_t) g.idx_key, IH = (size_t) g.idx_heads;
@@ -804,7 +815,7 @@ bool Glm5Model::verify_moe_router(int il, int tb, int T, cudaStream_t s, std::st
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     const int nj = verify_sh_late() && FFs > 0 ? 1 : 3;
-    if (!(g.arch == 0 || g.ink ? glm_mvn(j, nj, T, s) : g.q4x ? q4x_mvn(j, nj, T, s) : g.dsv4() ? ds_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
+    if (!(g.arch == 0 || g.ink || g.ling ? glm_mvn(j, nj, T, s) : g.q4x ? q4x_mvn(j, nj, T, s) : g.dsv4() ? ds_mvn(j, nj, T, s) : gf::mvn(j, nj, T, s))) { err = "deepseek4 verify: router / shared expert"; return false; }
     return true;
 }
 
@@ -835,6 +846,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared, k = g.n_exp_used;
     const size_t q8e = (size_t) (E / 32) * kQ8;
+    // (ling: its per-layer SwiGLU limits, as fast_moe - the other models keep the one value they always passed)
+    const float lim_e = g.ling ? g.lim_exp(il) : g.swiglu_exp, lim_s = g.ling ? g.lim_shexp(il) : g.swiglu_shexp;
     gf::MvJob j[3];
     j[0] = {Ly.router, nullptr, V->x + (size_t) tb * E, V->rlog + (size_t) tb * g.n_expert, nullptr, 1.0f,
             Ly.router_type, E, g.n_expert};   // (as fast_moe: deepseek4's BF16, deepseek41's F32)
@@ -880,7 +893,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     // 7.82 -> 8.02 ms a step; 4: 11.03 -> 10.97, 8: 16.96 -> 16.42, inkling --parallel, RTX 5090)
     static const int route_quiet_min = [] { const char* v = getenv("STRATA_GLM_ROUTE_QUIET_MIN"); return v ? std::atoi(v) : 4; }();
     bool routed = false;
-    if ((route_cols < 0 ? g.q4x || g.ink : route_cols != 0) && T > 1 && (late || FFs == 0) && V->route_sync != nullptr &&
+    if ((route_cols < 0 ? g.q4x || g.ink : route_cols != 0) && !g.ling && T > 1 && (late || FFs == 0) && V->route_sync != nullptr &&
         !F->prof_on) {
         const int* hid[8] = {};
         for (int t = 0; t < T && t < 8; ++t)
@@ -893,9 +906,13 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         if (routed) F->expected += T;
     }
     for (int t = tb; t < tb + T && !routed; ++t) {
-        gf::moe_route(V->rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, k, g.w_scale, g.norm_w != 0, il,
+        // (ling: the groups' mask on the column's selection, as fast_moe - ling_bias_ is one buffer, the routes in order)
+        const float* rbias = g.ling && g.ling_group > 1
+                                 ? ling_group_bias(il, V->rlog + (size_t) t * g.n_expert, Ly.router_bias, s)
+                                 : Ly.router_bias;
+        gf::moe_route(V->rlog + (size_t) t * g.n_expert, rbias, g.n_expert, k, g.w_scale, g.norm_w != 0, il,
                       V->x + (size_t) t * E, E, V->md[(size_t) t], late ? nullptr : V->sh_g + (size_t) t * FFs,
-                      late ? nullptr : V->sh_u + (size_t) t * FFs, g.swiglu_shexp, late ? 0 : FFs,
+                      late ? nullptr : V->sh_u + (size_t) t * FFs, lim_s, late ? 0 : FFs,
                       (uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                       s, nullptr, nullptr, 0, nullptr, nullptr, 0, fast_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min, pf_rank,
                       g.gating, Ly.tid2eid != nullptr ? Ly.tid2eid + (size_t) toks[(size_t) t] * k : nullptr,
@@ -905,8 +922,8 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         ++F->expected;
     }
     if (late) {
-        if (!(g.arch == 0 || g.ink ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : g.dsv4() ? ds_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
-        gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, g.swiglu_shexp, T * FFs,
+        if (!(g.arch == 0 || g.ink || g.ling ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : g.dsv4() ? ds_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
+        gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, lim_s, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
     }
     if (F->prof_on) F->mark("vm_route_shexp");
@@ -980,7 +997,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         // the next route may find this one's promotions resident: it goes after their copies have landed
         if (done_ev != nullptr && t == tb + T - 1) cudaEventRecord(done_ev, s);
         if (cols) continue;   // (the batched launches below; the check runs these after them)
-        gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
+        gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, lim_e, (const uint8_t*) V->xq + (size_t) t * q8e,
                         hq, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                         FFs, sh_out, s, Ly.up_type);
         if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, 1, E, s);
@@ -994,7 +1011,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         const size_t shq = (size_t) (FFs / 32) * kQ8;
         float* sh_out = V->sh_out + (size_t) tb * E;
         void* hq = (uint8_t*) V->hq + (size_t) tb * V->hq_n;
-        gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, g.swiglu_exp,
+        gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, lim_e,
                              (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
                              (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s, Ly.nv_scale,
                              Ly.up_type);
@@ -1010,7 +1027,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         md.nv_scale = Ly.nv_scale;   // (NVFP4 experts; null otherwise)
                 float* sh_o = V->sh_out + (size_t) t * E;
                 void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
-                gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, g.swiglu_exp, (const uint8_t*) V->xq + (size_t) t * q8e,
+                gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, lim_e, (const uint8_t*) V->xq + (size_t) t * q8e,
                                 hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s,
                                 Ly.up_type);
                 if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_o, 1, E, s);
@@ -1211,6 +1228,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         if (!(g.arch == 0 ? m->verify_part_glm(toks, p0, err)
               : g.ink ? m->verify_part_ink(toks, p0, err)
               : g.v41 ? m->verify_part_v41(toks, p0, err) : g.q4x ? m->verify_part_q4x(toks, p0, err)
+              : g.ling ? m->verify_part_ling(toks, p0, err)
               : g.qwen35() ? m->verify_part_q35(toks, p0, err)
                                                                        : m->verify_part(toks, p0, err))) return false;
     }
@@ -1940,6 +1958,160 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
     return true;
 }
 
+// ling's (one part, STRATA_LING_MTP): every column through the token path's kernels - the KDA layers' kda_prep /
+// kda_rec, the MLA layers' rope / prep / absorb / attend / out, the norms, swiglu, the routes and experts - a column at
+// a time where the token path's kernel reads or writes a state (the conv rows, the recurrence, the latent cache), and
+// the GEMVs over the columns at once through glm_mvn (mv()'s sums a column, the weights read once).  The KDA states as
+// before the window are kept (q35_snap / q35_csnap), and each column's projections (q | k | v, f, beta) so a rewind
+// replays the kept columns from them (verify_rewind_ling): the same states as the token path's.
+bool Glm5Model::verify_part_ling(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
+    namespace lk = strata::kernels::ling;
+    FastState* F = fast_;
+    auto* V = (VerifyBuf*) vb_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int T = V->T, TM = V->TM;
+    const int E = g.n_embd, H = g.n_head, DI = g.d_inner(), C = 3 * DI, HQ = H * lk::kQHead, HV = H * lk::kV;
+    const size_t q8e = (size_t) (E / 32) * kQ8, q8d = (size_t) (DI / 32) * kQ8, q8v = (size_t) (HV / 32) * kQ8;
+    const size_t state_n = (size_t) g.ssm_state * g.ssm_v_heads * g.ssm_state, conv_n = (size_t) g.ssm_conv_dim() * (g.d_conv - 1);
+    const auto Rt = [&](int t) { return V->R + (size_t) t * 2 * E; };
+    const auto xq_t = [&](int t) { return (uint8_t*) V->xq + (size_t) t * q8e; };
+    V->q35_p0 = p0;
+    for (int t = 0; t < T; ++t) V->q35_toks[t] = toks[(size_t) t];
+    if (q35_mtp_on() && !q35_mtp_pend_commit(toks[0], err)) return false;   // (the drafter: the last position's row)
+    int li = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr) continue;
+        cudaMemcpyAsync(V->q35_snap + (size_t) li * state_n, Ly.gdn_state, state_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(V->q35_csnap + (size_t) li * conv_n, Ly.gdn_conv, conv_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        ++li;
+    }
+    float2* cs = (float2*) (ling_bias_ + g.n_expert);
+    li = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        for (int t = 0; t < T; ++t)   // R (+ the last FFN), x = rms(R) * attn_norm - a column as the token path
+            gf::rms_q8(Rt(t), il == l0_ ? nullptr : V->ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps, E,
+                       V->x + (size_t) t * E, xq_t(t), s);
+        if (Ly.recr) {
+            float* proj = V->q35_qkv + (size_t) li * TM * C;     // a column's q | k | v (C floats)
+            float* fr = V->q35_rows + (size_t) li * TM * C;      // ... its f (DI floats a column)
+            float* beta = V->q35_beta + (size_t) li * TM * H;    // ... its beta logits
+            gf::MvJob j[6];
+            j[0] = {Ly.q.q, V->xq, V->x, proj, nullptr, 1.0f, Ly.q.type, E, DI};
+            j[1] = {Ly.k.q, V->xq, V->x, proj + DI, nullptr, 1.0f, Ly.k.type, E, DI};
+            j[2] = {Ly.v.q, V->xq, V->x, proj + 2 * DI, nullptr, 1.0f, Ly.v.type, E, DI};
+            for (int i = 0; i < 3; ++i) j[i].ys = C;
+            j[3] = {Ly.lg_f.q, V->xq, V->x, fr, nullptr, 1.0f, Ly.lg_f.type, E, DI};
+            j[4] = {Ly.lg_g.q, V->xq, V->x, V->q35_z, nullptr, 1.0f, Ly.lg_g.type, E, DI};
+            j[5] = {Ly.lg_beta.q, V->xq, V->x, beta, nullptr, 1.0f, Ly.lg_beta.type, E, H};
+            if (!glm_mvn(j, 6, T, s)) { err = "ling verify: the KDA projections"; return false; }
+            const float* cw[3] = {Ly.conv[0], Ly.conv[1], Ly.conv[2]};
+            for (int t = 0; t < T; ++t) {
+                lk::kda_prep(proj + (size_t) t * C, cw, Ly.gdn_conv, V->lg_scr, fr + (size_t) t * DI, Ly.dt_bias, Ly.ssm_a,
+                             g.kda_lb, V->lg_scr + C, H, g.kda_head_dim, g.d_conv, s);
+                gf::kda_rec(V->lg_scr, V->lg_scr + DI, V->lg_scr + 2 * DI, V->lg_scr + C, beta + (size_t) t * H,
+                            Ly.gdn_state, V->q35_z + (size_t) t * DI, Ly.ssm_norm, g.norm_eps, H, g.kda_head_dim,
+                            (uint8_t*) V->q35_yq + (size_t) t * q8d, s);
+            }
+            gf::MvJob o = {Ly.out.q, V->q35_yq, nullptr, V->mixer, nullptr, 1.0f, Ly.out.type, DI, E};
+            if (!glm_mvn(&o, 1, T, s)) { err = "ling verify: the KDA output"; return false; }
+            ++li;
+        } else {
+            gf::MvJob j[3];
+            j[0] = {Ly.lg_wq.q, V->xq, V->x, V->q35_qf, nullptr, 1.0f, Ly.lg_wq.type, E, HQ};
+            j[1] = {Ly.lg_kva.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.lg_kva.type, E, lk::kRow};
+            j[2] = {Ly.lg_gate.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.lg_gate.type, E, H};
+            if (!glm_mvn(j, 3, T, s)) { err = "ling verify: the MLA projections"; return false; }
+            for (int t = 0; t < T; ++t) {
+                const int64_t p = p0 + t;
+                float* qf = V->q35_qf + (size_t) t * HQ;
+                lk::rope_table(p, (double) g.rope_base, cs, s);
+                lk::mla_prep(qf, H, V->q35_k + (size_t) t * lk::kRow, Ly.lg_kvn, g.norm_eps, cs, Ly.kc + (size_t) p * lk::kRow, s);
+                lk::mla_absorb(qf, Ly.lg_kb, H, V->q35_q, s);
+                lk::mla_attend(V->q35_q, qf, Ly.kc, p + 1, 1.0f / std::sqrt((float) lk::kQHead), H, ling_sc_, ling_part_,
+                               V->q35_ao, s);
+                lk::mla_out(V->q35_ao, Ly.lg_vb, V->q35_v + (size_t) t * H, H, V->q35_o + (size_t) t * HV, s);
+                gf::quantize_q8_1(V->q35_o + (size_t) t * HV, (uint8_t*) V->q35_aoq + (size_t) t * q8v, HV, s);
+            }
+            gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_o, V->mixer, nullptr, 1.0f, Ly.out.type, HV, E};
+            if (!glm_mvn(&o, 1, T, s)) { err = "ling verify: the MLA output"; return false; }
+        }
+        for (int t = 0; t < T; ++t)
+            gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, E, V->x + (size_t) t * E, xq_t(t), s);
+        if (!Ly.moe) {   // the dense lead layers (fast_dense_ffn's: g.swiglu_shexp, a BF16 / F32 down on floats)
+            const int FF = g.n_ff_dense;
+            const size_t hqb = (size_t) FF / 32 * kQ8;
+            gf::MvJob jd[2];
+            jd[0] = {Ly.ffn_gate.q, V->xq, V->x, V->glm_dg, nullptr, 1.0f, Ly.ffn_gate.type, E, FF};
+            jd[1] = {Ly.ffn_up.q, V->xq, V->x, V->glm_du, nullptr, 1.0f, Ly.ffn_up.type, E, FF};
+            if (!glm_mvn(jd, 2, T, s)) { err = "ling verify: the dense FFN's gate / up"; return false; }
+            const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
+            for (int t = 0; t < T; ++t) {
+                if (hf)
+                    gf::swiglu_f32(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                                   V->glm_dg + (size_t) t * FF, s);
+                else
+                    gf::swiglu_q8(V->glm_dg + (size_t) t * FF, V->glm_du + (size_t) t * FF, g.swiglu_shexp, FF,
+                                  (uint8_t*) V->glm_dhq + (size_t) t * hqb, s);
+            }
+            gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, hf ? V->glm_dg : nullptr, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
+            if (!glm_mvn(&dn, 1, T, s)) { err = "ling verify: the dense FFN's down"; return false; }
+        } else if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) {
+            return false;
+        }
+    }
+    const auto nw = w_.find("output_norm.weight");
+    if (nw == w_.end()) { err = "ling verify: output_norm.weight"; return false; }
+    for (int t = 0; t < T; ++t)
+        gf::rms_q8(Rt(t), V->ffn + (size_t) t * E, nw->second, g.norm_eps, E, V->head_x + (size_t) t * E,
+                   (uint8_t*) V->head_xq + (size_t) t * q8e, s);
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (!glm_mvn(&o, 1, T, s)) { err = "ling verify: output head"; return false; }
+    if (F->zero_copy) {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok_hd + t, s);
+    } else {
+        for (int t = 0; t < T; ++t) gf::argmax(V->logits + (size_t) t * g.n_vocab, g.n_vocab, V->tok + t, s);
+        cudaMemcpyAsync(V->tok_h, V->tok, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost, s);
+    }
+    if (lk::launch_errors() != 0) { err = "ling verify: a kernel launch failed"; return false; }
+    cudaEventRecord(V->done, s);
+    return true;
+}
+
+// ling: the KDA states back to as before the window, then the kept columns replayed from their projections (the
+// token path's kda_prep / kda_rec in order) - the MLA layers' latent rows past the kept columns are written over later
+void Glm5Model::verify_rewind_ling(int kept) {
+    namespace lk = strata::kernels::ling;
+    auto* V = (VerifyBuf*) vb_;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int TM = V->TM, H = g.n_head, DI = g.d_inner(), C = 3 * DI;
+    const size_t state_n = (size_t) g.ssm_state * g.ssm_v_heads * g.ssm_state, conv_n = (size_t) g.ssm_conv_dim() * (g.d_conv - 1);
+    int li = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr) continue;
+        cudaMemcpyAsync(Ly.gdn_state, V->q35_snap + (size_t) li * state_n, state_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(Ly.gdn_conv, V->q35_csnap + (size_t) li * conv_n, conv_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        const float* proj = V->q35_qkv + (size_t) li * TM * C;
+        const float* fr = V->q35_rows + (size_t) li * TM * C;
+        const float* beta = V->q35_beta + (size_t) li * TM * H;
+        const float* cw[3] = {Ly.conv[0], Ly.conv[1], Ly.conv[2]};
+        for (int t = 0; t < kept; ++t) {   // (the output gate: any - only the state is kept)
+            lk::kda_prep(proj + (size_t) t * C, cw, Ly.gdn_conv, V->lg_scr, fr + (size_t) t * DI, Ly.dt_bias, Ly.ssm_a,
+                         g.kda_lb, V->lg_scr + C, H, g.kda_head_dim, g.d_conv, s);
+            gf::kda_rec(V->lg_scr, V->lg_scr + DI, V->lg_scr + 2 * DI, V->lg_scr + C, beta + (size_t) t * H, Ly.gdn_state,
+                        V->q35_z, Ly.ssm_norm, g.norm_eps, H, g.kda_head_dim, V->q35_yq, s);
+        }
+        ++li;
+    }
+}
+
 // inkling's (one part): ink_window's layers over the columns (inkling_fast_path.cu), then the head as the token path's
 // (output rows, the softcap, the argmax) a column
 bool Glm5Model::verify_part_ink(const std::vector<int32_t>& toks, int64_t p0, std::string& err) {
@@ -2472,6 +2644,10 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
         q35_mtp_pend_set(p0 + kept - 1, h + (size_t) (kept - 1) * E);
     }
     if (kept >= T) return;   // (every column kept: the states are after the window already)
+    if (g.ling) {
+        verify_rewind_ling(kept);
+        return;
+    }
     if (!g.q4x && F->q27 && V->q4_nattn > 0 && V->q4_tsnap != nullptr) {
         // Qwen3.8-27B QSA: the raw-key tail back to before the window, then the kept columns' keys again (a dropped
         // column in the next block wrote over tail slots of cells the kept block still pools; a block a dropped column
