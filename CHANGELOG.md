@@ -9,6 +9,42 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.198 - 2026-11-24
+
+Inkling 2 Mini's `"parallel"` (beta, opt-in) keeps every answer the same on a 24 GB card too (an RTX 3090 gave other
+answers on each start), pauses the running streams far less while a long prompt is read (8K prompt: 161 -> 37 ms on an
+RTX 5090), and routes 8 streams at once (+3% each: 59.8-62.8 tok/s, 457 together). The expert pool keeps its budget per
+card + pack + config, so every start carves the same slots. The defaults give the same bits as v1.3.197 (7-config md5
+check, Inkling 6 prompts x 3 modes, 45 concurrent requests on the 5090 and 71 on the 3090 equal to their answers alone).
+
+### Changed
+
+- **Inkling `"parallel"`: decode steps inside a long prompt's chunks.** A prompt read while other requests decode is
+  read in the prompt path's chunks as before, and inside each chunk the running streams take a decode step after every
+  8 of its 48 layer passes (`STRATA_PAR_YIELD`; the chunk's sums are unchanged, so the same answers). The finished
+  prompt's conversation is copied off the card on a copy stream while the others go on (`STRATA_PAR_SNAP_ASYNC`).
+  RTX 5090, UD-Q4_K_XL: the running streams' longest pause while an 8K prompt is read 161 -> 37 ms (38 ms for a 32K
+  one, 161-209 before), the 8K prompt's first token 1.50 -> 1.44 s.
+- **Inkling `"parallel"`: 4 or more streams route at once.** When no stream of a launch changes the shared expert state
+  (every chosen expert in VRAM, no CPU lane, no helper), every column routes at once instead of one after another - the
+  same plans and requests (`STRATA_GLM_ROUTE_QUIET`, on for Inkling; `STRATA_GLM_ROUTE_QUIET_MIN` 4). RTX 5090, 8 at
+  once: 59.1 -> 61.0 tok/s each (the route 38.7 -> 18.4 us a layer). Other models keep their routing (the 6 other
+  configs' decode within run-to-run noise).
+- **The expert pool's budget is kept** (`STRATA_GLM_POOL_PIN`, on). The budget the first start measures is saved in
+  `pool_pin.txt` beside the pack (MiB; keyed by the GPU UUID, its VRAM, the layers, the bytes held before the pool,
+  the build and the VRAM settings), and later starts carve the same pool whatever other processes hold that day - the
+  slots a layer, and with them the answers, no longer follow each start's free VRAM. A start with less free VRAM than
+  saved uses what is free for that start only (one line says so) and saves nothing; 1 GiB more free than saved measures
+  again. DeepSeek V4.1 JA256, RTX 5090: 11 starts, 67 slots a layer every time, the same md5. `=0`: as before;
+  `=reset`: measure again.
+
+### Fixed
+
+- **Inkling `"parallel"` answers changed from start to start on a 24 GB card.** The prompt buffers of the lane's own
+  scratch were bound onto the expert pool's tail as well, which on an RTX 3090 overlapped live expert slots; the own
+  scratch is now kept to itself. RTX 3090, UD-Q4_K_XL: 2 at once 9/9 and 8 at once 62/62 equal across starts (a
+  cancelled request too); one request 99 tok/s, 8 at once 26.6 each.
+
 ## v1.3.197 - 2026-11-24
 
 Inkling 2 Mini serves several requests at once (opt-in `"parallel"`, beta): on an RTX 5090 one request 196 tok/s, 4 at
