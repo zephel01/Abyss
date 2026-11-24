@@ -137,6 +137,23 @@ llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL�
 | `UD-IQ3_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 11.7 GB | llama.cpp の Q8_0 との KL 0.0280（英語 0.0304、日本語 0.0291、コード 0.0218）、top-1 の一致 93.6%。日本語の事実 589/666（Q4_K_XL は 593） | 全部 VRAM 136.1、`STRATA_GLM_VRAM_GB=12` 127.5、`=8` 102.9 tok/s。プロンプト 3,799 / 2,526 / 1,667 | GPU 8〜12 GB ＋ RAM |
 | `UD-IQ2_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 8.5 GB | KL 0.0782（英語 0.0835、日本語 0.0792、コード 0.0693）、top-1 の一致 89.1%。日本語の事実 552/666 とはっきり落ちる。VRAM 8 GB でも UD-IQ3_XXS のほうがよい | 全部 VRAM 140.2、`=12` 134.0、`=8` 120.5 tok/s | GPU 8 GB で、日本語より速さを取るとき |
 
+### Ling-3.2-air（ベータ、未リリース）
+
+inclusionAI の Ling-3.2-air（`bailingmoe3`。KDA の線形 attention 層 35 + MLA 層 7、エキスパート 512、グループ制限つきの
+top-8）。テキストのみ。まだ無いもの: MTP ブロック、モデル内の複数会話（1 つずつ）、画像。品質: 混在テキストの 96 位置での
+KL。参照は HF のモデルコード（`modeling_bailing_moe_v3_vl.py` と fla の KDA 再帰）の数式から書いた float64 の numpy の
+forward を、量子化を戻した重みで回したもの。速度: RTX 5090（PCIe Gen4 x4）+ RAM 123 GB、iGPU レーンなし、512 トークン、
+3 回の中央値。
+
+| ファイル（入手先） | サイズ | 品質 | 速度 | 用途 |
+| --- | ---: | --- | --- | --- |
+| `Q4_K_M`（[bartowski/Ling-3.2-air-GGUF](https://huggingface.co/bartowski/Ling-3.2-air-GGUF)、3 分割、imatrix） | 80.4 GB | 同じファイルの重みに対する KL 0.0165（トークン経路）/ 0.0108（プロンプト経路）= エンジン自身の誤差。私たちの Q8_0 の重みに対して 0.031 / 0.029（私たちの素の Q4_K_M: 0.057 / 0.055） | 4K のプロンプト 2,061 tok/s、decode 142.8。16K のプロンプト 3,092 tok/s、decode 120.7。VRAM 4.8 GB + エキスパート置き場 25.1 GB、RAM 層 49.7 GB（エキスパートは全部 VRAM か RAM）。サーバー: チャット 8 回（英語 / 日本語 / コード、thinking あり、200〜700 トークン）: 初回の起動（使用履歴がまだ無い）では decode 88〜116 tok/s（中央値 99）、TTFT 0.16〜0.38 秒。その約 4K トークンで覚えた使用履歴が入る次の起動からは 124〜141（中央値 135）、TTFT 0.13〜0.32 秒 | GPU 32 GB + RAM 64〜96 GB |
+| bartowski の他のファイル（IQ1_S 29.8 GB〜Q8_0） | | 未測定 | 未測定 | |
+
+GGUF の `rope.dimension_sections`（[8, 12, 12, 0]）は llama.cpp が VL モデルを変換したときに書くもので、llama.cpp は
+M-RoPE を NEOX のペアで当てる。モデルは隣り合うペア（interleaved）で回すので、Abyss はモデルに合わせる（このキーは
+読まない。同じテキストでの llama.cpp の Q4_K_M の perplexity: sections ありで 15.45、0 にして 14.78）。
+
 ### Qwen3.8-Flash-Next（qwen4exp）
 
 詳細、pack、ドラフターは [docs/qwen38](qwen38/README.ja.md)。KL は特に書かない限り NVFP4 教師との比較（seq 0〜9、

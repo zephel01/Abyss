@@ -106,6 +106,25 @@ RTX 3090（全部 VRAM）: decode 104 / 114 tok/s、同じプロンプト 1,700�
 ./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G（11.6 GB）
 ```
 
+Ling-3.2-air（inclusionAI、`bailingmoe3`。この版からベータ。[数字](MODELS.ja.md#ling-32-airベータ未リリース)）:
+bartowski が公開している Q4_K_M（3 分割、80.4 GB）をそのまま pack する。GPU 24〜32 GB + RAM 64〜96 GB 向け。
+テキストのみ、会話は 1 つずつ、MTP の下書き役はまだ無い。設定にはモデルのサンプリング（temperature 1.0、top-p 0.95、
+top-k 20）が入る。RTX 5090 + RAM 123 GB: 4K のプロンプト 2,061 tok/s、decode 142.8 tok/s。16K では 3,092 / 120.7。
+
+サーバーでは、いちばん最初の起動直後の回答が遅めになる。チャット 8 回（英語 / 日本語 / コード、thinking あり、
+200〜700 トークン）で decode 88〜116 tok/s（中央値 99）、TTFT 0.16〜0.38 秒。エンジンは答えながらこのマシンでの
+エキスパートの使われ方を覚え（pack の `expert_usage.txt`）、次の起動でそれに沿って VRAM を埋める。その約 4K トークンの
+あとの起動では 124〜141 tok/s（中央値 135）、TTFT 0.13〜0.32 秒。このモデルでは VRAM の置き場が会話の途中では
+動かないので、速くなるのは回答を重ねたときではなく次の起動から（`STRATA_GLM_BG_SPLIT=1` でも数字は同じ）。
+配布する経路の履歴（`STRATA_GLM_PRIOR`、Qwen3.8 にあるもの）があれば初回から速くなるが、Ling 用はまだ無い。
+
+確かめたのは Q4_K_M だけ。`--quant` には bartowski の他のファイル（IQ1_S〜Q8_0、bf16）を名前で渡せるが、未確認:
+
+```sh
+./setup-deepseek.sh --model ling32air --download-model                 # Ling-3.2-air-Q4_K_M（80.4 GB）
+./setup-deepseek.sh --model ling32air --quant IQ4_XS --download-model  # repo の他のファイル（未確認）
+```
+
 QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BETA。[Qwen3.5-9B QSA](#qwen35-9b-qsa)）は、ファイル全体を
 11 GB 以上の GPU 1 枚に載せる。その GPU で 128K までの文脈が動く（VRAM を 11 GB に制限して計測）。それより小さい GPU では
 何もダウンロードする前に止まる。既定は Q4_K_M（5.9 GB）、もう 1 つは `--quant Q8_0`（9.9 GB。メモリは未計測で、
@@ -1523,6 +1542,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_INK_WIN_GRAPH` | 1 | Inkling 2 Mini の verify window（`STRATA_INK_DRAFT` / `STRATA_INK_DSPARK`）: 窓の 48 回の層の適用と head を、（幅, attention の split の格子）ごとに 1 本の CUDA graph で流す。同じ kernel を同じ順に（結果は bit まで同じ）。キーごとに 6 回目の窓の後で記録する（記録 1 回で約 13 ms）。split の格子は 2 のべき乗に切り上げ（最小 8）、長い文脈でも graph は少なくて済む。プロファイルの印、dump、エキスパートの先読み、expert helper、画像の行があるときは使わない。`0`: kernel を 1 本ずつ起動 |
 | `STRATA_INK_WIN_CAP_AFTER` | 6 | graph のキーごとに、記録する前に 1 本ずつ起動する verify window の数（`STRATA_INK_WIN_GRAPH`。記録 1 回で約 13 ms） |
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini のプロンプト（CUDA、sm_80 以降）: プロンプト経路の attention をテンソルコアの kernel で（トークンのブロック x キーのタイル、FP16 の積を F32 で足す、相対バイアスは FP16 2 つに分けて F32 相当、窓の外のタイルは飛ばす）。attention のサブバッチは 2,048 行（`STRATA_INK_PREFILL_SUB` で変えられる）。RTX 5090、UD-Q4_K_XL で 8K プロンプト 3,784 → 6,874 tok/s、165K 765 → 5,298。足す順番と q / P の FP16 丸めでビットは変わるが、llama.cpp に対する KL は変わらない。`0`: トークン経路の kernel で 1 行ずつ、サブバッチ 512 行（前のビット）。AMD は常にこちら |
+| `STRATA_LING_PROMPT_ATTN` | 1 | Ling-3.2-air のプロンプト（CUDA、sm_80 以降）: MLA 層のプロンプトの attention をテンソルコアのフラッシュ kernel で（FP16 の積を F32 で足す、オンライン softmax、ヘッドごとのゲートは途中で掛ける）。アキュムレータの配置を初回に確かめ、合わなければ戻る。`0`: 1 行ずつ（行ごとに decode の kernel） |
 | `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini、`--serve`: まとめて decode するリクエストの数（`N`、または `auto`: 全 expert が VRAM に残り、3 GB とプロンプト経路の領域が余る範囲で最大 8。それより大きい `N` はそこまで減らす）。実行設定の `"parallel"`。[複数のリクエストを同時に](#複数のリクエストを同時にparallelinkling-2-miniベータ) を参照 |
 | `STRATA_PAR_CHUNK` | プロンプト経路の chunk | `"parallel"` が 2 以上: 他のリクエストが decode 中のとき、decode の合間に読むプロンプトのトークン数（`STRATA_PAR_PREFILL_MB` 2048 の 32 GB のカードで 1,280）。小さくすると走っているストリームの止まる時間が短くなり、プロンプトは遅くなる。また長いプロンプトの区切りがほかの decode の有無で変わるので、答えの最後のビットも変わりうる |
 | `STRATA_PAR_YIELD` | 8 | `"parallel"` が 2 以上: 他のリクエストが decode 中に読むプロンプトの chunk の中で、48 層のこの数ごとにそれらの decode を 1 ステップ挟む（chunk の和は変わらない）。小さいほど止まりは短く、プロンプトは遅い（4: p99 23 ms、8K 1.84 s。12: 48 ms、1.31 s）。0: 無効（chunk 全部のあと `STRATA_PAR_SHARE`） |

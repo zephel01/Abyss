@@ -1004,6 +1004,51 @@ class TestVariants(unittest.TestCase):
                 self.assertGreater(full.get("gb", 0), 0, (name, q))
 
 
+class LingAir(unittest.TestCase):
+    """--model ling32air: bartowski's repo, a quant's folder of shards (Q4_K_M, the default) or a top-level file (the
+    small ones) resolved the way main() asks quant_files; the config's sampling the model card's (1.0 / 0.95 / 20)."""
+
+    def files(self, q, listing):
+        m = A.MODELS["ling32air"]
+        m = {**m, "prefix_file": m["prefix_tmpl"].format(q=q)}
+        folder = (m.get("quant_folders") or {}).get(q, m.get("folder"))
+        prefix = m["prefix_file"] if q not in m["quant_folders"] else m["prefix_file"].rstrip(".") + "-"
+        seen = []
+
+        class R:
+            def read(self):
+                return json.dumps([{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in listing]).encode()
+
+        def urlopen(req, timeout=0):
+            seen.append(req.full_url)
+            return R()
+        with mock.patch.object(A.urllib.request, "urlopen", side_effect=urlopen):
+            got = A.quant_files(q, m["repo"], folder, prefix)
+        return [g[0] for g in got], seen[0]
+
+    def test_the_default_shards(self):
+        m = A.MODELS["ling32air"]
+        self.assertEqual((m["repo"], m["quant"]), ("bartowski/Ling-3.2-air-GGUF", "Q4_K_M"))
+        shards = ["Ling-3.2-air-Q4_K_M/Ling-3.2-air-Q4_K_M-0000%d-of-00003.gguf" % i for i in (1, 2, 3)]
+        got, url = self.files("Q4_K_M", shards)
+        self.assertEqual(got, shards)
+        self.assertTrue(url.endswith("/tree/main/Ling-3.2-air-Q4_K_M"), url)
+
+    def test_a_top_level_file(self):
+        got, url = self.files("IQ2_XXS", ["Ling-3.2-air-IQ2_XXS.gguf", "Ling-3.2-air-IQ2_XS.gguf",
+                                          "Ling-3.2-air-imatrix.gguf", "mmproj-Ling-3.2-air-f16.gguf"])
+        self.assertEqual(got, ["Ling-3.2-air-IQ2_XXS.gguf"])
+
+    def test_the_config(self):
+        m = A.MODELS["ling32air"]
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, _ = A.write_config("ling32air-q4_k_m", Path(d) / "pack", 65536, 8082, False, None, None, m)
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+        self.assertEqual(got["model_name"], "ling-3.2-air")
+        self.assertEqual((got["sampling"]["temperature"], got["sampling"]["top_p"], got["sampling"]["top_k"]),
+                         (1.0, 0.95, 20))
+
+
 class VenvLayout(unittest.TestCase):
     """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
 

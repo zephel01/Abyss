@@ -9,6 +9,31 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+Ling-3.2-air (inclusionAI, `bailingmoe3`: 42 layers - 35 KDA linear-attention layers and 7 MLA layers -, 512 experts,
+top-8 with group-limited routing) runs as a text-only beta, from bartowski's public Q4_K_M as it is.
+
+### Added
+
+- Ling-3.2-air (beta, text only): `./setup-deepseek.sh --model ling32air --download-model` fetches bartowski's
+  [Ling-3.2-air-GGUF](https://huggingface.co/bartowski/Ling-3.2-air-GGUF) Q4_K_M (3 shards, 80.4 GB), packs it and writes
+  the run config (temperature 1.0, top-p 0.95, top-k 20, the model's generation config). Decode: the KDA layers' conv,
+  gates and recurrence, the MLA layers' absorbed attention, the group-limited router, the per-layer SwiGLU limits.
+  Prompts: the batched KDA kernels, a tensor-core flash attention for the MLA layers (`STRATA_LING_PROMPT_ATTN=0` goes
+  back to one row at a time) and the group-limited batched router. The server stops on `<|role_end|>`. Not yet: the MTP
+  block (dropped at pack time), several conversations in the model (one at a time), images.
+  RTX 5090 (PCIe Gen4 x4) + 123 GB RAM, iGPU lane off, 512 tokens, median of 3: a 4K prompt 2,061 tok/s, decode
+  142.8 tok/s; a 16K prompt 3,092 tok/s, decode 120.7 tok/s; VRAM 4.8 GB + a 25.1 GB expert pool, RAM tier 49.7 GB (all
+  experts in VRAM or RAM). Server, 8 chat answers (EN / JA / code, thinking on, 200-700 tokens): on the very first
+  start (no usage profile yet) decode 88-116 tok/s, median 99; from the next start (the profile learned from those ~4K
+  tokens) 124-141, median 135; TTFT 0.13-0.38 s. KL on 96 positions of a mixed text against a float64 numpy forward written from the HF
+  modeling code: 0.0165 (token path) / 0.0108 (prompt path) against the same file's weights (the engine's own error);
+  0.031 / 0.029 against our Q8_0's weights (our own plain Q4_K_M: 0.057 / 0.055).
+- The fast path runs MoE layers whose gate is Q4_K and up Q6_K (or the other way round): bartowski's Ling-3.2-air
+  Q4_K_M has them in layers 2-10.
+- The GGUF keeps `rope.dimension_sections` [8, 12, 12, 0] from llama.cpp's VL conversion; Abyss does not read it and
+  rotates interleaved pairs as the model does (perplexity of our Q4_K_M in llama.cpp on the same text: 15.45 with the
+  sections, 14.78 with them zeroed).
+
 ## v1.3.200 - 2026-11-24
 
 Inkling 2 Mini's DSpark drafter is on by default when its file is on disk and it leaves the expert pool as it is: on an

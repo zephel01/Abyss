@@ -140,6 +140,23 @@ against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token E
 | `UD-IQ3_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 11.7 GB | KL 0.0280 against the llama.cpp Q8_0 (EN 0.0304, JA 0.0291, code 0.0218), same top-1 93.6%; Japanese facts 589/666 (Q4_K_XL 593) | all in VRAM 136.1; `STRATA_GLM_VRAM_GB=12` 127.5; `=8` 102.9 tok/s; prompts 3,799 / 2,526 / 1,667 | 8-12 GB GPU + RAM |
 | `UD-IQ2_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 8.5 GB | KL 0.0782 (EN 0.0835, JA 0.0792, code 0.0693), same top-1 89.1%; Japanese facts 552/666, clearly below - prefer UD-IQ3_XXS at an 8 GB cap | all in VRAM 140.2; `=12` 134.0; `=8` 120.5 tok/s | 8 GB GPU, when speed matters more than Japanese |
 
+### Ling-3.2-air (beta, unreleased)
+
+inclusionAI's Ling-3.2-air (`bailingmoe3`: 35 KDA linear-attention layers + 7 MLA layers, 512 experts, top-8 with
+group-limited routing), text only. Not yet: its MTP block, several conversations in the model (one at a time),
+images. Quality: KL on 96 positions of a mixed text against a float64 numpy forward written from the HF modeling
+code (`modeling_bailing_moe_v3_vl.py` and fla's KDA recurrence), run on the dequantized weights. Speeds: RTX 5090
+(PCIe Gen4 x4) + 123 GB RAM, iGPU lane off, 512 tokens, median of 3.
+
+| file (source) | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `Q4_K_M` ([bartowski/Ling-3.2-air-GGUF](https://huggingface.co/bartowski/Ling-3.2-air-GGUF), 3 shards, imatrix) | 80.4 GB | KL against the same file's weights 0.0165 (token path) / 0.0108 (prompt path) - the engine's own error; against our Q8_0's weights 0.031 / 0.029 (our plain Q4_K_M: 0.057 / 0.055) | a 4K prompt 2,061 tok/s, decode 142.8; a 16K prompt 3,092 tok/s, decode 120.7. VRAM 4.8 GB + a 25.1 GB expert pool, RAM tier 49.7 GB (every expert in VRAM or RAM). Server: 8 chat answers (EN / JA / code, thinking on, 200-700 tokens): on the first start, with no usage profile yet, decode 88-116 tok/s (median 99), TTFT 0.16-0.38 s; from the next start, with the profile those ~4K tokens taught, 124-141 (median 135), TTFT 0.13-0.32 s | 32 GB GPU + 64-96 GB RAM |
+| the other bartowski files (IQ1_S 29.8 GB to Q8_0) | | not measured | not measured | |
+
+The GGUF's `rope.dimension_sections` ([8, 12, 12, 0]) comes from llama.cpp's conversion of the VL model, which applies
+M-RoPE with NEOX pairs; the model rotates interleaved pairs, and Abyss follows the model (it does not read the key;
+perplexity of a Q4_K_M in llama.cpp on the same text: 15.45 with the sections, 14.78 with them zeroed).
+
 ### Qwen3.8-Flash-Next (qwen4exp)
 
 Details, packing and the drafter: [docs/qwen38](qwen38/README.md). KL is against the NVFP4 teacher (seq 0-9, 2,048

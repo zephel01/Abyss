@@ -109,6 +109,23 @@ tok/s; RTX 3090 (all in VRAM): decode 104 / 114 tok/s, the same prompt 1,700-1,9
 ./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G (11.6 GB)
 ```
 
+Ling-3.2-air (inclusionAI, `bailingmoe3`, beta from this version; [the numbers](MODELS.md#ling-32-air-beta-unreleased)):
+bartowski's public Q4_K_M (3 shards, 80.4 GB), packed as it is, for a 24-32 GB GPU + 64-96 GB RAM. Text only, one
+conversation at a time, no MTP drafter yet. The config takes the model's sampling (temperature 1.0, top-p 0.95, top-k
+20). RTX 5090 + 123 GB RAM: a 4K prompt 2,061 tok/s, decode 142.8 tok/s; 16K 3,092 / 120.7. In the server, expect the
+first answers after the very first start to be slower: 8 chat answers (EN / JA / code, thinking on, 200-700 tokens)
+decoded at 88-116 tok/s (median 99), TTFT 0.16-0.38 s. The engine learns this machine's expert usage as it answers (the
+pack's `expert_usage.txt`) and fills VRAM from it at the next start: 124-141 tok/s (median 135), TTFT 0.13-0.32 s after
+those ~4K tokens. On this model the VRAM pool does not move during a session, so the gain comes with the next start, not
+after more answers (`STRATA_GLM_BG_SPLIT=1` gave the same numbers). A shipped routing profile (`STRATA_GLM_PRIOR`, as
+Qwen3.8's) would make the first start warm too; there is none for Ling yet. Only Q4_K_M has been checked; `--quant`
+takes bartowski's other files (IQ1_S to Q8_0, bf16) by name, untested:
+
+```sh
+./setup-deepseek.sh --model ling32air --download-model                 # Ling-3.2-air-Q4_K_M (80.4 GB)
+./setup-deepseek.sh --model ling32air --quant IQ4_XS --download-model  # another file of the repo (untested)
+```
+
 Qwen3.5-9B QSA, a small dense model with a QSA indexer (zephel01's, BETA; [Qwen3.5-9B QSA](#qwen35-9b-qsa)): the whole
 file goes on one GPU of 11 GB or more, which holds a context up to 128K (measured with the VRAM capped at 11 GB). The setup
 stops on a smaller GPU before downloading anything. Q4_K_M (5.9 GB) is the default, `--quant Q8_0` (9.9 GB) the other
@@ -1593,6 +1610,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_INK_WIN_GRAPH` | 1 | Inkling 2 Mini's verify window (`STRATA_INK_DRAFT` / `STRATA_INK_DSPARK`): the window's 48 layer applications and its head replayed from one CUDA graph a (width, attention split grid) - the same kernels in the same order (the same bits). A key is captured after its 6th window (a capture costs ~13 ms), the attention's split grid rounded up to a power of two (8 at the least) so long contexts need few graphs. Not with the profile marks, dumps, expert prefetch / lookahead, the expert helper or image rows. `0`: the kernels launched one by one |
 | `STRATA_INK_WIN_CAP_AFTER` | 6 | the verify windows of a graph key launched one by one before the key's capture (`STRATA_INK_WIN_GRAPH`; a capture ~13 ms) |
 | `STRATA_INK_PREFILL_ATTN` | 1 | Inkling 2 Mini prompts (CUDA, sm_80 and newer): the prompt path's attention on a tensor-core kernel (a block of tokens x a tile of keys, FP16 products with F32 sums, the relative bias as FP16 pairs - about F32 -, out-of-window tiles skipped) and a 2,048-row attention sub-batch (`STRATA_INK_PREFILL_SUB` overrides). RTX 5090, UD-Q4_K_XL: 8K prompt 3,784 -> 6,874 tok/s, 165K 765 -> 5,298. The sum order and q / P rounded to FP16 change the bits, not the KL against llama.cpp. `0`: the token path's kernel a row at a time and 512-row sub-batches (the old bits). AMD always uses that one |
+| `STRATA_LING_PROMPT_ATTN` | 1 | Ling-3.2-air prompts (CUDA, sm_80 and newer): the MLA layers' prompt attention on a tensor-core flash kernel (FP16 products, F32 sums, an online softmax, the per-head gate applied on the way); its accumulator layout is checked once and a mismatch falls back. `0`: one row at a time (the decode kernel per row) |
 | `STRATA_INK_PARALLEL` / `--parallel` | 1 | Inkling 2 Mini, `--serve`: requests decoded together (`N`, or `auto`: as many as leave every expert in VRAM with 3 GB plus the prompt path's region to spare, at most 8; a larger `N` is cut to that); the run config's `"parallel"`. See [Several requests at once](#several-requests-at-once-parallel-inkling-2-mini-beta) |
 | `STRATA_PAR_CHUNK` | the prompt path's chunk | `"parallel"` above 1: the prompt tokens read between two decode steps while other requests decode (1,280 on a 32 GB card with `STRATA_PAR_PREFILL_MB` 2048). Smaller: shorter pauses for the running streams, a slower prompt - and a long prompt's pieces then depend on whether others decode, so its answer's last bits can too |
 | `STRATA_PAR_YIELD` | 8 | `"parallel"` above 1: inside a prompt chunk read while other requests decode, a decode step for them after every this many of the chunk's 48 layer passes (the chunk's sums unchanged). Smaller: shorter pauses, a slower prompt (4: 23 ms p99 pauses, the 8K prompt 1.84 s; 12: 48 ms, 1.31 s). 0: off (a whole chunk, then `STRATA_PAR_SHARE`) |
