@@ -2514,6 +2514,65 @@ static void glm_image_rows(strata::core::Glm5Model& model, const std::vector<int
     }
 }
 
+// MemT memory files (memt_path.cu's state): the safetensors layout MemT's save_state writes - "memory.<layer>" F32
+// [1, heads, 256, 256] for every memory layer, metadata format memt-memory-v1 - so a state saved by either side loads
+// in the other (the identity hash is MemT's own; Abyss writes "abyss" there and does not check it on load)
+static bool memt_file_write(const std::string& path, const std::vector<float>& st, const std::vector<int>& layers,
+                            int heads, std::string& err) {
+    const size_t per = st.size() / std::max<size_t>(1, layers.size());
+    std::string h = "{\"__metadata__\":{\"format\":\"memt-memory-v1\",\"identity\":\"abyss\"}";
+    for (size_t i = 0; i < layers.size(); ++i)
+        h += ",\"memory." + std::to_string(layers[i]) + "\":{\"dtype\":\"F32\",\"shape\":[1," + std::to_string(heads) +
+             ",256,256],\"data_offsets\":[" + std::to_string(i * per * 4) + "," + std::to_string((i + 1) * per * 4) + "]}";
+    h += "}";
+    while (h.size() % 8 != 0) h += ' ';
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { err = "cannot write " + tmp; return false; }
+    const uint64_t n = h.size();
+    bool ok = std::fwrite(&n, 8, 1, f) == 1 && std::fwrite(h.data(), 1, h.size(), f) == h.size() &&
+              std::fwrite(st.data(), 4, st.size(), f) == st.size();
+    ok = (std::fclose(f) == 0) && ok;
+    if (ok && std::rename(tmp.c_str(), path.c_str()) != 0) ok = false;
+    if (!ok) { std::remove(tmp.c_str()); err = "cannot write " + path; }
+    return ok;
+}
+
+static bool memt_file_read(const std::string& path, std::vector<float>& st, const std::vector<int>& layers, int heads,
+                           std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { err = "cannot read " + path; return false; }
+    uint64_t n = 0;
+    std::string h;
+    bool ok = std::fread(&n, 8, 1, f) == 1 && n < (1u << 20);
+    if (ok) { h.resize((size_t) n); ok = std::fread(&h[0], 1, h.size(), f) == h.size(); }
+    const long base = 8 + (long) n;
+    const size_t per = (size_t) heads * 256 * 256;
+    st.assign(per * layers.size(), 0.0f);
+    if (ok && h.find("memt-memory-v1") == std::string::npos) { err = path + ": not a memt-memory-v1 file"; ok = false; }
+    for (size_t i = 0; ok && i < layers.size(); ++i) {
+        const std::string key = "\"memory." + std::to_string(layers[i]) + "\"";
+        const size_t at = h.find(key);
+        const size_t end = at == std::string::npos ? at : h.find('}', at);
+        const std::string ent = at == std::string::npos ? "" : h.substr(at, end - at);
+        const size_t d = ent.find("\"data_offsets\"");
+        unsigned long long a = 0, b = 0;
+        if (at == std::string::npos || ent.find("\"F32\"") == std::string::npos || d == std::string::npos ||
+            std::sscanf(ent.c_str() + ent.find('[', d), "[%llu,%llu]", &a, &b) != 2 || b - a != per * 4) {
+            err = path + ": memory." + std::to_string(layers[i]) + " is missing or not F32 [1," + std::to_string(heads) +
+                  ",256,256]";
+            ok = false;
+            break;
+        }
+        ok = std::fseek(f, base + (long) a, SEEK_SET) == 0 && std::fread(st.data() + i * per, 4, per, f) == per;
+        if (!ok) err = path + ": short read";
+    }
+    std::fclose(f);
+    for (size_t i = 0; ok && i < st.size(); ++i)
+        if (!std::isfinite(st[i])) { err = path + ": not finite"; ok = false; }
+    return ok;
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -2810,7 +2869,9 @@ static int glm_pack_generate(const Options& o) {
     const bool q35_path = model.fast() && model.geometry().qwen35();
     std::string q35_slot_why;
     const bool q35_slot_ok = q35_path && model.q35_slot_supported(q35_slot_why);
+    // (MemT: one conversation in the model - a kept conversation's KV belongs to the memory it was read with)
     int slot_max = model.fast() && !model.geometry().dsv4() && !model.geometry().is_hy4() && (!q35_path || q35_slot_ok) &&
+                           !model.geometry().memt &&
                            getenv("STRATA_GLM_NO_REUSE") == nullptr
                        ? (int) env_num("STRATA_GLM_SLOTS", q35_path ? 8 : 4)
                        : 0;
@@ -4658,6 +4719,58 @@ static int glm_pack_generate(const Options& o) {
             std::fflush(stdout);
             // A partial request must not be mistaken for a complete request.
             if (!ok) return 1;
+            continue;
+        }
+        // MemT (MemT-1.0-Nano's native memory, memt_path.cu): MEMT OFF (no read: the backbone alone) | ZERO (an empty
+        // memory, read) | LOAD <file> | SAVE <file> | COMMIT <id,id,...> (a turn's replay written into the memory) |
+        // DOC <id,id,...> (a document, in chunks) | INFO.  Any change drops the conversation kept in the model (its
+        // KV was made with the other memory).  Replies: "MEMT <on 0|1> <floats> <ms>" or ERR
+        if (cmd == "MEMT") {
+            std::string sub, arg, extra;
+            ss >> sub >> arg;
+            const auto t0 = std::chrono::steady_clock::now();
+            bool ok = model.memt();
+            std::string why = ok ? "" : "MEMT: not a MemT model";
+            const auto& mg = model.geometry();
+            std::vector<int> mlayers;
+            for (int il = 0; il < mg.n_layers; ++il)
+                if (mg.n_head_kv[(size_t) il] != 0) mlayers.push_back(il);
+            std::vector<float> host;
+            if (ok && sub == "OFF") {
+                model.memt_use(false);
+            } else if (ok && sub == "ZERO") {
+                ok = model.memt_set(nullptr, why);
+                model.memt_use(true);
+            } else if (ok && sub == "LOAD" && !arg.empty()) {
+                ok = memt_file_read(arg, host, mlayers, mg.memt_heads, why) && model.memt_set(host.data(), why);
+                if (ok) model.memt_use(true);
+            } else if (ok && sub == "SAVE" && !arg.empty()) {
+                host.resize(model.memt_state_floats());
+                ok = model.memt_get(host.data(), why) && memt_file_write(arg, host, mlayers, mg.memt_heads, why);
+            } else if (ok && (sub == "COMMIT" || sub == "DOC") && !arg.empty()) {
+                std::vector<int64_t> t64;
+                ok = parse_i64_list(arg.c_str(), t64, why);
+                for (int64_t id : t64) ok = ok && id >= 0 && id < n_vocab;
+                if (ok && (int64_t) t64.size() > o.max_context) { ok = false; why = "MEMT: longer than the context"; }
+                if (ok) {
+                    const std::vector<int32_t> t(t64.begin(), t64.end());
+                    ok = model.memt_commit(t, sub == "DOC", why);
+                    model.memt_use(true);
+                }
+            } else if (ok && sub != "INFO") {
+                ok = false;
+                why = "malformed MEMT line (MEMT OFF|ZERO|INFO|LOAD <file>|SAVE <file>|COMMIT <ids>|DOC <ids>)";
+            }
+            if (sub != "INFO" && sub != "SAVE") {   // the model's conversation was read with the memory before
+                snap_tokens.clear();
+                lp_ctx.clear();
+                snap_in_slot = false;
+                model.reset();
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (ok) std::printf("MEMT %d %zu %.1f\n", model.memt_using() ? 1 : 0, model.memt_state_floats(), ms);
+            else std::printf("ERR %s\n", why.c_str());
+            std::fflush(stdout);
             continue;
         }
         if (cmd == "LOGP") {

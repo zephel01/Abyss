@@ -2725,6 +2725,96 @@ class Service:
         except ValueError:
             return 16
 
+    # ---- MemT (MemT-1.0-Nano's native memory, the engine's MEMT lines): a request with "memory": {"id": "<name>",
+    # "commit": true|false} (or Anthropic's metadata.memory) reads that memory while it answers; commit: afterwards the
+    # turn (its last user message as the template renders it alone, and the answer's tokens) is written into the
+    # memory and the memory saved to STRATA_MEMT_DIR/<name>.safetensors (MemT's memt-memory-v1 layout).  A client
+    # that commits a turn need not send it again: the memory holds it.  No "memory": the backbone alone.
+    MEMT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+    def memt_dir(self) -> Path:
+        d = Path(os.environ.get("STRATA_MEMT_DIR") or (Path.home() / ".abyss" / "memt"))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def memt_request(self, req: dict, messages, kw) -> dict | None:
+        m = req.get("memory")
+        if m is None and isinstance(req.get("metadata"), dict):
+            m = req["metadata"].get("memory")
+        if m is None:
+            return None
+        if isinstance(m, str):
+            m = {"id": m}
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not self.MEMT_ID.match(m["id"]):
+            raise ValueError('memory must be {"id": "<letters, digits, . _ ->", "commit": true|false}')
+        if getattr(self, "memt_ok", None) is None:
+            with self.fifo.shared():
+                try:
+                    self.engine.command("MEMT INFO", "MEMT")
+                    self.memt_ok = True
+                except (ValueError, AttributeError):
+                    self.memt_ok = False
+        if not self.memt_ok:
+            raise ValueError("memory: this model has no native memory (MemT models only)")
+        out = {"id": m["id"], "commit": m.get("commit") is True}
+        if out["commit"]:
+            users = [x for x in messages if x.get("role") == "user"]
+            if not users:
+                raise ValueError("memory.commit: the request has no user message to write")
+            tk = {k: v for k, v in kw.items() if k in ("enable_thinking", "reasoning_effort")}
+            out["replay"], _ = self._prompt_ids([users[-1]], None, tk, None, None)
+        return out
+
+    def _memt_select(self, m: dict | None):
+        want = m["id"] if m else None
+        cur = getattr(self, "memt_cur", None)
+        if want == cur:
+            return
+        if want is None:
+            self.engine.command("MEMT OFF", "MEMT")
+        else:
+            f = self.memt_dir() / (want + ".safetensors")
+            self.engine.command(f"MEMT LOAD {f}" if f.exists() else "MEMT ZERO", "MEMT")
+        self.memt_cur = want
+
+    def _memt_commit(self, m: dict, ids: list[int]) -> dict:
+        t0 = time.time()
+        reply = self.engine.command("MEMT COMMIT " + ",".join(str(i) for i in ids), "MEMT", timeout=900.0)
+        f = self.memt_dir() / (m["id"] + ".safetensors")
+        self.engine.command(f"MEMT SAVE {f}", "MEMT")
+        print(f"[abyss] memory {m['id']}: wrote {len(ids)} tokens in {time.time() - t0:.1f} s ({reply})", flush=True)
+        return {"id": m["id"], "committed_tokens": len(ids), "updated": True}
+
+    def memt_document(self, mid: str, text: str) -> dict:
+        """POST /v1/memory/<id>/documents {"text": ...}: the text written into the memory as a document (chunks)."""
+        if not self.MEMT_ID.match(mid):
+            raise ValueError("bad memory id")
+        prompt = self.template.render([{"role": "user", "content": text}], add_generation_prompt=False)
+        ids = self.tok.encode(prompt, parse_special=True)
+        with self.fifo.shared():
+            self._memt_select({"id": mid})
+            self.engine.command("MEMT DOC " + ",".join(str(i) for i in ids), "MEMT", timeout=1800.0)
+            f = self.memt_dir() / (mid + ".safetensors")
+            self.engine.command(f"MEMT SAVE {f}", "MEMT")
+        return {"id": mid, "document_tokens": len(ids), "updated": True}
+
+    def memt_list(self) -> dict:
+        d = self.memt_dir()
+        return {"object": "list", "data": [{"id": f.stem, "bytes": f.stat().st_size, "modified": int(f.stat().st_mtime)}
+                                           for f in sorted(d.glob("*.safetensors"))]}
+
+    def memt_delete(self, mid: str) -> dict:
+        if not self.MEMT_ID.match(mid):
+            raise ValueError("bad memory id")
+        f = self.memt_dir() / (mid + ".safetensors")
+        with self.fifo.shared():
+            if getattr(self, "memt_cur", None) == mid:
+                self.engine.command("MEMT OFF", "MEMT")
+                self.memt_cur = None
+            existed = f.exists()
+            f.unlink(missing_ok=True)
+        return {"id": mid, "deleted": existed}
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         # Inkling 2 thinks at any effort level, "none" included (thinking off writes a short
@@ -2769,6 +2859,7 @@ class Service:
         closed_by, reasoning_tokens = None, 0
         soft_ends, soft_max, runs = 0, self._soft_end_max(), 0
         first_last = None                               # the first engine run's DONE (the prompt's figures)
+        memt, memt_done = None, None                    # MemT: this request's memory, and what its commit wrote
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -2791,6 +2882,9 @@ class Service:
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                     self.last_request_at = time.time()
                     self.rate.clear()               # the previous request's samples must not leak into this one
+                memt = (sampling or {}).get("_memt")
+                if memt is not None or getattr(self, "memt_cur", None) is not None:
+                    self._memt_select(memt)
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
@@ -3033,6 +3127,8 @@ class Service:
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[abyss] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                if memt is not None and memt.get("commit") and finish in ("stop", "length") and not cancel.is_set():
+                    memt_done = self._memt_commit(memt, list(memt["replay"]) + raw_ids)
                 self.status["busy"] = self.fifo.active > 1   # (--parallel: the others still run)
         for ev in (ink_calls.finish() if ink_calls is not None else []) + parser.finish():
             yield "event", ev
@@ -3041,6 +3137,8 @@ class Service:
         if closed_by is not None:
             done["reasoning_closed_by"] = closed_by
             done["reasoning_tokens"] = reasoning_tokens
+        if memt is not None:
+            done["memory"] = memt_done or {"id": memt["id"], "updated": False}
         yield "done", done
 
     def _closed_by(self, is_think_end: bool, n: int, think_budget: int, by_room: bool) -> str:
@@ -3276,6 +3374,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                                                               "reasoning_closed_by": x["reasoning_closed_by"]}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            if x.get("memory"):
+                last["memory"] = x["memory"]            # MemT: the memory read, and whether this turn was written
             yield last
 
 
@@ -3384,6 +3484,8 @@ def openai_collect(chunks) -> dict:
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if last.get("memory"):
+        out["memory"] = last["memory"]
     return out
 
 
@@ -4051,6 +4153,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/memory":                       # MemT: the saved memories
+                if self._authorized():
+                    self._json(200, svc.memt_list())
             elif path == "/v1/strata/stream":
                 if self._authorized():
                     self._job_get()
@@ -4102,6 +4207,13 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path.startswith("/v1/memory/") and path.endswith("/documents"):   # MemT: a document written
+                    text = req.get("text") if isinstance(req, dict) else None
+                    if not isinstance(text, str) or not text:
+                        raise ValueError('documents takes {"text": "..."}')
+                    self._json(200, svc.memt_document(path[len("/v1/memory/"):-len("/documents")], text))
+                elif path.startswith("/v1/memory/") and path.endswith("/delete"):
+                    self._json(200, svc.memt_delete(path[len("/v1/memory/"):-len("/delete")]))
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except BadBody as e:
@@ -4266,7 +4378,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
-            req = {**req, "_snap_at": kw.get("_snap_at")}     # where the last message ends (#59)
+            req = {**req, "_snap_at": kw.get("_snap_at"), "_memt": svc.memt_request(req, messages, kw)}
             if kw.get("_no_calls"):
                 req = {**req, "_no_calls": True}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -4367,7 +4479,7 @@ def make_handler(svc: Service):
                 tools = kw["_parser_tools"]
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
-            req = {**req, "_snap_at": kw.get("_snap_at")}     # where the last message ends (#59)
+            req = {**req, "_snap_at": kw.get("_snap_at"), "_memt": svc.memt_request(req, messages, kw)}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)

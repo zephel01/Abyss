@@ -221,6 +221,12 @@ struct Glm5Geometry {
     // clamp(u, +-l) form (lim_e / lim_s).  The qwen35 fields are set so qwen35_alloc's delta-net states and conv rows
     // are the KDA ones (ssm_* = n_head heads of 128) and its KV rows the MLA cache rows (head_dim 576, one KV head)
     bool ling = false;
+    // ---- memt (MemTensor's MemT-1.0-Nano: the qwen35moe path with qwen35moe.memt.* keys and blk.N.memt_* tensors on the
+    // full-attention layers; src/core/memt_path.cu): a memory read added to the gated attention output, a state of
+    // memt_heads x 256 x 256 FP32 a memory layer, written by a replay at the end of a turn
+    bool memt = false;
+    int memt_heads = 16, memt_chunk = 2048;
+    float memt_softcap = 2.0f, memt_eps = 1e-6f;
     int ling_qk_nope = 128, ling_rope = 64, ling_v = 128, ling_group = 8, ling_topk_group = 4;
     std::vector<float> lim_e, lim_s;   // per layer (the NextN block's too); 0 = no clamp
     /// the limit the expert / shared-expert kernels take for layer il: ling encodes the llama.cpp form as
@@ -285,6 +291,22 @@ public:
     /// The fast decode path (src/core/glm_fast_path.cu) is the default for packs; STRATA_GLM_SLOW=1
     /// keeps the correctness-first per-op path (the reference the fast path is checked against).
     bool fast() const { return fast_ != nullptr; }
+    // ---- memt (MemT-1.0-Nano, memt_path.cu): the memory state of every memory layer (memt_state_floats() floats, layer
+    // by layer [heads][256][256]); memt_use(false): no read at all (the backbone alone); memt_commit: a replay of ids
+    // from position 0 on an empty context that writes into the state (reading the state as it was), then the context
+    // is reset; memt_document: the same in chunks of memt.chunk_tokens, each reading the state the last one wrote
+    bool memt() const { return g_.memt; }
+    size_t memt_state_floats() const;
+    bool memt_get(float* host, std::string& err);
+    bool memt_set(const float* host, std::string& err);   // nullptr: zero
+    void memt_use(bool on);
+    bool memt_using() const;
+    bool memt_commit(const std::vector<int32_t>& ids, bool document, std::string& err);
+    /// the prompt path's hook (glm_prefill.cu): rows xs [tn][n_embd] of layer il, their gated attention output ao
+    /// [tn][heads x 256]; gemm(W, N, X, Y, Tn) = Y[Tn][N] = X[Tn][n_embd] . W[N][n_embd]^T with W BF16
+    bool memt_rows(int il, const float* xs, int tn, float* ao, cudaStream_t s,
+                   const std::function<void(const uint16_t*, int, int, const float*, float*, int)>& gemm,
+                   std::string& err);
     /// Skip the per-token logits download (the driver samples on the device).
     void set_host_logits(bool on) { host_logits_ = on; }
     /// Live counters of the fast path (both halves summed), for the driver's STAT lines.
@@ -767,6 +789,12 @@ public:
     // qwen35_alloc), the KDA layer and the MLA layer of a token (x / xq -> mixer), the routed experts' group mask (the
     // router's logits -> a bias that keeps the chosen groups only), the buffers it owns
     void ling_bind(int il, std::string& missing);
+    // ---- memt (memt_path.cu): a memory layer's weights (from qwen35_bind), its state and scratch (from qwen35_alloc),
+    // the read (and, in a replay, the write) of a token (x -> q35_ao) and of a prompt's rows (xs -> ao)
+    void memt_bind(int il, std::string& missing);
+    bool memt_alloc(std::string& err);
+    bool memt_token(int il, std::string& err);
+    void memt_free();
     bool ling_alloc(std::string& err);
     bool fast_ling_kda(int il, std::string& err);
     bool fast_ling_mla(int il, int64_t p, std::string& err);
