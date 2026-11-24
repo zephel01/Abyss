@@ -9,6 +9,19 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- A turn cut by `max_tokens` mid-reasoning (empty answer) no longer makes the next turn read the whole conversation
+  again (#59). The server drops an empty assistant turn, so the next prompt did not start with the engine's snapshot
+  (taken just before the prompt's last token); the snapshot is now kept where the prompt's last message ends (GEN key
+  `snap_at=`, `STRATA_SNAP_AT=0` = as before). RTX 5090, Ornith-1.5-35B-A3B Q4_K_M, a 9K-token first turn cut at 48
+  tokens, the next turn sent as an OpenAI client does (`content: ""`): cache_n 0 / prompt_n 9,059, 1,630 ms -> cache_n
+  9,035 / prompt_n 24, 267 ms. Every model but Inkling had it (checked with each model's template and tokenizer:
+  Qwen3.5/3.8, Ornith, Laguna, Ling, GLM-5.3, DeepSeek V4 / V4.1, Hy4). A new prompt's answers can differ from v1.3.201's
+  in the last bits (the generation prompt's 4-5 tokens are read after the snapshot, as a reused turn already reads
+  them) and its first token comes ~55 ms later at 9-10K tokens (1,752-1,766 -> 1,805-1,818 ms); the CLI is unchanged
+  (7-config md5).
+
 ## v1.3.201 - 2026-11-24
 
 Ling-3.2-air (inclusionAI) runs as a text-only beta from bartowski's public Q4_K_M as it is: on an RTX 5090 + RAM a 4K

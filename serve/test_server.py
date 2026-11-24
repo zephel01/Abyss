@@ -2028,5 +2028,100 @@ class EmptyAnswerContent(unittest.TestCase):
         self.assertEqual(out["choices"][0]["message"]["content"], "hi")
 
 
+class SnapAtLastMessage(unittest.TestCase):
+    """#59: the GEN line's snap_at= is where the prompt's last message ends, so the engine keeps the conversation's
+    state there - a next turn that sends a turn cut by max_tokens back otherwise (content "", the reasoning given back
+    unclosed, or dropped and the empty turn not rendered) still starts with those tokens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ByteTokenizer()
+
+    def svc(self, engine=None):
+        return Service(engine or MockEngine(self.tok, "ok", max_context=CTX), self.tok,
+                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def prep(self, messages, **kw):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {k: v for k, v in kw.pop("env", {}).items()}):
+            from serve.frontend import openai_to_messages
+            msgs, tools, kwargs = openai_to_messages({"messages": messages, **kw})   # (as the OpenAI API reads them)
+            ids, _, _ = self.svc().prepare(msgs, tools, kwargs)
+            return ids, kwargs.get("_snap_at")
+
+    def test_boundary_is_the_last_message_end(self):
+        m1 = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "what is 2+2?"}]
+        ids, at = self.prep(m1)
+        self.assertIsInstance(at, int)
+        self.assertTrue(self.tok.decode(ids[:at]).endswith("what is 2+2?<|im_end|>\n"))
+        self.assertEqual(self.tok.decode(ids[at:]), "<|im_start|>assistant\n<think>\n")
+        # thinking off: the closed think block is the generation prompt's too
+        ids, at = self.prep(m1, reasoning_effort="none")
+        self.assertEqual(self.tok.decode(ids[at:]), "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+    def test_cut_turn_keeps_the_prefix(self):
+        m1 = [{"role": "system", "content": "a long system text"}, {"role": "user", "content": "explain"}]
+        ids1, at1 = self.prep(m1)
+        q2 = {"role": "user", "content": "in one sentence?"}
+        for a in ({"role": "assistant", "content": "", "reasoning_content": "The user asks"},   # reasoning unclosed
+                  {"role": "assistant", "content": ""},                                       # dropped: not rendered
+                  {"role": "assistant", "content": "done", "reasoning_content": "ok"}):       # a completed turn
+            with self.subTest(a=a):
+                ids2, at2 = self.prep(m1 + [a, q2])
+                # turn 1's tokens before the generation prompt start turn 2's: the engine's snapshot there matches,
+                # while turn 1's tokens before its LAST token do not when the turn is not rendered
+                self.assertEqual(ids2[:at1], ids1[:at1])
+                self.assertGreater(at2, at1)
+        ids2, _ = self.prep(m1 + [{"role": "assistant", "content": ""}, q2])
+        self.assertNotEqual(ids2[:len(ids1) - 1], ids1[:-1])
+
+    def test_dsv4_one_token_earlier(self):
+        # DeepSeek V4's template joins two user messages in a row (a dropped empty turn): the message's last token can
+        # merge with the blank line between them, so the place is one token before the message's end
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text(V4JapaneseSystemPrompt.V4, encoding="utf-8")
+            svc = Service(MockEngine(self.tok, "ok", max_context=CTX), self.tok, ChatTemplate(tpl))
+            self.assertTrue(svc.template.dsv4)
+            kw = {}
+            ids, _, _ = svc.prepare([{"role": "user", "content": "hello"}], None, kw)
+            self.assertEqual(self.tok.decode(ids[kw["_snap_at"]:]), "o<｜Assistant｜>")
+
+    def test_off_and_gen_keys(self):
+        m1 = [{"role": "user", "content": "hi"}]
+        self.assertIsNone(self.prep(m1, env={"STRATA_SNAP_AT": "0"})[1])
+        self.assertIn("snap_at=12", StrataEngine.sampling_keys({"_snap_at": 12}).split())
+        for bad in (None, 0, -3, True, 2.5, "12"):
+            self.assertFalse([k for k in StrataEngine.sampling_keys({"_snap_at": bad}).split()
+                              if k.startswith("snap_at=")], bad)
+
+    def test_requests_carry_it(self):
+        seen = []
+
+        class Rec(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                seen.append((list(ids), (sampling or {}).get("_snap_at")))
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        svc = self.svc(Rec(self.tok, "</think>\n\nok", max_context=CTX))
+        httpd = serve(svc, port=0)
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            for path in ("/v1/chat/completions", "/v1/messages"):
+                body = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+                ids, at = seen[-1]
+                with self.subTest(path=path):
+                    self.assertIsInstance(at, int)
+                    self.assertTrue(self.tok.decode(ids[:at]).endswith("hi<|im_end|>\n"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
