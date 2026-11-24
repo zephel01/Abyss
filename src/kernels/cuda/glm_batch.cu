@@ -1643,7 +1643,7 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
                                                     float* __restrict__ w, int gating, const int* __restrict__ hash,
                                                     const int* __restrict__ toks,
                                                     const float* __restrict__ bias_vl,
-                                                    const unsigned char* __restrict__ img) {
+                                                    const unsigned char* __restrict__ img, int n_group, int topk_group) {
     const int t = blockIdx.x, tid = threadIdx.x;
     // deepseek41: an image row selects its experts with exp_probs_b_vl (img[t] = 1); without img this is the plain bias
     if (img != nullptr && img[t] != 0 && bias_vl != nullptr) bias = bias_vl;
@@ -1664,6 +1664,32 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
         if (!isfinite(logits[(size_t) t * E + e]) || !isfinite(s_sel[e])) atomicExch(&bad, 1);
     }
     __syncthreads();
+    if (n_group > 1) {   // group-limited (Ling): the best topk_group groups by the sum of their best two scores
+        __shared__ float s_gs[32];
+        __shared__ int s_keep[32];
+        const int per = E / n_group;
+        if (tid < n_group) {
+            float b1 = -INFINITY, b2 = -INFINITY;
+            for (int i = 0; i < per; ++i) {
+                const float v = s_sel[tid * per + i];
+                if (v > b1) { b2 = b1; b1 = v; } else if (v > b2) { b2 = v; }
+            }
+            s_gs[tid] = b1 + b2;
+            s_keep[tid] = 0;
+        }
+        __syncthreads();
+        if (tid == 0)
+            for (int r = 0; r < topk_group; ++r) {   // (ties: the lower index, as the token path's group_bias)
+                int best = -1;
+                for (int gi = 0; gi < n_group; ++gi)
+                    if (!s_keep[gi] && (best < 0 || s_gs[gi] > s_gs[best])) best = gi;
+                s_keep[best] = 1;
+            }
+        __syncthreads();
+        for (int e = tid; e < E; e += blockDim.x)
+            if (!s_keep[e / per]) s_sel[e] = -1e30f;
+        __syncthreads();
+    }
     if (hash != nullptr) {   // a hash-routed layer: the token's ids from the table, no selection
         // (a window column whose token names no row - a draft's -1: the row of token 0, its output is rejected)
         if (tid < k) s_ids[tid] = hash[(size_t) (toks[t] >= 0 && toks[t] != 0x7fffffff ? toks[t] : 0) * k + tid];
@@ -1741,6 +1767,11 @@ __global__ void swiglu_rows_kernel(const float* gu, float* h, int rows, int n_ff
     const int64_t r = i / n_ff;
     const int c = (int) (i - r * n_ff);
     const float* row = gu + r * 2 * n_ff;
+    if (limit <= -1048576.0f) {   // (the llama.cpp form, Ling: min(silu(g), l) * clamp(u, -l, l) - glm_fast.cu's llama_swiglu)
+        const float l = -limit - 1048576.0f, gs = row[c];
+        h[r * ld_h + c] = fminf(gs / (1.0f + expf(-gs)), l) * fminf(fmaxf(row[n_ff + c], -l), l);
+        return;
+    }
     if (limit < 0.0f) {   // (Inkling's SITU, selected by a negative clamp: glm_fast.cu's situ_act)
         const float gs = row[c], us = row[n_ff + c];
         h[r * ld_h + c] = (4.0f * tanhf(gs * 0.25f)) * (1.0f / (1.0f + expf(-gs))) * (25.0f * tanhf(us * 0.04f));
@@ -1755,6 +1786,11 @@ __global__ void swiglu_f16_kernel(const float* __restrict__ gate, const float* _
                                   int64_t n, float limit) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (limit <= -1048576.0f) {   // (the llama.cpp form, as swiglu_rows)
+        const float l = -limit - 1048576.0f, gs = gate[i];
+        h[i] = __float2half(fminf(gs / (1.0f + expf(-gs)), l) * fminf(fmaxf(up[i], -l), l));
+        return;
+    }
     const float g = fminf(gate[i], limit);
     const float u = fminf(fmaxf(up[i], -limit), limit);
     h[i] = __float2half((g / (1.0f + expf(-g))) * u);
@@ -2188,10 +2224,10 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
            float* w, cudaStream_t s, int gating, const int* hash, const int* toks, const float* bias_vl,
-           const unsigned char* img) {
+           const unsigned char* img, int n_group, int topk_group) {
     if (T <= 0) return;
     route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w, gating, hash, toks,
-                                   bias_vl, img);
+                                   bias_vl, img, n_group, topk_group);
     check("route");
 }
 

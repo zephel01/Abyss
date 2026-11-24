@@ -456,7 +456,7 @@ struct Glm5Model::FastState {
         // (n_embd -> heads x (nope + rope)), attn_kv_a_mqa (n_embd -> kv_lora + rope), attn_gate (n_embd -> heads),
         // attn_kv_a_norm, the absorbed k_b ([head][kv_lora][nope]) / v_b ([head][v][kv_lora]) as F32 rows
         WSlot lg_f, lg_g, lg_beta, lg_wq, lg_kva, lg_gate;
-        const float *lg_kvn = nullptr, *lg_kb = nullptr, *lg_vb = nullptr;
+        const float *lg_kvn = nullptr, *lg_kb = nullptr, *lg_vb = nullptr, *lg_a_neg = nullptr;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;

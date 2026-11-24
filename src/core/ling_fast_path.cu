@@ -108,6 +108,18 @@ void Glm5Model::ling_bind(int il, std::string& missing) {
         Ly.conv[2] = f32("ssm_conv1d_v.weight");
         Ly.dt_bias = f32("ssm_dt.bias");
         Ly.ssm_a = f32("ssm_a");
+        // (the prompt path's batched recurrence, glm_batch's kda_rec, takes GLM's sign: -(f + dt) * a - a negated copy)
+        if (Ly.ssm_a != nullptr) {
+            std::vector<float> a((size_t) H);
+            void* d = nullptr;
+            if (cudaMemcpy(a.data(), Ly.ssm_a, a.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMalloc(&d, a.size() * 4) == cudaSuccess) {
+                ling_owned_.push_back(d);
+                for (float& v : a) v = -v;
+                if (cudaMemcpy(d, a.data(), a.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess) Ly.lg_a_neg = (const float*) d;
+            }
+            cudaGetLastError();
+        }
         Ly.ssm_norm = f32("ssm_norm.weight");
         Ly.out = q("attn_output.weight", DI, E);
     } else {

@@ -33,6 +33,7 @@
 #include "strata/kernels/inkling_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
+#include "strata/kernels/ling_fast.hpp"
 #include "strata/kernels/prompt_flash_attn.hpp"
 #include "strata/kernels/qsa27.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -164,6 +165,24 @@ KdaBufs carve_kda(Carve& c, size_t T, const Glm5Geometry& g) {
     b.g1 = c.take<float>(T * DI);
     b.g2 = c.take<float>(T * DI);
     b.out16 = c.take<uint16_t>(T * DI);
+    return b;
+}
+
+// Ling's MLA layers over a sub-batch of T rows: q, the kv row, the head gates, the gated heads (F32 and FP16)
+struct LingMlaBufs {
+    float *q, *kv, *gate, *o, *qc;
+    uint16_t* o16;
+};
+LingMlaBufs carve_ling_mla(Carve& c, size_t T, const Glm5Geometry& g) {
+    namespace lk = strata::kernels::ling;
+    LingMlaBufs b{};
+    const size_t H = (size_t) g.n_head;
+    b.q = c.take<float>(T * H * lk::kQHead);
+    b.kv = c.take<float>(T * lk::kRow);
+    b.gate = c.take<float>(T * H);
+    b.o = c.take<float>(T * H * lk::kV);
+    b.o16 = c.take<uint16_t>(T * H * lk::kV);
+    b.qc = c.take<float>(T * H * lk::kLat);   // (q_abs, then the gated context: the batched attention's)
     return b;
 }
 
@@ -539,6 +558,10 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
         size_t need = 0;
         if (kda) { Carve k; carve_kda(k, (size_t) t2, g); need = std::max(need, k.off); }
         if (g.qwen35()) { Carve q; carve_q35(q, (size_t) t2, g); carve_q4x(q, (size_t) t2, g); need = std::max(need, q.off); }
+        if (g.ling) {
+            Carve k; carve_kda(k, (size_t) t2, g); need = std::max(need, k.off);
+            Carve m; carve_ling_mla(m, (size_t) t2, g); need = std::max(need, m.off);
+        }
         if (dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, (size_t) t2, g, max_pools) : (void) carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
         if (dense) { Carve d; carve_dense(d, (size_t) t2, g); need = std::max(need, d.off); }
         if (need > room) break;
@@ -1194,10 +1217,6 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
-    if (g_.ling) {   // (Ling-3.x: no batched prompt path yet - the prompt runs token by token)
-        std::fprintf(stderr, "ling: the prompt runs token by token (no batched prompt path yet)\n");
-        return true;
-    }
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
@@ -1274,6 +1293,20 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         const auto& Ly = F->L[(size_t) il];
         if (g.is_hy4() || g.ink) {
             // (hy4_prompt_ok / ink_prompt_ok above)
+        } else if (g.ling) {   // (Ling: the projections batched, the MLA attention a row at a time - prefill_half)
+            if (Ly.recr) {
+                deq_ok(Ly.q, "attn_q", il);
+                deq_ok(Ly.k, "attn_k", il);
+                deq_ok(Ly.v, "attn_v", il);
+                deq_ok(Ly.lg_f, "ssm_f_a", il);
+                deq_ok(Ly.lg_g, "ssm_g_a", il);
+                deq_ok(Ly.lg_beta, "ssm_beta", il);
+            } else {
+                deq_ok(Ly.lg_wq, "attn_q", il);
+                deq_ok(Ly.lg_kva, "attn_kv_a_mqa", il);
+                deq_ok(Ly.lg_gate, "attn_gate", il);
+            }
+            deq_ok(Ly.out, "attn_output", il);
         } else if (g.qwen35()) {
             if (Ly.recr) {
                 deq_ok(Ly.qkv, "attn_qkv", il);
@@ -1968,6 +2001,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
     if (g.qwen35()) { Carve q; carve_q35(q, ts, g); carve_q4x(q, ts, g); uni = std::max(uni, q.off); }
+    if (g.ling) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); Carve m; carve_ling_mla(m, ts, g); uni = std::max(uni, m.off); }
     if (has_dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, ts, g, max_pools) : (void) carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
@@ -4855,6 +4889,73 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
                     hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
                 }
+            } else if (g.ling) {
+                // Ling (ling_fast_path.cu's layers over the sub-batch's rows): the projections as GEMMs; a KDA layer's
+                // conv and recurrence batched (glm_batch's, its state carried across sub-batches), an MLA layer's
+                // cache row and attention a row at a time (the token path's kernels), the output product batched
+                namespace lk = strata::kernels::ling;
+                const int H = g.n_head;
+                Carve c{S->uni};
+                if (Ly.recr) {
+                    KdaBufs B = carve_kda(c, (size_t) tn, g);
+                    hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
+                    hgemm_q(Ly.k, DI, E, x16, E, B.proj[1], DI, tn, 0.0f);
+                    hgemm_q(Ly.v, DI, E, x16, E, B.proj[2], DI, tn, 0.0f);
+                    hgemm_q(Ly.lg_f, DI, E, x16, E, B.g1, DI, tn, 0.0f);
+                    hgemm_q(Ly.lg_g, DI, E, x16, E, B.g2, DI, tn, 0.0f);
+                    hgemm_q(Ly.lg_beta, H, E, x16, E, B.beta, H, tn, 0.0f);
+                    S->mark("ling_kda_proj", s);
+                    const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
+                    float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
+                    gb::kda_conv(pr, Ly.conv, Ly.gdn_conv, cv, tn, DI, g.d_conv, s);
+                    gb::kda_conv_state(pr, Ly.gdn_conv, tn, DI, g.d_conv, s);
+                    gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.lg_a_neg, g.kda_lb, B.beta,
+                                Ly.gdn_state, B.g2, Ly.ssm_norm, g.norm_eps, H, tn, B.out16, s);
+                    S->mark("ling_kda_rec", s);
+                    if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                } else {
+                    LingMlaBufs B = carve_ling_mla(c, (size_t) tn, g);
+                    const int QD = H * lk::kQHead, HV = H * lk::kV;
+                    hgemm_q(Ly.lg_wq, QD, E, x16, E, B.q, QD, tn, 0.0f);
+                    hgemm_q(Ly.lg_kva, lk::kRow, E, x16, E, B.kv, lk::kRow, tn, 0.0f);
+                    hgemm_q(Ly.lg_gate, H, E, x16, E, B.gate, H, tn, 0.0f);
+                    S->mark("ling_mla_proj", s);
+                    float2* cs = (float2*) (ling_bias_ + g.n_expert);
+                    const float scl = 1.0f / std::sqrt((float) lk::kQHead);
+                    static const bool pa_env = [] { const char* v = getenv("STRATA_LING_PROMPT_ATTN"); return v == nullptr || std::atoi(v) != 0; }();
+                    if (pa_env && lk::prompt_attn_ok(H)) {
+                        // the rows' cache entries and q ropes, q_abs = k_b . q_nope per head (one batched product), the
+                        // causal attention on tensor cores (gated), o = v_b . ctx per head
+                        lk::mla_prep_rows(B.q, QD, B.kv, Ly.lg_kvn, g.norm_eps, p0 + t0, tn, (double) g.rope_base, Ly.kc, H, s);
+                        blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, lk::kLat, tn, lk::kNope, &one,
+                                                          Ly.lg_kb, lk::kNope, (long long) lk::kLat * lk::kNope, B.q, QD,
+                                                          lk::kQHead, &zero, B.qc, H * lk::kLat, lk::kLat, H),
+                                "ling q_abs");
+                        lk::mla_prompt_attn(B.qc, B.q, QD, Ly.kc, p0 + t0, tn, B.gate, scl, s);
+                        blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, lk::kV, tn, lk::kLat, &one,
+                                                          Ly.lg_vb, lk::kLat, (long long) lk::kV * lk::kLat, B.qc,
+                                                          H * lk::kLat, lk::kLat, &zero, B.o, HV, lk::kV, H),
+                                "ling mla out");
+                    } else
+                    for (int t = 0; t < tn; ++t) {
+                        if ((t & 255) == 255) progress_beat();
+                        const int64_t p = p0 + t0 + t;
+                        float* qt = B.q + (size_t) t * QD;
+                        lk::rope_table(p, (double) g.rope_base, cs, s);
+                        lk::mla_prep(qt, H, B.kv + (size_t) t * lk::kRow, Ly.lg_kvn, g.norm_eps, cs,
+                                     Ly.kc + (size_t) p * lk::kRow, s);
+                        lk::mla_absorb(qt, Ly.lg_kb, H, F->q35_q, s);
+                        lk::mla_attend(F->q35_q, qt, Ly.kc, p + 1, scl, H, ling_sc_,
+                                       ling_part_, F->q35_ao, s);
+                        lk::mla_out(F->q35_ao, Ly.lg_vb, B.gate + (size_t) t * H, H, B.o + (size_t) t * HV, s);
+                    }
+                    S->mark("ling_mla_attend", s);
+                    if (lk::launch_errors() != 0) { err = "ling: a prompt kernel launch failed"; return false; }
+                    if (!skip_output) {
+                        gb::f32_to_f16(B.o, B.o16, (int64_t) tn * HV, s);
+                        hgemm_q(Ly.out, E, HV, B.o16, HV, mixer, E, tn, 0.0f);
+                    }
+                }
             } else if (g.qwen35()) {
                 // qwen35moe: the token path's layers over the sub-batch's rows (qwen35_fast_path.cu's order), the
                 // recurrence and the conv carrying their state across sub-batches, the caches' rows written in order
@@ -5240,7 +5341,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     os.w = dffn[0].q;
                     os.dst = S->dq_gu;
                     S->oq->gate_up(os, dffn[0].type, FF, E,
-                                   (size_t) ((const uint8_t*) dffn[1].q - (const uint8_t*) dffn[0].q), g.swiglu_shexp, s);
+                                   (size_t) ((const uint8_t*) dffn[1].q - (const uint8_t*) dffn[0].q), g.lim_shexp(il), s);
                     fused = true;
                 }
 #endif
@@ -5306,7 +5407,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
                 hgemm_q(dffn[0], g.n_ff_dense, E, x16, E, B.dg, g.n_ff_dense, tn, 0.0f);
                 hgemm_q(dffn[1], g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
-                gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
+                gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.lim_shexp(il), s);
                 hgemm_q(dffn[2], E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
             if (dram) q35d_unstage(il, s);
@@ -5343,7 +5444,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
                 hgemm_q(Ly.sh_gate, FF, E, x16, E, M.sh_g, FF, tn, 0.0f);
                 hgemm_q(Ly.sh_up, FF, E, x16, E, M.sh_u, FF, tn, 0.0f);
-                gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
+                gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.lim_shexp(il), s);
                 hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
             abl_apply(il, 1, S->ffn, T, E, s);   // (S->ffn holds the shared expert alone here: the routed add later)
@@ -5370,7 +5471,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         S->mark("router", s);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s, g.gating,
-                  Ly.tid2eid, S->toks_d, Ly.router_bias_vl, S->img_on ? S->img_d : nullptr);
+                  Ly.tid2eid, S->toks_d, Ly.router_bias_vl, S->img_on ? S->img_d : nullptr,
+                  g.ling ? g.ling_group : 0, g.ling ? g.ling_topk_group : 0);
         const bool seed_layer = seed_on && F->layer_rc[(size_t) il] >= 0;
         if (seed_layer) {   // (the seed's ranking: the chunk's last rows alone, before the whole chunk's count)
             const int R = std::min(T, seed_rows);
@@ -5915,12 +6017,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const char* v = getenv("STRATA_GLM_MMQ_GLU");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl && !Ly.mixed() && !g.ink;   // (inkling: SITU apart)
+        const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl && !Ly.mixed() && !g.ink &&
+                         !g.ling;   // (inkling: SITU apart; ling: the llama-form limits apart)
         // the own GEMM, a product at a time: gate/up with the SwiGLU, down (each reads activations in its own form)
 #if defined(STRATA_MOE_OWN)
         // (inkling: its SITU in swiglu_rows - the split products, not the fused epilogue)
-        const bool own_gu = own_gate_up(Ly, g) && !g.ink, own_dn = own_down(Ly, g),
-                   own_split = own_gu_split(Ly, g) || (own_gate_up(Ly, g) && g.ink);
+        const bool own_gu = own_gate_up(Ly, g) && !g.ink && !g.ling, own_dn = own_down(Ly, g),
+                   own_split = own_gu_split(Ly, g) || (own_gate_up(Ly, g) && (g.ink || g.ling));
         // STRATA_INK_FP4ACT=1 / 2 (opt-in, lossy; default 0 = the exact int8 path): inkling's NVFP4 experts with FP4
         // activations, one term / two (x ~ q1 + q2, the residual's term), on sm_120a's block-scaled FP4 tensor cores
         // (own::fp4_built: CUDA sm_120 only).  The row scales in Xs / Hs, the codes in Xq / Hq (their bytes fit).
@@ -5988,7 +6091,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         cudaFree(xg);
                         if (FILE* f = std::fopen(own_dump, "wb")) {
                             const int32_t hd[8] = {0x314E574F, Ly.gu_type, Ly.d_type, (int32_t) E, (int32_t) nff, ne, nrows, a};
-                            const float lim = g.swiglu_exp;
+                            const float lim = g.lim_exp(il);
                             const uint64_t off[3] = {mmq::matrix_bytes(Ly.gu_type, nff, E), Ly.down_off, stride};
                             std::fwrite(hd, 4, 8, f);
                             std::fwrite(&lim, 4, 1, f);
@@ -6050,7 +6153,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         os.xq = M.Xq;
                         os.dst = GU;
                         os.ld = 2 * nff;
-                        S->oq->gate_up(os, Ly.gu_type, nff, E, mmq::matrix_bytes(Ly.gu_type, nff, E), g.swiglu_exp, s);
+                        S->oq->gate_up(os, Ly.gu_type, nff, E, mmq::matrix_bytes(Ly.gu_type, nff, E), g.lim_exp(il), s);
 #endif
                     } else if (own_split) {
 #if defined(STRATA_MOE_OWN)
@@ -6061,7 +6164,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         os.dst = GU;
                         const size_t up_off = Ly.mixed() ? Ly.gu_bytes : mmq::matrix_bytes(Ly.gu_type, nff, E);
                         if (f4 > 0) {   // (gate, up, their scales and the SwiGLU in one product: h in GU's first n_ff)
-                            if (!S->oq->fp4(os, M.Xs, f4, nff, E, 0, s, true, up_off, g.swiglu_exp)) {
+                            if (!S->oq->fp4(os, M.Xs, f4, nff, E, 0, s, true, up_off, g.lim_exp(il))) {
                                 std::fprintf(stderr, "glm prefill: the FP4 experts' gate/up did not fit\n");
                                 std::exit(1);
                             }
@@ -6073,10 +6176,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         if (nvl && f4 == 0)
                             gb::nv_scale_rows(GU, M.ids, M.pos, T * K, r0 + a, r0 + a + nrows, 2 * nff, 2 * nff,
                                               Ly.nv_scale, s);
-                        if (f4 == 0) gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+                        if (f4 == 0) gb::swiglu_rows(GU, GU, nrows, nff, g.lim_exp(il), s, 2 * nff);
 #endif
                     } else if (glu) {
-                        S->mq->run_glu(gu, g.swiglu_exp, s);   // (h in each row's first n_ff floats, as below)
+                        S->mq->run_glu(gu, g.lim_exp(il), s);   // (h in each row's first n_ff floats, as below)
                     } else if (Ly.mixed()) {
                         // gate and up of different types: one product a role, each into its half of the GU rows (gate
                         // in the first n_ff floats, up in the next, as the one product writes them); up's activations
@@ -6090,13 +6193,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         up.type = Ly.up_type;
                         up.dst = GU + nff - (size_t) a * (2 * nff);
                         S->mq->run(up, s);
-                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+                        gb::swiglu_rows(GU, GU, nrows, nff, g.lim_exp(il), s, 2 * nff);
                     } else {
                         S->mq->run(gu, s);
                         if (nvl)   // (NVFP4: the experts' gate/up scales, inside the SiLU)
                             gb::nv_scale_rows(GU, M.ids, M.pos, T * K, r0 + a, r0 + a + nrows, 2 * nff, 2 * nff,
                                               Ly.nv_scale, s);
-                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (in place: no T x K x n_ff buffer)
+                        gb::swiglu_rows(GU, GU, nrows, nff, g.lim_exp(il), s, 2 * nff);   // (in place: no T x K x n_ff buffer)
                     }
                     S->mark("x_gate_up", s);
 #if defined(STRATA_MOE_OWN)
@@ -6183,7 +6286,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     sa.max_rows = max_rows;
                     sa.n_embd = E;
                     sa.n_ff = nff;
-                    sa.limit = g.swiglu_exp;
+                    sa.limit = g.lim_exp(il);
                     const int o = place(r0 + a, nrows);
                     x3::set_gate_up(sa, S->x, E, M.row_tok + r0 + a, S->w16, nff, s);
                     x3::set_down(sa, S->w16, nff, M.OUTP + (size_t) o * E, E, s);
@@ -6234,7 +6337,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     }
                 }
                 for (int r = 0; r < 2; ++r) x3::rows_rot_out(GU + (size_t) r * nff, E, nrows, nff, mat(r).svh, s);
-                gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+                gb::swiglu_rows(GU, GU, nrows, nff, g.lim_exp(il), s, 2 * nff);
                 x3::reconstruct_inner_rows(mat(2), S->w16, s);
                 uint16_t* H16 = S->w16 + wdn;
                 for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
@@ -6259,7 +6362,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "gemm exl3 gate/up");
             }
-            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            gb::swiglu_rows(GU, GU, nrows, nff, g.lim_exp(il), s, 2 * nff);
             x3::reconstruct_rows(mat(2), S->w16, false, s);
             uint16_t* H16 = S->w16 + wdn;
             for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
@@ -6330,7 +6433,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             if (nvl)   // (NVFP4: the expert's gate/up scale inside the activation; the down one is in the route weights)
                 gb::nv_scale_rows(GU, M.ids, M.pos, T * K, r0 + a, r0 + a + nrows, 2 * nff, 2 * nff, Ly.nv_scale, s);
-            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            gb::swiglu_rows(GU, GU, nrows, nff, g.lim_exp(il), s, 2 * nff);
             deq16(Ly.d_type, blob + Ly.down_off, E, nff, S->w16);
             uint16_t* H16 = S->w16 + wdn;
             for (int c0 = (nrows - 1) / dn_rows * dn_rows; c0 >= 0; c0 -= dn_rows) {
@@ -6394,11 +6497,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const int o = place(rows_mmq, rows_res - rows_mmq);   // (light rows: at most kLightMax * kLightRows <= W)
             const bool lk = xact ? gf::rows_experts_exact(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off,
                                                           M.bounds + kLightOff, n_light, M.row_tok, S->x, T, E, nff,
-                                                          g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
+                                                          g.lim_exp(il), rows_mmq, rows_res, M.Xq, M.Hq,
                                                           M.OUTP + (size_t) (o - rows_mmq) * E, E, s, S->xl_ptrs_d)
                                  : gf::rows_experts(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off,
                                                     M.bounds + kLightOff, n_light, M.row_tok, S->x, T, E, nff,
-                                                    g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
+                                                    g.lim_exp(il), rows_mmq, rows_res, M.Xq, M.Hq,
                                                     M.OUTP + (size_t) (o - rows_mmq) * E, E, s);
             if (!lk) {
                 err = "glm prefill: the light expert kernels refused the layer's types";
@@ -6658,9 +6761,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
                 // (gathered: x row r is out_h row r, read before the outputs overwrite it)
                 const int rc = S->x_gathered
-                    ? F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
+                    ? F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.lim_exp(il), ncx, bl.data(), r_of.data(),
                                    nr.data(), S->id_h, S->out_h, cpu_nrows, 0, cpu_nrows, S->out_h, E)
-                    : F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.swiglu_exp, ncx, bl.data(), r_of.data(),
+                    : F->igpu_rows(Ly.gu_type, Ly.d_type, E, nff, Ly.down_off, g.lim_exp(il), ncx, bl.data(), r_of.data(),
                                    nr.data(), S->rt_h, S->x_h, T, 0, cpu_nrows, S->out_h, E);
                 if (rc == 0) {
                     on_igpu = true;
@@ -6691,7 +6794,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
                     }
                     kc::lane_q81_gu_rows(nf.gu_type, nf.gu_type, blob, nf.gu_row, blob + Ly.gu_bytes, nf.gu_row, E,
-                                         a.data(), cnt, o.data(), r0, r0 + kGu, g.swiglu_exp, 1.0f);
+                                         a.data(), cnt, o.data(), r0, r0 + kGu, g.lim_exp(il), 1.0f);
                 });
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
                     kc::lane_q81_quant(S->c_ff.data() + (size_t) r * nff, nff, S->c_hq.data() + (size_t) r * kH);
@@ -6810,10 +6913,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                            kGu);
                         kc::kq_rows_packed(nf.up_type, blob + Ly.gu_bytes + (size_t) r0 * nf.up_row, nf.up_row, E, pa,
                                            cnt, uo.data(), 0, kGu);
-                        const float lim = g.swiglu_exp;
+                        const float lim = g.lim_exp(il);
                         for (int t = 0; t < cnt; ++t) {
                             float* ff = S->c_ff.data() + (size_t) (b + t) * nff + r0;
                             for (int r = 0; r < kGu; ++r) {
+                                if (lim <= -Glm5Geometry::kLlamaClampBase) {   // (Ling: the llama.cpp form)
+                                    const float l = -lim - Glm5Geometry::kLlamaClampBase, gv = go[(size_t) t][r];
+                                    ff[r] = std::fmin(gv / (1.f + std::exp(-gv)), l) *
+                                            std::fmin(std::fmax(uo[(size_t) t][r], -l), l);
+                                    continue;
+                                }
                                 if (lim < 0.0f) {   // (Inkling's SITU)
                                     ff[r] = situ_host(go[(size_t) t][r], uo[(size_t) t][r]);
                                     continue;
@@ -6848,11 +6957,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                        0, kGu);
                         kc::iq512_rows(nf.up_type, blob + Ly.gu_bytes + (size_t) r0 * nf.up_row, nf.up_row, E, a.data(),
                                        cnt, uo.data(), 0, kGu);
-                        const float lim = g.swiglu_exp;
+                        const float lim = g.lim_exp(il);
                         const bool clamp = lim != std::numeric_limits<float>::infinity();
                         for (int t = 0; t < cnt; ++t)
                             for (int r = 0; r < kGu; ++r) {
                                 float gg = go[(size_t) t][r], uu = uo[(size_t) t][r];
+                                if (lim <= -Glm5Geometry::kLlamaClampBase) {   // (Ling: the llama.cpp form)
+                                    const float l = -lim - Glm5Geometry::kLlamaClampBase;
+                                    o[(size_t) t][r0 + r] = std::fmin(gg / (1.f + std::exp(-gg)), l) *
+                                                            std::fmin(std::fmax(uu, -l), l);
+                                    continue;
+                                }
                                 if (lim < 0.0f) {   // (Inkling's SITU)
                                     o[(size_t) t][r0 + r] = situ_host(gg, uu);
                                     continue;
@@ -6866,7 +6981,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         return;
                     }
                     kc::native_gu_rows_split(nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
-                                             g.swiglu_exp);
+                                             g.lim_exp(il));
                 });
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
                     kc::native_quant_h(nf, S->c_ff.data() + (size_t) r * nff, S->c_hq.data() + (size_t) r * kH);
@@ -7222,8 +7337,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
-        err = "prefill logits requires single-device DeepSeek V4.1 or Inkling"; return false;
+    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
+        err = "prefill logits requires single-device DeepSeek V4.1, Inkling or Ling"; return false;
     }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
@@ -7503,6 +7618,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
+                    else if (g.ling)   // (ling: R's row takes the last FFN, output_norm - the token path's head input)
+                        gf::rms_q8(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, w_.at("output_norm.weight"),
+                                   g.norm_eps, E, fast_->head_x, fast_->head_xq, fast_->cs);
                     else
                     d41::head_prep(pf_->R + (size_t) t * 4 * E, pf_->pre2 + (size_t) t * 4,
                                    w_.at("output_norm.weight"), g.norm_eps, E,

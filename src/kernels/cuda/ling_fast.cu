@@ -8,6 +8,14 @@
 #include <cmath>
 #include <cstdio>
 
+// the prompt attention's WMMA (sm_70+; AMD and older targets: the per-row kernels - prompt_attn_ok false)
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
+#define STRATA_LING_PA 0
+#else
+#define STRATA_LING_PA 1
+#include <mma.h>
+#endif
+
 namespace strata::kernels::ling {
 namespace {
 
@@ -286,6 +294,174 @@ __global__ void group_bias_kernel(const float* __restrict__ logits, const float*
         out[e] = keep[e / per] ? (bias != nullptr ? bias[e] : 0.0f) : -1e30f;
 }
 
+
+// ---------------------------------------------------------------- the prompt path's MLA
+// one block a row (position p0 + t): the cache row (the latent's rms norm, the key's rope) and the q heads' rope parts -
+// mla_prep's arithmetic with the position's table computed in the block (rope_table's)
+__global__ void mla_prep_rows_kernel(float* q, int ldq, const float* __restrict__ kv, const float* __restrict__ kv_norm,
+                                     float eps, int64_t p0, double base, uint16_t* __restrict__ cache) {
+    __shared__ float sred[32];
+    __shared__ float2 cs[kRot / 2];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const int64_t pos = p0 + t;
+    if (tid < kRot / 2) {
+        const double th = (double) pos * pow(base, -2.0 * (double) tid / (double) kRot);
+        cs[tid] = make_float2((float) cos(th), (float) sin(th));
+    }
+    __syncthreads();
+    if (blockIdx.y == 0) {
+        const float* r = kv + (size_t) t * kRow;
+        uint16_t* row = cache + (size_t) pos * kRow;
+        const float x = r[tid];
+        const float ss = block_sum(x * x, sred);
+        const float inv = rsqrtf(ss / (float) kLat + eps);
+        row[tid] = f2h(x * inv * kv_norm[tid]);
+        if (tid < kRot / 2) {
+            const float2 c = cs[tid];
+            const float x0 = r[kLat + 2 * tid], x1 = r[kLat + 2 * tid + 1];
+            row[kLat + 2 * tid] = f2h(x0 * c.x - x1 * c.y);
+            row[kLat + 2 * tid + 1] = f2h(x0 * c.y + x1 * c.x);
+        }
+        return;
+    }
+    if (tid >= kRot / 2) return;
+    float* qr = q + (size_t) t * ldq + (size_t) (blockIdx.y - 1) * kQHead + kNope;
+    const float2 c = cs[tid];
+    const float x0 = qr[2 * tid], x1 = qr[2 * tid + 1];
+    qr[2 * tid] = x0 * c.x - x1 * c.y;
+    qr[2 * tid + 1] = x0 * c.y + x1 * c.x;
+}
+
+#if STRATA_LING_PA
+namespace wm = nvcuda::wmma;
+constexpr int kPaH = 32;           // the query rows a block: a position's heads
+constexpr int kPaK = 32;           // the keys a tile
+constexpr int kPaLd = kRow + 8;    // the FP16 tiles' row pitch
+constexpr int kPaSld = kPaK + 4;   // the scores' pitch
+constexpr int kPaPld = kPaK + 8;   // the probabilities' pitch
+constexpr size_t kPaSmem = (size_t) 2 * kPaH * kPaLd * 2 + (size_t) 2 * kPaH * kPaSld * 4 + (size_t) kPaH * kPaPld * 2 +
+                           (size_t) 3 * kPaH * 4;
+// the accumulator element e's row in a 16 x 16 F32 fragment (the sm_80+ layout; layout_probe checks it at first use)
+__device__ __forceinline__ int acc_row(int lane, int e) { return (lane >> 2) + 8 * ((e >> 1) & 1); }
+
+__global__ void layout_probe_kernel(int* bad) {
+    __shared__ float m[16 * 16];
+    for (int i = threadIdx.x; i < 256; i += 32) m[i] = (float) (i / 16);
+    __syncwarp();
+    wm::fragment<wm::accumulator, 16, 16, 16, float> f;
+    wm::load_matrix_sync(f, m, 16, wm::mem_row_major);
+    for (int e = 0; e < f.num_elements; ++e)
+        if (f.x[e] != (float) acc_row(threadIdx.x, e)) atomicExch(bad, 1);
+    if (f.num_elements != 8) atomicExch(bad, 1);
+}
+
+// ctx[t][h] = softmax_j(scale (q_abs . lat_j + q_rot . k_rot_j)) . lat_j over j <= p0 + t, times sigmoid(gate[t][h]) -
+// mla_attend's sums as one flash pass a position: FP16 operands (q pre-scaled), F32 accumulation and online softmax.
+// qc: q_abs in, ctx out (a block reads its rows before it writes them)
+__global__ void __launch_bounds__(256) mla_prompt_kernel(float* qc, const float* __restrict__ q, int ldq,
+                                                         const uint16_t* __restrict__ cache, int64_t p0,
+                                                         const float* __restrict__ gate, float scale) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sQ = (__half*) smem;
+    __half* sK = sQ + kPaH * kPaLd;
+    float* sS = (float*) (sK + kPaH * kPaLd);             // two partial score tiles
+    __half* sP = (__half*) (sS + 2 * kPaH * kPaSld);
+    float* sm = (float*) (sP + kPaH * kPaPld);
+    float* sl = sm + kPaH;
+    float* sa = sl + kPaH;
+    const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int64_t p = p0 + t;
+    float* qrow = qc + (size_t) t * kPaH * kLat;
+    for (int i = tid; i < kPaH * kRow; i += 256) {
+        const int h = i / kRow, d = i - h * kRow;
+        const float v = d < kLat ? qrow[(size_t) h * kLat + d] : q[(size_t) t * ldq + (size_t) h * kQHead + kNope + (d - kLat)];
+        sQ[h * kPaLd + d] = __float2half(v * scale);
+    }
+    if (tid < kPaH) { sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+    wm::fragment<wm::accumulator, 16, 16, 16, float> o[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) wm::fill_fragment(o[r][c], 0.0f);
+    for (int64_t j0 = 0; j0 <= p; j0 += kPaK) {
+        __syncthreads();   // (the last tile's readers done)
+        for (int i = tid; i < kPaK * (kRow / 8); i += 256) {
+            const int r = i / (kRow / 8), c8 = i - r * (kRow / 8);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (j0 + r <= p) v = *(const uint4*) (cache + (size_t) (j0 + r) * kRow + c8 * 8);
+            *(uint4*) (sK + r * kPaLd + c8 * 8) = v;
+        }
+        __syncthreads();
+        {   // the scores: warp w the tile (w & 3) over half (w >> 2) of the 576 dims
+            const int f = warp & 3, kh = warp >> 2, rt = f >> 1, ct = f & 1;
+            wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+            wm::fill_fragment(acc, 0.0f);
+            for (int ks = kh * (kRow / 32); ks < (kh + 1) * (kRow / 32); ++ks) {
+                wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> a;
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> b;
+                wm::load_matrix_sync(a, sQ + rt * 16 * kPaLd + ks * 16, kPaLd);
+                wm::load_matrix_sync(b, sK + ct * 16 * kPaLd + ks * 16, kPaLd);
+                wm::mma_sync(acc, a, b, acc);
+            }
+            wm::store_matrix_sync(sS + kh * kPaH * kPaSld + rt * 16 * kPaSld + ct * 16, acc, kPaSld, wm::mem_row_major);
+        }
+        __syncthreads();
+        // the online softmax: warp w rows 4w .. 4w + 3, a lane a key
+        for (int rr = 0; rr < 4; ++rr) {
+            const int r = warp * 4 + rr;
+            float sv = sS[r * kPaSld + lane] + sS[kPaH * kPaSld + r * kPaSld + lane];
+            if (j0 + lane > p) sv = -INFINITY;
+            const float mx = warp_max(sv);
+            const float m_old = sm[r], m_new = fmaxf(m_old, mx);
+            const float e = __expf(sv - m_new);
+            const float sum = warp_sum(e);
+            sP[r * kPaPld + lane] = __float2half(e);
+            __syncwarp();
+            if (lane == 0) {
+                const float al = __expf(m_old - m_new);
+                sl[r] = sl[r] * al + sum;
+                sm[r] = m_new;
+                sa[r] = al;
+            }
+        }
+        __syncthreads();
+        // O = O * alpha + P . V: warp w the value columns [64w, 64w + 64) of both row tiles
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) o[r][c].x[e] *= sa[r * 16 + acc_row(lane, e)];
+#pragma unroll
+        for (int ks = 0; ks < kPaK / 16; ++ks) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> a;
+                wm::load_matrix_sync(a, sP + r * 16 * kPaPld + ks * 16, kPaPld);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::row_major> b;
+                    wm::load_matrix_sync(b, sK + ks * 16 * kPaLd + (warp * 4 + c) * 16, kPaLd);
+                    wm::mma_sync(o[r][c], a, b, o[r][c]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int h = r * 16 + acc_row(lane, e);
+                const float gv = gate[(size_t) t * kPaH + h];
+                o[r][c].x[e] *= (1.0f / sl[h]) * (1.0f / (1.0f + expf(-gv)));
+            }
+            wm::store_matrix_sync(qrow + (size_t) r * 16 * kLat + (warp * 4 + c) * 16, o[r][c], kLat, wm::mem_row_major);
+        }
+}
+#endif
 }  // namespace
 
 void kda_prep(const float* proj, const float* const conv_w[3], float* conv_state, float* out, const float* f,
@@ -331,6 +507,54 @@ void group_bias(const float* logits, const float* bias, int n_expert, int n_grou
                 cudaStream_t s) {
     group_bias_kernel<<<1, 512, 0, s>>>(logits, bias, n_expert, n_group, topk_group, out);
     check("group_bias");
+}
+
+void mla_prep_rows(float* q, int ldq, const float* kv, const float* kv_norm, float eps, int64_t p0, int T, double base,
+                   uint16_t* cache, int n_head, cudaStream_t s) {
+    if (T <= 0) return;
+    mla_prep_rows_kernel<<<dim3(T, 1 + n_head), kLat, 0, s>>>(q, ldq, kv, kv_norm, eps, p0, base, cache);
+    check("mla_prep_rows");
+}
+
+bool prompt_attn_ok(int n_head) {
+#if STRATA_LING_PA
+    static const int ok = [] {
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            major < 8)
+            return 0;
+        if (cudaFuncSetAttribute(mla_prompt_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kPaSmem) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        int* d = nullptr;
+        int bad = 1;
+        if (cudaMalloc(&d, 4) == cudaSuccess && cudaMemset(d, 0, 4) == cudaSuccess) {
+            layout_probe_kernel<<<1, 32>>>(d);
+            if (cudaMemcpy(&bad, d, 4, cudaMemcpyDeviceToHost) != cudaSuccess) bad = 1;
+        }
+        if (d != nullptr) cudaFree(d);
+        cudaGetLastError();
+        if (bad) std::fprintf(stderr, "ling: the WMMA accumulator layout is not the expected one - the prompt's MLA a row at a time\n");
+        return bad ? 0 : 1;
+    }();
+    return ok != 0 && n_head == kPaH;
+#else
+    (void) n_head;
+    return false;
+#endif
+}
+
+void mla_prompt_attn(float* qc, const float* q, int ldq, const uint16_t* cache, int64_t p0, int T, const float* gate,
+                     float scale, cudaStream_t s) {
+#if STRATA_LING_PA
+    if (T <= 0) return;
+    mla_prompt_kernel<<<T, 256, kPaSmem, s>>>(qc, q, ldq, cache, p0, gate, scale);
+    check("mla_prompt_attn");
+#else
+    (void) qc; (void) q; (void) ldq; (void) cache; (void) p0; (void) T; (void) gate; (void) scale; (void) s;
+    g_errors.fetch_add(1);
+#endif
 }
 
 int launch_errors() { return g_errors.load(); }

@@ -54,6 +54,16 @@ void mla_out(const float* ctx, const float* v_b, const float* gate, int n_head, 
 /// The group mask: out[e] = bias[e] (0 without one) where e's group is kept, else -1e30
 void group_bias(const float* logits, const float* bias, int n_expert, int n_group, int topk_group, float* out,
                 cudaStream_t s);
+/// The prompt path: rows t of T at positions p0 + t - the cache rows and the q heads' rope parts (mla_prep's, q rows
+/// of ldq floats)
+void mla_prep_rows(float* q, int ldq, const float* kv, const float* kv_norm, float eps, int64_t p0, int T, double base,
+                   uint16_t* cache, int n_head, cudaStream_t s);
+/// True where mla_prompt_attn runs (CUDA sm_80+, n_head 32, the WMMA layout probed once)
+bool prompt_attn_ok(int n_head);
+/// The causal attention of T rows (positions p0 + t, cache rows [0, p0 + t]) on tensor cores: qc [T][n_head][kLat]
+/// holds q_abs in and the gated ctx out (ctx * sigmoid(gate[t][h])); the rope parts in q's rows (ldq floats).
+void mla_prompt_attn(float* qc, const float* q, int ldq, const uint16_t* cache, int64_t p0, int T, const float* gate,
+                     float scale, cudaStream_t s);
 /// launches that failed (all ling kernels)
 int launch_errors();
 
