@@ -977,6 +977,10 @@ class StrataEngine:
             v = sampling.get("_" + k)
             if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{1,16}", v):
                 think += f" {k}={v}"
+        # where the prompt's last message ends (prepare): the conversation's snapshot goes there (#59)
+        sa = sampling.get("_snap_at")
+        if isinstance(sa, int) and not isinstance(sa, bool) and sa > 0:
+            think += f" snap_at={sa}"
         # the template's single-token tool-argument tags (GLM's <arg_value> </arg_value>), where the answer-loop guard
         # closes a looping argument; empty: this vocabulary has none (the engine's GLM ids are other tokens here)
         aid = sampling.get("_arg_ids")
@@ -2447,7 +2451,7 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def _prompt_ids(self, messages, tools, kwargs, force, v41_images):
+    def _prompt_ids(self, messages, tools, kwargs, force, v41_images, tail_out=None):
         """-> (the prompt's ids, the forced call's opening).  The template renders the messages with every special
         token's text inside them swapped for a sentinel (ContentGuard): that text goes back in as plain text, the
         template's own markers stay special.  v41_images (DeepSeek V4.1): each image is None in the ids, its place."""
@@ -2477,6 +2481,8 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
+        if tail_out is not None:
+            tail_out[:] = self._gen_tail(messages, shown, kwargs, prompt)
         if getattr(self.template, "ling", False):   # (the sentinels hide a message's own markers: these are the template's)
             prompt = prompt.replace(LING_IMAGE, LING_IMAGE + "\n")
         prompt, spans = (prompt, []) if raw else self.guard.restore(prompt)
@@ -2494,6 +2500,20 @@ class Service:
                 ids.append(None)
         return ids, prefill
 
+    def _gen_tail(self, messages, tools, kwargs, prompt) -> list:
+        """The ids of what the prompt adds after its last message (the generation prompt: Qwen's
+        `<|im_start|>assistant\\n<think>\\n`, a forced call's opening), [] when the template's render without it is
+        not the prompt's start.  Template text only (no message's), so it is encoded with the specials parsed."""
+        if os.environ.get("STRATA_SNAP_AT") == "0":
+            return []
+        try:
+            head = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
+        except Exception:   # (a template that insists on the generation prompt: the snapshot where it was)
+            return []
+        if not head or len(head) >= len(prompt) or not prompt.startswith(head):
+            return []
+        return self.tok.encode_spans(prompt[len(head):], [])
+
     def prepare(self, messages, tools, kwargs, max_new=None, fit=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  fit: a max_new beyond the context left is shortened to it (None: --fit-max-tokens'
@@ -2508,7 +2528,8 @@ class Service:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
         images = images_of(messages)
         v41_images = bool(images) and self.template.dsv4
-        ids, prefill = self._prompt_ids(messages, tools, kwargs, force, v41_images)
+        tail = []
+        ids, prefill = self._prompt_ids(messages, tools, kwargs, force, v41_images, tail)
         given["_prefill"] = prefill
         if v41_images and ids.count(None) != len(images):
             raise ValueError("the chat template dropped an image")
@@ -2584,6 +2605,14 @@ class Service:
             print(f"[abyss] max tokens {max_new:,} is more than the context leaves after the prompt "
                   f"({len(ids):,} of {self.engine.max_context:,}): answering with up to {max(1, room):,}", flush=True)
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+        # where the last message ends (GEN snap_at=, #59): the engine keeps the conversation's state there, not just
+        # before the last token, so a next turn that sends this one back otherwise than it was written (cut by
+        # max_tokens mid-reasoning: no answer, the reasoning dropped or unclosed) still continues from it
+        # DeepSeek V4 / V4.1's templates join two user messages in a row with a blank line (the cut turn dropped as
+        # empty): the message's last token can merge with it ('.' + '\\n\\n' is one token), so their place is one
+        # token earlier
+        at = len(ids) - len(tail) - (1 if self.template.dsv4 else 0)
+        given["_snap_at"] = at if tail and at > 1 and ids[-len(tail):] == tail else None
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def count_tokens(self, req: dict) -> dict:
@@ -3155,6 +3184,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill")}
         sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+        sampling = {**sampling, "_snap_at": kw.get("_snap_at")}
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4236,6 +4266,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            req = {**req, "_snap_at": kw.get("_snap_at")}     # where the last message ends (#59)
             if kw.get("_no_calls"):
                 req = {**req, "_no_calls": True}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -4336,6 +4367,7 @@ def make_handler(svc: Service):
                 tools = kw["_parser_tools"]
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            req = {**req, "_snap_at": kw.get("_snap_at")}     # where the last message ends (#59)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)

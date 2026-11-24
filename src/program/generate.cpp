@@ -2802,6 +2802,10 @@ static int glm_pack_generate(const Options& o) {
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
     uint64_t snap_ns = 0, snap_sess = 0;   // the namespace (API key) and session hint of the conversation in the model
     uint64_t req_ns = 0, req_sess = 0;     // this request's (GEN keys slot_ns=<hex>, slot_sess=<hex>)
+    // GEN key snap_at=<n> (the server's): where this prompt's last message ends - the conversation's snapshot is taken
+    // there instead of before the last token, so a next turn that sends the answer back otherwise (a turn cut by
+    // max_tokens: no answer, the reasoning dropped or unclosed, #59) still continues from it.  0: before the last token
+    int64_t req_snap_at = 0;
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
     const bool q35_path = model.fast() && model.geometry().qwen35();
     std::string q35_slot_why;
@@ -2970,43 +2974,85 @@ static int glm_pack_generate(const Options& o) {
         const auto st0 = model.fast_stats();   // (PP lines: the prompt's disk wait so far = disk_ms - st0's)
         const char* finish = "length";
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
-        // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it
+        // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it - or, with
+        // snap_at= (the server's: where the last message ends, #59), there: a next turn that sends this turn's answer
+        // back otherwise than it was written (cut by max_tokens - no answer, the reasoning dropped or unclosed - or a
+        // template that writes past turns another way) still continues from it.  The last token is read alone either way
         bool snapped = false;
+        const size_t snap_at = model.fast() && req_snap_at > 0 && (size_t) req_snap_at >= reuse &&
+                                       (size_t) req_snap_at < prompt.size() - 1
+                                   ? (size_t) req_snap_at
+                                   : prompt.size() - 1;
+        const auto save_snap = [&] {
+            if (model.snapshot_save()) {
+                snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
+                snap_img_hash = img_hash(snap_tokens.size());
+                snap_in_slot = false;
+                snap_ns = req_ns;
+                snap_sess = req_sess;
+            } else {
+                snap_tokens.clear();
+            }
+            snapped = true;
+        };
         // the batched prompt path (glm_prefill.cu) reads all but the last prompt token in chunks, layer by layer;
         // the last one goes through the token path, which leaves the logits the first sample reads
         const int pchunk = model.fast() ? model.prefill_chunk() : 0;
         size_t i_first = reuse;
         if (pchunk > 0 && prompt.size() - reuse > 1) {
-            // one call for everything but the last token: the two halves of a split pipeline the chunks; PP lines
-            // (the server's progress and heartbeat) come from the progress callback, possibly on the tail's thread
-            std::vector<int32_t> part(prompt.begin() + (long) reuse, prompt.end() - 1);
+            // one call a part (the two halves of a split pipeline the chunks): everything but the last token, or up to
+            // snap_at and then the rest; PP lines (the server's progress and heartbeat) come from the progress
+            // callback, possibly on the tail's thread.  -> 1 read, 0 declined (the token path reads it), -1 cancelled,
+            // -2 an error (ERR said)
             std::mutex pp_mu;
-            const auto pp_line = [&](size_t done) {
-                if (!o.serve) return;
-                std::lock_guard<std::mutex> lk(pp_mu);
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                std::printf("PP %zu %zu %.1f %.1f %zu %.1f\n", reuse + done, prompt.size(), ms,
-                            (double) done / (ms / 1000.0 + 1e-9), reuse, model.fast_stats().disk_ms - st0.disk_ms);
-                std::fflush(stdout);
+            const auto batched = [&](size_t from, size_t to, int32_t next) -> int {
+                std::vector<int32_t> part(prompt.begin() + (long) from, prompt.begin() + (long) to);
+                const auto pp_line = [&](size_t done) {
+                    if (!o.serve) return;
+                    std::lock_guard<std::mutex> lk(pp_mu);
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    std::printf("PP %zu %zu %.1f %.1f %zu %.1f\n", from + done, prompt.size(), ms,
+                                (double) (from - reuse + done) / (ms / 1000.0 + 1e-9), reuse,
+                                model.fast_stats().disk_ms - st0.disk_ms);
+                    std::fflush(stdout);
+                };
+                model.prefill_progress = [&](int64_t done, int64_t total) {
+                    (void) total;
+                    pp_line((size_t) done);
+                    return !stop_req.load();
+                };
+                err.clear();
+                const bool pok = model.prefill(part, err, next);   // (the NextN block's caches read the next token)
+                model.prefill_progress = nullptr;
+                if (pok) {
+                    pp_line(part.size());
+                    return 1;
+                }
+                if (err == "cancelled") return -1;
+                if (!err.empty()) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return -2;
+                }
+                return 0;
             };
-            model.prefill_progress = [&](int64_t done, int64_t total) {
-                (void) total;
-                pp_line((size_t) done);
-                return !stop_req.load();
-            };
-            const bool pok = model.prefill(part, err, prompt.back());   // (the NextN block's caches read it)
-            model.prefill_progress = nullptr;
-            if (pok) {
-                i_first = prompt.size() - 1;
-                pp_line(part.size());
-            } else if (err == "cancelled") {
+            int rc = 1;
+            if (snap_at > i_first) {
+                rc = batched(i_first, snap_at, prompt[snap_at]);
+                if (rc == 1) i_first = snap_at;
+            }
+            // (a rest under STRATA_GLM_PREFILL_MIN - the generation prompt's few tokens - is declined: the token path)
+            if (rc == 1 && i_first == snap_at && snap_at < prompt.size() - 1) {
+                save_snap();
+                rc = batched(snap_at, prompt.size() - 1, prompt.back());
+                if (rc == 1) i_first = prompt.size() - 1;
+            }
+            if (rc == -1) {
                 snap_tokens.clear();
                 model.reset();
                 finish = "cancel";
                 i_first = prompt.size();
-            } else if (!err.empty()) {
+            } else if (rc == -2) {
                 snap_tokens.clear();
-                std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
         }
@@ -3022,20 +3068,11 @@ static int glm_pack_generate(const Options& o) {
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
-            if (model.fast() && !snapped && i == prompt.size() - 1) {
-                if (model.snapshot_save()) {
-                    snap_tokens.assign(prompt.begin(), prompt.end() - 1);
-                    snap_img_hash = img_hash(snap_tokens.size());
-                    snap_in_slot = false;
-                    snap_ns = req_ns;
-                    snap_sess = req_sess;
-                } else {
-                    snap_tokens.clear();
-                }
-                snapped = true;
-            }
+            if (model.fast() && !snapped && i == snap_at) save_snap();
             size_t chunk = std::min<size_t>(8, prompt.size() - i);
-            if (model.fast() && !snapped && i + chunk > prompt.size() - 1) chunk = prompt.size() - 1 - i;
+            // (a step ends at the snapshot's place, and the last token goes alone)
+            const size_t stop_at = model.fast() && !snapped ? snap_at : prompt.size() - 1;
+            if (model.fast() && i < stop_at && i + chunk > stop_at) chunk = stop_at - i;
             std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
             const bool ok = model.forward(part, lg, err);
             if (!ok) {
@@ -4661,6 +4698,7 @@ static int glm_pack_generate(const Options& o) {
             req_bias = req_bias_ans = nullptr;
             std::string bias_err;
             req_ns = req_sess = 0;
+            req_snap_at = 0;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
@@ -4722,6 +4760,7 @@ static int glm_pack_generate(const Options& o) {
                 // another namespace is never taken back for this request (conv_slots.hpp)
                 else if (k == "slot_ns") { req_ns = std::strtoull(v.c_str(), nullptr, 16); }
                 else if (k == "slot_sess") { req_sess = std::strtoull(v.c_str(), nullptr, 16); }
+                else if (k == "snap_at") { req_snap_at = std::atoll(v.c_str()); }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (!bias_err.empty()) {

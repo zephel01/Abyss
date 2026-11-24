@@ -47,6 +47,18 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Qwen3.5 / Qwen3.8, Ornith, Laguna and Ling: the same for their kept expert pool budget - their attention caches and
   states sit outside what the key counted, so the key now names the context length and the `--kv` cache format. The
   first start after the update learns the budget once again.
+- A turn cut by `max_tokens` mid-reasoning (empty answer) no longer makes the next turn read the whole conversation
+  again (#59). The server drops an empty assistant turn, so the next prompt did not start with the engine's snapshot
+  (taken just before the prompt's last token); the snapshot is now kept where the prompt's last message ends (GEN key
+  `snap_at=`, `STRATA_SNAP_AT=0` = as before). RTX 5090, Ornith-1.5-35B-A3B Q4_K_M, a 9K-token first turn cut at 48
+  tokens, the next turn sent as an OpenAI client does (`content: ""`): cache_n 0 / prompt_n 9,059, 1,630 ms -> cache_n
+  9,035 / prompt_n 24, 267 ms. Every model but Inkling had it (checked with each model's template and tokenizer:
+  Qwen3.5/3.8, Ornith, Laguna, Ling, GLM-5.3, DeepSeek V4 / V4.1, Hy4). A new prompt's answers can differ from v1.3.201's
+  in the last bits (the generation prompt's 4-5 tokens are read after the snapshot, as a reused turn already reads
+  them; sum order only): teacher-forced on the same 768 answer tokens (code / prose / Japanese prompts of 2.9-5.4K
+  tokens), the KL to a token-path-only reading is the same as before - Ornith-1.5-35B-A3B 1.19e-2 -> 1.13e-2 (top-1
+  97.1% -> 97.0%), Qwen3.8 UD-IQ3_XXS 3.53e-3 -> 3.62e-3 (97.5% -> 97.8%). Its first token comes ~55 ms later at
+  9-10K tokens (1,752-1,766 -> 1,805-1,818 ms); the CLI is unchanged (7-config md5).
 
 ## v1.3.201 - 2026-11-24
 
