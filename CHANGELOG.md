@@ -40,6 +40,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   that group: Qwen3.8-27B UD-Q4_K_XL answered both test pictures right (shapes counted 4 / 2 / 1, a 3x3 grid's
   bottom-right letter P), and Hy4-flash Maya-XS gives the same answers and token counts as before the fix. A tree
   patched before is repaired at the next setup (tools/vision changed, so it patches and rebuilds strata-vision).
+- Inkling 2 Mini: the expert pool's kept budget (`pool_pin.txt`, v1.3.198) now names the context length and the
+  `--parallel` setting. Inkling's KV slots sit outside what the key counted, so a budget learnt at one `--max-context`
+  was used at another: a larger one did not fit and every start said so, a smaller one (within 1 GiB) left that much
+  VRAM unused. The first start after the update learns the budget once again; other models' keys are unchanged.
 
 ## v1.3.201 - 2026-11-24
 

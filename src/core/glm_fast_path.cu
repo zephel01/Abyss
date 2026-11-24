@@ -1471,7 +1471,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         const poolpin::Mode pin_mode = poolpin::mode();
         if (!F->unified_memory && pin_mode != poolpin::Mode::Off && getenv("STRATA_GLM_POOL_GB") == nullptr &&
             !pack_dir_.empty()) {
-            pin_key = poolpin::key(dev_, total_b, l0_, lt_, (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_));
+            pin_key = poolpin::key(dev_, total_b, l0_, lt_, (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_),
+                                  pin_extra());
             pin = poolpin::decide(avail, poolpin::load_mib(poolpin::file_for(pack_dir_), pin_key) << 20,
                                   pin_mode == poolpin::Mode::Reset);
             const double G = 1073741824.0;

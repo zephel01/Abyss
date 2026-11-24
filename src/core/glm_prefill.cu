@@ -1496,7 +1496,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // chunk is chosen against it too - a start's free VRAM then moves neither the pool nor the chunk)
     if (!F->unified_memory && getenv("STRATA_GLM_POOL_GB") == nullptr && !pack_dir_.empty() &&
         poolpin::mode() == poolpin::Mode::On) {
-        const std::string k = poolpin::key(dev_, dev_total, l0_, lt_, (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_));
+        const std::string k = poolpin::key(dev_, dev_total, l0_, lt_, (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_),
+                                  pin_extra());
         const poolpin::Choice c = poolpin::decide(avail, poolpin::load_mib(poolpin::file_for(pack_dir_), k) << 20, false);
         if (c.why == poolpin::kSaved) avail = c.budget;
     }
