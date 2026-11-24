@@ -19,8 +19,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
   9,035 / prompt_n 24, 267 ms. Every model but Inkling had it (checked with each model's template and tokenizer:
   Qwen3.5/3.8, Ornith, Laguna, Ling, GLM-5.3, DeepSeek V4 / V4.1, Hy4). A new prompt's answers can differ from v1.3.201's
   in the last bits (the generation prompt's 4-5 tokens are read after the snapshot, as a reused turn already reads
-  them) and its first token comes ~55 ms later at 9-10K tokens (1,752-1,766 -> 1,805-1,818 ms); the CLI is unchanged
-  (7-config md5).
+  them; sum order only): teacher-forced on the same 768 answer tokens (code / prose / Japanese prompts of 2.9-5.4K
+  tokens), the KL to a token-path-only reading is the same as before - Ornith-1.5-35B-A3B 1.19e-2 -> 1.13e-2 (top-1
+  97.1% -> 97.0%), Qwen3.8 UD-IQ3_XXS 3.53e-3 -> 3.62e-3 (97.5% -> 97.8%). Its first token comes ~55 ms later at
+  9-10K tokens (1,752-1,766 -> 1,805-1,818 ms); the CLI is unchanged (7-config md5).
 
 ## v1.3.201 - 2026-11-24
 
