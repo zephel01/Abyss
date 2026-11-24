@@ -9,6 +9,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.199 - 2026-11-24
+
+Hy4-flash now computes its Engram gates as the model does: the gate norms add FP32's machine epsilon, not bf16's 2^-7.
+Against the model's own math on the BF16 weights, Q8_0's KL falls to 0.03-0.12 (from 0.36-1.38) on mixed, Japanese,
+English and code text, and JSON / code answers no longer pick up stray tokens. Other models give the same bits as v1.3.198
+(7-config md5).
+
 ### Changed
 
 - Hy4-flash: the Engram gate's norms (value, key, stream) add FP32's machine epsilon (1.19e-7) instead of bf16's 2^-7, as the
