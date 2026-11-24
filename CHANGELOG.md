@@ -9,6 +9,16 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+## v1.3.202 - 2026-11-24
+
+Ling-3.2-air reads images (beta, NVIDIA) with Abyss's own CUDA encoder: three test pictures and five position-dependent
+ones all answered right on an RTX 5090. Images on Qwen3.8-27B work again: a strata-vision built since v1.3.177 stopped
+the server from starting (the next setup rebuilds it). After a turn cut by `max_tokens` mid-reasoning, the next turn
+reuses the conversation (Ornith-1.5-35B, 9K tokens: 1,630 -> 267 ms) instead of reading it all again (#59). The kept
+expert pool budget now names the context length (Inkling, Qwen3.5/3.8, Ornith, Laguna, Ling). CLI outputs give the
+same bits as v1.3.201 (7-config md5, Inkling 18 md5, Ling 4 md5); a server's new prompts can differ in the last bits
+(KL the same, see #59 below).
+
 ### Added
 
 - Ling-3.2-air reads images (beta, NVIDIA): `./setup-deepseek.sh --model ling32air` asks to fetch bartowski's

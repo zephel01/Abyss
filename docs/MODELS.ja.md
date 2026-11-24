@@ -121,7 +121,7 @@ numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの 
 | `Q3_K_M`（[nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF)。Engram の表は IQ4_NL で各ファイルの中。v1.3.178） | 107.5 GB | nll は 459 トークンの組で 1.746、日本語 4K の文で 3.910（Maya-XS 4.167）。日本語の事実問題は温度 0.9 で 80 中 76（seed 2 つ）、温度 0 で 40 中 38（Maya-XS は 76 / 80、40 / 40） | 生成 40.5 tok/s（3 回の中央値。エキスパート 63.8 GB のうち VRAM に 35%、1 トークンあたり 264 個を CPU で計算） | GPU 32 GB + RAM 96 GB |
 | `Q4_K_M`（同じリポジトリ） | 127.2 GB | 未計測 | 未計測 | |
 
-### Inkling 2 Mini（ベータ、未リリース）
+### Inkling 2 Mini（ベータ、v1.3.183）
 
 Thinking Machines の Inkling-2-Mini（Apache-2.0、26B。深さ方向の注意による混ぜ合わせと、層 6〜17 を 3 回まわすループ）。
 今はテキストだけ。GGUF は 2 つの形式とも読める: mainline の `inkling2_loop` と、unsloth の `inkling2`。品質は
@@ -137,7 +137,7 @@ llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL�
 | `UD-IQ3_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 11.7 GB | llama.cpp の Q8_0 との KL 0.0280（英語 0.0304、日本語 0.0291、コード 0.0218）、top-1 の一致 93.6%。日本語の事実 589/666（Q4_K_XL は 593） | 全部 VRAM 136.1、`STRATA_GLM_VRAM_GB=12` 127.5、`=8` 102.9 tok/s。プロンプト 3,799 / 2,526 / 1,667 | GPU 8〜12 GB ＋ RAM |
 | `UD-IQ2_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 8.5 GB | KL 0.0782（英語 0.0835、日本語 0.0792、コード 0.0693）、top-1 の一致 89.1%。日本語の事実 552/666 とはっきり落ちる。VRAM 8 GB でも UD-IQ3_XXS のほうがよい | 全部 VRAM 140.2、`=12` 134.0、`=8` 120.5 tok/s | GPU 8 GB で、日本語より速さを取るとき |
 
-### Ling-3.2-air（ベータ、未リリース）
+### Ling-3.2-air（ベータ、v1.3.201）
 
 inclusionAI の Ling-3.2-air（`bailingmoe3`。KDA の線形 attention 層 35 + MLA 層 7、エキスパート 512、グループ制限つきの
 top-8）。画像も読める（下記）。まだ無いもの: MTP ブロック。会話スロットは Qwen3.8 / Ornith と同じ（[MANUAL](MANUAL.ja.md)、`STRATA_GLM_SLOTS`）。品質: 混在テキストの 96 位置での

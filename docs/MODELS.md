@@ -124,7 +124,7 @@ Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a pos
 | `Q3_K_M` ([nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF); IQ4_NL Engram table inside the shards; v1.3.178) | 107.5 GB | nll 1.746 on the 459-token set, 3.910 on a Japanese 4K text (Maya-XS 4.167); Japanese facts 76 / 80 at temp 0.9 (2 seeds), 38 / 40 at temp 0 (Maya-XS 76 / 80, 40 / 40) | decode 40.5 tok/s (median of 3; 35% of its 63.8 GB of experts in VRAM, 264 experts a token on the CPU) | 32 GB GPU + 96 GB RAM |
 | `Q4_K_M` (same repository) | 127.2 GB | not measured | not measured | |
 
-### Inkling 2 Mini (beta, unreleased)
+### Inkling 2 Mini (beta, v1.3.183)
 
 Thinking Machines' Inkling-2-Mini (Apache-2.0, 26B, depth-attention mixes and a 3-pass loop over layers 6-17), text
 only. Both GGUF layouts load: the mainline `inkling2_loop` files and unsloth's root `inkling2` files. Quality: KL
@@ -140,7 +140,7 @@ against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token E
 | `UD-IQ3_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 11.7 GB | KL 0.0280 against the llama.cpp Q8_0 (EN 0.0304, JA 0.0291, code 0.0218), same top-1 93.6%; Japanese facts 589/666 (Q4_K_XL 593) | all in VRAM 136.1; `STRATA_GLM_VRAM_GB=12` 127.5; `=8` 102.9 tok/s; prompts 3,799 / 2,526 / 1,667 | 8-12 GB GPU + RAM |
 | `UD-IQ2_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 8.5 GB | KL 0.0782 (EN 0.0835, JA 0.0792, code 0.0693), same top-1 89.1%; Japanese facts 552/666, clearly below - prefer UD-IQ3_XXS at an 8 GB cap | all in VRAM 140.2; `=12` 134.0; `=8` 120.5 tok/s | 8 GB GPU, when speed matters more than Japanese |
 
-### Ling-3.2-air (beta, unreleased)
+### Ling-3.2-air (beta, v1.3.201)
 
 inclusionAI's Ling-3.2-air (`bailingmoe3`: 35 KDA linear-attention layers + 7 MLA layers, 512 experts, top-8 with
 group-limited routing); it reads images (below). Not yet: its MTP block. Conversation slots as on

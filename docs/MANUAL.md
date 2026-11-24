@@ -109,7 +109,7 @@ tok/s; RTX 3090 (all in VRAM): decode 104 / 114 tok/s, the same prompt 1,700-1,9
 ./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G (11.6 GB)
 ```
 
-Ling-3.2-air (inclusionAI, `bailingmoe3`, beta from this version; [the numbers](MODELS.md#ling-32-air-beta-unreleased)):
+Ling-3.2-air (inclusionAI, `bailingmoe3`, beta from this version; [the numbers](MODELS.md#ling-32-air-beta-v13201)):
 bartowski's public Q4_K_M (3 shards, 80.4 GB), packed as it is, for a 24-32 GB GPU + 64-96 GB RAM. It reads images (NVIDIA; the setup asks, see
 [images](SETTINGS.md#images-on-ling-32-air)); no MTP drafter yet; conversation slots as on Qwen3.8 (`STRATA_GLM_SLOTS`). The config takes the model's sampling (temperature 1.0, top-p 0.95, top-k
 20). RTX 5090 + 123 GB RAM: a 4K prompt 2,061 tok/s, decode 142.8 tok/s; 16K 3,092 / 120.7. In the server, expect the
