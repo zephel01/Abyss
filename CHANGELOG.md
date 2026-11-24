@@ -14,7 +14,10 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 - Inkling 2 Mini: the expert pool's kept budget (`pool_pin.txt`, v1.3.198) now names the context length and the
   `--parallel` setting. Inkling's KV slots sit outside what the key counted, so a budget learnt at one `--max-context`
   was used at another: a larger one did not fit and every start said so, a smaller one (within 1 GiB) left that much
-  VRAM unused. The first start after the update learns the budget once again; other models' keys are unchanged.
+  VRAM unused. The first start after the update learns the budget once again; GLM, DeepSeek V4 / V4.1 and Hy4 keys are unchanged.
+- Qwen3.5 / Qwen3.8, Ornith, Laguna and Ling: the same for their kept expert pool budget - their attention caches and
+  states sit outside what the key counted, so the key now names the context length and the `--kv` cache format. The
+  first start after the update learns the budget once again.
 
 ## v1.3.201 - 2026-11-24
 
