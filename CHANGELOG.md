@@ -9,6 +9,22 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- Inkling 2 Mini GGUFs whose loop controllers (`loop_{q,k,v,ffn}_ctrl_{down,gain,forget}`, 144 tensors in layers
+  6-17) are Q8_0 - AtomicChat's `Inkling-2-Mini-AD-Q4_K` (16.5 GB; Q4_K gate-up, Q5_0 down experts) - pack: the
+  packer refused them (`... is Q8_0: not on the inkling native set`). They are now dequantized into dense.bin as F32 -
+  the values a Q8_0 block holds, exact in F32, the bytes an F32 source with those values gives - and the engine reads
+  them as before (no engine change). Any other unexpected quantized tensor is still refused. ggml-org Q8_0 and unsloth
+  UD-Q4_K_XL packs come out byte-identical (dense.bin / index.txt / native_experts.txt md5 unchanged). Such a file's
+  controllers stay F32 on the GPU (`STRATA_INK_CTL_BF16` keeps a tensor whose values are not BF16 as F32). Measured on an
+  RTX 5090 (v1.3.202 engine, iGPU off, greedy, 4K prompt + 512, median of 3, interleaved, drafter off): decode all in
+  VRAM 198.3 tok/s (UD-Q4_K_XL 194.6), `STRATA_GLM_VRAM_GB=16` 177.5 (154.8), `=12` 142.0 (127.0); the 4K prompt 6,310 /
+  2,698 / 2,104 tok/s (5,823 / 2,099 / 1,475). KL against Abyss's own run of the ggml-org Q8_0 (3,071 positions, token
+  path): 0.0108 (EN 0.0100, JA 0.0121, code 0.0086), same top-1 96.0%; UD-Q4_K_XL the same way 0.0058 (0.0050 / 0.0070
+  / 0.0045), 97.5%. Unsloth's DSpark drafter (`STRATA_INK_DSPARK=<file>`) works with it: a code prompt 199.7 ->
+  237.8 tok/s, the same tokens (md5)
+
 ## v1.3.202 - 2026-11-24
 
 Ling-3.2-air reads images (beta, NVIDIA) with Abyss's own CUDA encoder: three test pictures and five position-dependent
