@@ -770,6 +770,12 @@ public:
     bool ling_alloc(std::string& err);
     bool fast_ling_kda(int il, std::string& err);
     bool fast_ling_mla(int il, int64_t p, std::string& err);
+    // ling's NextN drafter (STRATA_LING_MTP, ling_fast_path.cu): cache rows / one draft step, as q35_mtp_rows / _step
+    bool ling_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_stride, const int32_t* next, std::string& err);
+    bool ling_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err);
+    // ling's verify window (dsv4_verify.cu): each column the token path's kernels, the GEMVs over the columns at once
+    bool verify_part_ling(const std::vector<int32_t>& toks, int64_t p0, std::string& err);
+    void verify_rewind_ling(int kept);
     const float* ling_group_bias(int il, const float* logits, const float* bias, cudaStream_t s);
     void ling_free();
     std::vector<void*> ling_owned_;

@@ -7172,7 +7172,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (mtp_il_ >= 0 && next_ids != nullptr && kv_cut < 0) {
         int Tv = 0;   // rows whose next token is known (all but possibly the prompt's last)
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
-        if (g.qwen35() && Tv > 0) {
+        if (g.ling && Tv > 0) {
+            // ling (STRATA_LING_MTP): h = output_norm(R + the last layer's FFN) a row (on a copy: R stays as it is), then
+            // the block's latent rows through the drafter's own row kernels (ling_mtp_rows)
+            Carve c{S->uni};
+            float* hr = c.take<float>((size_t) Tv * E);
+            float* h = c.take<float>((size_t) Tv * E);
+            uint16_t* h16 = c.take<uint16_t>((size_t) Tv * E);
+            cudaMemcpy2DAsync(hr, (size_t) E * sizeof(float), S->R, (size_t) 4 * E * sizeof(float), (size_t) E * sizeof(float),
+                              (size_t) Tv, cudaMemcpyDeviceToDevice, s);
+            q35::add_rms_rows(hr, E, S->ffn, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, h16, s);
+            if (!ling_mtp_rows(p0, Tv, h, (size_t) E, next_ids, err)) return false;
+            S->mark("mtp_rows", s);
+        } else if (g.qwen35() && Tv > 0) {
             // qwen35moe: the block's K / V rows alone - eh_proj of [enorm(the next token's embedding) | hnorm(the trunk's
             // normed hidden)], the attention norm, k / v (k_norm, RoPE) into its caches at the rows' positions
             const auto& Ly = F->L[(size_t) mtp_il_];

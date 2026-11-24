@@ -302,9 +302,23 @@ static const char* const kMtpRawQ35D[] = {"attn_q.weight", "attn_k.weight", "att
                                           "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "nextn.eh_proj.weight"};
 static const char* const kMtpF32Q35D[] = {"attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight",
                                           "attn_k_norm.weight", "nextn.enorm.weight", "nextn.hnorm.weight"};
-// the block's name lists for kind 0 (glm5-next), 1 (qwen35moe), 2 (the dense qwen35)
+// ling's NextN block (bailingmoe3, STRATA_LING_MTP): an MLA layer and its MoE behind eh_proj, served as stored; the
+// router, the norms and the absorbed k_b / v_b as F32 (ling_bind decodes k_b / v_b to F32 rows anyway);
+// layer_output_norm is the block's final norm (HF's final_layernorm), the head the trunk's
+static const char* const kMtpRawLing[] = {"attn_q.weight", "attn_kv_a_mqa.weight", "attn_gate.weight",
+                                          "attn_output.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                                          "ffn_down_shexp.weight", "nextn.eh_proj.weight"};
+static const char* const kMtpF32Ling[] = {"attn_norm.weight", "ffn_norm.weight", "attn_kv_a_norm.weight",
+                                          "attn_k_b.weight", "attn_v_b.weight", "ffn_gate_inp.weight",
+                                          "exp_probs_b.bias", "nextn.enorm.weight", "nextn.hnorm.weight",
+                                          "layer_output_norm.weight"};
+// the block's name lists for kind 0 (glm5-next), 1 (qwen35moe), 2 (the dense qwen35), 3 (ling)
 static void mtp_names(int kind, std::vector<const char*>& raw, std::vector<const char*>& b16, std::vector<const char*>& f32) {
-    if (kind == 2) {
+    if (kind == 3) {
+        raw.assign(std::begin(kMtpRawLing), std::end(kMtpRawLing));
+        b16.clear();
+        f32.assign(std::begin(kMtpF32Ling), std::end(kMtpF32Ling));
+    } else if (kind == 2) {
         raw.assign(std::begin(kMtpRawQ35D), std::end(kMtpRawQ35D));
         b16.clear();
         f32.assign(std::begin(kMtpF32Q35D), std::end(kMtpF32Q35D));
@@ -4247,6 +4261,19 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // fits), or a more precise block than the model's own: load_mtp looks there first.
     bool mtp_extra = false;
     const char* mtp_gguf = getenv("STRATA_GLM_MTP_GGUF");
+    // ling (STRATA_LING_MTP, opt-in): the NextN block from tools/nextn_pack.py's file (the pack keeps the trunk only;
+    // its Q4_0 experts are not served, the tool writes them as Q5_0 - the same values): STRATA_LING_MTP=1 reads
+    // <pack>/nextn.gguf, another value names the file
+    std::string ling_mtp;
+    if (g_.ling) {
+        const char* lm = getenv("STRATA_LING_MTP");
+        if (lm != nullptr && lm[0] != '\0' && std::strcmp(lm, "0") != 0) {
+            ling_mtp = std::strcmp(lm, "1") == 0 ? pack_dir_ + "/nextn.gguf" : std::string(lm);
+            if (mtp_gguf == nullptr || mtp_gguf[0] == '\0') mtp_gguf = ling_mtp.c_str();
+        } else {
+            mtp_gguf = nullptr;   // (ling without STRATA_LING_MTP: no drafter)
+        }
+    }
     if (fast_mode_ && l1_ == g_.n_layers && mtp_gguf != nullptr && mtp_gguf[0] != '\0') {
         const bool own = find_tensor("blk." + std::to_string(g_.n_layers) + ".nextn.eh_proj.weight") != nullptr;
         auto extra = std::make_unique<strata::GgufFile>(mtp_gguf);
@@ -4568,7 +4595,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;   // a GGUF without the draft block
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
-    const int mkind = g_.q35_dense() ? 2 : g_.qwen35() ? 1 : 0;
+    const int mkind = g_.ling ? 3 : g_.q35_dense() ? 2 : g_.qwen35() ? 1 : 0;
     std::vector<const char*> raw_names, b16_names, f32_names;
     mtp_names(mkind, raw_names, b16_names, f32_names);
     uint64_t bytes = 0;

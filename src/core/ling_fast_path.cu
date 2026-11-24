@@ -16,6 +16,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/ling_fast.hpp"
+#include "strata/kernels/qwen35_fast.hpp"
 #include "strata/qtypes.hpp"
 
 #include <cuda_runtime.h>
@@ -131,6 +132,12 @@ void Glm5Model::ling_bind(int il, std::string& missing) {
         Ly.lg_vb = rows32("attn_v_b.weight", lk::kLat, (int64_t) lk::kV * H);
         Ly.out = q("attn_output.weight", (int64_t) H * lk::kV, E);
     }
+    if (Ly.mtp) {   // the NextN block (STRATA_LING_MTP): eh_proj in, its two norms, its final norm (HF's final_layernorm)
+        Ly.eh = q("nextn.eh_proj.weight", 2 * E, E);
+        Ly.enorm = f32("nextn.enorm.weight");
+        Ly.hnorm = f32("nextn.hnorm.weight");
+        Ly.shnorm = f32("layer_output_norm.weight");
+    }
 }
 
 bool Glm5Model::ling_alloc(std::string& err) {
@@ -245,6 +252,82 @@ bool Glm5Model::fast_ling_mla(int il, int64_t p, std::string& err) {
     if (F->prof_on) F->mark("ling_mla_out");
     if (dumps) ling_dump(s, "mla_out", il, F->mixer, E);
     if (lk::launch_errors() != 0) { err = "ling: a kernel launch failed"; return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- the NextN block (STRATA_LING_MTP): the drafter
+// HF's BailingMoeV3MTPLayer: x = eh_proj([enorm(e) | hnorm(h)]) (h: the trunk's output_norm'd hidden at a position, e:
+// the NEXT token's embedding); an MLA layer over its own latent cache, the MoE, final_layernorm; the trunk's head on
+// that (no output_norm after it - bench/lingmtp: 67.5 / 74.5% of en / ja drafts right against 66.3 / 72.2 with it).
+// Only the drafts' guesses come from here: the verify window checks every one against the trunk.
+
+// the cache rows of positions p0 .. p0 + n - 1 from their normed hiddens (h_stride floats apart) and next tokens:
+// eh_proj, the attention norm, kv_a and the latent / roped key into the block's cache (kVerifyMax rows at a time)
+bool Glm5Model::ling_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_stride, const int32_t* next,
+                              std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int il = mtp_il_, E = g.n_embd, H = g.n_head;
+    const size_t q8e = (size_t) (E / 32) * 36, cat_b = (size_t) (2 * E / 32) * 36;
+    const auto& Ly = F->L[(size_t) il];
+    for (int r0 = 0; r0 < n; r0 += kVerifyMax) {
+        const int m = std::min(kVerifyMax, n - r0);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "ling mtp rows", err)) return false;   // (tok_in_h)
+        for (int t = 0; t < m; ++t) F->tok_in_h[t] = next[r0 + t];
+        if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d,
+                              F->tok_in_d, m, E, F->q35_mt_emb, s)) { err = "ling mtp: the embedding rows"; return false; }
+        for (int t = 0; t < m; ++t)
+            gf::mtp_in(F->q35_mt_emb + (size_t) t * E, h_rows + (size_t) (r0 + t) * h_stride, Ly.enorm, Ly.hnorm,
+                       g.norm_eps, E, (uint8_t*) F->q35_mt_cat + (size_t) t * cat_b, s);
+        gf::MvJob eh = {Ly.eh.q, F->q35_mt_cat, nullptr, F->q35_mt_hid, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+        if (!gf::mvn(&eh, 1, m, s)) { err = "ling mtp: eh_proj rows"; return false; }
+        for (int t = 0; t < m; ++t)
+            gf::rms_q8(F->q35_mt_hid + (size_t) t * E, nullptr, Ly.attn_norm, g.norm_eps, E, F->q35_mt_x + (size_t) t * E,
+                       (uint8_t*) F->q35_mt_xq + (size_t) t * q8e, s);
+        gf::MvJob kv = {Ly.lg_kva.q, F->q35_mt_xq, F->q35_mt_x, F->q35_mt_k, nullptr, 1.0f, Ly.lg_kva.type, E, lk::kRow};
+        if (!gf::mvn(&kv, 1, m, s)) { err = "ling mtp: kv_a rows"; return false; }
+        float2* cs = (float2*) (ling_bias_ + g.n_expert);
+        for (int t = 0; t < m; ++t) {   // (q: scratch - the rows' keys alone are kept)
+            const int64_t p = p0 + r0 + t;
+            lk::rope_table(p, (double) g.rope_base, cs, s);
+            lk::mla_prep(F->q35_qf, H, F->q35_mt_k + (size_t) t * lk::kRow, Ly.lg_kvn, g.norm_eps, cs,
+                         Ly.kc + (size_t) p * lk::kRow, s);
+        }
+    }
+    q35_row_done_ = std::max(q35_row_done_, p0 + n - 1);
+    if (lk::launch_errors() != 0) { err = "ling mtp: a kernel launch failed"; return false; }
+    return true;
+}
+
+// one draft step at position p: the block whole (its row written on the way), the head, the argmax (tok_out, on the
+// device) and its probability (conf_out); F->head_x holds the block's normed output for a chained step
+bool Glm5Model::ling_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out,
+                              std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int il = mtp_il_, E = g.n_embd;
+    const auto& Ly = F->L[(size_t) il];
+    if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d,
+                          tok_dev, 1, E, F->emb, s)) { err = "ling mtp: the embedding"; return false; }
+    gf::mtp_in(F->emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+    gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+    if (!gf::mv(&eh, 1, s)) { err = "ling mtp: eh_proj"; return false; }
+    gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
+    if (!fast_ling_mla(il, p, err)) return false;
+    gf::rms_q8(F->mtp_h, F->mixer, Ly.post_norm, g.norm_eps, E, F->x, F->xq, s);
+    bool pf_pending = false;
+    if (!fast_moe(il, pf_pending, err)) return false;
+    gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    const WSlot& ow = ws_map_.at("output.weight");
+    gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (!gf::mv(&o, 1, s)) { err = "ling mtp: the head"; return false; }
+    gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
+    strata::kernels::q35::top_prob(F->mtp_logits, g.n_vocab, F->mtp_tok, conf_out, s);
+    cudaMemcpyAsync(tok_out, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToDevice, s);
+    if (lk::launch_errors() != 0) { err = "ling mtp: a kernel launch failed"; return false; }
     return true;
 }
 

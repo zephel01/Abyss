@@ -1188,6 +1188,7 @@ bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_st
     if (n <= 0) return true;
     if (g.q4x) return q4x_mtp_rows(p0, n, h_rows, h_stride, next, err);
     if (g.arch == 0) return glm_mtp_rows(p0, n, h_rows, h_stride, next, err);
+    if (g.ling) return ling_mtp_rows(p0, n, h_rows, h_stride, next, err);
     if (n > kVerifyMax) { err = "qwen35 mtp: " + std::to_string(n) + " rows (at most " + std::to_string(kVerifyMax) + ")"; return false; }
     const int il = mtp_il_, E = g.n_embd, D = g.head_dim, KV = g.attn_head_kv * D;
     const size_t q8e = (size_t) (E / 32) * 36, cat_b = (size_t) (2 * E / 32) * 36;
@@ -1221,6 +1222,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     cudaStream_t s = F->cs;
     if (g.q4x) return q4x_mtp_forward(p, 1, h, 0, tok_dev, true, conf_out, tok_out, err);
     if (g.arch == 0) return glm_mtp_step(p, tok_dev, h, conf_out, tok_out, err);
+    if (g.ling) return ling_mtp_step(p, tok_dev, h, conf_out, tok_out, err);
     const int il = mtp_il_, E = g.n_embd;
     const auto& Ly = F->L[(size_t) il];
     if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d, tok_dev, 1, E, F->emb, s)) { err = "qwen35 mtp: the embedding"; return false; }
@@ -1292,7 +1294,7 @@ void Glm5Model::spec_sampling_set(const strata::kernels::SamplerParams* sp) {
     ss_drafted_ = false;
     ss_win_ok_ = false;
     // qwen35 / qwen35moe's own NextN block on one part, a sampled request (not qwen4exp's layer, not GLM's block)
-    const bool can = sp != nullptr && !sp->greedy && sp->temperature > 0.0f && g_.qwen35() && !g_.q4x &&
+    const bool can = sp != nullptr && !sp->greedy && sp->temperature > 0.0f && g_.qwen35() && !g_.q4x && !g_.ling &&
                      dsp_ == nullptr && dfl_ == nullptr && next_port_ == nullptr && split_next_ == nullptr &&
                      q35_mtp_on();
     if (can && ss_alloc()) {
@@ -1320,7 +1322,7 @@ bool Glm5Model::window_dist(int i, const int*& ids, const float*& p, int& n) con
     return n > 0 && n <= strata::kernels::kDistMax;
 }
 
-// the drafts after y (the token at position(), pending): up to STRATA_Q35_MTP_K (1..5, default 3) chained steps from
+// the drafts after y (the token at position(), pending): up to STRATA_Q35_MTP_K (1..5, default 3; ling 1) chained steps from
 // the pending position, each the block over the previous step's argmax and normed output; a draft's confidence is
 // its softmax probability, read after every step (host-mapped) - the chain stops at the first below
 // STRATA_Q35_MTP_MIN (default STRATA_DS4_DSPARK_THR, else the decode's 0.5 for this drafter: it drops the rest anyway)
@@ -1335,10 +1337,11 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         q35_pend_pos_ = -1;
         return true;
     }
-    // (qwen4exp's draft layer: 4 and 0.75 - prose 59.1 -> 60.5-64.1 tok/s against 3 and 0.5, code the same 81)
+    // (qwen4exp's draft layer: 4 and 0.75 - prose 59.1 -> 60.5-64.1 tok/s against 3 and 0.5, code the same 81;
+    // ling's NextN block: 1 - RTX 5090 + RAM, 8 prompts x 3 runs, decode +3..+16% against off, 2 and 3 -5..+15%)
     const int kmax0 = [this] {
         const char* v = getenv("STRATA_Q35_MTP_K");
-        return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : g_.q4x ? 4 : 3;
+        return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : g_.q4x ? 4 : g_.ling ? 1 : 3;
     }();
     // every step writes the KV row at its position: the chain stops where the context ends (the caller's `room` bounds
     // the accepted drafts, not the rows tried; the server's CTX_SLACK of 8 hid the overrun, the CLI had none)
