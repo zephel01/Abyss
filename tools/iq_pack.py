@@ -173,6 +173,11 @@ HY4_NATIVE_OK = ("attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "
 INKLING_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_gate.weight",
                      "attn_rel.weight", "attn_sink_proj.weight", "attn_k_conv_proj.weight", "attn_v_conv_proj.weight",
                      "token_embd.weight", "output.weight")
+# the loop controllers some inkling2_loop GGUFs store as Q8_0 (AtomicChat's AD-Q4_K; ggml-org's and unsloth's keep them
+# F32): the engine reads them as F32 rows, so they are dequantized into dense.bin as F32 - a Q8_0 value (an F16 scale
+# times an int8) is exact in F32, so the bytes are those an F32 source holding the same values would give
+INKLING_Q8_TO_F32 = tuple("loop_%s_ctrl_%s.weight" % (c, r) for c in ("q", "k", "v", "ffn")
+                          for r in ("down", "gain", "forget"))
 # bailingmoe3 (inclusionAI Ling-3.x): every non-expert tensor served as stored (the KDA / MLA projections, the
 # absorbed MLA k_b / v_b as their 3-D bytes, the dense lead FFN, the shared expert); F32 norms, convs, ssm_a / dt,
 # routers and exp_probs_b into dense.bin.  The NextN block (blk.{trunk}) is dropped
@@ -351,6 +356,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             # (BF16 too: unsloth's 1017 GGUFs keep indexer.proj in BF16, exact in F32)
             widen_q = (compat_bf16 and arch == "deepseek41" and t.type_name not in ("F32", "F16") and name.startswith("blk.")
                        and name.endswith(DEEPSEEK41_ANY_TO_F32))
+            widen_q = widen_q or (arch in ("inkling2_loop", "inkling2") and t.type_name == "Q8_0"
+                                  and name.startswith("blk.") and name.endswith(INKLING_Q8_TO_F32))
             if t.type_name in FLOAT or convert or widen_q:
                 raw = tensor_bytes(mm, g, t).tobytes()
                 if widen_q:
