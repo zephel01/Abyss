@@ -17,6 +17,7 @@
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
+#include "glm_pool_pin.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 
@@ -1454,6 +1455,14 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // (elastic KV: the KV not mapped yet counts as taken, as the pool's layout counts it - the chunk is then the fixed
     // layout's, and a prompt's chunks, its sum order and its bits do not depend on --kv-elastic)
     avail -= std::min(avail, ekv_lendable());
+    // (the budget fast_setup keeps per card + pack + config, glm_pool_pin.hpp: when it will carve the kept one, the
+    // chunk is chosen against it too - a start's free VRAM then moves neither the pool nor the chunk)
+    if (!F->unified_memory && getenv("STRATA_GLM_POOL_GB") == nullptr && !pack_dir_.empty() &&
+        poolpin::mode() == poolpin::Mode::On) {
+        const std::string k = poolpin::key(dev_, dev_total, l0_, lt_, (size_t) (w_arena_bytes_ + state_bytes_ + sc_bytes_));
+        const poolpin::Choice c = poolpin::decide(avail, poolpin::load_mib(poolpin::file_for(pack_dir_), k) << 20, false);
+        if (c.why == poolpin::kSaved) avail = c.budget;
+    }
     size_t blob_sum = 0, stride_sum = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
