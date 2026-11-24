@@ -29,9 +29,11 @@ import hmac
 import codecs
 import itertools
 import json
+import math
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -94,6 +96,7 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 LING_END = "<|role_end|>"   # (Ling-3.x: the Bailing V3 template's turn end)
+LING_IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"   # (Ling-3.x: a picture in the template, before expansion)
 # elastic KV's engine lines (glm_elastic.cu): the split at start, and each time the KV grows
 ELASTIC_START = re.compile(r"glm elastic: ((?:CUDA|HIP)\d+) KV on demand: \d+ caches, ([\d.]+) GB reserved for (\d+) tokens, "
                            r"([\d.]+) GB mapped for the first (\d+) \(--kv-min (\d+)\); ([\d.]+) GB free for")
@@ -1351,6 +1354,8 @@ class Vision:
         if cfg.get("no_flash_attn"):   # GLM-5.3's encoder on a GPU: full-precision attention (cosine 0.9997 vs 0.999)
             args.append("--no-flash-attn")
         self.args, self.log, self.env = args, log, env
+        # "prep": "ling3vl" (abyss-vision, Ling-3.x): the picture goes to the encoder resized here (prepare)
+        self.prep, self.cap = cfg.get("prep"), int(cfg.get("max_tokens") or 4096)
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.proc = None
         self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
@@ -1458,6 +1463,38 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
+    @staticmethod
+    def prepare(data: bytes, cap: int) -> bytes:
+        """abyss-vision's input (Ling-3.x): int32 {'LVI1', width, height} + RGB bytes, resized as the HF processor does
+        (BailingMM2ImageProcessor: smart_resize - both sides multiples of 32, 4096 pixels at least, cap image tokens
+        (cap * 32 * 32 pixels) at most, the aspect kept - then PIL's bicubic).  tools/vision/ling3vl_ref.py does the
+        same for its reference."""
+        try:
+            import io
+            from PIL import Image
+        except ImportError:
+            raise ValueError("Ling's images need Pillow (python -m pip install pillow)") from None
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+        except Exception as e:
+            raise ValueError(f"the image could not be read ({e})") from None
+        im = im.convert("RGB")
+        w, h = im.size
+        if min(w, h) < 1 or max(w, h) / min(w, h) > 200:
+            raise ValueError("the image's aspect ratio must be under 200")
+        f, lo, hi = 32, 4096, max(4, int(cap)) * 32 * 32
+        rh, rw = round(h / f) * f, round(w / f) * f
+        if rh * rw > hi:
+            beta = math.sqrt(h * w / hi)
+            rh, rw = max(f, math.floor(h / beta / f) * f), max(f, math.floor(w / beta / f) * f)
+        elif rh * rw < lo:
+            beta = math.sqrt(lo / (h * w))
+            rh, rw = math.ceil(h * beta / f) * f, math.ceil(w * beta / f) * f
+        if (rw, rh) != (w, h):
+            im = im.resize((rw, rh), Image.BICUBIC)
+        return struct.pack("<3i", 0x3149564C, rw, rh) + im.tobytes()
+
     def encode(self, source: str) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens)."""
         data = self.normalize(self.load(source))
@@ -1468,7 +1505,7 @@ class Vision:
             if self.proc is None:
                 self._start()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
-            img.write_bytes(data)
+            img.write_bytes(self.prepare(data, self.cap) if self.prep == "ling3vl" else data)
             self.proc.stdin.write(f"ENC {img} {out}\n")
             self.proc.stdin.flush()
             try:   # (an encoder that never answers - a GPU hang - is ended and started again by the next picture)
@@ -2440,6 +2477,8 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
+        if getattr(self.template, "ling", False):   # (the sentinels hide a message's own markers: these are the template's)
+            prompt = prompt.replace(LING_IMAGE, LING_IMAGE + "\n")
         prompt, spans = (prompt, []) if raw else self.guard.restore(prompt)
         if not v41_images:
             return self.tok.encode_spans(prompt, spans), prefill

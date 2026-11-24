@@ -119,6 +119,9 @@ class ChatTemplate:
         # goes into a system message "Thinking effort level: <n>"; thinking off is "none" (the model may still think
         # briefly - the server reads its messages either way)
         self.ink = "Thinking effort level" in self.source and "effort_map" in self.source
+        # Ling-3.x (Bailing V3): <role>HUMAN</role> turns; its processor writes a newline after each picture's
+        # <|vision_end|> (BailingMM2Processor._expand_image_tokens), which the template itself does not
+        self.ling = "<role>HUMAN</role>" in self.source and "<|role_end|>" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:

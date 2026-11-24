@@ -110,8 +110,8 @@ tok/s; RTX 3090 (all in VRAM): decode 104 / 114 tok/s, the same prompt 1,700-1,9
 ```
 
 Ling-3.2-air (inclusionAI, `bailingmoe3`, beta from this version; [the numbers](MODELS.md#ling-32-air-beta-unreleased)):
-bartowski's public Q4_K_M (3 shards, 80.4 GB), packed as it is, for a 24-32 GB GPU + 64-96 GB RAM. Text only, no MTP
-drafter yet; conversation slots as on Qwen3.8 (`STRATA_GLM_SLOTS`). The config takes the model's sampling (temperature 1.0, top-p 0.95, top-k
+bartowski's public Q4_K_M (3 shards, 80.4 GB), packed as it is, for a 24-32 GB GPU + 64-96 GB RAM. It reads images (NVIDIA; the setup asks, see
+[images](SETTINGS.md#images-on-ling-32-air)); no MTP drafter yet; conversation slots as on Qwen3.8 (`STRATA_GLM_SLOTS`). The config takes the model's sampling (temperature 1.0, top-p 0.95, top-k
 20). RTX 5090 + 123 GB RAM: a 4K prompt 2,061 tok/s, decode 142.8 tok/s; 16K 3,092 / 120.7. In the server, expect the
 first answers after the very first start to be slower: 8 chat answers (EN / JA / code, thinking on, 200-700 tokens)
 decoded at 88-116 tok/s (median 99), TTFT 0.16-0.38 s. The engine learns this machine's expert usage as it answers (the
@@ -125,6 +125,12 @@ takes bartowski's other files (IQ1_S to Q8_0, bf16) by name, untested:
 ./setup-deepseek.sh --model ling32air --download-model                 # Ling-3.2-air-Q4_K_M (80.4 GB)
 ./setup-deepseek.sh --model ling32air --quant IQ4_XS --download-model  # another file of the repo (untested)
 ```
+
+Images on Ling-3.2-air: the setup also offers bartowski's `mmproj-Ling-3.2-air-f16.gguf` (0.87 GB) and runs it with
+`abyss-vision`, Abyss's own encoder for this model (compiled with the engine, no llama.cpp). OpenAI `image_url` items and
+Anthropic `image` blocks, also inside a `tool_result`, reach the model. RTX 5090: a picture of 240-375 image tokens
+encodes in 23-42 ms; a whole answer with one picture (prompt 274-411 tokens, 36-67 tokens out) took 1.1-2.4 s. Text-only
+requests give the same tokens as without images.
 
 Qwen3.5-9B QSA, a small dense model with a QSA indexer (zephel01's, BETA; [Qwen3.5-9B QSA](#qwen35-9b-qsa)): the whole
 file goes on one GPU of 11 GB or more, which holds a context up to 128K (measured with the VRAM capped at 11 GB). The setup

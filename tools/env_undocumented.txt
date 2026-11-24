@@ -148,6 +148,7 @@ STRATA_GLM_RAM_SLACK  # src/core/glm_fast_path.cu
 STRATA_GLM_ROUTE_EARLY  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_ROUTE_LOG  # src/core/glm_fast_path.cu
 STRATA_GLM_SCORE_DUMP  # src/program/generate.cpp
+STRATA_GLM_SCORE_IMAGES  # src/program/generate.cpp
 STRATA_GLM_SCORE_PREFILL  # src/program/generate.cpp
 STRATA_GLM_SCORE_REF  # src/program/generate.cpp
 STRATA_GLM_SCORE_TOPK  # src/program/generate.cpp

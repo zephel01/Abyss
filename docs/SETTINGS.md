@@ -184,7 +184,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | `installer` | what setup chose (the model and quant, for the Monitor's label); setup writes it, nothing reads it to decide | `{"quant": "UD-IQ2_XXS"}` |
 
 **Images (GLM-5.3-Flash by setup; DeepSeek V4.1 by hand, see below)**: `vision` holds the image encoder's settings (`exe`, `mmproj`, `model`, `gpu`,
-`resident`, `threads`, `max_tokens`, `no_flash_attn`). `./abyss.sh` writes it; it is normally left alone.
+`resident`, `threads`, `max_tokens`, `no_flash_attn`, `prep`). `./abyss.sh` writes it; it is normally left alone.
 
 Unknown keys are ignored. A bad value in `sampling`, though, stops the server from starting (so a typo cannot quietly
 change how it answers).
@@ -222,3 +222,16 @@ Setup does not install the image encoder for DeepSeek V4.1; add the `vision` ent
 ### Images on Qwen3.8-27B
 
 `./setup-deepseek.sh --model qwen38-27b` asks whether to set up images (default yes; `--no-vision` skips it): it downloads unsloth's `mmproj-F16.gguf` (0.93 GB, size and SHA-256 checked), builds `strata-vision` once (llama.cpp's image library, 10-20 minutes) and writes the `vision` entry: `exe` the encoder, `mmproj` the projector file, `model` the model's GGUF (the encoder reads only its vocabulary). The dense model has no expert cache to lend the encoder, so on a GPU with ~1.5 GB to spare beside the model and its context the entry says `"gpu": true, "resident": true` (the encoder stays on the GPU, ~1 GB); otherwise `"gpu": false` (it runs on the CPU, slower). Images go in as OpenAI `image_url` items or Anthropic `image` blocks; the engine places each picture's rows on its 2-D grid (M-RoPE: the rotary positions follow the GGUF's `qwen35.rope.dimension_sections`), and the text after it continues from there. Text-only requests are unchanged. HIP builds and Qwen3.8-Flash-Next have no images; the MoE qwen35 models (Ornith) take the same path but are untested (no projector file was tried).
+
+### Images on Ling-3.2-air
+
+`./setup-deepseek.sh --model ling32air` asks whether to set up images (default yes; `--no-vision` skips it): it downloads
+bartowski's `mmproj-Ling-3.2-air-f16.gguf` (0.87 GB) and writes `vision` with `exe` = `abyss-vision`, Abyss's own encoder
+for this model (`src/vision/abyss_vision.cu`, compiled with the engine: no llama.cpp build), `"gpu": true` and
+`"prep": "ling3vl"` (the server resizes the picture as the model's processor does - both sides multiples of 32, at most
+`max_tokens` image tokens, 4096 by default - and hands the encoder its pixels). The encoder starts when a picture arrives,
+in GPU memory the engine lends it from its expert cache (RTX 5090: 2.91 GB measured at 4096 image tokens), and ends after
+the request's pictures. Pictures come as OpenAI `image_url` items and Anthropic `image` blocks, also inside a
+`tool_result`. The rows take Ling's own positions (HF's `get_rope_index`: the grid centred on the picture's position,
+the text after it one position later). Text-only requests are unchanged (the same tokens as before). NVIDIA only for now;
+the prebuilt engine does not carry `abyss-vision` yet, so images need the compiled engine.

@@ -53,6 +53,29 @@ static std::vector<float> hy4v_axis_weights(int n, int edge) {
 """
 
 
+# clip_n_output_tokens: hy4v's own count (the newline column), and the Qwen-VL group it must not end up in
+NPATCH = ("        case PROJECTOR_TYPE_HY4V:\n"
+          "            {\n"
+          "                const int m = params.n_merge;\n"
+          "                n_patches = (img->nx() / (params.patch_size * m) + 1) * (img->ny() / (params.patch_size * m));\n"
+          "            } break;\n")
+QWEN_GROUP = ("        case PROJECTOR_TYPE_QWEN2VL:\n"
+              "        case PROJECTOR_TYPE_QWEN25VL:\n"
+              "        case PROJECTOR_TYPE_QWEN3VL:\n"
+              "        case PROJECTOR_TYPE_EXAONE4_5:\n"
+              "        case PROJECTOR_TYPE_MIMOVL:\n"
+              "        case PROJECTOR_TYPE_MINIMAX_M3:\n")
+
+
+def repair_npatch(path: pathlib.Path) -> None:
+    """A tree patched up to v1.3.201 has hy4v's count right after the Qwen-VL group's labels, so those projectors
+    (Qwen3.8's qwen3vl_merger among them) counted (nx + 1) x ny tokens for an nx x ny grid and strata-vision refused
+    the picture ("the image grid is not rectangular"): the block moves in front of the group."""
+    s = path.read_text(encoding="utf-8")
+    if QWEN_GROUP + NPATCH in s:
+        path.write_text(s.replace(QWEN_GROUP + NPATCH, NPATCH + QWEN_GROUP), encoding="utf-8", newline="\n")
+
+
 def main():
     root = pathlib.Path(sys.argv[1])
     m = root / "tools" / "mtmd"
@@ -83,6 +106,7 @@ def main():
     shutil.copy2(here / "hy4v" / "hy4v.cpp", m / "models" / "hy4v.cpp")
 
     clip = m / "clip.cpp"
+    repair_npatch(clip)
     edit(clip, [
         # the graph
         ("        case PROJECTOR_TYPE_GLM5NEXT:\n"
@@ -165,23 +189,9 @@ def main():
          "    switch (proj) {\n"
          "        case PROJECTOR_TYPE_HY4V:\n"
          "            return (img->ny() / params.patch_size) / params.n_merge;\n"),
-        ("        case PROJECTOR_TYPE_GLM4V:\n"
-         "        case PROJECTOR_TYPE_GLM5NEXT:\n"
-         "        case PROJECTOR_TYPE_YOUTUVL:\n"
-         "        case PROJECTOR_TYPE_MUSE_GLIMMER:\n"
-         "            {\n"
-         "                // dynamic size (2 conv, so double patch size)\n",
-         "        case PROJECTOR_TYPE_HY4V:\n"
-         "            {\n"
-         "                const int m = params.n_merge;\n"
-         "                n_patches = (img->nx() / (params.patch_size * m) + 1) * (img->ny() / (params.patch_size * m));\n"
-         "            } break;\n"
-         "        case PROJECTOR_TYPE_GLM4V:\n"
-         "        case PROJECTOR_TYPE_GLM5NEXT:\n"
-         "        case PROJECTOR_TYPE_YOUTUVL:\n"
-         "        case PROJECTOR_TYPE_MUSE_GLIMMER:\n"
-         "            {\n"
-         "                // dynamic size (2 conv, so double patch size)\n"),
+        # (before the Qwen-VL group, whose labels run on into GLM4V's block: inserted between them, as up to v1.3.201,
+        # Qwen2/3-VL, EXAONE, MiMo-VL and MiniMax fell into this block and got the extra column - repaired above)
+        (QWEN_GROUP + "        case PROJECTOR_TYPE_GLM4V:\n", NPATCH + QWEN_GROUP + "        case PROJECTOR_TYPE_GLM4V:\n"),
         # the inputs: the position grid's resampling weights
         ("        case PROJECTOR_TYPE_QWEN2VL:\n"
          "        case PROJECTOR_TYPE_QWEN3VL:\n"

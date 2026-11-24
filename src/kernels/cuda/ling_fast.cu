@@ -1,5 +1,6 @@
 // src/kernels/cuda/ling_fast.cu - see include/strata/kernels/ling_fast.hpp.
 #include "strata/kernels/ling_fast.hpp"
+#include "strata/kernels/mrope.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -104,10 +105,18 @@ __global__ void kda_prep_kernel(const __grid_constant__ KdaArgs a) {
 }
 
 // ---------------------------------------------------------------- MLA
-__global__ void rope_table_kernel(int64_t pos, double base, float2* cs) {
+// Images (mrope.hpp's table set: pos is a cell index, the table holds each cell's (t, h, w)): HF's apply_video_rope
+// with mrope_section [8, 12, 12] - of the 32 rotated pairs the first 24 alternate h (even) and w (odd), the last 8
+// take t.  Without a table (text) the position is the cell, the same arithmetic as before.
+__device__ __forceinline__ double ling_rope_pos(const int32_t* tab, int64_t pos, int j) {
+    if (tab == nullptr) return (double) pos;
+    return (double) __ldg(tab + (size_t) pos * 3 + (j < 24 ? 1 + (j & 1) : 0));
+}
+
+__global__ void rope_table_kernel(int64_t pos, double base, float2* cs, const int32_t* tab) {
     const int j = threadIdx.x;
     if (j >= kRot / 2) return;
-    const double th = (double) pos * pow(base, -2.0 * (double) j / (double) kRot);
+    const double th = ling_rope_pos(tab, pos, j) * pow(base, -2.0 * (double) j / (double) kRot);
     cs[j] = make_float2((float) cos(th), (float) sin(th));
 }
 
@@ -299,13 +308,14 @@ __global__ void group_bias_kernel(const float* __restrict__ logits, const float*
 // one block a row (position p0 + t): the cache row (the latent's rms norm, the key's rope) and the q heads' rope parts -
 // mla_prep's arithmetic with the position's table computed in the block (rope_table's)
 __global__ void mla_prep_rows_kernel(float* q, int ldq, const float* __restrict__ kv, const float* __restrict__ kv_norm,
-                                     float eps, int64_t p0, double base, uint16_t* __restrict__ cache) {
+                                     float eps, int64_t p0, double base, uint16_t* __restrict__ cache,
+                                     const int32_t* tab) {
     __shared__ float sred[32];
     __shared__ float2 cs[kRot / 2];
     const int t = blockIdx.x, tid = threadIdx.x;
     const int64_t pos = p0 + t;
     if (tid < kRot / 2) {
-        const double th = (double) pos * pow(base, -2.0 * (double) tid / (double) kRot);
+        const double th = ling_rope_pos(tab, pos, tid) * pow(base, -2.0 * (double) tid / (double) kRot);
         cs[tid] = make_float2((float) cos(th), (float) sin(th));
     }
     __syncthreads();
@@ -473,7 +483,7 @@ void kda_prep(const float* proj, const float* const conv_w[3], float* conv_state
 }
 
 void rope_table(int64_t pos, double base, float2* cs, cudaStream_t s) {
-    rope_table_kernel<<<1, 32, 0, s>>>(pos, base, cs);
+    rope_table_kernel<<<1, 32, 0, s>>>(pos, base, cs, mrope_table());
     check("rope_table");
 }
 
@@ -512,7 +522,7 @@ void group_bias(const float* logits, const float* bias, int n_expert, int n_grou
 void mla_prep_rows(float* q, int ldq, const float* kv, const float* kv_norm, float eps, int64_t p0, int T, double base,
                    uint16_t* cache, int n_head, cudaStream_t s) {
     if (T <= 0) return;
-    mla_prep_rows_kernel<<<dim3(T, 1 + n_head), kLat, 0, s>>>(q, ldq, kv, kv_norm, eps, p0, base, cache);
+    mla_prep_rows_kernel<<<dim3(T, 1 + n_head), kLat, 0, s>>>(q, ldq, kv, kv_norm, eps, p0, base, cache, mrope_table());
     check("mla_prep_rows");
 }
 

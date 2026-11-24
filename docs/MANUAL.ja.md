@@ -108,7 +108,7 @@ RTX 3090（全部 VRAM）: decode 104 / 114 tok/s、同じプロンプト 1,700�
 
 Ling-3.2-air（inclusionAI、`bailingmoe3`。この版からベータ。[数字](MODELS.ja.md#ling-32-airベータ未リリース)）:
 bartowski が公開している Q4_K_M（3 分割、80.4 GB）をそのまま pack する。GPU 24〜32 GB + RAM 64〜96 GB 向け。
-テキストのみ、MTP の下書き役はまだ無い。会話スロットは Qwen3.8 と同じ（`STRATA_GLM_SLOTS`）。設定にはモデルのサンプリング（temperature 1.0、top-p 0.95、
+画像も読める（NVIDIA。セットアップが聞く。[画像](SETTINGS.ja.md#ling-32-air-の画像)）。MTP の下書き役はまだ無い。会話スロットは Qwen3.8 と同じ（`STRATA_GLM_SLOTS`）。設定にはモデルのサンプリング（temperature 1.0、top-p 0.95、
 top-k 20）が入る。RTX 5090 + RAM 123 GB: 4K のプロンプト 2,061 tok/s、decode 142.8 tok/s。16K では 3,092 / 120.7。
 
 サーバーでは、いちばん最初の起動直後の回答が遅めになる。チャット 8 回（英語 / 日本語 / コード、thinking あり、
@@ -124,6 +124,12 @@ top-k 20）が入る。RTX 5090 + RAM 123 GB: 4K のプロンプト 2,061 tok/s�
 ./setup-deepseek.sh --model ling32air --download-model                 # Ling-3.2-air-Q4_K_M（80.4 GB）
 ./setup-deepseek.sh --model ling32air --quant IQ4_XS --download-model  # repo の他のファイル（未確認）
 ```
+
+Ling-3.2-air の画像: セットアップは bartowski の `mmproj-Ling-3.2-air-f16.gguf`（0.87 GB）も入れるかを聞き、
+`abyss-vision`（このモデル用に Abyss が自前で書いたエンコーダー。エンジンと一緒にコンパイルされ、llama.cpp は使わない）で動かす。
+OpenAI の `image_url`、Anthropic の `image` ブロック（`tool_result` の中も）がモデルに届く。RTX 5090 で、画像トークン
+240〜375 の画像のエンコードは 23〜42 ms。画像 1 枚つきの回答全体（プロンプト 274〜411 トークン、出力 36〜67 トークン）は
+1.1〜2.4 秒だった。文字だけの要求は、画像なしのときと同じトークンになる。
 
 QSA indexer 付きの小さい dense モデル Qwen3.5-9B QSA（zephel01 の BETA。[Qwen3.5-9B QSA](#qwen35-9b-qsa)）は、ファイル全体を
 11 GB 以上の GPU 1 枚に載せる。その GPU で 128K までの文脈が動く（VRAM を 11 GB に制限して計測）。それより小さい GPU では

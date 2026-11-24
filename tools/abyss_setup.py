@@ -14,7 +14,7 @@
                                              for a 12-32 GB GPU + 32 GB RAM (text only)
     ./setup-deepseek.sh --model inkling2mini-abl  the same model abliterated, orcarouter's Mix-16G (--quant Mix-12G: the
                                              11.6 GB file) for a 12-24 GB GPU + 32 GB RAM (text only)
-    ./setup-deepseek.sh --model ling32air   Ling-3.2-air (inclusionAI, 512 experts, KDA + MLA; BETA, text only), bartowski's
+    ./setup-deepseek.sh --model ling32air   Ling-3.2-air (inclusionAI, 512 experts, KDA + MLA; BETA, images too), bartowski's
                                              Q4_K_M for a 24-32 GB GPU + 64-96 GB RAM
     ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for an 8 GB+ GPU (FFN partly in RAM under ~20 GB)
     ./setup-deepseek.sh --model qwen35-9b-qsa  Qwen3.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
@@ -103,6 +103,7 @@ DENSE27_PICKS = ("UD-IQ2_XXS", "UD-IQ3_XXS", "UD-Q4_K_XL", "UD-Q6_K", "Q8_0")
 # unsloth's separate NextN block for the files without one, and the image encoder's weights (Qwen3.8-27B reads images)
 DENSE27_MTP = "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
 DENSE27_MMPROJ = "mmproj-F16.gguf"
+LING32_MMPROJ = "mmproj-Ling-3.2-air-f16.gguf"   # (bartowski's repo, top level: 0.87 GB, the vision tower + projector)
 # Qwen3.5-9B QSA (zephel01's, BETA, v1.3.162): the GPU size each context needs.  Measured on an RTX 5090, Q4_K_M, MTP
 # drafts on (bench/train9b/results.md, 2026-11-17): with no cap the engine peaks at 11.17 / 12.40 / 14.86 GB at 32K / 64K /
 # 128K, 4 GB of it the prompt path's buffer, which it sizes from the free VRAM; capped with STRATA_GLM_VRAM_GB=15 a 128K
@@ -219,7 +220,8 @@ MODELS = {
                          "title": "Inkling 2 Mini abliterated", "env": {}, "gb": 16, "pack_args": [],
                          "sampling": {"temperature": 1.0, "top_k": 50}},
     # Ling-3.2-air (inclusionAI, gguf arch bailingmoe3: the qwen35moe engine path's ling layers - KDA + MLA, 512 experts,
-    # BETA, text only): bartowski's GGUFs, a folder of shards a quant (the small ones one file at the repo's top level).
+    # BETA; images with bartowski's mmproj and abyss-vision): bartowski's GGUFs, a folder of shards a quant (the small
+    # ones one file at the repo's top level).
     # 80.4 GB at Q4_K_M: a 24-32 GB GPU + 64-96 GB RAM holds the experts in VRAM + RAM.  No MTP drafter yet; the file's
     # rope.dimension_sections (llama.cpp's VL conversion) is ignored - the engine rotates the model's interleaved pairs.
     # 2026-11-24, RTX 5090 + RAM: decode 171 tok/s after a 4K prompt, prompts 2.2K tok/s at 4K, 3.3K at 16K
@@ -482,7 +484,8 @@ def build_engine(arch: str | None, gpus, nvcc_arg: str | None = None) -> Path:
         S.say(f"  Configuring for {names} (CUDA arch {cc}) ...")
         S.run(conf + S.cmake_fresh(ROOT / "build", conf), quiet=True)
     S.say("  Compiling the engine (a few minutes the first time, only what changed later) ...")
-    S.run([cmake, "--build", ROOT / "build", "--target", "strata", "abyss_gpu_tune", "-j", str(max(2, (os.cpu_count() or 4)))],
+    S.run([cmake, "--build", ROOT / "build", "--target", "strata", "abyss_gpu_tune", "abyss_vision", "-j",
+           str(max(2, (os.cpu_count() or 4)))],
           quiet=True)
     S.ok(f"engine: {exe}")
     return exe
@@ -1174,11 +1177,41 @@ def vision_27b_step(a, repo: str, mdir: Path, gguf: Path, cfg: Path, gpus, backe
     S.ok(f"images: {M.VEXE} with {mmproj.name} ({cfg.name})")
 
 
+def vision_ling_step(a, repo: str, mdir: Path, gguf: Path, cfg: Path, backend: str) -> None:
+    """Ling-3.2-air reads images: bartowski's mmproj-Ling-3.2-air-f16.gguf (0.87 GB) and abyss-vision, Abyss's own
+    encoder (src/vision/abyss_vision.cu, compiled with the engine - no llama.cpp) - asked, default yes.  The encoder
+    starts while a request's pictures are encoded, in GPU memory the model lends it (the expert cache's tail), as
+    GLM-5.3-Flash's does.  --no-vision, an AMD GPU (untested) or a prebuilt engine without abyss-vision skip it."""
+    S.step(9, "images (the vision encoder)")
+    conf = json.loads(cfg.read_text(encoding="utf-8"))
+    if getattr(a, "no_vision", False):
+        S.ok("skipped (--no-vision): the model reads text only")
+        return
+    if backend != "cuda":
+        S.ok("images: NVIDIA only for now - the model reads text only")
+        return
+    exe = Path(conf["exe"]).with_name("abyss-vision" + (".exe" if WIN else ""))
+    if not exe.exists():
+        S.ok("images: this engine has no abyss-vision (the prebuilt engine does not carry it yet) - the model reads "
+             "text only")
+        return
+    if conf.get("vision") and Path(conf["vision"].get("mmproj", "")).exists():
+        S.ok(f"images: {conf['vision']['mmproj']} (already set up)")
+        return
+    if S.ask("  Set up images (the vision encoder's weights: a 0.87 GB download, once)?", ["y", "n"], "y", a.yes) != "y":
+        S.ok("images: not set up - the model reads text only (setup again asks)")
+        return
+    mmproj = side_file(a, repo, LING32_MMPROJ, mdir, "the image encoder's weights")
+    conf["vision"] = {"exe": str(exe), "mmproj": str(mmproj), "model": str(gguf), "gpu": True, "prep": "ling3vl"}
+    cfg.write_text(json.dumps(conf, indent=1) + "\n", encoding="utf-8")
+    S.ok(f"images: {exe.name} with {mmproj.name} ({cfg.name})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, text only), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
                     "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
@@ -1194,7 +1227,7 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, help="the GPU, as nvidia-smi numbers it (default: the one with the most VRAM)")
     ap.add_argument("--gpus", help="several GPUs for a layer split, as nvidia-smi numbers them (\"0,1\"; the first is "
                                    "the main card), or \"all\": every NVIDIA GPU (default: one GPU, --gpu)")
-    ap.add_argument("--no-vision", action="store_true", help="qwen38-27b: skip the image encoder (text only)")
+    ap.add_argument("--no-vision", action="store_true", help="qwen38-27b, ling32air: skip the image encoder (text only)")
     ap.add_argument("--arch", help="the CUDA architecture to compile for (default: the GPU's; 120a on RTX 50)")
     ap.add_argument("--nvcc", help="the CUDA compiler to build with (default: nvcc on PATH, else /usr/local/cuda); a V100 "
                                    "needs a CUDA 12 one, e.g. /usr/local/cuda-12.9/bin/nvcc")
@@ -1424,6 +1457,8 @@ def main() -> int:
         fits = (resident and backend == "cuda" and
                 (gpus[0].get("vram_gb") or 0.0) - need >= 1.5 + DFLASH27_GB)
         dflash27_step(a, data, cfg, gpus, fits)
+    if a.model == "ling32air":
+        vision_ling_step(a, repo, mdir, mdir / files[0][0], cfg, backend)
 
     S.step(8, "Abyss-tools")
     make_tools(tools)

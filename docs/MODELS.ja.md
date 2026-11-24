@@ -140,7 +140,7 @@ llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL�
 ### Ling-3.2-air（ベータ、未リリース）
 
 inclusionAI の Ling-3.2-air（`bailingmoe3`。KDA の線形 attention 層 35 + MLA 層 7、エキスパート 512、グループ制限つきの
-top-8）。テキストのみ。まだ無いもの: MTP ブロック、画像。会話スロットは Qwen3.8 / Ornith と同じ（[MANUAL](MANUAL.ja.md)、`STRATA_GLM_SLOTS`）。品質: 混在テキストの 96 位置での
+top-8）。画像も読める（下記）。まだ無いもの: MTP ブロック。会話スロットは Qwen3.8 / Ornith と同じ（[MANUAL](MANUAL.ja.md)、`STRATA_GLM_SLOTS`）。品質: 混在テキストの 96 位置での
 KL。参照は HF のモデルコード（`modeling_bailing_moe_v3_vl.py` と fla の KDA 再帰）の数式から書いた float64 の numpy の
 forward を、量子化を戻した重みで回したもの。速度: RTX 5090（PCIe Gen4 x4）+ RAM 123 GB、iGPU レーンなし、512 トークン、
 3 回の中央値。
@@ -153,6 +153,20 @@ forward を、量子化を戻した重みで回したもの。速度: RTX 5090�
 GGUF の `rope.dimension_sections`（[8, 12, 12, 0]）は llama.cpp が VL モデルを変換したときに書くもので、llama.cpp は
 M-RoPE を NEOX のペアで当てる。モデルは隣り合うペア（interleaved）で回すので、Abyss はモデルに合わせる（このキーは
 読まない。同じテキストでの llama.cpp の Q4_K_M の perplexity: sections ありで 15.45、0 にして 14.78）。
+
+画像（bartowski の `mmproj-Ling-3.2-air-f16.gguf`、0.87 GB。Abyss 自前の CUDA エンコーダー `abyss-vision` で動かす。
+RTX 5090。テスト画像は 3 枚: 赤い丸 4 + 青い四角 2 + 緑の三角 1、日本語と英語の文字 3 行、棒グラフ 1 月 120 / 2 月 260 / 3 月 180）:
+
+| 確認 | 結果 |
+| --- | --- |
+| mmproj と HF の重み（safetensors の画像タワーと変換器） | テンソル 334 本。差の最大は、そのテンソルの最大値の 6.8e-7（BF16 → F16 の丸め） |
+| エンコーダーの行と、HF のコードから書いた float64 の numpy エンコーダー（`tools/vision/ling3vl_ref.py`） | cosine 最小 0.99975、平均 0.999998。相対誤差 1.4e-3〜2.1e-3。1 枚 23〜42 ms（画像トークン 240〜375） |
+| 回答の最初の 16 トークンと、同じ画像の行と HF の位置で回した float64 の forward | KL 0.000001 / 0.000006 / 0.0103（トークン経路）、0.000000 / 0.000069 / 0.0065（プロンプト経路）。48 位置すべてで最上位のトークンが一致。画像の行を入れないと 0.67 |
+| サーバー経由の回答（貪欲、thinking なし） | 3 枚とも正解: 個数、文字は一字一句（日本語も）、3 つの値。Anthropic の `tool_result` の画像からも正解 |
+
+画像の行は HF の `get_rope_index` の位置を取る。これは Qwen-VL と違う。格子は画像自身の位置を中心に置かれ、画像のあとの文字は
+1 つ先の位置から続く（Qwen-VL は角から並べ、あとの文字は max(幅, 高さ) 先から）。この回答では、2 つの規則の差は float64 の
+forward で KL 0.006 で、エンジン自身の誤差と同じくらいの大きさ。そのため上の短い確認では 2 つを見分けられない。規則は HF のコードに従った。
 
 ### Qwen3.8-Flash-Next（qwen4exp）
 

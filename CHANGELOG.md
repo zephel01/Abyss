@@ -9,6 +9,30 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Added
+
+- Ling-3.2-air reads images (beta, NVIDIA): `./setup-deepseek.sh --model ling32air` asks to fetch bartowski's
+  `mmproj-Ling-3.2-air-f16.gguf` (0.87 GB) and runs it with `abyss-vision`, Abyss's own CUDA encoder for this model
+  (`src/vision/abyss_vision.cu`: the 27-block vision tower, its 2-D rotary and the 2x2 merger on cuBLAS, compiled with the
+  engine - no llama.cpp; the server resizes pictures as the model's processor does). OpenAI `image_url`, Anthropic
+  `image` blocks and images inside a `tool_result` reach the model. The picture's rows take HF's `get_rope_index`
+  positions (the grid centred on the picture's position, the text after it one position later - not Qwen-VL's rule),
+  read by the MLA layers' rotary with HF's pair-to-axis order. Measured on an RTX 5090 with three test pictures (shapes
+  to count, Japanese + English text, a bar chart): the encoder's rows against a float64 numpy encoder written from the
+  HF code, cosine 0.99975 at worst; the first 16 answer tokens against a float64 forward of the model with the same rows
+  and positions, KL 0.000001-0.0103 (token path) / 0.000000-0.0065 (prompt path), the same top token at all 48 (0.67
+  without the image rows); a picture encodes in 23-42 ms, a whole answer with one picture took 1.1-2.4 s; all three
+  answered right (the counts, the text word for word, the chart's values). The encoder starts when a picture comes, in
+  2.91 GB the engine lends it (4096 image tokens). Text-only output is unchanged (Ling md5 on 4 prompts as v1.3.201).
+
+### Fixed
+
+- `tools/vision/hy4v_patch.py` put Hy4's image-token count right after the Qwen-VL group's `case` labels in llama.cpp's
+  `clip.cpp`, so Qwen2/2.5/3-VL, EXAONE 4.5, MiMo-VL and MiniMax-M3 fell into it and counted one extra column per row
+  (found reading the patched source of v1.3.177 and later, not reproduced in a run; strata-vision refuses such a count
+  as "the image grid is not rectangular", which would stop Qwen3.8-27B pictures). The count now goes in front of the
+  group; a tree patched before is repaired when the patch runs again.
+
 ## v1.3.201 - 2026-11-24
 
 Ling-3.2-air (inclusionAI) runs as a text-only beta from bartowski's public Q4_K_M as it is: on an RTX 5090 + RAM a 4K

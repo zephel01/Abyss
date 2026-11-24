@@ -143,7 +143,7 @@ against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token E
 ### Ling-3.2-air (beta, unreleased)
 
 inclusionAI's Ling-3.2-air (`bailingmoe3`: 35 KDA linear-attention layers + 7 MLA layers, 512 experts, top-8 with
-group-limited routing), text only. Not yet: its MTP block, images. Conversation slots as on
+group-limited routing); it reads images (below). Not yet: its MTP block. Conversation slots as on
 Qwen3.8 / Ornith ([MANUAL](MANUAL.md), `STRATA_GLM_SLOTS`). Quality: KL on 96 positions of a mixed text against a float64 numpy forward written from the HF modeling
 code (`modeling_bailing_moe_v3_vl.py` and fla's KDA recurrence), run on the dequantized weights. Speeds: RTX 5090
 (PCIe Gen4 x4) + 123 GB RAM, iGPU lane off, 512 tokens, median of 3.
@@ -156,6 +156,22 @@ code (`modeling_bailing_moe_v3_vl.py` and fla's KDA recurrence), run on the dequ
 The GGUF's `rope.dimension_sections` ([8, 12, 12, 0]) comes from llama.cpp's conversion of the VL model, which applies
 M-RoPE with NEOX pairs; the model rotates interleaved pairs, and Abyss follows the model (it does not read the key;
 perplexity of a Q4_K_M in llama.cpp on the same text: 15.45 with the sections, 14.78 with them zeroed).
+
+Images (bartowski's `mmproj-Ling-3.2-air-f16.gguf`, 0.87 GB, run by `abyss-vision`, Abyss's own CUDA encoder; RTX 5090,
+three test pictures: 4 red circles + 2 blue squares + 1 green triangle; three lines of Japanese and English text; a
+bar chart Jan 120 / Feb 260 / Mar 180):
+
+| check | result |
+| --- | --- |
+| mmproj against the HF weights (the safetensors files' vision tower and projector) | 334 tensors, worst max abs difference 6.8e-7 of the tensor's largest value (BF16 -> F16 rounding) |
+| encoder rows against a float64 numpy encoder written from the HF code (`tools/vision/ling3vl_ref.py`) | cosine min 0.99975, mean 0.999998; relative error 1.4e-3 to 2.1e-3; 23-42 ms a picture (240-375 image tokens) |
+| first 16 answer tokens against a float64 forward with the same image rows and HF's positions | KL 0.000001 / 0.000006 / 0.0103 (token path), 0.000000 / 0.000069 / 0.0065 (prompt path), the same top token at all 48; without the image rows 0.67 |
+| answers through the server (greedy, thinking off) | all three right: the counts, the text word for word (Japanese included), the three values; also from an Anthropic `tool_result` image |
+
+The picture's rows take HF's `get_rope_index` positions, which differ from Qwen-VL's: the grid is centred on the
+picture's own position and the text after it goes on one position later (Qwen-VL: from the corner, and the text after it
+max(width, height) later). On these answers the two rules differ by KL 0.006 in the float64 forward, the size of the
+engine's own error, so the short check above does not separate them; the rule follows the HF code.
 
 ### Qwen3.8-Flash-Next (qwen4exp)
 

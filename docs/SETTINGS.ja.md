@@ -183,7 +183,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `installer` | セットアップが選んだもの（モデルと量子化。Monitor の表示名用）。セットアップが書き、判断には使わない | `{"quant": "UD-IQ2_XXS"}` |
 
 **画像（セットアップが入れるのは GLM-5.3-Flash。DeepSeek V4.1 は手で設定、下記）**: `vision` に画像エンコーダーの設定が入ります（`exe`、`mmproj`、`model`、`gpu`、`resident`、
-`threads`、`max_tokens`、`no_flash_attn`）。`./abyss.sh` が書くので、通常は触りません。
+`threads`、`max_tokens`、`no_flash_attn`、`prep`）。`./abyss.sh` が書くので、通常は触りません。
 
 知らない項目は無視されます。ただし `sampling` の値が間違っていると、サーバーは起動しません（設定の書き間違いで答え方が
 黙って変わらないようにするためです）。
@@ -221,3 +221,7 @@ DeepSeek V4.1 の画像エンコーダーは、セットアップでは入りま
 ### Qwen3.8-27B の画像
 
 `./setup-deepseek.sh --model qwen38-27b` は、画像を使えるようにするかを聞きます（既定は「はい」。`--no-vision` で飛ばす）。unsloth の `mmproj-F16.gguf`（0.93 GB。大きさと SHA-256 を確かめる）をダウンロードし、`strata-vision`（llama.cpp の画像ライブラリ。初回だけ 10〜20 分）を作り、`vision` を書きます。`exe` はエンコーダー、`mmproj` は変換器のファイル、`model` はモデルの GGUF です（エンコーダーは語彙だけを読みます）。dense のモデルにはエンコーダーに貸すエキスパートのキャッシュがないため、モデルと文脈のほかに約 1.5 GB 空く GPU では `"gpu": true, "resident": true`（エンコーダーは GPU に置いたまま、約 1 GB）、空かなければ `"gpu": false`（CPU で動く。遅い）と書きます。画像は OpenAI の `image_url`、Anthropic の `image` ブロックで渡します。エンジンは画像の行をその 2 次元の格子に並べ（M-RoPE。回転の位置は GGUF の `qwen35.rope.dimension_sections` に従う）、画像のあとの文字はそこから続けます。文字だけの要求は変わりません。HIP のビルドと Qwen3.8-Flash-Next では画像は使えません。MoE の qwen35（Ornith）も同じ経路を通りますが、未検証です（変換器ファイルは試していない）。
+
+### Ling-3.2-air の画像
+
+`./setup-deepseek.sh --model ling32air` は、画像を使えるようにするかを聞きます（既定は「はい」。`--no-vision` で飛ばす）。bartowski の `mmproj-Ling-3.2-air-f16.gguf`（0.87 GB）をダウンロードし、`vision` を書きます。`exe` は `abyss-vision` で、このモデル用に Abyss が自前で書いたエンコーダーです（`src/vision/abyss_vision.cu`。エンジンと一緒にコンパイルされ、llama.cpp のビルドは要らない）。`"gpu": true` と `"prep": "ling3vl"` も書きます（サーバーが画像をモデルの前処理と同じように縮めてからエンコーダーに渡す。縦横は 32 の倍数、画像トークンは `max_tokens` まで、既定 4096）。エンコーダーは画像が来たときに起動し、エンジンがエキスパートのキャッシュから貸す GPU メモリで動きます（RTX 5090 で、4096 画像トークンのとき 2.91 GB と測った）。その要求の画像が終わると止まります。画像は OpenAI の `image_url`、Anthropic の `image` ブロックで渡します。`tool_result` の中でも使えます。画像の行は Ling 独自の位置を取ります（HF の `get_rope_index`。格子は画像の位置を中心に置かれ、画像のあとの文字は 1 つ先の位置から続く）。文字だけの要求は変わりません（前と同じトークン）。今は NVIDIA だけです。配布しているビルド済みエンジンにはまだ `abyss-vision` が入っていないので、画像にはコンパイルしたエンジンが要ります。

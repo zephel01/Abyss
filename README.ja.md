@@ -79,7 +79,7 @@ QSA indexer 付き：**MiMo-V2.6-Distill-Qwen-9B QSA**（[zephel01 の Q4_K_M](h
 **SenseNova-Loop-9B**（ループする Qwen3.5-9B: 32 ブロックを 56 層として回し、ループの前後を 2 本の流れの mHC でつなぐ。[guideboardlabs の Q4_K_M](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-GGUF)、5.6 GB、`--model sensenova-loop-9b`、v1.3.169）：
 モデル自身の llama.cpp fork との KL は 0.005〜0.009、RTX 5090 で生成は 4K / 32K / 128K で 102 / 97 / 63 tok/s、32K なら 10 GB の GPU で動きます。文字だけです。日本語の回答に中国語の語がときどき混じります（モデル自身の癖です）。詳しくは [MANUAL](docs/MANUAL.ja.md#sensenova-loop-9b)。
 
-**Ling-3.2-air**（inclusionAI、KDA + MLA、エキスパート 512。ベータ、テキストのみ。[bartowski の Q4_K_M](https://huggingface.co/bartowski/Ling-3.2-air-GGUF)、80.4 GB、`--model ling32air`）は GPU 24〜32 GB + RAM 64〜96 GB 向け:
+**Ling-3.2-air**（inclusionAI、KDA + MLA、エキスパート 512。ベータ、画像も読める。[bartowski の Q4_K_M](https://huggingface.co/bartowski/Ling-3.2-air-GGUF)、80.4 GB、`--model ling32air`）は GPU 24〜32 GB + RAM 64〜96 GB 向け:
 RTX 5090 + RAM 123 GB、512 トークン: 4K のプロンプト 2,061 tok/s、decode 142.8 tok/s。16K では 3,092 / 120.7。詳しくは [docs/MODELS](docs/MODELS.ja.md#ling-32-airベータ未リリース)。
 
 **Laguna-S-2.1**（poolside の 118B MoE、[docs/laguna](docs/laguna/README.ja.md)、unsloth の UD-IQ4_XS、58 GB、`--model laguna`、v1.3.140）：RTX 5090 を 16 / 24 / 32 GB に制限、
@@ -362,7 +362,7 @@ setup がオンにする（`--no-dspark` でオフ）。8〜12 GB の GPU なら
 | | nace-ai の [Q3_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF)（Engram の表は IQ4_NL で各ファイルの中。v1.3.178） | 107.5 GB | 同じ条件で計測済み: 生成 40.5 tok/s（CPU で計算するエキスパートが多い）。日本語の事実問題 80 中 76。nll は日本語 4K の文で 3.91（Maya-XS 4.17）、日英コードの組で 1.75（Maya-XS 1.58） |
 | | nace-ai の [Q4_K_M](https://huggingface.co/nace-ai/Hy4-flash-GGUF) | 127.2 GB | 未確認 |
 | Inkling 2 Mini（Thinking Machines、ループする 128x1.8B の MoE、`inkling2`。[MANUAL](docs/MANUAL.ja.md)） | unsloth の [UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)（`--model inkling2mini`、v1.3.183）。8〜12 GB の GPU には UD-IQ3_XXS。DSpark ドラフトモデル `dspark-Inkling-2-Mini-Q8_0.gguf`（`STRATA_INK_DSPARK`、オプトイン） | 17.6 GB | RTX 5090 で計測（すべて VRAM）: 生成 183〜185 tok/s（ドラフトモデルありでコード・編集 223〜245）、プロンプト 8K 約 6,900〜8,300 / 165K 5,298 tok/s、llama.cpp の Q8_0 比 KL 0.0058、コーディング 8 問中 8 問 ×3 回（品質 84.1〜84.9）、ツール呼び出しの誤り 0（[数字](#-性能)） |
-| Ling-3.2-air（inclusionAI、KDA + MLA、エキスパート 512、`bailingmoe3`。ベータ、テキストのみ。[docs/MODELS](docs/MODELS.ja.md#ling-32-airベータ未リリース)） | bartowski の [Q4_K_M](https://huggingface.co/bartowski/Ling-3.2-air-GGUF) をそのまま（`--model ling32air`） | 80.4 GB | RTX 5090 + RAM 123 GB で測定: 4K のプロンプト 2,061 tok/s、decode 142.8 tok/s。16K では 3,092 / 120.7。同じ重みの float64 の forward に対して KL 0.0165。会話スロットあり（Claude Code のスレッドの切り替え）、MTP はまだ |
+| Ling-3.2-air（inclusionAI、KDA + MLA、エキスパート 512、`bailingmoe3`。ベータ、画像も読める。[docs/MODELS](docs/MODELS.ja.md#ling-32-airベータ未リリース)） | bartowski の [Q4_K_M](https://huggingface.co/bartowski/Ling-3.2-air-GGUF) をそのまま（`--model ling32air`） | 80.4 GB | RTX 5090 + RAM 123 GB で測定: 4K のプロンプト 2,061 tok/s、decode 142.8 tok/s。16K では 3,092 / 120.7。同じ重みの float64 の forward に対して KL 0.0165。会話スロットあり（Claude Code のスレッドの切り替え）、MTP はまだ |
 
 自作ファイルの以前の名前（ファイルの中身は同じ）: LDLQ 132G / 139G = DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G、Compact JA256 =
 DeepSeek-V4.1-Flash-1017-E256-IQ2_XXS-32G96G、IQ3_XXS-B = Ornith-1.5-122B-IQ3_XXS-16G64G、IQ3_XXS-B2 = Qwen3.5-122B-A10B-IQ3_XXS-16G64G、

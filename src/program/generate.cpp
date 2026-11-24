@@ -2418,6 +2418,102 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
     return 0;
 }
 
+// GENI's pictures (and STRATA_GLM_SCORE_IMAGES'): the strata-vision records in emb_path -> the rows standing in for the
+// prompt's image tokens (cur_img_pos ascending, E floats a row) and, for the M-RoPE models, the cells' (t, h, w) table
+// mtab (left empty when the model takes no image positions).  ge: why the request is refused (empty: fine).
+static void glm_image_rows(strata::core::Glm5Model& model, const std::vector<int64_t>& toks, const std::string& emb_path,
+                           int64_t max_context, std::vector<int64_t>& cur_img_pos, std::vector<float>& cur_img_rows,
+                           std::vector<int32_t>& mtab, std::string& ge) {
+    // the embeddings file is one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd
+    // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
+    // tokens take no positions of their own: the rows only replace the embeddings)
+    // Qwen3.5 / 3.8 (qwen35, qwen35moe): one <|image_pad|> a row as well, and the rows also take M-RoPE positions - a
+    // record's rows are an nx x ny grid (row i at x = i % nx, y = i / nx) whose cells share t and take h = t + y,
+    // w = t + x; the text after the image goes on at t + max(nx, ny) (Glm5Model::set_mrope)
+    constexpr int64_t kGlmImageToken = 154854;   // <|image|>
+    constexpr int64_t kV41ImageToken = 129264;   // deepseek41: <｜deepseek_image｜> (one token a row of the record)
+    constexpr int64_t kQwenImageToken = 248056;  // qwen35: <|image_pad|> (config.json image_token_id)
+    // hy4 (Hy4-flash): <｜hy_image▁pad｜> a row as well, M-RoPE like Qwen's; the record's grid is nx = merged columns + 1
+    // (each merged row ends with the newline row), ny = merged rows, so the text after it goes on at t + max(nx, ny)
+    constexpr int64_t kHy4ImageToken = 120120;
+    // ling (Ling-3.x, bailingmoe3): <|image_pad|> 157157 a row; HF's get_rope_index places the grid around the image's
+    // own position - t = p, h = p + y - (ny - 1) / 2, w = p + x - (nx - 1) / 2 - and the text after it goes on at
+    // p + 1 (the MLA layers' rotary reads the three with ling_fast.cu's pair-to-axis rule)
+    constexpr int64_t kLingImageToken = 157157;
+    const bool img_ling = model.geometry().ling;
+    const bool img_mrope = (model.geometry().qwen35() && !model.geometry().v41) || model.geometry().is_hy4();
+    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : model.geometry().is_hy4() ? kHy4ImageToken
+                                : img_ling ? kLingImageToken : img_mrope ? kQwenImageToken : kGlmImageToken;
+    const int64_t E = model.geometry().is_hy4() ? model.geometry().hy_dim : model.geometry().n_embd;
+    std::vector<std::array<int32_t, 3>> grids;   // a record's (n, nx, ny)
+    std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+    ge = f ? "" : "cannot open " + emb_path;
+    while (f && ge.empty()) {
+        int32_t hdr[5];
+        // the end of the records only between two of them: a header cut short is a broken file, and a
+        // record cannot hold more rows than the prompt has tokens (not a multi-GB allocation off one)
+        const size_t got = std::fread(hdr, 1, sizeof hdr, f);
+        if (got == 0 && std::feof(f)) break;
+        if (got != sizeof hdr || hdr[0] != 0x31455653 || hdr[1] <= 0 || hdr[4] != E ||
+            (size_t) hdr[1] > toks.size() - cur_img_rows.size() / (size_t) E) {
+            ge = "not a strata-vision record for this model";
+            break;
+        }
+        grids.push_back({hdr[1], hdr[2], hdr[3]});
+        const size_t at = cur_img_rows.size();
+        cur_img_rows.resize(at + (size_t) hdr[1] * (size_t) E);
+        if (std::fread(cur_img_rows.data() + at, sizeof(float) * (size_t) E, (size_t) hdr[1], f) !=
+            (size_t) hdr[1])
+            ge = "short embeddings file";
+    }
+    if (f) std::fclose(f);
+    for (size_t i = 0; ge.empty() && i < toks.size(); ++i)
+        if (toks[i] == image_token) cur_img_pos.push_back((int64_t) i);
+    if (ge.empty() && (int64_t) cur_img_pos.size() * E != (int64_t) cur_img_rows.size())
+        ge = std::to_string(cur_img_pos.size()) + " image tokens, " +
+             std::to_string(cur_img_rows.size() / (size_t) E) + " image rows";
+    // deepseek41: image rows route with exp_probs_b_vl - without it they would run on the text bias
+    if (ge.empty() && model.geometry().v41 && !cur_img_pos.empty() && !model.has_vl_bias())
+        ge = "this model has no exp_probs_b_vl (set STRATA_GLM_VL_BIAS or put exp_probs_b_vl.f32 in the "
+             "pack): image input is refused";
+    // qwen35: each record's rows on one run of consecutive <|image_pad|> cells, its grid whole; the cells'
+    // (t, h, w) then follow from the grids (a text cell's three are its rotary position)
+    if (ge.empty() && img_mrope && !cur_img_pos.empty()) {
+        const int64_t cells = std::max<int64_t>(max_context, (int64_t) toks.size()) + 64;
+        mtab.resize((size_t) cells * 3);
+        int64_t shift = 0, cell = 0;   // shift: cells minus rotary positions so far
+        size_t k = 0;
+        const auto text_to = [&](int64_t end) {
+            for (; cell < end; ++cell)
+                mtab[(size_t) cell * 3] = mtab[(size_t) cell * 3 + 1] = mtab[(size_t) cell * 3 + 2] =
+                    (int32_t) (cell - shift);
+        };
+        for (const auto& gr : grids) {
+            const int64_t n = gr[0], nx = gr[1], ny = gr[2];
+            if (nx <= 0 || ny <= 0 || nx * ny != n || k + (size_t) n > cur_img_pos.size()) {
+                ge = "an image record's grid does not match its rows";
+                break;
+            }
+            const int64_t s0 = cur_img_pos[k];
+            if (cur_img_pos[k + (size_t) n - 1] != s0 + n - 1) {
+                ge = "an image's <|image_pad|> tokens are not one run";
+                break;
+            }
+            text_to(s0);
+            const int32_t t = (int32_t) (s0 - shift);
+            const int32_t cy = img_ling ? (int32_t) ((ny - 1) / 2) : 0, cx = img_ling ? (int32_t) ((nx - 1) / 2) : 0;
+            for (int64_t i = 0; i < n; ++i, ++cell) {
+                mtab[(size_t) cell * 3] = t;
+                mtab[(size_t) cell * 3 + 1] = t + (int32_t) (i / nx) - cy;
+                mtab[(size_t) cell * 3 + 2] = t + (int32_t) (i % nx) - cx;
+            }
+            shift += n - (img_ling ? 1 : std::max(nx, ny));
+            k += (size_t) n;
+        }
+        if (ge.empty()) text_to(cells);
+    }
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -4195,6 +4291,23 @@ static int glm_pack_generate(const Options& o) {
             std::vector<float> tlp((size_t) std::max(tk, 1));
             model.set_host_logits(true);
             model.reset();
+            // STRATA_GLM_SCORE_IMAGES=<strata-vision records>: the tokens' image rows (and M-RoPE positions) as a GENI
+            // request gives them - the yardstick for prompts with pictures against a reference
+            if (const char* si = getenv("STRATA_GLM_SCORE_IMAGES"); si != nullptr && si[0] != '\0') {
+                std::string ge;
+                std::vector<int64_t> t64(o.tokens.begin(), o.tokens.end()), ipos;
+                std::vector<float> irows;
+                std::vector<int32_t> mtab;
+                if (!model.images_ok(ge)) ge = ge.empty() ? "images refused" : ge;
+                else glm_image_rows(model, t64, si, o.max_context, ipos, irows, mtab, ge);
+                if (ge.empty() && !mtab.empty() && !model.set_mrope(mtab, ge)) ge = "images: " + ge;
+                if (!ge.empty()) {
+                    std::printf("ERR %s\n", ge.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "maya generate: score with %zu image rows\n", ipos.size());
+                model.set_image_rows(std::move(ipos), std::move(irows));
+            }
             std::vector<float> lg, ls((size_t) n_vocab), rl((size_t) n_vocab);
             double nll = 0.0, kl = 0.0, kl_max = 0.0;
             size_t n = 0, top1 = 0, same = 0, nref = 0;
@@ -4354,21 +4467,7 @@ static int glm_pack_generate(const Options& o) {
     std::printf("READY %lld stop\n", (long long) o.max_context);
     std::fprintf(stderr, "maya generate: glm5-next serve (M3.1): GEN <max_new> [keys] <ids>, GENI <max_new> [keys] "
                          "<embeddings> <ids>; QUIT to end\n");
-    // GENI: the embeddings file is one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd
-    // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
-    // tokens take no positions of their own: the rows only replace the embeddings)
-    // Qwen3.5 / 3.8 (qwen35, qwen35moe): one <|image_pad|> a row as well, and the rows also take M-RoPE positions - a
-    // record's rows are an nx x ny grid (row i at x = i % nx, y = i / nx) whose cells share t and take h = t + y,
-    // w = t + x; the text after the image goes on at t + max(nx, ny) (Glm5Model::set_mrope)
-    constexpr int64_t kGlmImageToken = 154854;   // <|image|>
-    constexpr int64_t kV41ImageToken = 129264;   // deepseek41: <｜deepseek_image｜> (one token a row of the record)
-    constexpr int64_t kQwenImageToken = 248056;  // qwen35: <|image_pad|> (config.json image_token_id)
-    // hy4 (Hy4-flash): <｜hy_image▁pad｜> a row as well, M-RoPE like Qwen's; the record's grid is nx = merged columns + 1
-    // (each merged row ends with the newline row), ny = merged rows, so the text after it goes on at t + max(nx, ny)
-    constexpr int64_t kHy4ImageToken = 120120;
-    const bool img_mrope = (model.geometry().qwen35() && !model.geometry().v41) || model.geometry().is_hy4();
-    const int64_t image_token = model.geometry().v41 ? kV41ImageToken : model.geometry().is_hy4() ? kHy4ImageToken
-                                : img_mrope ? kQwenImageToken : kGlmImageToken;
+    // GENI: glm_image_rows (above) reads the request's pictures
     strata::program::LogposWriter logpos;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     std::string line;
@@ -4653,80 +4752,17 @@ static int glm_pack_generate(const Options& o) {
             cur_img_rows.clear();
             bool mrope_set = false;
             if (cmd == "GENI") {
-                const int64_t E = model.geometry().is_hy4() ? model.geometry().hy_dim : model.geometry().n_embd;
                 std::string why;
                 if (!model.images_ok(why)) {
                     std::printf("ERR %s\n", why.c_str());
                     std::fflush(stdout);
                     continue;
                 }
-                std::vector<std::array<int32_t, 3>> grids;   // a record's (n, nx, ny)
-                std::FILE* f = std::fopen(emb_path.c_str(), "rb");
-                std::string ge = f ? "" : "cannot open " + emb_path;
-                while (f && ge.empty()) {
-                    int32_t hdr[5];
-                    // the end of the records only between two of them: a header cut short is a broken file, and a
-                    // record cannot hold more rows than the prompt has tokens (not a multi-GB allocation off one)
-                    const size_t got = std::fread(hdr, 1, sizeof hdr, f);
-                    if (got == 0 && std::feof(f)) break;
-                    if (got != sizeof hdr || hdr[0] != 0x31455653 || hdr[1] <= 0 || hdr[4] != E ||
-                        (size_t) hdr[1] > toks.size() - cur_img_rows.size() / (size_t) E) {
-                        ge = "not a strata-vision record for this model";
-                        break;
-                    }
-                    grids.push_back({hdr[1], hdr[2], hdr[3]});
-                    const size_t at = cur_img_rows.size();
-                    cur_img_rows.resize(at + (size_t) hdr[1] * (size_t) E);
-                    if (std::fread(cur_img_rows.data() + at, sizeof(float) * (size_t) E, (size_t) hdr[1], f) !=
-                        (size_t) hdr[1])
-                        ge = "short embeddings file";
-                }
-                if (f) std::fclose(f);
-                for (size_t i = 0; ge.empty() && i < toks.size(); ++i)
-                    if (toks[i] == image_token) cur_img_pos.push_back((int64_t) i);
-                if (ge.empty() && (int64_t) cur_img_pos.size() * E != (int64_t) cur_img_rows.size())
-                    ge = std::to_string(cur_img_pos.size()) + " image tokens, " +
-                         std::to_string(cur_img_rows.size() / (size_t) E) + " image rows";
-                // deepseek41: image rows route with exp_probs_b_vl - without it they would run on the text bias
-                if (ge.empty() && model.geometry().v41 && !cur_img_pos.empty() && !model.has_vl_bias())
-                    ge = "this model has no exp_probs_b_vl (set STRATA_GLM_VL_BIAS or put exp_probs_b_vl.f32 in the "
-                         "pack): image input is refused";
-                // qwen35: each record's rows on one run of consecutive <|image_pad|> cells, its grid whole; the cells'
-                // (t, h, w) then follow from the grids (a text cell's three are its rotary position)
                 std::vector<int32_t> mtab;
-                if (ge.empty() && img_mrope && !cur_img_pos.empty()) {
-                    const int64_t cells = std::max<int64_t>(o.max_context, (int64_t) toks.size()) + 64;
-                    mtab.resize((size_t) cells * 3);
-                    int64_t shift = 0, cell = 0;   // shift: cells minus rotary positions so far
-                    size_t k = 0;
-                    const auto text_to = [&](int64_t end) {
-                        for (; cell < end; ++cell)
-                            mtab[(size_t) cell * 3] = mtab[(size_t) cell * 3 + 1] = mtab[(size_t) cell * 3 + 2] =
-                                (int32_t) (cell - shift);
-                    };
-                    for (const auto& gr : grids) {
-                        const int64_t n = gr[0], nx = gr[1], ny = gr[2];
-                        if (nx <= 0 || ny <= 0 || nx * ny != n || k + (size_t) n > cur_img_pos.size()) {
-                            ge = "an image record's grid does not match its rows";
-                            break;
-                        }
-                        const int64_t s0 = cur_img_pos[k];
-                        if (cur_img_pos[k + (size_t) n - 1] != s0 + n - 1) {
-                            ge = "an image's <|image_pad|> tokens are not one run";
-                            break;
-                        }
-                        text_to(s0);
-                        const int32_t t = (int32_t) (s0 - shift);
-                        for (int64_t i = 0; i < n; ++i, ++cell) {
-                            mtab[(size_t) cell * 3] = t;
-                            mtab[(size_t) cell * 3 + 1] = t + (int32_t) (i / nx);
-                            mtab[(size_t) cell * 3 + 2] = t + (int32_t) (i % nx);
-                        }
-                        shift += n - std::max(nx, ny);
-                        k += (size_t) n;
-                    }
-                    if (ge.empty()) text_to(cells);
-                    if (ge.empty() && !model.set_mrope(mtab, ge)) ge = "images: " + ge;
+                std::string ge;
+                glm_image_rows(model, toks, emb_path, o.max_context, cur_img_pos, cur_img_rows, mtab, ge);
+                if (ge.empty() && !mtab.empty()) {
+                    if (!model.set_mrope(mtab, ge)) ge = "images: " + ge;
                     mrope_set = ge.empty();
                 }
                 if (!ge.empty()) {

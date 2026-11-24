@@ -276,6 +276,55 @@ class ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class LingImages(unittest.TestCase):
+    """Ling-3.x: the template's <|vision_start|><|image_pad|><|vision_end|> becomes the rows plus the newline HF's
+    processor writes after <|vision_end|>; Vision.prepare resizes as BailingMM2ImageProcessor does."""
+
+    class LingTok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<|vision_start|>", "<|vision_end|>", "<role>", "</role>", "<|role_end|>"]
+
+    TEMPLATE = ("{%- for m in messages -%}<role>{{ m['role'] | upper }}</role>{%- if m['content'] is string -%}"
+                "{{ m['content'] }}{%- else -%}{%- for b in m['content'] -%}{%- if b.type == 'image' -%}"
+                "<|vision_start|><|image_pad|><|vision_end|>{%- else -%}{{ b.text }}{%- endif -%}{%- endfor -%}"
+                "{%- endif -%}<|role_end|>{%- endfor -%}<role>HUMAN</role><|role_end|>"
+                "{%- if add_generation_prompt -%}<role>ASSISTANT</role>{%- endif -%}")
+
+    def test_rows_then_a_newline(self):
+        import tempfile
+        tok = self.LingTok()
+        with tempfile.TemporaryDirectory() as d:
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text(self.TEMPLATE, encoding="utf-8")
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(tpl),
+                          vision=ImageMarkers.FakeVision(d))
+            self.assertTrue(svc.template.ling)
+            msgs = [{"role": "user", "content": [{"type": "image", "source": "x.png"}, {"type": "text", "text": "Q"}]}]
+            ids, _, _ = svc.prepare(msgs, None, {})
+            pad = tok.encode("<|image_pad|>", parse_special=True)[0]
+            self.assertEqual(ids.count(pad), 3)
+            self.assertIn("<|image_pad|><|vision_end|>\nQ", tok.decode(ids))
+            svc.embeddings.path.unlink(missing_ok=True)
+
+    def test_prepare_sizes(self):
+        import io
+        import struct
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("no Pillow")
+        from serve.server import Vision
+        for (w, h), cap, want in (((640, 448), 4096, (640, 448)), ((10, 10), 4096, (64, 64)),
+                                  ((1000, 500), 4096, (992, 512)), ((4000, 3000), 64, (288, 192))):
+            with self.subTest(size=(w, h), cap=cap):
+                b = io.BytesIO()
+                Image.new("RGB", (w, h), (200, 10, 10)).save(b, format="PNG")
+                out = Vision.prepare(b.getvalue(), cap)
+                magic, rw, rh = struct.unpack("<3i", out[:12])
+                self.assertEqual((magic, rw, rh), (0x3149564C, *want))
+                self.assertEqual(len(out), 12 + 3 * rw * rh)
+                self.assertLessEqual(rw * rh // 1024, cap)
+
+
 class ToolResultImages(unittest.TestCase):
     """#41: an image inside a tool result (Anthropic tool_result blocks, OpenAI role "tool" image parts) reaches the
     prompt as an image, through the whole path (conversion, the model's template, the image rows); a server without the

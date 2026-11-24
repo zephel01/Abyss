@@ -502,6 +502,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_custom_command(TARGET strata POST_BUILD
                      COMMAND ${CMAKE_COMMAND} -DENGINE=$<TARGET_FILE:strata> -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/engine_alias.cmake
                      VERBATIM)
+  # abyss-vision: Abyss's own image encoder for Ling-3.x's mmproj (ling3vl) - strata-vision's protocol, cuBLAS, no
+  # llama.cpp (src/vision/abyss_vision.cu; the server prepares the pictures)
+  # (CUDA only for now: on AMD the pictures are refused)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(abyss_vision src/vision/abyss_vision.cu)
+    target_include_directories(abyss_vision PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(abyss_vision PRIVATE strata_artifact ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    set_target_properties(abyss_vision PROPERTIES OUTPUT_NAME abyss-vision)
+  endif()
   # abyss --gpu-tune: the per-GPU kernel choices measured on this GPU without a model (src/program/gpu_tune.cpp)
   add_executable(abyss_gpu_tune src/program/gpu_tune.cpp)
   target_include_directories(abyss_gpu_tune PRIVATE ${_strata_gpu_include_directories})
