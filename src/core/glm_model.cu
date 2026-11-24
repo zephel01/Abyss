@@ -1500,6 +1500,35 @@ bool Glm5Geometry::from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, 
         }
     }
     out.n_head_kv.assign((size_t) out.n_layers, 1);   // no KDA layer
+    if (const auto* ml = g.get(p + "memt.layers"); ml != nullptr && ml->type == strata::MetaType::ARRAY) {
+        // MemT-1.0-Flash (tools/memt_flash.py): the memory blocks of the listed layers
+        out.memt = true;
+        out.memt_heads = (int) num("memt.head_count", 64);
+        out.memt_dim = (int) num("memt.key_length", 512);
+        out.memt_qrank = (int) num("memt.q_rank", 1024);
+        out.memt_groups = (int) num("memt.kv_groups", 8);
+        out.memt_kvrank = (int) num("memt.kv_rank", 512);
+        out.memt_grank = (int) num("memt.gate_rank", 512);
+        out.memt_chunk = (int) num("memt.chunk_tokens", 2048);
+        out.memt_softcap = (float) num("memt.softcap", 2.0);
+        out.memt_eps = (float) num("memt.norm_eps", 1e-6);
+        out.memt_layer.assign((size_t) out.n_layers, -1);
+        int n = 0;
+        for (const auto& it : ml->items) {
+            const int il = (int) it.u;
+            if (il < 0 || il >= out.n_layers || out.memt_layer[(size_t) il] >= 0) {
+                err = "memt: deepseek4.memt.layers names layer " + std::to_string(il);
+                return false;
+            }
+            out.memt_layer[(size_t) il] = n++;
+        }
+        if (out.memt_dim != 512 || out.memt_heads != out.n_head || out.memt_heads * out.memt_dim != out.n_head * out.head_dim ||
+            out.memt_groups <= 0 || out.memt_heads % out.memt_groups != 0 || out.memt_qrank % 32 != 0 ||
+            out.memt_kvrank % 32 != 0 || out.memt_grank % 32 != 0 || out.memt_groups > 8) {
+            err = "memt: deepseek4 memory geometry (heads = attention heads of 512, <= 8 groups) is not implemented";
+            return false;
+        }
+    }
     out.indexer_full.assign((size_t) out.n_layers, 1);
     out.idx_kpool = 4;          // (glm's k-pool fields: unused by the deepseek4 path, kept valid for shared sizing)
     out.qk_nope = out.v_head = out.head_dim;

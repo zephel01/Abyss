@@ -1201,7 +1201,7 @@ static constexpr int64_t kDqRows = 512;
 static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool has_dsa, bool deq = false) {
     const int64_t E = g.n_embd;
     int64_t w32 = 2 << 20;
-    if (g.memt) w32 = std::max<int64_t>(w32, (int64_t) g.memt_heads * 256 * E);   // (MemT: a memt_in block at once)
+    if (g.memt && g.memt_qrank == 0) w32 = std::max<int64_t>(w32, (int64_t) g.memt_heads * 256 * E);   // (MemT: a memt_in block at once)
     if (has_dsa)
         w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
     int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
@@ -3166,6 +3166,21 @@ bool Glm5Model::prefill_ds4_mixer(int il, int64_t p0_64, int tn, const uint16_t*
     ds::attend_batch(B.q, B.keys, n_hist, g.n_swa, Ly.comp_cache, B.sel, g.idx_top_k, r, Ly.sinks, g.n_head, D, g.n_rot,
                      rope, p0, tn, B.o, s);
     S->mark("ds4_attn", s);
+    if (Ly.mt >= 0) {   // MemT-1.0-Flash: the memory read added before wo_a (a replay: the write too, every row)
+        const auto mg = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy, int Tn) {
+            const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
+            for (int r0 = 0; r0 < N; r0 += rows) {
+                const int n = std::min(rows, N - r0);
+                strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, S->w16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16, CUDA_R_16F, Kd, X16,
+                                     CUDA_R_16F, ldx, &zero, Y + r0, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "memt gemm f16");
+            }
+        };
+        if (!memt4_rows(il, x16, xs, tn, B.o, s, mg, err)) return false;
+        S->mark("memt", s);
+    }
     if (skip_output) return true;
     // 5. the grouped output LoRA, then wo_b
     ds::to_f16(B.o, B.o16, (int64_t) tn * HD, s);
@@ -7358,7 +7373,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.memt) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
+    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || (g_.memt && !g_.dsv4())) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
         err = "prefill logits requires single-device DeepSeek V4.1, Inkling, Ling or MemT"; return false;
     }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
@@ -7639,7 +7654,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
-                    else if (g.ling || g.memt)   // (ling, MemT's qwen35moe: R's row takes the last FFN, output_norm -
+                    else if (g.ling || (g.memt && !g.dsv4()))   // (ling, MemT's qwen35moe: R's row takes the last FFN, output_norm -
                                                  // the token path's head input)
                         gf::rms_q8(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, w_.at("output_norm.weight"),
                                    g.norm_eps, E, fast_->head_x, fast_->head_xq, fast_->cs);

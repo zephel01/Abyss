@@ -2515,15 +2515,16 @@ static void glm_image_rows(strata::core::Glm5Model& model, const std::vector<int
 }
 
 // MemT memory files (memt_path.cu's state): the safetensors layout MemT's save_state writes - "memory.<layer>" F32
-// [1, heads, 256, 256] for every memory layer, metadata format memt-memory-v1 - so a state saved by either side loads
+// [1, heads, dim, dim] for every memory layer, metadata format memt-memory-v1 - so a state saved by either side loads
 // in the other (the identity hash is MemT's own; Abyss writes "abyss" there and does not check it on load)
 static bool memt_file_write(const std::string& path, const std::vector<float>& st, const std::vector<int>& layers,
-                            int heads, std::string& err) {
+                            int heads, int dim, std::string& err) {
     const size_t per = st.size() / std::max<size_t>(1, layers.size());
     std::string h = "{\"__metadata__\":{\"format\":\"memt-memory-v1\",\"identity\":\"abyss\"}";
     for (size_t i = 0; i < layers.size(); ++i)
         h += ",\"memory." + std::to_string(layers[i]) + "\":{\"dtype\":\"F32\",\"shape\":[1," + std::to_string(heads) +
-             ",256,256],\"data_offsets\":[" + std::to_string(i * per * 4) + "," + std::to_string((i + 1) * per * 4) + "]}";
+             "," + std::to_string(dim) + "," + std::to_string(dim) +
+             "],\"data_offsets\":[" + std::to_string(i * per * 4) + "," + std::to_string((i + 1) * per * 4) + "]}";
     h += "}";
     while (h.size() % 8 != 0) h += ' ';
     const std::string tmp = path + ".tmp";
@@ -2539,7 +2540,7 @@ static bool memt_file_write(const std::string& path, const std::vector<float>& s
 }
 
 static bool memt_file_read(const std::string& path, std::vector<float>& st, const std::vector<int>& layers, int heads,
-                           std::string& err) {
+                           int dim, std::string& err) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) { err = "cannot read " + path; return false; }
     uint64_t n = 0;
@@ -2547,7 +2548,7 @@ static bool memt_file_read(const std::string& path, std::vector<float>& st, cons
     bool ok = std::fread(&n, 8, 1, f) == 1 && n < (1u << 20);
     if (ok) { h.resize((size_t) n); ok = std::fread(&h[0], 1, h.size(), f) == h.size(); }
     const long base = 8 + (long) n;
-    const size_t per = (size_t) heads * 256 * 256;
+    const size_t per = (size_t) heads * dim * dim;
     st.assign(per * layers.size(), 0.0f);
     if (ok && h.find("memt-memory-v1") == std::string::npos) { err = path + ": not a memt-memory-v1 file"; ok = false; }
     for (size_t i = 0; ok && i < layers.size(); ++i) {
@@ -2560,7 +2561,7 @@ static bool memt_file_read(const std::string& path, std::vector<float>& st, cons
         if (at == std::string::npos || ent.find("\"F32\"") == std::string::npos || d == std::string::npos ||
             std::sscanf(ent.c_str() + ent.find('[', d), "[%llu,%llu]", &a, &b) != 2 || b - a != per * 4) {
             err = path + ": memory." + std::to_string(layers[i]) + " is missing or not F32 [1," + std::to_string(heads) +
-                  ",256,256]";
+                  "," + std::to_string(dim) + "," + std::to_string(dim) + "]";
             ok = false;
             break;
         }
@@ -4732,9 +4733,7 @@ static int glm_pack_generate(const Options& o) {
             bool ok = model.memt();
             std::string why = ok ? "" : "MEMT: not a MemT model";
             const auto& mg = model.geometry();
-            std::vector<int> mlayers;
-            for (int il = 0; il < mg.n_layers; ++il)
-                if (mg.n_head_kv[(size_t) il] != 0) mlayers.push_back(il);
+            const std::vector<int> mlayers = ok ? model.memt_layers() : std::vector<int>{};
             std::vector<float> host;
             if (ok && sub == "OFF") {
                 model.memt_use(false);
@@ -4742,11 +4741,11 @@ static int glm_pack_generate(const Options& o) {
                 ok = model.memt_set(nullptr, why);
                 model.memt_use(true);
             } else if (ok && sub == "LOAD" && !arg.empty()) {
-                ok = memt_file_read(arg, host, mlayers, mg.memt_heads, why) && model.memt_set(host.data(), why);
+                ok = memt_file_read(arg, host, mlayers, mg.memt_heads, mg.memt_dim, why) && model.memt_set(host.data(), why);
                 if (ok) model.memt_use(true);
             } else if (ok && sub == "SAVE" && !arg.empty()) {
                 host.resize(model.memt_state_floats());
-                ok = model.memt_get(host.data(), why) && memt_file_write(arg, host, mlayers, mg.memt_heads, why);
+                ok = model.memt_get(host.data(), why) && memt_file_write(arg, host, mlayers, mg.memt_heads, mg.memt_dim, why);
             } else if (ok && (sub == "COMMIT" || sub == "DOC") && !arg.empty()) {
                 std::vector<int64_t> t64;
                 ok = parse_i64_list(arg.c_str(), t64, why);

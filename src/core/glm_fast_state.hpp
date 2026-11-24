@@ -435,6 +435,9 @@ struct Glm5Model::FastState {
         int mt = -1;
         const uint16_t *mt_in = nullptr, *mt_fd = nullptr, *mt_gd = nullptr;
         const float *mt_bias = nullptr, *mt_dsl = nullptr, *mt_onorm = nullptr;
+        // MemT-1.0-Flash (memt4_*): memt_in (q | k | v | b | w | f | g latents), the expansions, the norms, g's bias
+        WSlot mt4_in, mt4_qup, mt4_kup, mt4_vup, mt4_bup, mt4_wup, mt4_fd, mt4_gd;
+        const float *mt4_qn = nullptr, *mt4_kn = nullptr, *mt4_vn = nullptr, *mt4_gb = nullptr;
         // ---- laguna (qwen35_fast_path.cu): the q heads, a window layer, the cache's rows (a ring for a window
         // layer: position j in row j % lag_ring), attn_gate (n_embd -> heads)
         int lag_heads = 0, lag_ring = 0;

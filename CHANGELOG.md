@@ -110,6 +110,23 @@ on its own. CLI outputs give the same bits as v1.3.202 (7-config md5, Inkling 18
   / 0.0045), 97.5%. Unsloth's old-layout DSpark drafter (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `STRATA_INK_DSPARK=<file>`) works with it: a code prompt 199.7 ->
   237.8 tok/s, the same tokens (md5)
 
+MemT-1.0-Flash (MemTensor; DeepSeek-V4-Flash-0731 post-trained, with a memory block in each of its 20 CSA layers 4..42
+even, state 64 x 512 x 512 FP32 a layer, 1.25 GiB in all) runs with its memory on the deepseek4 path (beta, NVIDIA).
+`tools/memt_flash.py` writes an overlay GGUF over a V4 Flash 0731 GGUF (the base's keys, `deepseek4.memt.*` and the
+memory weights, Q8_0; the other shards are links to the base's); pack it with `iq_pack.py --first-wins`. With
+`--backbone=<range reads> --gpuq=<lib> --imatrix=<file>` MemT's own non-expert backbone replaces the base's in the base's
+types (MemT's experts round back to 0731's MXFP4 codes, so the base's stay). The read is added to the attention output
+before wo_a on the token and prompt paths (the state read rounded to BF16, as the reference does); a commit or document
+writes the turn. The server follows MemT's session rules: once a memory holds something, the prompt, the written turn
+and a document start without the BOS. Measured on an RTX 5090 over the 0731 L97 GGUF (Q8_0 memory, against a float64
+reference fed from the engine's inputs, layers 4 / 22 / 42): written state within 0.03-0.05 % of the same Q8_0 weights'
+math (1.7-2.0 % of the BF16 weights'), the read within 0.5-1.1 %. A fact told in turn 1, and a Japanese document, are
+recalled in a new conversation through the memory alone, over either backbone. MemT's backbone vs 0731's (memory off,
+5 x 1024-token texts): KL 0.023-0.061, lower NLL on all 5. 4K prompt + 256 tokens, deterministic mode: decode 16.01 tok/s
+on the plain L97 pack, 12.20 on the MemT pack with the memory off (the memory weights and two states take 6.1 GB of the
+expert pool: 24.0 -> 17.9 GB), 11.77 with a memory (-3.5 %). Other models give the same bits as before (7-config md5,
+Inkling 18 md5, L97 without memory).
+
 ## v1.3.202 - 2026-11-24
 
 Ling-3.2-air reads images (beta, NVIDIA) with Abyss's own CUDA encoder: three test pictures and five position-dependent

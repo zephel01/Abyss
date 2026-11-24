@@ -227,6 +227,12 @@ struct Glm5Geometry {
     bool memt = false;
     int memt_heads = 16, memt_chunk = 2048;
     float memt_softcap = 2.0f, memt_eps = 1e-6f;
+    // MemT-1.0-Flash (deepseek4 with deepseek4.memt.* keys; worklog 2026-11-25_memt-flash.md): heads of memt_dim 512,
+    // q through a low rank (memt_qrank, its own RMSNorm), k / v through memt_groups grouped low ranks (memt_kvrank,
+    // a group RMSNorm, then an expansion to the group's heads), b / w / f / g from memt_grank latents, the read
+    // against the state rounded to BF16, added to the de-roped attention output before wo_a.  Nano: memt_qrank 0.
+    int memt_dim = 256, memt_qrank = 0, memt_groups = 0, memt_kvrank = 0, memt_grank = 0;
+    std::vector<int> memt_layer;   // per layer: its memory index, -1 none
     int ling_qk_nope = 128, ling_rope = 64, ling_v = 128, ling_group = 8, ling_topk_group = 4;
     std::vector<float> lim_e, lim_s;   // per layer (the NextN block's too); 0 = no clamp
     /// the limit the expert / shared-expert kernels take for layer il: ling encodes the llama.cpp form as
@@ -304,6 +310,8 @@ public:
     bool memt_commit(const std::vector<int32_t>& ids, bool document, std::string& err);
     /// the prompt path's hook (glm_prefill.cu): rows xs [tn][n_embd] of layer il, their gated attention output ao
     /// [tn][heads x 256]; gemm(W, N, X, Y, Tn) = Y[Tn][N] = X[Tn][n_embd] . W[N][n_embd]^T with W BF16
+    /// the memory layers in order (their layer numbers), for the state file's names
+    std::vector<int> memt_layers() const;
     bool memt_rows(int il, const float* xs, int tn, float* ao, cudaStream_t s,
                    const std::function<void(const uint16_t*, int, int, const float*, float*, int)>& gemm,
                    std::string& err);
@@ -795,6 +803,13 @@ public:
     bool memt_alloc(std::string& err);
     bool memt_token(int il, std::string& err);
     void memt_free();
+    // MemT-1.0-Flash on the deepseek4 path: its weights (from dsv4_bind), the read (and a replay's write) of a token
+    // (F->x, F->xq -> F->ds_o, before wo_a) and of a prompt's rows (x16 / xs -> o [tn][heads x 512], before wo_a)
+    void memt4_bind(int il, std::string& missing);
+    bool memt4_token(int il, std::string& err);
+    bool memt4_rows(int il, const uint16_t* x16, const float* xs, int tn, float* o, cudaStream_t s,
+                    const std::function<void(const WSlot&, int, int, const uint16_t*, int, float*, int, int)>& gemm,
+                    std::string& err);
     bool ling_alloc(std::string& err);
     bool fast_ling_kda(int il, std::string& err);
     bool fast_ling_mla(int il, int64_t p, std::string& err);
