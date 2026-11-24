@@ -238,7 +238,10 @@ struct Hy4State {
     std::vector<int32_t> hist;                      // the tokens by position (the n-grams)
     std::vector<char> img_pos;                      // an image row at that position (no n-gram)
     bool eng_on = false;
-    float eng_eps = 0.0078125f, eng_row_eps = 1e-12f;
+    // the Engram gate norms' (value, key, stream) epsilon: FP32's machine epsilon - the reference's RMSNorm(eps=None)
+    // adds that for BF16 inputs too. Up to v1.3.198 it was bf16's 2^-7, which shrank the small layer-1/11 streams in the
+    // gate's query and opened the gates 2-8x; STRATA_HY4_ENG_EPS=0.0078125 brings the old value back.
+    float eng_eps = 1.1920929e-07f, eng_row_eps = 1e-12f;
     bool eng_vfirst = false;
     std::unique_ptr<ReadPool> pool;
     // STRATA_HY4_ENG_ASYNC (default on): a token's Engram reads run on the pool while the GPU computes layer 0 - each

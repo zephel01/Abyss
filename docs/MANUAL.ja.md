@@ -1065,7 +1065,7 @@ RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークン�
 （既定は tensor core、sm_80 以上）。`STRATA_HY4_IX_TILED=0` でインデクサのスコアをワープ 1 本でグループ 1 つの版に戻します
 （既定はレジスタでタイルを組む版、16 ヘッド）。`STRATA_HY4_ENG_ASYNC=0` で、トークンの Engram の行を層の計算の前に読み終える
 形に戻します（既定は層 0 の計算中に読み、各 Engram 層が自分の行だけを待つ。値は同じ）。
-`STRATA_HY4_PREFILL_ENG_ASYNC=0` でプロンプトのチャンクの Engram の行を、その層の計算の前にまとめて読む形に戻します（既定は層の計算中に読み、各 Engram 層が自分の行だけを待つ。同じ行）。`STRATA_GLM_PREFILL_PROF=1` /
+`STRATA_HY4_PREFILL_ENG_ASYNC=0` でプロンプトのチャンクの Engram の行を、その層の計算の前にまとめて読む形に戻します（既定は層の計算中に読み、各 Engram 層が自分の行だけを待つ。同じ行）。Engram の gate の 3 つの norm（value、key、gate を掛けるストリーム）には FP32 の machine epsilon（1.19e-7）を足します。モデルの参照コードと同じです（参照コードの `RMSNorm(eps=None)` はBF16 の入力にもこの値を足します）。v1.3.198 までは bf16 の 2^-7 を足していて、層 1 と 11 の小さいストリームが縮み、gate が 2〜8 倍開いていました。BF16 の重みでの参照計算と比べた KL（混在 457 トークン、ja / en / code 各 1,024）は、Q8_0 で 1.21 / 0.46 / 1.38 / 0.36 → 0.12 / 0.11 / 0.04 / 0.03、自作の 32G96G pack C で 1.25 / 0.71 / 1.47 / 0.31 → 0.57 / 0.51 / 0.74 / 0.21。JSON / コードの崩れた答えは 2/48 → 0/48 です。`STRATA_HY4_ENG_EPS=0.0078125` で前の値に戻せます。`STRATA_GLM_PREFILL_PROF=1` /
 `STRATA_GLM_PROF=<n>` でプロンプト / 生成の時間を段階ごとに出します（`hy4_*` とトークン経路の各段階）。画像: mmproj
 （`mmproj-Hy4-Flash-Maya-XS.gguf`）は strata-vision で動きます（`tools/vision/hy4v_patch.py`、setup の vision ビルドが当てます）。
 `"model"` には `python tools/vision/hy4v_ref.py vocab --gguf <1 本目の分割ファイル> --out <dir>/hy4-vocab.gguf` で作る語彙だけの GGUF を指定します。

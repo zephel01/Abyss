@@ -9,6 +9,15 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Changed
+
+- Hy4-flash: the Engram gate's norms (value, key, stream) add FP32's machine epsilon (1.19e-7) instead of bf16's 2^-7, as the
+  model's reference code does (`RMSNorm(eps=None)` adds FP32's epsilon for BF16 inputs too). The old value shrank the small
+  layer-1/11 streams and opened the gates 2-8x. KL against the reference math on the BF16 weights (mixed 457 tokens, ja / en /
+  code 1,024 each): Q8_0 1.21 / 0.46 / 1.38 / 0.36 -> 0.12 / 0.11 / 0.04 / 0.03, top-1 agreement 67-81% -> 90-93%; our 32G96G
+  pack C 1.25 / 0.71 / 1.47 / 0.31 -> 0.57 / 0.51 / 0.74 / 0.21. JSON / code stray answers (pack C, 48) 2 -> 0. Decode speed
+  the same. Other models give the same bits (7-config md5). `STRATA_HY4_ENG_EPS=0.0078125` brings the old value back.
+
 ## v1.3.198 - 2026-11-24
 
 Inkling 2 Mini's `"parallel"` (beta, opt-in) keeps every answer the same on a 24 GB card too (an RTX 3090 gave other

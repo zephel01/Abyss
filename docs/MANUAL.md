@@ -1126,7 +1126,7 @@ tensor cores, sm_80+); `STRATA_HY4_IX_TILED=0` the indexer score's warp-per-grou
 one, 16 heads); `STRATA_HY4_ENG_ASYNC=0` a token's Engram rows read before its layers start (default: read while
 layer 0 runs, each Engram layer waiting for its own rows - the same values); `STRATA_HY4_PREFILL_ENG_ASYNC=0` a prompt
 chunk's Engram rows read before its layers start (default: read while they run, each Engram layer waiting for its own
-rows - the same rows). `STRATA_GLM_PREFILL_PROF=1` /
+rows - the same rows). The Engram gate's three norms (value, key, the stream it is gated by) add FP32's machine epsilon (1.19e-7), as the model's reference code does (its `RMSNorm(eps=None)` adds that for BF16 inputs too); up to v1.3.198 Abyss added bf16's 2^-7, which shrank the small layer-1/11 streams and opened the gates 2-8x. Against the reference math on the BF16 weights (mixed 457 tokens, ja / en / code 1,024 each), KL Q8_0 1.21 / 0.46 / 1.38 / 0.36 -> 0.12 / 0.11 / 0.04 / 0.03, our 32G96G pack C 1.25 / 0.71 / 1.47 / 0.31 -> 0.57 / 0.51 / 0.74 / 0.21; JSON / code stray answers 2/48 -> 0/48. `STRATA_HY4_ENG_EPS=0.0078125` brings the old value back. `STRATA_GLM_PREFILL_PROF=1` /
 `STRATA_GLM_PROF=<n>` break the prompt / token time down by stage (`hy4_*` and the token path's stages). Images: the
 mmproj (`mmproj-Hy4-Flash-Maya-XS.gguf`) runs on strata-vision (`tools/vision/hy4v_patch.py`, applied by setup's
 vision build) with a vocab-only GGUF from `python tools/vision/hy4v_ref.py vocab --gguf <shard 1> --out <dir>/hy4-vocab.gguf`
