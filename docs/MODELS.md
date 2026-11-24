@@ -140,6 +140,24 @@ against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token E
 | `UD-IQ3_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 11.7 GB | KL 0.0280 against the llama.cpp Q8_0 (EN 0.0304, JA 0.0291, code 0.0218), same top-1 93.6%; Japanese facts 589/666 (Q4_K_XL 593) | all in VRAM 136.1; `STRATA_GLM_VRAM_GB=12` 127.5; `=8` 102.9 tok/s; prompts 3,799 / 2,526 / 1,667 | 8-12 GB GPU + RAM |
 | `UD-IQ2_XXS` ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 8.5 GB | KL 0.0782 (EN 0.0835, JA 0.0792, code 0.0693), same top-1 89.1%; Japanese facts 552/666, clearly below - prefer UD-IQ3_XXS at an 8 GB cap | all in VRAM 140.2; `=12` 134.0; `=8` 120.5 tok/s | 8 GB GPU, when speed matters more than Japanese |
 
+AtomicChat's `Inkling-2-Mini-AD-Q4_K.gguf` ([AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF),
+16.5 GB; Q4_K gate-up and Q5_0 down experts) packs from v1.3.203: its 144 loop-controller tensors are Q8_0 (F32 in the
+ggml-org and unsloth files), and `tools/iq_pack.py` now writes them into the pack as their exact F32 values. Setup does
+not offer it; pack it by hand (`python tools/iq_pack.py --gguf Inkling-2-Mini-AD-Q4_K.gguf --out pack`) and start with
+`--glm-pack pack`. Measured against unsloth's UD-Q4_K_XL in the same runs (RTX 5090, iGPU lane off, v1.3.202's engine):
+
+| | AtomicChat AD-Q4_K | unsloth UD-Q4_K_XL |
+| --- | --- | --- |
+| KL against Abyss's own run of ggml-org's Q8_0 (3,071 positions, token path; **not** the llama.cpp Q8_0 reference of the rows above) | 0.0108 (EN 0.0100, JA 0.0121, code 0.0086), same top-1 96.0%, p99 0.096 | 0.0058 (EN 0.0050, JA 0.0070, code 0.0045), same top-1 97.5%, p99 0.053 |
+| decode, a 4,030-token prompt + 512 tokens, median of 3 (batched prompt path): all in VRAM / `STRATA_GLM_VRAM_GB=16` / `=12` | 198.3 / 177.5 / 142.0 tok/s | 194.6 / 154.8 / 127.0 tok/s |
+| that 4K prompt: all in VRAM / 16 / 12 | 6,310 / 2,698 / 2,104 tok/s | 5,823 / 2,099 / 1,475 tok/s |
+| VRAM hit rate at 16 / 12 GB | 97.8% / 89.2% | 94.6% / 85.0% |
+
+The smaller file keeps more experts in VRAM, so it is faster on 12-16 GB cards; its KL is about twice UD-Q4_K_XL's.
+Server answers (EN / JA / code / a tool call, temperature 0) were as right as UD-Q4_K_XL's. Unsloth's old-layout
+drafter (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `STRATA_INK_DSPARK=<file>`) works with it: code, 512 tokens, median of 3,
+199.7 -> 237.8 tok/s (+19%), the same tokens (md5; these runs named the file).
+
 ### Ling-3.2-air (beta, v1.3.201)
 
 inclusionAI's Ling-3.2-air (`bailingmoe3`: 35 KDA linear-attention layers + 7 MLA layers, 512 experts, top-8 with

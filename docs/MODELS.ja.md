@@ -137,6 +137,24 @@ llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL�
 | `UD-IQ3_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 11.7 GB | llama.cpp の Q8_0 との KL 0.0280（英語 0.0304、日本語 0.0291、コード 0.0218）、top-1 の一致 93.6%。日本語の事実 589/666（Q4_K_XL は 593） | 全部 VRAM 136.1、`STRATA_GLM_VRAM_GB=12` 127.5、`=8` 102.9 tok/s。プロンプト 3,799 / 2,526 / 1,667 | GPU 8〜12 GB ＋ RAM |
 | `UD-IQ2_XXS`（[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)） | 8.5 GB | KL 0.0782（英語 0.0835、日本語 0.0792、コード 0.0693）、top-1 の一致 89.1%。日本語の事実 552/666 とはっきり落ちる。VRAM 8 GB でも UD-IQ3_XXS のほうがよい | 全部 VRAM 140.2、`=12` 134.0、`=8` 120.5 tok/s | GPU 8 GB で、日本語より速さを取るとき |
 
+AtomicChat の `Inkling-2-Mini-AD-Q4_K.gguf`（[AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF)、
+16.5 GB。エキスパートは gate-up が Q4_K、down が Q5_0）は v1.3.203 から pack できる。ループのコントローラ 144 テンソルが
+Q8_0 になっていて（ggml-org と unsloth のファイルでは F32）、`tools/iq_pack.py` がそれを正確な F32 の値として pack に入れる。
+setup の選択肢にはない。手で pack して（`python tools/iq_pack.py --gguf Inkling-2-Mini-AD-Q4_K.gguf --out pack`）、
+`--glm-pack pack` で起動する。同じ実行の中で unsloth の UD-Q4_K_XL と比べた（RTX 5090、iGPU レーンなし、v1.3.202 のエンジン）:
+
+| | AtomicChat AD-Q4_K | unsloth UD-Q4_K_XL |
+| --- | --- | --- |
+| Abyss で動かした ggml-org の Q8_0 との KL（3,071 位置、トークン経路。上の表の llama.cpp Q8_0 とは参照が**違う**） | 0.0108（英語 0.0100、日本語 0.0121、コード 0.0086）、top-1 の一致 96.0%、p99 0.096 | 0.0058（英語 0.0050、日本語 0.0070、コード 0.0045）、top-1 の一致 97.5%、p99 0.053 |
+| 生成。4,030 トークンのプロンプト＋512 トークン、3 回の中央値（一括のプロンプト経路）: 全部 VRAM / `STRATA_GLM_VRAM_GB=16` / `=12` | 198.3 / 177.5 / 142.0 tok/s | 194.6 / 154.8 / 127.0 tok/s |
+| その 4K のプロンプト: 全部 VRAM / 16 / 12 | 6,310 / 2,698 / 2,104 tok/s | 5,823 / 2,099 / 1,475 tok/s |
+| 16 / 12 GB での VRAM ヒット率 | 97.8% / 89.2% | 94.6% / 85.0% |
+
+ファイルが小さいぶん VRAM に載るエキスパートが多く、12〜16 GB のカードで速い。KL は UD-Q4_K_XL の約 2 倍。
+サーバーでの回答（英語・日本語・コード・ツール呼び出し、温度 0）は UD-Q4_K_XL と同じくらい正しかった。unsloth の旧形式の
+drafter（`dspark-Inkling-2-Mini-Q8_0_Old.gguf`、`STRATA_INK_DSPARK=<ファイル>`）がそのまま使える: コード、512 トークン、3 回の
+中央値で 199.7 → 237.8 tok/s（+19%）、出るトークンは同じ（md5。この計測ではファイルを指定した）。
+
 ### Ling-3.2-air（ベータ、v1.3.201）
 
 inclusionAI の Ling-3.2-air（`bailingmoe3`。KDA の線形 attention 層 35 + MLA 層 7、エキスパート 512、グループ制限つきの
