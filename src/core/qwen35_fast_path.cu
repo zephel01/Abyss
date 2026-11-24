@@ -92,13 +92,17 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         }
     } else {
         Ly.attn_norm = f32("attn_norm.weight");
-        Ly.post_norm = f32(g.laguna ? "ffn_norm.weight" : "post_attention_norm.weight");   // (laguna: pre-norms only)
+        Ly.post_norm = f32(g.laguna || g.ling ? "ffn_norm.weight" : "post_attention_norm.weight");   // (laguna, ling: pre-norms only)
         if (g.loop && g.kind(il) != 0) {   // SenseNova-Loop: the mHC routers (the first visit's on a second visit)
             Ly.mhc_w[0] = f32("mhc_attn.weight");
             Ly.mhc_b[0] = f32("mhc_attn.bias");
             Ly.mhc_w[1] = f32("mhc_ffn.weight");
             Ly.mhc_b[1] = f32("mhc_ffn.bias");
         }
+    }
+    if (g.ling) {   // (ling: KDA / MLA - ling_fast_path.cu)
+        ling_bind(il, missing);
+        return;
     }
     if (g.laguna) {   // every layer attention: q (no gate half), k, v, the per-head gate, out; q / k norms
         const int H = g.lag_heads[(size_t) il];
@@ -415,6 +419,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                          "for %lld tokens%s)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
                  (double) n_attn * cache_b / 1073741824.0, (long long) ctx,
                  q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
+    if (g.ling && !ling_alloc(err)) return false;
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
     if (g.qsa27 && !q27_qsa_setup(err)) return false;
@@ -964,6 +969,10 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
     }
     if (g_.ink) {
         why = "inkling's slots are not covered yet";
+        return false;
+    }
+    if (g_.ling) {
+        why = "ling's slots are not covered yet";
         return false;
     }
     if (g_.laguna) {
@@ -1994,7 +2003,9 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
             else q35_dump(s, "inp_embd", il, state_, g.n_embd);
             q35_dump(s, "attn_norm", il, F->x, g.n_embd);
         }
-        if (g.laguna) {
+        if (g.ling) {
+            if (!(Ly.recr ? fast_ling_kda(il, err) : fast_ling_mla(il, p, err))) return false;
+        } else if (g.laguna) {
             if (!fast_laguna_attn(il, p, err)) return false;
         } else if (Ly.recr) {
             if (!fast_qwen35_gdn(il, err)) return false;

@@ -27,6 +27,7 @@
 #include "strata/core/part_port.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <condition_variable>
@@ -209,6 +210,30 @@ struct Glm5Geometry {
         return pass == 0 ? il : n_layers + (pass - 1) * (ink_hi - ink_lo) + (il - ink_lo);
     }
     static bool from_gguf_inkling(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+
+    // ---- ling (inclusionAI Ling-3.x, GGUF arch bailingmoe3; src/core/ling_fast_path.cu, kernels/ling_fast.hpp): arch
+    // stays 2 (the qwen35moe path's MoE, pool, tiers and CPU lane) with ling set.  Plain residuals; KDA layers (n_head_kv
+    // 0: q / k / v short convs, f_a / g_a full width with no f_b / g_b, ssm_a = +exp(A_log)) and every
+    // layer_group_size-th an MLA layer (a 512 latent + a 64-dim rope key, q without a LoRA, absorbed k_b / v_b, a sigmoid
+    // gate per head, NORM RoPE of rope_base, scale 1/sqrt(qk_nope + rope)) over every position; dense_lead dense FFN
+    // layers; a sigmoid router with exp_probs_b over ling_group groups (the best ling_topk_group by the sum of their
+    // best two), normalised, w_scale; an ungated shared expert; per-layer SwiGLU limits in the min(silu(g), l) *
+    // clamp(u, +-l) form (lim_e / lim_s).  The qwen35 fields are set so qwen35_alloc's delta-net states and conv rows
+    // are the KDA ones (ssm_* = n_head heads of 128) and its KV rows the MLA cache rows (head_dim 576, one KV head)
+    bool ling = false;
+    int ling_qk_nope = 128, ling_rope = 64, ling_v = 128, ling_group = 8, ling_topk_group = 4;
+    std::vector<float> lim_e, lim_s;   // per layer (the NextN block's too); 0 = no clamp
+    /// the limit the expert / shared-expert kernels take for layer il: ling encodes the llama.cpp form as
+    /// -(kLlamaClampBase + l) (+inf: no clamp); other archs the scalar swiglu_exp / swiglu_shexp
+    static constexpr float kLlamaClampBase = 1048576.0f;
+    float lim_exp(int il) const { return lim_at(lim_e, il, swiglu_exp); }
+    float lim_shexp(int il) const { return lim_at(lim_s, il, swiglu_shexp); }
+    static float lim_at(const std::vector<float>& v, int il, float dflt) {
+        if (v.empty() || il < 0 || il >= (int) v.size()) return dflt;
+        const float l = v[(size_t) il];
+        return l > 1e-6f ? -(kLlamaClampBase + l) : INFINITY;
+    }
+    static bool from_gguf_ling(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
@@ -738,6 +763,19 @@ public:
     bool fast_qwen35_gdn(int il, std::string& err);        // x / xq -> mixer
     bool fast_qwen35_attn(int il, int64_t p, std::string& err);
     bool fast_laguna_attn(int il, int64_t p, std::string& err);   // laguna's attention layer (x / xq -> mixer)
+    // ---- ling (ling_fast_path.cu): the layer's KDA / MLA weights (from qwen35_bind), the MLA attention's scratch (from
+    // qwen35_alloc), the KDA layer and the MLA layer of a token (x / xq -> mixer), the routed experts' group mask (the
+    // router's logits -> a bias that keeps the chosen groups only), the buffers it owns
+    void ling_bind(int il, std::string& missing);
+    bool ling_alloc(std::string& err);
+    bool fast_ling_kda(int il, std::string& err);
+    bool fast_ling_mla(int il, int64_t p, std::string& err);
+    const float* ling_group_bias(int il, const float* logits, const float* bias, cudaStream_t s);
+    void ling_free();
+    std::vector<void*> ling_owned_;
+    float* ling_sc_ = nullptr;     // the MLA scores [heads][ctx] and the partial contexts
+    float* ling_part_ = nullptr;
+    float* ling_bias_ = nullptr;   // the group-masked router bias (n_expert)
     // ---- inkling (inkling_fast_path.cu): the physical layer's weights (from qwen35_bind), the slots and scratch (from
     // qwen35_alloc, inside qwen35_state_), the token path's 48 layer applications and the head's mix (head_x / head_xq),
     // a new sequence's zeroed conv states, the snapshot's runs (conv states, window rings)

@@ -112,6 +112,15 @@ GPT4O_PATTERNS = (
 )
 
 
+# The `bailingmoe2` pre-tokenizer (inclusionAI Ling-2 / Ling-3, also `bailingmoe` and `llada-moe`), transcribed from
+# llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_BAILINGMOE): one expression - the tokenizer.json split with its possessive
+# quantifiers made greedy as llama.cpp has them, single digits, no ignore_merges
+BAILINGMOE_PATTERNS = (
+    r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]"
+    r"|\s+(?!\S)|\s+",
+)
+
+
 def split_sequential(text: str, pats) -> list[str]:
     pieces = [text]
     for pat in pats:
@@ -137,9 +146,11 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2"):
+        if pre in ("bailingmoe", "llada-moe"):
+            pre = self.pre = "bailingmoe2"
+        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
-                             "hy_v4, inkling2" % pre)
+                             "hy_v4, inkling2, bailingmoe2" % pre)
         # glm4/glm5 and inkling2 set ignore_merges: an exact vocab hit emits the whole pre-token piece (Inkling 2's
         # tokenizer.json sets it; its o200k vocabulary has entries the merges cannot build - chffff, Aleksandr, VBORw)
         self.ignore_merges = pre in ("glm4", "glm5", "inkling2")
@@ -163,7 +174,7 @@ class Tokenizer:
         self._re = regex.compile(GLM_PATTERN if pre in ("glm4", "glm5") else QWEN35_PATTERN)
         # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
         seq = (JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna"
-               else GPT4O_PATTERNS if pre == "inkling2" else None)
+               else GPT4O_PATTERNS if pre == "inkling2" else BAILINGMOE_PATTERNS if pre == "bailingmoe2" else None)
         self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -426,11 +437,12 @@ def extract(gguf_path, out_dir) -> dict:
         # (named by `pre`, not by ignore_merges: inkling2 sets the flag but splits the GPT-4o way)
         "pre_pattern": (GLM_PATTERN if tk.pre in ("glm4", "glm5") else list(JOYAI_PATTERNS) if tk.pre in ("joyai-llm", "hy_v4")
                         else list(LAGUNA_PATTERNS) if tk.pre == "laguna" else list(GPT4O_PATTERNS) if tk.pre == "inkling2"
-                        else QWEN35_PATTERN),
+                        else list(BAILINGMOE_PATTERNS) if tk.pre == "bailingmoe2" else QWEN35_PATTERN),
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.pre in ("glm4", "glm5") else
                                "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (inkling2; its tokenizer.json sets "
                                "ignore_merges)" if tk.pre == "inkling2" else
+                               "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_BAILINGMOE (bailingmoe2)" if tk.pre == "bailingmoe2" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

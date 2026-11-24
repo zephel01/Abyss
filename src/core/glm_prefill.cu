@@ -1194,6 +1194,10 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
+    if (g_.ling) {   // (Ling-3.x: no batched prompt path yet - the prompt runs token by token)
+        std::fprintf(stderr, "ling: the prompt runs token by token (no batched prompt path yet)\n");
+        return true;
+    }
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;

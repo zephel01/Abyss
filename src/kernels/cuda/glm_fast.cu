@@ -116,6 +116,14 @@ __device__ __forceinline__ float lane_expf(float x) {
 __device__ __forceinline__ float situ_act(float g, float u) {
     return (4.0f * tanhf(g * 0.25f)) * (1.0f / (1.0f + expf(-g))) * (25.0f * tanhf(u * 0.04f));
 }
+// Ling's clamped SwiGLU (llama.cpp's bailingmoe3 form, the model's own): min(silu(g), l) * clamp(u, -l, l), selected
+// by a limit of -(kLlamaClamp + l) (Glm5Geometry::lim_at; below SITU's negative limits)
+constexpr float kLlamaClamp = 1048576.0f;
+__device__ __forceinline__ bool llama_clamp_on(float limit) { return limit <= -kLlamaClamp; }
+__device__ __forceinline__ float llama_swiglu(float g, float u, float limit) {
+    const float l = -limit - kLlamaClamp;
+    return fminf(g / (1.0f + expf(-g)), l) * fminf(fmaxf(u, -l), l);
+}
 // the exact combine's fixed point (glm_fast.hpp kFxShift; the CPU lane's q81::fx_term): a term to int64 units of
 // 2^-kFxShift, rounded to nearest even; kFxBad when it is not finite or |v| >= 2^24.  fx_float: a sum back, rounded once
 __device__ __forceinline__ long long fx_term(float v) {
@@ -2907,6 +2915,10 @@ __global__ void swiglu_q8_kernel(const float* __restrict__ gate, const float* __
                                  block_q8_1* __restrict__ hq) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n % 32 == 0
+    if (llama_clamp_on(limit)) {
+        q8_1_store_warp(llama_swiglu(gate[i], up[i], limit), hq + i / 32, threadIdx.x & 31);
+        return;
+    }
     if (limit < 0.0f) {
         q8_1_store_warp(situ_act(gate[i], up[i]), hq + i / 32, threadIdx.x & 31);
         return;
@@ -3276,6 +3288,10 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
         // the shared expert's swiglu + q8_1 (warp-aligned 32-runs)
         const int i = (blockIdx.x - 1) * ROUTE_THREADS + tid;
         if (i >= a.n_ff_sh) return;
+        if (llama_clamp_on(a.sh_limit)) {
+            q8_1_store_warp(llama_swiglu(a.sh_gate[i], a.sh_up[i], a.sh_limit), a.sh_hq + i / 32, lane);
+            return;
+        }
         const float g = fminf(a.sh_gate[i], a.sh_limit);
         const float u = fminf(fmaxf(a.sh_up[i], -a.sh_limit), a.sh_limit);
         q8_1_store_warp((g / (1.0f + expf(-g))) * u, a.sh_hq + i / 32, lane);
@@ -4328,7 +4344,12 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
         float sc = 1.0f;
         // (any type: a requantized NVFP4 model keeps the scales on its i-quant experts; null for other models)
         if (d.nv_scale != nullptr && plan_id != nullptr && plan_id[ei] >= 0) sc = d.nv_scale[2 * plan_id[ei]];
-        if (limit < 0.0f) {
+        if (llama_clamp_on(limit)) {   // (the exact lane exp, as the CPU lane's)
+            const float g = sc * sg[lane], l = -limit - kLlamaClamp;
+            const float u = fminf(fmaxf(sc * su[lane], -l), l);
+            q8_1_store_warp(__fmul_rn(fminf(__fdiv_rn(g, __fadd_rn(1.0f, lane_expf(-g))), l), u),
+                            hq + (size_t) ei * (n_ff / 32) + chunk, lane);
+        } else if (limit < 0.0f) {
             q8_1_store_warp(situ_act(sc * sg[lane], sc * su[lane]), hq + (size_t) ei * (n_ff / 32) + chunk, lane);
         } else {
         const float g = fminf(sc * sg[lane], limit);
@@ -4753,6 +4774,11 @@ __global__ void rows_swiglu_q8_kernel(const float* __restrict__ gu, int ld, int 
     const int64_t r = rlo + w / per, b = w % per;
     if (r >= rhi) return;
     const float* row = gu + (size_t) r * ld;
+    if (llama_clamp_on(limit)) {
+        q8_1_store_warp(llama_swiglu(row[b * 32 + lane], row[n_ff + b * 32 + lane], limit), hq + (size_t) (r - rlo) * per + b,
+                        lane);
+        return;
+    }
     if (limit < 0.0f) {
         q8_1_store_warp(situ_act(row[b * 32 + lane], row[n_ff + b * 32 + lane]), hq + (size_t) (r - rlo) * per + b, lane);
         return;
@@ -5826,6 +5852,10 @@ void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq,
 __global__ void swiglu_f32_kernel(const float* gate, const float* __restrict__ up, float limit, int n, float* h) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (llama_clamp_on(limit)) {
+        h[i] = llama_swiglu(gate[i], up[i], limit);
+        return;
+    }
     if (limit < 0.0f) {
         h[i] = situ_act(gate[i], up[i]);
         return;
@@ -5845,6 +5875,10 @@ __global__ void sh_swiglu_kernel(const float* __restrict__ sh_gate, const float*
     // moe_route_kernel's blocks > 0, unchanged: the shared expert's swiglu + q8_1 (warp-aligned 32-runs)
     const int i = blockIdx.x * ROUTE_THREADS + threadIdx.x;
     if (i >= n_ff_sh) return;
+    if (llama_clamp_on(sh_limit)) {
+        q8_1_store_warp(llama_swiglu(sh_gate[i], sh_up[i], sh_limit), sh_hq + i / 32, threadIdx.x & 31);
+        return;
+    }
     const float g = fminf(sh_gate[i], sh_limit);
     const float u = fminf(fmaxf(sh_up[i], -sh_limit), sh_limit);
     q8_1_store_warp((g / (1.0f + expf(-g))) * u, sh_hq + i / 32, threadIdx.x & 31);
@@ -6458,7 +6492,12 @@ __global__ void __launch_bounds__(GU_WARPS * 32) xrows_gate_up_kernel(const uint
         __syncthreads();
         if (warp < nt) {   // (moe_gate_up_kernel's epilogue: sc = 1)
             const float sc = 1.0f;
-            if (limit < 0.0f) {
+            if (llama_clamp_on(limit)) {
+                const float g = sc * sg[warp][lane], l = -limit - kLlamaClamp;
+                const float u = fminf(fmaxf(sc * su[warp][lane], -l), l);
+                q8_1_store_warp(__fmul_rn(fminf(__fdiv_rn(g, __fadd_rn(1.0f, lane_expf(-g))), l), u),
+                                hq + (size_t) (R0 + t0 + warp - rlo) * (n_ff / 32) + chunk, lane);
+            } else if (limit < 0.0f) {
                 q8_1_store_warp(situ_act(sc * sg[warp][lane], sc * su[warp][lane]),
                                 hq + (size_t) (R0 + t0 + warp - rlo) * (n_ff / 32) + chunk, lane);
             } else {

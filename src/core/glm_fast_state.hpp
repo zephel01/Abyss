@@ -452,6 +452,11 @@ struct Glm5Model::FastState {
         // Qwen3.8-27B QSA (qsa27.hpp): the same fields with FP32 k_proj / q_proj, q4_ikn the cell key's norm
         // (k_norm.pre_weight) and this the block key's (k_norm.weight); q4_tail the raw keys of the block being filled
         const float* q27_kbn = nullptr;
+        // ---- ling (ling_fast_path.cu): KDA f_a / g_a (n_embd -> d_inner) and ssm_beta (n_embd -> n_head); MLA attn_q
+        // (n_embd -> heads x (nope + rope)), attn_kv_a_mqa (n_embd -> kv_lora + rope), attn_gate (n_embd -> heads),
+        // attn_kv_a_norm, the absorbed k_b ([head][kv_lora][nope]) / v_b ([head][v][kv_lora]) as F32 rows
+        WSlot lg_f, lg_g, lg_beta, lg_wq, lg_kva, lg_gate;
+        const float *lg_kvn = nullptr, *lg_kb = nullptr, *lg_vb = nullptr;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;

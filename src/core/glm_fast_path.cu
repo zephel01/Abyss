@@ -946,7 +946,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
+            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
             if (!g.ink) {   // (inkling: no shared expert)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
@@ -2983,7 +2983,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         }, [&](int i, int q) {
             const X3Rows R = rows(i);
             const kc::Exl3Part pt[3] = {part(i, 0), part(i, 1), part(i, 2)};
-            x3_down_prep(&R, 1, pt, q, g.swiglu_exp);
+            x3_down_prep(&R, 1, pt, q, g.lim_exp(il));
         }, [&](int i, int q, int c0, int c1) {
             const X3Rows R = rows(i);
             x3_down_rows(&R, 1, part(i, 2), q, c0, c1);
@@ -3002,7 +3002,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         const int nc = std::max(1, std::min(ne - 1, (int) std::lround(ne * F->x3_frac)));
         const size_t off9[9] = {Ly.xl.suh[0], Ly.xl.suh[1], Ly.xl.suh[2], Ly.xl.svh[0], Ly.xl.svh[1],
                                 Ly.xl.svh[2], Ly.xl.trellis[0], Ly.xl.trellis[1], Ly.xl.trellis[2]};
-        if (F->igpu_x3s(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.swiglu_exp, ne - nc, (const void* const*) (blob + nc),
+        if (F->igpu_x3s(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.lim_exp(il), ne - nc, (const void* const*) (blob + nc),
                         w + nc, x) == 0) {
             x3_cpu(nc, blob, w, out);
             float* go = F->x3_gout.data();
@@ -3030,13 +3030,13 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         if (Ly.exl3) {
             const size_t off9[9] = {Ly.xl.suh[0], Ly.xl.suh[1], Ly.xl.suh[2], Ly.xl.svh[0], Ly.xl.svh[1],
                                     Ly.xl.svh[2], Ly.xl.trellis[0], Ly.xl.trellis[1], Ly.xl.trellis[2]};
-            rc = F->igpu_x3(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.swiglu_exp, ne, (const void* const*) blob, w, x,
+            rc = F->igpu_x3(Ly.xl.K, Ly.xl.cb, off9, n_embd, n_ff, g.lim_exp(il), ne, (const void* const*) blob, w, x,
                             out);
         } else {
             rc = xq != nullptr && F->igpu_experts_q != nullptr
-                     ? F->igpu_experts_q(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
+                     ? F->igpu_experts_q(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.lim_exp(il), ne,
                                          (const void* const*) blob, w, xq, out)
-                     : F->igpu_experts(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, ne,
+                     : F->igpu_experts(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.lim_exp(il), ne,
                                        (const void* const*) blob, w, x, out);
         }
         // a call is ~0.1-0.3 ms; one that waits for the kernel driver to fault a registered range in again (the stall
@@ -3150,7 +3150,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
             float* o[1] = {F->cpu_ff.data() + (size_t) i * n_ff};
-            lane_gu_rows(exact, nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp,
+            lane_gu_rows(exact, nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.lim_exp(il),
                          gs != nullptr ? gs[i] : 1.0f);
             // the job that finishes expert i's last gate/up rows of an h piece quantizes that piece (one piece, the
             // whole h, unless the pieces below are on); the last piece's makes h ready for the down rows
@@ -3325,7 +3325,7 @@ bool Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         const strata::qt::Traits* td = strata::qt::traits((strata::qt::Type) Ly.d_type);
         std::vector<float> row((size_t) std::max(n_embd, n_ff));
         std::vector<double> hr((size_t) n_ff), ref((size_t) n_embd, 0.0);
-        const double lim = g.swiglu_exp;
+        const double lim = g.lim_exp(il);
         for (int i = 0; i < ne; ++i) {
             for (int r = 0; r < n_ff; ++r) {
                 double gs = 0.0, us = 0.0;
@@ -3404,7 +3404,7 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
     // cannot see, ...): a call a column below; < 0: the lane is gone, the CPU takes over as fast_cpu_experts does
     if (n >= 2 && !Ly.exl3 && !Ly.mixed() && F->igpu_experts != nullptr && F->igpu_cols != nullptr && n <= kVerifyMax &&
         gs == nullptr) {
-        const int rc = F->igpu_cols(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, n, ne,
+        const int rc = F->igpu_cols(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.lim_exp(il), n, ne,
                                     (const void* const*) blob, w, x, xq, out);
         if (rc == 0) {
             F->igpu_calls.fetch_add((uint64_t) n, std::memory_order_relaxed);
@@ -3488,7 +3488,7 @@ bool Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
                 a[k] = act + (size_t) ucol[u][k] * kc::kNativeActBytes;
                 o[k] = F->cpu_ff_m.data() + (size_t) upair[u][k] * n_ff;
             }
-            lane_gu_rows(exact, nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.swiglu_exp, ugs[u]);
+            lane_gu_rows(exact, nf, ub[u], ub[u] + Ly.gu_bytes, a, ucnt[u], o, r0, r1, g.lim_exp(il), ugs[u]);
             q += r1 - r0;
         }
     };
@@ -4356,7 +4356,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         xa.k = 1;
         xa.n_embd = E;
         xa.n_ff = FFE;
-        xa.limit = g.swiglu_exp;
+        xa.limit = g.lim_exp(il_cal);
         x3::moe_gate_up(xa, dx, nullptr, F->cs);
         x3::moe_down(xa, nullptr, nullptr, dout, F->cs);
         cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
@@ -4373,7 +4373,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         std::vector<float> gr((size_t) FFE), ur((size_t) FFE), hr((size_t) FFE), orf((size_t) E);
         ref_mv(0, xc.data(), gr.data());
         ref_mv(1, xc.data(), ur.data());
-        const float lim = g.swiglu_exp;
+        const float lim = g.lim_exp(il_cal);
         for (int r = 0; r < FFE; ++r) {
             const float gs = std::min(gr[(size_t) r], lim), us = std::min(std::max(ur[(size_t) r], -lim), lim);
             hr[(size_t) r] = gs / (1.0f + std::exp(-gs)) * us;
@@ -4420,7 +4420,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaMemsetAsync(F->md.cpu_flag, 0, 4, F->cs);
         gf::MoeDev mdc = F->md;
         mdc.nv_scale = Ly.nv_scale;
-        gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr, F->cs,
+        gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.lim_exp(il_cal), dxq, dhq, nullptr, 0, nullptr, 0, nullptr, F->cs,
                         Ly.up_type);
         gf::moe_down(Ly.d_type, mdc, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
         cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
@@ -4441,7 +4441,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             for (int i = 0; i < E; ++i) us += (double) row[(size_t) i] * xc[(size_t) i];
             gs *= sgu;
             us *= sgu;
-            const double lim = g.swiglu_exp;
+            const double lim = g.lim_exp(il_cal);
             gs = std::min(gs, lim);
             us = std::min(std::max(us, -lim), lim);
             hr[(size_t) r] = gs / (1.0 + std::exp(-gs)) * us;
@@ -4530,7 +4530,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                 gf::MoeDev mdc = F->md;
                 mdc.nv_scale = Ly.nv_scale;
                 mdc.xpart = nullptr;   // (the float form: out = 1 * the expert's row + 0, its bits as they are)
-                gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.swiglu_exp, dxq, dhq, nullptr, 0, nullptr, 0, nullptr,
+                gf::moe_gate_up(Ly.gu_type, mdc, 1, E, FFE, g.lim_exp(il_cal), dxq, dhq, nullptr, 0, nullptr, 0, nullptr,
                                 F->cs, Ly.up_type);
                 gf::moe_down(Ly.d_type, mdc, 1, E, FFE, Ly.down_off, dhq, nullptr, dout, F->cs);
                 cudaMemcpyAsync(xc.data(), dx, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
@@ -5382,7 +5382,7 @@ void Glm5Model::fast_service() {
                 std::string helper_err;
                 const auto& L = F->L[(size_t) wq_layer];
                 bool ok = H->begin_cols(wq_layer, wq_n, hne, hid, hw, x, L.gu_type, L.d_type, L.down_off,
-                                        g.swiglu_exp, helper_err);
+                                        g.lim_exp(wq_layer), helper_err);
                 if (ok) {
                     if (nc > 0) fast_cpu_experts_multi(wq_layer, nc, cne, cb, cw, cx, cout, xq_all ? cxq : nullptr);
                     ok = H->finish_cols(wq_n, hne, out, helper_err);
@@ -5426,7 +5426,7 @@ void Glm5Model::fast_service() {
                             const strata::qt::Traits* td = strata::qt::traits((strata::qt::Type) Lc.d_type);
                             if (!tg || !tg->to_float || !tu || !tu->to_float || !td || !td->to_float) continue;
                             const int E = g.n_embd, FF = g.n_ff_exp;
-                            const float lim = g.swiglu_exp;
+                            const float lim = g.lim_exp(wq_layer);
                             exf.resize((size_t) std::max(E, FF));
                             exh.resize((size_t) FF);
                             exo.assign((size_t) E, 0.0f);
@@ -5760,7 +5760,7 @@ void Glm5Model::fast_service() {
                         bl[ne] = (const void*) rq->cpu_src[i];
                         wl[ne++] = rq->w[i];
                     }
-                lane_started = F->igpu_start(Ly.gu_type, Ly.d_type, g.n_embd, g.n_ff_exp, Ly.down_off, g.swiglu_exp, ne,
+                lane_started = F->igpu_start(Ly.gu_type, Ly.d_type, g.n_embd, g.n_ff_exp, Ly.down_off, g.lim_exp(il), ne,
                                              bl, wl, rq->x,
                                              rq->xq_ok && F->igpu_experts_q != nullptr ? (const void*) rq->xq : nullptr) == 0;
             };
@@ -6113,7 +6113,7 @@ void Glm5Model::fast_service() {
                     if (hn) {
                         const auto& L = F->L[(size_t) rq->layer];
                         ok = H->begin(rq->layer, hn, hi, hw, rq->x, L.gu_type, L.d_type, L.down_off,
-                                      g.swiglu_exp, helper_err);
+                                      g.lim_exp(rq->layer), helper_err);
                     }
                     if (ok) {
                         if (cn) fast_cpu_experts(rq->layer, cn, cb, cw, rq->x, ans->part,
@@ -7491,8 +7491,11 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     }();
     // deepseek41: an image row selects its experts with exp_probs_b_vl (the prediction and lookahead of the next layers too)
     const bool vl = F->cur_img && Ly.router_bias_vl != nullptr;
-    gf::moe_route(F->rlog, vl ? Ly.router_bias_vl : Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
-                  g.n_embd, md, late ? nullptr : F->sh_g, late ? nullptr : F->sh_u, g.swiglu_shexp, late ? 0 : FFs,
+    // ling: the groups' mask on the selection (the router's bias with the experts of the groups left out at -1e30)
+    const float* rbias = vl ? Ly.router_bias_vl : Ly.router_bias;
+    if (g.ling && g.ling_group > 1) rbias = ling_group_bias(il, F->rlog, rbias, s);
+    gf::moe_route(F->rlog, rbias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
+                  g.n_embd, md, late ? nullptr : F->sh_g, late ? nullptr : F->sh_u, g.lim_shexp(il), late ? 0 : FFs,
                   F->sh_hq, s,
                   pred ? F->plog : nullptr, pred ? (F->cur_img && F->L[(size_t) il + 1].router_bias_vl ? F->L[(size_t) il + 1].router_bias_vl
                                                                     : F->L[(size_t) il + 1].router_bias)
@@ -7527,7 +7530,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         sj[0] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
         sj[1] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
         if (!gf::mv(sj, 2, s)) { err = "glm fast: shared expert"; return false; }
-        gf::sh_swiglu(F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, s);
+        gf::sh_swiglu(F->sh_g, F->sh_u, g.lim_shexp(il), FFs, F->sh_hq, s);
         if (F->prof_on) F->mark("shexp_mv");
     }
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
@@ -7576,14 +7579,14 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         xa.k = g.n_exp_used;
         xa.n_embd = g.n_embd;
         xa.n_ff = g.n_ff_exp;
-        xa.limit = g.swiglu_exp;
+        xa.limit = g.lim_exp(il);
         strata::kernels::exl3::moe_gate_up(xa, F->x, nullptr, s);
         if (F->prof_on) F->mark("moe_gate_up");
         strata::kernels::exl3::moe_down(xa, nullptr, Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
         if (F->prof_on) F->mark("moe_down");
     } else {
     // (the shared expert's down rides the gate/up launch: sh_out)
-    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
+    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.lim_exp(il), F->xq, F->hq, Ly.sh_down.q,
                     Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s, Ly.up_type);
     if (Ly.sh_down.q != nullptr) abl_apply(il, 1, F->sh_out, 1, g.n_embd, s);
     if (F->prof_on) F->mark("moe_gate_up");
