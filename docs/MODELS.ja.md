@@ -155,10 +155,23 @@ setup の選択肢にはない。手で pack して（`python tools/iq_pack.py -
 drafter（`dspark-Inkling-2-Mini-Q8_0_Old.gguf`、`STRATA_INK_DSPARK=<ファイル>`）がそのまま使える: コード、512 トークン、3 回の
 中央値で 199.7 → 237.8 tok/s（+19%）、出るトークンは同じ（md5。この計測ではファイルを指定した）。
 
+orcarouter の abliterated（検閲を外した）モデル [orcarouter/Inkling-2-Mini-abliterated-GGUF](https://huggingface.co/orcarouter/Inkling-2-Mini-abliterated-GGUF)
+（`Mix-16G` 15.7 GB、`Mix-12G` 11.6 GB。層ごとに型を混ぜたもの）は v1.3.197 から動きます（`./setup-deepseek.sh --model inkling2mini-abl`、
+小さいほうは `--quant Mix-12G`。[MANUAL](MANUAL.ja.md)）。3,071 位置のセットでの KL:
+
+| | Mix-16G | Mix-12G |
+| --- | --- | --- |
+| 元のモデルの Q8_0（上の表と同じ llama.cpp の参照）に対して | 0.112、上位 1 位の一致 86.8% | 0.130、86.1% |
+| 同じファイルでの Abyss と llama.cpp の差（エンジン自身の差） | 0.0117 | 0.0071 |
+| RTX 3090（すべて VRAM）、コードの生成: drafter なし → unsloth の drafter あり | 104 → 132 tok/s | 114 → 132 tok/s |
+
+元のモデルからのずれは abliteration そのものの分です（llama.cpp で同じファイルを動かしても同じ KL）。drafter は unsloth の旧形式
+`dspark-Inkling-2-Mini-Q8_0_Old.gguf`（v1.3.203 の案内）で、つけても出るトークンは同じです。
+
 ### Ling-3.2-air（ベータ、v1.3.201）
 
 inclusionAI の Ling-3.2-air（`bailingmoe3`。KDA の線形 attention 層 35 + MLA 層 7、エキスパート 512、グループ制限つきの
-top-8）。画像も読める（下記）。まだ無いもの: MTP ブロック。会話スロットは Qwen3.8 / Ornith と同じ（[MANUAL](MANUAL.ja.md)、`STRATA_GLM_SLOTS`）。品質: 混在テキストの 96 位置での
+top-8）。画像も読める（下記）。MTP（NextN）ブロックの下書きは v1.3.204 から opt-in（`STRATA_LING_MTP`、[MANUAL](MANUAL.ja.md)。RTX 5090 + RAM で生成 +3〜+16%、出るトークンは同じ）。会話スロットは Qwen3.8 / Ornith と同じ（[MANUAL](MANUAL.ja.md)、`STRATA_GLM_SLOTS`）。品質: 混在テキストの 96 位置での
 KL。参照は HF のモデルコード（`modeling_bailing_moe_v3_vl.py` と fla の KDA 再帰）の数式から書いた float64 の numpy の
 forward を、量子化を戻した重みで回したもの。速度: RTX 5090（PCIe Gen4 x4）+ RAM 123 GB、iGPU レーンなし、512 トークン、
 3 回の中央値。
@@ -188,6 +201,19 @@ forward で KL 0.006 で、エンジン自身の誤差と同じくらいの大�
 右下、右下の隅の単語、右上の色）では、サーバー経由で 5 枚とも正解。float64 の forward での正解の確率は、HF の規則のほうが同じか高い
 （隅の単語は 0.9962 対 Qwen-VL の規則で 0.9764、ほかの 4 枚は差 0.0001 以内）。どちらの規則でも正解になる。画像タワー自身の 2 次元の回転が
 パッチの位置をすでに持っているため。規則は HF のコードに従った。
+
+### MemT-1.0-Nano（ベータ、v1.3.204）
+
+MemTensor の MemT-1.0-Nano。Qwen3.6-35B-A3B（qwen35moe の経路）の 10 層のフルアテンション層それぞれにメモリのブロックがあり、
+メモリは 40 MiB の状態です。モデルは答えるあいだこれを読み、ターンの終わりに書きます。変換・pack・サーバーの `memory` API の使い方は
+[MANUAL](MANUAL.ja.md#memt-10-nanoネイティブのメモリベータ)。公開の GGUF はなく、HF のファイルから `tools/memt_convert.py` で作ったもの。
+品質: HF のコードから書いた float64 の numpy の forward（`recipes/memt/ref_memt.py`）に対する KL(基準 || エンジン)。速さ: RTX 5090、
+iGPU レーンなし、4K のプロンプト + 512 トークン、3 回の中央値。
+
+| ファイル | 大きさ | 品質 | 速さ | 向き |
+| --- | ---: | --- | --- | --- |
+| `Q8_0`（`tools/memt_convert.py`。メモリのブロックは BF16 / F32） | 37.8 GB | 骨格、メモリなし: 49 トークンのチャット 0.0014（トークン経路）/ 0.0078（プロンプト経路）、文書の先頭 512 トークン 0.052 / 0.034。基準の状態を読む: 0.003 / 0.004、上位 1 位は 28 位置すべて一致（メモリなしでは 3.01、37%）。58 トークンからの書き: 層ごとの相対誤差 0.8〜2.8%、cos 0.9994 以上。思い出し: 4 点すべて（CLI とサーバー） | 未計測 | 基準に近いほう（確認用）。ほかの MoE と同じく RAM の段を使って動くが、速さは未計測 |
+| `Q4_K_M`（テンソルごとの型は Ornith-1.5-35B-A3B の Q4_K_M と同じ。k-quant は trench-gguf の GPU 量子化） | 22.1 GB | 骨格、メモリなし、同じ 512 トークン: 0.194（プロンプト経路）、一致 88.3%。サーバーでの思い出し: 4 点すべて。`/documents` で書いた 62 トークンのメモ: 2 問とも正解 | 生成はメモリなし 304.6 tok/s、あり 295.5（−3.0%）。4K のプロンプト 8,955 → 8,362 tok/s（−6.6%）。194 トークンのターンを書くのに 0.17 秒。メモリ 1 つ 40 MiB（GPU では書き用と合わせて 80 MiB） | 32 GB の GPU で計測。小さい GPU は未計測 |
 
 ### Qwen3.8-Flash-Next（qwen4exp）
 

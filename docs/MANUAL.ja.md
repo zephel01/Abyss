@@ -1063,6 +1063,59 @@ MoE、1 トークンあたり約 8B が動く）を qwen35moe の層経路で動
 36.3 / 41.4 / 47.4。llama.cpp 32.0 / 38.1 / 43.2）、プロンプト 859 / 1,005 / 1,174（318 / 391 / 470）、llama.cpp との KL 0.024
 （llama.cpp 自身の CPU と CUDA の差と同じ）。NextN ドラフターはなく、v1.3.142 から n-gram の下書きが有効です。詳しくは [docs/laguna](laguna/README.ja.md)。
 
+## MemT-1.0-Nano（ネイティブのメモリ、ベータ）
+
+v1.3.204 から、エンジンは MemTensor の [MemT-1.0-Nano](https://huggingface.co/MemTensor/MemT-1.0-Nano)（Apache-2.0）を、
+そのモデル自身のメモリつきで動かします（NVIDIA）。骨格は Qwen3.6-35B-A3B（qwen35moe の経路。形は Ornith-1.5-35B-A3B と同じ）で、
+10 層あるフルアテンションの層それぞれにメモリのブロックがあります。メモリは 1 層あたり 16 x 256 x 256 個の FP32 の状態
+（全部で 40 MiB）です。モデルは答えるあいだこれを読み、ターンの終わりにそのターンを書き込みます（ターンをモデルに流し直す）。
+1 回話した事実を、それを含まない新しい会話で聞けます。setup の選択肢と公開の GGUF はまだありません。変換・pack・設定は手で行います。
+
+変換（`tools/memt_convert.py`。Abyss 自前の読み書きで、llama.cpp・safetensors・torch は使いません）。`--meta` は、キーとトークナイザーを写す
+同じ系統の GGUF で、Ornith-1.5-35B-A3B の Q4_K_M を使います（`./setup-deepseek.sh --model ornith35` がダウンロードします）。
+メモリのブロックは BF16 / F32 のままです（0.9 GB）。
+
+```bash
+# Q8_0（37.8 GB）: numpy だけ
+.venv/bin/python tools/memt_convert.py <MemT-1.0-Nano のフォルダ> MemT-1.0-Nano-Q8_0.gguf --meta=Ornith-1.5-35B-Q4_K_M.gguf
+# Q4_K_M（22.1 GB）: テンソルごとの型は Ornith の Q4_K_M と同じ。k-quant は trench-gguf の GPU 量子化で
+.venv/bin/python tools/memt_convert.py <MemT-1.0-Nano のフォルダ> MemT-1.0-Nano-Q4_K_M.gguf --meta=Ornith-1.5-35B-Q4_K_M.gguf \
+  --types-from=Ornith-1.5-35B-Q4_K_M.gguf --gpuq=<trench-gguf>/gpuq/libgpuq_cuda.so
+.venv/bin/python tools/iq_pack.py --gguf MemT-1.0-Nano-Q4_K_M.gguf --out <dir>/pack
+```
+
+設定: `"args": ["--glm-pack", "<dir>/pack", "--max-context", "16384", "--prefill", "auto"]`、`"tokenizer": "<dir>/pack/tokenizer"`。
+サーバーは `--engine strata` で起動します。`memory` のない要求は骨格だけで答えます（Qwen3.6-35B-A3B と同じ答え方）。
+
+サーバーのメモリの API（メモリはファイル `STRATA_MEMT_DIR/<id>.safetensors`、既定は `~/.abyss/memt`。id は英数字と `.` `_` `-` で 1〜128 文字）:
+
+| 要求 | すること |
+| --- | --- |
+| チャットの要求（OpenAI の `/v1/chat/completions`、Anthropic の `/v1/messages`）に `"memory": {"id": "<id>", "commit": true}`（Anthropic は `metadata.memory` も可。`"memory": "<id>"` は読むだけ） | 答えはそのメモリを読みます（ファイルがまだなければ空のメモリ）。`"commit": true` なら、答えのあと（finish が `stop` か `length`）、要求の最後のユーザー発言と答えをメモリに書き、ファイルに保存します。返事に `"memory": {"id", "committed_tokens", "updated"}` が付きます。書いたターンは、次から送らなくてかまいません |
+| `POST /v1/memory/<id>/documents` `{"text": "..."}` | 文章を文書としてメモリに書き（2,048 トークンごとの区切り）、保存します |
+| `GET /v1/memory` | 保存したメモリの一覧（id、バイト数、更新時刻） |
+| `POST /v1/memory/<id>/delete` | ファイルを消します（読むのもやめます） |
+
+ファイルは MemT の `save_state` と同じ並びです（`memory.<層>` F32 [1, 16, 256, 256]、`format` = `memt-memory-v1`）。HF のコードで保存した
+状態をここで読めますし、その逆もできます（identity のハッシュは確かめません）。エンジンのコマンド（`--serve`）:
+`MEMT OFF|ZERO|INFO|LOAD <file>|SAVE <file>|COMMIT <ids>|DOC <ids>`。
+
+RTX 5090（iGPU レーンなし）で測りました。基準は HF のコードから書いた float64 の numpy の順伝播（`recipes/memt/ref_memt.py`）、KL(基準 || エンジン):
+
+| 確認 | 結果 |
+| --- | --- |
+| 骨格、メモリなし、Q8_0 | 49 トークンのチャット: KL 0.0014（トークン経路）/ 0.0078（プロンプト経路）、上位 1 位の一致 97.9% / 100%。長い文書の先頭 512 トークン: 0.052 / 0.034（64 位置ごとの中央値 0.001〜0.004。平均を押し上げているのは、基準自身も迷う目次の数か所）。同じ 512 で Q4_K_M: 0.194（プロンプト経路）、一致 88.3% |
+| メモリの読み、Q8_0、基準が書いた状態を読み込む | KL 0.003（トークン経路、最大 0.013）/ 0.004（プロンプト経路）、28 位置すべてで上位 1 位が一致。同じ入力をメモリなしで流すと KL 3.01、一致 37% |
+| メモリの書き、Q8_0、空の状態に 58 トークン | 層ごとの相対誤差 0.8〜2.8%（プロンプト経路）/ 1.4〜3.6%（トークン経路）、cos 0.9994 以上。深い層ほど大きい（Q8_0 の骨格の誤差が層の入力に入るため） |
+| 思い出し（MemT の README の子猫の例） | 1 ターン目を書いたあと、質問だけの新しい会話で 4 点（名前・年齢・好物・特技）すべて正解。Q8_0 の CLI とサーバー、Q4_K_M のサーバーで確認。空のメモリでは「分からない」と答える。`/documents` で書いた 62 トークンのメモ: 2 問とも正解 |
+| 速さ、Q4_K_M、4K のプロンプト＋512 トークン、3 回の中央値 | 生成はメモリなし 304.6 tok/s、あり 295.5（−3.0%）。プロンプト 8,955 → 8,362 tok/s（−6.6%） |
+| ターンを書く時間 | 194 トークンで 0.17 秒（Q4_K_M、サーバー）。58 トークンで 0.6 秒（Q8_0、最初の書き込み。プロンプト経路の準備を含む） |
+
+ベータです。NVIDIA だけ（カーネルは HIP でもビルドできますが、動かしていません）。モデルに入るメモリは一度に 1 つ（別のメモリの要求が来ると、
+そのファイルを読み込みます）。MemT では会話スロット・`--parallel`・層の分割・下書きは使いません（MTP の重みがありません）。文書の書き方
+（ユーザー発言 1 通として描画し、生成プロンプトを付けない）は MemT 自身のコードとは照らしていません（その文書への答えは正しく出ました）。
+骨格が Qwen3.6-35B-A3B とバイト単位で同じかは確かめていません（元の重みが手元にないため）。
+
 ## Hy4-flash（ベータ、未リリース）
 
 エンジンは Tencent の Hy4-flash（GGUF のアーキテクチャ `hy_v4_flash`。シンク付きのゲート MLA 注意、4 本の hyper-connection、

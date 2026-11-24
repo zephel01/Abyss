@@ -1121,6 +1121,64 @@ unsloth's UD-IQ4_XS (58 GB). RTX 5090 capped at 16 / 24 / 32 GB: decode 42.5 / 5
 47.4 in v1.3.140; llama.cpp 32.0 / 38.1 / 43.2), prompts 859 / 1,005 / 1,174 (318 / 391 / 470); KL against llama.cpp 0.024, the
 same as its own CPU against CUDA. No NextN drafter; the n-gram drafts are on from v1.3.142. Details: [docs/laguna](laguna/README.md).
 
+## MemT-1.0-Nano (native memory, beta)
+
+From v1.3.204 the engine runs MemTensor's [MemT-1.0-Nano](https://huggingface.co/MemTensor/MemT-1.0-Nano) (Apache-2.0)
+with its native memory, on NVIDIA. The backbone is Qwen3.6-35B-A3B (the qwen35moe path, the shapes of Ornith-1.5-35B-A3B);
+each of its 10 full-attention layers has a memory block. A memory is a state of 16 x 256 x 256 FP32 numbers a layer
+(40 MiB in all): the model reads it while it answers, and a turn is written into it at the end (the turn is replayed
+through the model). A fact told once can be asked in a new conversation that does not contain it. There is no setup
+entry and no published GGUF yet: convert, pack and write the config by hand.
+
+Convert (`tools/memt_convert.py`, Abyss's own reader and writer - no llama.cpp, safetensors or torch). `--meta` is a
+GGUF of the same family whose keys and tokenizer are copied: Ornith-1.5-35B-A3B's Q4_K_M (`./setup-deepseek.sh --model
+ornith35` downloads it). The memory blocks stay BF16 / F32 (0.9 GB).
+
+```bash
+# Q8_0 (37.8 GB): numpy only
+.venv/bin/python tools/memt_convert.py <MemT-1.0-Nano folder> MemT-1.0-Nano-Q8_0.gguf --meta=Ornith-1.5-35B-Q4_K_M.gguf
+# Q4_K_M (22.1 GB): the per-tensor types of Ornith's Q4_K_M, the k-quants through trench-gguf's GPU quantizer
+.venv/bin/python tools/memt_convert.py <MemT-1.0-Nano folder> MemT-1.0-Nano-Q4_K_M.gguf --meta=Ornith-1.5-35B-Q4_K_M.gguf \
+  --types-from=Ornith-1.5-35B-Q4_K_M.gguf --gpuq=<trench-gguf>/gpuq/libgpuq_cuda.so
+.venv/bin/python tools/iq_pack.py --gguf MemT-1.0-Nano-Q4_K_M.gguf --out <dir>/pack
+```
+
+The config: `"args": ["--glm-pack", "<dir>/pack", "--max-context", "16384", "--prefill", "auto"]`, `"tokenizer":
+"<dir>/pack/tokenizer"`, and start the server with `--engine strata`. A request without `memory` runs the backbone
+alone (the model answers as Qwen3.6-35B-A3B would).
+
+The server's memory API (the memories are files `STRATA_MEMT_DIR/<id>.safetensors`, default `~/.abyss/memt`; an id is
+1-128 letters, digits, `.`, `_` or `-`):
+
+| request | what it does |
+| --- | --- |
+| chat request (OpenAI `/v1/chat/completions` or Anthropic `/v1/messages`) with `"memory": {"id": "<id>", "commit": true}` (Anthropic: also `metadata.memory`; `"memory": "<id>"` = read only) | the answer reads that memory (an empty one if the file does not exist yet). With `"commit": true`, after the answer (finish `stop` or `length`) the request's last user message and the answer are written into the memory and the file is saved. The reply carries `"memory": {"id", "committed_tokens", "updated"}`. A client that committed a turn need not send it again |
+| `POST /v1/memory/<id>/documents` `{"text": "..."}` | the text is written into the memory as a document (in 2,048-token chunks) and saved |
+| `GET /v1/memory` | the saved memories: id, bytes, modified time |
+| `POST /v1/memory/<id>/delete` | deletes the file (and stops reading it) |
+
+The file has the layout MemT's own `save_state` writes (`memory.<layer>` F32 [1, 16, 256, 256], `format` =
+`memt-memory-v1`), so a state saved by the HF code loads here and the other way round (the identity hash is not
+checked). The engine's command lines (`--serve`): `MEMT OFF|ZERO|INFO|LOAD <file>|SAVE <file>|COMMIT <ids>|DOC <ids>`.
+
+Measured on an RTX 5090 (iGPU lane off), against a float64 numpy forward written from the HF code
+(`recipes/memt/ref_memt.py`), KL(reference || engine):
+
+| check | result |
+| --- | --- |
+| backbone, memory off, Q8_0 | a 49-token chat: KL 0.0014 (token path) / 0.0078 (prompt path), the same top token at 97.9% / 100%; the first 512 tokens of a long document: 0.052 / 0.034 (median per 64 positions 0.001-0.004; a few table-of-contents positions where the reference itself is unsure carry the mean). Q4_K_M on the same 512: 0.194 (prompt path), same top token 88.3% |
+| memory read, Q8_0, the reference's written state loaded | KL 0.003 (token path, max 0.013) / 0.004 (prompt path), the same top token at all 28 positions; the same input without the memory: KL 3.01, 37% |
+| memory write, Q8_0, 58 tokens into an empty state | relative error per layer 0.8-2.8% (prompt path) / 1.4-3.6% (token path), cosine >= 0.9994; it grows with depth (the Q8_0 backbone's own error feeds the layer inputs) |
+| recall (the kitten example of MemT's README) | turn 1 committed; in a new conversation with only the question, all four facts (name, age, food, trait) right - Q8_0 through the CLI and the server, Q4_K_M through the server; with an empty memory the model says it does not know. A 62-token note written through `/documents`: both questions on it answered right |
+| speed, Q4_K_M, a 4K prompt + 512 tokens, median of 3 | decode 304.6 tok/s without a memory, 295.5 with one (-3.0%); prompt 8,955 -> 8,362 tok/s (-6.6%) |
+| writing a turn | 194 tokens 0.17 s (Q4_K_M, server); 58 tokens 0.6 s on the first write (Q8_0, it includes the prompt path's start) |
+
+Beta: NVIDIA only (the kernels build for HIP but have not run there); one memory in the model at a time (a request for
+another loads that file); conversation slots, `--parallel`, a layer split and drafting are off for MemT (it has no MTP
+weights); the way a document is rendered (one user message, no generation prompt) is not checked against MemT's own
+code - the answers on it are right. The backbone is not checked byte for byte against Qwen3.6-35B-A3B (those weights
+are not here).
+
 ## Hy4-flash (beta, unreleased)
 
 The engine runs Tencent's Hy4-flash (GGUF architecture `hy_v4_flash`: gated MLA attention with sinks, 4 hyper-connection

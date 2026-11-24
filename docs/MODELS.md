@@ -158,10 +158,23 @@ Server answers (EN / JA / code / a tool call, temperature 0) were as right as UD
 drafter (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `STRATA_INK_DSPARK=<file>`) works with it: code, 512 tokens, median of 3,
 199.7 -> 237.8 tok/s (+19%), the same tokens (md5; these runs named the file).
 
+orcarouter's abliterated (uncensored) model, [orcarouter/Inkling-2-Mini-abliterated-GGUF](https://huggingface.co/orcarouter/Inkling-2-Mini-abliterated-GGUF)
+(`Mix-16G` 15.7 GB, `Mix-12G` 11.6 GB; mixed per-layer types), runs from v1.3.197 (`./setup-deepseek.sh --model
+inkling2mini-abl`, `--quant Mix-12G` for the smaller one; [MANUAL](MANUAL.md)). KL on the 3,071-position set:
+
+| | Mix-16G | Mix-12G |
+| --- | --- | --- |
+| against the original model's Q8_0 (the llama.cpp reference of the rows above) | 0.112, same top-1 86.8% | 0.130, 86.1% |
+| Abyss against llama.cpp on the same file (the engine's own difference) | 0.0117 | 0.0071 |
+| decode on an RTX 3090 (all in VRAM), code: without / with unsloth's drafter | 104 -> 132 tok/s | 114 -> 132 tok/s |
+
+The shift against the original is the abliteration itself: llama.cpp on the same files gives the same KL. The drafter is
+unsloth's old layout, `dspark-Inkling-2-Mini-Q8_0_Old.gguf` (v1.3.203's note); the tokens are the same with it.
+
 ### Ling-3.2-air (beta, v1.3.201)
 
 inclusionAI's Ling-3.2-air (`bailingmoe3`: 35 KDA linear-attention layers + 7 MLA layers, 512 experts, top-8 with
-group-limited routing); it reads images (below). Not yet: its MTP block. Conversation slots as on
+group-limited routing); it reads images (below). Its MTP (NextN) block drafts opt-in from v1.3.204 (`STRATA_LING_MTP`, [MANUAL](MANUAL.md): decode +3 to +16% on an RTX 5090 + RAM, the same tokens). Conversation slots as on
 Qwen3.8 / Ornith ([MANUAL](MANUAL.md), `STRATA_GLM_SLOTS`). Quality: KL on 96 positions of a mixed text against a float64 numpy forward written from the HF modeling
 code (`modeling_bailing_moe_v3_vl.py` and fla's KDA recurrence), run on the dequantized weights. Speeds: RTX 5090
 (PCIe Gen4 x4) + 123 GB RAM, iGPU lane off, 512 tokens, median of 3.
@@ -194,6 +207,19 @@ shape above the circle, a 3x3 letter grid's bottom-right cell, the word in a cor
 right through the server; in the float64 forward the right answer is as likely or more likely under HF's rule (corner
 word 0.9962 against 0.9764 under Qwen-VL's, the other four within 0.0001). Both rules answer right: the vision tower's
 own 2-D rotary already places the patches, and the rule follows the HF code.
+
+### MemT-1.0-Nano (beta, v1.3.204)
+
+MemTensor's MemT-1.0-Nano: Qwen3.6-35B-A3B (the qwen35moe path) with a memory block on each of its 10 full-attention
+layers; the memory is a 40 MiB state the model reads while it answers and writes at a turn's end. How to convert, pack
+and use the server's `memory` API: [MANUAL](MANUAL.md#memt-10-nano-native-memory-beta). No published GGUF; ours made with
+`tools/memt_convert.py` from the HF files. Quality: KL(reference || engine) against a float64 numpy forward written from
+the HF code (`recipes/memt/ref_memt.py`). Speeds: RTX 5090, iGPU lane off, a 4K prompt + 512 tokens, median of 3.
+
+| file | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `Q8_0` (`tools/memt_convert.py`, the memory blocks BF16 / F32) | 37.8 GB | backbone, memory off: a 49-token chat 0.0014 (token path) / 0.0078 (prompt path); a document's first 512 tokens 0.052 / 0.034. Memory read with the reference's state: 0.003 / 0.004, same top token 28 of 28 (without the memory 3.01, 37%). Memory written from 58 tokens: 0.8-2.8% relative error a layer, cosine >= 0.9994. Recall: 4 of 4 facts (CLI and server) | not measured | the closer file (checks); runs with the RAM tier like any MoE, speed not measured |
+| `Q4_K_M` (the per-tensor types of Ornith-1.5-35B-A3B's Q4_K_M, k-quants through trench-gguf's GPU quantizer) | 22.1 GB | backbone, memory off, the same 512 tokens: 0.194 (prompt path), same top token 88.3%. Recall through the server: 4 of 4 facts; a 62-token note written by `/documents`: 2 of 2 questions | decode 304.6 tok/s without a memory, 295.5 with one (-3.0%); the 4K prompt 8,955 -> 8,362 tok/s (-6.6%). Writing a 194-token turn 0.17 s. A memory 40 MiB (80 MiB on the GPU with the write copy) | measured on a 32 GB GPU; smaller GPUs not measured |
 
 ### Qwen3.8-Flash-Next (qwen4exp)
 
