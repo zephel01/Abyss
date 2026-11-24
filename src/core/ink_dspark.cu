@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -570,11 +571,66 @@ int64_t env_i(const char* n, int64_t def) {
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------ load
+// the drafter where setup and the Hugging Face layout keep it, from the pack's folder up: <d>/<name>, <d>/dspark/<name>
+// (unsloth's repo folder), and <d>/[models/]unsloth/Inkling-2-Mini-GGUF/[dspark/]<name> (the abliterated model's pack
+// finds unsloth's drafter there too)
+std::string Glm5Model::inkd_find() const {
+    namespace fs = std::filesystem;
+    static const char* kName = "dspark-Inkling-2-Mini-Q8_0.gguf";
+    if (pack_dir_.empty()) return "";
+    std::error_code ec;
+    fs::path d = fs::absolute(fs::path(pack_dir_), ec);
+    if (ec) return "";
+    const fs::path ud = fs::path("unsloth") / "Inkling-2-Mini-GGUF";
+    for (int up = 0; up < 6 && !d.empty(); ++up) {
+        for (const fs::path& c : {d / kName, d / "dspark" / kName, d / ud / "dspark" / kName, d / ud / kName,
+                                  d / "models" / ud / "dspark" / kName, d / "models" / ud / kName})
+            if (fs::is_regular_file(c, ec) && fs::file_size(c, ec) > ((uintmax_t) 100 << 20)) return c.string();
+        if (d == d.parent_path()) break;
+        d = d.parent_path();
+    }
+    return "";
+}
+
+size_t Glm5Model::inkd_bytes() const {
+    const auto* D = (const IkState*) inkd_;
+    return D != nullptr ? D->bytes : 0;
+}
+
 bool Glm5Model::inkd_load(std::string& err) {
     (void) err;
     const Glm5Geometry& g = g_;
+    // STRATA_INK_DSPARK=<the GGUF> loads that drafter; =0 (or off / none) keeps it off.  Unset (2026-11-24): the file
+    // beside the pack (inkd_find) loads on one CUDA GPU with one lane, a discrete card, not under STRATA_DETERMINISTIC
+    // - there the expert tiers stay where they start and the CPU lane is off, so a window's extra columns fetch the
+    // RAM-tier experts they route over PCIe (a 165K prompt on an RTX 5090, 1,024 tokens: 3.1 -> 9.2 RAM fetches a
+    // token, 85.0 -> 62.0 tok/s); the tests that compare drafts name the file.  fast_setup then keeps it only when the
+    // expert pool comes out the same as without it (inkd_auto_)
     const char* path = getenv("STRATA_INK_DSPARK");
-    if (path == nullptr || !path[0] || !g.ink) return true;
+    inkd_auto_ = false;
+    if (!g.ink) return true;
+    if (path != nullptr && (std::strcmp(path, "0") == 0 || std::strcmp(path, "off") == 0 || std::strcmp(path, "none") == 0))
+        return true;
+    std::string found;
+    if (path == nullptr || !path[0]) {
+#if defined(STRATA_USE_HIP)
+        return true;   // (not measured on HIP; STRATA_INK_DSPARK=<file> loads it)
+#else
+        const FastState* F = fast_;
+        if (n_parts_ != 1 || l0_ != 0 || l1_ != g.n_layers || F == nullptr || F->unified_memory ||
+            ink_parallel_env() != 1)
+            return true;
+        found = inkd_find();
+        if (found.empty()) return true;
+        if (const char* dv = getenv("STRATA_DETERMINISTIC"); dv != nullptr && std::atoi(dv) != 0) {
+            std::fprintf(stderr, "ink dspark: %s not loaded - STRATA_DETERMINISTIC (STRATA_INK_DSPARK=<file> loads it)\n",
+                         found.c_str());
+            return true;
+        }
+        path = found.c_str();
+        inkd_auto_ = true;
+#endif
+    }
     const auto refuse = [&](const std::string& why) {
         std::fprintf(stderr, "ink dspark: not loaded - %s\n", why.c_str());
         inkd_destroy();
@@ -850,6 +906,7 @@ bool Glm5Model::inkd_load(std::string& err) {
 
 void Glm5Model::inkd_destroy() {
     auto* D = (IkState*) inkd_;
+    inkd_auto_ = false;
     if (D == nullptr) return;
     inkd_ = nullptr;
     for (void* p : D->allocs) cudaFree(p);

@@ -236,8 +236,9 @@ class DSparkStep(unittest.TestCase):
 
 
 class InkDSparkStep(unittest.TestCase):
-    """ink_dspark_step (Inkling 2 Mini's DSpark drafter) against a config in a temporary folder: nothing downloaded,
-    a file on disk named in the config's env, --no-dspark takes it out, CUDA and one GPU only."""
+    """ink_dspark_step (Inkling 2 Mini's DSpark drafter) against a config in a temporary folder: nothing downloaded;
+    the engine finds a file on disk itself (the config does not name it), --no-dspark writes STRATA_INK_DSPARK=0, a
+    config that names the file setup found loses the line, one that names another file keeps it; CUDA, one GPU."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -258,6 +259,11 @@ class InkDSparkStep(unittest.TestCase):
             A.ink_dspark_step(a, self.mdir, self.cfg, gpus or self.gpu, backend)
         return json.loads(self.cfg.read_text(encoding="utf-8"))["env"]
 
+    def name(self, v):
+        conf = json.loads(self.cfg.read_text(encoding="utf-8"))
+        conf["env"]["STRATA_INK_DSPARK"] = v
+        self.cfg.write_text(json.dumps(conf), encoding="utf-8")
+
     def put(self):
         self.dst.parent.mkdir(parents=True, exist_ok=True)
         self.dst.write_bytes(b"GGUF")
@@ -265,40 +271,50 @@ class InkDSparkStep(unittest.TestCase):
     def test_off_without_the_file(self):
         self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
 
-    def test_on_when_the_file_is_there(self):
+    def test_on_when_the_file_is_there_the_engine_finds_it(self):
         self.put()
         env = self.run_step()
-        self.assertEqual(env["STRATA_INK_DSPARK"], str(self.dst))
+        self.assertNotIn("STRATA_INK_DSPARK", env)   # (unset: the engine's auto mode)
         self.assertEqual(env["STRATA_LANG"], "ja-en")   # the rest of the env stays
+        self.assertEqual(A.ink_dspark_found(self.mdir), self.dst)
 
     def test_the_file_beside_the_model_folder(self):
         f = self.mdir.parent / A.INK_DSPARK_NAME
         f.write_bytes(b"GGUF")
-        self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], str(f))
+        self.assertEqual(A.ink_dspark_found(self.mdir), f)
+        self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
 
     def test_the_abliterated_model_uses_unsloths_drafter(self):
         # (--model inkling2mini-abl: orcarouter's repo has no drafter; unsloth's folder beside it serves it)
         self.put()
         self.mdir = self.mdir.parents[2] / "orcarouter" / "Inkling-2-Mini-abliterated-GGUF" / "Mix-16G"
         self.mdir.mkdir(parents=True)
-        self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], str(self.dst))
+        self.assertEqual(A.ink_dspark_found(self.mdir), self.dst)
+        self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
         m = A.MODELS["inkling2mini-abl"]
         self.assertEqual(m["prefix_tmpl"].format(q=m["quant"]), "Inkling-2-Mini-abliterated-Mix-16G.")
         self.assertIn("Mix-12G", m["quants"])
 
-    def test_a_config_that_names_one_keeps_it_and_no_dspark_takes_it_out(self):
-        conf = json.loads(self.cfg.read_text(encoding="utf-8"))
-        conf["env"]["STRATA_INK_DSPARK"] = "/elsewhere/d.gguf"
-        self.cfg.write_text(json.dumps(conf), encoding="utf-8")
+    def test_an_old_config_naming_the_found_file_loses_the_line(self):
+        # (v1.3.195-v1.3.199 setups wrote the path: loaded whatever the VRAM; now the engine's check applies)
+        self.put()
+        self.name(str(self.dst))
+        self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
+
+    def test_a_config_that_names_another_file_keeps_it_and_no_dspark_writes_0(self):
+        self.name("/elsewhere/d.gguf")
         self.put()
         self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], "/elsewhere/d.gguf")
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step(no_dspark=True))
+        self.assertEqual(self.run_step(no_dspark=True)["STRATA_INK_DSPARK"], "0")
         self.assertTrue(self.dst.exists())   # the file stays
-        self.assertNotIn("STRATA_INK_DSPARK", self.run_step(no_dspark=True))
+        self.assertEqual(self.run_step(no_dspark=True)["STRATA_INK_DSPARK"], "0")
+        self.assertEqual(self.run_step()["STRATA_INK_DSPARK"], "0")   # (off stays off)
 
     def test_not_with_a_layer_split_or_amd(self):
         self.put()
+        self.name(str(self.dst))
         self.assertNotIn("STRATA_INK_DSPARK", self.run_step(gpus=self.gpu * 2))
+        self.name("/elsewhere/d.gguf")
         self.assertNotIn("STRATA_INK_DSPARK", self.run_step(backend="hip"))
 
 

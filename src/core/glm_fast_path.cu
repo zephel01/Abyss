@@ -1419,6 +1419,51 @@ bool Glm5Model::fast_setup(std::string& err) {
             avail = std::min(avail, room);
             avail_top = std::min(avail_top, room);
         }
+        // Inkling 2 Mini's DSpark drafter found beside the pack (inkd_load, STRATA_INK_DSPARK unset): kept only when the
+        // pool comes out as it would without it - the same slots a layer, and every expert with the prompt's tail /
+        // the spares on top where the card had that room.  Else its VRAM would come out of the experts: a prompt would
+        // evict them, or RAM-tier experts would run through the CPU lane (other tokens' answers, and a window's
+        // columns route more of them).  STRATA_INK_DSPARK=<file> loads it whatever the VRAM; =0 never
+        if (inkd_ != nullptr && inkd_auto_) {
+            const size_t db = inkd_bytes();
+            size_t ss = 0;
+            for (int il = l0_; il < lt_; ++il) {
+                const auto& Ly = F->L[(size_t) il];
+                if (Ly.moe) ss += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type, g.n_ff_exp, Ly.up_type);
+            }
+            ss = std::max<size_t>(ss, 1);
+            const int kx = pf_ != nullptr ? (int) ((prefill_borrow_bytes() + ss - 1) / ss) : 0;
+            const auto shape = [&](size_t av, size_t at) {
+                const int per = (int) std::min<size_t>((size_t) g.n_expert, av / ss);
+                const bool top = per >= g.n_expert && (size_t) (g.n_expert + gf::kSpares + kx) * ss <= at;
+                return std::make_pair(per, top);
+            };
+            size_t av0 = avail + db, at0 = avail_top + db;   // (without it: its bytes free; STRATA_GLM_POOL_GB still caps)
+            if (getenv("STRATA_GLM_POOL_GB")) {
+                av0 = std::min(av0, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+                at0 = std::min(at0, av0);
+            }
+            const auto w = shape(avail, avail_top), wo = shape(av0, at0);
+            const double G = 1073741824.0;
+            if (w == wo) {
+                const std::string path = inkd_find();
+#if defined(_WIN32)
+                _putenv_s("STRATA_INK_DSPARK", path.c_str());
+#else
+                setenv("STRATA_INK_DSPARK", path.c_str(), 1);   // (the kept pool budget's key: as with the file named)
+#endif
+                std::fprintf(stderr, "ink dspark: on - found beside the pack, the expert pool the same with it (%d slots "
+                                     "a layer%s; %.2f GB; STRATA_INK_DSPARK=0 turns it off)\n", w.first,
+                             w.second ? ", every expert with the prompt tail on top" : "", (double) db / G);
+            } else {
+                inkd_destroy();
+                avail = av0;
+                avail_top = at0;
+                std::fprintf(stderr, "ink dspark: off - its %.2f GB would come out of the expert pool (%d -> %d slots a "
+                                     "layer%s; STRATA_INK_DSPARK=<file> loads it anyway)\n", (double) db / G, wo.first,
+                             w.first, wo.second && !w.second ? ", the prompt tail no longer on top" : "");
+            }
+        }
         // the budget kept per card + pack + config (glm_pool_pin.hpp): every start carves the same pool, whatever
         // other processes hold today (a discrete card; STRATA_GLM_POOL_GB or STRATA_GLM_POOL_PIN=0 skip it)
         std::string pin_key;

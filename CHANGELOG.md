@@ -9,6 +9,45 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Changed
+
+- **Inkling 2 Mini's DSpark drafter is on by default** when unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf` is on disk where
+  setup and the Hugging Face repo keep it (`<data>/models/unsloth/Inkling-2-Mini-GGUF/dspark/`, or next to the pack's
+  folders; the abliterated model's pack finds it there too; nothing is downloaded). `STRATA_INK_DSPARK` unset now
+  means auto: the engine loads the file, then keeps it only when the expert pool comes out as it would without it -
+  the same slots a layer, and every expert with the prompt's tail or the spares on top where the card had that room.
+  Otherwise it frees the drafter again and says so in one line (`ink dspark: off - its 0.66 GB would come out of the
+  expert pool (119 -> 113 slots a layer ...)`), because its VRAM would push experts into RAM. The kept tokens are the
+  target's either way (greedy md5 equal). RTX 5090, UD-Q4_K_XL, the server's single lane through the engine's pipe,
+  `--max-context 65536` (setup's), 2 starts each, drafter off -> auto, a request's tok/s after its first token:
+  - greedy: code 195.5 / 194.8 -> 214.9 / 214.8, edit 196.7 / 196.0 -> 218.7 / 224.3, a 7,822-token prompt's answer
+    190.2 / 189.2 -> 272.8 / 272.9, its follow-up 190.8 / 189.7 -> 262.4 / 242.1, prose 196.6 / 195.9 -> 199.0 /
+    197.6; Japanese 196.5 / 195.7 -> 193.5 / 193.7 (-1.2%);
+  - sampled as the config does (temperature 1.0, top_k 50; the answers differ run to run): code 191.4 / 191.5 ->
+    265.0 / 218.5, edit 192.6 / 192.4 -> 208.3 / 204.2, the 7,822-token prompt 186.3 / 186.4 -> 257.4 / 189.4, its
+    follow-up 186.7 / 186.8 -> 233.1 / 220.8, Japanese 192.2 / 192.4 -> 205.5 / 189.9, prose 192.2 / 192.3 -> 190.9
+    / 189.4 (-1.1%);
+  - the first token as before (0.04-0.07 s on short prompts; 7,822 tokens 0.89 -> 0.91-0.92 s); the largest gap
+    between two streamed tokens 5.3-9.1 -> 11.7-21.1 ms (p99 5.3-5.4 -> 11.0-17.5 ms), since a verify window gives
+    several tokens at once.
+
+  RTX 3090 (24 GB), `--max-context 65536`: kept with UD-Q4_K_XL and orcarouter's Mix-16G (128 slots a layer either
+  way; code 98.4 -> 116.5 and 102.7 -> 130.4 tok/s, prose 97.8 -> 96.0 and 102.3 -> 100.0, 8K code 91.8 -> 106.6 and
+  96.1 -> 121.2; one run each). UD-Q4_K_XL at `--max-context 196608`: left off (119 -> 113 slots); loaded anyway
+  there it gave code 112.6 / 100.8 against 94.2 / 94.2 tok/s but prose 91.9 / 91.1 against 94.5 / 93.7 and the short
+  prompt 813-899 against 670-714 ms. RTX 5090 with `STRATA_GLM_VRAM_GB=20` / `16`: off (117 -> 112, 83 -> 77 slots).
+  Not loaded on its own under `STRATA_DETERMINISTIC=1`: there the tiers stay where they start and the CPU lane is off,
+  so a verify window's columns fetch the RAM-tier experts they route over PCIe one by one (RTX 5090, a 165K prompt,
+  1,024 tokens: RAM fetches 3.1 -> 9.2 a token, 85.0 -> 62.0 tok/s; with the CPU lane back the drafter wins there
+  too, 34.0 -> 42.6, the same md5). That mode is a test switch nothing sets by default; the md5 tests name the file.
+  Nor with `--parallel` above 1 (the drafter reads one conversation; `--parallel` md5s unchanged), a layer split,
+  unified memory or HIP. `STRATA_INK_DSPARK=0` (`off` / `none`) keeps it off; `=<file>` loads it whatever the VRAM,
+  as before.
+- Setup (`--model inkling2mini` / `inkling2mini-abl`) no longer names the drafter in the config's env: the engine
+  finds it. `--no-dspark` writes `STRATA_INK_DSPARK=0`. A config whose env names the file setup found (setups
+  v1.3.195-v1.3.199 wrote it, which loaded it whatever the VRAM) loses that line when setup runs again; a config that
+  names another file keeps it.
+
 ## v1.3.199 - 2026-11-24
 
 Hy4-flash now computes its Engram gates as the model does: the gate norms add FP32's machine epsilon, not bf16's 2^-7.

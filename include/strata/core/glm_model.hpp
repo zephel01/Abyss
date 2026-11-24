@@ -869,6 +869,12 @@ public:
     void inkd_tok_taps(int n = 1);   // (a replayed token / window graph of n rows: the taps' row counts its capture set)
     bool inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     bool ink_dspark_on() const { return inkd_ != nullptr; }
+    // the drafter with STRATA_INK_DSPARK unset (2026-11-24): the file found beside the pack (inkd_find) loads on its own on
+    // one CUDA GPU, one lane, not under STRATA_DETERMINISTIC; fast_setup drops it again when its VRAM would take expert
+    // slots, the prompt tail's place on top or the spares' (inkd_auto_)
+    bool inkd_auto_ = false;
+    std::string inkd_find() const;
+    size_t inkd_bytes() const;   // (its device allocations)
     int inkd_max() const;   // (drafts a step at most: 7, STRATA_INK_DSPARK_N)
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);

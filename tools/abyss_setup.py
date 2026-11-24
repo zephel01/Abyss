@@ -46,7 +46,7 @@ What it does:
   7. the DSpark drafter (V4 only; asked when the config is new, or --dspark): bleysg's GGUF of DeepSeek's block drafter into
      <data>/models/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF, its path in the config's env (STRATA_DS4_DSPARK)
      (inkling2mini / inkling2mini-abl: unsloth's dspark-Inkling-2-Mini-Q8_0.gguf, not downloaded - when it is on
-     disk, its path in the config's env, STRATA_INK_DSPARK; --no-dspark takes it out)
+     disk the engine finds and keeps it if the experts fit beside it; --no-dspark: STRATA_INK_DSPARK=0 in the env)
   8. the Abyss-tools folder (abyss.sh start / stop / status / update / log / models) from ops/abyss-tools/
 
 The data folder defaults to Abyss-data beside Abyss, the tools folder to Abyss-tools beside it.  The helpers (the PC
@@ -657,15 +657,27 @@ def dspark_step(a, data: Path, cfg: Path, fresh: bool, had: str | None, gpus, ba
 
 
 # Inkling 2 Mini's DSpark drafter (v1.3.192): unsloth's dspark-Inkling-2-Mini-Q8_0.gguf (the repo's dspark/ folder,
-# 0.6 GB in VRAM; src/core/ink_dspark.cu, CUDA, one GPU).  Setup does not download it; a file already there - the hf
-# layout next to the model's folder, or the folder itself - is named in the config's env (STRATA_INK_DSPARK)
+# 0.6 GB in VRAM; src/core/ink_dspark.cu, CUDA, one GPU).  Setup does not download it.  The engine finds it itself
+# beside the pack (inkd_find: the hf layout next to the model's folder, or the folder itself) and keeps it when the
+# expert pool comes out the same with it; the config's env names it only by hand (STRATA_INK_DSPARK=<file>: loaded
+# whatever the VRAM) or turns it off (=0, --no-dspark)
 INK_DSPARK_NAME = "dspark-Inkling-2-Mini-Q8_0.gguf"
 
 
+def ink_dspark_found(mdir: Path) -> Path | None:
+    """Where the engine finds the drafter for a pack in mdir (the same places, ink_dspark.cu's inkd_find)."""
+    ud = mdir.parents[2] / "unsloth" / "Inkling-2-Mini-GGUF"
+    return next((p for p in (mdir.parent / "dspark" / INK_DSPARK_NAME, mdir.parent / INK_DSPARK_NAME,
+                             mdir / INK_DSPARK_NAME, ud / "dspark" / INK_DSPARK_NAME, ud / INK_DSPARK_NAME)
+                 if p.is_file()), None)
+
+
 def ink_dspark_step(a, mdir: Path, cfg: Path, gpus, backend: str) -> None:
-    """Inkling 2 Mini's DSpark drafter: on when its file is on disk (mdir/../dspark/, mdir/.., mdir) - its path goes
-    into the config's env (STRATA_INK_DSPARK); --no-dspark takes it out (the file stays).  A config that names a
-    drafter keeps it.  CUDA and one GPU only (the engine's drafter runs there)."""
+    """Inkling 2 Mini's DSpark drafter: on by default when its file is on disk where the engine finds it (mdir/../dspark/,
+    mdir/.., mdir, unsloth's folder beside an abliterated model's) - the engine keeps it when the expert pool holds as
+    many experts with it as without.  --no-dspark writes STRATA_INK_DSPARK=0 (the file stays).  A config that names
+    the file setup found (v1.3.195-v1.3.199 wrote it: loaded whatever the VRAM) loses the line, so the engine's check
+    applies; one that names another file keeps it.  CUDA and one GPU only (the engine's drafter runs there)."""
     conf = json.loads(cfg.read_text(encoding="utf-8"))
     env = conf.setdefault("env", {})
     have = env.get("STRATA_INK_DSPARK") or None
@@ -674,30 +686,38 @@ def ink_dspark_step(a, mdir: Path, cfg: Path, gpus, backend: str) -> None:
         cfg.write_text(json.dumps(conf, indent=1) + "\n", encoding="utf-8")
         S.ok(what)
 
-    if a.no_dspark or (have and (len(gpus) > 1 or backend != "cuda")):
-        if have:
-            del env["STRATA_INK_DSPARK"]
-            save(f"DSpark drafter off in {cfg.name} (the file stays: {have})")
+    found = ink_dspark_found(mdir)
+    if a.no_dspark:
+        if have != "0":
+            env["STRATA_INK_DSPARK"] = "0"
+            save(f"DSpark drafter off in {cfg.name} (STRATA_INK_DSPARK=0; the file stays" +
+                 (f": {have})" if have else ")"))
         else:
             S.ok("DSpark drafter: off (--no-dspark)")
         return
-    if have:
-        S.ok(f"DSpark drafter: on ({have})")
-        return
     if backend != "cuda" or len(gpus) > 1:
-        S.ok("DSpark drafter: NVIDIA and one GPU only")
+        if have and have != "0":
+            del env["STRATA_INK_DSPARK"]
+            save(f"DSpark drafter: NVIDIA and one GPU only - {cfg.name} written without STRATA_INK_DSPARK")
+        else:
+            S.ok("DSpark drafter: NVIDIA and one GPU only")
         return
-    # (the abliterated model's repo has no drafter: unsloth's, where --model inkling2mini keeps it, serves it too)
-    ud = mdir.parents[2] / "unsloth" / "Inkling-2-Mini-GGUF"
-    found = next((p for p in (mdir.parent / "dspark" / INK_DSPARK_NAME, mdir.parent / INK_DSPARK_NAME,
-                              mdir / INK_DSPARK_NAME, ud / "dspark" / INK_DSPARK_NAME, ud / INK_DSPARK_NAME)
-                  if p.is_file()), None)
+    if have == "0":
+        S.ok(f"DSpark drafter: off ({cfg.name} sets STRATA_INK_DSPARK=0; take the line out to turn it on)")
+        return
+    if have and (found is None or Path(have) != found):
+        S.ok(f"DSpark drafter: on ({have}, named in {cfg.name}: loaded whatever the VRAM)")
+        return
+    if have:
+        del env["STRATA_INK_DSPARK"]
+        save(f"DSpark drafter: the engine finds {found} itself - {cfg.name} no longer names it, so it is kept only "
+             "when the experts fit beside it")
+        return
     if found is None:
         S.ok(f"DSpark drafter: off - put unsloth's {INK_DSPARK_NAME} (the repo's dspark/ folder) in "
-             f"{mdir.parent / 'dspark'} and run setup again, or name it in the config's env (STRATA_INK_DSPARK)")
+             f"{mdir.parent / 'dspark'} and the engine loads it")
         return
-    env["STRATA_INK_DSPARK"] = str(found)
-    save(f"DSpark drafter on in {cfg.name} (STRATA_INK_DSPARK={found})")
+    S.ok(f"DSpark drafter: on ({found}; the engine keeps it when the experts fit beside it, --no-dspark turns it off)")
 
 
 def dflash_step(a, data: Path, cfg: Path, gpus) -> None:
@@ -1156,7 +1176,7 @@ def main() -> int:
                     "the config: drafts checked a step at a time, ~+28%% on swe-bench tasks on an AI PRO R9700 (~6.5 GB "
                     "of VRAM; one GPU, DeepSeek V4 Flash 0731). Asked when the config is new")
     ap.add_argument("--no-dspark", action="store_true", help="turn the DSpark drafter off in the config (the file stays; "
-                    "inkling2mini / inkling2mini-abl: its drafter, turned on when the file is on disk)")
+                    "inkling2mini / inkling2mini-abl: its drafter, on when the file is on disk - STRATA_INK_DSPARK=0)")
     ap.add_argument("--dflash", action="store_true", help="(qwen38) download the DFlash 2 drafter (0.65 GB) and turn it on "
                     "in the config instead of the MTP layer: faster code and lists, slower prose (docs/MANUAL.md, "
                     "Qwen3.8-Flash-Next); one GPU.  (qwen38-27b) set up its DFlash 2 drafter (1.14 GB) also where it does "
