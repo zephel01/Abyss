@@ -947,7 +947,8 @@ bool Glm5Model::q35_snap_copy(bool restore) {
 // ---------------------------------------------------------------- conversation slots (strata/program/conv_slots.hpp)
 // A qwen35 conversation set aside while others run: the snapshot (q35_snap_h_, taken just before its prompt's last
 // token: the delta-net states and conv rows, qwen4exp's QSA tails and PLE history, the drafter's pending hidden) and
-// every attention cache's rows 0 .. n-1 - the trunk's layers, the NextN block's, qwen4exp's QSA block keys (the dead
+// every attention cache's rows 0 .. n-1 (ling: the KDA states and conv rows ride the snapshot, an MLA layer's latent
+// rows its one cache) - the trunk's layers, the NextN block's, qwen4exp's QSA block keys (the dead
 // key and the pooled rows of the blocks done by n) and the qwen4exp draft layer's caches.  These are all the state
 // a position < n holds: the rows are written once a position and only read after, so the model is then exactly as
 // it was when the snapshot was taken (the same tokens follow as on the conversation's own snapshot).
@@ -971,10 +972,6 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
         why = "inkling's slots are not covered yet";
         return false;
     }
-    if (g_.ling) {
-        why = "ling's slots are not covered yet";
-        return false;
-    }
     if (g_.laguna) {
         why = "laguna's window rings are not covered yet";
         return false;
@@ -992,7 +989,12 @@ void Glm5Model::q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& 
     const size_t N = (size_t) n;
     for (int il = l0_; il < lt_; ++il) {   // (the NextN block's layer too)
         const auto& Ly = F->L[(size_t) il];
-        if (Ly.recr || Ly.kc == nullptr || Ly.vc == nullptr) continue;
+        if (Ly.recr || Ly.kc == nullptr) continue;
+        if (g.ling) {   // (ling's MLA layer: one latent cache, rows of 576 FP16 - its vc is not read)
+            out.push_back({(void*) Ly.kc, N * KV * 2});
+            continue;
+        }
+        if (Ly.vc == nullptr) continue;
         out.push_back({(void*) Ly.kc, N * rk});
         out.push_back({(void*) Ly.vc, N * rv});
         if ((g.q4x || F->q27) && Ly.q4_pooled != nullptr && Ly.q4_dead != nullptr) {   // (Qwen3.8-27B QSA's too)

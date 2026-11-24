@@ -20,7 +20,7 @@ top-8 with group-limited routing) runs as a text-only beta, from bartowski's pub
   gates and recurrence, the MLA layers' absorbed attention, the group-limited router, the per-layer SwiGLU limits.
   Prompts: the batched KDA kernels, a tensor-core flash attention for the MLA layers (`STRATA_LING_PROMPT_ATTN=0` goes
   back to one row at a time) and the group-limited batched router. The server stops on `<|role_end|>`. Not yet: the MTP
-  block (dropped at pack time), several conversations in the model (one at a time), images.
+  block (dropped at pack time), images.
   RTX 5090 (PCIe Gen4 x4) + 123 GB RAM, iGPU lane off, 512 tokens, median of 3: a 4K prompt 2,061 tok/s, decode
   142.8 tok/s; a 16K prompt 3,092 tok/s, decode 120.7 tok/s; VRAM 4.8 GB + a 25.1 GB expert pool, RAM tier 49.7 GB (all
   experts in VRAM or RAM). Server, 8 chat answers (EN / JA / code, thinking on, 200-700 tokens): on the very first
@@ -28,6 +28,13 @@ top-8 with group-limited routing) runs as a text-only beta, from bartowski's pub
   tokens) 124-141, median 135; TTFT 0.13-0.38 s. KL on 96 positions of a mixed text against a float64 numpy forward written from the HF
   modeling code: 0.0165 (token path) / 0.0108 (prompt path) against the same file's weights (the engine's own error);
   0.031 / 0.029 against our Q8_0's weights (our own plain Q4_K_M: 0.057 / 0.055).
+- Ling-3.2-air: conversation slots (`STRATA_GLM_SLOTS`, 8 by default as on Qwen3.8 / Ornith). A conversation set aside
+  keeps the KDA layers' recurrent states and conv rows (the snapshot) and the MLA layers' latent cache rows, in host
+  RAM first, then files; 79 MB + 8.2 KB a token (0.37 GB at 35.7K tokens), no VRAM. RTX 5090, bartowski Q4_K_M, 65,536
+  context, four Claude-Code-like threads of 35.7K / 24.5K / 14.8K / 10.2K tokens taking turns (A B C D B A D C A, 512-token
+  answers, deterministic): every answer the same as the thread run alone (9 of 9, also with every switch through a
+  slot); a thread coming back starts answering in 2.1-3.8 s instead of 7.1-19.2 s (the whole prompt read again with
+  `STRATA_GLM_SLOTS=0`); setting aside / taking back 0.0-0.1 s, the rest is the new turn's 140-535 tokens.
 - The fast path runs MoE layers whose gate is Q4_K and up Q6_K (or the other way round): bartowski's Ling-3.2-air
   Q4_K_M has them in layers 2-10.
 - The GGUF keeps `rope.dimension_sections` [8, 12, 12, 0] from llama.cpp's VL conversion; Abyss does not read it and

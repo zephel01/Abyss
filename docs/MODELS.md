@@ -143,8 +143,8 @@ against llama.cpp mainline (690b87d881 or later, GPU experts) on a 3,072-token E
 ### Ling-3.2-air (beta, unreleased)
 
 inclusionAI's Ling-3.2-air (`bailingmoe3`: 35 KDA linear-attention layers + 7 MLA layers, 512 experts, top-8 with
-group-limited routing), text only. Not yet: its MTP block, several conversations in the model (one at a time),
-images. Quality: KL on 96 positions of a mixed text against a float64 numpy forward written from the HF modeling
+group-limited routing), text only. Not yet: its MTP block, images. Conversation slots as on
+Qwen3.8 / Ornith ([MANUAL](MANUAL.md), `STRATA_GLM_SLOTS`). Quality: KL on 96 positions of a mixed text against a float64 numpy forward written from the HF modeling
 code (`modeling_bailing_moe_v3_vl.py` and fla's KDA recurrence), run on the dequantized weights. Speeds: RTX 5090
 (PCIe Gen4 x4) + 123 GB RAM, iGPU lane off, 512 tokens, median of 3.
 

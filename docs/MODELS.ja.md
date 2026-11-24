@@ -140,7 +140,7 @@ llama.cpp mainline（690b87d881 以降、エキスパートは GPU）との KL�
 ### Ling-3.2-air（ベータ、未リリース）
 
 inclusionAI の Ling-3.2-air（`bailingmoe3`。KDA の線形 attention 層 35 + MLA 層 7、エキスパート 512、グループ制限つきの
-top-8）。テキストのみ。まだ無いもの: MTP ブロック、モデル内の複数会話（1 つずつ）、画像。品質: 混在テキストの 96 位置での
+top-8）。テキストのみ。まだ無いもの: MTP ブロック、画像。会話スロットは Qwen3.8 / Ornith と同じ（[MANUAL](MANUAL.ja.md)、`STRATA_GLM_SLOTS`）。品質: 混在テキストの 96 位置での
 KL。参照は HF のモデルコード（`modeling_bailing_moe_v3_vl.py` と fla の KDA 再帰）の数式から書いた float64 の numpy の
 forward を、量子化を戻した重みで回したもの。速度: RTX 5090（PCIe Gen4 x4）+ RAM 123 GB、iGPU レーンなし、512 トークン、
 3 回の中央値。
