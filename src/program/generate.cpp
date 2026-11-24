@@ -3618,8 +3618,9 @@ static int glm_pack_generate(const Options& o) {
             // (Inkling 2 Mini's DSpark: its token is a ~5.4 ms CUDA graph, so a step's ~1.1 ms of drafting costs more than
             // prose / Japanese windows give back - 184 -> 170 / 159 tok/s.  STRATA_INK_DSPARK_GATE (default on): every 16
             // drafted steps their tokens over their time (drafting + token / window) are set against the single token's
-            // rate (cw[1]); a loss skips the drafter for 32, 64 .. 512 steps (one token at a time, the repeats' windows
-            // still tried), then 16 drafted steps measure again; a win keeps it.  The kept tokens are the target's either way)
+            // rate (STRATA_INK_DSPARK_PROBE's plain steps); a loss skips the drafter for 32, 64 .. 512 steps (one token
+            // at a time, the repeats' windows still tried), then drafted steps measure again; a win keeps it.  The kept
+            // tokens are the target's either way)
             static const bool ink_gate_env = [] {
                 const char* v = std::getenv("STRATA_INK_DSPARK_GATE");
                 return v == nullptr || std::atoi(v) != 0;
@@ -3641,22 +3642,55 @@ static int glm_pack_generate(const Options& o) {
                 const char* v = std::getenv("STRATA_INK_DSPARK_GATE_AFTER0");
                 return v == nullptr ? 0 : std::max(0, std::atoi(v));
             }();
+            // STRATA_INK_DSPARK_PROBE=<n> (default 256; 0 off): the single token's rate the gate sets the drafted steps
+            // against is measured on plain steps (the median of the last 8) - 8 steps without the drafter after the
+            // first 8 drafted steps, after the next 16 twice more, then after every n, and the steps a loss skips.  The
+            // single tokens among the windows (a step that kept no draft) run among the windows' experts and are
+            // slower: at 32K on a 24 GB pool they took 16.5 ms against the plain token's 7.9, so drafting at 97 tok/s
+            // against 127 without it passed as a win
+            static const int ink_probe_every = [] {
+                const char* v = std::getenv("STRATA_INK_DSPARK_PROBE");
+                return v == nullptr ? 256 : std::max(0, std::atoi(v));
+            }();
             const bool ink_gate = ink_dsp && ink_gate_env;
             int ink_skip = ink_gate ? ink_first : 0, ink_back = 0, ink_n = 0, ink_skips = 0;
             double ink_tok = 0.0, ink_ms = 0.0;
+            constexpr int kInkProbe = 8;
+            int ink_probe = 0, ink_since = 0, ink_probes = 0, ink_base_n = 0;   // (probe steps left, drafted steps since one)
+            int ink_next = 8;                                                   // (drafted steps before the next probe)
+            double ink_base_r[8] = {}, ink_base = 0.0;                          // (plain steps' ms: their median)
+            const auto ink_base_add = [&](double ms) {
+                ink_base_r[ink_base_n & 7] = ms;   // (the last 8: the plain token as it is now)
+                ++ink_base_n;
+                const int n = std::min(ink_base_n, 8);
+                double v[8];
+                std::copy(ink_base_r, ink_base_r + n, v);
+                std::nth_element(v, v + n / 2, v + n);
+                ink_base = v[n / 2];
+            };
             const auto ink_gate_add = [&](double toks, double ms) {
                 if (!ink_gate) return;
                 ink_tok += toks;
                 ink_ms += ms;
                 ++ink_n;
-                if (cw_n[1] == 0 || cw[1] <= 0.0) return;
-                const bool early = ink_early > 0 && ink_n >= ink_early && ink_n < 16 && ink_tok / ink_ms < 0.85 / cw[1];
+                if (ink_probe_every > 0 && ++ink_since >= ink_next) {   // (a probe: the plain token's ms again)
+                    ink_probe = kInkProbe;
+                    ink_since = 0;
+                    // (the answer's first probes next to the first measures - the tiers still settling after the
+                    // prompt; then every ink_probe_every)
+                    ink_next = ink_probes < 3 ? 16 : ink_probe_every;
+                    ++ink_probes;
+                }
+                // (the plain steps' median once 4 are measured, else the single tokens among the windows)
+                const double one = ink_probe_every > 0 && ink_base_n >= 4 ? ink_base : cw_n[1] > 0 ? cw[1] : 0.0;
+                if (one <= 0.0) return;
+                const bool early = ink_early > 0 && ink_n >= ink_early && ink_n < 16 && ink_tok / ink_ms < 0.85 / one;
                 if (ink_n < 16 && !early) return;
                 static const bool ink_glog = std::getenv("STRATA_INK_DSPARK_GATE_LOG") != nullptr;   // (a measure's end)
                 if (ink_glog)
                     std::fprintf(stderr, "ink gate: pos %lld: %d steps %.2f tok/ms vs %.2f%s\n", (long long) model.position(),
-                                 ink_n, ink_tok / ink_ms, 1.0 / cw[1], early ? " (early)" : "");
-                if (early || ink_tok / ink_ms < 1.0 / cw[1]) {   // (drafting lost: off for a while, longer each time)
+                                 ink_n, ink_tok / ink_ms, 1.0 / one, early ? " (early)" : "");
+                if (early || ink_tok / ink_ms < 1.0 / one) {   // (drafting lost: off for a while, longer each time)
                     ink_skip = 32 << ink_back;
                     ink_back = std::min(ink_back + 1, 4);
                     ++ink_skips;
@@ -3718,8 +3752,11 @@ static int glm_pack_generate(const Options& o) {
                 model.spec_sampling_set(nullptr);
                 // the step's drafter: 1 the NextN block (or DSpark / Flash-Next's DFlash 2), 2 the dense qwen35's DFlash 2
                 int use = 0, dret = 0;
-                const bool ink_off = ink_gate && !rep && ink_skip > 0;
-                if (ink_off) --ink_skip;
+                const bool ink_off = ink_gate && !rep && (ink_skip > 0 || ink_probe > 0);
+                if (ink_off) {
+                    if (ink_skip > 0) --ink_skip;
+                    else --ink_probe;
+                }
                 if (!rep && !ink_off && model.dspark_ready()) {
                     use = dfl_dense ? 2 : 1;
                     if (dfl_both) {
@@ -3946,6 +3983,7 @@ static int glm_pack_generate(const Options& o) {
                     if ((copy || dfl_both) && use != 0 && (d_timed || dfl_both))   // (rate_add: the timed ones)
                         rate_add(1.0, std::max(1e-3, ms_since(td)));
                     if (use != 0 && !capd) ink_gate_add(1.0, std::max(1e-3, ms_since(td)));
+                    if (ink_off && !capd) ink_base_add(std::max(1e-3, ms_since(td)));   // (a plain step: the gate's base)
                     if (ink_gate && use != 0 && ink_skip == 0) ink_skip = ink_after0;   // (nothing kept: a short pause)
                     continue;
                 }
@@ -4046,8 +4084,8 @@ static int glm_pack_generate(const Options& o) {
                          ms_one / (double) std::max<int64_t>(1, n_one), ms_dr / (double) std::max<int64_t>(1, n_dsp),
                          (double) (steps + n_acc) / (double) std::max<int64_t>(1, steps));
             if (ink_gate)
-                std::fprintf(stderr, "ink dspark gate: the drafter skipped %d times (a loss against the single token)\n",
-                             ink_skips);
+                std::fprintf(stderr, "ink dspark gate: the drafter skipped %d times (a loss against the single token); %d "
+                                     "probes, the plain token %.2f ms\n", ink_skips, ink_probes, ink_base);
             if (ss_win > 0)
                 std::fprintf(stderr, "spec sampling: %lld windows, %lld drafts judged, %lld kept (%.0f%%)\n",
                              (long long) ss_win, (long long) ss_cols, (long long) ss_kept,
