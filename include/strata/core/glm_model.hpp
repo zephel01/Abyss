@@ -817,10 +817,13 @@ public:
     // moves each lane on; ink_batch_pick(t, sp) is row t's token then (greedy: its argmax; else its sampler, a row)
     static int ink_parallel_env();      // STRATA_INK_PARALLEL (--parallel): 1 default, -1 auto
     int ink_par_ = 1;                   // the lanes allocated
-    // the pool pin key's part own_b does not see (glm_pool_pin.hpp): Inkling's context length and --parallel setting
+    // the pool pin key's part own_b does not see (glm_pool_pin.hpp): the qwen35 family's caches sit in qwen35_state_,
+    // outside state_bytes_ - Inkling's context length and --parallel setting, the others' (Qwen3.5 / 3.8, Ornith,
+    // Laguna, Ling) context length and attention cache format (--kv; q35_kv_ is set in qwen35_alloc, before the key)
     std::string pin_extra() const {
-        return g_.ink ? "|ctx=" + std::to_string((long long) max_ctx_) + "|par=" + std::to_string(ink_parallel_env())
-                      : std::string();
+        if (g_.ink) return "|ctx=" + std::to_string((long long) max_ctx_) + "|par=" + std::to_string(ink_parallel_env());
+        if (g_.qwen35()) return "|ctx=" + std::to_string((long long) max_ctx_) + "|kv=" + std::to_string(q35_kv_);
+        return std::string();
     }
     int ink_lane() const;
     int64_t ink_lane_pos(int j) const;
