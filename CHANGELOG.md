@@ -32,11 +32,14 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ### Fixed
 
-- `tools/vision/hy4v_patch.py` put Hy4's image-token count right after the Qwen-VL group's `case` labels in llama.cpp's
-  `clip.cpp`, so Qwen2/2.5/3-VL, EXAONE 4.5, MiMo-VL and MiniMax-M3 fell into it and counted one extra column per row
-  (found reading the patched source of v1.3.177 and later, not reproduced in a run; strata-vision refuses such a count
-  as "the image grid is not rectangular", which would stop Qwen3.8-27B pictures). The count now goes in front of the
-  group; a tree patched before is repaired when the patch runs again.
+- Images on Qwen3.8-27B (and every Qwen2/2.5/3-VL, EXAONE 4.5, MiMo-VL and MiniMax-M3 projector) were broken in a
+  strata-vision built since v1.3.177: `tools/vision/hy4v_patch.py` put Hy4's image-token count right after those
+  projectors' `case` labels in llama.cpp's `clip.cpp`, so they counted one extra column per row. Built with setup's
+  flags at the pinned commit and run on an RTX 5090: the encoder aborted in its warm-up ("expected output 4160
+  tokens, got 4096") and the server with Qwen3.8-27B's images did not start. With the fix the count goes in front of
+  that group: Qwen3.8-27B UD-Q4_K_XL answered both test pictures right (shapes counted 4 / 2 / 1, a 3x3 grid's
+  bottom-right letter P), and Hy4-flash Maya-XS gives the same answers and token counts as before the fix. A tree
+  patched before is repaired at the next setup (tools/vision changed, so it patches and rebuilds strata-vision).
 
 ## v1.3.201 - 2026-11-24
 
