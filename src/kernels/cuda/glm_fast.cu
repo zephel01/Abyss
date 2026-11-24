@@ -3244,7 +3244,7 @@ __device__ __forceinline__ T ld_l2(const T* p) {   // a load past this SM's L1 (
 }
 #define RL(x) (COLS ? ld_l2(&(x)) : (x))
 template <bool COLS>
-__device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* sync, int col, int ncol) {
+__device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* sync, int col, int ncol, int quiet = 0) {
     const int tid = threadIdx.x, lane = tid & 31;
     // (COLS) this column's turn at the shared state, and the next one's after it
     const auto col_wait = [&] {
@@ -3410,7 +3410,49 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
     }
     // (COLS) the shared state from here: this column's turn (the earlier columns' plans written), then what the
     // launch a column did before the scores - the earlier route's error, the counts' aging
+    // QUIET (moe_route_cols' quiet, STRATA_GLM_ROUTE_QUIET): when no column of the launch writes the shared state -
+    // every chosen expert resident in VRAM, no CPU lane, no helper, no prediction, no error - the plans are the ones
+    // the turns would give (each reads what no one writes) and only the request numbers chain: column c takes
+    // seq0 + c + 1.  Every column checks itself, then all of them meet once (sync[2] the columns that are not quiet,
+    // sync[3] the arrivals, sync[4] the departures); any column that is not quiet sends the launch through the turns
+    bool q_all = false;
+    __shared__ unsigned int s_qbase;
     if constexpr (COLS) {
+        if (quiet) {
+            __shared__ int s_q, s_qall;
+            if (tid == 0) s_q = bad == 0 && a.cpu_plan == 0ull && a.d.helper_owned == nullptr && a.pred_logits == nullptr &&
+                                (a.d.route_error_d == nullptr || ld_l2(a.d.route_error_d) == 0) &&
+                                (a.d.route_error == nullptr || *(volatile int*) a.d.route_error == 0) ? 1 : 0;
+            __syncthreads();
+            if (tid < a.k && (s_ids[tid] < 0 || s_ids[tid] >= E || ld_l2(&a.d.tab[(size_t) a.layer * E + s_ids[tid]]) == 0ull))
+                s_q = 0;
+            __syncthreads();
+            if (tid == 0) {
+                s_qbase = ld_l2(a.d.seq);   // (before any column's write: those come after the meeting)
+                if (!s_q) atomicAdd(sync + 2, 1u);
+                __threadfence();
+                atomicAdd(sync + 3, 1u);
+                const long long t0 = clock64();
+                while (*(volatile unsigned int*) (sync + 3) < (unsigned int) ncol) {
+                    if (clock64() - t0 > (1ll << 36)) break;
+                }
+                __threadfence();
+                s_qall = *(volatile unsigned int*) (sync + 2) == 0u;
+                if (atomicAdd(sync + 4, 1u) == (unsigned int) ncol - 1u) {   // the last to leave: ready for the next launch
+                    *(volatile unsigned int*) (sync + 2) = 0u;
+                    *(volatile unsigned int*) (sync + 3) = 0u;
+                    *(volatile unsigned int*) (sync + 4) = 0u;
+                    if (s_qall) {   // (no turns ran: every ticket is taken, sync[1] never moved)
+                        *(volatile unsigned int*) sync = 0u;
+                    }
+                    __threadfence();
+                }
+            }
+            __syncthreads();
+            q_all = s_qall != 0;
+        }
+    }
+    if constexpr (COLS) if (!q_all) {
         col_wait();
         if (tid == 0)
             prev_err = a.d.route_error_d != nullptr ? (int) ld_l2(a.d.route_error_d)
@@ -3436,7 +3478,7 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
         }
         s_cnt[tid] = c;
     }
-    if (tid == 32) s_seq0 = RL(*a.d.seq);
+    if (tid == 32) s_seq0 = q_all ? s_qbase + (unsigned int) col : RL(*a.d.seq);
     if (tid == 0 && prev_err != 0) atomicMax(&bad, 1);
     __syncthreads();
     ROUTE_PROF(5)
@@ -3658,7 +3700,7 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
             *a.d.pf_n = npf;
             s_npf = npf;
             const unsigned int seq = s_seq0 + 1;
-            *a.d.seq = seq;
+            if (!q_all || col + 1 == ncol) *a.d.seq = seq;   // (QUIET: the last column leaves the count)
             s_seq = seq;
             *a.d.wait_seq = mask ? seq : 0u;
             if (a.d.cpu_seq != nullptr) {   // [1]: the route before this one's (expert deferral waits for that one)
@@ -3669,7 +3711,7 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
         }
     }
     __syncthreads();
-    col_release();   // (COLS: the next column plans while this one publishes its request)
+    if (!q_all) col_release();   // (COLS: the next column plans while this one publishes its request)
     ROUTE_PROF(6)
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
     if ((s_cpu != 0u || (a.promote_min < 0 && s_mask != 0u)) && !a.early_x) {   // (the disk lane reads x too)
@@ -3752,6 +3794,7 @@ struct RouteColsArgs {
     int* cpu_flag[kRouteCols];
     float* cpu_part[kRouteCols];
     unsigned int* cpu_seq[kRouteCols];
+    int quiet;                        // the QUIET meeting (route_body) may skip the turns
 };
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_cols_kernel(const __grid_constant__ RouteColsArgs c) {
     STRATA_PDL_ENTRY();   // (pdl.hpp: before any global access)
@@ -3783,7 +3826,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_cols_kernel(const __g
         a.win_more = c.nc - 1 - col;
     }
     __syncthreads();
-    route_body<true>(a, c.sync, col, c.nc);
+    route_body<true>(a, c.sync, col, c.nc, c.quiet);
 }
 
 // moe_wait's work for a route with misses (`s_need`, the whole block): the host's response, applied
@@ -5870,7 +5913,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
 bool moe_route_cols(const float* logits, size_t logit_stride, const float* bias, int n_expert, int k, float w_scale,
                     bool norm_w, int layer, const float* x, size_t x_stride, const MoeDev* mds, int nc,
                     unsigned int* sync, cudaStream_t s, int skip_from, unsigned long long cpu_plan, int promote_min,
-                    int pf_rank, int gating, const int* const* hash_ids, float skip_w, int skip_disk) {
+                    int pf_rank, int gating, const int* const* hash_ids, float skip_w, int skip_disk, bool quiet) {
     // the launch a column's own settings, read once there (moe_route): with any that reads the shared state before
     // the column's turn - EARLY X's request slot, the LOSSY affinities' table reads - the caller routes column by column
     static const bool plain = [] {
@@ -5893,6 +5936,7 @@ bool moe_route_cols(const float* logits, size_t logit_stride, const float* bias,
     c.a.topk_par = route_topk_par();
     c.nc = nc;
     c.sync = sync;
+    c.quiet = quiet && d0.helper_owned == nullptr && c.a.cpu_plan == 0ull ? 1 : 0;
     for (int t = 0; t < nc; ++t) {
         const MoeDev& m = mds[t];
         c.logits[t] = logits + (size_t) t * logit_stride;
