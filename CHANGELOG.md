@@ -7,6 +7,75 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.204 - 2026-11-25
+
+MemT-1.0-Nano (MemTensor) runs with its native memory (beta, NVIDIA): a fact told in one turn is answered in a new
+conversation through the memory alone, and the server takes a `memory` field and a small memory API. Ling-3.2-air's own
+MTP block drafts opt-in (`STRATA_LING_MTP=1`; decode +3 to +16% on an RTX 5090 + RAM, the same tokens). Inkling's
+DSpark gate measures the single token on plain steps, so drafts that lose after a long prompt on a small pool no longer
+pass as wins (#58); a looser pool rule is opt-in. CLI outputs give the same bits as v1.3.203 (7-config md5, Inkling 18
+md5, Ling 4 md5); Ling with MTP on gives the same tokens as off (8 of 8).
+
+### Added
+
+- MemT-1.0-Nano (MemTensor, Apache-2.0; beta, NVIDIA). The backbone is Qwen3.6-35B-A3B (qwen35moe); each of its 10
+  full-attention layers has a memory block whose state (16 x 256 x 256 FP32 a layer, 40 MiB in all) is read while the
+  model answers and written at a turn's end from a replay of the turn. `tools/memt_convert.py` makes the GGUF from the
+  HF files with Abyss's own reader and writer (Q8_0, or Q4_K_M with the per-tensor types of Ornith-1.5-35B-A3B's Q4_K_M
+  through trench-gguf's GPU quantizer); no setup entry, pack and config by hand ([MANUAL](docs/MANUAL.md#memt-10-nano-native-memory-beta)).
+  The server takes `"memory": {"id": "<name>", "commit": true}` on a chat request (Anthropic: also `metadata.memory`):
+  the answer reads that memory, and with `commit` the turn is written into it and saved to
+  `STRATA_MEMT_DIR/<name>.safetensors` (default `~/.abyss/memt`; MemT's `memt-memory-v1` layout).
+  `POST /v1/memory/<id>/documents {"text"}` writes a document, `GET /v1/memory` lists, `POST /v1/memory/<id>/delete`
+  deletes. The engine takes `MEMT OFF|ZERO|INFO|LOAD|SAVE|COMMIT|DOC`. A request without `memory` runs the backbone
+  alone. Measured on an RTX 5090 against a float64 numpy forward written from the HF code: the read with the
+  reference's state KL 0.003 (Q8_0, token path; without the memory 3.01), the written state within 0.8-2.8% a layer
+  (cosine >= 0.9994); MemT's README example (a kitten's name, age, food and trait told in turn 1) recalled 4 of 4 in a
+  new conversation (Q8_0 CLI and server, Q4_K_M server), and a 62-token note written through `/documents` answered 2 of
+  2. Q4_K_M, a 4K prompt + 512 tokens, median of 3: decode 304.6 tok/s without a memory, 295.5 with one (-3.0%),
+  prompt 8,955 -> 8,362 tok/s (-6.6%).
+- Ling-3.2-air (opt-in, `STRATA_LING_MTP=1`): the GGUF's NextN block (blk.42) drafts one token a step and a verify
+  window checks it against the model, so the kept tokens are the model's (greedy, `STRATA_DETERMINISTIC=1`: md5 with
+  the drafter equal to without it on code / prose / ja / edit after 4K and 16K, 8 of 8 at K=1 and 8 of 8 at K=3; MTP
+  off equal to v1.3.201 8 of 8). The block comes from a separate file written once by
+  `tools/nextn_pack.py --experts q5_0` (2.11 GB; bartowski's Q4_0 experts repacked to Q5_0 with the same values, no
+  ggml). Drafts a window: `STRATA_Q35_MTP_K`, 1 for Ling. RTX 5090 + RAM (STRATA_GLM_RAM_GB=89, the 5090 serving 66%
+  of the expert reads), bartowski Q4_K_M, 512 greedy tokens, median of 3 runs each under the CPU lock: decode against
+  off code 4K 109.2 -> 112.7, prose 4K 114.3 -> 121.4, ja 4K 128.8 -> 139.4, edit 4K 105.3 -> 121.2, code 16K
+  109.4 -> 126.7, prose 16K 109.6 -> 112.6, ja 16K 124.8 -> 133.4, edit 16K 105.2 -> 116.4 tok/s (+3 to +16%, 70-92%
+  of drafts accepted); 2 or 3 drafts a window -5 to +15%. Prompts 6-8% slower (4K 1,361 -> 1,274 tok/s, 16K 2,702 ->
+  2,496: the block's cache rows). Server (one request at a time, the same 8 prompts): decode +0.4 to +11%, time to
+  the first token +0.14 to +0.47 s, stream gaps p95 12-19 -> 16-23 ms (edit 30-43 ms). Off by default: measured on
+  this one box only, and the file is an extra setup step.
+- `STRATA_INK_DSPARK_POOL_LOSS=<percent>` (opt-in, default 0 = v1.3.200's rule, #58): the Inkling drafter found beside
+  the pack stays loaded when it takes at most this share of the expert pool's slots a layer. Measured with 8
+  (non-deterministic greedy, 2 runs each unless said): RTX 3090 at `--max-context 262144` (102 -> 96 slots) code
+  92.3-93.0 -> 118.2-125.6 tok/s, a ~3K-token reasoning answer 93.9-94.1 -> 133.0-142.6, edits +31-40%, Japanese
+  +4-17%, 8K prompts +9-28%; RTX 5090 held to 24 GB at 262144 (101 -> 94) 250K prompts prose 74.3-74.6 -> 87.5-92.6,
+  code 71.8 -> 84.6-102.7, 128K -4 to +12%; held to 20 / 16 GB at 65536 (117 -> 112 / 83 -> 77, 1 run) code +44 / +26%,
+  8K code +32 / +27%. But prose loses: 3090 90.6-90.7 -> 87.4-89.4, 5090 at 20 GB 176.4 -> 168.3 and at 16 GB 142.5
+  -> 133.7 (medians of 3; the smaller pool alone -2 to -4%), and a short prompt takes 0.15-0.25 s longer on the 3090
+  (the pool, not the drafter), so it stays opt-in. `STRATA_INK_DSPARK=<file>` still loads the drafter whatever the VRAM.
+
+### Fixed
+
+- Inkling 2 Mini DSpark gate (`STRATA_INK_DSPARK_GATE`): the single token's rate it sets drafting against is now
+  measured on plain steps (`STRATA_INK_DSPARK_PROBE`, default 256: 8 steps without the drafter early in the answer, then
+  after every 256 drafted steps). It used the single tokens between windows, which run among the windows' experts and
+  were twice as slow after a 32K prompt on a 24 GB pool (16.5 against 7.9 ms), so losing drafts passed as wins. RTX
+  5090 held to 24 GB (`STRATA_GLM_VRAM_GB=24`), `--max-context 262144`, drafter named, a 32K prose prompt, 512 tokens:
+  96.6 tok/s before (1 run), now 123.3 / 127.9 / 134.1 against 132.5 / 131.6 / 131.1 without the drafter and
+  127.8 / 127.0 / 126.8 with it loaded but never drafting (what is left is its smaller expert pool). Greedy answers are
+  the same tokens (Inkling 18 md5 on sm_120 and sm_86).
+
+### Docs
+
+- README / MODELS list orcarouter's abliterated Inkling 2 Mini GGUFs (`Mix-16G` 15.7 GB, `Mix-12G` 11.6 GB; running
+  since v1.3.197, `--model inkling2mini-abl`): KL against the original model's Q8_0 (the llama.cpp reference, 3,071
+  positions) 0.112 / 0.130, same top-1 86.8% / 86.1% - the abliteration's own shift, llama.cpp on the same files gives
+  the same; Abyss against llama.cpp on the same file 0.0117 / 0.0071; unsloth's `_Old` DSpark drafter works with them
+  (RTX 3090, code 104 -> 132 / 114 -> 132 tok/s). MemT-1.0-Nano: MANUAL (convert, pack, run, the memory API) and MODELS.
+
 ## v1.3.203 - 2026-11-25
 
 AtomicChat's Inkling 2 Mini GGUF (`Inkling-2-Mini-AD-Q4_K`, 16.5 GB) packs and runs: on 12-16 GB cards it decodes
@@ -40,20 +109,6 @@ on its own. CLI outputs give the same bits as v1.3.202 (7-config md5, Inkling 18
   path): 0.0108 (EN 0.0100, JA 0.0121, code 0.0086), same top-1 96.0%; UD-Q4_K_XL the same way 0.0058 (0.0050 / 0.0070
   / 0.0045), 97.5%. Unsloth's old-layout DSpark drafter (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `STRATA_INK_DSPARK=<file>`) works with it: a code prompt 199.7 ->
   237.8 tok/s, the same tokens (md5)
-
-MemT-1.0-Nano (MemTensor, Apache-2.0) runs with its native memory (beta, NVIDIA). The backbone is Qwen3.6-35B-A3B
-(qwen35moe); each of its 10 full-attention layers has a memory block whose state (16 x 256 x 256 FP32 a layer, 40 MiB in
-all) is read while the model answers and written at a turn's end from a replay of the turn. `tools/memt_convert.py`
-makes the GGUF from the HF files (Q8_0, or Q4_K_M with the per-tensor types of a reference GGUF). The server takes
-`"memory": {"id": "<name>", "commit": true}` on a chat request (Anthropic: `metadata.memory`): the answer reads that
-memory, and with `commit` the turn is written into it and saved to `STRATA_MEMT_DIR/<name>.safetensors` (MemT's
-`memt-memory-v1` layout). `POST /v1/memory/<id>/documents {"text"}` writes a document, `GET /v1/memory` lists,
-`POST /v1/memory/<id>/delete` deletes. The engine takes `MEMT OFF|ZERO|INFO|LOAD|SAVE|COMMIT|DOC`. A request without
-`memory` runs the backbone alone. Measured on an RTX 5090 (Q8_0 vs a float64 reference of the HF model): the read with a
-fixed state KL 0.003 (no memory: 3.0), the written state within 0.8-2.8 % (cosine >= 0.9996) per layer; a fact told in
-turn 1 is recalled in a new conversation through the memory alone. Q4_K_M, 4K prompt + 512 tokens: decode 304.6 tok/s
-without memory, 295.5 with (-3.0 %), prompt 8,955 -> 8,362 tok/s. Other models give the same bits as v1.3.202
-(6 of the 7-config md5 - the Qwen3.8 UD pack was not on this box - and Inkling 18 md5).
 
 ## v1.3.202 - 2026-11-24
 
@@ -115,52 +170,6 @@ same bits as v1.3.201 (7-config md5, Inkling 18 md5, Ling 4 md5); a server's new
   tokens), the KL to a token-path-only reading is the same as before - Ornith-1.5-35B-A3B 1.19e-2 -> 1.13e-2 (top-1
   97.1% -> 97.0%), Qwen3.8 UD-IQ3_XXS 3.53e-3 -> 3.62e-3 (97.5% -> 97.8%). Its first token comes ~55 ms later at
   9-10K tokens (1,752-1,766 -> 1,805-1,818 ms); the CLI is unchanged (7-config md5).
-
-### Added
-
-- Ling-3.2-air (opt-in, `STRATA_LING_MTP=1`): the GGUF's NextN block (blk.42) drafts one token a step and a verify
-  window checks it against the model, so the kept tokens are the model's (greedy, `STRATA_DETERMINISTIC=1`: md5 with
-  the drafter equal to without it on code / prose / ja / edit after 4K and 16K, 8 of 8 at K=1 and 8 of 8 at K=3; MTP
-  off equal to v1.3.201 8 of 8). The block comes from a separate file written once by
-  `tools/nextn_pack.py --experts q5_0` (2.11 GB; bartowski's Q4_0 experts repacked to Q5_0 with the same values, no
-  ggml). Drafts a window: `STRATA_Q35_MTP_K`, 1 for Ling. RTX 5090 + RAM (STRATA_GLM_RAM_GB=89, the 5090 serving 66%
-  of the expert reads), bartowski Q4_K_M, 512 greedy tokens, median of 3 runs each under the CPU lock: decode against
-  off code 4K 109.2 -> 112.7, prose 4K 114.3 -> 121.4, ja 4K 128.8 -> 139.4, edit 4K 105.3 -> 121.2, code 16K
-  109.4 -> 126.7, prose 16K 109.6 -> 112.6, ja 16K 124.8 -> 133.4, edit 16K 105.2 -> 116.4 tok/s (+3 to +16%, 70-92%
-  of drafts accepted); 2 or 3 drafts a window -5 to +15%. Prompts 6-8% slower (4K 1,361 -> 1,274 tok/s, 16K 2,702 ->
-  2,496: the block's cache rows). Server (one request at a time, the same 8 prompts): decode +0.4 to +11%, time to
-  the first token +0.14 to +0.47 s, stream gaps p95 12-19 -> 16-23 ms (edit 30-43 ms). Off by default: measured on
-  this one box only, and the file is an extra setup step.
-
-### Fixed
-
-- Inkling 2 Mini: the expert pool's kept budget (`pool_pin.txt`, v1.3.198) now names the context length and the
-  `--parallel` setting. Inkling's KV slots sit outside what the key counted, so a budget learnt at one `--max-context`
-  was used at another: a larger one did not fit and every start said so, a smaller one (within 1 GiB) left that much
-  VRAM unused. The first start after the update learns the budget once again; GLM, DeepSeek V4 / V4.1 and Hy4 keys are unchanged.
-- Qwen3.5 / Qwen3.8, Ornith, Laguna and Ling: the same for their kept expert pool budget - their attention caches and
-  states sit outside what the key counted, so the key now names the context length and the `--kv` cache format. The
-  first start after the update learns the budget once again.
-- Inkling 2 Mini DSpark gate (`STRATA_INK_DSPARK_GATE`): the single token's rate it sets drafting against is now
-  measured on plain steps (`STRATA_INK_DSPARK_PROBE`, default 256: 8 steps without the drafter early in the answer, then
-  after every 256 drafted steps). It used the single tokens between windows, which run among the windows' experts and
-  were twice as slow after a 32K prompt on a 24 GB pool (16.5 against 7.9 ms), so losing drafts passed as wins. RTX
-  5090 held to 24 GB (`STRATA_GLM_VRAM_GB=24`), `--max-context 262144`, drafter named, a 32K prose prompt, 512 tokens:
-  96.6 tok/s before (1 run), now 123.3 / 127.9 / 134.1 against 132.5 / 131.6 / 131.1 without the drafter and
-  127.8 / 127.0 / 126.8 with it loaded but never drafting (what is left is its smaller expert pool). Greedy answers are
-  the same tokens (Inkling 18 md5 on sm_120 and sm_86).
-
-### Added
-
-- `STRATA_INK_DSPARK_POOL_LOSS=<percent>` (opt-in, default 0 = v1.3.200's rule, #58): the Inkling drafter found beside
-  the pack stays loaded when it takes at most this share of the expert pool's slots a layer. Measured with 8
-  (non-deterministic greedy, 2 runs each unless said): RTX 3090 at `--max-context 262144` (102 -> 96 slots) code
-  92.3-93.0 -> 118.2-125.6 tok/s, a ~3K-token reasoning answer 93.9-94.1 -> 133.0-142.6, edits +31-40%, Japanese
-  +4-17%, 8K prompts +9-28%; RTX 5090 held to 24 GB at 262144 (101 -> 94) 250K prompts prose 74.3-74.6 -> 87.5-92.6,
-  code 71.8 -> 84.6-102.7, 128K -4 to +12%; held to 20 / 16 GB at 65536 (117 -> 112 / 83 -> 77, 1 run) code +44 / +26%,
-  8K code +32 / +27%. But prose loses: 3090 90.6-90.7 -> 87.4-89.4, 5090 at 20 GB 176.4 -> 168.3 and at 16 GB 142.5
-  -> 133.7 (medians of 3; the smaller pool alone -2 to -4%), and a short prompt takes 0.15-0.25 s longer on the 3090
-  (the pool, not the drafter), so it stays opt-in. `STRATA_INK_DSPARK=<file>` still loads the drafter whatever the VRAM.
 
 ## v1.3.201 - 2026-11-24
 
