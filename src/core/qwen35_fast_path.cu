@@ -134,6 +134,7 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         Ly.out = q("attn_output.weight", (int64_t) g.n_head * D, E);
         Ly.q_norm = f32("attn_q_norm.weight");
         Ly.k_norm = f32("attn_k_norm.weight");
+        if (g.memt && il < g.n_layers) memt_bind(il, missing);
         if (g.q4x) {   // the QSA indexer: BF16 projections
             const auto b16 = [&](const char* n, int64_t n_out) -> WSlot {
                 const auto it = w16_.find(P + n);
@@ -420,6 +421,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  (double) n_attn * cache_b / 1073741824.0, (long long) ctx,
                  q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.ling && !ling_alloc(err)) return false;
+    if (g.memt && !memt_alloc(err)) return false;
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
     if (g.qsa27 && !q27_qsa_setup(err)) return false;
@@ -1839,6 +1841,7 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
         q35_dump(s, "attn_pregate", il, F->q35_ao, HD);
     }
     q35::attn_gate(F->q35_ao, F->q35_qf, g.n_head, D, s, q35_kv_);
+    if (Ly.mt >= 0 && !memt_token(il, err)) return false;   // (MemT: the memory read added, a replay's write)
     if (F->prof_on) F->mark("q35_attend");
     if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
     gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);

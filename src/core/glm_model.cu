@@ -795,6 +795,17 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
             out.yarn_beta_slow = (float) num("rope.scaling.yarn_beta_slow", 1.0);
         }
     }
+    if (const auto* mh = g.get(p + "memt.head_count"); mh != nullptr && mh->is_num()) {   // MemT-1.0-Nano
+        out.memt = true;
+        out.memt_heads = (int) mh->num();
+        out.memt_softcap = (float) num("memt.softcap", 2.0);
+        out.memt_eps = (float) num("memt.norm_eps", out.norm_eps);
+        out.memt_chunk = (int) num("memt.chunk_tokens", 2048);
+        if (out.memt_heads != out.n_head || out.head_dim != 256) {
+            err = "memt: the memory takes one head a query head of 256 dims";
+            return false;
+        }
+    }
     if (loop) {   // the looped block: the mHC layer kinds, the second visit's weights the first's
         const auto* ks = g.get(p + "mhc.layer_kinds");
         if ((int) num("mhc.streams", 0) != 2 || ks == nullptr || ks->type != strata::MetaType::ARRAY ||
@@ -1675,6 +1686,7 @@ Glm5Model::~Glm5Model() {
     }
     fast_destroy();
     ling_free();      // (ling: the k_b / v_b rows and the attention scratch it allocated)
+    memt_free();      // (memt: the memory states and scratch)
     q35d_destroy();   // (load_pack's record when fast_setup never ran)
     if (!stage_workers_.empty()) {
         // stop the staging pool: without this the workers block in stage_cv_ forever and the

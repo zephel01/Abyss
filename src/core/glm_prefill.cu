@@ -1201,6 +1201,7 @@ static constexpr int64_t kDqRows = 512;
 static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool has_dsa, bool deq = false) {
     const int64_t E = g.n_embd;
     int64_t w32 = 2 << 20;
+    if (g.memt) w32 = std::max<int64_t>(w32, (int64_t) g.memt_heads * 256 * E);   // (MemT: a memt_in block at once)
     if (has_dsa)
         w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
     int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
@@ -5053,6 +5054,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         }
                     }
                     q35::attn_gate_rows(B.ao, B.qf, tn, g.n_head, D, s, q35_kv_);
+                    if (Ly.mt >= 0) {   // MemT: the memory read added to the gated output (a replay: the write too)
+                        const auto mg = [&](const uint16_t* Wm, int N, int Kd, const float* X, float* Y, int Tn) {
+                            sgemm_bf16(Wm, N, Kd, X, Kd, Y, N, Tn, 1.0f);
+                        };
+                        if (!memt_rows(il, xs, tn, B.ao, s, mg, err)) return false;
+                        S->mark("memt", s);
+                    }
                     S->mark("q35_attn", s);
                     if (t0 + tn == T) dump_row("attn_gated-" + Ls, B.ao, HDq, tn - 1);
                     if (!skip_output) {
@@ -7338,8 +7346,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
-        err = "prefill logits requires single-device DeepSeek V4.1, Inkling or Ling"; return false;
+    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.memt) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
+        err = "prefill logits requires single-device DeepSeek V4.1, Inkling, Ling or MemT"; return false;
     }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
@@ -7619,7 +7627,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
-                    else if (g.ling)   // (ling: R's row takes the last FFN, output_norm - the token path's head input)
+                    else if (g.ling || g.memt)   // (ling, MemT's qwen35moe: R's row takes the last FFN, output_norm -
+                                                 // the token path's head input)
                         gf::rms_q8(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, w_.at("output_norm.weight"),
                                    g.norm_eps, E, fast_->head_x, fast_->head_xq, fast_->cs);
                     else

@@ -9,6 +9,20 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+MemT-1.0-Nano (MemTensor, Apache-2.0) runs with its native memory (beta, NVIDIA). The backbone is Qwen3.6-35B-A3B
+(qwen35moe); each of its 10 full-attention layers has a memory block whose state (16 x 256 x 256 FP32 a layer, 40 MiB in
+all) is read while the model answers and written at a turn's end from a replay of the turn. `tools/memt_convert.py`
+makes the GGUF from the HF files (Q8_0, or Q4_K_M with the per-tensor types of a reference GGUF). The server takes
+`"memory": {"id": "<name>", "commit": true}` on a chat request (Anthropic: `metadata.memory`): the answer reads that
+memory, and with `commit` the turn is written into it and saved to `STRATA_MEMT_DIR/<name>.safetensors` (MemT's
+`memt-memory-v1` layout). `POST /v1/memory/<id>/documents {"text"}` writes a document, `GET /v1/memory` lists,
+`POST /v1/memory/<id>/delete` deletes. The engine takes `MEMT OFF|ZERO|INFO|LOAD|SAVE|COMMIT|DOC`. A request without
+`memory` runs the backbone alone. Measured on an RTX 5090 (Q8_0 vs a float64 reference of the HF model): the read with a
+fixed state KL 0.003 (no memory: 3.0), the written state within 0.8-2.8 % (cosine >= 0.9996) per layer; a fact told in
+turn 1 is recalled in a new conversation through the memory alone. Q4_K_M, 4K prompt + 512 tokens: decode 304.6 tok/s
+without memory, 295.5 with (-3.0 %), prompt 8,955 -> 8,362 tok/s. Other models give the same bits as v1.3.202
+(6 of the 7-config md5 - the Qwen3.8 UD pack was not on this box - and Inkling 18 md5).
+
 ## v1.3.202 - 2026-11-24
 
 Ling-3.2-air reads images (beta, NVIDIA) with Abyss's own CUDA encoder: three test pictures and five position-dependent
