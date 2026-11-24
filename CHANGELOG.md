@@ -41,6 +41,12 @@ top-8 with group-limited routing) runs as a text-only beta, from bartowski's pub
   rotates interleaved pairs as the model does (perplexity of our Q4_K_M in llama.cpp on the same text: 15.45 with the
   sections, 14.78 with them zeroed).
 
+### Fixed
+
+- Setup finds a model that sits in a plain mirror of its Hugging Face repo - a quant's file at the repo's top level,
+  e.g. `<data>/models/unsloth/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf` - and links it into its quant folder
+  (where the pack and the config go) instead of stopping at "the model is not downloaded" (#56).
+
 ## v1.3.200 - 2026-11-24
 
 Inkling 2 Mini's DSpark drafter is on by default when its file is on disk and it leaves the expert pool as it is: on an

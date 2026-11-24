@@ -1072,5 +1072,30 @@ class VenvLayout(unittest.TestCase):
         self.assertEqual(calls[-1][0], str(Path(scripts) / "cmake.exe"))
 
 
+class LinkMirror(unittest.TestCase):
+    """#56: a plain mirror of the Hugging Face repo (a quant's file at the repo's top level) is linked into setup's
+    quant folder instead of stopping at "the model is not downloaded"."""
+
+    def test_links_a_flat_mirror(self):
+        with tempfile.TemporaryDirectory() as d:
+            flat, mdir = Path(d) / "unsloth" / "Inkling-2-Mini-GGUF", Path(d) / "unsloth" / "Inkling-2-Mini-GGUF" / "UD-Q4_K_XL"
+            flat.mkdir(parents=True)
+            (flat / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"GGUF")
+            self.assertTrue(A.link_mirror(flat, mdir, ["Inkling-2-Mini-UD-Q4_K_XL.gguf"]))
+            link = mdir / "Inkling-2-Mini-UD-Q4_K_XL.gguf"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.read_bytes(), b"GGUF")
+            self.assertTrue((flat / "Inkling-2-Mini-UD-Q4_K_XL.gguf").is_file())   # (the mirror is left as it is)
+
+    def test_links_nothing_when_a_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            flat, mdir = Path(d) / "r", Path(d) / "r" / "Q4_K_M"
+            (flat / "Q4_K_M").mkdir(parents=True)
+            (flat / "Q4_K_M" / "a-00001-of-00002.gguf").write_bytes(b"1")
+            self.assertFalse(A.link_mirror(flat, mdir, ["Q4_K_M/a-00001-of-00002.gguf", "Q4_K_M/a-00002-of-00002.gguf"]))
+            self.assertFalse((mdir / "a-00002-of-00002.gguf").exists())
+            self.assertFalse((mdir / "a-00001-of-00002.gguf").is_symlink())
+
+
 if __name__ == "__main__":
     unittest.main()

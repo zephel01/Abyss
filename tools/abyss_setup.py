@@ -375,6 +375,20 @@ def quant_files(quant: str, repo: str = REPO, folder: str | None = None, prefix:
     S.fail(f"{repo} has no quant {quant!r}", "names are the folders on https://huggingface.co/" + repo)
 
 
+def link_mirror(flat: Path, mdir: Path, paths: list[str]) -> bool:
+    """When every file is already in `flat`, a plain mirror of the Hugging Face repo (each at its repo path, e.g. a
+    quant's file at the repo's top level), link them into `mdir` - setup's quant folder, where the pack and the config
+    go - and say True.  Nothing is moved; with any file missing nothing is linked."""
+    if not paths or not all((flat / p).is_file() for p in paths):
+        return False
+    mdir.mkdir(parents=True, exist_ok=True)
+    for p in paths:
+        dst = mdir / Path(p).name
+        if not dst.exists():
+            dst.symlink_to((flat / p).resolve())
+    return True
+
+
 def sha256_of(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -1307,6 +1321,9 @@ def main() -> int:
     total = sum(f[1] for f in files)
     S.say(f"  {len(files)} files, {total / 1e9:.1f} GB -> {mdir}")
     missing = [f for f in files if not (mdir / Path(f[0]).name).exists()]
+    if missing and link_mirror(data / "models" / repo, mdir, [f[0] for f in missing]):
+        S.ok(f"the files are in {data / 'models' / repo} (a mirror of the repo): linked into {mdir}")
+        missing = []
     if missing:
         free = shutil.disk_usage(mdir.parent if mdir.parent.exists() else data.parent).free
         S.say(f"  to download: {sum(f[1] for f in missing) / 1e9:.1f} GB (free on that disk: {free / 1e9:.0f} GB)")
