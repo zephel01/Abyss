@@ -52,13 +52,16 @@ inline Mode mode() {
 inline std::string file_for(const std::string& pack_dir) { return pack_dir + "/pool_pin.txt"; }
 
 // the key: what decides the pool's budget apart from other processes.  `own_b`: the bytes this part holds before the
-// pool (its dense weights, KV and state) - the context length and KV type show up here
-inline std::string key(int dev, size_t total_b, int l0, int lt, size_t own_b) {
+// pool (its dense weights, KV and state) - the context length and KV type show up here.  `extra`: what decides the
+// budget that own_b does not see (Inkling: its KV slots and --parallel lanes sit outside state_bytes_, so its context
+// length and lanes are named - "|ctx=<n>|par=<n>"; an entry saved under the key without them is not found, the
+// budget is learnt once again)
+inline std::string key(int dev, size_t total_b, int l0, int lt, size_t own_b, const std::string& extra = std::string()) {
     std::string u = strata::program::gpu_uuid(dev);
     if (u.empty()) u = "dev" + std::to_string(dev) + "@" + strata::program::gpu_pci(dev);
     std::ostringstream k;
     k << u << "|vram=" << (total_b >> 20) << "|layers=" << l0 << "-" << lt << "|own=" << (own_b >> 20)
-      << "|v=" << STRATA_VERSION;
+      << extra << "|v=" << STRATA_VERSION;
     static const char* const kEnv[] = {"STRATA_GLM_VRAM_GB",   "STRATA_GLM_VRAM_GB_PARTS", "STRATA_GLM_RESERVE_MB",
                                        "STRATA_INK_DSPARK",    "STRATA_DS4_DSPARK",        "STRATA_GLM_VISION_LEND_MB",
                                        "STRATA_GLM_TAIL_ON_TOP"};

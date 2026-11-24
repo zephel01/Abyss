@@ -817,6 +817,11 @@ public:
     // moves each lane on; ink_batch_pick(t, sp) is row t's token then (greedy: its argmax; else its sampler, a row)
     static int ink_parallel_env();      // STRATA_INK_PARALLEL (--parallel): 1 default, -1 auto
     int ink_par_ = 1;                   // the lanes allocated
+    // the pool pin key's part own_b does not see (glm_pool_pin.hpp): Inkling's context length and --parallel setting
+    std::string pin_extra() const {
+        return g_.ink ? "|ctx=" + std::to_string((long long) max_ctx_) + "|par=" + std::to_string(ink_parallel_env())
+                      : std::string();
+    }
     int ink_lane() const;
     int64_t ink_lane_pos(int j) const;
     bool ink_lane_use(int j, std::string& err);

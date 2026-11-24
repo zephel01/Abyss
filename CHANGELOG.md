@@ -9,6 +9,13 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+### Fixed
+
+- Inkling 2 Mini: the expert pool's kept budget (`pool_pin.txt`, v1.3.198) now names the context length and the
+  `--parallel` setting. Inkling's KV slots sit outside what the key counted, so a budget learnt at one `--max-context`
+  was used at another: a larger one did not fit and every start said so, a smaller one (within 1 GiB) left that much
+  VRAM unused. The first start after the update learns the budget once again; other models' keys are unchanged.
+
 ## v1.3.201 - 2026-11-24
 
 Ling-3.2-air (inclusionAI) runs as a text-only beta from bartowski's public Q4_K_M as it is: on an RTX 5090 + RAM a 4K
