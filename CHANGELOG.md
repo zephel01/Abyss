@@ -7,6 +7,44 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased (v1.3.205)
+
+MemT-1.0-Flash (MemTensor) runs with its native memory on the deepseek4 path (beta, NVIDIA), built over our DeepSeek
+V4 Flash 0731 `32G96G` L97: a fact told in one turn, or a document, is answered in a new conversation through the memory
+alone. With the memory off it costs no VRAM, so the expert pool is the plain L97 pack's. CLI outputs give the same bits
+as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
+
+### Added
+
+- MemT-1.0-Flash (MemTensor, MIT; beta, NVIDIA). DeepSeek-V4-Flash-0731 post-trained with a memory block in each of its
+  20 CSA layers (4, 6, ..., 42); the state is 64 x 512 x 512 FP32 a layer (1.25 GiB, a 1.34 GB file). Its experts are
+  0731's, so `tools/memt_flash_fetch.py` (new, stdlib only, resumable) fetches only the memory files and the non-expert
+  bytes of the model shards by HTTP range reads (21.9 GB of the 576 GB checkpoint), and `tools/memt_flash.py` writes an
+  overlay GGUF over L97: L97's keys, MemT's non-expert backbone in L97's tensor types (`--backbone`, k-quants through
+  trench-gguf's GPU quantizer, optional `--imatrix`), the memory weights Q8_0 (9.3 GB written in ~20 s; shards 2-4 link
+  to L97's). No setup entry: fetch, overlay, pack and config by hand ([MANUAL](docs/MANUAL.md#memt-10-flash-native-memory-beta)).
+  The server's `memory` field and memory API are Nano's. Placement: with the memory off the memory weights stay in the
+  pack's mapping and no state is allocated (VRAM before the expert pool 5.95 GB, L97 5.94; the pool 23.97 GB on an
+  RTX 5090). With a memory on, the read weights (1.2 GB Q8_0) and the state rounded to BF16 (0.67 GB) take the last 7
+  slots of each layer's pool (2.33 GB) and the FP32 state stays in RAM; a commit or a document borrows 4.1 GB of the
+  pool's tail for the write weights and an FP32 write state during the replay and gives it back. Measured on an RTX 5090
+  + 123 GB RAM (iGPU lane off, default RAM tier, learned pool files, a 4K prompt + 512 tokens, median of 3): decode 77.9
+  tok/s without a memory (L97 78.9), 68.2 with one; the 4K prompt 986 / 867 tok/s; a 325-token commit 3.3-3.5 s, the save
+  0.7-2.7 s, a switch (`LOAD`) 1.2-1.4 s. Against a float64 forward of the HF code with the same weights: memory write
+  3.3-4.5e-4, read 0.5-1.1% relative error; recall 4 of 4 facts from a committed turn and 5 of 5 from a Japanese note.
+  Drafting of every kind (DSpark, the MTP draft block, the n-gram repeats), `--parallel` and a layer split are off for
+  MemT (the verify windows do not read the memory).
+
+### Changed
+
+- The server follows MemT's session rules (MemT-1.0-Nano and -Flash): once a memory holds something (its file exists),
+  the prompt, the turn written back and a document start without the BOS; an empty memory keeps it.
+
+### Fixed
+
+- MemT-1.0-Nano: the n-gram repeats' drafts went through verify windows that do not read the memory, so an accepted
+  draft could differ from the token path's answer with a memory on; MemT models now decode a token at a time.
+
 ## v1.3.204 - 2026-11-25
 
 MemT-1.0-Nano (MemTensor) runs with its native memory (beta, NVIDIA): a fact told in one turn is answered in a new
@@ -109,23 +147,6 @@ on its own. CLI outputs give the same bits as v1.3.202 (7-config md5, Inkling 18
   path): 0.0108 (EN 0.0100, JA 0.0121, code 0.0086), same top-1 96.0%; UD-Q4_K_XL the same way 0.0058 (0.0050 / 0.0070
   / 0.0045), 97.5%. Unsloth's old-layout DSpark drafter (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `STRATA_INK_DSPARK=<file>`) works with it: a code prompt 199.7 ->
   237.8 tok/s, the same tokens (md5)
-
-MemT-1.0-Flash (MemTensor; DeepSeek-V4-Flash-0731 post-trained, with a memory block in each of its 20 CSA layers 4..42
-even, state 64 x 512 x 512 FP32 a layer, 1.25 GiB in all) runs with its memory on the deepseek4 path (beta, NVIDIA).
-`tools/memt_flash.py` writes an overlay GGUF over a V4 Flash 0731 GGUF (the base's keys, `deepseek4.memt.*` and the
-memory weights, Q8_0; the other shards are links to the base's); pack it with `iq_pack.py --first-wins`. With
-`--backbone=<range reads> --gpuq=<lib> --imatrix=<file>` MemT's own non-expert backbone replaces the base's in the base's
-types (MemT's experts round back to 0731's MXFP4 codes, so the base's stay). The read is added to the attention output
-before wo_a on the token and prompt paths (the state read rounded to BF16, as the reference does); a commit or document
-writes the turn. The server follows MemT's session rules: once a memory holds something, the prompt, the written turn
-and a document start without the BOS. Measured on an RTX 5090 over the 0731 L97 GGUF (Q8_0 memory, against a float64
-reference fed from the engine's inputs, layers 4 / 22 / 42): written state within 0.03-0.05 % of the same Q8_0 weights'
-math (1.7-2.0 % of the BF16 weights'), the read within 0.5-1.1 %. A fact told in turn 1, and a Japanese document, are
-recalled in a new conversation through the memory alone, over either backbone. MemT's backbone vs 0731's (memory off,
-5 x 1024-token texts): KL 0.023-0.061, lower NLL on all 5. 4K prompt + 256 tokens, deterministic mode: decode 16.01 tok/s
-on the plain L97 pack, 12.20 on the MemT pack with the memory off (the memory weights and two states take 6.1 GB of the
-expert pool: 24.0 -> 17.9 GB), 11.77 with a memory (-3.5 %). Other models give the same bits as before (7-config md5,
-Inkling 18 md5, L97 without memory).
 
 ## v1.3.202 - 2026-11-24
 

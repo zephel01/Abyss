@@ -21,16 +21,18 @@ __device__ __forceinline__ float warp_sum(float v) {
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
-template <bool B16>
-__device__ __forceinline__ float st_ld(const float* p) {
-    if constexpr (B16) return __bfloat162float(__float2bfloat16_rn(*p));
-    else return *p;
+// the state's value: M 0 FP32 as it is, 1 FP32 rounded to BF16, 2 stored as BF16 (the same values as 1)
+template <int M>
+__device__ __forceinline__ float st_ld(const void* p, size_t i) {
+    if constexpr (M == 2) return __uint_as_float((unsigned) ((const uint16_t*) p)[i] << 16);
+    else if constexpr (M == 1) return __bfloat162float(__float2bfloat16_rn(((const float*) p)[i]));
+    else return ((const float*) p)[i];
 }
 
 // grid (ceil(T / kRows), H), block D
-template <int D, bool B16>
+template <int D, int M>
 __global__ void k_read_rows(const float* __restrict__ q, const float* __restrict__ g, const float* __restrict__ gbias,
-                            const float* __restrict__ S, const float* __restrict__ onorm, float* __restrict__ ao,
+                            const void* __restrict__ S, const float* __restrict__ onorm, float* __restrict__ ao,
                             int T, int H, float scale, float eps, float softcap) {
     __shared__ float buf[kRows][D];
     __shared__ float inv[kRows];
@@ -50,9 +52,9 @@ __global__ void k_read_rows(const float* __restrict__ q, const float* __restrict
     float acc[kRows];
 #pragma unroll
     for (int j = 0; j < kRows; ++j) acc[j] = 0.0f;
-    const float* Sh = S + (size_t) h * D * D + tid;
+    const size_t Sh = (size_t) h * D * D + tid;
     for (int k = 0; k < D; ++k) {
-        const float sv = st_ld<B16>(Sh + (size_t) k * D);
+        const float sv = st_ld<M>(S, Sh + (size_t) k * D);
 #pragma unroll
         for (int j = 0; j < kRows; ++j) acc[j] = fmaf(buf[j][k] * inv[j], sv, acc[j]);
     }
@@ -78,8 +80,8 @@ __global__ void k_read_rows(const float* __restrict__ q, const float* __restrict
 }
 
 // grid (H, kSplit), block D: rows k of the slice, every column v (a thread) - part[h][slice][v]
-template <int D, bool B16>
-__global__ void k_read_part(const float* __restrict__ q, const float* __restrict__ S, float* __restrict__ part, int H) {
+template <int D, int M>
+__global__ void k_read_part(const float* __restrict__ q, const void* __restrict__ S, float* __restrict__ part, int H) {
     __shared__ float qs[D];
     __shared__ float red[D / 32];
     const int h = blockIdx.x, sl = blockIdx.y, tid = threadIdx.x;
@@ -93,10 +95,10 @@ __global__ void k_read_part(const float* __restrict__ q, const float* __restrict
     for (int i = 0; i < D / 32; ++i) ss += red[i];
     const float inv = rsqrtf(ss + 1e-6f);
     constexpr int R = D / kSplit;
-    const float* Sh = S + (size_t) h * D * D + (size_t) sl * R * D + tid;
+    const size_t Sh = (size_t) h * D * D + (size_t) sl * R * D + tid;
     float acc = 0.0f;
 #pragma unroll
-    for (int k = 0; k < R; ++k) acc = fmaf(qs[sl * R + k] * inv, st_ld<B16>(Sh + (size_t) k * D), acc);
+    for (int k = 0; k < R; ++k) acc = fmaf(qs[sl * R + k] * inv, st_ld<M>(S, Sh + (size_t) k * D), acc);
     part[((size_t) h * kSplit + sl) * D + tid] = acc;
 }
 
@@ -194,19 +196,31 @@ __global__ void k_group_rms(float* __restrict__ x, const float* __restrict__ w, 
 }
 
 template <int D>
-void read_rows_t(const float* q, const float* g, const float* gbias, const float* S, const float* onorm, float* ao,
-                 int T, int H, bool b16, float scale, float eps, float softcap, cudaStream_t s) {
+void read_rows_t(const float* q, const float* g, const float* gbias, const void* S, const float* onorm, float* ao,
+                 int T, int H, int m, float scale, float eps, float softcap, cudaStream_t s) {
     const dim3 grid((unsigned) ((T + kRows - 1) / kRows), (unsigned) H);
-    if (b16) k_read_rows<D, true><<<grid, D, 0, s>>>(q, g, gbias, S, onorm, ao, T, H, scale, eps, softcap);
-    else k_read_rows<D, false><<<grid, D, 0, s>>>(q, g, gbias, S, onorm, ao, T, H, scale, eps, softcap);
+    if (m == 2) k_read_rows<D, 2><<<grid, D, 0, s>>>(q, g, gbias, S, onorm, ao, T, H, scale, eps, softcap);
+    else if (m == 1) k_read_rows<D, 1><<<grid, D, 0, s>>>(q, g, gbias, S, onorm, ao, T, H, scale, eps, softcap);
+    else k_read_rows<D, 0><<<grid, D, 0, s>>>(q, g, gbias, S, onorm, ao, T, H, scale, eps, softcap);
 }
 
 template <int D>
-void read_tok_t(const float* q, const float* g, const float* gbias, const float* S, const float* onorm, float* ao,
-                float* part, int H, bool b16, float scale, float eps, float softcap, cudaStream_t s) {
-    if (b16) k_read_part<D, true><<<dim3((unsigned) H, (unsigned) kSplit), D, 0, s>>>(q, S, part, H);
-    else k_read_part<D, false><<<dim3((unsigned) H, (unsigned) kSplit), D, 0, s>>>(q, S, part, H);
+void read_tok_t(const float* q, const float* g, const float* gbias, const void* S, const float* onorm, float* ao,
+                float* part, int H, int m, float scale, float eps, float softcap, cudaStream_t s) {
+    const dim3 grid((unsigned) H, (unsigned) kSplit);
+    if (m == 2) k_read_part<D, 2><<<grid, D, 0, s>>>(q, S, part, H);
+    else if (m == 1) k_read_part<D, 1><<<grid, D, 0, s>>>(q, S, part, H);
+    else k_read_part<D, 0><<<grid, D, 0, s>>>(q, S, part, H);
     k_read_fin<D><<<(unsigned) H, D, 0, s>>>(part, g, gbias, onorm, ao, scale, eps, softcap);
+}
+
+// round to nearest even (what __float2bfloat16_rn gives a finite value; NaN -> 0x7fff) - memt_path.cu's host copy
+// rounds the same way
+__global__ void k_to_bf16(const float* __restrict__ x, uint16_t* __restrict__ y, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const unsigned u = __float_as_uint(x[i]);
+        y[i] = (u & 0x7fffffffu) > 0x7f800000u ? (uint16_t) 0x7fff : (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
 }
 
 }  // namespace
@@ -214,14 +228,32 @@ void read_tok_t(const float* q, const float* g, const float* gbias, const float*
 void read_rows(const float* q, const float* g, const float* gbias, const float* S, const float* onorm, float* ao,
                int T, int H, int D, bool bf16_state, float scale, float eps, float softcap, cudaStream_t s) {
     if (T <= 0) return;
-    if (D == 512) read_rows_t<512>(q, g, gbias, S, onorm, ao, T, H, bf16_state, scale, eps, softcap, s);
-    else read_rows_t<256>(q, g, gbias, S, onorm, ao, T, H, bf16_state, scale, eps, softcap, s);
+    if (D == 512) read_rows_t<512>(q, g, gbias, S, onorm, ao, T, H, bf16_state ? 1 : 0, scale, eps, softcap, s);
+    else read_rows_t<256>(q, g, gbias, S, onorm, ao, T, H, bf16_state ? 1 : 0, scale, eps, softcap, s);
+}
+
+void read_rows16(const float* q, const float* g, const float* gbias, const uint16_t* S, const float* onorm, float* ao,
+                 int T, int H, int D, float scale, float eps, float softcap, cudaStream_t s) {
+    if (T <= 0) return;
+    if (D == 512) read_rows_t<512>(q, g, gbias, S, onorm, ao, T, H, 2, scale, eps, softcap, s);
+    else read_rows_t<256>(q, g, gbias, S, onorm, ao, T, H, 2, scale, eps, softcap, s);
 }
 
 void read_tok(const float* q, const float* g, const float* gbias, const float* S, const float* onorm, float* ao,
               float* part, int H, int D, bool bf16_state, float scale, float eps, float softcap, cudaStream_t s) {
-    if (D == 512) read_tok_t<512>(q, g, gbias, S, onorm, ao, part, H, bf16_state, scale, eps, softcap, s);
-    else read_tok_t<256>(q, g, gbias, S, onorm, ao, part, H, bf16_state, scale, eps, softcap, s);
+    if (D == 512) read_tok_t<512>(q, g, gbias, S, onorm, ao, part, H, bf16_state ? 1 : 0, scale, eps, softcap, s);
+    else read_tok_t<256>(q, g, gbias, S, onorm, ao, part, H, bf16_state ? 1 : 0, scale, eps, softcap, s);
+}
+
+void read_tok16(const float* q, const float* g, const float* gbias, const uint16_t* S, const float* onorm, float* ao,
+                float* part, int H, int D, float scale, float eps, float softcap, cudaStream_t s) {
+    if (D == 512) read_tok_t<512>(q, g, gbias, S, onorm, ao, part, H, 2, scale, eps, softcap, s);
+    else read_tok_t<256>(q, g, gbias, S, onorm, ao, part, H, 2, scale, eps, softcap, s);
+}
+
+void to_bf16(const float* x, uint16_t* y, size_t n, cudaStream_t s) {
+    if (n == 0) return;
+    k_to_bf16<<<1024, 256, 0, s>>>(x, y, n);
 }
 
 void write_prep(float* k, const float* v, const float* b, float* w, float* f, const float* bias, const float* dsl,

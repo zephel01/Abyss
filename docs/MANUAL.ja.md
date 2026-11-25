@@ -1116,6 +1116,78 @@ RTX 5090（iGPU レーンなし）で測りました。基準は HF のコード
 （ユーザー発言 1 通として描画し、生成プロンプトを付けない）は MemT 自身のコードとは照らしていません（その文書への答えは正しく出ました）。
 骨格が Qwen3.6-35B-A3B とバイト単位で同じかは確かめていません（元の重みが手元にないため）。
 
+## MemT-1.0-Flash（ネイティブのメモリ、ベータ）
+
+v1.3.205 から、エンジンは MemTensor の [MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash)（MIT）を、そのモデル自身のメモリつきで
+deepseek4 の経路で動かします（NVIDIA）。MemT-1.0-Flash は DeepSeek-V4-Flash-0731 を追加学習したもので、20 層の CSA 層（4, 6, ..., 42）それぞれに
+メモリのブロックがあります。メモリは 1 層あたり 64 x 512 x 512 個の FP32（全部で 1.25 GiB、ファイルは 1.34 GB）です。サーバーのメモリの API は
+[MemT-1.0-Nano](#memt-10-nanoネイティブのメモリベータ) と同じです。setup の選択肢と公開の GGUF はありません。ファイルは、私たちの
+DeepSeek V4 Flash 0731 の `32G96G` GGUF（L97）の上に手で作ります。
+
+MemT のエキスパートは 0731 のものと同じです（0731 の MXFP4 の値にそのまま戻ります）。要るのはメモリのブロックと MemT 自身のエキスパート以外の骨格だけで、
+576 GB のチェックポイントのうち 21.9 GB です:
+
+| もの | 取り先 | 大きさ |
+| --- | --- | ---: |
+| メモリのブロック（`memt-0000N-of-00002.safetensors`）と `config.json` | [MemTensor/MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash)、ファイルごと | 7.2 GB |
+| MemT のエキスパート以外の骨格（注意、共有エキスパート、ルーター、hyper-connection、埋め込み、ヘッド） | 同じリポジトリの 43 個のモデルの分割ファイルから、HTTP の範囲読み（44 回） | 14.7 GB |
+| 元の GGUF | [zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF) の `L97` フォルダ | 96.8 GB |
+| trench-gguf の GPU 量子化（`gpuq/libgpuq_cuda.so`、v0.5.0 以降） | [zephel01/trench-gguf](https://github.com/zephel01/trench-gguf) | - |
+
+```bash
+# 1. メモリのブロックとエキスパート以外のバイト（途中から再開できます。HF のトークンがあれば HF_TOKEN か ~/.cache/huggingface/token）
+.venv/bin/python tools/memt_flash_fetch.py <dir>/MemT-1.0-Flash-src
+# 2. 重ねる GGUF: L97 のキー、MemT の骨格を L97 と同じテンソルの型で（k-quant は GPU で）、メモリの重みは Q8_0。
+#    分割 2〜4 は L97 へのリンク（書くのは 9.3 GB、RTX 5090 で約 20 秒）
+.venv/bin/python tools/memt_flash.py <dir>/MemT-1.0-Flash-src <L97>/DeepSeek-V4-Flash-0731-L97-00001-of-00003.gguf \
+  <dir>/MemT-1.0-Flash-B --outtype=q8_0 --backbone=<dir>/MemT-1.0-Flash-src --gpuq=<trench-gguf>/gpuq/libgpuq_cuda.so
+# 3. pack
+.venv/bin/python tools/iq_pack.py --gguf <dir>/MemT-1.0-Flash-B/overlay-00001-of-00004.gguf --out <dir>/MemT-1.0-Flash-B/pack \
+  --compat-bf16 --first-wins
+```
+
+`--imatrix=<imatrix.gguf>` で骨格の k-quant に重みを付けます（私たちは自前の 0731 の imatrix を使いました。公開していません。なしでは
+重みなしの k-quant になります。なしの品質は測っていません）。`--backbone` なしでは L97（0731）の骨格のままメモリだけを足します（「A」、書くのは 3.8 GB）。
+MemT 自身の骨格（「B」）のほうが思い出しが正確で NLL も低い（下の表）ので、B を使ってください。
+
+設定: `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`、
+`"tokenizer": "<dir>/MemT-1.0-Flash-B/pack/tokenizer"`。サーバーは `--engine strata` で起動します。`memory` のない要求は MemT の骨格だけで答えます。
+
+かかるもの:
+
+- メモリなし（要求に `memory` がない）: なし。メモリの重みは pack のマッピングに置いたままで、状態も取らないので、エキスパートの置き場は
+  L97 の pack そのままと同じです（RTX 5090 で 23.97 GB）。
+- メモリあり: 読み用の重み（Q8_0 で 1.2 GB）と BF16 に丸めた状態（0.67 GB）を、エキスパートの置き場の各層の末尾 7 枠に移します（置き場の 2.33 GB）。
+  状態の FP32 の本体は RAM に置きます（1.34 GB）。メモリを切り替えると 1.34 GB のファイルを読みます。
+- ターンや文書を書くとき: その流し直しの間だけ、書き用の重み（2.8 GB）と FP32 の書きの状態（1.34 GB）を置き場の尾の終わりに置き（4.1 GB、終われば返す）、
+  ファイルを書き直します（ディスクにはメモリ 1 つで 1.34 GB）。
+
+速度（RTX 5090、iGPU の経路なし、123 GB の機械で RAM の段は既定、学習したプールのファイルあり。4K のプロンプト＋512 トークン、
+1 回温めてから 3 回の中央値。`bench/MEASURE.md` の手順）:
+
+| | decode tok/s | prompt tok/s |
+| --- | ---: | ---: |
+| L97（DeepSeek V4 Flash 0731 そのまま） | 78.9 | 988 |
+| MemT-1.0-Flash B、メモリなし | 77.9 | 986 |
+| MemT-1.0-Flash B、メモリあり（325 トークン書いたメモリ） | 68.2（なしより -12%） | 867（-12%） |
+
+メモリありで遅くなるのは、ほとんどが読みの計算そのものです（置き場の VRAM の当たりは、なし 81% に対して 77〜79%）。325 トークンのターンを書くのは
+`COMMIT` 3.3〜3.5 秒（うち流し直し 1.8〜1.9 秒）、そのあと保存 0.7〜2.7 秒。メモリの切り替え（`LOAD`）は 1.2〜1.4 秒です。
+
+RTX 5090 で、HF のコードから書いた float64 の numpy の計算（`recipes/memt-flash/ref_block.py`）と、エンジン自身の入力で比べました（層 4 / 22 / 42）:
+
+| 確かめたこと | 結果 |
+| --- | --- |
+| メモリの書き（370 トークン）、同じ Q8_0 の重みの計算と | 相対誤差 4.2e-4 / 3.3e-4 / 4.5e-4。MemT の BF16 の重みとは 1.9% / 2.0% / 1.7%（cos >= 0.9998） |
+| メモリの読み、同じ Q8_0 の重みの計算と | プロンプト経路 1.1% / 0.73% / 0.49%、トークン経路 0.60% / 0.98% / 0.56%（参照側の BF16 の丸めだけで 0.34〜0.36%） |
+| 空のメモリ（`MEMT ZERO`）とメモリなし | 同じトークン |
+| 思い出し（MemT の README の子猫の例） | ターン 1 を書いて、質問だけの新しい会話で 4 項目とも正しい。メモリなしでは「知らない」 |
+| 文書として書いた日本語のメモ（83 トークン） | 5 項目（稼働日、場所、責任者、目標、検査）とも正しい。メモリなしでは知らない |
+| B と A、メモリなし、1,024 トークン × 5 本（英語、コード、日本語） | 5 本とも B の NLL が低い（例：日本語 3.012 → 2.877）。KL(A \|\| B) 0.023〜0.061 |
+
+ベータです。NVIDIA だけ。モデルに入るメモリは一度に 1 つ。MemT では下書き（DSpark、MTP、n-gram の繰り返し）、会話スロット、`--parallel`、層の分割は使いません
+（検証の窓がメモリを読まないため）。書くにはエキスパートの置き場の尾が要ります（32 GB の GPU で 13 GB あります。足りないと、理由を言って書くのを断ります）。
+
 ## Hy4-flash（ベータ、未リリース）
 
 エンジンは Tencent の Hy4-flash（GGUF のアーキテクチャ `hy_v4_flash`。シンク付きのゲート MLA 注意、4 本の hyper-connection、

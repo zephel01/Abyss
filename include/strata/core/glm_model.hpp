@@ -305,7 +305,11 @@ public:
     size_t memt_state_floats() const;
     bool memt_get(float* host, std::string& err);
     bool memt_set(const float* host, std::string& err);   // nullptr: zero
-    void memt_use(bool on);
+    bool memt_set(std::vector<float>&& host, std::string& err);   // (Flash: the host copy taken over, no second copy)
+    // MemT-1.0-Flash: on takes the memory's room from the expert pool (the read weights and the BF16 state in main
+    // slots of every layer); off gives it back and drops the state (a MemT pack with the memory off runs on the
+    // plain backbone's pool).  false (err the reason): the pool has no room
+    bool memt_use(bool on, std::string& err);
     bool memt_using() const;
     bool memt_commit(const std::vector<int32_t>& ids, bool document, std::string& err);
     /// the prompt path's hook (glm_prefill.cu): rows xs [tn][n_embd] of layer il, their gated attention output ao
@@ -736,6 +740,14 @@ public:
     // colder resident, parks in the RAM tier or goes) and is left in `state` (kLent: the tail; kElastic: elastic KV)
     bool lend_slots(const std::function<bool(int, int)>& take, char state, uint64_t& moved, uint64_t& dropped,
                     std::string& err);
+    // MemT-1.0-Flash (memt_path.cu): the memory's room in the expert pool - level 1 (the read weights, the BF16 state,
+    // the prompt path's read rows) in the last main slots of every layer while the memory is on; level 2 (the write
+    // weights, the FP32 write state, the write rows) at the end of the pool's tail during a replay, which the prompt
+    // path's chunk then stays below (memt_cap_)
+    bool memt4_take(int level, std::string& err);
+    void memt4_drop(int level);
+    bool memt4_commit(const std::vector<int32_t>& ids, bool document, std::string& err);
+    size_t memt_cap_ = 0;   // bytes at the end of the pool's tail the prompt path must leave alone (a replay's level 2)
     // ---- hy4 (src/core/hy4_fast_path.cu): the token path; its weights, caches and activations live in hy4_
     void* hy4_ = nullptr;
     bool hy4_setup(std::string& err);                      // fast_setup: bind, allocate, open the Engram table

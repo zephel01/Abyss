@@ -4736,13 +4736,12 @@ static int glm_pack_generate(const Options& o) {
             const std::vector<int> mlayers = ok ? model.memt_layers() : std::vector<int>{};
             std::vector<float> host;
             if (ok && sub == "OFF") {
-                model.memt_use(false);
+                ok = model.memt_use(false, why);
             } else if (ok && sub == "ZERO") {
-                ok = model.memt_set(nullptr, why);
-                model.memt_use(true);
+                ok = model.memt_set(nullptr, why) && model.memt_use(true, why);
             } else if (ok && sub == "LOAD" && !arg.empty()) {
-                ok = memt_file_read(arg, host, mlayers, mg.memt_heads, mg.memt_dim, why) && model.memt_set(host.data(), why);
-                if (ok) model.memt_use(true);
+                ok = memt_file_read(arg, host, mlayers, mg.memt_heads, mg.memt_dim, why) &&
+                     model.memt_set(std::move(host), why) && model.memt_use(true, why);
             } else if (ok && sub == "SAVE" && !arg.empty()) {
                 host.resize(model.memt_state_floats());
                 ok = model.memt_get(host.data(), why) && memt_file_write(arg, host, mlayers, mg.memt_heads, mg.memt_dim, why);
@@ -4754,7 +4753,11 @@ static int glm_pack_generate(const Options& o) {
                 if (ok) {
                     const std::vector<int32_t> t(t64.begin(), t64.end());
                     ok = model.memt_commit(t, sub == "DOC", why);
-                    model.memt_use(true);
+                    std::string e2;
+                    if (!model.memt_use(true, e2) && ok) {
+                        ok = false;
+                        why = e2;
+                    }
                 }
             } else if (ok && sub != "INFO") {
                 ok = false;

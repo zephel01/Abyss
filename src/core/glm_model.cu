@@ -254,9 +254,17 @@ static bool dense_q8_row(const std::string& name, const std::string& kind, const
     return false;
 }
 
+// MemT-1.0-Flash's quantized memory matrices (tools/memt_flash.py: Q8_0, natively served): they stay in the pack's
+// mapping - memt_path.cu's memt4_take copies the read ones into the expert pool while the memory is on and the write
+// ones while a replay runs - so a MemT pack with the memory off has the plain backbone's VRAM.  (Nano's are BF16 rows)
+static bool memt_host_row(const std::string& name, const std::string& kind) {
+    return kind == "0" && name.rfind("blk.", 0) == 0 && name.find(".memt_") != std::string::npos;
+}
+
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr, bool glm5 = false) {
     if (fast && name == "token_embd.weight") return 0;
+    if (fast && memt_host_row(name, kind)) return 0;
     if (dense_q8_row(name, kind, t, fast, glm5)) {
         if (how) *how = " q8";
         return ((uint64_t) t->elements() / 32 * 34 + 255u) & ~(uint64_t) 255u;
@@ -4206,6 +4214,18 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
+        if (fast_mode_ && memt_host_row(r.name, r.kind)) {   // (MemT-1.0-Flash: in the mapping, memt4_take uploads)
+            const int si = find_shard_of(r.name);
+            const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;
+            if (ti == nullptr) {
+                err = "pack: native tensor " + r.name + " not found in any shard";
+                return false;
+            }
+            const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
+            ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) src, (int64_t) ti->shape[0],
+                                                  (int64_t) native_rows(ti)};
+            continue;
+        }
         if (!dequant_at_load(r.name)) {
             // quantized rows: upload the raw GGUF bytes and serve them by device MMVQ
             const int si = find_shard_of(r.name);
@@ -4335,7 +4355,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
     // (qwen35moe on a split: no reader - its drafts verify in the one-part window and decode_spec is glm5's - #55)
     const bool q35_split = g_.qwen35() && !g_.q4x && n_parts_ > 1;
+    // (MemT: no draft block - the verify windows have no memory read)
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr && !q35_split &&
+        !g_.memt &&
         (l0_ > 0 || g_.qwen35() || getenv("STRATA_GLM_MTP") != nullptr || (g_.arch == 0 && l0_ == 0 && glm_window_nextn_env()))) {
         // (glm5-next on one part with STRATA_GLM_WINDOW=1: the block drafts for the verify window, dsv4_verify.cu)   // any split: the speculative decode runs on 2+ parts; qwen35moe: its drafter
         if (!load_mtp(gfs, err)) return false;

@@ -7385,7 +7385,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // chunks it lays out; =2 (a test) every batched prompt takes it at the plain chunk (the same arithmetic: its
     // tokens must match =0's bit for bit)
     bool dt = false;
-    if (const int dtm = dt_mode(); dtm > 0 && split_next_ == nullptr && !dt_failed_) {
+    if (const int dtm = dt_mode(); dtm > 0 && split_next_ == nullptr && !dt_failed_ && memt_cap_ == 0) {
         if (dt_ == nullptr) {
             std::string why;
             if (!dt_prepare(why)) {
@@ -7436,6 +7436,16 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
                 cudaEventRecord(dt_->ev_free[b], fast_->cs);
                 cudaEventRecord(dt_->ev_ready[b], fast_->cs);
             }
+        }
+    }
+    // a MemT-1.0-Flash replay holds the tail's end (memt4_take level 2): the chunk stays below it (a longer replay runs
+    // in more chunks)
+    if (memt_cap_ > 0 && !dt) {
+        const size_t lim = fast_->xpool_bytes > memt_cap_ ? fast_->xpool_bytes - memt_cap_ : 0;
+        while (Trun > 64 && prefill_carve(Trun) > lim) Trun = std::max(64, (Trun / 2 + 63) / 64 * 64);
+        if (prefill_carve(Trun) > lim) {
+            err = "memt: the expert pool's tail has no room for the replay's prompt beside the memory's write side";
+            return false;
         }
     }
     bool ok = true;

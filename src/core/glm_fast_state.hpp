@@ -569,7 +569,8 @@ struct Glm5Model::FastState {
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).
     // kLanding: a background promotion's copy is on its way into the slot (fast_boundary step 5)
     // kElastic: a main slot whose memory the elastic KV took back (glm_elastic.cu): not part of the pool until mapped again
-    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5, kElastic = 6 };
+    // kMemt: a slot whose memory MemT-1.0-Flash's memory holds (memt_path.cu's memt4_take): not part of the pool until given back
+    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5, kElastic = 6, kMemt = 7 };
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).

@@ -1179,6 +1179,81 @@ weights); the way a document is rendered (one user message, no generation prompt
 code - the answers on it are right. The backbone is not checked byte for byte against Qwen3.6-35B-A3B (those weights
 are not here).
 
+## MemT-1.0-Flash (native memory, beta)
+
+From v1.3.205 the engine runs MemTensor's [MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash) (MIT) with
+its native memory, on NVIDIA, on the deepseek4 path. MemT-1.0-Flash is DeepSeek-V4-Flash-0731 post-trained with a memory
+block in each of its 20 CSA layers (4, 6, ..., 42); a memory is 64 x 512 x 512 FP32 numbers a layer (1.25 GiB in all, a
+1.34 GB file). The server's memory API is the same as [MemT-1.0-Nano's](#memt-10-nano-native-memory-beta). There is no
+setup entry and no published GGUF: the files are made by hand over our DeepSeek V4 Flash 0731 `32G96G` GGUF (L97).
+
+MemT's experts are 0731's (they round back to 0731's MXFP4 codes exactly), so only the memory blocks and MemT's own
+non-expert backbone are needed - 21.9 GB of the 576 GB checkpoint:
+
+| what | where | size |
+| --- | --- | ---: |
+| the memory blocks (`memt-0000N-of-00002.safetensors`) and `config.json` | [MemTensor/MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash), whole files | 7.2 GB |
+| MemT's non-expert backbone (attention, shared experts, routers, hyper-connections, embeddings, head) | the same repo's 43 model shards, by HTTP range reads (44 reads) | 14.7 GB |
+| the base GGUF | [zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF), folder `L97` | 96.8 GB |
+| trench-gguf's GPU quantizer (`gpuq/libgpuq_cuda.so`, v0.5.0 or later) | [zephel01/trench-gguf](https://github.com/zephel01/trench-gguf) | - |
+
+```bash
+# 1. the memory blocks and the non-expert bytes (resumable; HF_TOKEN or ~/.cache/huggingface/token if you have one)
+.venv/bin/python tools/memt_flash_fetch.py <dir>/MemT-1.0-Flash-src
+# 2. the overlay: L97's keys, MemT's backbone in L97's tensor types (k-quants on the GPU), the memory weights Q8_0;
+#    shards 2-4 are links to L97's (9.3 GB written, ~20 s on an RTX 5090)
+.venv/bin/python tools/memt_flash.py <dir>/MemT-1.0-Flash-src <L97>/DeepSeek-V4-Flash-0731-L97-00001-of-00003.gguf \
+  <dir>/MemT-1.0-Flash-B --outtype=q8_0 --backbone=<dir>/MemT-1.0-Flash-src --gpuq=<trench-gguf>/gpuq/libgpuq_cuda.so
+# 3. the pack
+.venv/bin/python tools/iq_pack.py --gguf <dir>/MemT-1.0-Flash-B/overlay-00001-of-00004.gguf --out <dir>/MemT-1.0-Flash-B/pack \
+  --compat-bf16 --first-wins
+```
+
+`--imatrix=<imatrix.gguf>` weights the backbone's k-quants (we used our own 0731 imatrix, not published; without it the
+k-quants are plain - not measured). Without `--backbone` the overlay keeps L97's (0731's) backbone and adds only the
+memory ("A": 3.8 GB written); MemT's own backbone ("B") recalled better and has a lower NLL (below), so B is the one to use.
+
+The config: `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`,
+`"tokenizer": "<dir>/MemT-1.0-Flash-B/pack/tokenizer"`, start the server with `--engine strata`. A request without
+`memory` runs MemT's backbone alone.
+
+What it costs:
+
+- Memory off (no `memory` in the request): nothing - the memory weights stay in the pack's mapping and the state is not
+  allocated, so the expert pool is the plain L97 pack's (23.97 GB on an RTX 5090).
+- Memory on: the read weights (1.2 GB Q8_0) and the state rounded to BF16 (0.67 GB) move into the last 7 slots of every
+  layer's expert pool (2.33 GB of it); the state's FP32 copy is in RAM (1.34 GB). Switching memories reads the 1.34 GB file.
+- Writing a turn or a document: for the replay also the write weights (2.8 GB) and an FP32 write state (1.34 GB) at the
+  end of the pool's tail (4.1 GB, given back afterwards), and the file is written again (1.34 GB a memory on disk).
+
+Speed on an RTX 5090 (iGPU lane off, the default RAM tier on a 123 GB box, the learned pool files kept; a 4K prompt + 512
+tokens, a warm-up run then the median of 3; `bench/MEASURE.md`):
+
+| | decode tok/s | prompt tok/s |
+| --- | ---: | ---: |
+| L97 (plain DeepSeek V4 Flash 0731) | 78.9 | 988 |
+| MemT-1.0-Flash B, memory off | 77.9 | 986 |
+| MemT-1.0-Flash B, memory on (a 325-token memory) | 68.2 (-12% against off) | 867 (-12%) |
+
+The memory-on cost is mostly the read itself (the pool's VRAM hit is 77-79% against 81% off). Writing a 325-token turn:
+`COMMIT` 3.3-3.5 s (the replay 1.8-1.9 s of it), then the save 0.7-2.7 s; switching memories (`LOAD`) 1.2-1.4 s.
+
+Checked on the RTX 5090 against a float64 numpy forward written from the HF code (`recipes/memt-flash/ref_block.py`),
+with the engine's own inputs (layers 4 / 22 / 42):
+
+| check | result |
+| --- | --- |
+| memory write, 370 tokens, against the same Q8_0 weights | relative error 4.2e-4 / 3.3e-4 / 4.5e-4; against MemT's BF16 weights 1.9% / 2.0% / 1.7% (cosine >= 0.9998) |
+| memory read, against the same Q8_0 weights | prompt path 1.1% / 0.73% / 0.49%, token path 0.60% / 0.98% / 0.56% (the reference's own BF16 rounding alone: 0.34-0.36%) |
+| an empty memory (`MEMT ZERO`) against no memory | the same tokens |
+| recall (the kitten example of MemT's README) | turn 1 committed; in a new conversation with only the question, all four facts right; without the memory the model says it does not know |
+| a Japanese note written as a document (83 tokens) | all five facts (dates, place, owner, target, inspection) right; without the memory it does not know |
+| B against A, memory off, 5 x 1,024 tokens (English, code, Japanese) | B's NLL lower on all 5 (e.g. Japanese 3.012 -> 2.877); KL(A \|\| B) 0.023-0.061 |
+
+Beta: NVIDIA only; one memory in the model at a time; drafting of every kind (DSpark, the MTP draft block, the n-gram
+repeats), conversation slots, `--parallel` and a layer split are off for MemT (the verify windows do not read the memory); a commit needs the pool's tail (a 32 GB GPU
+has 13 GB of it; a smaller tail refuses the commit with a message).
+
 ## Hy4-flash (beta, unreleased)
 
 The engine runs Tencent's Hy4-flash (GGUF architecture `hy_v4_flash`: gated MLA attention with sinks, 4 hyper-connection

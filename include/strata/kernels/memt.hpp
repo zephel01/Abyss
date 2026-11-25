@@ -28,6 +28,13 @@ void read_rows(const float* q, const float* g, const float* gbias, const float* 
 constexpr int kSplit = 16;
 void read_tok(const float* q, const float* g, const float* gbias, const float* S, const float* onorm, float* ao,
               float* part, int H, int D, bool bf16_state, float scale, float eps, float softcap, cudaStream_t s);
+/// ... the same with the state stored as BF16 (S [H][D][D] BF16 bits: the values the rounded FP32 read sees)
+void read_rows16(const float* q, const float* g, const float* gbias, const uint16_t* S, const float* onorm, float* ao,
+                 int T, int H, int D, float scale, float eps, float softcap, cudaStream_t s);
+void read_tok16(const float* q, const float* g, const float* gbias, const uint16_t* S, const float* onorm, float* ao,
+                float* part, int H, int D, float scale, float eps, float softcap, cudaStream_t s);
+/// y[i] = x[i] rounded to BF16 (nearest even), n values
+void to_bf16(const float* x, uint16_t* y, size_t n, cudaStream_t s);
 /// The write's inputs in place: k -> u, w -> wv (reads v), f -> lam (f: f_down's output, [T][H*D]); b [T][H*D]
 void write_prep(float* k, const float* v, const float* b, float* w, float* f, const float* bias, const float* dsl,
                 int T, int H, int D, cudaStream_t s);

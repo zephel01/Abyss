@@ -219,6 +219,9 @@ bool Glm5Model::verify_ready() const {
     // MoE layers; the head's weights on the last
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
+        // (MemT, Nano and Flash: the windows do not read the memory - no drafts of any kind, n-gram ones included;
+        // a token at a time, so a memory's answer is the token path's)
+        if (m->g_.memt) return false;
         // (inkling: its window opt-in - STRATA_INK_DRAFT=1, ink_window; one part, no prefetch / lookahead)
         // (--parallel's lanes: the batch steps are windows too - ink_batch_step)
         if (m->g_.ink && (!(ink_draft_env() || inkd_ != nullptr || ink_par_ > 1) || m->split_next_ != nullptr || m != this))
