@@ -108,7 +108,7 @@ MemTensor's MemT models with their native memory (beta, NVIDIA, one GPU; [MemT-1
 [MemT-1.0-Flash](#memt-10-flash-native-memory-beta)):
 
 ```sh
-./setup-deepseek.sh --model memt-nano --download-model    # MemT-1.0-Nano-Q4_K_M.gguf (22.1 GB), measured on a 32 GB GPU
+./setup-deepseek.sh --model memt-nano --download-model    # MemT-1.0-Nano-Q4_K_M.gguf (22.1 GB), an 8-32 GB GPU
 ./setup-deepseek.sh --model memt-flash --download-model   # 9.3 GB over the V4 0731 32G96G L97 shards (96.8 GB, set up too)
 ```
 
@@ -1202,8 +1202,17 @@ nvcc is missing):
 It downloads our Q4_K_M ([zephel01/MemT-1.0-Nano-Q4_K_M-GGUF](https://huggingface.co/zephel01/MemT-1.0-Nano-Q4_K_M-GGUF),
 `MemT-1.0-Nano-Q4_K_M.gguf`, 22.1 GB, checked against Hugging Face's SHA-256), packs it and writes
 `abyss-memt-nano-q4_k_m.json` with the config below and MemT's generation_config sampling (temperature 0.7, top_p 0.95,
-top_k 40). Measured on an RTX 5090 (32 GB) only, the whole file in VRAM; on a smaller GPU the experts that do not fit go
-to RAM as for Ornith-1.5-35B-A3B (the same shapes) - not measured with MemT.
+top_k 40). On a smaller GPU the experts that do not fit go to RAM and the CPU lane computes part of them. RTX 5090 (OCuLink Gen4
+x4) + 123 GB RAM, held to a smaller GPU with `STRATA_GLM_VRAM_GB`, a 4K prompt + 512 tokens, median of 3:
+
+| GPU | decode tok/s, memory off / on | prompt tok/s, off / on |
+| --- | ---: | ---: |
+| 32 GB (all in VRAM) | 298.2 / 270.0 | 8,847 / 8,373 |
+| 16 GB | 256.2 / 244.3 | 4,219 / 4,193 |
+| 12 GB | 237.1 / 211.8 | 3,620 / 3,575 |
+| 8 GB | 184.2 / 175.3 | 2,846 / 2,804 |
+
+At 8 GB the RAM tier held 17.7 GB of experts; a 32 GB-RAM PC and a DDR5 desktop are not measured.
 
 Building it yourself - convert (`tools/memt_convert.py`, Abyss's own reader and writer - no llama.cpp, safetensors or torch). `--meta` is a
 GGUF of the same family whose keys and tokenizer are copied: Ornith-1.5-35B-A3B's Q4_K_M (`./setup-deepseek.sh --model

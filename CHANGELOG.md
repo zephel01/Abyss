@@ -23,6 +23,10 @@ memt-nano`; beta, NVIDIA, one GPU) from our prebuilt GGUFs - no trench-gguf, no 
   with 16K context and MemT's generation_config sampling (temperature 0.7, top_p 0.95, top_k 40).
 - Both stop before ROCm or the engine is touched on AMD (the memory is measured on CUDA only) and with `--gpus` (no layer
   split for MemT). Without `--context` the MemT configs get 16384, the context their numbers were measured at.
+- MemT-1.0-Nano on smaller GPUs, measured (the docs and the setup said only 32 GB was): an RTX 5090 + 123 GB RAM held
+  to 16 / 12 / 8 GB with `STRATA_GLM_VRAM_GB` (the rest in the RAM tier and the CPU lane), a 4K prompt + 512 tokens,
+  median of 3: decode 256.2 / 237.1 / 184.2 tok/s without a memory, 244.3 / 211.8 / 175.3 with one (32 GB: 298.2 /
+  270.0 in the same normal mode). At 8 GB 17.7 GB of experts were in RAM.
 
 ## v1.3.205 - 2026-11-25
 

@@ -105,7 +105,7 @@ MemTensor の MemT（モデル自身のメモリつき。ベータ、NVIDIA、GP
 [MemT-1.0-Flash](#memt-10-flashネイティブのメモリベータ)）:
 
 ```sh
-./setup-deepseek.sh --model memt-nano --download-model    # MemT-1.0-Nano-Q4_K_M.gguf（22.1 GB）。測ったのは 32 GB の GPU
+./setup-deepseek.sh --model memt-nano --download-model    # MemT-1.0-Nano-Q4_K_M.gguf（22.1 GB）。GPU 8〜32 GB
 ./setup-deepseek.sh --model memt-flash --download-model   # V4 0731 32G96G の L97（96.8 GB、これも用意する）に重ねる 9.3 GB
 ```
 
@@ -1140,9 +1140,18 @@ v1.3.204 から、エンジンは MemTensor の [MemT-1.0-Nano](https://huggingf
 
 私たちの Q4_K_M（[zephel01/MemT-1.0-Nano-Q4_K_M-GGUF](https://huggingface.co/zephel01/MemT-1.0-Nano-Q4_K_M-GGUF) の
 `MemT-1.0-Nano-Q4_K_M.gguf`、22.1 GB。Hugging Face の SHA-256 で確かめます）をダウンロードし、pack を作り、下の設定と MemT の
-generation_config のサンプリング（temperature 0.7、top_p 0.95、top_k 40）で `abyss-memt-nano-q4_k_m.json` を書きます。測ったのは
-RTX 5090（32 GB）だけで、ファイル全体が VRAM に載った状態です。もっと小さい GPU では、入りきらないエキスパートが Ornith-1.5-35B-A3B
-（同じ形）と同じように RAM に置かれますが、MemT では測っていません。
+generation_config のサンプリング（temperature 0.7、top_p 0.95、top_k 40）で `abyss-memt-nano-q4_k_m.json` を書きます。もっと
+小さい GPU では、入りきらないエキスパートが RAM に置かれ、一部を CPU レーンが計算します。RTX 5090（OCuLink Gen4 x4）+ RAM 123 GB を
+`STRATA_GLM_VRAM_GB` で小さい GPU に見立て、4K のプロンプト + 512 トークン、3 回の中央値:
+
+| GPU | 生成 tok/s（メモリなし / あり） | プロンプト tok/s（なし / あり） |
+| --- | ---: | ---: |
+| 32 GB（全部 VRAM） | 298.2 / 270.0 | 8,847 / 8,373 |
+| 16 GB | 256.2 / 244.3 | 4,219 / 4,193 |
+| 12 GB | 237.1 / 211.8 | 3,620 / 3,575 |
+| 8 GB | 184.2 / 175.3 | 2,846 / 2,804 |
+
+8 GB のとき、RAM に置いたエキスパートは 17.7 GB でした。RAM 32 GB の PC と DDR5 のデスクトップでは測っていません。
 
 自分で作る場合 - 変換（`tools/memt_convert.py`。Abyss 自前の読み書きで、llama.cpp・safetensors・torch は使いません）。`--meta` は、キーとトークナイザーを写す
 同じ系統の GGUF で、Ornith-1.5-35B-A3B の Q4_K_M を使います（`./setup-deepseek.sh --model ornith35` がダウンロードします）。
