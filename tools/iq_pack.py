@@ -121,6 +121,9 @@ DEEPSEEK4_NATIVE_OK = (
     "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
     "ffn_gate_tid2eid.weight",            # I32: the hash-routed layers' expert ids, uploaded raw
     "token_embd.weight", "output.weight",
+    # MemT-1.0-Flash's memory blocks (tools/memt_flash.py): the projections served by the quantized GEMV
+    "memt_in.weight", "memt_q_up.weight", "memt_k_up.weight", "memt_v_up.weight", "memt_b_up.weight",
+    "memt_w_up.weight", "memt_f_down.weight", "memt_g_down.weight",
 )
 # deepseek41 (DeepSeek V4.1 Flash, the antirez/kyuz0 GGUF layout): deepseek4's tensors plus the index keys' projection
 # and the Engram projection / norms, all F16 / F32 in that GGUF

@@ -435,6 +435,9 @@ struct Glm5Model::FastState {
         int mt = -1;
         const uint16_t *mt_in = nullptr, *mt_fd = nullptr, *mt_gd = nullptr;
         const float *mt_bias = nullptr, *mt_dsl = nullptr, *mt_onorm = nullptr;
+        // MemT-1.0-Flash (memt4_*): memt_in (q | k | v | b | w | f | g latents), the expansions, the norms, g's bias
+        WSlot mt4_in, mt4_qup, mt4_kup, mt4_vup, mt4_bup, mt4_wup, mt4_fd, mt4_gd;
+        const float *mt4_qn = nullptr, *mt4_kn = nullptr, *mt4_vn = nullptr, *mt4_gb = nullptr;
         // ---- laguna (qwen35_fast_path.cu): the q heads, a window layer, the cache's rows (a ring for a window
         // layer: position j in row j % lag_ring), attn_gate (n_embd -> heads)
         int lag_heads = 0, lag_ring = 0;
@@ -566,7 +569,8 @@ struct Glm5Model::FastState {
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).
     // kLanding: a background promotion's copy is on its way into the slot (fast_boundary step 5)
     // kElastic: a main slot whose memory the elastic KV took back (glm_elastic.cu): not part of the pool until mapped again
-    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5, kElastic = 6 };
+    // kMemt: a slot whose memory MemT-1.0-Flash's memory holds (memt_path.cu's memt4_take): not part of the pool until given back
+    enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5, kElastic = 6, kMemt = 7 };
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).

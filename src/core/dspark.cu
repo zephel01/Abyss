@@ -204,6 +204,11 @@ bool Glm5Model::dspark_load(std::string& err) {
     const char* path = getenv("STRATA_DS4_DSPARK");
     std::string found;
     dsp_auto_ = false;
+    if (g.memt) {   // (MemT-1.0-Flash: the drafter's verify window has no memory read)
+        if (path != nullptr && path[0] && std::strcmp(path, "0") != 0)
+            std::fprintf(stderr, "dspark: off for MemT (the verify window does not read the memory)\n");
+        return true;
+    }
     if (path != nullptr && (std::strcmp(path, "0") == 0 || std::strcmp(path, "off") == 0 || std::strcmp(path, "none") == 0))
         return true;
     if (path == nullptr || !path[0]) {

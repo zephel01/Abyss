@@ -2730,6 +2730,11 @@ class Service:
     # turn (its last user message as the template renders it alone, and the answer's tokens) is written into the
     # memory and the memory saved to STRATA_MEMT_DIR/<name>.safetensors (MemT's memt-memory-v1 layout).  A client
     # that commits a turn need not send it again: the memory holds it.  No "memory": the backbone alone.
+    # MemT's session rules (its README / MemTSession): once a memory holds something (its file exists), the prompt,
+    # the turn written back and a document start without the BOS; an empty memory keeps it.  A document is one user
+    # message without the generation prefix, written in chunk_tokens pieces (the engine).  A memory lives on disk
+    # (MemT-1.0-Flash's is 1.34 GB): a switch is one file read into the engine, a commit one write - the server keeps
+    # no copy in RAM.
     MEMT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
     def memt_dir(self) -> Path:
@@ -2756,14 +2761,21 @@ class Service:
                     self.memt_ok = False
         if not self.memt_ok:
             raise ValueError("memory: this model has no native memory (MemT models only)")
-        out = {"id": m["id"], "commit": m.get("commit") is True}
+        out = {"id": m["id"], "commit": m.get("commit") is True,
+               "present": (self.memt_dir() / (m["id"] + ".safetensors")).exists()}
         if out["commit"]:
             users = [x for x in messages if x.get("role") == "user"]
             if not users:
                 raise ValueError("memory.commit: the request has no user message to write")
             tk = {k: v for k, v in kw.items() if k in ("enable_thinking", "reasoning_effort")}
             out["replay"], _ = self._prompt_ids([users[-1]], None, tk, None, None)
+            if out["present"]:
+                out["replay"] = self._memt_strip_bos(out["replay"])
         return out
+
+    def _memt_strip_bos(self, ids: list[int]) -> list[int]:
+        bos = (getattr(self.tok, "special_ids", None) or {}).get("tokenizer.ggml.bos_token_id")
+        return list(ids[1:]) if ids and isinstance(bos, int) and ids[0] == bos else list(ids)
 
     def _memt_select(self, m: dict | None):
         want = m["id"] if m else None
@@ -2791,6 +2803,8 @@ class Service:
             raise ValueError("bad memory id")
         prompt = self.template.render([{"role": "user", "content": text}], add_generation_prompt=False)
         ids = self.tok.encode(prompt, parse_special=True)
+        if (self.memt_dir() / (mid + ".safetensors")).exists():
+            ids = self._memt_strip_bos(ids)
         with self.fifo.shared():
             self._memt_select({"id": mid})
             self.engine.command("MEMT DOC " + ",".join(str(i) for i in ids), "MEMT", timeout=1800.0)
@@ -2885,6 +2899,8 @@ class Service:
                 memt = (sampling or {}).get("_memt")
                 if memt is not None or getattr(self, "memt_cur", None) is not None:
                     self._memt_select(memt)
+                if memt is not None and memt.get("present"):
+                    ids = self._memt_strip_bos(ids)
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many

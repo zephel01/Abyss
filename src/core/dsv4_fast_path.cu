@@ -95,6 +95,7 @@ bool Glm5Model::dsv4_bind(std::string& err) {
             Ly.idx_comp_norm = f32("indexer_compressor_norm.weight");
             Ly.idx_proj_f = f32("indexer.proj.weight");
         }
+        if (g.memt && g.memt_layer[(size_t) il] >= 0) memt4_bind(il, missing);   // (MemT-1.0-Flash's memory block)
         if (il < g.hash_layers) {
             const auto it = wi32_.find(P + "ffn_gate_tid2eid.weight");
             if (it == wi32_.end()) missing += P + "ffn_gate_tid2eid.weight (i32) ";
@@ -175,6 +176,7 @@ bool Glm5Model::dsv4_alloc(std::string& err) {
     F->ds_sel = (int*) take((size_t) g.idx_top_k * 4);
     std::fprintf(stderr, "deepseek4: CUDA%d attention caches %.2f GB for %lld tokens\n", dev_,
                  (double) bytes / 1073741824.0, (long long) ctx);
+    if (g.memt && !memt_alloc(err)) return false;   // (MemT-1.0-Flash: the memory states and scratch)
     return true;
 }
 
@@ -296,6 +298,12 @@ bool Glm5Model::fast_dsv4_attn(int il, int64_t p64, std::string& err) {
     ds::attend(F->q, Ly.raw, ds_ring_, n_raw, Ly.comp_cache, sel, n_comp, Ly.sinks, g.n_head, D, g.n_rot, rope, p,
                F->ds_o, s, 0, F->ds_oq);   // (and its q8_1, wo_a's input)
     if (F->prof_on) F->mark("ds_attend");
+    if (Ly.mt >= 0) {   // MemT-1.0-Flash: the memory read added before wo_a (a replay: the write too)
+        if (dumps) dsv4_dump(s, "memt_x-" + Ls, F->x, g.n_embd);
+        if (dumps) dsv4_dump(s, "memt_pre-" + Ls, F->ds_o, (int64_t) g.n_head * D);
+        if (!memt4_token(il, err)) return false;
+        if (F->prof_on) F->mark("memt");
+    }
     if (dumps) dsv4_dump(s, "attn_derope-" + Ls, F->ds_o, (int64_t) g.n_head * D);
 
     // 5. the grouped output LoRA: group gi (heads gi*H/G ..) through rows [gi*o_lora, (gi+1)*o_lora) of wo_a, then wo_b

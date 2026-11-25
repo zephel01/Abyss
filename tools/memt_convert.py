@@ -161,7 +161,7 @@ class GpuQ:
         if rc != 0:
             sys.exit("gpuq_init %d" % rc)
 
-    def __call__(self, x: np.ndarray, t: int) -> np.ndarray:
+    def __call__(self, x: np.ndarray, t: int, imat: np.ndarray | None = None) -> np.ndarray:
         n_per_row = x.shape[-1]
         rows = x.size // n_per_row
         out = np.empty(gio.nbytes(t, [n_per_row, rows]), dtype=np.uint8)
@@ -171,7 +171,8 @@ class GpuQ:
         for r0 in range(0, rows, step):
             r1 = min(rows, r0 + step)
             c = np.ascontiguousarray(x2[r0:r1], dtype=np.float32)
-            n = self.q.gpuq_quantize(t, c.ctypes.data, out[r0 * rb:].ctypes.data, r1 - r0, n_per_row, None)
+            n = self.q.gpuq_quantize(t, c.ctypes.data, out[r0 * rb:].ctypes.data, r1 - r0, n_per_row,
+                                     None if imat is None else imat.ctypes.data)
             if n != (r1 - r0) * rb:
                 sys.exit("gpuq_quantize: %d bytes for %d" % (n, (r1 - r0) * rb))
         return out
