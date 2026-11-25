@@ -28,12 +28,12 @@ as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
   RTX 5090). With a memory on, the read weights (1.2 GB Q8_0) and the state rounded to BF16 (0.67 GB) take the last 7
   slots of each layer's pool (2.33 GB) and the FP32 state stays in RAM; a commit or a document borrows 4.1 GB of the
   pool's tail for the write weights and an FP32 write state during the replay and gives it back. Measured on an RTX 5090
-  + 123 GB RAM (iGPU lane off, default RAM tier, learned pool files, a 4K prompt + 512 tokens, median of 3): decode 77.9
-  tok/s without a memory (L97 78.9), 68.2 with one; the 4K prompt 986 / 867 tok/s; a 325-token commit 3.3-3.5 s, the save
+  + 123 GB RAM (iGPU lane off, default RAM tier, learned pool files, a 4K prompt + 512 tokens, median of 3): decode 77.5
+  tok/s without a memory (L97 78.9), 68.2 with one; the 4K prompt 983 / 867 tok/s; a 325-token commit 3.3-3.5 s, the save
   0.7-2.7 s, a switch (`LOAD`) 1.2-1.4 s. Against a float64 forward of the HF code with the same weights: memory write
   3.3-4.5e-4, read 0.5-1.1% relative error; recall 4 of 4 facts from a committed turn and 5 of 5 from a Japanese note.
-  Drafting of every kind (DSpark, the MTP draft block, the n-gram repeats), `--parallel` and a layer split are off for
-  MemT (the verify windows do not read the memory).
+  DSpark and the MTP draft block are off for MemT, the n-gram repeats' drafts only while no memory is on (the verify
+  windows do not read the memory); `--parallel` and a layer split are off.
 
 ### Changed
 
@@ -43,9 +43,10 @@ as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
 ### Fixed
 
 - MemT-1.0-Nano: the n-gram repeats' drafts went through verify windows that do not read the memory, so an accepted
-  draft could differ from the token path's answer with a memory on; MemT models now decode a token at a time.
-  Nano Q4_K_M on an RTX 5090 (a 4K prompt + 512 tokens, median of 3): decode 298.5 tok/s without a memory, 280.1 with
-  one (v1.3.204's 304.6 / 295.5 were with those drafts); the 4K prompt 8,692 / 8,367 tok/s. Recall is unchanged (19 of
+  draft could differ from the token path's answer with a memory on; while a memory is on (`MEMT ZERO` / `LOAD` / a
+  commit) MemT models now decode a token at a time, and with it off the windows run as before (the same tokens as
+  v1.3.204). Nano Q4_K_M on an RTX 5090 (a 4K prompt + 512 tokens, median of 3): decode 304.8 tok/s without a memory
+  (v1.3.204 304.6, the same md5), 279.8 with one (v1.3.204's 295.5 was with those drafts); the 4K prompt 8,802 / 8,336. Recall is unchanged (19 of
   19 on the set in `recipes/memt-flash/memeval.py`; 0 without the memory).
 - `tools/memt_flash.py --imatrix` read the imatrix's F32 values as bytes and so changed nothing; it now weights the
   k-quants (a grouped weight such as `attn_output_a` takes one slice a group).
