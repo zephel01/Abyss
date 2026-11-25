@@ -3741,14 +3741,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         k::ngram_rows(S->toks_h.data(), prev.data(), T, consts, rows.data());
         if (F->ple_pf_n < (size_t) T * E) {
             if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt PLE buffer", e)) return false;
-            if (F->ple_pf_h != nullptr) cudaFreeHost(F->ple_pf_h);
-            F->ple_pf_n = 0;
-            if (cudaHostAlloc((void**) &F->ple_pf_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                F->ple_pf_h = nullptr;
-                e = "glm prefill: qwen4exp's PLE rows did not allocate";
+            if (!glmfast::host_rows_grow(F->ple_pf_h, F->ple_pf_n, F->ple_pf_pageable, (size_t) T * E,
+                                         "glm prefill: qwen4exp's PLE rows", e))
                 return false;
-            }
-            F->ple_pf_n = (size_t) T * E;
         }
         // (the previous chunk's copies out of it are long done: every MoE layer syncs the stream)
         if (!F->ple->gather_batch(rows.data(), (size_t) T, F->ple_pf_h, e)) { e = "qwen4exp: PLE: " + e; return false; }

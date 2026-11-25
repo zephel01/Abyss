@@ -28,6 +28,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -51,6 +52,36 @@ inline bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
     if (e == cudaSuccess) return true;
     err = std::string(what) + ": " + cudaGetErrorString(e);
     return false;
+}
+// a host buffer the GPU copies from, grown to `want` floats: pinned when the driver gives it, else ordinary memory
+// (#61: on Windows HIP the RAM tier can use up the driver's pinned limit; a copy from ordinary memory is slower, the
+// output the same)
+inline bool host_rows_grow(float*& p, size_t& n, bool& pageable, size_t want, const char* what, std::string& err) {
+    if (n >= want) return true;
+    if (p != nullptr) {
+        if (pageable) std::free(p);
+        else cudaFreeHost(p);
+    }
+    p = nullptr;
+    n = 0;
+    pageable = false;
+    // (STRATA_TEST_NO_PIN=1: skip the pinned try - the tests' way to reach the fallback on a box with room)
+    static const bool no_pin = [] { const char* v = std::getenv("STRATA_TEST_NO_PIN"); return v != nullptr && v[0] == '1'; }();
+    if (no_pin || cudaHostAlloc((void**) &p, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+        if (!no_pin) (void) cudaGetLastError();
+        p = (float*) std::malloc(want * sizeof(float));
+        if (p == nullptr) {
+            err = std::string(what) + " did not allocate";
+            return false;
+        }
+        pageable = true;
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "glm fast: %s: no pinned memory left (the GPU driver's limit) - using ordinary memory "
+                                 "(%.1f MB; the same output)\n", what, (double) (want * sizeof(float)) / 1e6);
+    }
+    n = want;
+    return true;
 }
 // the next token from the device: outside [0, n_vocab) is the argmax's "no pick" (0x7fffffff) - every logit was NaN
 // (or -inf), the forward is broken.  An error (the caller reports it once and stops) rather than a token that reads
@@ -565,6 +596,7 @@ struct Glm5Model::FastState {
     bool q27 = false;                                            // ... the selection is on (q27_qsa_setup)
     float* ple_pf_h = nullptr;
     size_t ple_pf_n = 0;
+    bool ple_pf_pageable = false;                                // ... not pinned (host_rows_grow, #61)
     WSlot q4_head_w[2];                                          // output_hc_down, output_hc_up
     // ---- the VRAM tier: per-layer partitions.  A slot is FREE, RESIDENT (in tab), a SPARE (handed to the
     //      device, which may fill it during a token and mark it resident itself) or DRAINING (its old expert

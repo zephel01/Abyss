@@ -2307,14 +2307,9 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
         k::ngram_rows(toks.data(), prev, T, consts, rows);
         if (F->ple_pf_n < (size_t) TM * E) {
             if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen4exp verify PLE buffer", err)) return false;
-            if (F->ple_pf_h != nullptr) cudaFreeHost(F->ple_pf_h);
-            F->ple_pf_n = 0;
-            if (cudaHostAlloc((void**) &F->ple_pf_h, (size_t) TM * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                F->ple_pf_h = nullptr;
-                err = "qwen4exp verify: the PLE rows did not allocate";
+            if (!glmfast::host_rows_grow(F->ple_pf_h, F->ple_pf_n, F->ple_pf_pageable, (size_t) TM * E,
+                                         "qwen4exp verify: the PLE rows", err))
                 return false;
-            }
-            F->ple_pf_n = (size_t) TM * E;
         }
         // (the buffer's last H2D copy, an earlier window's, finished: the previous window was waited for)
         ple_join.dst = F->ple_pf_h;
