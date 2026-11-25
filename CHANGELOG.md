@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+MemT-1.0-Flash and MemT-1.0-Nano install with one command (`./setup-deepseek.sh --model memt-flash` / `--model
+memt-nano`; beta, NVIDIA, one GPU) from our prebuilt GGUFs - no trench-gguf, no CUDA toolkit with the prebuilt engine.
+
+### Added
+
+- `--model memt-flash`: sets up the DeepSeek V4 Flash 0731 `32G96G` L97 shards as `--quant 32G96G` does (the same folder:
+  L97 already there is only checked), downloads the overlay's shard 1 from `zephel01/MemT-1.0-Flash-32G96G-GGUF`
+  (`MemT-1.0-Flash-32G96G-00001-of-00004.gguf`, 9.3 GB), links L97's shards beside it as shards 2-4 (a hard link, else
+  a copy, where symlinks are not allowed), packs it (`--compat-bf16 --first-wins`) and writes the config (16K context).
+  Every file SHA-256 checked; the download is asked once for both repos.
+- `--model memt-nano`: `zephel01/MemT-1.0-Nano-Q4_K_M-GGUF`'s `MemT-1.0-Nano-Q4_K_M.gguf` (22.1 GB), packed, the config
+  with 16K context and MemT's generation_config sampling (temperature 0.7, top_p 0.95, top_k 40).
+- Both stop before ROCm or the engine is touched on AMD (the memory is measured on CUDA only) and with `--gpus` (no layer
+  split for MemT). Without `--context` the MemT configs get 16384, the context their numbers were measured at.
+
 ## v1.3.205 - 2026-11-25
 
 MemT-1.0-Flash (MemTensor) runs with its native memory on the deepseek4 path (beta, NVIDIA), built over our DeepSeek

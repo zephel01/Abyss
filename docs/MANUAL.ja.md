@@ -101,6 +101,14 @@ GPU からすべて VRAM に載せる（8 GB: 8K、9.5 GB: 32K、12 GB: 64K、16
 ./setup-deepseek.sh --model bonsai27b --quant Q2_0 --download-model # Q2_0 のファイル（7.67 GB、同じ重み、MTP ブロックなし）
 ```
 
+MemTensor の MemT（モデル自身のメモリつき。ベータ、NVIDIA、GPU 1 枚。[MemT-1.0-Nano](#memt-10-nanoネイティブのメモリベータ)、
+[MemT-1.0-Flash](#memt-10-flashネイティブのメモリベータ)）:
+
+```sh
+./setup-deepseek.sh --model memt-nano --download-model    # MemT-1.0-Nano-Q4_K_M.gguf（22.1 GB）。測ったのは 32 GB の GPU
+./setup-deepseek.sh --model memt-flash --download-model   # V4 0731 32G96G の L97（96.8 GB、これも用意する）に重ねる 9.3 GB
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -1122,9 +1130,21 @@ v1.3.204 から、エンジンは MemTensor の [MemT-1.0-Nano](https://huggingf
 そのモデル自身のメモリつきで動かします（NVIDIA）。骨格は Qwen3.6-35B-A3B（qwen35moe の経路。形は Ornith-1.5-35B-A3B と同じ）で、
 10 層あるフルアテンションの層それぞれにメモリのブロックがあります。メモリは 1 層あたり 16 x 256 x 256 個の FP32 の状態
 （全部で 40 MiB）です。モデルは答えるあいだこれを読み、ターンの終わりにそのターンを書き込みます（ターンをモデルに流し直す）。
-1 回話した事実を、それを含まない新しい会話で聞けます。setup の選択肢と公開の GGUF はまだありません。変換・pack・設定は手で行います。
+1 回話した事実を、それを含まない新しい会話で聞けます。
 
-変換（`tools/memt_convert.py`。Abyss 自前の読み書きで、llama.cpp・safetensors・torch は使いません）。`--meta` は、キーとトークナイザーを写す
+コマンド 1 つで入ります（NVIDIA、GPU 1 枚。CUDA ツールキットと trench-gguf は要りません。nvcc がなければビルド済みのエンジンを使います）:
+
+```bash
+./setup-deepseek.sh --model memt-nano --download-model
+```
+
+私たちの Q4_K_M（[zephel01/MemT-1.0-Nano-Q4_K_M-GGUF](https://huggingface.co/zephel01/MemT-1.0-Nano-Q4_K_M-GGUF) の
+`MemT-1.0-Nano-Q4_K_M.gguf`、22.1 GB。Hugging Face の SHA-256 で確かめます）をダウンロードし、pack を作り、下の設定と MemT の
+generation_config のサンプリング（temperature 0.7、top_p 0.95、top_k 40）で `abyss-memt-nano-q4_k_m.json` を書きます。測ったのは
+RTX 5090（32 GB）だけで、ファイル全体が VRAM に載った状態です。もっと小さい GPU では、入りきらないエキスパートが Ornith-1.5-35B-A3B
+（同じ形）と同じように RAM に置かれますが、MemT では測っていません。
+
+自分で作る場合 - 変換（`tools/memt_convert.py`。Abyss 自前の読み書きで、llama.cpp・safetensors・torch は使いません）。`--meta` は、キーとトークナイザーを写す
 同じ系統の GGUF で、Ornith-1.5-35B-A3B の Q4_K_M を使います（`./setup-deepseek.sh --model ornith35` がダウンロードします）。
 メモリのブロックは BF16 / F32 のままです（0.9 GB）。
 
@@ -1137,7 +1157,7 @@ v1.3.204 から、エンジンは MemTensor の [MemT-1.0-Nano](https://huggingf
 .venv/bin/python tools/iq_pack.py --gguf MemT-1.0-Nano-Q4_K_M.gguf --out <dir>/pack
 ```
 
-設定: `"args": ["--glm-pack", "<dir>/pack", "--max-context", "16384", "--prefill", "auto"]`、`"tokenizer": "<dir>/pack/tokenizer"`。
+設定（setup が書きます。手で書く場合）: `"args": ["--glm-pack", "<dir>/pack", "--max-context", "16384", "--prefill", "auto"]`、`"tokenizer": "<dir>/pack/tokenizer"`。
 サーバーは `--engine strata` で起動します。`memory` のない要求は骨格だけで答えます（Qwen3.6-35B-A3B と同じ答え方）。
 
 サーバーのメモリの API（メモリはファイル `STRATA_MEMT_DIR/<id>.safetensors`、既定は `~/.abyss/memt`。id は英数字と `.` `_` `-` で 1〜128 文字）:
@@ -1174,10 +1194,29 @@ RTX 5090（iGPU レーンなし）で測りました。基準は HF のコード
 v1.3.205 から、エンジンは MemTensor の [MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash)（MIT）を、そのモデル自身のメモリつきで
 deepseek4 の経路で動かします（NVIDIA）。MemT-1.0-Flash は DeepSeek-V4-Flash-0731 を追加学習したもので、20 層の CSA 層（4, 6, ..., 42）それぞれに
 メモリのブロックがあります。メモリは 1 層あたり 64 x 512 x 512 個の FP32（全部で 1.25 GiB、ファイルは 1.34 GB）です。サーバーのメモリの API は
-[MemT-1.0-Nano](#memt-10-nanoネイティブのメモリベータ) と同じです。setup の選択肢と公開の GGUF はありません。ファイルは、私たちの
-DeepSeek V4 Flash 0731 の `32G96G` GGUF（L97）の上に手で作ります。
+[MemT-1.0-Nano](#memt-10-nanoネイティブのメモリベータ) と同じです。
 
-MemT のエキスパートは 0731 のものと同じです（0731 の MXFP4 の値にそのまま戻ります）。要るのはメモリのブロックと MemT 自身のエキスパート以外の骨格だけで、
+コマンド 1 つで入ります（NVIDIA、GPU 1 枚。CUDA ツールキットと trench-gguf は要りません）:
+
+```bash
+./setup-deepseek.sh --model memt-flash --download-model
+```
+
+MemT のエキスパートは 0731 のものと同じなので、私たちのファイルは DeepSeek V4 Flash 0731 の `32G96G` GGUF（L97）に重ねるもので、
+単独では動く GGUF ではありません。setup は次のことをします:
+
+1. L97 の 3 つの分割ファイルを `--quant 32G96G` と同じフォルダに用意します（[zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF)
+   の `L97` フォルダ、96.8 GB）。もう入っていれば確かめるだけで、ダウンロードし直しません。
+2. 重ねるファイルの分割 1 をダウンロードします（[zephel01/MemT-1.0-Flash-32G96G-GGUF](https://huggingface.co/zephel01/MemT-1.0-Flash-32G96G-GGUF)
+   の `MemT-1.0-Flash-32G96G-00001-of-00004.gguf`、9.3 GB。L97 のキー、MemT 自身のエキスパート以外の骨格、メモリの重み）。
+   どのファイルも Hugging Face の SHA-256 で確かめます。
+3. その横に L97 の分割ファイルを `MemT-1.0-Flash-32G96G-00002..00004-of-00004.gguf` としてリンクします（シンボリックリンク。
+   使えない環境 - 開発者モードでない Windows - ではハードリンク、それもだめならコピー）。
+4. pack（`iq_pack.py --compat-bf16 --first-wins`）を作り、下の設定で `abyss-memt-flash-32g96g.json` を書きます。
+
+GPU 32 GB + RAM 96 GB 向けです（L97 と同じ）。メモリは Abyss 独自の実装なので、llama.cpp では動きません。
+
+自分で作る場合: MemT のエキスパートは 0731 のものと同じです（0731 の MXFP4 の値にそのまま戻ります）。要るのはメモリのブロックと MemT 自身のエキスパート以外の骨格だけで、
 576 GB のチェックポイントのうち 21.9 GB です:
 
 | もの | 取り先 | 大きさ |
@@ -1204,7 +1243,7 @@ imatrix（公開していません）で作っても、量子化そのものの�
 KL(B || imatrix あり) 0.009〜0.031、上位 1 位の一致 91〜96%。メモリあり: KL 0.022〜0.048。思い出しはどちらも 19 問中 19）。`--backbone` なしでは L97（0731）の骨格のままメモリだけを足します（「A」、書くのは 3.8 GB）。
 MemT 自身の骨格（「B」）のほうが思い出しが正確で NLL も低い（下の表）ので、B を使ってください。
 
-設定: `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`、
+設定（setup が書きます。手で書く場合）: `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`、
 `"tokenizer": "<dir>/MemT-1.0-Flash-B/pack/tokenizer"`。サーバーは `--engine strata` で起動します。`memory` のない要求は MemT の骨格だけで答えます。
 
 かかるもの:

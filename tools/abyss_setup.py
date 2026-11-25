@@ -27,6 +27,12 @@
     ./setup-deepseek.sh --model qwen38       Qwen3.8-Flash-Next, zephel01's GGUFs: --quant 12G32G (12 GB GPU + 32 GB RAM),
                                              16G64G (the default) or 24G64G
     ./setup-deepseek.sh --model glm          GLM-5.3-Flash, zephel01's GGUFs: --quant 32G96G (the default) or 32G128G
+    ./setup-deepseek.sh --model memt-flash   MemT-1.0-Flash (MemTensor, DeepSeek V4 Flash 0731 with a native memory; BETA,
+                                             NVIDIA only): zephel01's 9.3 GB overlay over the v4 --quant 32G96G (L97)
+                                             shards, which it sets up too (kept when already there), for a 32 GB GPU +
+                                             96 GB RAM
+    ./setup-deepseek.sh --model memt-nano    MemT-1.0-Nano (MemTensor, Qwen3.6-35B-A3B with a native memory; BETA, NVIDIA
+                                             only): zephel01's Q4_K_M (22.1 GB), measured on a 32 GB GPU (RTX 5090)
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
     (no --quant: the PC-size file that suits this PC's VRAM + RAM is proposed - qwen38, glm, ornith; v4 keeps
      UD-Q2_K_XL and names zephel01's file for this size)
@@ -43,6 +49,8 @@ What it does:
   3. compiles the engine (build/abyss) for the GPU - arch 120a on RTX 50, whose MXFP4 kernels need it
   4. the model: unsloth's DeepSeek-V4-Flash-0731-GGUF quant into <data>/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/<quant>
      (--model v41: zephel01/DeepSeek-V4.1-Flash-1017-IQ2_XXS-32G96G-GGUF, 132G or 139G)
+     (--model memt-flash: L97's 3 shards into v4's 32G96G folder, the overlay's shard 1 into its own, and L97's
+     shards linked beside it as shards 2-4 - a hard link or a copy where symlinks are not allowed)
      (asks first, or --download-model), every file checked against Hugging Face's SHA-256
   5. the pack next to the shards (tools/iq_pack.py --compat-bf16)
   6. the run config abyss-<name>.json and the start script run-abyss-<name>.sh in the Abyss folder
@@ -310,6 +318,30 @@ MODELS = {
                 "prefix": "sensenova-loop-9b", "title": "SenseNova-Loop-9B", "env": {}, "gb": 6, "pack_args": [],
                 "sampling": {"temperature": 1.0, "top_p": 0.95},
                 "vram_ctx": LOOP9_VRAM, "gpu_min": 10},
+    # MemTensor's MemT-1.0-Nano (Apache-2.0; native memory, BETA, v1.3.204): Qwen3.6-35B-A3B (the qwen35moe path, Ornith-
+    # 1.5-35B-A3B's shapes) with a memory block in each of its 10 full-attention layers.  zephel01's Q4_K_M (tools/
+    # memt_convert.py, Ornith's per-tensor types; the memory blocks BF16 / F32), one file at the repo's top level.
+    # NVIDIA only, one GPU; no drafter (MemT has no MTP weights).  Measured on an RTX 5090 (32 GB) only, all in VRAM:
+    # decode 304.8 tok/s without a memory, 279.8 with one (4K prompt + 512, median of 3); a smaller GPU is not measured.
+    # 16K context and the generation_config's sampling, as the manual's config
+    "memt-nano": {"repo": "zephel01/MemT-1.0-Nano-Q4_K_M-GGUF", "quant": "Q4_K_M", "quants": ("Q4_K_M",), "folder": "",
+                  "prefix_tmpl": "MemT-1.0-Nano-{q}.", "model_name": "memt-1.0-nano", "prefix": "memt-nano",
+                  "title": "MemT-1.0-Nano", "env": {}, "gb": 22, "pack_args": [],
+                  "sampling": {"temperature": 0.7, "top_p": 0.95, "top_k": 40},
+                  "nvidia_only": True, "context": 16384},
+    # MemTensor's MemT-1.0-Flash (MIT; native memory, BETA, v1.3.205): DeepSeek V4 Flash 0731 with a memory block in each
+    # of its 20 CSA layers.  zephel01's overlay is ONE file, shard 1 of 4 (L97's keys, MemT's own non-expert backbone in
+    # L97's types, the memory weights Q8_0; 9.27 GB): shards 2-4 are the v4 --quant 32G96G (L97) shards as they are -
+    # MemT's experts are 0731's - so "base" fetches those into v4's own folder (L97 already set up is not downloaded
+    # again) and setup links them beside the overlay under its name (iq_pack.py and the engine find the siblings by
+    # the -0000N-of-00004 pattern; the pack is --first-wins: shard 1's backbone shadows L97's).  NVIDIA only, one GPU; no
+    # drafters (the verify windows do not read the memory).  RTX 5090, 4K prompt + 512: decode 77.5 tok/s memory off,
+    # 68.2 on (L97 alone 78.9).  16K context as the manual's config; sampling the default (MemT-1.0-Flash's
+    # generation_config was not fetched: the memory blocks and config.json only)
+    "memt-flash": {"repo": "zephel01/MemT-1.0-Flash-32G96G-GGUF", "quant": "32G96G", "quants": ("32G96G",), "folder": "",
+                   "prefix_file": "MemT-1.0-Flash-32G96G-", "model_name": "memt-1.0-flash", "prefix": "memt-flash",
+                   "title": "MemT-1.0-Flash", "env": {}, "gb": 106, "pack_args": ["--compat-bf16", "--first-wins"],
+                   "base": ("v4", "32G96G"), "nvidia_only": True, "context": 16384},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -408,6 +440,82 @@ def link_mirror(flat: Path, mdir: Path, paths: list[str]) -> bool:
         if not dst.exists():
             dst.symlink_to((flat / p).resolve())
     return True
+
+
+def link_file(src: Path, dst: Path) -> str:
+    """dst as another name of src: a symlink, else (Windows without the developer mode's symlinks) a hard link - the
+    same disk - else a copy.  An existing dst that is src already (or a whole copy of it) is kept; a stale link is
+    replaced.  Says how ("symlink", "hard link", "copy", "kept")."""
+    if dst.exists():
+        if os.path.samefile(src, dst) or (not dst.is_symlink() and dst.stat().st_size == src.stat().st_size):
+            return "kept"
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dst.symlink_to(src.resolve())
+        return "symlink"
+    except OSError:
+        pass
+    try:
+        os.link(src.resolve(), dst)
+        return "hard link"
+    except OSError:
+        pass
+    S.say(f"  (no symlink or hard link here: copying {src.name}, {src.stat().st_size / 1e9:.1f} GB, to {dst.name})")
+    shutil.copyfile(src, dst)
+    return "copy"
+
+
+def fetch_files(a, data: Path, groups) -> None:
+    """Step 4's downloads: each (repo, local folder, files from quant_files) - a file already there (or in a plain
+    mirror of the repo, link_mirror) is not fetched again, the rest is asked once for all (or --download-model); every
+    file is checked against Hugging Face's SHA-256 and as a whole GGUF."""
+    todo = []
+    for repo, mdir, files in groups:
+        total = sum(f[1] for f in files)
+        S.say(f"  {repo}: {len(files)} file{'s' if len(files) != 1 else ''}, {total / 1e9:.1f} GB -> {mdir}")
+        missing = [f for f in files if not (mdir / Path(f[0]).name).exists()]
+        if missing and link_mirror(data / "models" / repo, mdir, [f[0] for f in missing]):
+            S.ok(f"the files are in {data / 'models' / repo} (a mirror of the repo): linked into {mdir}")
+            missing = []
+        todo += [(mdir, f) for f in missing]
+    if todo:
+        where = todo[0][0]
+        free = shutil.disk_usage(where.parent if where.parent.exists() else data.parent).free
+        S.say(f"  to download: {sum(f[1] for _, f in todo) / 1e9:.1f} GB (free on that disk: {free / 1e9:.0f} GB)")
+        if not a.download_model and S.ask("  Download it now?", ["y", "n"], "n", a.yes) != "y":
+            S.fail("the model is not downloaded", "run again with --download-model, or put the files into " +
+                   " / ".join(str(g[1]) for g in groups))
+    for repo, mdir, files in groups:
+        for path, size, sha in files:
+            dst = mdir / Path(path).name
+            S.download(HF_FILE.format(repo=repo, path=path), dst, dst.name)
+            if sha and not verified(dst, sha):
+                S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
+        S.check_shards([mdir / Path(f[0]).name for f in files])
+    S.ok("every file checked")
+
+
+def overlay_links(mdir: Path, first: str, base_dir: Path, base_files) -> list[Path]:
+    """An overlay GGUF's shards 2..N (MemT-1.0-Flash: shard 1 is the repo's one file, 2-4 are L97's three): linked
+    beside shard 1 under its name, <stem>-0000k-of-0000N.gguf -> the base's shard k-1, so iq_pack.py and the engine
+    find them by that pattern.  Returns every shard, 1 first."""
+    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", first)
+    n = int(m.group(2)) if m else 0
+    if not m or int(m.group(1)) != 1 or n != len(base_files) + 1:
+        S.fail(f"{first}: not shard 1 of {len(base_files) + 1} (the base has {len(base_files)} shards)",
+               "the overlay and its base do not belong together - run setup again after `git pull`")
+    stem = first[:m.start()]
+    out = [mdir / first]
+    how = set()
+    for k, (path, _, _) in enumerate(base_files, start=2):
+        dst = mdir / f"{stem}-{k:05d}-of-{n:05d}.gguf"
+        how.add(link_file(base_dir / Path(path).name, dst))
+        out.append(dst)
+    S.ok(f"shards 2-{n}: the base's ({', '.join(sorted(how))}) in {mdir}")
+    S.check_shards(out)
+    return out
 
 
 def sha256_of(path: Path) -> str:
@@ -1248,16 +1356,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM), memt-flash: MemT-1.0-Flash (native memory, BETA, NVIDIA only: zephel01's overlay over the v4 32G96G L97 shards, which it sets up too, a 32 GB GPU + 96 GB RAM), memt-nano: MemT-1.0-Nano (native memory, BETA, NVIDIA only: zephel01's Q4_K_M, measured on a 32 GB GPU); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G; memt-flash: 32G96G; memt-nano: Q4_K_M.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Abyss-data"), help="where the models go (default: Abyss-data beside Abyss)")
     ap.add_argument("--tools-dir", default=str(ROOT.parent / "Abyss-tools"), help="the tools folder (default: Abyss-tools beside Abyss)")
-    ap.add_argument("--context", type=int, default=65536, help="the context in tokens (default 65536)")
+    ap.add_argument("--context", type=int, help="the context in tokens (default 65536; memt-flash / memt-nano: 16384)")
     ap.add_argument("--port", type=int, help="the server's port (default 8082; --rewrite-config keeps the config's)")
     ap.add_argument("--backend", choices=("cuda", "hip"), help="cuda (NVIDIA) or hip (AMD: RX 7900 XT / XTX, RX 9070 / "
                     "AI PRO R9700, Ryzen AI Max's Radeon 8060S; ROCm 7). Default: cuda when an NVIDIA GPU is there, else hip")
@@ -1309,6 +1417,11 @@ def main() -> int:
     backend = a.backend or ("cuda" if gpu is not None else "hip" if S.amd_gpus() else None)
     if backend is None:
         S.fail("no NVIDIA or supported AMD GPU found", "Abyss runs on NVIDIA GPUs (CUDA), or AMD ones with --backend hip")
+    if model.get("nvidia_only") and backend != "cuda":
+        # (the memory's kernels build for HIP but have not run there: stopped before ROCm or the engine is touched)
+        S.fail(f"{model['title']}'s native memory runs on NVIDIA GPUs only in this version (CUDA; on AMD it is untested)",
+               "an NVIDIA GPU (RTX 30 / 40 / 50); on AMD, DeepSeek V4 Flash 0731 (--model v4 --quant 32G96G) or "
+               "Ornith-1.5-35B-A3B (--model ornith35) run without the memory")
     hip_extra = None
     if backend == "hip":
         gpus, hip_extra = hip_engine(a)
@@ -1325,10 +1438,14 @@ def main() -> int:
         gpus = [found[i] for i in want]
     for g in gpus if backend == "cuda" else []:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
+    if model.get("nvidia_only") and len(gpus) > 1:
+        S.fail(f"{model['title']} runs on one GPU (a layer split is off for MemT)", "set it up without --gpus (--gpu picks the card)")
     a._prebuilt = backend == "cuda" and use_prebuilt(a, gpus)
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
     # a model that runs all in VRAM (Qwen3.8-27B): one GPU that holds it, and the context it holds - checked first
+    # (no --context: 64K, MemT 16K - the context its numbers were measured at)
+    a.context = a.context or model.get("context", 65536)
     ctx = a.context
     # the quant: --quant, else the PC-size file that suits this PC's VRAM + RAM (choose_quant)
     quant = choose_quant(a, a.model, gpus)
@@ -1362,6 +1479,17 @@ def main() -> int:
     elif a.model == "ornith35":
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: VRAM + RAM hold it all on an 8-16 GB GPU + "
              "32 GB RAM PC)")
+    elif a.model == "memt-flash":
+        S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 32 GB GPU + 96 GB RAM, as its base L97: with VRAM, ~100 GB holds every "
+             "expert; less reads from the SSD)")
+        if (gpus[0].get("vram_gb") or 0) < 30:
+            S.warn(f"MemT-1.0-Flash is measured on a 32 GB GPU only (RTX 5090): writing a memory needs ~4.1 GB at the end of "
+                   "the expert pool (a 32 GB GPU has 13 GB there) - with less the engine refuses the write with a message")
+    elif a.model == "memt-nano":
+        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: measured all in VRAM on an RTX 5090, 32 GB)")
+        if (gpus[0].get("vram_gb") or 0) < 30:
+            S.warn(f"MemT-1.0-Nano is measured on a 32 GB GPU only (RTX 5090): on this smaller one the experts that do not "
+                   "fit go to RAM as for Ornith-1.5-35B-A3B (the same shapes); its speed and the memory there are not measured")
     elif model.get("vram_ctx"):
         gb = (model.get("quant_gb") or {}).get(quant, (model["gb"],))[0]
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file, ~{gb:.0f} GB, runs in VRAM: RAM holds the server and the "
@@ -1388,24 +1516,19 @@ def main() -> int:
     files = quant_files(quant, repo, (model.get("quant_folders") or {}).get(quant, model.get("folder")),
                         model.get("prefix_file", "") if quant not in (model.get("quant_folders") or {})
                         else model["prefix_file"].rstrip(".") + "-")
-    total = sum(f[1] for f in files)
-    S.say(f"  {len(files)} files, {total / 1e9:.1f} GB -> {mdir}")
-    missing = [f for f in files if not (mdir / Path(f[0]).name).exists()]
-    if missing and link_mirror(data / "models" / repo, mdir, [f[0] for f in missing]):
-        S.ok(f"the files are in {data / 'models' / repo} (a mirror of the repo): linked into {mdir}")
-        missing = []
-    if missing:
-        free = shutil.disk_usage(mdir.parent if mdir.parent.exists() else data.parent).free
-        S.say(f"  to download: {sum(f[1] for f in missing) / 1e9:.1f} GB (free on that disk: {free / 1e9:.0f} GB)")
-        if not a.download_model and S.ask("  Download it now?", ["y", "n"], "n", a.yes) != "y":
-            S.fail("the model is not downloaded", "run again with --download-model, or put the files into " + str(mdir))
-    for path, size, sha in files:
-        dst = mdir / Path(path).name
-        S.download(HF_FILE.format(repo=repo, path=path), dst, dst.name)
-        if sha and not verified(dst, sha):
-            S.fail(f"{dst.name} does not match Hugging Face's SHA-256", "delete it and run again")
-    S.check_shards([mdir / Path(f[0]).name for f in files])
-    S.ok("every file checked")
+    groups = [(repo, mdir, files)]
+    if model.get("base"):
+        # (an overlay - MemT-1.0-Flash: its base's shards first, in the base's own setup folder, so a base set up before
+        # is only checked; then the overlay's shard 1, and the base's shards linked beside it as shards 2..N)
+        bkey, bq = model["base"]
+        bm = {**MODELS[bkey], **MODELS[bkey]["variants"][bq]}
+        bdir = data / "models" / bm["repo"] / bq
+        bfiles = quant_files(bq, bm["repo"], bm["folder"], bm["prefix_file"])
+        S.say(f"  {model['title']} is one file over {bm['title']} {bq} ({bm['folder']}): both are needed")
+        groups.insert(0, (bm["repo"], bdir, bfiles))
+    fetch_files(a, data, groups)
+    if model.get("base"):
+        overlay_links(mdir, Path(files[0][0]).name, bdir, bfiles)
     mtp = None
     if (model.get("quant_gb") or {}).get(quant, (0, True))[1] is False:
         mtp = side_file(a, repo, DENSE27_MTP, mdir, "the NextN draft block (this file has none)")
@@ -1485,7 +1608,9 @@ def main() -> int:
              else (" (MiMo-V2.6-Distill-Qwen-9B drafts with Qwen3.5-9B's NextN block, MTP/)" if mtp else
                    " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model in ("mimo-9b", "mimo-9b-qsa")
              else " (SenseNova-Loop-9B: no draft block - n-gram drafts)" if a.model == "sensenova-loop-9b"
-             else " (Ling-3.2-air: its MTP block is not used yet)" if a.model == "ling32air" else ""))
+             else " (Ling-3.2-air: its MTP block is not used yet)" if a.model == "ling32air"
+             else " (MemT: drafting is off - the draft checks do not read the memory)" if model.get("nvidia_only")
+             else ""))
     if a.model == "qwen38":
         dflash_step(a, data, cfg, gpus)
     if a.model == "qwen38-27b":
@@ -1505,6 +1630,10 @@ def main() -> int:
     S.say()
     S.say(f"Done. Start it with:  {tools / 'abyss.sh'} start {name}")
     S.say(f"then open http://127.0.0.1:{json.loads(cfg.read_text(encoding='utf-8')).get('port', 8082)}/  (the manual: {ROOT / 'docs' / 'MANUAL.md'})")
+    if a.model.startswith("memt-"):
+        sec = "memt-10-flash-native-memory-beta" if a.model == "memt-flash" else "memt-10-nano-native-memory-beta"
+        S.say('The memory: "memory": {"id": "<name>", "commit": true} in a chat request reads that memory and writes the '
+              f"turn into it; without it the model answers without one (docs/MANUAL.md#{sec})")
     if not model.get("vram_ctx"):   # (a model all in VRAM has no CPU lane or PCIe split to tune)
         S.say(f"Once, with it stopped: {tools / 'abyss.sh'} --calibrate  tunes the CPU lane / PCIe split for this PC "
               "(~10-15 minutes; +12% on an RTX 4090, issue #39)")

@@ -104,6 +104,14 @@ from an 8 GB GPU (8 GB: 8K, 9.5 GB: 32K, 12 GB: 64K, 16 GB: 128K; [Ternary Bonsa
 ./setup-deepseek.sh --model bonsai27b --quant Q2_0 --download-model # the Q2_0 file (7.67 GB, the same weights, no MTP block)
 ```
 
+MemTensor's MemT models with their native memory (beta, NVIDIA, one GPU; [MemT-1.0-Nano](#memt-10-nano-native-memory-beta),
+[MemT-1.0-Flash](#memt-10-flash-native-memory-beta)):
+
+```sh
+./setup-deepseek.sh --model memt-nano --download-model    # MemT-1.0-Nano-Q4_K_M.gguf (22.1 GB), measured on a 32 GB GPU
+./setup-deepseek.sh --model memt-flash --download-model   # 9.3 GB over the V4 0731 32G96G L97 shards (96.8 GB, set up too)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -1182,10 +1190,22 @@ From v1.3.204 the engine runs MemTensor's [MemT-1.0-Nano](https://huggingface.co
 with its native memory, on NVIDIA. The backbone is Qwen3.6-35B-A3B (the qwen35moe path, the shapes of Ornith-1.5-35B-A3B);
 each of its 10 full-attention layers has a memory block. A memory is a state of 16 x 256 x 256 FP32 numbers a layer
 (40 MiB in all): the model reads it while it answers, and a turn is written into it at the end (the turn is replayed
-through the model). A fact told once can be asked in a new conversation that does not contain it. There is no setup
-entry and no published GGUF yet: convert, pack and write the config by hand.
+through the model). A fact told once can be asked in a new conversation that does not contain it.
 
-Convert (`tools/memt_convert.py`, Abyss's own reader and writer - no llama.cpp, safetensors or torch). `--meta` is a
+Set it up with one command (NVIDIA, one GPU; no CUDA toolkit or trench-gguf needed - the prebuilt engine is taken when
+nvcc is missing):
+
+```bash
+./setup-deepseek.sh --model memt-nano --download-model
+```
+
+It downloads our Q4_K_M ([zephel01/MemT-1.0-Nano-Q4_K_M-GGUF](https://huggingface.co/zephel01/MemT-1.0-Nano-Q4_K_M-GGUF),
+`MemT-1.0-Nano-Q4_K_M.gguf`, 22.1 GB, checked against Hugging Face's SHA-256), packs it and writes
+`abyss-memt-nano-q4_k_m.json` with the config below and MemT's generation_config sampling (temperature 0.7, top_p 0.95,
+top_k 40). Measured on an RTX 5090 (32 GB) only, the whole file in VRAM; on a smaller GPU the experts that do not fit go
+to RAM as for Ornith-1.5-35B-A3B (the same shapes) - not measured with MemT.
+
+Building it yourself - convert (`tools/memt_convert.py`, Abyss's own reader and writer - no llama.cpp, safetensors or torch). `--meta` is a
 GGUF of the same family whose keys and tokenizer are copied: Ornith-1.5-35B-A3B's Q4_K_M (`./setup-deepseek.sh --model
 ornith35` downloads it). The memory blocks stay BF16 / F32 (0.9 GB).
 
@@ -1198,7 +1218,7 @@ ornith35` downloads it). The memory blocks stay BF16 / F32 (0.9 GB).
 .venv/bin/python tools/iq_pack.py --gguf MemT-1.0-Nano-Q4_K_M.gguf --out <dir>/pack
 ```
 
-The config: `"args": ["--glm-pack", "<dir>/pack", "--max-context", "16384", "--prefill", "auto"]`, `"tokenizer":
+The config (setup writes it; by hand): `"args": ["--glm-pack", "<dir>/pack", "--max-context", "16384", "--prefill", "auto"]`, `"tokenizer":
 "<dir>/pack/tokenizer"`, and start the server with `--engine strata`. A request without `memory` runs the backbone
 alone (the model answers as Qwen3.6-35B-A3B would).
 
@@ -1239,10 +1259,29 @@ are not here).
 From v1.3.205 the engine runs MemTensor's [MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash) (MIT) with
 its native memory, on NVIDIA, on the deepseek4 path. MemT-1.0-Flash is DeepSeek-V4-Flash-0731 post-trained with a memory
 block in each of its 20 CSA layers (4, 6, ..., 42); a memory is 64 x 512 x 512 FP32 numbers a layer (1.25 GiB in all, a
-1.34 GB file). The server's memory API is the same as [MemT-1.0-Nano's](#memt-10-nano-native-memory-beta). There is no
-setup entry and no published GGUF: the files are made by hand over our DeepSeek V4 Flash 0731 `32G96G` GGUF (L97).
+1.34 GB file). The server's memory API is the same as [MemT-1.0-Nano's](#memt-10-nano-native-memory-beta).
 
-MemT's experts are 0731's (they round back to 0731's MXFP4 codes exactly), so only the memory blocks and MemT's own
+Set it up with one command (NVIDIA, one GPU; no CUDA toolkit or trench-gguf needed):
+
+```bash
+./setup-deepseek.sh --model memt-flash --download-model
+```
+
+MemT's experts are 0731's, so our file is an overlay over our DeepSeek V4 Flash 0731 `32G96G` GGUF (L97), not a
+standalone GGUF. The setup:
+
+1. sets up L97's three shards as `--quant 32G96G` does, into the same folder ([zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF),
+   folder `L97`, 96.8 GB) - already set up, they are only checked, not downloaded again;
+2. downloads the overlay's shard 1 ([zephel01/MemT-1.0-Flash-32G96G-GGUF](https://huggingface.co/zephel01/MemT-1.0-Flash-32G96G-GGUF),
+   `MemT-1.0-Flash-32G96G-00001-of-00004.gguf`, 9.3 GB: L97's keys, MemT's own non-expert backbone, the memory weights);
+   every file is checked against Hugging Face's SHA-256;
+3. links L97's shards beside it as `MemT-1.0-Flash-32G96G-00002..00004-of-00004.gguf` (symlinks; a hard link, else a
+   copy, where symlinks are not allowed - Windows without the developer mode);
+4. packs it (`iq_pack.py --compat-bf16 --first-wins`) and writes `abyss-memt-flash-32g96g.json` with the config below.
+
+For a 32 GB GPU + 96 GB RAM, as L97. llama.cpp does not run the memory (it is Abyss's own).
+
+Building it yourself: MemT's experts are 0731's (they round back to 0731's MXFP4 codes exactly), so only the memory blocks and MemT's own
 non-expert backbone are needed - 21.9 GB of the 576 GB checkpoint:
 
 | what | where | size |
@@ -1270,7 +1309,7 @@ with our own 0731 imatrix (not published) the result was the same within the qua
 recall 19 of 19 on both. Without `--backbone` the overlay keeps L97's (0731's) backbone and adds only the
 memory ("A": 3.8 GB written); MemT's own backbone ("B") recalled better and has a lower NLL (below), so B is the one to use.
 
-The config: `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`,
+The config (setup writes it; by hand): `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`,
 `"tokenizer": "<dir>/MemT-1.0-Flash-B/pack/tokenizer"`, start the server with `--engine strata`. A request without
 `memory` runs MemT's backbone alone.
 

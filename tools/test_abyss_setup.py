@@ -1091,6 +1091,137 @@ class LingAir(unittest.TestCase):
                          (1.0, 0.95, 20))
 
 
+class MemT(unittest.TestCase):
+    """--model memt-flash / memt-nano (MemTensor's MemT with its native memory, BETA): the entries, the Flash overlay's
+    shards 2-4 linked to L97's under the overlay's name (a hard link where symlinks are not allowed), the downloads asked
+    once and skipped when the base is already there, the config (16K, the Nano's generation_config), NVIDIA only."""
+
+    def test_the_entries(self):
+        f, n = A.MODELS["memt-flash"], A.MODELS["memt-nano"]
+        self.assertEqual((f["repo"], f["quant"], f["base"]), ("zephel01/MemT-1.0-Flash-32G96G-GGUF", "32G96G", ("v4", "32G96G")))
+        self.assertEqual(f["pack_args"], ["--compat-bf16", "--first-wins"])
+        self.assertTrue("MemT-1.0-Flash-32G96G-00001-of-00004.gguf".startswith(f["prefix_file"]))
+        base = {**A.MODELS["v4"], **A.MODELS["v4"]["variants"]["32G96G"]}
+        self.assertEqual((base["folder"], base["prefix_file"]), ("L97", "DeepSeek-V4-Flash-0731-L97-"))
+        self.assertEqual((n["repo"], n["quant"], n["pack_args"]), ("zephel01/MemT-1.0-Nano-Q4_K_M-GGUF", "Q4_K_M", []))
+        self.assertTrue("MemT-1.0-Nano-Q4_K_M.gguf".startswith(n["prefix_tmpl"].format(q="Q4_K_M")))
+        for m in (f, n):
+            self.assertTrue(m["nvidia_only"])
+            self.assertEqual(m["context"], 16384)
+
+    def base_files(self, d: Path):
+        base = d / "v4" / "32G96G"
+        base.mkdir(parents=True)
+        files = []
+        for i in (1, 2, 3):
+            name = f"DeepSeek-V4-Flash-0731-L97-0000{i}-of-00003.gguf"
+            (base / name).write_bytes(b"L97-%d" % i)
+            files.append(("L97/" + name, 5, ""))
+        return base, files
+
+    def test_the_overlay_links(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A.S, "check_shards") as chk, \
+                mock.patch.object(A.S, "ok"):
+            base, files = self.base_files(Path(d))
+            mdir = Path(d) / "memt" / "32G96G"
+            mdir.mkdir(parents=True)
+            (mdir / "MemT-1.0-Flash-32G96G-00001-of-00004.gguf").write_bytes(b"overlay")
+            got = A.overlay_links(mdir, "MemT-1.0-Flash-32G96G-00001-of-00004.gguf", base, files)
+            self.assertEqual([p.name for p in got], ["MemT-1.0-Flash-32G96G-0000%d-of-00004.gguf" % i for i in (1, 2, 3, 4)])
+            for i in (2, 3, 4):
+                self.assertTrue(got[i - 1].is_symlink())
+                self.assertEqual(got[i - 1].read_bytes(), b"L97-%d" % (i - 1))
+            chk.assert_called_with(got)
+            # again: kept; a stale link (the base moved) is made again
+            self.assertEqual(A.link_file(base / Path(files[0][0]).name, got[1]), "kept")
+            got[2].unlink()
+            got[2].symlink_to(Path(d) / "gone.gguf")
+            A.overlay_links(mdir, got[0].name, base, files)
+            self.assertEqual(got[2].read_bytes(), b"L97-2")
+            # an overlay that is not shard 1 of (base + 1) stops
+            with self.assertRaises(SystemExit), mock.patch.object(A.S, "say"):
+                A.overlay_links(mdir, "MemT-1.0-Flash-32G96G-00001-of-00003.gguf", base, files)
+
+    def test_a_hard_link_where_symlinks_are_not_allowed(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(Path, "symlink_to", side_effect=OSError("no privilege")):
+            src = Path(d) / "a.gguf"
+            src.write_bytes(b"x" * 10)
+            self.assertEqual(A.link_file(src, Path(d) / "sub" / "b.gguf"), "hard link")
+            self.assertTrue((Path(d) / "sub" / "b.gguf").samefile(src))
+            with mock.patch.object(A.os, "link", side_effect=OSError("another disk")), mock.patch.object(A.S, "say"):
+                self.assertEqual(A.link_file(src, Path(d) / "c.gguf"), "copy")
+            self.assertEqual(A.link_file(src, Path(d) / "c.gguf"), "kept")
+
+    def test_downloads_asked_once_and_the_base_kept(self):
+        body = b"overlay shard"
+        sha = hashlib.sha256(body).hexdigest()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A.S, "check_shards"), \
+                mock.patch.object(A.S, "say"), mock.patch.object(A.S, "ok"):
+            base, files = self.base_files(Path(d))
+            mdir = Path(d) / "memt" / "32G96G"
+            groups = [("zephel01/base", base, files),
+                      ("zephel01/MemT-1.0-Flash-32G96G-GGUF", mdir,
+                       [("MemT-1.0-Flash-32G96G-00001-of-00004.gguf", len(body), sha)])]
+            got = []
+
+            def dl(url, dst, name):
+                got.append(url)
+                if not Path(dst).exists():
+                    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                    Path(dst).write_bytes(body)
+            a = Namespace(download_model=False, yes=False)
+            with mock.patch.object(A.S, "download", side_effect=dl), \
+                    mock.patch.object(A.S, "ask", return_value="y") as ask:
+                A.fetch_files(a, Path(d), groups)
+            self.assertEqual(ask.call_count, 1)   # (one question for the overlay; L97 is there)
+            self.assertTrue(got[-1].endswith("/zephel01/MemT-1.0-Flash-32G96G-GGUF/resolve/main/"
+                                             "MemT-1.0-Flash-32G96G-00001-of-00004.gguf"), got[-1])
+            self.assertTrue((mdir / "MemT-1.0-Flash-32G96G-00001-of-00004.gguf.sha256").exists())
+            with mock.patch.object(A.S, "download", side_effect=dl), mock.patch.object(A.S, "ask") as ask:
+                A.fetch_files(a, Path(d), groups)   # (all there now: nothing asked)
+            ask.assert_not_called()
+            (mdir / "MemT-1.0-Flash-32G96G-00001-of-00004.gguf").write_bytes(b"something else")
+            (mdir / "MemT-1.0-Flash-32G96G-00001-of-00004.gguf.sha256").unlink()
+            with mock.patch.object(A.S, "download", side_effect=dl), self.assertRaises(SystemExit):
+                A.fetch_files(a, Path(d), groups)
+
+    def test_the_config(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(A, "ROOT", Path(d)):
+            cfg, run = A.write_config("memt-nano-q4_k_m", Path(d) / "pack", 16384, None, False, None, None,
+                                      A.MODELS["memt-nano"])
+            got = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertIn("--engine strata", run.read_text(encoding="utf-8"))
+        self.assertEqual(got["args"], ["--glm-pack", str(Path(d) / "pack"), "--max-context", "16384", "--prefill", "auto"])
+        self.assertEqual(got["tokenizer"], str(Path(d) / "pack" / "tokenizer"))
+        self.assertEqual(got["sampling"], {"temperature": 0.7, "top_p": 0.95, "top_k": 40})
+        self.assertNotIn("env", got)
+
+    def test_nvidia_only(self):
+        for key in ("memt-flash", "memt-nano"):
+            argv = ["abyss_setup.py", "--model", key, "--backend", "hip"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                    mock.patch.object(A, "hip_engine", side_effect=AssertionError("no ROCm step")), \
+                    mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+                A.main()
+            self.assertIn("NVIDIA GPUs only", fail.call_args.args[0])
+
+    def test_one_gpu(self):
+        gpu = {"index": 0, "name": "RTX 5090", "vram_gb": 32.0, "arch": "120", "count": 2}
+        argv = ["abyss_setup.py", "--model", "memt-nano", "--gpus", "0,1"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "gpu_info", return_value=gpu), \
+                mock.patch.object(A.S, "gpus", return_value=[gpu, {**gpu, "index": 1}]), \
+                mock.patch.object(A, "use_prebuilt", side_effect=AssertionError("stopped before the engine")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("runs on one GPU", fail.call_args.args[0])
+
+    def test_dspark_is_v4_only(self):
+        with mock.patch.object(sys, "argv", ["abyss_setup.py", "--model", "memt-flash", "--dspark"]), \
+                mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            A.main()
+
+
 class VenvLayout(unittest.TestCase):
     """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
 
