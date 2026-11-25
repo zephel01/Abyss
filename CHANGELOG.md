@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased (v1.3.205)
+## v1.3.205 - 2026-11-25
 
 MemT-1.0-Flash (MemTensor) runs with its native memory on the deepseek4 path (beta, NVIDIA), built over our DeepSeek
 V4 Flash 0731 `32G96G` L97: a fact told in one turn, or a document, is answered in a new conversation through the memory
@@ -75,6 +75,8 @@ prompt on an RTX 3090 a short answer +4-5% over v1.3.204's opt-in pool rule, the
   anything was measured). RTX 3090, a 250K prompt, `STRATA_INK_DSPARK_POOL_LOSS=8`, 2 runs: a 256-token answer 41.4-43.5
   -> 43.2-45.2 tok/s (off 40.4-40.6), a 1,536-token answer 47.7-47.9 -> 47.7-50.3. The same tokens (Inkling 18 md5 on an
   RTX 5090 and an RTX 3090). `STRATA_INK_DSPARK_GATE_LOG=2` logs every step.
+- README: a V100 SXM2 16 GB (sm_70) ran GLM-5.3-Flash IQ2_XS-32G96G at ctx 65536: a 25K prompt 652.9 tok/s, decode
+  16.3 / 14.3 tok/s at 25K (reported in #57).
 
 ## v1.3.204 - 2026-11-25
 
