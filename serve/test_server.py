@@ -856,6 +856,24 @@ class InklingToolCalls(unittest.TestCase):
                           prompt="hi" + ink_call_open("get_weather"), sampling={"_prefill": ink_call_open("get_weather")})
         self.assertEqual(out["calls"], [("get_weather", {"city": "Kyoto"})])
 
+    def test_required_with_one_tool_names_it(self):
+        """tool_choice "required" ("_force_tool": "") with one tool offered opens that tool's call, as a named
+        choice does; among several tools the model still picks (no opening)."""
+        import tempfile
+        from serve.frontend import ink_call_open
+        tok = self.InkTok()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(InklingThinkingLevels.SRC, encoding="utf-8")
+            svc = Service(MockEngine(tok, "", max_context=CTX), tok, ChatTemplate(p))
+            msgs = [{"role": "user", "content": "weather?"}]
+            two = self.TOOLS + [{"name": "get_time", "parameters": {"type": "object", "properties": {}}}]
+            for tools, force, want in ((self.TOOLS, "", ink_call_open("get_weather")), (two, "", ""),
+                                       (two, "get_time", ink_call_open("get_time"))):
+                kw = {"_force_tool": force}
+                svc.prepare(msgs, tools, kw)
+                self.assertEqual(kw["_prefill"], want)
+
     def test_tool_results_named_for_the_template(self):
         from serve.frontend import ink_tool_names, openai_to_messages
         msgs, _, _ = openai_to_messages({"messages": [

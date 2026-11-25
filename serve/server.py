@@ -2476,7 +2476,11 @@ class Service:
             prompt += "</think>"
         prefill = ""
         if force is not None and tools and getattr(self.template, "ink", False):
-            # Inkling: a named call opens its call message (InklingCalls reads the JSON); "any" leaves it to the model
+            # Inkling: a named call opens its call message (InklingCalls reads the JSON).  "any" with one tool offered
+            # is that tool named (without an opening the model wrote a call 2 times in 10 on Maya's measure, #1160);
+            # "any" among several still leaves it to the model
+            if not force and len(tools) == 1 and tools[0].get("name"):
+                force = tools[0]["name"]
             prefill = ink_call_open(force) if force else ""
             prompt += prefill
         elif force is not None and tools:
