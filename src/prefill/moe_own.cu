@@ -849,6 +849,7 @@ void launch(int type, const KArgs& a, unsigned grid, int shape, cudaStream_t s) 
         case 29: launch_t<29, GLU>(a, grid, shape, s); break;
         case 20: launch_t<20, GLU>(a, grid, shape, s); break;
         case 42: launch_t<42, GLU>(a, grid, shape, s); break;
+        case 143: launch_t<143, GLU>(a, grid, shape, s); break;
         case 23: launch_t<23, GLU>(a, grid, shape, s); break;
 #if defined(__HIPCC__)
         case 12: launch_t<12, GLU>(a, grid, shape, s); break;
@@ -884,6 +885,7 @@ bool wide_type(int type) {
         case 29: return Wide<29>::on;
         case 20: return Wide<20>::on;
         case 42: return Wide<42>::on;
+        case 143: return Wide<143>::on;
         case 23: return Wide<23>::on;
         case 12: return Wide<12>::on;
         case 14: return Wide<14>::on;
@@ -910,6 +912,7 @@ bool fine_only_type(int type) {
         case 29: return Wide<29>::fine_only;
         case 20: return Wide<20>::fine_only;
         case 42: return Wide<42>::fine_only;
+        case 143: return Wide<143>::fine_only;
         case 23: return Wide<23>::fine_only;
         case 12: return Wide<12>::fine_only;
         case 14: return Wide<14>::fine_only;
@@ -942,7 +945,7 @@ bool built() {
 }
 bool tuned_device() { return false; }   // (no AMD card is measured against MMQ yet: MMQ stays the default)
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6 || t == 13 || t == 11 || t == 10 || t == 21);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 143 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6 || t == 13 || t == 11 || t == 10 || t == 21);
 }
 #else
 namespace {
@@ -962,7 +965,7 @@ int device_cc() {
 bool tuned_device() { return device_cc() == 120; }
 bool built() { return device_cc() >= 80; }   // (int8 mma.sync and cp.async)
 bool supported(int t) {
-    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6 || t == 13 || t == 11 || t == 10 || t == 21);
+    return built() && (t == 16 || t == 17 || t == 18 || t == 22 || t == 39 || t == 19 || t == 29 || t == 20 || t == 42 || t == 143 || t == 23 || t == 12 || t == 14 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6 || t == 13 || t == 11 || t == 10 || t == 21);
 }
 #endif
 
@@ -978,7 +981,7 @@ bool supported(int t) {
 // the layer takes the FP16 path), Q4_1 / Q5_0, Q3_K, Q2_K, IQ3_S (faster in the kernel bench, no model run yet),
 // Q8_0 (Qwen3.8-27B Q8_0 -5%).
 static const char* const kDefaultTypes = "16,17,18,22,19,20,42,23,12,13,14";
-static const char* const kDefaultDense = "16,17,18,22,19,20,42,23,12,13,2";
+static const char* const kDefaultDense = "16,17,18,22,19,20,42,143,23,12,13,2";
 
 bool type_on(int type, bool mmq_built, bool dense) {
     // (the lists once; which one applies follows the current device)
@@ -1009,7 +1012,7 @@ bool type_on(int type, bool mmq_built, bool dense) {
 
 bool usable(int t, int64_t rows, int64_t cols) {
     // (a chunk of the type's blocks: 256 values, 128 for the 32- and 64-value block types)
-    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
+    const int64_t chunk = (t == 39 || t == 20 || t == 42 || t == 143 || t == 8 || t == 40 || t == 2 || t == 3 || t == 6) ? 128 : 256;   // (IQ4_XS, Q4_K, Q6_K: 256-value blocks)
     return supported(t) && rows > 0 && cols > 0 && cols % chunk == 0 && rows % 16 == 0;
 }
 

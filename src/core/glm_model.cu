@@ -828,6 +828,100 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
             return false;
         }
     }
+    // PrismML's Ternary Bonsai (prism.hadamard.*): rotated weights and the activations' transform (Glm5Geometry::prism_*).
+    // Fail-closed as PrismML's loader is: a key this engine does not apply refuses the file rather than running wrong math
+    if (const auto* hb = g.get("prism.hadamard.block_size"); hb != nullptr) {
+        const auto str = [&](const char* k) -> std::string {
+            const auto* v = g.get(k);
+            return v != nullptr && v->type == strata::MetaType::STRING ? v->s : std::string();
+        };
+        const int B = hb->is_num() ? (int) hb->num() : 0;
+        const std::string sm = str("prism.hadamard.sign_mode");
+        if (!dense || loop || B < 32 || B > 1024 || (B & (B - 1)) != 0 ||
+            str("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard" ||
+            str("prism.hadamard.axis") != "input-last-dimension" || (sm != "explicit" && sm != "identity")) {
+            err = "prism: the prism.hadamard keys ask for a transform this engine does not apply (a dense qwen35 file, "
+                  "block 32-1024, normalized Sylvester-Walsh-Hadamard over the input dimension)";
+            return false;
+        }
+        out.prism_block = B;
+        const auto* wn = g.get("prism.hadamard.weight_names");
+        if (wn == nullptr || wn->type != strata::MetaType::ARRAY || wn->items.size() != wn->count || wn->count == 0) {
+            err = "prism: prism.hadamard.weight_names is missing";
+            return false;
+        }
+        for (const auto& it : wn->items) out.prism_rot.push_back(it.s);
+        if (sm == "explicit") {
+            const auto* sw = g.get("prism.hadamard.sign_widths");
+            const auto* sv = g.get("prism.hadamard.sign_values");
+            if (sw == nullptr || sv == nullptr || sw->type != strata::MetaType::ARRAY || sv->type != strata::MetaType::ARRAY ||
+                sw->items.size() != sw->count || sv->items.size() != sv->count || sw->count == 0) {
+                err = "prism: explicit signs without prism.hadamard.sign_widths / sign_values";
+                return false;
+            }
+            size_t off = 0;
+            for (const auto& wv : sw->items) {
+                const int w = (int) (int64_t) wv.u;
+                if (w <= 0 || w % B != 0 || off + (size_t) w > sv->items.size()) {
+                    err = "prism: a sign width is off";
+                    return false;
+                }
+                auto& v = out.prism_signs[w];
+                v.resize((size_t) w);
+                for (int i = 0; i < w; ++i) {
+                    const int64_t x = (int64_t) sv->items[off + (size_t) i].u;
+                    if (x != 1 && x != -1) { err = "prism: sign values must be +1 / -1"; return false; }
+                    v[(size_t) i] = (float) x;
+                }
+                off += (size_t) w;
+            }
+            if (off != sv->items.size()) { err = "prism: sign_values length mismatch"; return false; }
+        }
+        if (const auto* iv = g.get("prism.hadamard.inverse_weight_names"); iv != nullptr) {
+            if (iv->type != strata::MetaType::ARRAY || iv->items.size() != iv->count) { err = "prism: inverse_weight_names"; return false; }
+            for (const auto& it : iv->items) {
+                if (it.s != "token_embd.weight") {
+                    err = "prism: " + it.s + " is not an inverse-after-lookup table this engine restores";
+                    return false;
+                }
+                out.prism_inv_embd = true;
+            }
+        }
+        if (const auto* gv = g.get("prism.hadamard.gdn_v_grouped"); gv != nullptr && gv->is_num()) out.prism_gdn_grouped = gv->u != 0;
+        // every rotated weight must be one this engine feeds through the transform (prism_* sites); the rest refuse
+        static const char* const kKinds[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_qkv.weight",
+                                              "attn_gate.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
+                                              "ffn_down.weight", "ssm_out.weight"};
+        for (const auto& n : out.prism_rot) {
+            bool ok = n == "output.weight";
+            if (!ok && n.rfind("blk.", 0) == 0) {
+                const size_t d = n.find('.', 4);
+                const int il = d == std::string::npos ? -1 : std::atoi(n.c_str() + 4);
+                if (il >= 0 && il < out.n_layers)
+                    for (const char* k : kKinds) ok = ok || n.compare(d + 1, std::string::npos, k) == 0;
+            }
+            if (!ok) { err = "prism: " + n + " is rotated, but this engine does not rotate its input"; return false; }
+        }
+        // and every trunk layer rotates all of them (the sites rotate a whole input: its consumers must agree); the head
+        // too; the NextN block none (its rows are plain)
+        std::string miss;
+        for (int il = 0; il < out.n_layers; ++il) {
+            const std::string P = "blk." + std::to_string(il) + ".";
+            const bool rec = out.n_head_kv[(size_t) il] == 0;
+            const char* const rk[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
+            const char* const ak[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"};
+            const char* const fk[] = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
+            for (const char* k : rec ? std::vector<const char*>(rk, rk + 3) : std::vector<const char*>(ak, ak + 4))
+                if (!out.prism_has(P + k)) miss += P + k + " ";
+            for (const char* k : fk)
+                if (!out.prism_has(P + k)) miss += P + k + " ";
+        }
+        if (!out.prism_has("output.weight")) miss += "output.weight ";
+        if (!miss.empty()) {
+            err = "prism: not every trunk weight is rotated (" + miss.substr(0, 300) + ") - this engine rotates whole sites";
+            return false;
+        }
+    }
     if (loop) {   // the looped block: the mHC layer kinds, the second visit's weights the first's
         const auto* ks = g.get(p + "mhc.layer_kinds");
         if ((int) num("mhc.streams", 0) != 2 || ks == nullptr || ks->type != strata::MetaType::ARRAY ||
@@ -1738,6 +1832,7 @@ Glm5Model::~Glm5Model() {
     fast_destroy();
     ling_free();      // (ling: the k_b / v_b rows and the attention scratch it allocated)
     memt_free();      // (memt: the memory states and scratch)
+    prism_free();     // (prism: the sign vectors and scratch)
     q35d_destroy();   // (load_pack's record when fast_setup never ran)
     if (!stage_workers_.empty()) {
         // stop the staging pool: without this the workers block in stage_cv_ forever and the

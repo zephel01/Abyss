@@ -226,6 +226,16 @@ struct Glm5Geometry {
     // memt_heads x 256 x 256 FP32 a memory layer, written by a replay at the end of a turn
     bool memt = false;
     int memt_heads = 16, memt_chunk = 2048;
+    // ---- prism (PrismML's Ternary Bonsai: prism.hadamard.* keys on a dense qwen35 file): the named weights are stored in a
+    // blockwise Hadamard-rotated basis, so their input is rotated first - x' = H_B (signs * P x) per block of prism_block
+    // values (H the normalized Sylvester-Walsh-Hadamard, P the GDN value heads' grouped order on ssm_out's input when
+    // prism_gdn_grouped) - and the embedding row (prism_inv_embd) is restored after the lookup: h = signs * (H z).
+    // prism_block 0: not a prism file
+    int prism_block = 0;
+    bool prism_inv_embd = false, prism_gdn_grouped = false;
+    std::map<int, std::vector<float>> prism_signs;   // by input width
+    std::vector<std::string> prism_rot;               // the rotated weights' names (prism.hadamard.weight_names)
+    bool prism_has(const std::string& n) const { return std::find(prism_rot.begin(), prism_rot.end(), n) != prism_rot.end(); }
     float memt_softcap = 2.0f, memt_eps = 1e-6f;
     // MemT-1.0-Flash (deepseek4 with deepseek4.memt.* keys; worklog 2026-11-25_memt-flash.md): heads of memt_dim 512,
     // q through a low rank (memt_qrank, its own RMSNorm), k / v through memt_groups grouped low ranks (memt_kvrank,
@@ -822,6 +832,26 @@ public:
     bool memt4_rows(int il, const uint16_t* x16, const float* xs, int tn, float* o, cudaStream_t s,
                     const std::function<void(const WSlot&, int, int, const uint16_t*, int, float*, int, int)>& gemm,
                     std::string& err);
+    // ---- prism (prism_path.cu, PrismML's Ternary Bonsai): the activations' transform before a rotated weight's product
+    // (Glm5Geometry::prism_*).  prism_in: rows of x (n wide, ld apart) rotated in place (x16: also their FP16 copy), xq
+    // (when set) their q8_1; prism_gdn: ssm_out's input with the value heads' reorder (rows of y, out of place into the
+    // scratch and back over y; q8_1 into yq, FP16 into y16 when set); prism_emb: embedding rows
+    // restored in place.  All of them return true and do nothing when the file is not a prism one
+    bool prism_on() const { return g_.prism_block > 0; }
+    bool prism_l(int il) const { return g_.prism_block > 0 && il >= 0 && il < g_.n_layers; }   // (a trunk layer: rotated)
+    // prism_q8: x left as it is, its rotated rows (scratch) quantized into xq - the head's input (head_x also feeds the
+    // NextN block, which reads it plain)
+    bool prism_q8(const float* x, int n, int rows, void* xq, cudaStream_t s);
+    bool prism_alloc(std::string& err);
+    void prism_free();
+    bool prism_in(float* x, int n, int rows, int ld, void* xq, uint16_t* x16, int ld16, cudaStream_t s);
+    bool prism_gdn(float* y, int rows, int ld, void* yq, uint16_t* y16, int ld16, cudaStream_t s);
+    bool prism_emb(float* e, int rows, int ld, cudaStream_t s);
+    void prism_emb_host(float* row) const;
+    // down's input on a split dense layer: the first n of n_ff_dense values a row (n a multiple of the block), n_ff's
+    // signs (a width's lookup would take n_embd's for n = n_embd)
+    bool prism_in_ff(float* x, int n, int rows, int ld, void* xq, cudaStream_t s);   // prism_emb's arithmetic on one host row (the same bits)
+    bool prism_weights(int il, std::string& err);   // qwen35_bind: rotate the F32 ssm_alpha / ssm_beta rows once
     bool ling_alloc(std::string& err);
     bool fast_ling_kda(int il, std::string& err);
     bool fast_ling_mla(int il, int64_t p, std::string& err);

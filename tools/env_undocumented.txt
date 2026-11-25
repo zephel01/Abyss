@@ -208,6 +208,7 @@ STRATA_PREFILL_ISSUER  # src/prefill/prefill.cpp
 STRATA_PREFILL_LEND_PCT  # src/core/glm_prefill.cu
 STRATA_PREFILL_RING  # src/prefill/prefill.cpp
 STRATA_PREFILL_TIMING  # src/prefill/prefill.cpp
+STRATA_PRISM_HAD  # src/kernels/cuda/prism_had.cu
 STRATA_PROMPT_ATTN_OLD  # src/prefill/prefill.cpp
 STRATA_PROMPT_ATTN_V1  # src/kernels/cuda/qsa_prompt_attn.cu
 STRATA_PROMPT_OWN_DUMP  # src/core/glm_prefill.cu

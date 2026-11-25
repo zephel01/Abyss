@@ -1461,6 +1461,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 14: block_elems = 256; block_bytes = 210; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
+    case 143: block_elems = 128; block_bytes = 28; break;   // (sizing only: PrismML's PTQ1_0 is served by glm_fast mv)
     case 16: case 17: case 18: case 19: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");

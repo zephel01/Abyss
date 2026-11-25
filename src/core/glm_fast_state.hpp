@@ -511,6 +511,8 @@ struct Glm5Model::FastState {
     struct Ink* ink = nullptr;
     // memt (memt_path.cu): the memory states and scratch
     struct Memt* memt = nullptr;
+    // prism (prism_path.cu): PrismML's Hadamard transform - the signs on the device, a scratch row block
+    struct Prism* prism = nullptr;
     // ---- qwen4exp activations: the normed streams, the low rank, the gate, the injections ([0] attention, [1] FFN:
     // each lives until its combine, the FFN's into the next layer)
     float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};

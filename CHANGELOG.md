@@ -14,6 +14,11 @@ V4 Flash 0731 `32G96G` L97: a fact told in one turn, or a document, is answered 
 alone. With the memory off it costs no VRAM, so the expert pool is the plain L97 pack's. CLI outputs give the same bits
 as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
 
+prism-ml's Ternary Bonsai 2.5 27B runs (beta): ternary Qwen3.8-27B weights in a blockwise Hadamard basis, both of its files
+(PTQ1_0 with the MTP block, Q2_0), all in VRAM from an 8 GB GPU. RTX 5090, 4K prompt + 512 tokens: decode 185.3 tok/s with
+the file's MTP block, 125.5 without (Qwen3.8-27B UD-Q4_K_XL: 137.4 / 76.8); capped at 8 GB 178.6. Other models' outputs are
+unchanged (7-config md5, Inkling 18 md5, Ling 4 md5, Qwen3.8-27B UD-Q4_K_XL md5 at 32 / 12 GB with and without MTP).
+
 ### Added
 
 - MemT-1.0-Flash (MemTensor, MIT; beta, NVIDIA). DeepSeek-V4-Flash-0731 post-trained with a memory block in each of its
@@ -34,11 +39,22 @@ as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
   3.3-4.5e-4, read 0.5-1.1% relative error; recall 4 of 4 facts from a committed turn and 5 of 5 from a Japanese note.
   DSpark and the MTP draft block are off for MemT, the n-gram repeats' drafts only while no memory is on (the verify
   windows do not read the memory); `--parallel` and a layer split are off.
+- Ternary Bonsai 2.5 27B (prism-ml, Apache-2.0; beta, NVIDIA): `./setup-deepseek.sh --model bonsai27b` (PTQ1_0, 6.23 GB;
+  `--quant Q2_0` the 7.67 GB file). The GGUF's `prism.hadamard.*` keys are read: the engine rotates each activation before
+  the rotated weights (1,024-value blocks, the file's sign vectors, the grouped delta-net order before `ssm_out`), restores
+  the embedding row, and rotates the F32 `ssm_alpha` / `ssm_beta` rows at load. The transform runs in registers and warp
+  shuffles and writes the q8_1 blocks the products read. On the token path, the prompt path, the verify window (MTP
+  drafts: the same tokens as without) and the CPU lane. The two files give the same logits (KL 0.000000 over 3,071
+  positions); prompt path against token path KL 0.00015 ([MANUAL](docs/MANUAL.md#ternary-bonsai-25-27b-beta)).
+- PTQ1_0 (GGUF type 143: 128 trits and an FP16 scale in 28 bytes): GPU GEMV (one decode for every column of a verify
+  window), the own int8 prompt GEMM, FP16 dequantization, and the CPU lane (scalar and AVX2).
 
 ### Changed
 
 - The server follows MemT's session rules (MemT-1.0-Nano and -Flash): once a memory holds something (its file exists),
   the prompt, the turn written back and a document start without the BOS; an empty memory keeps it.
+- Qwen3.8-27B-shaped dense models that keep FFN rows in RAM split the rows at a multiple of the Hadamard block when the
+  file is rotated (unchanged otherwise: 256).
 
 ### Fixed
 

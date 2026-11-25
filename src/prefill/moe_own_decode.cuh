@@ -280,6 +280,45 @@ template<> struct Dec<42> {
     }
 };
 
+// PTQ1_0 (PrismML's Ternary Bonsai, type 143): 128 trits a block in 28 bytes - qs[24] five a byte, qh[2] four, then
+// f16 d.  Trit n of byte q: ((uint8) (q 3^n) 3) >> 8 (0..2, value - 1).  qs[0..16) hold values 16 n + m, qs[16..24)
+// 80 + 8 n + m, qh[h] 120 + 2 n + h.  A chunk is one block; group g of 4 values (0..31) is one 4-byte word's trit
+// (g < 20: word g % 4, trit g / 4; g < 30: word 4 + (g - 20) % 2, trit (g - 20) / 2) or the qh bytes' (g 30 / 31)
+__device__ __forceinline__ uint32_t ptq1_tri(uint32_t w, uint32_t p) {   // 4 bytes' trit (p = 3^n), 0..2 a byte
+    uint32_t e = ((w & 0x00FF00FFu) * p) & 0x00FF00FFu, o = (((w >> 8) & 0x00FF00FFu) * p) & 0x00FF00FFu;
+    e = ((e * 3u) >> 8) & 0x00030003u;
+    o = ((o * 3u) >> 8) & 0x00030003u;
+    return e | o << 8;
+}
+__device__ __forceinline__ uint32_t ptq1_grp(const uint8_t* b, int g) {
+    uint32_t v;
+    if (g < 20) {
+        const int n = g >> 2;
+        v = ptq1_tri(rd32(b + 4 * (g & 3)), n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u);
+    } else if (g < 30) {
+        const int n = (g - 20) >> 1;
+        v = ptq1_tri(rd32(b + 16 + 4 * ((g - 20) & 1)), n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u);
+    } else {
+        const uint32_t q = rd16(b + 24), p = g == 30 ? 1u : 9u;
+        v = (ptq1_tri(q, p) & 0xFFFFu) | (ptq1_tri(q, 3u * p) << 16);
+    }
+    return ((v | 0x80808080u) - 0x01010101u) ^ 0x80808080u;   // - 1
+}
+template<> struct Dec<143> {
+    static constexpr int GW = 0;
+    __device__ static __forceinline__ const uint32_t* table() { return nullptr; }
+    static constexpr int WCH = 128, CB = 28, AL = 2, SUB = 32;
+    __device__ static __forceinline__ float head(const uint8_t*) { return 1.0f; }
+    __device__ static __forceinline__ Step step(const uint8_t* p, int ib, int t, float, const uint32_t*) {
+        Step r;
+        r.lo = ptq1_grp(p, 8 * ib + t);
+        r.hi = ptq1_grp(p, 8 * ib + 4 + t);
+        r.s = rd_f16(p + 26);
+        r.m0 = r.m1 = 0;
+        return r;
+    }
+};
+
 // IQ4_XS: 256 values: {f16 d; u16 scales_h; 4 x u8 scales_l; 128 bytes as IQ4_NL's, 16 a 32-value block}; block ib's
 // scale is d (ls - 32), ls = scales_l's nibble ib | scales_h's 2 bits ib << 4.
 // A chunk is half of it (the whole 136 bytes of 256 rows twice over do not fit a CTA's shared memory): the 8-byte

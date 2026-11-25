@@ -482,6 +482,43 @@ struct T42 {   // Q2_0: 64 values a block (two sub-blocks), codes - 1
         T20::fin2(p, v, A, B, g, a, b);
     }
 };
+struct T143 {   // PTQ1_0 (PrismML): 128 trits a block in 28 bytes (lane_q81.cpp's dw143 has the layout)
+    static constexpr int qk = 128, bytes = 28, form = SIGNED, needs_u = 0;
+    using P = T20::P;
+    struct Map {   // value e of a block -> its byte and trit; a byte -> its five trits - 1
+        uint8_t byte[128], n[128];
+        int8_t trit[256][5];
+        Map() {
+            for (int e = 0; e < 128; ++e) {
+                if (e < 80) { byte[e] = (uint8_t) (e & 15); n[e] = (uint8_t) (e >> 4); }
+                else if (e < 120) { byte[e] = (uint8_t) (16 + ((e - 80) & 7)); n[e] = (uint8_t) ((e - 80) >> 3); }
+                else { byte[e] = (uint8_t) (24 + ((e - 120) & 1)); n[e] = (uint8_t) ((e - 120) >> 1); }
+            }
+            for (int q = 0; q < 256; ++q) {
+                unsigned p = 1;
+                for (int k = 0; k < 5; ++k, p *= 3) trit[q][k] = (int8_t) ((int) ((((unsigned) q * p) & 0xFFu) * 3u >> 8) - 1);
+            }
+        }
+    };
+    static const Map& map() { static const Map m; return m; }
+    static void dec(const uint8_t* b, int ns, __m256i* w, __m256i*, P& p) {
+        const Map& M = map();
+        alignas(32) float dw[8] = {};
+        alignas(32) int8_t v[32];
+        for (int j = 0; j < ns; ++j) {
+            const uint8_t* blk = b + bytes * (j / 4);
+            const int e0 = 32 * (j & 3);
+            for (int i = 0; i < 32; ++i) v[i] = M.trit[blk[M.byte[e0 + i]]][M.n[e0 + i]];
+            w[j] = _mm256_load_si256((const __m256i*) v);
+            dw[j] = hf(blk + 26);
+        }
+        p.dw = _mm256_load_ps(dw);
+    }
+    static __m256 fin(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g) { return T20::fin(p, v, A, B, g); }
+    static void fin2(const P& p, const __m256i* v, __m256i A, __m256i B, const TokG& g, __m256& a, __m256& b) {
+        T20::fin2(p, v, A, B, g, a, b);
+    }
+};
 struct T40 {   // NVFP4: 64 values a block, a UE4M3 scale a 16
     static constexpr int qk = 64, bytes = 36, form = SIGNED, needs_u = 0;
     struct P { __m256 u0, u1; };
@@ -786,7 +823,7 @@ inline __m256 round_away(__m256 r) {   // roundf
 bool lane_q81_avx2_type(int t) noexcept {
     switch (t) {
         case 16: case 17: case 22: case 18: case 21: case 19: case 29: case 23: case 20: case 39: case 8: case 6:
-        case 7: case 42: case 40: case 10: case 11: case 12: case 13: case 14: case 2: case 3: return true;
+        case 7: case 42: case 143: case 40: case 10: case 11: case 12: case 13: case 14: case 2: case 3: return true;
         default: return false;
     }
 }
@@ -818,6 +855,7 @@ void lane_q81_avx2_rows(int t, const uint8_t* w, size_t row_bytes, int n, const 
         case 2: rows_any<T2>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 3: rows_any<T3>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 42: rows_any<T42>(w, row_bytes, n, act, nt, out, r0, r1); break;
+        case 143: rows_any<T143>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 40: rows_any<T40>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 10: rows_any<T10>(w, row_bytes, n, act, nt, out, r0, r1); break;
         case 11: rows_any<T11>(w, row_bytes, n, act, nt, out, r0, r1); break;

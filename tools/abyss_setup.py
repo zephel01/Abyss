@@ -17,6 +17,7 @@
     ./setup-deepseek.sh --model ling32air   Ling-3.2-air (inclusionAI, 512 experts, KDA + MLA; BETA, images too), bartowski's
                                              Q4_K_M for a 24-32 GB GPU + 64-96 GB RAM
     ./setup-deepseek.sh --model qwen38-27b   Qwen3.8-27B (dense), unsloth's UD-Q4_K_XL for an 8 GB+ GPU (FFN partly in RAM under ~20 GB)
+    ./setup-deepseek.sh --model bonsai27b    Ternary Bonsai 2.5 27B (prism-ml, ternary Qwen3.8-27B, BETA): PTQ1_0 6.2 GB for an 8 GB+ GPU
     ./setup-deepseek.sh --model qwen35-9b-qsa  Qwen3.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model ornith-9b-qsa  Ornith-1.5-9B QSA (dense, zephel01's Q4_K_M with a QSA indexer) for an 11 GB+ GPU
     ./setup-deepseek.sh --model mimo-9b     MiMo-V2.6-Distill-Qwen-9B (dense, bartowski's Q4_K_M) for an 11 GB+ GPU
@@ -104,6 +105,16 @@ DENSE27_PICKS = ("UD-IQ2_XXS", "UD-IQ3_XXS", "UD-Q4_K_XL", "UD-Q6_K", "Q8_0")
 DENSE27_MTP = "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
 DENSE27_MMPROJ = "mmproj-F16.gguf"
 LING32_MMPROJ = "mmproj-Ling-3.2-air-f16.gguf"   # (bartowski's repo, top level: 0.87 GB, the vision tower + projector)
+# Ternary Bonsai 2.5 27B (prism-ml, Apache-2.0; BETA): Qwen3.8-27B with ternary weights (one FP16 scale a 128) in a
+# blockwise Hadamard basis (prism.hadamard.* in the GGUF: the engine rotates the activations, prism_path.cu).  Two files
+# at the repo's top level: PTQ1_0 (6.23 GB, with the MTP block blk.64) and Q2_0 (7.67 GB, the same weights, no MTP).
+# The GPU size each context needs, PTQ1_0, MTP on, 4K prompt (bench/bonsai/vram.txt, 2026-11-25, RTX 5090 capped:
+# a cap short of it puts rows of 52 layers on the CPU, 4K prompt then 30.5 tok/s at 32K / 9 GB, 64.8 at 64K / 11 GB):
+# at 8 / 9.5 / 11.75 / 16 GB for 8K / 32K / 64K / 128K only one layer's last 1,024 rows are on the CPU - decode 178.6
+# (8K, median of 3) / 179.4 / 186.9 / 186.4 tok/s (one run each; bench/bonsai/vram2.txt), against 185.3 uncapped
+BONSAI27_VRAM = {8192: 8.0, 32768: 9.5, 65536: 12.0, 131072: 16.0}
+BONSAI27_QUANTS = {"PTQ1_0": (6.23, True), "Q2_0": (7.67, True)}   # (Q2_0 has no draft block: the engine runs without)
+BONSAI27_FFN_GB = 3.7   # (64 layers x 3 x 5120 x 17408 trits at 28 bytes a 128)
 # Qwen3.5-9B QSA (zephel01's, BETA, v1.3.162): the GPU size each context needs.  Measured on an RTX 5090, Q4_K_M, MTP
 # drafts on (bench/train9b/results.md, 2026-11-17): with no cap the engine peaks at 11.17 / 12.40 / 14.86 GB at 32K / 64K /
 # 128K, 4 GB of it the prompt path's buffer, which it sizes from the free VRAM; capped with STRATA_GLM_VRAM_GB=15 a 128K
@@ -243,6 +254,14 @@ MODELS = {
                    "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
                    "vram_ctx": DENSE27_VRAM, "ffn_gb": DENSE27_FFN_GB, "ram_min": DENSE27_RAM_GB,
                    "small_gpu": DENSE27_SMALL, "gpu_min": 8},
+    # Ternary Bonsai 2.5 27B (prism-ml; BETA): a dense qwen35 like qwen38-27b (BONSAI27_VRAM above); text only (no
+    # image projector in the repo); the card's sampling.  An 8 GB GPU keeps a part of the FFN on the CPU lane
+    "bonsai27b": {"repo": "prism-ml/Ternary-Bonsai-2.5-27B-GGUF", "quant": "PTQ1_0", "quants": tuple(BONSAI27_QUANTS),
+                  "quant_gb": BONSAI27_QUANTS, "picks": ("PTQ1_0",), "folder": "",
+                  "prefix_tmpl": "Ternary-Bonsai-2.5-27B-{q}", "model_name": "ternary-bonsai-2.5-27b",
+                  "prefix": "bonsai27b", "title": "Ternary Bonsai 2.5 27B", "env": {}, "gb": 7, "pack_args": [],
+                  "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                  "vram_ctx": BONSAI27_VRAM, "ffn_gb": BONSAI27_FFN_GB, "ram_min": 16, "gpu_min": 8},
     # Qwen3.5-9B QSA (a dense qwen35 like the 27B, with a QSA indexer trained at home; BETA): zephel01's GGUFs, one file
     # a quant at the repo's top level, each with its NextN drafter.  The engine reads the QSA layers from the file (7
     # of 8 attention layers, layer 3 dense: compress_ratios 0) from v1.3.162; no env.  Text only: the file has no
@@ -1006,8 +1025,9 @@ def dense_gpu_check(a, key: str, gpus, backend: str, shared: bool, ram: float | 
                    f"~{ffn_gb:.0f} GB, pinned): it needs {model['ram_min']} GB of RAM, and this PC has {ram:.0f} GB",
                    f"a PC with {model['ram_min']} GB of RAM or more, or a GPU that holds the file (24 GB or more)")
         S.ok(f"{model['title']}: this {vram:.0f} GB GPU holds a {sctx // 1024}K context with part of the FFN in RAM "
-             f"(the engine computes those rows on the CPU: slower than all in VRAM - RTX 5090 capped to 12 / 16 GB: "
-             f"~16 / ~27 / ~65 tok/s with the drafter at 8 / 12 / 16 GB, 20 GB and up all in VRAM ~130)")
+             + (f"(the engine computes those rows on the CPU: slower than all in VRAM - RTX 5090 capped to 12 / 16 GB: "
+                f"~16 / ~27 / ~65 tok/s with the drafter at 8 / 12 / 16 GB, 20 GB and up all in VRAM ~130)"
+                if key == "qwen38-27b" else "(the engine computes those rows on the CPU: slower than all in VRAM)"))
         if small and sctx == small[1] and vram < 9.0:
             S.warn(f"an {vram:.0f} GB GPU runs {model['title']} with ~0.2 GB to spare at 8K: keep other programs "
                    "(a browser, the desktop on another GPU if you can) off it")
@@ -1228,10 +1248,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1458,6 +1478,8 @@ def main() -> int:
              else " (Qwen3.8 drafts with its own MTP block from the shards)" if a.model == "qwen38"
              else (" (Qwen3.8-27B drafts with unsloth's separate NextN block, MTP/)" if mtp else
                    " (Qwen3.8-27B drafts with its own NextN block from the file)") if a.model == "qwen38-27b"
+             else (" (Ternary Bonsai drafts with the MTP block in its PTQ1_0 file)" if quant == "PTQ1_0" else
+                   " (Ternary Bonsai Q2_0: no draft block in the file)") if a.model == "bonsai27b"
              else " (Qwen3.5-9B QSA drafts with its own NextN block from the file)" if a.model == "qwen35-9b-qsa"
              else " (Ornith-1.5-9B QSA drafts with its own NextN block from the file)" if a.model == "ornith-9b-qsa"
              else (" (MiMo-V2.6-Distill-Qwen-9B drafts with Qwen3.5-9B's NextN block, MTP/)" if mtp else

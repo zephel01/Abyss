@@ -422,6 +422,11 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.ling && !ling_alloc(err)) return false;
     if (g.memt && !memt_alloc(err)) return false;
+    if (prism_on()) {   // (PrismML's Ternary Bonsai: the signs, the scratch, the F32 alpha / beta rows rotated once)
+        if (!prism_alloc(err)) return false;
+        for (int il = l0_; il < l1_; ++il)
+            if (!prism_weights(il, err)) return false;
+    }
     if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
     if (g.q4x && !q4x_qsa_setup(err)) return false;
     if (g.qsa27 && !q27_qsa_setup(err)) return false;
@@ -1198,6 +1203,7 @@ bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_st
     if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp rows", err)) return false;   // (tok_in_h may feed an earlier copy)
     for (int t = 0; t < n; ++t) F->tok_in_h[t] = next[t];
     if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d, F->tok_in_d, n, E, F->q35_mt_emb, s)) { err = "qwen35 mtp: the embedding rows"; return false; }
+    if (!prism_emb(F->q35_mt_emb, n, E, s)) { err = "prism: the drafter's embedding rows"; return false; }
     for (int t = 0; t < n; ++t)
         gf::mtp_in(F->q35_mt_emb + (size_t) t * E, h_rows + (size_t) t * h_stride, Ly.enorm, Ly.hnorm, g.norm_eps, E,
                    (uint8_t*) F->q35_mt_cat + (size_t) t * cat_b, s);
@@ -1228,6 +1234,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     const int il = mtp_il_, E = g.n_embd;
     const auto& Ly = F->L[(size_t) il];
     if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d, tok_dev, 1, E, F->emb, s)) { err = "qwen35 mtp: the embedding"; return false; }
+    if (!prism_emb(F->emb, 1, E, s)) { err = "prism: the drafter's embedding"; return false; }
     gf::mtp_in(F->emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!gf::mv(&eh, 1, s)) { err = "qwen35 mtp: eh_proj"; return false; }
@@ -1237,6 +1244,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     bool pf_pending = false;
     if (!(Ly.moe ? fast_moe(il, pf_pending, err) : fast_dense_ffn(il, err))) return false;
     gf::rms_q8(F->mtp_h, F->ffn, w_.at("output_norm.weight"), g.norm_eps, E, F->head_x, F->head_xq, s);
+    if (prism_on() && !prism_q8(F->head_x, E, 1, F->head_xq, s)) { err = "prism: the drafter's head input"; return false; }
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
@@ -1718,7 +1726,11 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
             strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
         if (F->prof_on) F->mark("q35_gdn");
         if (dumps) q35_dump(s, "final_output", il, F->q35_y, V);
-        gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
+        if (prism_l(il)) {   // (ssm_out's rotated input: the value heads reordered, signs, H)
+            if (!prism_gdn(F->q35_y, 1, V, F->q35_yq, nullptr, 0, s)) { err = "prism: ssm_out's input"; return false; }
+        } else {
+            gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
+        }
     }
     gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
     if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
@@ -1847,7 +1859,11 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     if (Ly.mt >= 0 && !memt_token(il, err)) return false;   // (MemT: the memory read added, a replay's write)
     if (F->prof_on) F->mark("q35_attend");
     if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
-    gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
+    if (prism_l(il)) {
+        if (!prism_in(F->q35_ao, HD, 1, HD, F->q35_aoq, nullptr, 0, s)) { err = "prism: attn_output's input"; return false; }
+    } else {
+        gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);
+    }
     gf::MvJob o = {Ly.out.q, F->q35_aoq, F->q35_ao, F->mixer, nullptr, 1.0f, Ly.out.type, HD, E};
     if (!gf::mv(&o, 1, s)) { err = "qwen35moe: attn_output"; return false; }
     if (F->prof_on) F->mark("q35_attn_out");
@@ -1974,7 +1990,10 @@ bool Glm5Model::fast_dense_ffn(int il, std::string& err) {
         // (a BF16 / F32 down - unsloth's BF16 file - reads h as floats: kept in dg)
         const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
         if (hf) gf::swiglu_f32(F->dg, F->du, g.swiglu_shexp, FF, F->dg, s);
-        else gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
+        else if (prism_l(il)) {   // (down's rotated input: the product in floats, rotated, then its q8_1)
+            gf::swiglu_f32(F->dg, F->du, g.swiglu_shexp, FF, F->dg, s);
+            if (!prism_in_ff(F->dg, FF, 1, FF, F->dhq, s)) { err = "prism: down's input"; return false; }
+        } else gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, FF, F->dhq, s);
         gf::MvJob dn = {Ly.ffn_down.q, F->dhq, hf ? F->dg : nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, E};
         if (!gf::mv(&dn, 1, s)) { err = "qwen35: the dense FFN's down"; return false; }
         if (F->prof_on) F->mark("q35_dense_down");
@@ -2003,6 +2022,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         // the residual R (state_) takes the last FFN's output, then x = rms(R) * attn_norm (and its q8_1)
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (prism_l(il) && !prism_in(F->x, g.n_embd, 1, g.n_embd, F->xq, nullptr, 0, s)) { err = "prism: the mixer's input"; return false; }
         abl_cap(il, state_, 1, s);
         if (dfl_ != nullptr) dflash_capture(il, state_, 1, 0, false, s);   // (DFlash 2's features: the 27B's)
         if (F->prof_on) F->mark("q35_norm");
@@ -2022,6 +2042,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         }
         abl_out(il, 0, F->mixer, 1, g.n_embd, s);
         gf::rms_q8(state_, F->mixer, Ly.post_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        if (prism_l(il) && !prism_in(F->x, g.n_embd, 1, g.n_embd, F->xq, nullptr, 0, s)) { err = "prism: the FFN's input"; return false; }
         if (F->prof_on) F->mark("q35_norm");
         if (dumps) {
             q35_dump(s, "attn_residual", il, state_, g.n_embd);
@@ -2050,6 +2071,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "qwen35moe: output_norm.weight"; return false; }
     gf::rms_q8(state_, F->ffn, nw->second, g.norm_eps, g.n_embd, F->head_x, F->head_xq, s);
+    if (prism_on() && !prism_q8(F->head_x, g.n_embd, 1, F->head_xq, s)) { err = "prism: the head's input"; return false; }
     if (l1_ == g.n_layers) abl_cap(g.n_layers, state_, 1, s);
     if (F->prof_on) F->mark("q35_head");
     if (dumps) {

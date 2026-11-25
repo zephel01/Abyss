@@ -234,6 +234,18 @@ pool files, a 4K prompt + 512 tokens, a warm-up then the median of 3.
 | --- | ---: | --- | --- | --- |
 | "B" (`tools/memt_flash.py --backbone`: MemT's non-expert backbone in L97's tensor types, the memory Q8_0, L97's experts) | 106.1 GB (9.3 GB written; the rest links to L97's shards) | memory write 3.3-4.5e-4, read 0.5-1.1% (layers 4 / 22 / 42). Recall: 4 of 4 facts from a committed turn, 5 of 5 from a Japanese note written as a document. Memory off: NLL below "A" (L97's backbone + the memory) on all 5 texts | decode 77.5 tok/s without a memory (L97 78.9), 68.2 with one (-12%); the 4K prompt 983 / 867 tok/s. A 325-token commit 3.3-3.5 s + the save 0.7-2.7 s | 32 GB GPU + 96 GB RAM (a commit needs the expert pool's tail); smaller GPUs not measured |
 
+### Ternary Bonsai 2.5 27B (beta, unreleased)
+
+prism-ml's Ternary-Bonsai-2.5-27B: Qwen3.8-27B with ternary weights in a blockwise Hadamard basis ([MANUAL](MANUAL.md#ternary-bonsai-25-27b-beta)).
+Quality: SCORE over 3,071 positions of English, Japanese and code (`bench/qwen35dense/score.ids`), KL against Qwen3.8-27B
+Q8_0 on the same engine. Speeds: RTX 5090, iGPU lane off, a 4K prompt + 512 tokens, median of 3 (`bench/bonsai/speed.txt`).
+
+| file | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `PTQ1_0` ([prism-ml](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF), with the MTP block) | 6.23 GB | the same logits as Q2_0 (KL 0.000000); against Q8_0 KL 0.405, same top token 75.6%, nll 2.021 (Q8_0 1.671); greedy EN / JA / code / tool call / reasoning answers correct | decode 185.3 tok/s with MTP (82% accepted), 125.5 without; prompts 3,162 tok/s; capped at 12 / 8 GB 185.7 / 178.6. prism-ml's card (their runtime): ~163-174 / 305 | **the default**: all in VRAM from an 8 GB GPU (8K; 16 GB: 128K) |
+| `Q2_0` (the same repo, no MTP block) | 7.67 GB | the same weights as PTQ1_0 (every value compared) | decode 130.6 tok/s (no drafter), prompts 3,313 | when PTQ1_0 is not wanted; no MTP drafts |
+| for scale: Qwen3.8-27B unsloth `UD-Q4_K_XL` | 17.7 GB | against Q8_0 KL 0.0067, 96.4% | 137.4 / 76.8 tok/s (MTP / none); capped at 12 / 8 GB 28.0 / 15.6 | [Qwen3.8-27B](MANUAL.md#qwen38-27b-dense) |
+
 ### Qwen3.8-Flash-Next (qwen4exp)
 
 Details, packing and the drafter: [docs/qwen38](qwen38/README.md). KL is against the NVFP4 teacher (seq 0-9, 2,048
