@@ -54,7 +54,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, ContentGuard, Event,  # noqa: E402
                             INK_CALL, InklingCalls, ink_call_open,
-                            OutputParser, thinking_signature,
+                            OutputParser, reasoning_tail_calls, thinking_signature,
                             anthropic_to_messages, effort_kwargs, effort_level, images_of, ja_system_prompt,
                             openai_to_messages,
                             v41_images_as_text)
@@ -109,6 +109,9 @@ HY4_END = "<\uff5chy_end:opensource\uff5c>"   # Hy4-flash's turn end (its EOS)
 HY4_IMAGE_START = "<\uff5chy_image\u2581start:opensource\uff5c>"
 HY4_IMAGE_PAD = "<\uff5chy_image\u2581pad:opensource\uff5c>"
 # the thinking budget's bridge (STRATA_GLM_THINK_BRIDGE): said inside the reasoning just before a forced </think>
+# what an empty turn after reasoning is answered with (Service.run): an agent sends an empty turn again, a line says why
+EMPTY_TURN_NOTE = ("(The model ended its turn after thinking, without an answer or a tool call. "
+                   "Ask it to go on, or send the request again.)")
 THINK_BRIDGE = ("\n\nI have used up my thinking budget, so I stop thinking here and write the final answer now, "
                 "in the language of the user's question.\n")
 
@@ -2830,7 +2833,55 @@ class Service:
         return {"id": mid, "deleted": existed}
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+
+        A turn that reasoned and then ended (finish "stop", no client stop string) with no answer text and no tool
+        call is not handed back empty - an agent sends an empty turn again and again (Maya #1206 / #1207's idea):
+        when the reasoning ends with a call block (DeepSeek's DSML, or <tool_call>), that block's calls are the
+        turn's calls (the model wrote its call in its thinking and stopped); otherwise one line, EMPTY_TURN_NOTE,
+        is the answer.  The tokens are the same either way; only what the client is handed differs."""
+        reasoning, said = [], False
+        turn = self._run_turn(ids, thinking, tools, max_new, sampling, cancel)
+        try:
+            for kind, x in turn:
+                if kind == "event":
+                    if x.kind == "reasoning":
+                        reasoning.append(x.text)
+                    elif x.kind in ("tool_start", "tool_call") or (x.kind == "content" and x.text.strip()):
+                        said = True
+                elif kind == "done":
+                    refused = x.pop("_refused", False)
+                    if not said and not refused and x.get("finish") == "stop" and not x.get("stop_sequence") and \
+                            "".join(reasoning).strip():
+                        for ev in self._empty_turn("".join(reasoning), tools, sampling):
+                            yield "event", ev
+                yield kind, x
+        finally:
+            turn.close()                                # (a disconnect reaches the turn's own GeneratorExit at once)
+
+    def _empty_turn(self, reasoning: str, tools, sampling) -> list[Event]:
+        """What an empty turn after reasoning is handed back as (run): the calls of a call block the reasoning ends
+        with, else the note."""
+        calls = []
+        if tools and (sampling or {}).get("_no_calls") is not True:
+            ends = []
+            for i in self.stop_ids:
+                try:
+                    ends.append(self.tok.decode([i]))
+                except Exception:   # noqa: BLE001 - (a tokenizer that cannot spell it: nothing to strip)
+                    pass
+            calls = reasoning_tail_calls(reasoning, tools, tuple(ends) + tuple(self.stop_texts),
+                                         xml_calls=getattr(self, "ink_ids", None) is not None)
+        if calls:
+            print(f"[abyss] the turn ended inside its reasoning, which ends with a tool call: "
+                  f"{len(calls)} call(s) read out of it", flush=True)
+            return calls
+        print("[abyss] the turn ended after its reasoning with no answer and no tool call: a one-line note is the "
+              "answer", flush=True)
+        return [Event("content", EMPTY_TURN_NOTE)]
+
+    def _run_turn(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+        """run() without its empty-turn handling."""
         # Inkling 2 thinks at any effort level, "none" included (thinking off writes a short
         # <|content_thinking|> message in English): the reasoning is read as reasoning either way, and a turn that
         # opens with <|content_text|> has none (the message markers below)
@@ -2871,6 +2922,7 @@ class Service:
         # who closed the reasoning (usage.completion_tokens_details.reasoning_closed_by): model, budget, answer_room,
         # end_guard, loop_guard, tool_call, wrap; "unclosed" when the answer ended inside it.  None: no reasoning.
         closed_by, reasoning_tokens = None, 0
+        refused_any = False                             # tool_choice none cut a call off (run: not an empty turn)
         soft_ends, soft_max, runs = 0, self._soft_end_max(), 0
         first_last = None                               # the first engine run's DONE (the prompt's figures)
         memt, memt_done = None, None                    # MemT: this request's memory, and what its commit wrote
@@ -2983,6 +3035,7 @@ class Service:
                                     refused = any(ev.kind == "calls_refused" for ev in evs)
                                     evs = [ev for ev in evs if ev.kind != "calls_refused"]
                                     if refused:
+                                        refused_any = True
                                         print("[abyss] tool_choice none: the model started a tool call - the answer "
                                               "ends before it", flush=True)
                                     self._note(n, evs)
@@ -3021,6 +3074,8 @@ class Service:
                             text, stopped = detok.push(t), False
                             if getattr(self, "ink_ids", None) is not None and t == self.ink_ids[3]:
                                 text = ""                   # (Inkling: the reasoning's end marker is not text)
+                            elif is_think_end and parser.state != "reasoning":
+                                text = ""                   # a second </think> (the reasoning had closed): not text
                             stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
                             if (is_think_end and parser.state == "reasoning") or soft:   # the real end, or a kept end
                                 text, held, stops = held + text, "", []                  # token: past the stop scan
@@ -3042,6 +3097,7 @@ class Service:
                                     closed_by = self._closed_by(is_think_end, n, think_budget, by_room)
                             refused = any(ev.kind == "calls_refused" for ev in evs)
                             if refused:
+                                refused_any = True
                                 evs = [ev for ev in evs if ev.kind != "calls_refused"]
                                 print("[abyss] tool_choice none: the model started a tool call - the answer ends "
                                       "before it", flush=True)
@@ -3155,6 +3211,8 @@ class Service:
             done["reasoning_tokens"] = reasoning_tokens
         if memt is not None:
             done["memory"] = memt_done or {"id": memt["id"], "updated": False}
+        if refused_any:
+            done["_refused"] = True
         yield "done", done
 
     def _closed_by(self, is_think_end: bool, n: int, think_budget: int, by_room: bool) -> str:

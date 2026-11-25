@@ -10,12 +10,14 @@ import sys
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
+import serve.server as SV  # noqa: E402
 from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, engine_model_path, Service, StrataEngine, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -696,6 +698,79 @@ class ModelOpensThink(unittest.TestCase):
 
     def test_prompt_opened_think(self):
         self.assertEqual(self.answer("plan</think>Tokyo.", "<|im_start|>assistant\n<think>\n"), ("plan", "Tokyo."))
+
+
+class EmptyTurnAfterThinking(unittest.TestCase):
+    """DeepSeek V4 / V4.1 (Maya #1206 / #1207's idea): a turn that thinks and then ends with no answer and no call.
+    A call block the reasoning ends with is the turn's call; otherwise one line says what happened (an agent sends an
+    empty turn again and again); a second </think> after the reasoning closed is not answer text."""
+
+    class ThinkTok(ByteTokenizer):
+        SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+
+    TOOLS = [{"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+    DSML = ('<\uff5cDSML\uff5ctool_calls>\n<\uff5cDSML\uff5cinvoke name="get_weather">\n'
+            '<\uff5cDSML\uff5cparameter name="city" string="true">Tokyo</\uff5cDSML\uff5cparameter>\n'
+            '</\uff5cDSML\uff5cinvoke>\n</\uff5cDSML\uff5ctool_calls>')
+    DSML41 = ('<\uff5cDSML\uff5c calls>\n<\uff5cDSML\uff5c invoke name="get_weather">\n'
+              '<\uff5cDSML\uff5c parameter name="city" string="true">Tokyo</\uff5cDSML\uff5c parameter>\n'
+              '</\uff5cDSML\uff5c invoke>\n</\uff5cDSML\uff5c calls>')
+
+    def answer(self, script, tools=TOOLS, sampling=None, thinking=True):
+        tok = self.ThinkTok()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out = {"reasoning": "", "content": "", "calls": [], "finish": None}
+        prompt = "<|im_start|>assistant\n<think>\n" if thinking else "<|im_start|>assistant\n"
+        for kind, v in svc.run(tok.encode(prompt, parse_special=True), thinking, tools, 3000, sampling or {},
+                               threading.Event()):
+            if kind == "event" and v.kind == "tool_call":
+                out["calls"].append((v.call.name, v.call.arguments))
+            elif kind == "event" and v.kind in out:
+                out[v.kind] += v.text
+            elif kind == "done":
+                out["finish"] = v["finish"]
+        return out
+
+    def test_dsml_call_that_ends_the_reasoning(self):
+        for block in (self.DSML, self.DSML41):
+            out = self.answer("I will look it up.\n" + block + "</think>\n\n")
+            self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})])
+            self.assertEqual(out["content"], "")
+
+    def test_tool_call_form_in_unclosed_reasoning(self):
+        call = '<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>'
+        with unittest.mock.patch.dict(os.environ, {"STRATA_SOFT_END": "0"}):   # (no kept end: the turn ends there)
+            out = self.answer("look it up " + call + "\n")
+        self.assertEqual(out["calls"], [("get_weather", {"city": "Tokyo"})])
+
+    def test_call_thought_over_is_not_read(self):
+        out = self.answer("maybe " + self.DSML + " no, I can answer myself.</think>\n")
+        self.assertEqual(out["calls"], [])
+        self.assertEqual(out["content"], SV.EMPTY_TURN_NOTE)
+
+    def test_empty_answer_gets_the_note(self):
+        out = self.answer("plan</think>\n\n")
+        self.assertEqual((out["content"], out["calls"], out["finish"]), (SV.EMPTY_TURN_NOTE, [], "stop"))
+
+    def test_undeclared_tool_and_tool_choice_none(self):
+        self.assertEqual(self.answer("x " + self.DSML + "</think>", tools=[{"name": "other"}])["content"],
+                         SV.EMPTY_TURN_NOTE)
+        out = self.answer("x " + self.DSML + "</think>", sampling={"_no_calls": True})
+        self.assertEqual((out["content"], out["calls"]), (SV.EMPTY_TURN_NOTE, []))
+
+    def test_answers_left_alone(self):
+        self.assertEqual(self.answer("plan</think>Tokyo.")["content"], "Tokyo.")
+        self.assertEqual(self.answer("", thinking=False)["content"], "")      # (no reasoning: not this case)
+
+    def test_kept_end_markers_after_the_block(self):
+        from serve.frontend import reasoning_tail_calls
+        calls = reasoning_tail_calls("x " + self.DSML + "<|im_end|>\n<|im_end|>", self.TOOLS, ("<|im_end|>",))
+        self.assertEqual([(e.call.name, e.call.arguments) for e in calls], [("get_weather", {"city": "Tokyo"})])
+        self.assertEqual(reasoning_tail_calls("x " + self.DSML + " then more", self.TOOLS), [])
+
+    def test_second_think_end_is_not_text(self):
+        out = self.answer("plan</think>Tokyo.</think> Sunny.")
+        self.assertEqual((out["reasoning"], out["content"]), ("plan", "Tokyo. Sunny."))
 
 
 class InklingThinkingOff(unittest.TestCase):

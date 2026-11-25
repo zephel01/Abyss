@@ -1763,3 +1763,29 @@ class OutputParser:
             self.buf = ""
             self._reset_body()
         return out
+
+
+def reasoning_tail_calls(reasoning: str, tools: list[dict] | None, ends: tuple[str, ...] = (),
+                         xml_calls: bool = False) -> list[Event]:
+    """The tool calls of a call block the reasoning ENDS with (DeepSeek V4 / V4.1's DSML block, or <tool_call> ...
+    </tool_call>), for a turn that then ended with no answer and no call (Service.run): the model wrote its call in its
+    thinking and stopped there.  Only a block at the very end counts (whitespace and the turn's end-marker texts
+    `ends` - kept end tokens - may follow it); a call written earlier and thought over again is not one.  A block
+    that does not parse, or names no declared tool, gives no calls."""
+    if not tools:
+        return []
+    t = reasoning.rstrip()
+    while True:                                   # (the end markers a soft end kept as text, and spaces between)
+        e = next((s for s in ends if s and t.endswith(s)), None)
+        if e is None:
+            break
+        t = t[:-len(e)].rstrip()
+    for opening, close in ((DSML_CALLS, DSML_CALLS_END), (DSML41_CALLS, DSML41_CALLS_END), (CALL_START, CALL_END)):
+        if t.endswith(close):
+            i = t.rfind(opening)
+            if i < 0:
+                return []
+            p = OutputParser(thinking=False, tools=tools, xml_calls=xml_calls)
+            names = {x.get("name") for x in tools}
+            return [ev for ev in p.feed(t[i:]) + p.finish() if ev.kind == "tool_call" and ev.call.name in names]
+    return []
