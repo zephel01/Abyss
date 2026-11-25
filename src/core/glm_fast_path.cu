@@ -1247,7 +1247,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     const char* q4m = getenv("STRATA_Q4X_MTP");
     const char* q4f = getenv("STRATA_Q4X_DFLASH");   // (DFlash 2's block reads y's embedding the same way)
     const bool q4_draft = g.q4x && l1_ == g.n_layers &&
-                          ((q4m != nullptr && q4m[0] != '\0' && getenv("STRATA_GLM_NO_MTP") == nullptr) ||
+                          ((q4m != nullptr && q4m[0] != '\0' && !strata::core::env_on("STRATA_GLM_NO_MTP")) ||
                            (q4f != nullptr && q4f[0] != '\0'));
     const bool glm_draft = g.arch == 0 && mtp_il_ >= 0 && F->q35_pend_h != nullptr;   // (the one-GPU NextN drafter)
     if ((g.qwen35() || glm_draft) && (mtp_il_ >= 0 || q4_draft) && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
@@ -2075,7 +2075,7 @@ bool Glm5Model::fast_setup(std::string& err) {
 #endif
                 }
                 remaining = total;
-                remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
+                remaining_layers = g.n_layers - g.dense_lead + (strata::core::env_on("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
             budget = l1_ >= g.n_layers ? remaining
@@ -8441,7 +8441,7 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
-    if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
+    if (fast_ == nullptr || split_next_ == nullptr || strata::core::env_on("STRATA_GLM_NO_SPEC")) return false;
     // (the glm5 layers' draft step - fast_mtp's DSA attention, the KDA state backups: not the qwen35 family's, #55)
     if (g_.qwen35()) return false;
     const Glm5Model* last = this;

@@ -21,6 +21,7 @@
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 
+#include "strata/core/knobs.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -1217,7 +1218,7 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 // ---------------------------------------------------------------- setup
 bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     (void) err;
-    if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
+    if (strata::core::env_on("STRATA_GLM_NO_PREFILL")) return true;
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;

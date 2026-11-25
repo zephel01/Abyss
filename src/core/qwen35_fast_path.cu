@@ -436,7 +436,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     if (g.q4x && dfl_set && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0')
         std::fprintf(stderr, "qwen4exp: STRATA_Q4X_DFLASH is set - the MTP layer (STRATA_Q4X_MTP) is not loaded\n");
     if (g.q4x && !dfl_set && q4d_ == nullptr && l1_ == g.n_layers && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
-        getenv("STRATA_GLM_NO_MTP") == nullptr && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err)) {
+        !strata::core::env_on("STRATA_GLM_NO_MTP") && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err)) {
         // (refused before it allocated anything - a model its files do not fit: run without the drafter)
         if (q4d_ != nullptr) return false;
         std::fprintf(stderr, "qwen4exp: %s - running without the MTP drafter\n", err.c_str());

@@ -28,6 +28,11 @@ int main() {
     const long long ks[][3] = {{5, 0, 100}, {5, 95, 100}, {5, 96, 100}, {5, 99, 100}, {5, 100, 100}, {5, 101, 100},
                                {3, 97, 100}, {5, -1, 100}, {0, 10, 100}};
     for (const auto& k : ks) std::printf("k:%lld,%lld,%lld=%d\n", k[0], k[1], k[2], draft_kmax((int) k[0], k[1], k[2]));
+    const char* sw[] = {"", " ", "0", "1", "off", "OFF", "false", "No", " 0 ", "on", "yes", "true", "2", "x"};
+    for (const char* v : sw) std::printf("s:%s=%d%d\n", v, env_on("STRATA_TEST_SW", false, v) ? 1 : 0,
+                                         env_on("STRATA_TEST_SW", true, v) ? 1 : 0);
+    std::printf("s:<unset>=%d%d\n", env_on("STRATA_TEST_SW_UNSET_X", false) ? 1 : 0,
+                env_on("STRATA_TEST_SW_UNSET_X", true) ? 1 : 0);
     return 0;
 }
 """
@@ -69,6 +74,14 @@ class KnobTests(unittest.TestCase):
         self.assertIn("STRATA_TEST_KNOB=abc is not a number: using 6", self.err)
         self.assertIn("STRATA_TEST_KNOB=1,0 is not a number: using 0.73", self.err)
         self.assertIn("STRATA_TEST_KNOB=200 is outside 0..64: using 64", self.err)
+
+    def test_env_on_reads_the_value(self):
+        got = dict(ln[2:].rsplit("=", 1) for ln in self.out if ln.startswith("s:"))
+        for v in ("", " ", "0", "off", "OFF", "false", "No", " 0 "):
+            self.assertEqual(got[v], "00", repr(v))     # off, whatever the default
+        for v in ("1", "on", "yes", "true", "2", "x"):
+            self.assertEqual(got[v], "11", repr(v))     # on
+        self.assertEqual(got["<unset>"], "01")          # unset: the default
 
     def test_draft_kmax_stops_at_the_context(self):
         got = dict(ln[2:].split("=") for ln in self.out if ln.startswith("k:"))

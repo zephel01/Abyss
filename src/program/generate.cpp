@@ -2032,7 +2032,7 @@ static int glm_parallel_serve(strata::core::Glm5Model& model, const Options& o, 
                 if (l.req) continue;
                 size_t len = 0;
                 if (!l.snap.empty() && l.ns == r->ns && l.snap.size() < r->prompt.size() &&
-                    std::equal(l.snap.begin(), l.snap.end(), r->prompt.begin()) && getenv("STRATA_GLM_NO_REUSE") == nullptr)
+                    std::equal(l.snap.begin(), l.snap.end(), r->prompt.begin()) && !strata::core::env_on("STRATA_GLM_NO_REUSE"))
                     len = l.snap.size();
                 if (best < 0 || len > best_len || (len == best_len && l.used < lanes[(size_t) best].used)) {
                     best = j;
@@ -2873,10 +2873,10 @@ static int glm_pack_generate(const Options& o) {
     // (MemT: one conversation in the model - a kept conversation's KV belongs to the memory it was read with)
     int slot_max = model.fast() && !model.geometry().dsv4() && !model.geometry().is_hy4() && (!q35_path || q35_slot_ok) &&
                            !model.geometry().memt &&
-                           getenv("STRATA_GLM_NO_REUSE") == nullptr
+                           !strata::core::env_on("STRATA_GLM_NO_REUSE")
                        ? (int) env_num("STRATA_GLM_SLOTS", q35_path ? 8 : 4)
                        : 0;
-    if (q35_path && !q35_slot_ok && getenv("STRATA_GLM_NO_REUSE") == nullptr && env_num("STRATA_GLM_SLOTS", 8) > 0)
+    if (q35_path && !q35_slot_ok && !strata::core::env_on("STRATA_GLM_NO_REUSE") && env_num("STRATA_GLM_SLOTS", 8) > 0)
         std::fprintf(stderr, "qwen35 slots: off (%s) - one conversation in the model, as before\n", q35_slot_why.c_str());
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
     // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
@@ -3014,7 +3014,7 @@ static int glm_pack_generate(const Options& o) {
         if (model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
             std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
             img_hash(snap_tokens.size()) == snap_img_hash && (slot_max <= 0 || snap_ns == req_ns) &&
-            getenv("STRATA_GLM_NO_REUSE") == nullptr && model.snapshot_restore())
+            !strata::core::env_on("STRATA_GLM_NO_REUSE") && model.snapshot_restore())
             reuse = snap_tokens.size();
         if (reuse == 0 && slot_max > 0 && abl_req == abl_def) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it

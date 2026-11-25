@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/kernels/token_ban.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -5595,8 +5596,8 @@ static int hc_mode(int n_embd) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
-        mode = (getenv("STRATA_GLM_HC1") == nullptr && per * sms >= n_embd / HC2_EB) ? 2 : 1;
-        if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && hc3_width(n_embd) && per3 * sms >= n_embd / HC2_EB)
+        mode = (!strata::core::env_on("STRATA_GLM_HC1") && per * sms >= n_embd / HC2_EB) ? 2 : 1;
+        if (mode == 2 && !strata::core::env_on("STRATA_GLM_HC2") && hc3_width(n_embd) && per3 * sms >= n_embd / HC2_EB)
             mode = 3;
     }
     return mode;
