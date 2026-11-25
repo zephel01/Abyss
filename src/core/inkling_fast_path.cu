@@ -26,6 +26,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/core/graph.hpp"
+#include "strata/core/knobs.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -114,9 +115,10 @@ struct Ink {
     struct TokGraph {
         CapturedGraph g;
         uint64_t requests = 0;   // (the routes it posts: FastState::expected)
+        bool bad = false;        // its capture / instantiate failed: that key's tokens are launches (the same kernels)
     };
     std::map<std::tuple<int, int, unsigned long long, int, float, int>, TokGraph> graphs;   // (+ the lane: its caches)
-    uint64_t graph_caps = 0, graph_runs = 0;
+    uint64_t graph_caps = 0, graph_runs = 0, graph_eager = 0;
     // the verify window in one CUDA graph too (STRATA_INK_WIN_GRAPH): a graph per (width, the last column's full /
     // window layers' attention splits, the CPU-lane plan, the tail skip, the routes' by-value settings); the first
     // position from pos_d.  bad: its capture failed - that key's windows stay launches
@@ -576,8 +578,10 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
 void Glm5Model::ink_free() {
     if (fast_ == nullptr || fast_->ink == nullptr) return;
     if (!fast_->ink->graphs.empty() || fast_->ink->graph_caps > 0)
-        std::fprintf(stderr, "inkling: CUDA%d token graphs: %llu captured, %llu runs\n", dev_,
-                     (unsigned long long) fast_->ink->graph_caps, (unsigned long long) fast_->ink->graph_runs);
+        std::fprintf(stderr, "inkling: CUDA%d token graphs: %llu captured, %llu runs%s\n", dev_,
+                     (unsigned long long) fast_->ink->graph_caps, (unsigned long long) fast_->ink->graph_runs,
+                     fast_->ink->graph_eager > 0 ? (", " + std::to_string(fast_->ink->graph_eager) +
+                                                     " tokens launched (no graph)").c_str() : "");
     if (fast_->ink->wgraph_caps + fast_->ink->wgraph_eager > 0)
         std::fprintf(stderr, "inkling: CUDA%d window graphs: %llu captured (%llu refused), %llu runs, %llu windows launched\n",
                      dev_, (unsigned long long) fast_->ink->wgraph_caps, (unsigned long long) fast_->ink->wgraph_bad,
@@ -1048,35 +1052,55 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
             if (K.graphs.size() >= 96) K.graphs.clear();
             Ink::TokGraph tg;
             const uint64_t e0 = F->expected;
-            if (!tg.g.begin(s, err)) return false;
-            bool ok;
-            {   // (PDL on: the graph keeps the launches' programmatic edges)
-                strata::kernels::PdlCapture pc(strata::kernels::pdl_enabled());
-                ok = run();
+            // STRATA_TEST_INK_GRAPH_FAIL=1 (tests only): every capture counts as failed - the launches below run
+            static const bool test_fail = strata::core::env_on("STRATA_TEST_INK_GRAPH_FAIL");
+            bool ok = tg.g.begin(s, err);
+            if (ok) {
+                {   // (PDL on: the graph keeps the launches' programmatic edges)
+                    strata::kernels::PdlCapture pc(strata::kernels::pdl_enabled());
+                    ok = run();
+                }
+                const cudaError_t ce = cudaGetLastError();
+                if (!ok || ce != cudaSuccess || test_fail) {
+                    cudaGraph_t junk = nullptr;
+                    cudaStreamEndCapture(s, &junk);
+                    if (junk) cudaGraphDestroy(junk);
+                    if (err.empty()) err = ce != cudaSuccess ? cudaGetErrorString(ce) : test_fail ? "the test switch" : "";
+                    ok = false;
+                } else {
+                    ok = tg.g.end(s, err);   // (end + instantiate)
+                }
             }
-            const cudaError_t ce = cudaGetLastError();
-            if (!ok || ce != cudaSuccess) {
-                cudaGraph_t junk = nullptr;
-                cudaStreamEndCapture(s, &junk);
-                if (junk) cudaGraphDestroy(junk);
-                F->expected = e0;
-                if (err.empty()) err = std::string("inkling: the token graph's capture: ") + cudaGetErrorString(ce);
-                return false;
-            }
-            if (!tg.g.end(s, err)) {
-                F->expected = e0;
-                return false;
-            }
+            cudaGetLastError();               // (a failed capture's error is not the token's: the launches decide)
             tg.requests = F->expected - e0;
             F->expected = e0;
+            if (!ok) {
+                // a token graph that cannot be made (out of memory for the instantiate, a capture error): this key's
+                // tokens run as launches - the same kernels in the same order - instead of failing the token
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "inkling: the token graph did not capture%s%s - launches for it\n",
+                                 err.empty() ? "" : ": ", err.c_str());
+                }
+                err.clear();
+                tg.g = CapturedGraph();   // (a graph end() made without its exec: freed)
+                tg.bad = true;
+            } else {
+                ++K.graph_caps;
+            }
             it = K.graphs.emplace(key, std::move(tg)).first;
-            ++K.graph_caps;
             graph_cap_ = true;
         }
-        if (!it->second.g.launch(s, err)) return false;
-        inkd_tok_taps();   // (the taps inside the graph: their rows' bookkeeping on the host)
-        F->expected += it->second.requests;
-        ++K.graph_runs;
+        if (it->second.bad) {
+            if (!run()) return false;
+            ++K.graph_eager;
+        } else {
+            if (!it->second.g.launch(s, err)) return false;
+            inkd_tok_taps();   // (the taps inside the graph: their rows' bookkeeping on the host)
+            F->expected += it->second.requests;
+            ++K.graph_runs;
+        }
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
