@@ -341,7 +341,9 @@ MODELS = {
     "memt-flash": {"repo": "zephel01/MemT-1.0-Flash-32G96G-GGUF", "quant": "32G96G", "quants": ("32G96G",), "folder": "",
                    "prefix_file": "MemT-1.0-Flash-32G96G-", "model_name": "memt-1.0-flash", "prefix": "memt-flash",
                    "title": "MemT-1.0-Flash", "env": {}, "gb": 106, "pack_args": ["--compat-bf16", "--first-wins"],
-                   "base": ("v4", "32G96G"), "nvidia_only": True, "context": 16384},
+                   "base": ("v4", "32G96G"), "nvidia_only": True, "context": 16384,
+                   # MemTensor/MemT-1.0-Flash generation_config.json (2026-11-25): temperature 1.0, top_p 1.0
+                   "sampling": {"temperature": 1.0, "top_p": 1.0}},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
