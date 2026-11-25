@@ -3714,6 +3714,11 @@ static int glm_pack_generate(const Options& o) {
                 return v == nullptr ? 256 : std::max(0, std::atoi(v));
             }();
             const bool ink_gate = ink_dsp && ink_gate_env;
+            // STRATA_INK_DSPARK_GATE_LOG=2: every step too (its kind, drafts, tokens, ms)
+            static const bool ink_glog2 = [] {
+                const char* v = std::getenv("STRATA_INK_DSPARK_GATE_LOG");
+                return v != nullptr && std::atoi(v) >= 2;
+            }();
             int ink_skip = ink_gate ? ink_first : 0, ink_back = 0, ink_n = 0, ink_skips = 0;
             double ink_tok = 0.0, ink_ms = 0.0;
             constexpr int kInkProbe = 8;
@@ -4045,6 +4050,9 @@ static int glm_pack_generate(const Options& o) {
                         rate_add(1.0, std::max(1e-3, ms_since(td)));
                     if (use != 0 && !capd) ink_gate_add(1.0, std::max(1e-3, ms_since(td)));
                     if (ink_off && !capd) ink_base_add(std::max(1e-3, ms_since(td)));   // (a plain step: the gate's base)
+                    if (ink_gate && ink_glog2)
+                        std::fprintf(stderr, "ink step: pos %lld %s k 0 came 1 %.2f ms\n", (long long) model.position(),
+                                     use != 0 ? "draft" : ink_off ? (ink_skip > 0 ? "skip" : "probe") : "plain", ms_since(td));
                     if (ink_gate && use != 0 && ink_skip == 0) ink_skip = ink_after0;   // (nothing kept: a short pause)
                     continue;
                 }
@@ -4112,6 +4120,9 @@ static int glm_pack_generate(const Options& o) {
                     rate_add((double) came.size(), std::max(1e-3, ms_since(td)));
                 const bool capd = model.graph_captured();   // (a window that captured its graph: not its cost)
                 if (!rep && use != 0 && !capd) ink_gate_add((double) came.size(), std::max(1e-3, ms_since(td)));
+                if (ink_gate && ink_glog2)
+                    std::fprintf(stderr, "ink step: pos %lld %s k %d came %zu %.2f ms (window %.2f)\n", (long long) model.position(),
+                                 rep ? "rep" : "draft", k, came.size(), ms_since(td), mw);
                 ms_win += mw;
                 if (d_timed && !capd) cw_add(k + 1, mw);
                 // STRATA_DS4_DSPARK_LOG=<n>: every n windows, their mean time and size (the decode's drift)
