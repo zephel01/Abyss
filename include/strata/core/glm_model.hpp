@@ -907,6 +907,7 @@ public:
     // each of n distinct lanes (2..kVerifyMax) as one window - every row the bits that lane's token path gives - and
     // moves each lane on; ink_batch_pick(t, sp) is row t's token then (greedy: its argmax; else its sampler, a row)
     static int ink_parallel_env();      // STRATA_INK_PARALLEL (--parallel): 1 default, -1 auto
+    static bool ink_kv_lend_env();      // STRATA_INK_KV_LEND: the full layers' KV lent to the experts (elastic KV)
     int ink_par_ = 1;                   // the lanes allocated
     // the pool pin key's part own_b does not see (glm_pool_pin.hpp): the qwen35 family's caches sit in qwen35_state_,
     // outside state_bytes_ - Inkling's context length and --parallel setting, the others' (Qwen3.5 / 3.8, Ornith,
