@@ -58,6 +58,7 @@
 #include <fstream>
 #include <functional>
 #include <sstream>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -3880,10 +3881,36 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     for (int s = 0; s < R.n && (int) cal_all.size() < 4 * kCalSets; ++s)
         if (R.st[(size_t) s] == FastState::kRHold && R.key[(size_t) s] / g.n_expert == il_cal)
             cal_all.push_back(R.base + (size_t) s * R.stride);
+    // elastic KV with every expert in VRAM at start (the elastic ranks hold the rest): the RAM tier holds nothing yet,
+    // but the experts go to it once the KV takes the ranks back (a long prompt) - the lane is timed on copies of that
+    // layer's VRAM experts in a pinned buffer of this call's (without it a 250K prompt on an RTX 3090 sent every
+    // RAM-tier expert over PCIe: 28.4 tok/s against 40.6 with the fixed layout's lane)
+    struct HostFree { void operator()(uint8_t* p) const { if (p != nullptr) cudaFreeHost(p); } };
+    std::unique_ptr<uint8_t, HostFree> cal_tmp;
+    int cal_tmp_id = -1;
+    if (cal_all.empty() && ekv_lent() > 0) {
+        const auto& P = F->lp[(size_t) il_cal];
+        const size_t blob = F->L[(size_t) il_cal].blob;
+        std::vector<int> src;
+        for (int s = 0; s < P.n_main && (int) src.size() < 4 * kCalSets; ++s)
+            if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0) src.push_back(s);
+        uint8_t* hb = nullptr;
+        if (!src.empty() && cudaHostAlloc((void**) &hb, src.size() * R.stride, cudaHostAllocMapped) == cudaSuccess) {
+            cal_tmp.reset(hb);
+            bool ok = true;
+            for (size_t i = 0; i < src.size() && ok; ++i)
+                ok = cudaMemcpy(hb + i * R.stride, P.slot_ptr(src[i]), blob, cudaMemcpyDeviceToHost) == cudaSuccess;
+            if (ok) {
+                for (size_t i = 0; i < src.size(); ++i) cal_all.push_back(hb + i * R.stride);
+                cal_tmp_id = P.key[(size_t) src[0]];
+            }
+        }
+        cudaGetLastError();
+    }
     if (cal_all.empty()) return true;   // nothing in RAM: the lane would never run
     const uint8_t* cal = cal_all[0];
-    int cal_id = 0;   // (its expert id: an NVFP4 layer's check applies that expert's scales)
-    for (int s = 0; s < R.n; ++s)
+    int cal_id = cal_tmp_id >= 0 ? cal_tmp_id : 0;   // (its expert id: an NVFP4 layer's check applies that expert's scales)
+    for (int s = 0; s < R.n && cal_tmp_id < 0; ++s)
         if (R.base + (size_t) s * R.stride == cal) cal_id = R.key[(size_t) s] % g.n_expert;
     const int n_cal = (int) std::min<size_t>(4, cal_all.size());
     const int n_sets = (int) cal_all.size() / n_cal;   // (fewer than 64 held: the sets repeat sooner)

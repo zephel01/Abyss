@@ -448,6 +448,26 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
              ink_al(3 * E * 4) + 3 * ink_al(E * 4) + 3 * ink_al(2 * E / 32 * 36) + ink_al(HD * 4) * 2 + ink_al(KV * 4) * 2 +
              ink_al(H * ik::kRel * 4) + ink_al(H * 4) + ink_al(KVh * ik::kConv * 4) * 2 + ink_al(HD * 4) + ink_al(E * 4) +
              ink_al(part * 4) + ink_al(HD / 32 * 36) + ink_al(64) + ink_al(ik::mix_tok_floats() * 4) + 256;
+    // KV lending (elastic KV, glm_elastic.cu): the full layers' caches - the ones that span the whole context - on
+    // CUDA's virtual memory API, mapped as the conversation reaches them; the part no position has reached yet holds
+    // more expert slots a layer (the elastic ranks), and those experts leave before the KV maps their memory
+    // (kv_ensure: a prompt's, a token's and a verify window's rows, conversation by conversation).  The window
+    // layers' rings and the conv states stay here.  Only where an expert is read from changes, so the tokens are the
+    // fixed layout's.  STRATA_INK_KV_LEND=0 (or --kv-elastic 0): the caches allocated whole, as before; --parallel
+    // lanes keep the fixed layout (each lane's caches are their own allocation, sized against the VRAM left)
+    std::vector<size_t> erows;
+    std::vector<void*> eptr;
+    if (ink_kv_lend_env() && ink_parallel_env() == 1) {
+        for (int sl = 0; sl < NS; ++sl)
+            if (!K.L[(size_t) g.ink_phys(sl)].swa && ring_of(g.ink_phys(sl)) == ctx) {
+                erows.push_back(KV * 2);
+                erows.push_back(KV * 2);
+            }
+        if (!erows.empty() && ekv_kv_setup(erows, eptr))
+            for (size_t r : erows) bytes -= ink_al(ctx * r);
+        else
+            eptr.clear();
+    }
     if (cudaMalloc(&K.base, bytes) != cudaSuccess) {
         cudaGetLastError();
         err = "inkling: the slots and scratch (" + std::to_string(bytes >> 20) + " MB for " + std::to_string(ctx) +
@@ -463,11 +483,17 @@ bool Glm5Model::ink_alloc(size_t& bytes_out, bool place, uint8_t*& at_out, std::
         return p;
     };
     K.S.assign((size_t) NS, Ink::Slot{});
+    size_t ei = 0;
     for (int sl = 0; sl < NS; ++sl) {
         auto& S = K.S[(size_t) sl];
         S.ring = (int) ring_of(g.ink_phys(sl));
-        S.kc = (uint16_t*) take((size_t) S.ring * KV * 2);
-        S.vc = (uint16_t*) take((size_t) S.ring * KV * 2);
+        if (!eptr.empty() && !K.L[(size_t) g.ink_phys(sl)].swa && (size_t) S.ring == ctx) {   // (elastic: above)
+            S.kc = (uint16_t*) eptr[ei++];
+            S.vc = (uint16_t*) eptr[ei++];
+        } else {
+            S.kc = (uint16_t*) take((size_t) S.ring * KV * 2);
+            S.vc = (uint16_t*) take((size_t) S.ring * KV * 2);
+        }
         S.conv = (float*) take(K.conv_floats * 4);
     }
     for (int i = 0; i < Ink::kBufs; ++i) K.hb[i] = (float*) take(E * 4);
@@ -1133,6 +1159,15 @@ void Glm5Model::ink_win_commit(int64_t pos) {
 }
 
 // ---------------------------------------------------------------- the batched decode (--parallel)
+// STRATA_INK_KV_LEND (default 1): the full layers' KV on the elastic KV (ink_alloc); 0 allocates it whole as before
+bool Glm5Model::ink_kv_lend_env() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_INK_KV_LEND");
+        return v == nullptr || *v == 0 || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 int Glm5Model::ink_parallel_env() {
     static const int n = [] {
         const char* v = getenv("STRATA_INK_PARALLEL");
