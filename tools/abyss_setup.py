@@ -1488,13 +1488,17 @@ def main() -> int:
         S.ok(f"RAM {S.ram_gb():.0f} GB (made for a 32 GB GPU + 96 GB RAM, as its base L97: with VRAM, ~100 GB holds every "
              "expert; less reads from the SSD)")
         if (gpus[0].get("vram_gb") or 0) < 30:
-            S.warn(f"MemT-1.0-Flash is measured on a 32 GB GPU only (RTX 5090): writing a memory needs ~4.1 GB at the end of "
-                   "the expert pool (a 32 GB GPU has 13 GB there) - with less the engine refuses the write with a message")
+            S.say("  MemT-1.0-Flash on an RTX 5090 held to 24 GB: decode 67.7 tok/s without a memory, 61.2 with one; the write")
+            S.say("  (~4.1 GB at the end of the expert pool) worked there")
+            if (gpus[0].get("vram_gb") or 0) < 23:
+                S.warn("MemT-1.0-Flash under 24 GB is not measured: writing a memory needs ~4.1 GB at the end of the expert pool"
+                       " - with less the engine refuses the write with a message")
     elif a.model == "memt-nano":
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: the experts that do not fit the GPU go to RAM)")
         if (gpus[0].get("vram_gb") or 0) < 30:
             S.say("  MemT-1.0-Nano on an RTX 5090 held to 16 / 12 / 8 GB decoded 256 / 237 / 184 tok/s without a memory,")
-            S.say("  244 / 212 / 175 with one (123 GB RAM; at 8 GB 17.7 GB of experts in RAM - a 32 GB-RAM PC is not measured)")
+            S.say("  244 / 212 / 175 with one (123 GB RAM; at 8 GB 17.7 GB of experts in RAM - a 32 GB-RAM PC is not measured);")
+            S.say("  an RTX 3090 (24 GB) 148 / 140 tok/s")
         if S.ram_gb() < 30:
             S.warn("MemT-1.0-Nano keeps the experts that do not fit the GPU in RAM: with under 32 GB of RAM it is not measured")
     elif model.get("vram_ctx"):

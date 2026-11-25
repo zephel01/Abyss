@@ -27,6 +27,9 @@ memt-nano`; beta, NVIDIA, one GPU) from our prebuilt GGUFs - no trench-gguf, no 
   to 16 / 12 / 8 GB with `STRATA_GLM_VRAM_GB` (the rest in the RAM tier and the CPU lane), a 4K prompt + 512 tokens,
   median of 3: decode 256.2 / 237.1 / 184.2 tok/s without a memory, 244.3 / 211.8 / 175.3 with one (32 GB: 298.2 /
   270.0 in the same normal mode). At 8 GB 17.7 GB of experts were in RAM.
+  An RTX 3090 (24 GB, USB4): 147.8 / 140.4 tok/s, every expert in VRAM.
+- MemT-1.0-Flash on an RTX 5090 held to 24 GB, measured: decode 67.7 tok/s without a memory, 61.2 with one; the memory
+  write (about 4.1 GB at the end of the expert pool) works there (3.3-3.7 s for a 325-token turn).
 
 ## v1.3.205 - 2026-11-25
 

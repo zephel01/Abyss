@@ -1211,6 +1211,7 @@ x4) + 123 GB RAM, held to a smaller GPU with `STRATA_GLM_VRAM_GB`, a 4K prompt +
 | 16 GB | 256.2 / 244.3 | 4,219 / 4,193 |
 | 12 GB | 237.1 / 211.8 | 3,620 / 3,575 |
 | 8 GB | 184.2 / 175.3 | 2,846 / 2,804 |
+| an RTX 3090 (24 GB, USB4 3.8 GB/s; RAM tier 20 GB, all experts in VRAM) | 147.8 / 140.4 | 3,209 / 3,009 |
 
 At 8 GB the RAM tier held 17.7 GB of experts; a 32 GB-RAM PC and a DDR5 desktop are not measured.
 
@@ -1342,6 +1343,9 @@ tokens, a warm-up run then the median of 3; `bench/MEASURE.md`):
 
 The memory-on cost is mostly the read itself (the pool's VRAM hit is 77-79% against 81% off). Writing a 325-token turn:
 `COMMIT` 3.3-3.5 s (the replay 1.8-1.9 s of it), then the save 0.7-2.7 s; switching memories (`LOAD`) 1.2-1.4 s.
+
+The same card held to 24 GB (`STRATA_GLM_VRAM_GB=24`, the same runs): decode 67.7 tok/s memory off, 61.2 on (-10%),
+prompts 841 / 757 tok/s; the write worked there (`COMMIT` 3.3-3.7 s, the save 0.7-0.9 s). Under 24 GB is not measured.
 
 Checked on the RTX 5090 against a float64 numpy forward written from the HF code (`recipes/memt-flash/ref_block.py`),
 with the engine's own inputs (layers 4 / 22 / 42):
