@@ -104,7 +104,18 @@ int main(int argc, char** argv) {
             check(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "fp16_to_fp32");
         }
         // the type table: ids, block geometry and names equal ggml's (ggml's own count included)
-        for (int t = 0; t < qt::COUNT; ++t) {
+        // ggml's own count: ids at and past it are ours only (PTQ1_0 = 143, PrismML's; the rest unused)
+        int ggml_count = 0;
+        {
+            int64_t b;
+            size_t sz;
+            const char* nm;
+            while (ggml_count < qt::COUNT && kc::ggml_base_type_info(ggml_count, &b, &sz, &nm)) ++ggml_count;
+        }
+        check(ggml_count == qt::Q2_0 + 1, "ggml's type count " + std::to_string(ggml_count) + " (own ggml ids end at Q2_0)");
+        for (int t = ggml_count; t < qt::COUNT; ++t)
+            check(t == qt::PTQ1_0 || qt::blck_size(t) == 0, "own type past ggml's " + std::to_string(t));
+        for (int t = 0; t < ggml_count; ++t) {
             int64_t b = 0;
             size_t sz = 0;
             const char* nm = nullptr;
@@ -114,14 +125,8 @@ int main(int argc, char** argv) {
                   "type table " + std::to_string(t) + " (ggml " + nm + " " + std::to_string(b) + "/" + std::to_string(sz) +
                       ", own " + qt::type_name(t) + " " + std::to_string(qt::blck_size(t)) + "/" + std::to_string(qt::type_size(t)) + ")");
         }
-        {
-            int64_t b;
-            size_t sz;
-            const char* nm;
-            check(!kc::ggml_base_type_info(qt::COUNT, &b, &sz, &nm), "ggml has more types than qtypes (COUNT)");
-        }
-        // dequantizers
-        for (int t = 0; t < qt::COUNT; ++t) {
+        // dequantizers (ggml's types only: ggml has no PTQ1_0 to compare with)
+        for (int t = 0; t < ggml_count; ++t) {
             const qt::Traits* tr = qt::traits(t);
             if (tr == nullptr || tr->to_float == nullptr || t == qt::Q8_K || t == qt::F32) continue;
             const int64_t n = qt::blck_size(t) * 64;
