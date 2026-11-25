@@ -139,6 +139,24 @@ RAON_PATTERNS = (
 GIGACHAT4_PATTERNS = GPT4O_PATTERNS
 
 
+# The `ernie55` pre-tokenizer (baidu ERNIE 5.5, transcribed from its tokenizer.json's Sequence; no llama.cpp type):
+#   1. Digits (individual_digits false): every run of numeric characters (Rust char::is_numeric = Nd | Nl | No) apart;
+#   2. Nd runs cut into 510-digit pieces, the first one the remainder (\G is where the last match ended);
+#   3. a 4+ digit run whose length is not a multiple of 3: its leading 1-2 digits apart (right-aligned groups);
+#   4. then 3 digits at a time from the left - with 3., a number splits right-aligned: 1234567 -> 1 / 234 / 567;
+#   5. CJK ideograph + kana runs apart; 6. the GPT-like expression of joyai-llm's third step.
+# Onig (Ruby syntax) reads `\p{Nd}{3}+` as (\p{Nd}{3})+ - Python's regex reads it as possessive {3}, so it is spelled
+# (?:\p{Nd}{3})+ here; Onig's `\z` is `\Z` in Python (the very end; `$` only ever sees digit-only pieces at step 2).
+ERNIE55_PATTERNS = (
+    r"\p{N}+",
+    r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}",
+    r"\A\p{Nd}{1,2}(?=(?:\p{Nd}{3})+\Z)",
+    r"\A\p{Nd}{3}|\G\p{Nd}{3}",
+    JOYAI_PATTERNS[1],
+    JOYAI_PATTERNS[2],
+)
+
+
 def split_sequential(text: str, pats) -> list[str]:
     pieces = [text]
     for pat in pats:
@@ -169,9 +187,9 @@ class Tokenizer:
         if pre == "hunyuan-dense":   # (Tencent Hy-MT3: llama-vocab.cpp gives it hy_v4's three expressions, no clean_spaces)
             pre = self.pre = "hy_v4"
         if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2", "raon",
-                       "gigachat4"):
+                       "gigachat4", "ernie55"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
-                             "hy_v4, inkling2, bailingmoe2, raon, gigachat4" % pre)
+                             "hy_v4, inkling2, bailingmoe2, raon, gigachat4, ernie55" % pre)
         self.nfc = pre == "raon"   # (its tokenizer.json's NFC normalizer, on the text between special tokens)
         # glm4/glm5 and inkling2 set ignore_merges: an exact vocab hit emits the whole pre-token piece (Inkling 2's
         # tokenizer.json sets it; its o200k vocabulary has entries the merges cannot build - chffff, Aleksandr, VBORw)
@@ -197,7 +215,8 @@ class Tokenizer:
         # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
         seq = (JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna"
                else GPT4O_PATTERNS if pre == "inkling2" else BAILINGMOE_PATTERNS if pre == "bailingmoe2"
-               else RAON_PATTERNS if pre == "raon" else GIGACHAT4_PATTERNS if pre == "gigachat4" else None)
+               else RAON_PATTERNS if pre == "raon" else GIGACHAT4_PATTERNS if pre == "gigachat4"
+               else ERNIE55_PATTERNS if pre == "ernie55" else None)
         self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -264,7 +283,8 @@ class Tokenizer:
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
         tokens = list(md["tokenizer.ggml.tokens"])
         types = list(md.get("tokenizer.ggml.token_type") or []) or None
-        if types and md.get("general.architecture") in ("deepseek4", "deepseek41"):
+        # (not ERNIE 5.5's, a deepseek4-arch file with its own types: its vocabulary above 128000 is ordinary text)
+        if types and md.get("general.architecture") in ("deepseek4", "deepseek41") and md.get("tokenizer.ggml.pre") != "ernie55":
             types = deepseek_special_types(tokens, types)
         return cls(tokens, list(md["tokenizer.ggml.merges"]), types, md.get("tokenizer.ggml.pre", "qwen35"), special)
 
@@ -464,7 +484,8 @@ def extract(gguf_path, out_dir) -> dict:
                         else list(LAGUNA_PATTERNS) if tk.pre == "laguna" else list(GPT4O_PATTERNS) if tk.pre == "inkling2"
                         else list(BAILINGMOE_PATTERNS) if tk.pre == "bailingmoe2"
                         else list(RAON_PATTERNS) if tk.pre == "raon"
-                        else list(GIGACHAT4_PATTERNS) if tk.pre == "gigachat4" else QWEN35_PATTERN),
+                        else list(GIGACHAT4_PATTERNS) if tk.pre == "gigachat4"
+                        else list(ERNIE55_PATTERNS) if tk.pre == "ernie55" else QWEN35_PATTERN),
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.pre in ("glm4", "glm5") else
                                "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (inkling2; its tokenizer.json sets "
@@ -473,6 +494,7 @@ def extract(gguf_path, out_dir) -> dict:
                                "Raon-1's tokenizer.json Split regex, NFC first (raon)" if tk.pre == "raon" else
                                "GigaChat4's tokenizer.json Split regex (= GPT-4o's; ignore_merges false)"
                                if tk.pre == "gigachat4" else
+                               "ERNIE 5.5 tokenizer.json pre_tokenizer Sequence (ernie55)" if tk.pre == "ernie55" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

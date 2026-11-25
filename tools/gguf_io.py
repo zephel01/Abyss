@@ -8,7 +8,7 @@ alignment, then each tensor's bytes padded to the alignment.  test_gguf_io.py ch
 for the same calls when gguf-py is at hand (STRATA_GGUF_PY), and the pack tools' outputs were compared by SHA-256 on
 real models (worklog 2026-11-16_no-llamacpp).
 
-Also here: the row dequantizers of the plain types (F32, F16, BF16, Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0, Q2_K .. Q6_K)
+Also here: the row dequantizers of the plain types (F32, F16, BF16, Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0, Q2_K .. Q6_K, MXFP4)
 in single-precision steps (each product and sum rounded on its own, as numpy float32 does), the round-to-nearest-even
 BF16 conversion, and the GGUF type table.  The i-quants and the other formats have no Python dequantizer here: a tool
 that needs one says so (dequantize raises NeedsLlamaCpp).
@@ -411,6 +411,12 @@ def dequantize(raw, t) -> np.ndarray:
                     out[:, 128 * half + 32 * k + 16 * p:][:, :16] = (d * S[:, 2 * k + p:2 * k + p + 1].astype(f)) * \
                         v[:, 16 * p:16 * p + 16]
         return out.reshape(-1)
+    if t == 39:   # MXFP4: {e8m0, qs[16]}, qs[j] = element j | element j + 16 << 4, value kvalues[q] * 2^(e - 128)
+        b = _blocks(raw, t)
+        kv = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=f)
+        d = np.ldexp(f(1), b[:, 0].astype(np.int32) - 128).astype(f)[:, None]
+        q = b[:, 1:]
+        return (np.concatenate([kv[q & 0xF], kv[q >> 4]], axis=1) * d).reshape(-1)
     raise NeedsLlamaCpp("dequantizing %s needs llama.cpp's gguf-py (STRATA_GGUF_PY)" % type_name(t))
 
 

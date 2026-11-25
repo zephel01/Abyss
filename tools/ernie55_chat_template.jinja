@@ -1,0 +1,74 @@
+{#- ERNIE 5.5 chat format (baidu's encoding_ernie.py render_chat, written as Jinja for the GGUF; Abyss
+    tools/ernie55_convert.py).  Covered: a leading system message, user / assistant / tool turns, past thinking kept
+    (reasoning_content, or an inline <ernie:think>..</ernie:think>), tool calls as <invoke name><parameter name>, the
+    tool list (keys sorted), enable_thinking, reasoning_effort low / medium / high (default high), parallel_tool_calls.
+    Not covered: media blocks, agent_storage / examples / system_settings.  Every string is written explicitly
+    ({{ "\n" }}), so trim_blocks / lstrip_blocks do not change the output. -#}
+{%- set think_off = (enable_thinking is defined and (enable_thinking is false or enable_thinking == 0 or enable_thinking == "false")) -%}
+{%- set effort = reasoning_effort if (reasoning_effort is defined and reasoning_effort) else "high" -%}
+{%- set has_tools = tools is defined and tools -%}
+{%- set parallel = not (parallel_tool_calls is defined and (parallel_tool_calls is false or parallel_tool_calls == 0 or parallel_tool_calls == "false")) -%}
+{%- macro text(c) -%}
+{%- if c is string -%}{{ c }}{%- elif c is iterable and c is not mapping -%}{%- for b in c -%}{%- if b.type == "text" -%}{{ b.text }}{%- endif -%}{%- endfor -%}{%- endif -%}
+{%- endmacro -%}
+{{- "<|ERNIE_MASK|><|ernie:im_start|>system\n" -}}
+{%- if messages and messages[0].role == "system" -%}
+{{- "<ernie:system_setting>\n" + text(messages[0].content) + "\n</ernie:system_setting>\n" -}}
+{%- endif -%}
+{{- "<ernie:global_setting>" -}}
+{%- if not think_off -%}{{- "\nreasoning_effort=" + effort -}}{%- endif -%}
+{%- if has_tools and parallel -%}{{- "\nparallel_tool_calls=True" -}}{%- endif -%}
+{{- "\n</ernie:global_setting>" -}}
+{%- if has_tools -%}
+{{- "\n<ernie:tool_list>\n[" -}}
+{%- for t in tools -%}{%- if not loop.first -%}{{- ", " -}}{%- endif -%}{{- t | tojson(sort_keys=true) -}}{%- endfor -%}
+{{- "]\n</ernie:tool_list>" -}}
+{%- endif -%}
+{{- "<|ernie:im_end|>\n" -}}
+{%- set ns = namespace(first=true) -%}
+{%- for m in messages -%}
+{%- if m.role == "system" and loop.first -%}
+{%- elif m.role == "user" or m.role == "system" -%}
+{%- if not ns.first -%}{{- "\n" -}}{%- endif -%}{%- set ns.first = false -%}
+{{- "<|ernie:im_start|>" + m.role + "\n" + text(m.content) + "<|ernie:im_end|>" -}}
+{%- elif m.role == "assistant" -%}
+{%- if not ns.first -%}{{- "\n" -}}{%- endif -%}{%- set ns.first = false -%}
+{%- set body = text(m.content) -%}
+{%- set ns.reason = "" -%}
+{%- if m.reasoning_content is defined and m.reasoning_content is string -%}
+{%- set ns.reason = m.reasoning_content -%}
+{%- elif "</ernie:think>" in body -%}
+{%- set ns.reason = body.split("</ernie:think>")[0].split("<ernie:think>")[-1] -%}
+{%- set body = body.split("</ernie:think>")[-1] -%}
+{%- endif -%}
+{{- "<|ernie:im_start|>assistant\n<ernie:think>" -}}
+{%- if not think_off and ns.reason | trim -%}{{- ns.reason -}}{%- endif -%}
+{{- "</ernie:think>" + body -}}
+{%- if m.tool_calls is defined and m.tool_calls -%}
+{{- "<ernie:tool_call>\n" -}}
+{%- for call in m.tool_calls -%}
+{%- set f = call.function if call.function is defined else call -%}
+{{- "<invoke name=\"" + f.name + "\">" -}}
+{%- set args = f.arguments | from_json if f.arguments is string else f.arguments -%}
+{%- for k in args | sort -%}
+{%- set v = args[k] -%}
+{{- "<parameter name=\"" + k + "\">" + (v if v is string else v | tojson(sort_keys=true)) + "</parameter>" -}}
+{%- endfor -%}
+{{- "</invoke>\n" -}}
+{%- endfor -%}
+{{- "</ernie:tool_call>" -}}
+{%- endif -%}
+{{- "<|ernie:im_end|>" -}}
+{%- elif m.role == "tool" -%}
+{%- if loop.first or messages[loop.index0 - 1].role != "tool" -%}
+{%- if not ns.first -%}{{- "\n" -}}{%- endif -%}{%- set ns.first = false -%}
+{{- "<|ernie:im_start|>tool" -}}
+{%- endif -%}
+{{- "\n<ernie:tool_output>" + text(m.content) + "</ernie:tool_output>" -}}
+{%- if loop.last or messages[loop.index0 + 1].role != "tool" -%}{{- "<|ernie:im_end|>" -}}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- "\n<|ernie:im_start|>assistant\n" -}}
+{{- "<ernie:think></ernie:think>" if think_off else "<ernie:think>" -}}
+{%- endif -%}
