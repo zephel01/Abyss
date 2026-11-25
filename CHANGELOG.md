@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.206 - 2026-11-25
 
 MemT-1.0-Flash and MemT-1.0-Nano install with one command (`./setup-deepseek.sh --model memt-flash` / `--model
 memt-nano`; beta, NVIDIA, one GPU) from our prebuilt GGUFs - no trench-gguf, no CUDA toolkit with the prebuilt engine.
