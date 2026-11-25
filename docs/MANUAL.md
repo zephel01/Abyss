@@ -1170,7 +1170,7 @@ Measured on an RTX 5090 (iGPU lane off), against a float64 numpy forward written
 | memory read, Q8_0, the reference's written state loaded | KL 0.003 (token path, max 0.013) / 0.004 (prompt path), the same top token at all 28 positions; the same input without the memory: KL 3.01, 37% |
 | memory write, Q8_0, 58 tokens into an empty state | relative error per layer 0.8-2.8% (prompt path) / 1.4-3.6% (token path), cosine >= 0.9994; it grows with depth (the Q8_0 backbone's own error feeds the layer inputs) |
 | recall (the kitten example of MemT's README) | turn 1 committed; in a new conversation with only the question, all four facts (name, age, food, trait) right - Q8_0 through the CLI and the server, Q4_K_M through the server; with an empty memory the model says it does not know. A 62-token note written through `/documents`: both questions on it answered right |
-| speed, Q4_K_M, a 4K prompt + 512 tokens, median of 3 | decode 304.6 tok/s without a memory, 295.5 with one (-3.0%); prompt 8,955 -> 8,362 tok/s (-6.6%) |
+| speed, Q4_K_M, a 4K prompt + 512 tokens, median of 3 | decode 298.5 tok/s without a memory, 280.1 with one (-6.2%); prompt 8,692 -> 8,367 tok/s (-3.7%) (v1.3.205; v1.3.204's 304.6 / 295.5 had drafts through verify windows that did not read the memory) |
 | writing a turn | 194 tokens 0.17 s (Q4_K_M, server); 58 tokens 0.6 s on the first write (Q8_0, it includes the prompt path's start) |
 
 Beta: NVIDIA only (the kernels build for HIP but have not run there); one memory in the model at a time (a request for
@@ -1209,8 +1209,10 @@ non-expert backbone are needed - 21.9 GB of the 576 GB checkpoint:
   --compat-bf16 --first-wins
 ```
 
-`--imatrix=<imatrix.gguf>` weights the backbone's k-quants (we used our own 0731 imatrix, not published; without it the
-k-quants are plain - not measured). Without `--backbone` the overlay keeps L97's (0731's) backbone and adds only the
+No imatrix is needed: the commands above are the measured B. `--imatrix=<imatrix.gguf>` weights the backbone's k-quants;
+with our own 0731 imatrix (not published) the result was the same within the quantization's own spread - memory off, the
+5 texts below: NLL -0.009 to +0.006, KL(B || imatrix) 0.009-0.031, same top token 91-96%; memory on: KL 0.022-0.048;
+recall 19 of 19 on both. Without `--backbone` the overlay keeps L97's (0731's) backbone and adds only the
 memory ("A": 3.8 GB written); MemT's own backbone ("B") recalled better and has a lower NLL (below), so B is the one to use.
 
 The config: `"args": ["--glm-pack", "<dir>/MemT-1.0-Flash-B/pack", "--max-context", "16384", "--prefill", "auto"]`,
@@ -1249,6 +1251,8 @@ with the engine's own inputs (layers 4 / 22 / 42):
 | recall (the kitten example of MemT's README) | turn 1 committed; in a new conversation with only the question, all four facts right; without the memory the model says it does not know |
 | a Japanese note written as a document (83 tokens) | all five facts (dates, place, owner, target, inspection) right; without the memory it does not know |
 | B against A, memory off, 5 x 1,024 tokens (English, code, Japanese) | B's NLL lower on all 5 (e.g. Japanese 3.012 -> 2.877); KL(A \|\| B) 0.023-0.061 |
+| recall set, 19 facts (the kitten 4, the Japanese note 5, 10 made-up facts told in one turn and asked one at a time, each in a new conversation; `recipes/memt-flash/memeval.py`) | no memory 0 of 19; the facts earlier in the same conversation 19; through the memory 19 (MemT-1.0-Nano Q4_K_M and Q8_0: the same 0 / 19 / 19) |
+| a memory on while reading unrelated text (the same 5 texts, a 1-turn or the note's memory) | NLL +0.18 to +0.49 (Nano: +0.19 to +0.83); KL(off \|\| on) 0.26-0.46 - a memory is for the conversations it was written for: turn it off (no `memory` in the request) for the rest |
 
 Beta: NVIDIA only; one memory in the model at a time; drafting of every kind (DSpark, the MTP draft block, the n-gram
 repeats), conversation slots, `--parallel` and a layer split are off for MemT (the verify windows do not read the memory); a commit needs the pool's tail (a 32 GB GPU

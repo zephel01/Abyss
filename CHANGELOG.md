@@ -21,7 +21,7 @@ as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
   0731's, so `tools/memt_flash_fetch.py` (new, stdlib only, resumable) fetches only the memory files and the non-expert
   bytes of the model shards by HTTP range reads (21.9 GB of the 576 GB checkpoint), and `tools/memt_flash.py` writes an
   overlay GGUF over L97: L97's keys, MemT's non-expert backbone in L97's tensor types (`--backbone`, k-quants through
-  trench-gguf's GPU quantizer, optional `--imatrix`), the memory weights Q8_0 (9.3 GB written in ~20 s; shards 2-4 link
+  trench-gguf's GPU quantizer; no imatrix needed - with ours the same within the quantization's spread), the memory weights Q8_0 (9.3 GB written in ~20 s; shards 2-4 link
   to L97's). No setup entry: fetch, overlay, pack and config by hand ([MANUAL](docs/MANUAL.md#memt-10-flash-native-memory-beta)).
   The server's `memory` field and memory API are Nano's. Placement: with the memory off the memory weights stay in the
   pack's mapping and no state is allocated (VRAM before the expert pool 5.95 GB, L97 5.94; the pool 23.97 GB on an
@@ -44,6 +44,11 @@ as v1.3.204 (7-config md5, Inkling 18 md5, Ling 4 md5).
 
 - MemT-1.0-Nano: the n-gram repeats' drafts went through verify windows that do not read the memory, so an accepted
   draft could differ from the token path's answer with a memory on; MemT models now decode a token at a time.
+  Nano Q4_K_M on an RTX 5090 (a 4K prompt + 512 tokens, median of 3): decode 298.5 tok/s without a memory, 280.1 with
+  one (v1.3.204's 304.6 / 295.5 were with those drafts); the 4K prompt 8,692 / 8,367 tok/s. Recall is unchanged (19 of
+  19 on the set in `recipes/memt-flash/memeval.py`; 0 without the memory).
+- `tools/memt_flash.py --imatrix` read the imatrix's F32 values as bytes and so changed nothing; it now weights the
+  k-quants (a grouped weight such as `attn_output_a` takes one slice a group).
 
 ## v1.3.204 - 2026-11-25
 

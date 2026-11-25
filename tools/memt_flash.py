@@ -200,14 +200,20 @@ def main() -> int:
     imat = {}
     if flags.get("--imatrix"):   # llama-quantize's weights: in_sum2 / counts (1 where never seen)
         ir = gio.Reader(flags["--imatrix"])
-        cnt = {x.name[:-7]: np.asarray(x.data, np.float32).reshape(-1) for x in ir.tensors if x.name.endswith(".counts")}
+        # (the tensors are F32 bytes: read them as float32, not converted byte by byte - before this every entry
+        # had 4 "counts" and was skipped, so --imatrix changed nothing)
+        f32 = lambda x: np.ascontiguousarray(x.data).reshape(-1).view("<f4")  # noqa: E731
+        cnt = {x.name[:-7]: f32(x) for x in ir.tensors if x.name.endswith(".counts")}
         for x in ir.tensors:
             if x.name.endswith(".in_sum2"):
                 n = x.name[:-8]
                 c = cnt[n]
-                s = np.asarray(x.data, np.float32).reshape(len(c), -1)
+                s = f32(x).reshape(len(c), -1)
                 if len(c) == 1:
                     imat[n] = np.ascontiguousarray(np.where(c[0] > 0, s[0] / max(c[0], 1), 1.0), np.float32)
+        if not imat:
+            sys.exit("%s: no 2-D weight in the imatrix" % flags["--imatrix"])
+        print("imatrix: %d weights" % len(imat))
     t0 = time.time()
 
     def quant(x: np.ndarray, t: int, name: str) -> np.ndarray:
@@ -221,8 +227,17 @@ def main() -> int:
         if gq is None:
             sys.exit("%s: type %s needs --gpuq" % (name, gio.type_name(t)))
         im = imat.get(name)
-        if im is not None and im.size != x.shape[-1]:
-            sys.exit("%s: imatrix %d vs %d columns" % (name, im.size, x.shape[-1]))
+        n = x.shape[-1]
+        if im is not None and im.size != n:
+            # a grouped weight (V4's attn_output_a: rows [g*o_lora, (g+1)*o_lora) take input group g): llama.cpp's
+            # imatrix holds one n-wide slice a group, as for a 3-D weight - each group's rows with its own slice
+            g = im.size // n
+            rows = x.size // n
+            if im.size % n or rows % g:
+                sys.exit("%s: imatrix %d vs %d columns" % (name, im.size, n))
+            x2 = x.reshape(g, rows // g, n)
+            return np.concatenate([gq(np.ascontiguousarray(x2[i]), t, np.ascontiguousarray(im[i * n:(i + 1) * n]))
+                                   for i in range(g)])
         return gq(x, t, im)
 
     n_bb = 0
