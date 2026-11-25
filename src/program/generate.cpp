@@ -3574,14 +3574,21 @@ static int glm_pack_generate(const Options& o) {
                 const double m = v != nullptr ? std::atof(v) : def;
                 return m >= 1.0 && m <= 2.0 ? m : def;
             }();
+            // (#58) Inkling's DSpark before the table has a single token (an answer's first 16 steps in a new process):
+            // the plain token the gate's first probe measured, and a width c at (1.2 + 0.3 (c - 1)) of it - RTX 3090
+            // at 8K and 250K 2 / 4 / 6 columns 1.4-1.9 / 2.1-2.2 / 2.9-3.1x, RTX 5090 1.5 / 2.0 / 2.5x.  Before, the
+            // confidence threshold alone: 5-8-column windows at 250K took 90-130 ms for 2-4 tokens (23 ms a token)
+            double cost_prior1 = 0.0;
             const auto cost_pick = [&](const double* a, int kmax, int fallback) {
-                if (cw_n[1] == 0) return fallback;   // (nothing measured yet)
+                const bool prior = cw_n[1] == 0 && cost_prior1 > 0.0;
+                if (cw_n[1] == 0 && !prior) return fallback;   // (nothing measured yet)
+                const double t1 = prior ? cost_prior1 : cw[1];
                 ++n_cost;
-                if ((n_cost & 31) == 0 && ct.since1 >= 32) return 0;   // (width 1 refreshed)
-                if ((n_cost & 15) == 0)
+                if (!prior && (n_cost & 31) == 0 && ct.since1 >= 32) return 0;   // (width 1 refreshed)
+                if (!prior && (n_cost & 15) == 0)
                     for (int c2 = 2; c2 <= kmax + 1; ++c2)
                         if (cw_n[c2] < 3) return c2 - 1;
-                double best = -1.0, e = 1.0, q = 1.0, t_last = cw[1];
+                double best = -1.0, e = 1.0, q = 1.0, t_last = t1;
                 int bk = 0, c_last = 1;
                 for (int kk = 0; kk <= kmax; ++kk) {
                     if (kk > 0) {
@@ -3589,8 +3596,10 @@ static int glm_pack_generate(const Options& o) {
                         e += q;
                     }
                     // an unmeasured width: the widest measured below it, + 30% of a single token a column
-                    double t = cw[kk + 1];
-                    if (cw_n[kk + 1] > 0) {
+                    double t = kk == 0 ? t1 : cw[kk + 1];
+                    if (prior) {
+                        if (kk > 0) t = t1 * (1.2 + 0.3 * (double) kk);
+                    } else if (cw_n[kk + 1] > 0) {
                         t_last = t;
                         c_last = kk + 1;
                     } else {
@@ -3714,6 +3723,14 @@ static int glm_pack_generate(const Options& o) {
                 return v == nullptr ? 256 : std::max(0, std::atoi(v));
             }();
             const bool ink_gate = ink_dsp && ink_gate_env;
+            // STRATA_INK_DSPARK_PROBE_FIRST=<n> (default 6; 0: the first probe after 8 drafted steps, as v1.3.204): the
+            // answer starts with n plain steps, so the gate has the plain token's rate before the first drafted step
+            // and its early rule can end a losing measure after 4 of them (#58: an answer of ~170 tokens at 250K drafted
+            // 8+ steps before anything was measured; a plain step costs nothing against running without the drafter)
+            static const int ink_probe_first = [] {
+                const char* v = std::getenv("STRATA_INK_DSPARK_PROBE_FIRST");
+                return v == nullptr ? 6 : std::max(0, std::atoi(v));
+            }();
             // STRATA_INK_DSPARK_GATE_LOG=2: every step too (its kind, drafts, tokens, ms)
             static const bool ink_glog2 = [] {
                 const char* v = std::getenv("STRATA_INK_DSPARK_GATE_LOG");
@@ -3722,8 +3739,9 @@ static int glm_pack_generate(const Options& o) {
             int ink_skip = ink_gate ? ink_first : 0, ink_back = 0, ink_n = 0, ink_skips = 0;
             double ink_tok = 0.0, ink_ms = 0.0;
             constexpr int kInkProbe = 8;
-            int ink_probe = 0, ink_since = 0, ink_probes = 0, ink_base_n = 0;   // (probe steps left, drafted steps since one)
-            int ink_next = 8;                                                   // (drafted steps before the next probe)
+            const bool ink_pf = ink_gate && ink_probe_every > 0 && ink_probe_first > 0;
+            int ink_probe = ink_pf ? ink_probe_first : 0, ink_since = 0, ink_probes = ink_pf ? 1 : 0, ink_base_n = 0;
+            int ink_next = ink_pf ? 16 : 8;   // (drafted steps before the next probe; probe steps left, drafted steps since one)
             double ink_base_r[8] = {}, ink_base = 0.0;                          // (plain steps' ms: their median)
             const auto ink_base_add = [&](double ms) {
                 ink_base_r[ink_base_n & 7] = ms;   // (the last 8: the plain token as it is now)
@@ -3733,6 +3751,7 @@ static int glm_pack_generate(const Options& o) {
                 std::copy(ink_base_r, ink_base_r + n, v);
                 std::nth_element(v, v + n / 2, v + n);
                 ink_base = v[n / 2];
+                if (ink_base_n >= 4) cost_prior1 = ink_base;
             };
             const auto ink_gate_add = [&](double toks, double ms) {
                 if (!ink_gate) return;
@@ -3754,7 +3773,7 @@ static int glm_pack_generate(const Options& o) {
                 if (ink_n < 16 && !early) return;
                 static const bool ink_glog = std::getenv("STRATA_INK_DSPARK_GATE_LOG") != nullptr;   // (a measure's end)
                 if (ink_glog)
-                    std::fprintf(stderr, "ink gate: pos %lld: %d steps %.2f tok/ms vs %.2f%s\n", (long long) model.position(),
+                    std::fprintf(stderr, "ink gate: pos %lld: %d steps %.4f tok/ms vs %.4f%s\n", (long long) model.position(),
                                  ink_n, ink_tok / ink_ms, 1.0 / one, early ? " (early)" : "");
                 if (early || ink_tok / ink_ms < 1.0 / one) {   // (drafting lost: off for a while, longer each time)
                     ink_skip = 32 << ink_back;
