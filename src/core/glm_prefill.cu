@@ -254,8 +254,11 @@ Q4xBufs carve_q4x(Carve& c, size_t T, const Glm5Geometry& g) {
 // MMQ reads K in whole tiles of 256 (FP4: 512) values, so with n_ff not a multiple of that (qwen4exp's 640) a down
 // matrix's last row reads past the matrix: llama.cpp zeroes that padding at allocation (a garbage FP16 scale there
 // times the zero activations is NaN - the prompt's FFN rows had NaN in column n_embd - 1).  The slots' tail bytes
-// [off, off + n) of n_exp slots `stride` apart, zeroed before the product (the slot padding is never read otherwise)
-__global__ void zero_tails(uint8_t* base, size_t stride, size_t off, int n) {
+// [off, off + n) of n_exp slots `stride` apart, zeroed before the product (the slot padding is never read otherwise).
+// bounds (the product's, n_exp + 1): a slot with no rows is left alone - the product does not read it, and under the
+// elastic KV such a slot may be a rank whose memory the KV took back (not mapped)
+__global__ void zero_tails(uint8_t* base, size_t stride, size_t off, int n, const int* bounds = nullptr) {
+    if (bounds != nullptr && bounds[blockIdx.x + 1] == bounds[blockIdx.x]) return;
     uint8_t* p = base + (size_t) blockIdx.x * stride + off;
     for (int i = threadIdx.x; i < n; i += blockDim.x) p[i] = 0;
 }
@@ -6274,7 +6277,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         said = true;
                     } else if (dn_over > 0)
                         zero_tails<<<i1 - i0, 128, 0, s>>>(const_cast<uint8_t*>(wbase) + (size_t) i0 * stride, stride,
-                                                           dn_end, dn_over);
+                                                           dn_end, dn_over, d_bounds + i0);
                     mmq::Product dn;
                     dn.w = wbase + (size_t) i0 * stride + Ly.down_off;
                     dn.type = Ly.d_type;
