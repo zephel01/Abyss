@@ -19,6 +19,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>   // (pin_thread's SetThreadAffinityMask)
+#include <malloc.h>    // (host_staging_alloc: _aligned_malloc)
 #endif
 
 #include <cuda_runtime.h>
@@ -82,6 +83,47 @@ inline bool host_rows_grow(float*& p, size_t& n, bool& pageable, size_t want, co
     }
     n = want;
     return true;
+}
+// a host staging buffer the GPU reads with cudaMemcpyAsync only (never mapped, never read by a kernel): pinned when the
+// driver gives it, else ordinary memory, 4 KiB aligned (#61's other half: the prompt path's embedding rows and disk
+// landing ring).  An async copy from ordinary memory is staged by the driver before the call returns, so the buffer
+// may be written again as soon as it would be with pinned memory - the copy is slower, the output the same.
+// pageable = true when it is ordinary memory (host_staging_free must be told).  STRATA_TEST_NO_PIN=1 skips the pinned
+// try (as host_rows_grow).
+inline bool test_no_pin() {   // STRATA_TEST_NO_PIN=1 (tests only): the prompt staging's pinned tries are skipped
+    static const bool v = [] { const char* e = std::getenv("STRATA_TEST_NO_PIN"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+inline void* host_staging_alloc(size_t bytes, bool& pageable, const char* what) {
+    pageable = false;
+    void* p = nullptr;
+    const bool no_pin = test_no_pin();
+    if (!no_pin && cudaHostAlloc(&p, bytes, cudaHostAllocDefault) == cudaSuccess) return p;
+    if (!no_pin) (void) cudaGetLastError();
+    p = nullptr;
+    const size_t n = (bytes + 4095) / 4096 * 4096;
+#ifdef _WIN32
+    p = _aligned_malloc(n, 4096);
+#else
+    if (posix_memalign(&p, 4096, n) != 0) p = nullptr;
+#endif
+    if (p == nullptr) return nullptr;
+    pageable = true;
+    std::fprintf(stderr, "glm fast: %s: no pinned memory left (the GPU driver's limit) - using ordinary memory "
+                         "(%.1f MB; the same output, slower copies)\n", what, (double) bytes / 1e6);
+    return p;
+}
+inline void host_staging_free(void* p, bool pageable) {
+    if (p == nullptr) return;
+    if (!pageable) {
+        cudaFreeHost(p);
+        return;
+    }
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
 }
 // the next token from the device: outside [0, n_vocab) is the argmax's "no pick" (0x7fffffff) - every logit was NaN
 // (or -inf), the forward is broken.  An error (the caller reports it once and stops) rather than a token that reads

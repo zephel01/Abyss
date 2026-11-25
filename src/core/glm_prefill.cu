@@ -689,11 +689,13 @@ struct Glm5Model::PrefillState {
     // experts ahead of the groups that use them (12 slots kept the reader and the GPU waiting on each other: a 16k
     // prompt on Mercury read the NVMe at ~0.7 of its ~2.9 GB/s); STRATA_GLM_PREFILL_LAND=<slots>, at least NG * GE
     uint8_t* gpin = nullptr;
+    bool gpin_pageable = false;          // (#61: ordinary memory - the driver's pinned limit was reached)
     int nland = NG * GE;
     cudaEvent_t ev_ready[NG] = {}, ev_free[NG] = {};
     std::vector<cudaEvent_t> ev_land;    // a landing slot's copy to the device ran: the reader may refill it
-    // pinned host staging
+    // pinned host staging (ordinary memory when the driver's pinned limit is reached: emb_pageable, #61)
     float* emb_h = nullptr;          // T x n_embd
+    bool emb_pageable = false;
     unsigned char* img_d = nullptr;  // deepseek41: the chunk's image-row flags on the device (route's per-row bias)
     bool img_on = false;             // ... and this chunk has an image row (else route takes the plain bias)
     int* toks_d = nullptr;           // deepseek4: the chunk's token ids on the device (hash routing)
@@ -1068,11 +1070,11 @@ void Glm5Model::prefill_cap(int T, const char* why) {
     if (S == nullptr || S->T <= T) return;
     const size_t E = (size_t) g_.n_embd;
     cudaSetDevice(dev_);
-    cudaFreeHost(S->emb_h);
-    S->emb_h = nullptr;
-    if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-        cudaGetLastError();
-        std::fprintf(stderr, "glm prefill: CUDA%d pinned staging did not allocate - token by token\n", dev_);
+    glmfast::host_staging_free(S->emb_h, S->emb_pageable);
+    S->emb_h = (float*) glmfast::host_staging_alloc((size_t) T * E * sizeof(float), S->emb_pageable,
+                                                    "the prompt's embedding rows");
+    if (S->emb_h == nullptr) {
+        std::fprintf(stderr, "glm prefill: CUDA%d the staging did not allocate - token by token\n", dev_);
         prefill_destroy();
         return;
     }
@@ -1710,7 +1712,11 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         c.take<uint8_t>(S->pbuf_bytes);
         S->borrow_bytes = c.off;
     }
-    if (cudaHostAlloc((void**) &S->emb_h, (size_t) T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
+    // the embedding rows: pinned, else ordinary memory (only cudaMemcpyAsync reads them); the three count arrays are
+    // mapped (kernels write them, the host reads them with no copy): they must be pinned - 64 KB
+    S->emb_h = (float*) glmfast::host_staging_alloc((size_t) T * E * sizeof(float), S->emb_pageable,
+                                                    "the prompt's embedding rows");
+    if (S->emb_h == nullptr ||
         cudaHostAlloc((void**) &S->h_counts, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_base, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_bounds, 8192 * sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
@@ -1732,11 +1738,19 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         if (F->unified_memory) want = kMinLand;
         if (const char* v = getenv("STRATA_GLM_PREFILL_LAND")) want = std::max(kMinLand, std::atoi(v));
         int n = want;
-        while (cudaHostAlloc((void**) &S->gpin, (size_t) n * gstride, cudaHostAllocDefault) != cudaSuccess) {
+        while (glmfast::test_no_pin() ||
+               cudaHostAlloc((void**) &S->gpin, (size_t) n * gstride, cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
             S->gpin = nullptr;
             if (n == kMinLand) break;
             n = std::max(kMinLand, n / 2);
+        }
+        if (S->gpin == nullptr) {   // (#61: no pinned memory left - the smallest ring in ordinary memory: its slots are
+            //                         only cudaMemcpyAsync's source, staged before the call returns, and the reader
+            //                         refills a slot after its copy's event as before)
+            n = kMinLand;
+            S->gpin = (uint8_t*) glmfast::host_staging_alloc((size_t) n * gstride, S->gpin_pageable,
+                                                             "the prompt's disk landing ring");
         }
         if (S->gpin == nullptr) {
             std::fprintf(stderr, "glm prefill: CUDA%d the disk landing ring did not allocate - token by token\n", dev_);
@@ -3032,8 +3046,8 @@ void Glm5Model::prefill_destroy() {
     for (auto e : S->ev_land)
         if (e) cudaEventDestroy(e);
     if (S->ev_hop) cudaEventDestroy(S->ev_hop);
-    if (S->gpin) cudaFreeHost(S->gpin);
-    if (S->emb_h) cudaFreeHost(S->emb_h);
+    glmfast::host_staging_free(S->gpin, S->gpin_pageable);
+    glmfast::host_staging_free(S->emb_h, S->emb_pageable);
     if (S->toks_d) cudaFree(S->toks_d);
     if (S->xl_ptrs_d) cudaFree(S->xl_ptrs_d);
     if (S->img_d) cudaFree(S->img_d);
@@ -7436,13 +7450,15 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         int place = 0;
         // (the embedding rows' pinned staging for the longer chunk; it stays that size for the next ones)
         if (Trun > S->emb_T) {
-            float* nb = nullptr;
-            if (cudaHostAlloc((void**) &nb, (size_t) Trun * g_.n_embd * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
-                cudaFreeHost(S->emb_h);
+            bool nb_pageable = false;
+            float* nb = (float*) glmfast::host_staging_alloc((size_t) Trun * g_.n_embd * sizeof(float), nb_pageable,
+                                                             "the prompt's embedding rows");
+            if (nb != nullptr) {
+                glmfast::host_staging_free(S->emb_h, S->emb_pageable);
                 S->emb_h = nb;
+                S->emb_pageable = nb_pageable;
                 S->emb_T = Trun;
             } else {
-                cudaGetLastError();
                 dt = false;
             }
         }
