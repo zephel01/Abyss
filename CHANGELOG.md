@@ -7,6 +7,19 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.207 - 2026-11-25
+
+Qwen3.8-Flash-Next no longer stops at its first prompt when the RAM tier used up the GPU driver's pinned memory (#61,
+Windows HIP, RX 9060 XT + 64 GB RAM at the setup's `STRATA_GLM_RAM_GB=46`).
+
+### Fixed
+
+- `glm prefill: qwen4exp's PLE rows did not allocate` (#61): the prompt's PLE row buffer is taken after the RAM tier
+  gave pinned slots back, and the give-back did not count it. When pinned memory cannot be had it now comes from
+  ordinary memory (the log says so once: `... no pinned memory left (the GPU driver's limit) - using ordinary memory`);
+  the copies are slower, the output the same (Qwen3.8-Flash-Next UD-IQ3_XXS md5 with pinned and with ordinary memory
+  forced). The same for the verify window's PLE rows.
+
 ## v1.3.206 - 2026-11-25
 
 MemT-1.0-Flash and MemT-1.0-Nano install with one command (`./setup-deepseek.sh --model memt-flash` / `--model
