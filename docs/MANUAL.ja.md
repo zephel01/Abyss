@@ -93,6 +93,14 @@ UD-IQ2_XXS、UD-IQ2_XS、UD-IQ2_S）では、unsloth の別ファイル（`MTP/m
 SHA-256 で確認）も取ってきて、設定に書く（`STRATA_Q35_DFLASH`）。`--no-dflash` で取らない（設定にあれば外す）。
 `--dflash` で小さい GPU でも入れる（[下書き役](#qwen38-27bdense)）。
 
+Ternary Bonsai 2.5 27B（prism-ml の 3 値の Qwen3.8-27B、ベータ）: PTQ1_0 のファイル（6.23 GB、MTP ブロックつき）を 8 GB の
+GPU からすべて VRAM に載せる（8 GB: 8K、9.5 GB: 32K、12 GB: 64K、16 GB: 128K。[Ternary Bonsai](#ternary-bonsai-25-27bベータ)）:
+
+```sh
+./setup-deepseek.sh --model bonsai27b --download-model              # Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf（6.23 GB）
+./setup-deepseek.sh --model bonsai27b --quant Q2_0 --download-model # Q2_0 のファイル（7.67 GB、同じ重み、MTP ブロックなし）
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -908,6 +916,51 @@ SwiGLU FFN（5120 → 17408）でエキスパートはなく、下書きは Next
   [docs/SETTINGS.ja.md](SETTINGS.ja.md#qwen38-27b-の画像)。
 - **まだないもの:** 複数 GPU へのレイヤー分割、AMD（コンパイルは通る。未検証）、AMD での画像。Qwen3.8-Flash-Next は画像を
   断ります。MoE の qwen35（Ornith）も同じ画像の経路を通りますが未検証です（変換器ファイルは試していない）。
+
+## Ternary Bonsai 2.5 27B（ベータ）
+
+エンジンは prism-ml の [Ternary-Bonsai-2.5-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF)（Apache-2.0）も
+動かします。Qwen3.8-27B（dense の `qwen35`。[Qwen3.8-27B](#qwen38-27bdense) と同じ形）の重みを 3 値（-1 / 0 / 1、128 個に
+FP16 のスケール 1 つ）にして、ブロックごとの Hadamard の基底で持つモデルです。2 つのファイルは同じ重みです:
+`Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf`（6.23 GB、PTQ1_0 = 1 バイトに 3 値 5 個、MTP ブロックつき）と
+`Ternary-Bonsai-2.5-27B-Q2_0.gguf`（7.67 GB、Q2_0、MTP ブロックなし）。`./setup-deepseek.sh --model bonsai27b` が PTQ1_0 の
+ファイルを入れて pack を作ります（`--quant Q2_0` でもう一方）。文字だけです。
+
+- **動かし方。** GGUF の `prism.hadamard.*` が、どの重みを回したかを書いています（401 本: すべての射影、FFN、head。1,024 個の
+  ブロック、幅 5,120 / 6,144 / 17,408 の符号）。エンジンは積の前に活性化を回し（`x' = H (S . x)`。`ssm_out` は delta-net の
+  出力の並べ替えも）、埋め込みの行は引いたあとに戻し、F32 の `ssm_alpha` / `ssm_beta` の行は読み込み時に一度回します。変換は
+  FP32 で正確で（1/32 は 2 のべき）、積が読む q8_1 への量子化と一緒に 1 つのカーネルでします。トークン経路、プロンプト経路
+  （PTQ1_0 / Q2_0 は自前の int8 GEMM）、検証窓、CPU レーン（RAM に置いた FFN の行）のすべてで回します。MTP ブロック
+  （`blk.64`、Q4_0）は回していないので、そのまま NextN の経路で下書きします。
+- **品質。** 2 つのファイルは同じ 3 値の重みになり（269 億個すべてと、スケール・F32 のテンソルを比べた。
+  `recipes/bonsai27b/cmp_formats.py`）、トークン経路のロジットも同じです（英語・日本語・コードの 3,071 位置で KL 0.000000）。
+  プロンプト経路とトークン経路: KL 0.00015、同じ最上位トークン 99.4%。同じ位置で Qwen3.8-27B の Q8_0 と比べると KL 0.405、
+  同じ最上位 75.6%、nll 2.021（Q8_0 は 1.671。unsloth の UD-Q4_K_XL は KL 0.0067、96.4%）。モデルカードはタスクの成績が FP16 に
+  近いとしています。元のモデルとの KL は、3 値に合わせて学習し直したモデルが元からどれだけ離れたかで、タスクの品質ではありません。
+  英語・日本語・コード・ツール呼び出し・推論ありの貪欲の回答は正しいです。
+- **速さ**（RTX 5090、iGPU なし、4K のプロンプト + 512 トークン、3 回の中央値。`bench/bonsai/speed.txt`）:
+
+  | ファイル | 生成、MTP あり | 生成、下書きなし | プロンプト tok/s | VRAM 最大 |
+  |---|---|---|---|---|
+  | PTQ1_0 | **185.3**（採用 82%） | 125.5 | 3,162 | 11.8 GB |
+  | Q2_0 | （MTP ブロックなし） | 130.6 | 3,313 | 13.0 GB |
+  | Qwen3.8-27B UD-Q4_K_XL（比較用） | 137.4 | 76.8 | 3,105 | 21.5 GB |
+  | PTQ1_0、上限 12 GB | 185.7 | | 3,154 | 8.8 GB |
+  | PTQ1_0、上限 8 GB | 178.6 | 125.4 | 3,069 | 7.5 GB |
+  | UD-Q4_K_XL、上限 12 / 8 GB | 28.0 / 15.6 | | 1,479 / 638 | |
+
+  上限なしの VRAM 最大にはプロンプト経路のバッファが入っています（空きの VRAM から大きさを決める）。prism-ml のカード（自前の
+  llama.cpp のフォーク、RTX 5090）: 下書きなし約 163〜174 tok/s、MTP 3 個で 305、2K のプロンプト約 4,200 tok/s。エンジンの
+  3 値の GEMV はまだそれより遅く（トークン経路で 1 トークン約 8.3 ms。3 値はレジスタで復号）、速いカーネルが次の課題です。
+- **メモリ。** ファイル全体を VRAM に置くときに文脈ごとに要る GPU の大きさ（PTQ1_0、MTP あり、F16 の KV、4K のプロンプト。
+  RTX 5090 で上限をかけて計測）: 8K で 8 GB、32K で 9.5 GB、64K で 12 GB、128K で 16 GB（それぞれ生成 179〜187 tok/s。CPU に
+  あるのは 1 層の最後の 1,024 行だけ）。セットアップは GPU に入るいちばん長い文脈を書きます（Q2_0 は +1.4 GB）。それより小さいと、
+  多くの層の FFN の行を RAM に置いて CPU で計算します（CPU レーンは PTQ1_0 を読み、down の入力の自分の分を自分で回す）。
+  動きますが遅く、9 GB で 32K は 30.5 tok/s、11 GB で 64K は 64.8 です。KV を必要なときに取る仕組みが、128K の使っていない分を
+  文脈が伸びるまで FFN に貸します。長いプロンプト（上限なし）: 32K は 3,005 tok/s、そのあと生成 127.2。64K は 2,634、そのあと
+  88.2（下書きなしで 74.5）。
+- **まだないもの:** 画像（リポジトリに変換器のファイルがない）、AMD（コンパイルは通る。未検証）、複数 GPU への層の分割、DFlash 2
+  下書き役（Qwen3.8-27B 用のもの。このモデルでは試していない）。Q2_0 のファイルは下書きしません（n-gram の下書きだけ）。
 
 ## Qwen3.5-9B QSA
 

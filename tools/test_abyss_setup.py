@@ -96,7 +96,7 @@ class PickQuant(unittest.TestCase):
         self.assertEqual((r["quant"], r["extra"]), ("24G64G", "32G128G"))
 
     def test_models_without_pc_sizes(self):
-        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "qwen35-9b-qsa", "ornith-9b-qsa", "mimo-9b",
+        for key in ("v41", "ornith35", "qwen35", "qwen38-27b", "bonsai27b", "qwen35-9b-qsa", "ornith-9b-qsa", "mimo-9b",
                     "sensenova-loop-9b", "mimo-9b-qsa"):
             self.assertIsNone(A.fit_quant(key, 32, 96))
 
@@ -537,6 +537,25 @@ class ToolkitSwitch(unittest.TestCase):
             cfg, _ = A.write_config("ornith-iq3_xxs-b", self.root / "pack", 65536, 8082, False, None, None, m)
         self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["sampling"]["top_k"], 20)
 
+
+
+class BonsaiAllInVram(unittest.TestCase):
+    """--model bonsai27b (prism-ml's Ternary Bonsai 2.5 27B): its own VRAM table, the PTQ1_0 file by its prefix."""
+    KEY = "bonsai27b"
+
+    def test_the_context_a_gpu_holds(self):
+        f = A.dense_context
+        self.assertEqual(f(self.KEY, 7.6, 65536), 8192)
+        self.assertEqual(f(self.KEY, 11.6, 65536), 65536)
+        self.assertEqual(f(self.KEY, 15.6, 131072), 131072)
+        self.assertIsNone(f(self.KEY, 5.9, 8192))
+        self.assertEqual(f(self.KEY, 11.6, 65536, "Q2_0"), 32768)   # (+1.44 GB for the Q2_0 file)
+
+    def test_the_file_names(self):
+        m = A.MODELS[self.KEY]
+        self.assertTrue("Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf".startswith(m["prefix_tmpl"].format(q="PTQ1_0")))
+        self.assertTrue("Ternary-Bonsai-2.5-27B-Q2_0.gguf".startswith(m["prefix_tmpl"].format(q="Q2_0")))
+        self.assertFalse("Ternary-Bonsai-2.5-27B-Q2_0.gguf".startswith(m["prefix_tmpl"].format(q="PTQ1_0")))
 
 
 class DenseAllInVram(unittest.TestCase):

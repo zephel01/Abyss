@@ -7971,6 +7971,11 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         if (img) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
         cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     }
+    // (PrismML's Ternary Bonsai: the table's rows are stored rotated - restored here; an image row is not a table row)
+    if (!g.is_hy4() && img == nullptr && !prism_emb(F->emb, 1, g.n_embd, F->cs)) {
+        err = "prism: the embedding row";
+        return false;
+    }
     if (!g.is_hy4()) abl_res(F->emb, 1, g.n_embd, F->cs);
     if (g.is_hy4()) {
         // (hy4_embed wrote state_)

@@ -23,7 +23,8 @@ enum Type : int {
     IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23,
     I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, IQ1_M = 29, BF16 = 30,
     TQ1_0 = 34, TQ2_0 = 35, MXFP4 = 39, NVFP4 = 40, Q1_0 = 41, Q2_0 = 42,
-    COUNT = 43
+    PTQ1_0 = 143,   // PrismML's dense ternary (Ternary Bonsai GGUFs); ids 43..142 are unused here
+    COUNT = 144
 };
 
 using ToFloat = void (*)(const void* src, float* dst, int64_t n);

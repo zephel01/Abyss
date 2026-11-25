@@ -7,6 +7,30 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+prism-ml's Ternary Bonsai 2.5 27B runs (beta): ternary Qwen3.8-27B weights in a blockwise Hadamard basis, both of its files
+(PTQ1_0 with the MTP block, Q2_0), all in VRAM from an 8 GB GPU. RTX 5090, 4K prompt + 512 tokens: decode 185.3 tok/s with
+the file's MTP block, 125.5 without (Qwen3.8-27B UD-Q4_K_XL: 137.4 / 76.8); capped at 8 GB 178.6. Other models' outputs are
+unchanged (7-config md5, Inkling 18 md5, Ling 4 md5, Qwen3.8-27B UD-Q4_K_XL md5 at 32 / 12 GB with and without MTP).
+
+### Added
+
+- Ternary Bonsai 2.5 27B (prism-ml, Apache-2.0; beta, NVIDIA): `./setup-deepseek.sh --model bonsai27b` (PTQ1_0, 6.23 GB;
+  `--quant Q2_0` the 7.67 GB file). The GGUF's `prism.hadamard.*` keys are read: the engine rotates each activation before
+  the rotated weights (1,024-value blocks, the file's sign vectors, the grouped delta-net order before `ssm_out`), restores
+  the embedding row, and rotates the F32 `ssm_alpha` / `ssm_beta` rows at load. The transform runs in registers and warp
+  shuffles and writes the q8_1 blocks the products read. On the token path, the prompt path, the verify window (MTP
+  drafts: the same tokens as without) and the CPU lane. The two files give the same logits (KL 0.000000 over 3,071
+  positions); prompt path against token path KL 0.00015 ([MANUAL](docs/MANUAL.md#ternary-bonsai-25-27b-beta)).
+- PTQ1_0 (GGUF type 143: 128 trits and an FP16 scale in 28 bytes): GPU GEMV (one decode for every column of a verify
+  window), the own int8 prompt GEMM, FP16 dequantization, and the CPU lane (scalar and AVX2).
+
+### Changed
+
+- Qwen3.8-27B-shaped dense models that keep FFN rows in RAM split the rows at a multiple of the Hadamard block when the
+  file is rotated (unchanged otherwise: 256).
+
 ## v1.3.204 - 2026-11-25
 
 MemT-1.0-Nano (MemTensor) runs with its native memory (beta, NVIDIA): a fact told in one turn is answered in a new

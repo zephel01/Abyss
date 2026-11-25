@@ -96,6 +96,14 @@ in one NVIDIA GPU's VRAM (UD-Q4_K_XL: a 24 GB+ GPU), it also fetches z-lab's DFl
 against Hugging Face's SHA-256) and names it in the config (`STRATA_Q35_DFLASH`); `--no-dflash` skips it (or takes it
 out of a config), `--dflash` sets it up on a smaller GPU too ([the drafter](#qwen38-27b-dense)).
 
+Ternary Bonsai 2.5 27B (prism-ml's ternary Qwen3.8-27B, beta): the PTQ1_0 file (6.23 GB, with its MTP block) all in VRAM
+from an 8 GB GPU (8 GB: 8K, 9.5 GB: 32K, 12 GB: 64K, 16 GB: 128K; [Ternary Bonsai](#ternary-bonsai-25-27b-beta)):
+
+```sh
+./setup-deepseek.sh --model bonsai27b --download-model              # Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf (6.23 GB)
+./setup-deepseek.sh --model bonsai27b --quant Q2_0 --download-model # the Q2_0 file (7.67 GB, the same weights, no MTP block)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -966,6 +974,53 @@ SwiGLU FFN (5120 -> 17408) in every layer, no experts, and a NextN block that dr
   as before). Settings: [docs/SETTINGS.md](SETTINGS.md#images-on-qwen38-27b).
 - **Not yet:** a layer split over several GPUs, AMD (it compiles; untested), images on AMD; Qwen3.8-Flash-Next refuses
   images; the MoE qwen35 models (Ornith) take the same image path but are untested (no projector file tried).
+
+## Ternary Bonsai 2.5 27B (beta)
+
+The engine runs prism-ml's [Ternary-Bonsai-2.5-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF)
+(Apache-2.0): Qwen3.8-27B (the dense `qwen35`, as [Qwen3.8-27B](#qwen38-27b-dense)) with ternary weights (-1 / 0 / 1, one FP16
+scale per 128) stored in a blockwise Hadamard basis. Two files hold the same weights: `Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf`
+(6.23 GB, PTQ1_0 - five trits a byte - with the MTP block) and `Ternary-Bonsai-2.5-27B-Q2_0.gguf` (7.67 GB, Q2_0, no MTP block).
+`./setup-deepseek.sh --model bonsai27b` installs the PTQ1_0 file (`--quant Q2_0` the other) and makes the pack. Text only.
+
+- **How it runs.** The GGUF's `prism.hadamard.*` keys say which weights are rotated (401 of them: every projection, the FFN
+  and the head; 1,024-value blocks, sign vectors for the widths 5,120 / 6,144 / 17,408). The engine rotates each activation
+  before its product (`x' = H (S . x)`, plus the grouped order of the delta-net output for `ssm_out`), restores the
+  embedding row after the lookup, and rotates the F32 `ssm_alpha` / `ssm_beta` rows once at load. The transform is exact
+  in FP32 (the 1/32 scale is a power of two) and is fused with the q8_1 quantization the products read. The token path,
+  the prompt path (own int8 GEMM for PTQ1_0 / Q2_0), the verify window and the CPU lane (FFN rows in RAM) all do it.
+  The MTP block (`blk.64`, Q4_0) is not rotated and drafts through the NextN path.
+- **Quality.** The two files decode to the same ternary weights (all 26.9 billion values, scales and F32 tensors
+  compared; `recipes/bonsai27b/cmp_formats.py`) and give the same logits on the token path (KL 0.000000 over 3,071
+  positions of English, Japanese and code). The prompt path against the token path: KL 0.00015, the same top token
+  99.4%. Against Qwen3.8-27B Q8_0 on the same positions: KL 0.405, the same top token 75.6%, nll 2.021 against 1.671
+  (unsloth's UD-Q4_K_XL: KL 0.0067, 96.4%). The model card reports near-FP16 task scores; KL against the base model
+  measures how far the fine-tuned ternary model is from it, not task quality. Greedy answers in English, Japanese, code,
+  a tool call and with reasoning on are correct.
+- **Speed** (RTX 5090, iGPU off, 4K prompt + 512 tokens, median of 3; `bench/bonsai/speed.txt`):
+
+  | file | decode, MTP | decode, no drafter | prompt tok/s | peak VRAM |
+  |---|---|---|---|---|
+  | PTQ1_0 | **185.3** (82% accepted) | 125.5 | 3,162 | 11.8 GB |
+  | Q2_0 | (no MTP block) | 130.6 | 3,313 | 13.0 GB |
+  | Qwen3.8-27B UD-Q4_K_XL (for scale) | 137.4 | 76.8 | 3,105 | 21.5 GB |
+  | PTQ1_0 capped at 12 GB | 185.7 | | 3,154 | 8.8 GB |
+  | PTQ1_0 capped at 8 GB | 178.6 | 125.4 | 3,069 | 7.5 GB |
+  | UD-Q4_K_XL capped at 12 / 8 GB | 28.0 / 15.6 | | 1,479 / 638 | |
+
+  The peak VRAM uncapped includes the prompt path's buffer, which the engine sizes from the free VRAM. prism-ml's card
+  (their own llama.cpp fork, RTX 5090): ~163-174 tok/s without drafts, 305 with 3 MTP drafts, 2K prompts ~4,200 tok/s. The
+  engine's ternary GEMV is still slower than theirs (about 8.3 ms a token on the token path, decoding the trits in
+  registers); faster kernels are the next step.
+- **Memory.** The GPU size a context needs with the whole file in VRAM (PTQ1_0, MTP on, F16 KV, a 4K prompt; RTX 5090
+  capped): 8 GB at 8K, 9.5 GB at 32K, 12 GB at 64K, 16 GB at 128K (decode 179-187 tok/s at each, only one layer's last
+  1,024 FFN rows on the CPU). The setup writes the longest of these the GPU holds (Q2_0: +1.4 GB). Below that the engine
+  keeps FFN rows of many layers in RAM and computes them on the CPU (the CPU lane reads PTQ1_0, and rotates its part of the
+  down input itself): it runs, but slowly - 30.5 tok/s at 32K on 9 GB, 64.8 at 64K on 11 GB. KV on demand lends the
+  unused part of a 128K cache to the FFN until the context grows. Long prompts (uncapped): 32K at 3,005 tok/s then decode
+  127.2, 64K at 2,634 then 88.2 (74.5 without MTP).
+- **Not yet:** images (no projector file in the repo), AMD (it compiles; untested), a layer split over several GPUs, the
+  DFlash 2 drafter (Qwen3.8-27B's: not tried with this model). The Q2_0 file drafts nothing (n-gram drafts only).
 
 ## Qwen3.5-9B QSA
 

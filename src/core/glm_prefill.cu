@@ -4812,6 +4812,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         } else if (g.qwen35()) {
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
+            // (PrismML's Ternary Bonsai: the mixer's rotated input, x and x16 both - prism_path.cu)
+            if (prism_l(il) && !prism_in(S->x, E, T, E, nullptr, S->x16, E, s)) { err = "prism: the mixer's input rows"; return false; }
             if (dfl_ != nullptr) dflash_capture(il, S->R, T, (size_t) 4 * E, true, s);   // DFlash 2's features (27B)
         } else {
             hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_fn8, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
@@ -4983,6 +4985,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                                            (void*) s);
                     S->mark("q35_gdn", s);
                     if (t0 + tn == T) dump_row("final_output-" + Ls, B.y, V, tn - 1);
+                    if (!skip_output && prism_l(il) && !prism_gdn(B.y, tn, V, nullptr, nullptr, 0, s)) {
+                        err = "prism: ssm_out's input rows";
+                        return false;
+                    }
                     if (!skip_output) {
                         if (!mmq_gemm(Ly.ssm_o, E, V, B.y, mixer, tn)) {
                             gb::f32_to_f16(B.y, B.y16, (int64_t) tn * V, s);
@@ -5063,6 +5069,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     }
                     S->mark("q35_attn", s);
                     if (t0 + tn == T) dump_row("attn_gated-" + Ls, B.ao, HDq, tn - 1);
+                    if (!skip_output && prism_l(il) && !prism_in(B.ao, HDq, tn, HDq, nullptr, nullptr, 0, s)) {
+                        err = "prism: attn_output's input rows";
+                        return false;
+                    }
                     if (!skip_output) {
                         if (!mmq_gemm(Ly.out, E, HDq, B.ao, mixer, tn)) {
                             gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
@@ -5251,9 +5261,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         else if (g.loop && g.kind(il) != 0)   // (sensenova_loop: the attention's merge, the FFN's router)
             q35::mhc2_rows(S->R, S->R + E, 4 * E, E, T, S->mixer, 2, S->comb, false, Ly.mhc_w[1], Ly.mhc_b[1],
                            g.sinkhorn_iters, Ly.post_norm, g.norm_eps, S->x, S->x16, S->comb + (size_t) 8 * T, s);
-        else if (g.qwen35())
+        else if (g.qwen35()) {
             q35::add_rms_rows(S->R, 4 * E, S->mixer, Ly.post_norm, g.norm_eps, T, E, S->x, S->x16, s);
-        else
+            if (prism_l(il) && !prism_in(S->x, E, T, E, nullptr, S->x16, E, s)) { err = "prism: the FFN's input rows"; return false; }
+        } else
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_fn8, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
         dump_row("ffn_norm-" + std::to_string(il), S->x, E);
@@ -5378,6 +5389,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     }
                     gb::swiglu_rows(S->dq_gu, S->dq_gu, tn, (int) FF, g.swiglu_shexp, s, (int) (2 * FF));
                 }
+                // (PrismML's Ternary Bonsai: down's rotated input - each row's first FF floats)
+                if (prism_l(il) && !prism_in(S->dq_gu, (int) FF, tn, (int) (2 * FF), nullptr, nullptr, 0, s)) {
+                    err = "prism: down's input rows";
+                    return false;
+                }
 #if defined(STRATA_MOE_OWN)
                 if (od) {
                     own::quantize(S->dq_gu, nullptr, S->dq_hq, FF, 2 * FF, tn, s, own::needs_sums(dffn[2].type));
@@ -5416,6 +5432,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
                 hgemm_q(dffn[0], g.n_ff_dense, E, x16, E, B.dg, g.n_ff_dense, tn, 0.0f);
                 hgemm_q(dffn[1], g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
+                if (prism_l(il)) {   // (PrismML's Ternary Bonsai: the product in floats, rotated, its FP16 into dh16)
+                    strata::kernels::glmf::swiglu_f32(B.dg, B.du, g.lim_shexp(il), tn * g.n_ff_dense, B.dg, s);
+                    if (!prism_in(B.dg, g.n_ff_dense, tn, g.n_ff_dense, nullptr, B.dh16, g.n_ff_dense, s)) {
+                        err = "prism: down's input rows";
+                        return false;
+                    }
+                } else
                 gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.lim_shexp(il), s);
                 hgemm_q(dffn[2], E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
@@ -7216,6 +7239,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             float* kq = c.take<float>((size_t) Tv * KVq);
             float* vq = c.take<float>((size_t) Tv * KVq);
             cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
+            if (!prism_emb(emb, Tv, E, s)) { err = "prism: the draft block's embedding rows"; return false; }
             // h = output_norm(R + the last layer's FFN) a row (the tail skip is off with a draft block)
             q35::add_rms_rows(S->R, 4 * E, S->ffn, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, h16, s);
             gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
@@ -7358,7 +7382,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.memt) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
+    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.memt || g_.prism_block > 0) || split_next_ || l0_ != 0 ||
+                           l1_ != g_.n_layers)) {
         err = "prefill logits requires single-device DeepSeek V4.1, Inkling, Ling or MemT"; return false;
     }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
@@ -7542,6 +7567,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             tt->to_float(pack_emb_src_ + (size_t) tokens[(size_t) (i + t)] * row_b, S->emb_h + (size_t) t * E, E);
             if (const float* img = image_row(pos_start + i + t))   // an image's row in place of its <|image|> token
                 std::memcpy(S->emb_h + (size_t) t * E, img, (size_t) E * sizeof(float));
+            else if (prism_on())   // (PrismML's Ternary Bonsai: the table's rows stored rotated - restored, the GPU's bits)
+                prism_emb_host(S->emb_h + (size_t) t * E);
         };
         if (emb_par && fast_->workers != nullptr && T >= 256) {
             const int nj = 8;
@@ -7639,10 +7666,12 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
-                    else if (g.ling || g.memt)   // (ling, MemT's qwen35moe: R's row takes the last FFN, output_norm -
-                                                 // the token path's head input)
+                    else if (g.ling || g.memt || g.prism_block > 0) {   // (ling, MemT's qwen35moe, the prism dense
+                        // qwen35: R's row takes the last FFN, output_norm - the token path's head input)
                         gf::rms_q8(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, w_.at("output_norm.weight"),
                                    g.norm_eps, E, fast_->head_x, fast_->head_xq, fast_->cs);
+                        if (!prism_q8(fast_->head_x, E, 1, fast_->head_xq, fast_->cs)) { err = "prism: the head rows"; return false; }
+                    }
                     else
                     d41::head_prep(pf_->R + (size_t) t * 4 * E, pf_->pre2 + (size_t) t * 4,
                                    w_.at("output_norm.weight"), g.norm_eps, E,

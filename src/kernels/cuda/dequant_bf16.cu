@@ -47,6 +47,21 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             const int q = (b[2 + e / 4] >> ((e % 4) * 2)) & 3;
             put(out, j, (float) (q - 1) * d);
         }
+    } else if constexpr (TYPE == 143) {                           // PTQ1_0 (PrismML): 128 trits per block of 28 B
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 4) * 28;
+        const float d = h2f(b + 26);
+        const int e0 = (gi_in_row % 4) * 32;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int e = e0 + j;
+            int byte, n;
+            if (e < 80) { byte = e & 15; n = e >> 4; }
+            else if (e < 120) { byte = 16 + ((e - 80) & 7); n = (e - 80) >> 3; }
+            else { byte = 24 + ((e - 120) & 1); n = (e - 120) >> 1; }
+            const unsigned p3 = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u;
+            const int q = (int) ((((b[byte] * p3) & 0xFFu) * 3u) >> 8);
+            put(out, j, (float) (q - 1) * d);
+        }
     } else if constexpr (TYPE == 2) {                              // Q4_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
         const float d = h2f(b);
@@ -290,6 +305,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 14: block_elems = 256; block_bytes = 210; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
+    case 143: block_elems = 128; block_bytes = 28; return true;
     default: return false;
     }
 }
@@ -321,6 +337,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 20: STRATA_DQ(20);
     case 23: STRATA_DQ(23);
     case 42: STRATA_DQ(42);
+    case 143: STRATA_DQ(143);
     }
 #undef STRATA_DQ
     const cudaError_t e = cudaGetLastError();

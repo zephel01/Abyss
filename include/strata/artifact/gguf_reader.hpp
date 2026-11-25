@@ -108,6 +108,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 143:
+        return "PTQ1_0";   // PrismML's dense ternary (Ternary Bonsai): 128 trits, 24 + 2 packed bytes, an fp16 scale
     default:
         return "?";
     }
@@ -206,6 +208,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 64;
         bytes = 18;
         return true;
+    case 143:   // PTQ1_0: qs[24] (5 trits a byte), qh[2] (4 a byte), fp16 d
+        elems = 128;
+        bytes = 28;
+        return true;
     default:
         return false;
     }
@@ -268,7 +274,9 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+// keep_all: every item of an array (PrismML's Hadamard sign table, prism.hadamard.*: 28,672 values); other arrays
+// keep a sample of 64
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, bool keep_all = false) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -316,10 +324,10 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, keep_all ? v.count : 64));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (keep_all || i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
         }
         break;
     }
@@ -421,7 +429,8 @@ private:
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = c.str();
             MetaType t = (MetaType)c.read<uint32_t>();
-            meta_.emplace(std::move(key), read_value(c, t));
+            const bool keep_all = key.rfind("prism.hadamard.", 0) == 0;
+            meta_.emplace(std::move(key), read_value(c, t, 0, keep_all));
         }
         tensors_.reserve((size_t)n_tensors);
         // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a

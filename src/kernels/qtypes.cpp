@@ -15,7 +15,8 @@ namespace strata::qt {
 
 // The ids are the GGUF format's: they must stay these numbers.
 static_assert(Q4_0 == 2 && Q8_0 == 8 && Q2_K == 10 && Q8_K == 15 && IQ2_XXS == 16 && IQ4_XS == 23 && IQ1_M == 29 &&
-              BF16 == 30 && TQ2_0 == 35 && MXFP4 == 39 && NVFP4 == 40 && Q2_0 == 42 && COUNT == 43, "GGUF type ids");
+              BF16 == 30 && TQ2_0 == 35 && MXFP4 == 39 && NVFP4 == 40 && Q2_0 == 42 && PTQ1_0 == 143 && COUNT == 144,
+              "GGUF type ids");
 
 // ---- fp16 / bf16
 float fp16_to_fp32(uint16_t h) noexcept {
@@ -214,6 +215,26 @@ void dq_q2_0(const void* s, float* y, int64_t n) {
     for (int64_t i = 0; i < n / QK2_0; ++i, y += QK2_0) {
         const float d = h2f(x[i].d);
         for (int j = 0; j < QK2_0; ++j) y[j] = (float) ((int) ((x[i].qs[j / 4] >> ((j % 4) * 2)) & 3) - 1) * d;
+    }
+}
+
+// PTQ1_0 (PrismML): 128 values a block in 28 bytes - qs[24] five trits a byte, qh[2] four, then the fp16 d.  Trit n of
+// byte q: ((uint8_t) (q * 3^n) * 3) >> 8 (0..2 meaning -1..1).  qs[0..16) hold elements n * 16 + m, qs[16..24)
+// 80 + n * 8 + m, qh[h] 120 + n * 2 + h
+void dq_ptq1_0(const void* s, float* y, int64_t n) {
+    static const uint8_t p3[5] = {1, 3, 9, 27, 81};
+    const uint8_t* b = (const uint8_t*) s;
+    const auto trit = [](uint8_t q, uint8_t p) { return (int) (((unsigned) (uint8_t) (q * p) * 3u) >> 8) - 1; };
+    for (int64_t i = 0; i < n / 128; ++i, b += 28, y += 128) {
+        uint16_t dh;
+        std::memcpy(&dh, b + 26, 2);
+        const float d = fp16_to_fp32(dh);
+        for (int t = 0; t < 5; ++t)
+            for (int m = 0; m < 16; ++m) y[t * 16 + m] = (float) trit(b[m], p3[t]) * d;
+        for (int t = 0; t < 5; ++t)
+            for (int m = 0; m < 8; ++m) y[80 + t * 8 + m] = (float) trit(b[16 + m], p3[t]) * d;
+        for (int t = 0; t < 4; ++t)
+            for (int h = 0; h < 2; ++h) y[120 + t * 2 + h] = (float) trit(b[24 + h], p3[t]) * d;
     }
 }
 
@@ -626,6 +647,7 @@ struct Table {
         set(NVFP4, "nvfp4", QK_NVFP4, sizeof(block_nvfp4), true, dq_nvfp4);
         set(Q1_0, "q1_0", QK1_0, sizeof(block_q1_0), true, dq_q1_0);
         set(Q2_0, "q2_0", QK2_0, sizeof(block_q2_0), true, dq_q2_0);
+        set(PTQ1_0, "ptq1_0", 128, 28, true, dq_ptq1_0);
     }
 };
 const Table& table() {

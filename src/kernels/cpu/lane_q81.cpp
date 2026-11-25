@@ -564,6 +564,26 @@ float dw42(const uint8_t* row, int kbx, int iqs, const XB& x) {
     return half_of(&b->d) * x.d * (float) sumi;
 }
 
+// PTQ1_0 (PrismML's Ternary Bonsai): 128 trits in 28 bytes - qs[24] (five a byte), qh[2] (four), f16 d; trit n of
+// byte q is ((uint8) (q 3^n) 3) >> 8, value - 1; qs[0..16) hold values 16 n + m, qs[16..24) 80 + 8 n + m, qh[h]
+// 120 + 2 n + h.  A call: q8_1 block iqs (values 32 iqs ..), the device's dw<143> (an exact integer sum, d d8 sum)
+float dw143(const uint8_t* row, int kbx, int iqs, const XB& x) {
+    const uint8_t* b = row + (size_t) kbx * 28;
+    int sumi = 0;
+    for (int i = 0; i < 32; ++i) {
+        const int e = 32 * iqs + i;
+        int byte, n;
+        if (e < 80) { byte = e & 15; n = e >> 4; }
+        else if (e < 120) { byte = 16 + ((e - 80) & 7); n = (e - 80) >> 3; }
+        else { byte = 24 + ((e - 120) & 1); n = (e - 120) >> 1; }
+        unsigned p = 1;
+        for (int k = 0; k < n; ++k) p *= 3;
+        const int t = (int) (((((unsigned) b[byte] * p) & 0xFFu) * 3u) >> 8) - 1;
+        sumi += t * (int) (int8_t) ((const uint8_t*) x.u)[i];
+    }
+    return half_of(b + 26) * x.d * (float) sumi;
+}
+
 // qk values a block, ipb calls a block, iqs = step * call, block bytes
 struct Fmt {
     int qk, ipb, step;
@@ -594,6 +614,7 @@ bool fmt_of(int t, Fmt& f) {
         case 3: f = {32, 1, 1, sizeof(block_q4_1)}; return true;
         case 30: f = {32, 1, 1, 64}; return true;
         case 42: f = {64, 2, 1, sizeof(block_q2_0)}; return true;
+        case 143: f = {128, 4, 1, 28}; return true;
         default: return false;
     }
 }
@@ -624,6 +645,7 @@ float call(int t, const uint8_t* row, const XB* y, int kbx, int iqs) {
         case 3: return dw3(row, kbx, y[0]);
         case 30: return dw30(row, kbx, y[0]);
         case 42: return dw42(row, kbx, iqs, y[iqs]);
+        case 143: return dw143(row, kbx, iqs, y[iqs]);
         default: return 0.0f;
     }
 }

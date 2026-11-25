@@ -1125,6 +1125,80 @@ template<> __device__ __forceinline__ float dw<42>(const uint8_t* row, int kbx, 
 template<> struct F<42> { static constexpr int qk = 64, ipb = 2, step = 1, bytes = sizeof(block_q2_0);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {
         return dw<42>((const uint8_t*) v, kbx, iqs, load_xv(y + iqs), nullptr); } };
+// PTQ1_0 (PrismML's Ternary Bonsai, ggml type 143): 128 trits a block in 28 bytes - qs[24] five trits a byte, qh[2] four,
+// then the FP16 scale.  A trit n of byte q is ((uint8_t) (q * 3^n) * 3) >> 8 (0..2, meaning -1..1); qs[0..16) hold
+// elements n * 16 + m (byte m), qs[16..24) 80 + n * 8 + m, qh[h] 120 + n * 2 + h.  A call per q8_1 block (iqs 0..3:
+// elements 32 iqs .. 32 iqs + 31): the 32 trits as signed bytes, an exact integer sum, times d and d8
+// 4 bytes of one word -> their trit n (power p = 3^n) as 4 signed bytes: the even and the odd bytes in 16-bit lanes
+// (q * p <= 255 * 81 and the mod-256 value * 3 stay inside a lane), ((q * p mod 256) * 3) >> 8 a lane, then - 1
+__device__ __forceinline__ int ptq1_tri4(uint32_t w, uint32_t p) {
+    uint32_t e = ((w & 0x00FF00FFu) * p) & 0x00FF00FFu, o = (((w >> 8) & 0x00FF00FFu) * p) & 0x00FF00FFu;
+    e = ((e * 3u) >> 8) & 0x00030003u;
+    o = ((o * 3u) >> 8) & 0x00030003u;
+    return __vsub4((int) (e | (o << 8)), 0x01010101);
+}
+// the 32 trits of q8_1 block iqs (0..3) of a PTQ1_0 block as 8 ints of signed bytes, without branches on iqs (the
+// lanes of a warp hold different iqs: a branch a case ran all three paths one after the other).  Word j of the 8:
+//   iqs 0 / 1: qs word j % 4, trit 2 iqs + j / 4;   iqs 2: j < 4 qs word j trit 4, else word 4 + j % 2 trit (j - 4) / 2;
+//   iqs 3: j < 6 word 4 + j % 2 trit 2 + j / 2, j 6 / 7 the qh bytes' trits 0, 1 / 2, 3 (the two bytes alternating)
+__device__ __forceinline__ float ptq1_bytes(const uint8_t* blk, int iqs, int v[8]) {
+    const uint32_t* w = (const uint32_t*) blk;   // (28-byte blocks: 4-byte aligned)
+    const bool lo = iqs < 2, i2 = iqs == 2;
+    const uint32_t p0 = iqs == 0 ? 1u : 9u;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int wi = lo || i2 ? j : 4 + (j & 1);
+        const uint32_t p = lo ? p0 : i2 ? 81u : (j < 2 ? 9u : 27u);
+        v[j] = ptq1_tri4(w[wi], p);
+    }
+#pragma unroll
+    for (int j = 4; j < 6; ++j) {
+        const int wi = lo ? j - 4 : 4 + (j & 1);
+        const uint32_t p = lo ? 3u * p0 : i2 ? 1u : 81u;
+        v[j] = ptq1_tri4(w[wi], p);
+    }
+    const uint32_t q6 = w[6];
+#pragma unroll
+    for (int j = 6; j < 8; ++j) {
+        const int wi = lo ? j - 4 : 4 + (j & 1);
+        const uint32_t p = lo ? 3u * p0 : 3u;
+        const int t = ptq1_tri4(w[wi], p);
+        const uint32_t ph = j == 6 ? 1u : 9u;   // (iqs 3: the qh trits)
+        const int h = (ptq1_tri4(q6, ph) & 0xFFFF) | (ptq1_tri4(q6, 3u * ph) << 16);
+        v[j] = iqs == 3 ? h : t;
+    }
+    return __half2float(__ushort_as_half((uint16_t) (q6 >> 16)));
+}
+template<> __device__ __forceinline__ float dw<143>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t*) {
+    int v[8];
+    const float d = ptq1_bytes(row + (size_t) kbx * 28, iqs, v);
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) sumi = __dp4a(v[j], x.u[j], sumi);
+    return d * x.d * (float) sumi;
+}
+template<> struct F<143> { static constexpr int qk = 128, ipb = 4, step = 1, bytes = 28;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {
+        return dw<143>((const uint8_t*) v, kbx, iqs, load_xv(y + iqs), nullptr); } };
+// the ternary formats' weights of one q8_1 block as 8 ints of signed bytes and the block's scale - decoded once for all
+// the window's columns (mvn_kernel_ts): dw<42> / dw<143>'s bytes, so each column's integer sum (exact) and its
+// d * d8 * sum are the token path's bits
+template<int T> __device__ __forceinline__ float tern_w(const uint8_t* row, int kbx, int iqs, int v[8]);
+template<> __device__ __forceinline__ float tern_w<42>(const uint8_t* row, int kbx, int iqs, int v[8]) {
+    const block_q2_0* b = (const block_q2_0*) row + kbx;
+    const uint16_t* qs = (const uint16_t*) b->qs + iqs * 4;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q = qs[j];
+        v[2 * j] = q2_0_bytes(q & 0xFF);
+        v[2 * j + 1] = q2_0_bytes(q >> 8);
+    }
+    return __half2float(b->d);
+}
+template<> __device__ __forceinline__ float tern_w<143>(const uint8_t* row, int kbx, int iqs, int v[8]) {
+    return ptq1_bytes(row + (size_t) kbx * 28, iqs, v);
+}
+
 // NR rows against ONE activation, the whole warp; s[r] gets each row's full sum
 // the K-quant calls read 4 q8_1 blocks' int (iqs % 8) each: loaded ONCE per call position for all rows
 struct XK {
@@ -1233,7 +1307,7 @@ __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, c
         case kTypeBF16: return row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
 #define GF_CASE(T) case T: return row_dot<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3) GF_CASE(143)
 #undef GF_CASE
         default: return 0.0f;
     }
@@ -1246,7 +1320,7 @@ __device__ __forceinline__ size_t any_row_bytes(int type, int n_in) {
         case kTypeBF16: return (size_t) n_in * 2;
 #define GF_CASE(T) case T: return rbytes<T>(n_in);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3) GF_CASE(143)
 #undef GF_CASE
         default: return 0;
     }
@@ -1297,7 +1371,7 @@ __device__ __forceinline__ float any_row_dot_part(int type, const void* w, int r
         }
 #define GF_CASE(T) case T: return row_dot_part<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane, p, split);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20) GF_CASE(7) GF_CASE(42) GF_CASE(2) GF_CASE(3) GF_CASE(143)
 #undef GF_CASE
         default: return 0.0f;
     }
@@ -1544,8 +1618,21 @@ __global__ void __launch_bounds__(256) mvn_kernel_t(const __grid_constant__ MvBa
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
     for (int k = lane; k < nb * Fm::ipb; k += 32) {
         const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
+        if constexpr (T == 42 || T == 143) {   // (the ternary formats: the weights decoded once for every column -
+            int v[8];                           // the dot's bytes and its d * d8 * sum: the same bits)
+            const float dw_ = tern_w<T>(w, kbx, iqs, v);
 #pragma unroll
-        for (int c = 0; c < NC; ++c) acc[c] += Fm::dot(w, x + (size_t) c * xs + kbx * (Fm::qk / 32), kbx, iqs);
+            for (int c = 0; c < NC; ++c) {
+                const XV xv = load_xv(x + (size_t) c * xs + kbx * (Fm::qk / 32) + iqs);
+                int sumi = 0;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) sumi = __dp4a(v[q], xv.u[q], sumi);
+                acc[c] += dw_ * xv.d * (float) sumi;
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < NC; ++c) acc[c] += Fm::dot(w, x + (size_t) c * xs + kbx * (Fm::qk / 32), kbx, iqs);
+        }
     }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
@@ -1639,8 +1726,21 @@ __global__ void __launch_bounds__(256) mvn_kernel_ts(const __grid_constant__ MvB
         const int k0 = nk * part / SPLIT, k1 = nk * (part + 1) / SPLIT;
         for (int k = k0 + lane; k < k1; k += 32) {
             const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
+            if constexpr (T == 42 || T == 143) {   // (the ternary formats: the weights decoded once, every column)
+                int v[8];
+                const float dw_ = tern_w<T>(w, kbx, iqs, v);
 #pragma unroll
-            for (int c = 0; c < NC; ++c) acc[c] += Fm::dot(w, x + (size_t) c * xs + kbx * (Fm::qk / 32), kbx, iqs);
+                for (int c = 0; c < NC; ++c) {
+                    const XV xv = load_xv(x + (size_t) c * xs + kbx * (Fm::qk / 32) + iqs);
+                    int sumi = 0;
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) sumi = __dp4a(v[q], xv.u[q], sumi);
+                    acc[c] += dw_ * xv.d * (float) sumi;
+                }
+            } else {
+#pragma unroll
+                for (int c = 0; c < NC; ++c) acc[c] += Fm::dot(w, x + (size_t) c * xs + kbx * (Fm::qk / 32), kbx, iqs);
+            }
         }
     }
 #pragma unroll
@@ -4963,7 +5063,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
 int mv_type_ok(int t) {
     switch (t) {
         case kTypeF32: case kTypeBF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23: case 10: case 11:
-        case 17: case 22: case 21: case 29: case 20: case 7: case 42: case 2: case 3: return 1;
+        case 17: case 22: case 21: case 29: case 20: case 7: case 42: case 2: case 3: case 143: return 1;
         case exl3::kTypeEXL3: return 1;   // forwarded to the EXL3 kernels (mv below)
         default: return 0;
     }
@@ -5029,6 +5129,7 @@ size_t row_bytes(int type, int64_t n_in) {
         case 7: return (size_t) (n_in / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n_in / 32) * sizeof(block_q5_0);
         case 42: return (size_t) (n_in / 64) * sizeof(block_q2_0);
+        case 143: return (size_t) (n_in / 128) * 28;   // (PTQ1_0)
         case 2: return (size_t) (n_in / 32) * sizeof(block_q4_0);
         case 3: return (size_t) (n_in / 32) * sizeof(block_q4_1);
         default: return 0;
@@ -5037,7 +5138,7 @@ size_t row_bytes(int type, int64_t n_in) {
 
 bool mvn_supported(int type) {   // (qwen4exp's i-quant projections too: IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
     return type == 8 || type == 12 || type == 13 || type == 14 || type == 18 || type == 20 || type == 21 || type == 22 ||
-           type == 23 || type == 7 || type == 42 || type == 2 || type == 3 ||   // (Q4_0 / Q4_1: Qwen3.8-27B's)
+           type == 23 || type == 7 || type == 42 || type == 2 || type == 3 || type == 143 ||   // (Q4_0 / Q4_1: Qwen3.8-27B's; PTQ1_0)
            type == kTypeBF16 || type == kTypeF32;
 }
 
@@ -5115,7 +5216,7 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     // one launch per type present (as mv's typed kernels), each compiled for the column count
     // (PDL + the early L2 pull as mv's: mvn_launch_pdl; STRATA_GLM_MVN_PDL=0 launches them plainly, A/B)
     const int pf = mvn_launch_pdl();
-    constexpr int kTypes[] = {14, 8, 12, 13, 18, 20, 21, 22, 23, 7, 42, 2, 3, kTypeBF16};
+    constexpr int kTypes[] = {14, 8, 12, 13, 18, 20, 21, 22, 23, 7, 42, 2, 3, 143, kTypeBF16};
     bool done[kMaxMvJobs] = {};
     for (const int T : kTypes) {
         MvBatch b{};
@@ -5152,6 +5253,7 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
             case 23: GF_MVN(23) break;
             case 7: GF_MVN(7) break;
             case 42: GF_MVN(42) break;
+            case 143: GF_MVN(143) break;
             case 2: GF_MVN(2) break;
             case 3: GF_MVN(3) break;
             default:
@@ -5256,7 +5358,7 @@ bool mvn_mv(const MvJob* jobs, int n, int nc, cudaStream_t s) {
     const int q6k_force = g_q6k_force.load(std::memory_order_relaxed);
     const bool q6k_split = q6k_force >= 0 ? q6k_force != 0 : mv_tune().q6k_split;
     bool done[kMaxMvJobs] = {};
-    constexpr int kTyped[] = {14, 8, 12, 13};
+    constexpr int kTyped[] = {14, 8, 12, 13, 143};   // (143: PTQ1_0, the Ternary Bonsai GEMVs; Q2_0 stays generic - other models use it)
     if (typed) {
         for (const int T : kTyped) {
             MvBatch b{};
@@ -5309,6 +5411,7 @@ bool mvn_mv(const MvJob* jobs, int n, int nc, cudaStream_t s) {
                 case 8: GF_MVNT(8) break;
                 case 12: GF_MVNT(12) break;
                 case 13: GF_MVNT(13) break;
+                case 143: GF_MVNT(143) break;
             }
 #undef GF_MVNT
 #undef GF_MVN1
@@ -5380,7 +5483,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     const int q6k_force = g_q6k_force.load(std::memory_order_relaxed);
     const bool q6k_split = q6k_force >= 0 ? q6k_force != 0 : mv_tune().q6k_split;
     static const int split_env = [] { const char* v = getenv("STRATA_GLM_MV_SPLIT"); return v ? std::atoi(v) : -1; }();
-    constexpr int kTyped[] = {14, 8, 12, 13};
+    constexpr int kTyped[] = {14, 8, 12, 13, 143};   // (143: PTQ1_0, the Ternary Bonsai GEMVs; Q2_0 stays generic - other models use it)
     bool done[kMaxMvJobs] = {};
     // EXL3 weights (w: an exl3::Mat): their own kernels, F32 input when the job has it, else the q8_1
     {
@@ -5441,6 +5544,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 case 8: GF_MV_T(8) break;
                 case 12: GF_MV_T(12) break;
                 case 13: GF_MV_T(13) break;
+                case 143: GF_MV_T(143) break;
             }
 #undef GF_MV_T
         }

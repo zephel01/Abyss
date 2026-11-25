@@ -221,6 +221,18 @@ the HF code (`recipes/memt/ref_memt.py`). Speeds: RTX 5090, iGPU lane off, a 4K 
 | `Q8_0` (`tools/memt_convert.py`, the memory blocks BF16 / F32) | 37.8 GB | backbone, memory off: a 49-token chat 0.0014 (token path) / 0.0078 (prompt path); a document's first 512 tokens 0.052 / 0.034. Memory read with the reference's state: 0.003 / 0.004, same top token 28 of 28 (without the memory 3.01, 37%). Memory written from 58 tokens: 0.8-2.8% relative error a layer, cosine >= 0.9994. Recall: 4 of 4 facts (CLI and server) | not measured | the closer file (checks); runs with the RAM tier like any MoE, speed not measured |
 | `Q4_K_M` (the per-tensor types of Ornith-1.5-35B-A3B's Q4_K_M, k-quants through trench-gguf's GPU quantizer) | 22.1 GB | backbone, memory off, the same 512 tokens: 0.194 (prompt path), same top token 88.3%. Recall through the server: 4 of 4 facts; a 62-token note written by `/documents`: 2 of 2 questions | decode 304.6 tok/s without a memory, 295.5 with one (-3.0%); the 4K prompt 8,955 -> 8,362 tok/s (-6.6%). Writing a 194-token turn 0.17 s. A memory 40 MiB (80 MiB on the GPU with the write copy) | measured on a 32 GB GPU; smaller GPUs not measured |
 
+### Ternary Bonsai 2.5 27B (beta, unreleased)
+
+prism-ml's Ternary-Bonsai-2.5-27B: Qwen3.8-27B with ternary weights in a blockwise Hadamard basis ([MANUAL](MANUAL.md#ternary-bonsai-25-27b-beta)).
+Quality: SCORE over 3,071 positions of English, Japanese and code (`bench/qwen35dense/score.ids`), KL against Qwen3.8-27B
+Q8_0 on the same engine. Speeds: RTX 5090, iGPU lane off, a 4K prompt + 512 tokens, median of 3 (`bench/bonsai/speed.txt`).
+
+| file | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `PTQ1_0` ([prism-ml](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF), with the MTP block) | 6.23 GB | the same logits as Q2_0 (KL 0.000000); against Q8_0 KL 0.405, same top token 75.6%, nll 2.021 (Q8_0 1.671); greedy EN / JA / code / tool call / reasoning answers correct | decode 185.3 tok/s with MTP (82% accepted), 125.5 without; prompts 3,162 tok/s; capped at 12 / 8 GB 185.7 / 178.6. prism-ml's card (their runtime): ~163-174 / 305 | **the default**: all in VRAM from an 8 GB GPU (8K; 16 GB: 128K) |
+| `Q2_0` (the same repo, no MTP block) | 7.67 GB | the same weights as PTQ1_0 (every value compared) | decode 130.6 tok/s (no drafter), prompts 3,313 | when PTQ1_0 is not wanted; no MTP drafts |
+| for scale: Qwen3.8-27B unsloth `UD-Q4_K_XL` | 17.7 GB | against Q8_0 KL 0.0067, 96.4% | 137.4 / 76.8 tok/s (MTP / none); capped at 12 / 8 GB 28.0 / 15.6 | [Qwen3.8-27B](MANUAL.md#qwen38-27b-dense) |
+
 ### Qwen3.8-Flash-Next (qwen4exp)
 
 Details, packing and the drafter: [docs/qwen38](qwen38/README.md). KL is against the NVFP4 teacher (seq 0-9, 2,048

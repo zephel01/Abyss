@@ -166,6 +166,10 @@ struct Glm5Model::Q35dRam {
     std::thread svc;
     std::atomic<bool> quit{false};
     int threads = 0, n_embd = 0, n_ff = 0;
+    // PrismML's Ternary Bonsai (prism_path.cu): down's input is rotated - the CPU part's h rows [kg, n_ff) through the
+    // same blockwise transform (kg a multiple of the block: q35d_place), the signs at their global positions
+    int prism_B = 0;
+    const float* prism_sg = nullptr;   // n_ff signs (host), or nullptr
     std::vector<uint8_t> act, hq;   // kVerifyCols columns of the lane's activations
     std::vector<float> ff;
     std::atomic<uint64_t> calls{0}, cols{0}, us{0};
@@ -331,6 +335,24 @@ void Glm5Model::Q35dRam::compute(int il, int nt) {
         kc::lane_q81_gu_rows(f.type[0], f.type[1], f.host[0], f.row[0], f.host[1], f.row[1], E, a, nt, o, r0, r1,
                              std::numeric_limits<float>::infinity(), 1.0f);
     });
+    if (prism_B > 0) {   // (the rows' h rotated: S, the butterflies, the scale - prism_had.cu's arithmetic)
+        const int kg0 = std::max(0, f.kg), B = prism_B;
+        pool->run(nt * (FC / B), [&](int job) {
+            const int t = job / (FC / B), b0 = (job % (FC / B)) * B;
+            float* x = ff.data() + (size_t) t * FC + b0;
+            if (prism_sg != nullptr)
+                for (int i = 0; i < B; ++i) x[i] *= prism_sg[kg0 + b0 + i];
+            for (int h = 1; h < B; h <<= 1)
+                for (int q = 0; q < B / 2; ++q) {
+                    const int i = (q / h) * 2 * h + (q % h), j = i + h;
+                    const float a = x[i], c = x[j];
+                    x[i] = a + c;
+                    x[j] = a - c;
+                }
+            const float sc = (float) (1.0 / std::sqrt((double) B));
+            for (int i = 0; i < B; ++i) x[i] *= sc;
+        });
+    }
     const auto t1 = std::chrono::steady_clock::now();
     if (nt == 1) {
         kc::lane_q81_quant(ff.data(), FC, hq.data());
@@ -417,6 +439,11 @@ bool Glm5Model::q35d_place(std::string& err) {
     const Glm5Geometry& g = g_;
     const int NL = g.n_layers;
     const double G = 1073741824.0;
+    if (g.prism_block > 0) {   // (every trunk layer's down rotated: from_gguf_qwen35 checks it)
+        Q->prism_B = g.prism_block;
+        const auto it = g.prism_signs.find(g.n_ff_dense);
+        Q->prism_sg = it != g.prism_signs.end() ? it->second.data() : nullptr;
+    }
     for (int il = 0; il < NL; ++il)
         for (int r = 0; r < 3; ++r)
             if (Q->L[(size_t) il].src[r] == nullptr) {
@@ -581,9 +608,11 @@ bool Glm5Model::q35d_place(std::string& err) {
             if (!Q->L[(size_t) il].lent) cand.push_back(il);
         // the fewest CPU rows (a multiple of 256) on n layers that leave the rest within room2; FF + 256 when even all of
         // them on the CPU does not
+        // (PrismML's Ternary Bonsai: whole Hadamard blocks a part - the CPU's h is rotated on its own)
+        const int gran = g.prism_block > 0 ? std::max(256, g.prism_block) : 256;
         const auto rows_for = [&](int n) {
             const auto set = spread(n);
-            for (int c = 256; c <= FF; c += 256)
+            for (int c = gran; c <= FF; c += gran)
                 if (gpu_need(set, c) <= room2) return c;
             return FF + 256;
         };
@@ -592,6 +621,7 @@ bool Glm5Model::q35d_place(std::string& err) {
         // while the CPU computes its part; whole layers (STRATA_Q35D_SPLIT=0 or STRATA_Q35D_GPU_LAYERS): the fewest
         int c_min = 2048;
         if (const char* v = getenv("STRATA_Q35D_SPLIT_MIN")) c_min = std::max(256, std::min(FF, std::atoi(v) / 256 * 256));
+        c_min = (c_min + gran - 1) / gran * gran;
         if (split && gpu_cap == NL) {
             int n = std::max(1, (int) cand.size()), c = rows_for(n);
             if (const char* v = getenv("STRATA_Q35D_SPLIT_N")) {   // (tests: n layers, their fewest rows)

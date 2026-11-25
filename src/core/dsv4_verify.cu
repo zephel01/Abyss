@@ -1194,6 +1194,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
         cudaMemcpyAsync(V->emb, V->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, s);
     }
     abl_res(V->emb, T, (int) E, s);
+    if (prism_on() && !prism_emb(V->emb, T, (int) E, s)) { err = "prism: the window's embedding rows"; return false; }
     for (int t = 0; t < T; ++t) {
         if (g.q4x)   // qwen4exp: four streams a column, the columns contiguous (hc n_embd apart)
             gf::embed_streams(V->emb + (size_t) t * E, V->R + (size_t) t * HCE, g.n_embd, s);
@@ -1758,6 +1759,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
         } else {
             norm_cols(il == l0_ ? nullptr : V->ffn, Ly.attn_norm, V->x, V->xq);
+            if (prism_l(il) && !prism_in(V->x, (int) E, T, (int) E, V->xq, nullptr, 0, s)) { err = "prism: window x"; return false; }
             if (dfl_ != nullptr) dflash_capture(il, Rt(0), T, (size_t) 2 * E, false, s);   // (DFlash 2: the 27B's)
         }
         mark(0);
@@ -1777,6 +1779,9 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             q35::gdn_scan(Ly.gdn_state, rows, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
             strata::kernels::gdn_out_norm_silu(V->q35_o, V->q35_z, Ly.ssm_norm, V->q35_y, (int64_t) T * HV, Sd, g.norm_eps,
                                                (void*) s);
+            if (prism_l(il)) {
+                if (!prism_gdn(V->q35_y, T, Vd, V->q35_yq, nullptr, 0, s)) { err = "prism: window ssm_out input"; return false; }
+            } else
             gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
             gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, (int) E};
             if (!q35_mvn(&o, 1, T, s)) { err = "qwen35 verify: ssm_out"; return false; }
@@ -1864,6 +1869,9 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                                  V->q35_part, V->q35_ao, s, q35_kv_);
             }
             q35::attn_gate_rows(V->q35_ao, V->q35_qf, T, g.n_head, D, s, q35_kv_);
+            if (prism_l(il)) {
+                if (!prism_in(V->q35_ao, HD, T, HD, V->q35_aoq, nullptr, 0, s)) { err = "prism: window attn_output input"; return false; }
+            } else
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HD, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HD, (int) E};
             if (!q35_mvn(&o, 1, T, s)) { err = "qwen35 verify: attn_output"; return false; }
@@ -1877,6 +1885,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             gf::quantize_q8_1(V->x, V->xq, T * (int) E, s);
         } else {
             norm_cols(V->mixer, Ly.post_norm, V->x, V->xq);
+            if (prism_l(il) && !prism_in(V->x, (int) E, T, (int) E, V->xq, nullptr, 0, s)) { err = "prism: window x"; return false; }
         }
         mark(2);
         if (!Ly.moe) {   // the dense qwen35 (Qwen3.8-27B): fast_dense_ffn over the columns
@@ -1909,6 +1918,12 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                 if (!mvc(jd, 2, "dense ffn gate / up")) return false;
                 // (a BF16 / F32 down reads h as floats, kept in glm_dg - unsloth's BF16 file)
                 const bool hf = Ly.ffn_down.type == gf::kTypeBF16 || Ly.ffn_down.type == gf::kTypeF32;
+                if (prism_l(il)) {   // (PrismML: h in floats, rotated, then its q8_1 - the token path's order)
+                    gf::swiglu_f32(V->glm_dg, V->glm_du, g.swiglu_shexp, T * FF, V->glm_dg, s);
+                    if (!prism_in_ff(V->glm_dg, FF, T, FF, V->glm_dhq, s)) { err = "prism: window down input"; return false; }
+                    gf::MvJob dn = {Ly.ffn_down.q, V->glm_dhq, V->glm_dg, V->ffn, nullptr, 1.0f, Ly.ffn_down.type, FF, (int) E};
+                    return mvc(&dn, 1, "dense ffn down");
+                }
                 // (the columns contiguous - FF floats, FF / 32 q8_1 blocks apart: one launch is the launches a column)
                 for (int t = 0; t < (rows1 ? 1 : T); ++t) {
                     const int nn = rows1 ? T * FF : FF;
@@ -1932,6 +1947,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "qwen35 verify: output_norm.weight"; return false; }
     norm_cols(V->ffn, nw->second, V->head_x, V->head_xq);
+    if (prism_on() && !prism_q8(V->head_x, (int) E, T, V->head_xq, s)) { err = "prism: window head input"; return false; }
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, V->head_xq, V->head_x, V->logits, nullptr, 1.0f, ow.type, (int) E, g.n_vocab};
     if (q35d_head_split()) {   // (the dense qwen35 on an 8 GB card: the head's last rows on the CPU)
