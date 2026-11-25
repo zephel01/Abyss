@@ -7,6 +7,48 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.208 - 2026-11-26
+
+Inkling 2 Mini lends the part of its long-context KV that the conversation has not reached yet to the expert pool
+(RTX 3090 at 262144: decode +4-6%, first token about 3x sooner, same output). DeepSeek V4 / V4.1 no longer hand an
+empty turn back after thinking, Inkling's "required" tool choice opens the call when one tool is offered, and on/off
+switches read their value.
+
+### Changed
+
+- Inkling 2 Mini: KV lending (`STRATA_INK_KV_LEND`, default on; CUDA, one GPU, `--max-context` above `--kv-min`). The full
+  layers' caches go on the elastic KV: VRAM is mapped behind them only as the conversation reaches them, and the part no
+  position has reached yet holds more expert slots a layer; those experts leave before the KV needs the memory and come
+  back with a new conversation. The tokens are those without it (`STRATA_DETERMINISTIC=1` md5 on an RTX 5090 and an RTX
+  3090, at the setup's context and at 262144). RTX 3090 (24 GB) at `--max-context 262144`, UD-Q4_K_XL: 102 -> 163
+  expert slots a layer at start (every expert in VRAM until the KV passes ~160K), decode without the drafter +4-6%
+  (prose 91.7 -> 97.1 tok/s, code 92.2 -> 97.1, Japanese 92.3 -> 96.9), the first token after a short prompt 1.1-1.6 s
+  -> 0.36-0.58 s, an 8K prompt 4.4 -> 3.0 s; a 250K prompt the same (40.6 -> 40.9 tok/s; the prompt 0.5-1.2% longer
+  while the slots go back). RTX 5090 at 262144: code 241 -> 293 tok/s; at the setup's 65536 nothing is lent and the
+  speed is the same. `0` allocates the caches whole as before; `--parallel` above 1 keeps them whole.
+
+### Fixed
+
+- A turn that thought and then ended with no answer and no tool call (DeepSeek V4 / V4.1 in agents) came back empty,
+  and agents sent it again and again. When the reasoning ends with a tool call block (DSML, or `<tool_call>`), that
+  call is now the turn's call; otherwise the answer is one line saying the model ended its turn after thinking.
+  The tokens are the same.
+- A second `</think>` after the reasoning had closed showed up in the answer text. It no longer does.
+- Inkling 2: `tool_choice: "required"` (Anthropic `"any"`) with one tool offered now starts that tool's call, as a
+  named tool choice does. (With several tools the model still picks.)
+- `STRATA_GLM_NO_REUSE=0` turned conversation reuse off: several on/off switches were on whenever they were set.
+  `STRATA_GLM_NO_REUSE`, `NO_MTP`, `NO_SPEC`, `NO_PREFILL`, `MTP`, `HC1`, `HC2` and `PIPE` now read their value
+  (empty, `0`, `off`, `false`, `no` = off). `=1` works as before.
+- Inkling 2: when the one-token CUDA graph cannot be made (for example no memory for it), the token now runs as
+  ordinary launches (one log line) instead of failing the request. Same output.
+- When the GPU driver's pinned memory was used up (#61, Windows AMD with a large RAM tier), every prompt ran token by
+  token. The prompt's embedding rows and disk landing buffer now fall back to ordinary memory (the log says so);
+  prompts keep the batched path, the output is the same.
+- The prompt path no longer writes to expert slots with no rows (`zero_tails`): with the elastic KV such a slot may be a
+  rank the KV took back, and the write was an illegal memory access (found with Inkling's KV lending on a 250K prompt).
+- The CPU lane starts when the elastic KV's slots hold every expert at start (the RAM tier was empty, so the lane had
+  nothing to time and stayed off; a later long prompt then sent every RAM-tier expert over PCIe).
+
 ## v1.3.207 - 2026-11-25
 
 Qwen3.8-Flash-Next no longer stops at its first prompt when the RAM tier used up the GPU driver's pinned memory (#61,
