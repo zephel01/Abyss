@@ -1161,10 +1161,7 @@ void Glm5Model::ink_win_commit(int64_t pos) {
 // ---------------------------------------------------------------- the batched decode (--parallel)
 // STRATA_INK_KV_LEND (default 1): the full layers' KV on the elastic KV (ink_alloc); 0 allocates it whole as before
 bool Glm5Model::ink_kv_lend_env() {
-    static const bool on = [] {
-        const char* v = getenv("STRATA_INK_KV_LEND");
-        return v == nullptr || *v == 0 || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::core::env_on("STRATA_INK_KV_LEND", true);   // (by value: 0 / off / false / no)
     return on;
 }
 
