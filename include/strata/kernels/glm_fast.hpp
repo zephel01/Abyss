@@ -109,6 +109,7 @@ struct HcArgs {
                                       // this sublayer's own pre.  pre still receives the new one (another buffer)
     const unsigned int* cpu_seq = nullptr;   // the CPU LANE's answer for the last route (MoeDev::cpu_seq[0], 0 = none):
     const void* cpu_ans = nullptr;           // added into block_out first (MoeDev::cpu_ans) - moe_cpu_wait, fused
+    int eps_out = 0;                  // ERNIE-5.5: the mixes' RMS factor 1 / (sqrt(mean) + norm_eps) (0: rsqrt(mean + norm_eps))
 };
 void hc(const HcArgs& a, cudaStream_t s);
 /// hc() runs hc3 for this width (the kernel that can take HcArgs::cpu_seq itself; the others wait in moe_cpu_wait's

@@ -224,6 +224,7 @@ bool Glm5Model::verify_ready() const {
         // with the memory off (MEMT OFF, or none loaded yet) the windows as for the backbone alone.  Asked again at
         // every request, so OFF -> LOAD -> OFF switches them off and on)
         if (m->g_.memt && m->memt_using()) return false;
+        if (m->g_.ernie) return false;   // (ERNIE-5.5: no verify window yet - every token on the token path)
         // (inkling: its window opt-in - STRATA_INK_DRAFT=1, ink_window; one part, no prefetch / lookahead)
         // (--parallel's lanes: the batch steps are windows too - ink_batch_step)
         if (m->g_.ink && (!(ink_draft_env() || inkd_ != nullptr || ink_par_ > 1) || m->split_next_ != nullptr || m != this))

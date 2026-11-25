@@ -1260,6 +1260,10 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     }
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    if (g.ernie) {   // (ERNIE-5.5: the batched kernels have no MLA / gate / VHA / latent MoE yet)
+        std::fprintf(stderr, "glm prefill: CUDA%d ernie has no prompt path yet - token by token\n", dev_);
+        return true;
+    }
     // NVFP4 experts: the MMQ sets apply their second-level scales (the down one folded into the route weights, the
     // gate/up one on the product's rows before the SwiGLU); the light kernels, the CPU and the iGPU rows do not take
     // them (their staged experts all go over PCIe), and the fused SwiGLU product is off for them

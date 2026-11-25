@@ -73,6 +73,7 @@ bool Glm5Model::dsv4_bind(std::string& err) {
             return it->second;
         };
         Ly.ratio = g.ratio(il);
+        if (g.is_er_mla(il)) continue;   // (ERNIE-5.5's MLA layers: ernie_setup binds them)
         Ly.q_a = q("attn_q_a.weight");
         Ly.q_b = q("attn_q_b.weight");
         Ly.kv = q("attn_kv.weight");
@@ -190,6 +191,7 @@ bool Glm5Model::fast_dsv4_attn(int il, int64_t p64, std::string& err) {
     const int D = g.head_dim, r = Ly.ratio;
     const ds::Rope rope = layer_rope(g, r != 0), crope = layer_rope(g, true);
     const std::string Ls = std::to_string(il);
+    if (g.is_er_mla(il)) return fast_ernie_mla(il, p64, err);   // (ERNIE-5.5's MLA + DSA layers: ernie_fast_path.cu)
 
     // 1. the projections of x: q_a, kv, the compressors (kv and gate), the indexer's weights
     gf::MvJob j[gf::kMaxMvJobs];
@@ -298,6 +300,7 @@ bool Glm5Model::fast_dsv4_attn(int il, int64_t p64, std::string& err) {
     ds::attend(F->q, Ly.raw, ds_ring_, n_raw, Ly.comp_cache, sel, n_comp, Ly.sinks, g.n_head, D, g.n_rot, rope, p,
                F->ds_o, s, 0, F->ds_oq);   // (and its q8_1, wo_a's input)
     if (F->prof_on) F->mark("ds_attend");
+    if (g.ernie && !ernie_hca_vha(il, err)) return false;   // (ERNIE-5.5: the value heads' mix, ds_o and its q8_1)
     if (Ly.mt >= 0) {   // MemT-1.0-Flash: the memory read added before wo_a (a replay: the write too)
         if (dumps) dsv4_dump(s, "memt_x-" + Ls, F->x, g.n_embd);
         if (dumps) dsv4_dump(s, "memt_pre-" + Ls, F->ds_o, (int64_t) g.n_head * D);
@@ -316,6 +319,7 @@ bool Glm5Model::fast_dsv4_attn(int il, int64_t p64, std::string& err) {
                   (const uint8_t*) F->ds_oq + (size_t) gi * (gin / 32) * 36, F->ds_o + (size_t) gi * gin,
                   F->ds_oa + (size_t) gi * g.o_lora, nullptr, 1.0f, Ly.out_a.type, gin, g.o_lora};
     if (!gf::mv(jo, g.o_groups, s)) { err = "deepseek4: wo_a"; return false; }
+    if (g.ernie && !ernie_hca_gate(il, err)) return false;   // (ERNIE-5.5: ds_oa *= sigmoid(qr . attn_gate))
     gf::quantize_q8_1(F->ds_oa, F->ds_oaq, g.o_groups * g.o_lora, s);
     gf::MvJob ob = {Ly.out_b.q, F->ds_oaq, F->ds_oa, F->mixer, nullptr, 1.0f, Ly.out_b.type, g.o_groups * g.o_lora,
                     g.n_embd};

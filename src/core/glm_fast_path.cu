@@ -980,13 +980,13 @@ bool Glm5Model::fast_setup(std::string& err) {
                 Ly.d_type = nl.fmt.d_type;
                 Ly.gu_bytes = (size_t) nl.fmt.gu_row * (size_t) g.n_ff_exp;
                 Ly.up_bytes = (size_t) nl.fmt.up_row * (size_t) g.n_ff_exp;
-                Ly.dn_bytes = (size_t) nl.fmt.d_row * (size_t) g.n_embd;
+                Ly.dn_bytes = (size_t) nl.fmt.d_row * (size_t) g.exp_dim();
                 Ly.down_off = Ly.gu_bytes + Ly.up_bytes;
                 Ly.blob = Ly.gu_bytes + Ly.up_bytes + Ly.dn_bytes;
                 if (!gf::moe_supported(Ly.gu_type) || !gf::moe_supported(Ly.up_type) || !gf::moe_supported(Ly.d_type) ||
                     !gf::moe_gate_up_pair_supported(Ly.gu_type, Ly.up_type) ||
-                    gf::row_bytes(Ly.gu_type, g.n_embd) != nl.fmt.gu_row ||
-                    gf::row_bytes(Ly.up_type, g.n_embd) != nl.fmt.up_row ||
+                    gf::row_bytes(Ly.gu_type, g.exp_dim()) != nl.fmt.gu_row ||
+                    gf::row_bytes(Ly.up_type, g.exp_dim()) != nl.fmt.up_row ||
                     gf::row_bytes(Ly.d_type, g.n_ff_exp) != nl.fmt.d_row)
                     missing += P + "expert types " + std::to_string(Ly.gu_type) + "/" + std::to_string(Ly.up_type) + "/" +
                                std::to_string(Ly.d_type) + " ";
@@ -1056,6 +1056,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         return false;
     }
     if (g.dsv4() && !g.v41 && (!dsv4_bind(err) || !dsv4_alloc(err))) return false;
+    if (g.ernie && !ernie_setup(err)) return false;
     if (g.v41 && (!dsv41_bind(err) || !dsv41_alloc(err))) return false;
     if (g.qwen35() && !qwen35_alloc(err)) return false;
     if (g.is_hy4() && !hy4_setup(err)) return false;
@@ -3793,6 +3794,11 @@ static bool lane_xc_wanted(bool q4x) {
 bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    if (g.ernie) {   // (ERNIE-5.5: the lanes take the expert width as n_embd; its latent experts run on the GPU)
+        std::fprintf(stderr, "glm fast: CUDA%d ernie: the CPU / iGPU expert lanes are off (not implemented for the latent "
+                             "MoE yet) - RAM-tier experts go over PCIe\n", dev_);
+        return true;
+    }
     const char* lv = getenv(("STRATA_GLM_CPU_LANE" + std::to_string(dev_)).c_str());
     const bool own_count = lv != nullptr;   // this card's own count: a pool of its own
     if (lv == nullptr) lv = getenv("STRATA_GLM_CPU_LANE");
@@ -5134,6 +5140,7 @@ void Glm5Model::fast_destroy() {
     q35d_destroy();
     ink_free();   // (inkling_fast_path.cu: its slots and scratch)
     hy4_destroy();   // (hy4_fast_path.cu: its arena, buffers and the Engram table's file)
+    ernie_free();    // (ernie_fast_path.cu: its scratch, caches and folded weights)
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
     if (F->expert_helper) {
@@ -7950,6 +7957,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         h.xq = F->xq;
         h.part = F->part;
         h.counter = F->counter;
+        h.eps_out = g.ernie && g.er_hc_eps_out ? 1 : 0;
         if (g.v41) {   // the collapse with the previous sublayer's pre (layer 0: the one-hot fast_token sets)
             h.pre = F->v41_pre[0];
             h.pre_use = F->v41_pre[1];
@@ -8060,7 +8068,9 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             fast_dump(s, "mixer-" + Ls, F->mixer, g.n_embd);
         }
 
-        if (!Ly.moe) {
+        if (g.ernie) {
+            if (!fast_ernie_ffn(il, err)) return false;   // (the dense SiTU FFN or the latent MoE: ernie_fast_path.cu)
+        } else if (!Ly.moe) {
             gf::MvJob j[2];
             j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
             j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
@@ -8319,6 +8329,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     if (g.ink || g.giga) strata::kernels::ink::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
+    if (g.ernie) tail->ernie_multimax(tail->sc_ + tail->sc_logits, FT->cs);   // (ERNIE-5.5: MultiMax on the logits)
     // STRATA_TEST_NAN_AT=<position> (a test): that position's logits all NaN - the token path must stop with one
     // message, not read past the embedding table
     static const long long nan_at = [] { const char* v = getenv("STRATA_TEST_NAN_AT"); return v ? std::atoll(v) : -1LL; }();

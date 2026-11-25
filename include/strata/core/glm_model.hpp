@@ -104,6 +104,7 @@ struct Glm5Geometry {
     int ratio(int il) const { return il < (int) comp_ratio.size() ? comp_ratio[(size_t) il] : 0; }
     static bool from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
     static bool from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+    static bool from_gguf_ernie(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);   // (from _dsv4)
     // ---- qwen35moe (Qwen3.5-MoE: Ornith-1.5-122B; src/core/qwen35_fast_path.cu): arch 2 - plain residuals (no
     // hyper-connections, hc 1), gated delta-net layers (ssm_*: S x h_v x S states, a d_conv conv) with a full-attention
     // layer (GQA n_head / attn_head_kv of head_dim, NEOX RoPE on the first n_rot dims, q / k norms, a sigmoid output
@@ -244,6 +245,27 @@ struct Glm5Geometry {
     // against the state rounded to BF16, added to the de-roped attention output before wo_a.  Nano: memt_qrank 0.
     int memt_dim = 256, memt_qrank = 0, memt_groups = 0, memt_kvrank = 0, memt_grank = 0;
     std::vector<int> memt_layer;   // per layer: its memory index, -1 none
+    // ---- ernie (baidu ERNIE-5.5-Flash-Preview: deepseek4 with deepseek4.ernie.* keys, tools/ernie55_convert.py;
+    // src/core/ernie_fast_path.cu, worklog 2026-11-25_ernie55-port-survey.md): the V4 HCA layers with an output gate
+    // (sigmoid of the q latent, rounded to BF16, on wo_a's output) and a value-head mix (VHA: o_h <- sum_g M[h][g] o_g,
+    // M = I + V U^T of rank er_vha_rank) after the attention; er_mla layers an MLA attention instead (one 512 latent +
+    // a 64-dim rope key, plain RoPE of er_mla_rope_base, sinks, the same gate and VHA) whose DSA indexer only selects
+    // past er_dense_ctx() positions; the mHC pre's RMS factor 1 / (sqrt(mean) + eps); a dense SiTU FFN on the first
+    // dense_lead layers; the MoE routed by sigma(l0) + sigma(l1) of two routers (gating 3: the score as given), its
+    // weights times a learned per-expert scale, its experts in a latent of x_exp (fc1 -> experts -> RMSNorm -> fc2),
+    // SiTU everywhere; MultiMax on the logits.  x_exp: the routed experts' width (the tiers size by exp_dim(); 0 = n_embd)
+    bool ernie = false;
+    std::vector<char> er_mla;
+    int er_mla_qlora = 1024, er_mla_kvlora = 512, er_mla_nope = 192, er_mla_rope = 64, er_mla_v = 256;
+    float er_mla_rope_base = 8.0e6f;
+    int er_vha_rank = 16, er_idx_top_k = 2048;
+    bool er_hc_eps_out = true, er_multimax = true, er_gate_bf16 = true;
+    int x_exp = 0;
+    int exp_dim() const { return x_exp > 0 ? x_exp : n_embd; }
+    bool is_er_mla(int il) const { return ernie && il >= 0 && il < (int) er_mla.size() && er_mla[(size_t) il] != 0; }
+    /// the context the ERNIE token path runs without the DSA indexer (top-k of the positions older than the window):
+    /// up to here every earlier position is selected, so the MLA attention is dense
+    int er_dense_ctx() const { return er_idx_top_k + n_swa; }
     int ling_qk_nope = 128, ling_rope = 64, ling_v = 128, ling_group = 8, ling_topk_group = 4;
     std::vector<float> lim_e, lim_s;   // per layer (the NextN block's too); 0 = no clamp
     /// the limit the expert / shared-expert kernels take for layer il: ling encodes the llama.cpp form as
@@ -723,6 +745,16 @@ public:
     bool dsv4_bind(std::string& err);                      // in fast_setup: the per-layer weights
     bool fast_dsv4_attn(int il, int64_t p, std::string& err);   // one attention mixer (x -> mixer) at position p
     bool dsv4_head(std::string& err);                      // the hyper-connection head -> head_x / head_xq
+    // ---- ernie (src/core/ernie_fast_path.cu): its weights and scratch (in fast_setup, after dsv4_bind / dsv4_alloc), the
+    // MLA layers' mixer (x -> mixer), the HCA layers' additions (the VHA mix on ds_o, the gate on ds_oa), the FFN of a
+    // layer (x -> ffn: the dense SiTU FFN or the latent MoE through the tiers), MultiMax on the logits
+    bool ernie_setup(std::string& err);
+    void ernie_free();
+    bool fast_ernie_mla(int il, int64_t p, std::string& err);
+    bool ernie_hca_vha(int il, std::string& err);
+    bool ernie_hca_gate(int il, std::string& err);
+    bool fast_ernie_ffn(int il, std::string& err);
+    void ernie_multimax(float* logits, cudaStream_t s);
     // ---- deepseek41 (src/core/dsv41_fast_path.cu): the token path, prompt chunks (their attention a token at a time),
     // snapshots and verify windows (dsv4_verify.cu, the batched kind); no layer splits
     void* dsv41_state_ = nullptr;                          // the window rings, the 4 KV slots and the scratch

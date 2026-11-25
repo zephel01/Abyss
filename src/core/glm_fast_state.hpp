@@ -608,6 +608,8 @@ struct Glm5Model::FastState {
     struct Ink* ink = nullptr;
     // memt (memt_path.cu): the memory states and scratch
     struct Memt* memt = nullptr;
+    // ernie (ernie_fast_path.cu): ERNIE-5.5's weights beyond deepseek4's, the MLA caches and scratch
+    struct Ernie* ernie = nullptr;
     // prism (prism_path.cu): PrismML's Hadamard transform - the signs on the device, a scratch row block
     struct Prism* prism = nullptr;
     // ---- qwen4exp activations: the normed streams, the low rank, the gate, the injections ([0] attention, [1] FFN:

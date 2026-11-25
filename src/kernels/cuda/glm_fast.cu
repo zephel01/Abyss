@@ -114,6 +114,10 @@ __device__ __forceinline__ float lane_expf(float x) {
 
 // SITU (Inkling 2's expert activation), selected by a negative clamp `limit` (kSituLimit; the clamped SwiGLU's limit is
 // never negative): beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb), beta 4, lb 25 (the loader checks the GGUF's)
+// the mHC mixes' RMS factor: rsqrt(mean + eps) (DeepSeek V4, GLM-5.3), or 1 / (sqrt(mean) + eps) (ERNIE-5.5)
+__device__ __forceinline__ float hc_inv(float mean, float eps, int eps_out) {
+    return eps_out ? 1.0f / (sqrtf(mean) + eps) : rsqrtf(mean + eps);
+}
 __device__ __forceinline__ float situ_act(float g, float u) {
     return (4.0f * tanhf(g * 0.25f)) * (1.0f / (1.0f + expf(-g))) * (25.0f * tanhf(u * 0.04f));
 }
@@ -1825,7 +1829,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc_kernel(const __grid_constant__ 
         smix[tid] = acc;
     }
     __syncthreads();
-    const float inv = rsqrtf(smix[24] / (float) hc_dim + a.norm_eps);
+    const float inv = hc_inv(smix[24] / (float) hc_dim, a.norm_eps, a.eps_out);
     if (warp == 0) {
         if (lane < hc) {
             const float pre_v = dsigmoid(smix[lane] * inv * a.w_scale[0] + a.w_base[lane]) + a.hc_eps;
@@ -1952,7 +1956,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__
         smix[tid] = acc;
     }
     __syncthreads();
-    const float inv = rsqrtf(smix[24] / (float) hc_dim + a.norm_eps);
+    const float inv = hc_inv(smix[24] / (float) hc_dim, a.norm_eps, a.eps_out);
     if (warp == 0) {
         if (lane < hc) {
             const float pre_v = dsigmoid(smix[lane] * inv * a.w_scale[0] + a.w_base[lane]) + a.hc_eps;
@@ -2149,7 +2153,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
         if (lane == 0) smix[m] = t;
     }
     __syncthreads();
-    const float inv = rsqrtf(smix[24] / (float) (hc * n_embd) + a.norm_eps);
+    const float inv = hc_inv(smix[24] / (float) (hc * n_embd), a.norm_eps, a.eps_out);
     if (warp == 0) {
         if (lane < hc) {
             const float pre_v = dsigmoid(smix[lane] * inv * a.w_scale[0] + a.w_base[lane]) + a.hc_eps;
@@ -3104,7 +3108,8 @@ struct RouteArgs {
     int promote_min;            // STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
     int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
-    int gating;                 // 0: sigmoid (glm5-next), 1: sqrt(softplus) (deepseek4), 2: softmax top-k (qwen35moe)
+    int gating;                 // 0: sigmoid (glm5-next), 1: sqrt(softplus) (deepseek4), 2: softmax top-k (qwen35moe),
+                                // 3: the logits are the probabilities (ERNIE-5.5: the two routers' sigmoids, summed)
     const int* hash_ids;        // deepseek4's hash-routed layers: the token's k expert ids (no selection)
     float skip_w;               // ... and those not in VRAM whose share of the route's probability is below skip_w
     int early_x;                // 1: the request's x (16 KB, host-mapped) is written at the kernel's start, beside
@@ -3133,7 +3138,7 @@ __device__ __forceinline__ void route_put_xq(const RouteArgs& a, MoeRequest* rq,
 // softmax, and the plan takes the softmax over the k chosen, which is the renormalised top-k of the full softmax)
 __device__ __forceinline__ float route_score(float x, int gating) {
     if (gating == 1) return sqrtf(x > 20.0f ? x : logf(1.0f + expf(x)));   // ggml's softplus, then sqrt
-    if (gating == 2) return x;
+    if (gating == 2 || gating == 3) return x;   // (3: ERNIE-5.5's sigma(l0) + sigma(l1), summed before the route)
     return 1.0f / (1.0f + expf(-x));
 }
 
