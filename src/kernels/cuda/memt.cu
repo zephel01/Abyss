@@ -3,7 +3,9 @@
 // bits run to run).  Every kernel is a template on the head dim D (256: Nano, 512: Flash), a block D threads.
 #include "strata/kernels/memt.hpp"
 
+#if !defined(STRATA_USE_HIP)
 #include <cuda_bf16.h>
+#endif
 #include <cuda_runtime.h>
 
 namespace strata::kernels::memt {
@@ -25,7 +27,15 @@ __device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1
 template <int M>
 __device__ __forceinline__ float st_ld(const void* p, size_t i) {
     if constexpr (M == 2) return __uint_as_float((unsigned) ((const uint16_t*) p)[i] << 16);
+#if defined(STRATA_USE_HIP)   // (no cuda_bf16.h: k_to_bf16's round to nearest even, the same value for a finite one)
+    else if constexpr (M == 1) {
+        const unsigned u = __float_as_uint(((const float*) p)[i]);
+        return (u & 0x7fffffffu) > 0x7f800000u ? __uint_as_float(0x7fffu << 16)
+                                                : __uint_as_float(((u + 0x7fffu + ((u >> 16) & 1u)) >> 16) << 16);
+    }
+#else
     else if constexpr (M == 1) return __bfloat162float(__float2bfloat16_rn(((const float*) p)[i]));
+#endif
     else return ((const float*) p)[i];
 }
 
