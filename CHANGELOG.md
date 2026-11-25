@@ -19,6 +19,9 @@ prism-ml's Ternary Bonsai 2.5 27B runs (beta): ternary Qwen3.8-27B weights in a 
 the file's MTP block, 125.5 without (Qwen3.8-27B UD-Q4_K_XL: 137.4 / 76.8); capped at 8 GB 178.6. Other models' outputs are
 unchanged (7-config md5, Inkling 18 md5, Ling 4 md5, Qwen3.8-27B UD-Q4_K_XL md5 at 32 / 12 GB with and without MTP).
 
+Inkling's DSpark gate starts an answer with plain steps and prices its first windows from them (#58): after a 250K
+prompt on an RTX 3090 a short answer +4-5% over v1.3.204's opt-in pool rule, the same tokens.
+
 ### Added
 
 - MemT-1.0-Flash (MemTensor, MIT; beta, NVIDIA). DeepSeek-V4-Flash-0731 post-trained with a memory block in each of its
@@ -66,6 +69,12 @@ unchanged (7-config md5, Inkling 18 md5, Ling 4 md5, Qwen3.8-27B UD-Q4_K_XL md5 
   19 on the set in `recipes/memt-flash/memeval.py`; 0 without the memory).
 - `tools/memt_flash.py --imatrix` read the imatrix's F32 values as bytes and so changed nothing; it now weights the
   k-quants (a grouped weight such as `attn_output_a` takes one slice a group).
+- Inkling DSpark gate (#58): the answer's first 6 steps go without the drafter (`STRATA_INK_DSPARK_PROBE_FIRST`, `0`: as
+  v1.3.204), so the gate knows the plain token before the first drafted step and its early rule works from the start, and
+  the first windows are priced from that token instead of the drafts' confidence alone (it drew 5-8 column windows before
+  anything was measured). RTX 3090, a 250K prompt, `STRATA_INK_DSPARK_POOL_LOSS=8`, 2 runs: a 256-token answer 41.4-43.5
+  -> 43.2-45.2 tok/s (off 40.4-40.6), a 1,536-token answer 47.7-47.9 -> 47.7-50.3. The same tokens (Inkling 18 md5 on an
+  RTX 5090 and an RTX 3090). `STRATA_INK_DSPARK_GATE_LOG=2` logs every step.
 
 ## v1.3.204 - 2026-11-25
 
