@@ -7,6 +7,17 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.212 - 2026-11-28
+
+The setup's V4.1 / Hy4 RAM tier no longer gets the engine stopped on a 123-128 GB box. The engine is the same as
+v1.3.211.
+
+### Fixed
+
+- Setup: the V4.1 / Hy4 RAM tier (`STRATA_GLM_RAM_GB`) is now the smaller of RAM - 34 GB and 65% of RAM, minus a
+  drafter kept in host RAM. RAM - 34 gave 89 GB on a 123 GB box and systemd-oomd stopped the V4.1 132G load three
+  times. 94 GB boxes keep 60; 123 GB -> 80, 128 GB -> 83.
+
 ## v1.3.211 - 2026-11-26
 
 KRAFTON's Raon-1 mini runs (beta, NVIDIA, one GPU): `./setup-deepseek.sh --model raon` sets up KRAFTON's Q4_K_M
