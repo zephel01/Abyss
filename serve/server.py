@@ -2683,6 +2683,15 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    @staticmethod
+    def ink_rewrap_budget() -> int:
+        """STRATA_INK_REWRAP_BUDGET (default 512; 0 = off, as before v1.3.209): the most tokens an Inkling 2 thinking
+        message opened after the thinking budget is used up may think (run())."""
+        try:
+            return max(0, int(os.environ.get("STRATA_INK_REWRAP_BUDGET", "512") or 0))
+        except ValueError:
+            return 512
+
     def think_close_ids(self, ids) -> list[int]:
         """The bridge's tokens for this prompt (THINK_BRIDGE, see __init__); [] = a bare </think>."""
         b = self.think_bridge
@@ -2970,6 +2979,13 @@ class Service:
                 if by_room:
                     think_budget = room_budget
                 in_think = think_budget > 0
+                # Inkling 2 may open another thinking message after the budget closed the first one (Strata #7084: 2 of
+                # 3 agent runs thought on to max tokens, an empty answer): every thinking message counts against the
+                # one budget, and one opened past it gets STRATA_INK_REWRAP_BUDGET tokens (512); then the server
+                # closes it (the bridge, <|end_message|>) and starts the answer (<|message_model|><|content_text|>).
+                # Nothing changes for an answer whose thinking stays within the budget.
+                rewrap_tokens = self.ink_rewrap_budget() if in_think and getattr(self, "ink_ids", None) else 0
+                reopen_cap, rewrap = None, False       # (the reasoning_tokens that close the reopened message)
                 if thinking and parser.state == "reasoning":
                     closed_by = "unclosed"
                 # the prompt does not open the reasoning (no <think> in its last tokens): the model opens it itself with
@@ -3075,6 +3091,8 @@ class Service:
                                     for ev in evs:
                                         yield "event", ev
                                     parser.state, parser.lead = "reasoning", False
+                                    if rewrap_tokens:
+                                        reopen_cap = max(think_budget, reasoning_tokens + rewrap_tokens)
                                     continue
                                 if is_tx or t in (ink_mm, ink_th) or (t == ink_em and parser.state != "reasoning"):
                                     continue
@@ -3108,6 +3126,9 @@ class Service:
                                 reasoning_tokens += 1
                                 if parser.state != "reasoning":
                                     closed_by = self._closed_by(is_think_end, n, think_budget, by_room)
+                                    reopen_cap = None
+                                elif reopen_cap is not None and reasoning_tokens >= reopen_cap:
+                                    rewrap = True       # (a reopened thinking message past the budget: closed below)
                             refused = any(ev.kind == "calls_refused" for ev in evs)
                             if refused:
                                 refused_any = True
@@ -3123,7 +3144,9 @@ class Service:
                             if stopped or refused:
                                 finish = "stop"
                                 break
-                        if held:                    # the run ended on what only looked like a marker's start
+                            if rewrap:
+                                break
+                        if held and not rewrap:                    # the run ended on what only looked like a marker's start
                             for ev in parser.feed(held):
                                 yield "event", ev
                             held = ""
@@ -3147,6 +3170,37 @@ class Service:
                     if first_last is None:
                         fl = getattr(self.engine, "last", None)
                         first_last = dict(fl) if fl is not None and fl is not engine_last0 else {}
+                    if rewrap:
+                        rewrap, reopen_cap = False, None
+                        if cancel.is_set():
+                            finish = "cancel"
+                            break
+                        # the reopened thinking message ends as the budget ends the first (the bridge, the end marker)
+                        # and the answer message starts; the engine goes on from there without a budget
+                        ink_mm, _, ink_tx, ink_em = self.ink_ids[:4]
+                        bridge = self.think_close_ids(ids)
+                        text = held + "".join(detok.push(x) for x in bridge)
+                        detok.push(ink_em)              # (the end marker is not text)
+                        held = ""
+                        evs = parser.feed(text, think_end=True)
+                        if parser.state == "reasoning":   # (a parser that kept it open: close it as the marker does)
+                            parser.state, parser.lead = "content", True
+                        parser.lead = True
+                        forced = bridge + [ink_em, ink_mm, ink_tx]
+                        raw_ids += forced
+                        n += len(forced)
+                        reasoning_tokens += len(bridge)
+                        closed_by = "answer_room" if by_room else "budget"
+                        print(f"[abyss] Inkling opened another thinking message past the {closed_by.replace('_', ' ')}"
+                              f" ({think_budget} tokens): closed after {rewrap_tokens} more at most, answering",
+                              flush=True)
+                        for ev in evs:
+                            yield "event", ev
+                        if n >= max_new:
+                            break
+                        run_ids, run_max = list(ids) + raw_ids, max_new - n
+                        run_sampling = engine_sampling(n, False)
+                        continue
                     # the engine ended its run on an end token the answer keeps (it stops on those itself): the run goes
                     # on from there - the prompt and the answer so far, which the conversation cache mostly holds
                     if not (soft_tail and finish == "length" and n < max_new and not cancel.is_set()):

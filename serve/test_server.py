@@ -2425,5 +2425,67 @@ class HostGuard(unittest.TestCase):
             g.server_close()
 
 
+class InklingReopenedThinking(unittest.TestCase):
+    """Inkling 2 opening another thinking message after the budget (Strata #7084's idea): the reopened message counts
+    against the same budget (at least STRATA_INK_REWRAP_BUDGET more tokens), then the server closes it and starts the
+    answer message; an answer whose thinking stays within the budget is untouched (one engine run, same text)."""
+
+    MM, TH, TX, EM, END = ("<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|end_message|>",
+                           "<|content_model_end_sampling|>")
+    LONG = "hmm, let me reconsider. " * 40                       # 960 thinking tokens (one per byte)
+
+    class Rec(MockEngine):
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.calls = getattr(self, "calls", []) + [(list(ids), dict(sampling or {}))]
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+    def script(self, tail=""):
+        return (self.MM + self.TH + "plan" + self.EM + self.MM + self.TX + "Answer." + self.EM +
+                self.MM + self.TH + self.LONG + self.EM + self.MM + self.TX + "More." + self.EM + self.END + tail)
+
+    def answer(self, scripts, budget, rewrap=None):
+        tok = InklingThinkingOff.InkTok()
+        eng = self.Rec(tok, scripts, max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.think_budget = budget
+        out = {"reasoning": "", "content": "", "done": None}
+        env = {} if rewrap is None else {"STRATA_INK_REWRAP_BUDGET": str(rewrap)}
+        with unittest.mock.patch.dict(os.environ, env):
+            for kind, v in svc.run(tok.encode("hi"), True, None, 3000, {}, threading.Event()):
+                if kind == "event" and v.kind in out:
+                    out[v.kind] += v.text
+                elif kind == "done":
+                    out["done"] = v
+        return out, eng, tok
+
+    def test_reopened_thinking_is_capped(self):
+        out, eng, tok = self.answer([self.script(), "Final." + self.EM + self.END], budget=100, rewrap=50)
+        self.assertEqual(len(eng.calls), 2)                              # closed, then the answer's own run
+        ids = tok.encode(self.EM + self.MM + self.TX, parse_special=True)
+        self.assertEqual(eng.calls[1][0][-3:], ids)                      # ... from the answer message's start
+        self.assertNotIn("_think_budget", eng.calls[1][1])
+        self.assertEqual(out["content"], "Answer.Final.")
+        self.assertTrue(out["reasoning"].startswith("plan" + self.LONG[:90]))
+        self.assertNotIn(self.LONG[:200], out["reasoning"])
+        self.assertEqual(out["done"]["reasoning_closed_by"], "budget")
+        self.assertEqual(out["done"]["finish"], "stop")
+
+    def test_rewrap_floor_after_the_budget(self):
+        # the budget was used up by the first message: the reopened one still gets the rewrap's tokens
+        out, eng, _ = self.answer([self.script(), "Final." + self.EM + self.END], budget=2, rewrap=300)
+        self.assertEqual(len(eng.calls), 2)
+        self.assertIn(self.LONG[:296], out["reasoning"])
+        self.assertNotIn(self.LONG[:310], out["reasoning"])
+
+    def test_within_budget_untouched(self):
+        ref, eng0, _ = self.answer([self.script()], budget=100, rewrap=0)      # (off: as before)
+        for budget in (100, 5000):
+            out, eng, _ = self.answer([self.script()], budget=budget, rewrap=5000 if budget == 100 else None)
+            self.assertEqual(len(eng.calls), 1)
+            self.assertEqual((out["reasoning"], out["content"]), (ref["reasoning"], ref["content"]))
+        self.assertEqual(ref["content"], "Answer.More.")
+        self.assertIn(self.LONG, ref["reasoning"])
+
+
 if __name__ == "__main__":
     unittest.main()
