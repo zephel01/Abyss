@@ -112,6 +112,13 @@ MemTensor's MemT models with their native memory (beta, NVIDIA, one GPU; [MemT-1
 ./setup-deepseek.sh --model memt-flash --download-model   # 9.3 GB over the V4 0731 32G96G L97 shards (96.8 GB, set up too)
 ```
 
+Tencent's Hy4-flash (beta, NVIDIA, one GPU, text only; [Hy4-flash](#hy4-flash-beta-unreleased)): our 32G96G GGUF for a
+32 GB GPU + 96 GB RAM, with the model card's sampling (temperature 0.9, top_p 1.0) and V4.1's RAM tier (RAM - 34 GB):
+
+```sh
+./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf (92.9 GB)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -1377,7 +1384,12 @@ The engine runs Tencent's Hy4-flash (GGUF architecture `hy_v4_flash`: gated MLA 
 streams, window and sparse-indexed layers, a latent MoE, and an Engram n-gram table read from the SSD). Tested on
 [peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya) `Maya-XS` (IQ2_XXS experts, FP8 Engram);
 the loader also takes other converters' files (an Engram table in IQ4_NL / Q8_0 / F16 / BF16 / F32 in any shard,
-BF16 / F16 projections), not tested on such a file yet. No setup entry yet: pack it by hand and write the config.
+BF16 / F16 projections), not tested on such a file yet. Our
+[zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF) (92.9 GB, for a 32 GB GPU + 96 GB
+RAM) sets up with `./setup-deepseek.sh --model hy4` (the files checked against Hugging Face's SHA-256, the pack, and
+`abyss-hy4-32g96g.json` with a 65,536 context, temperature 0.9 / top_p 1.0 and `STRATA_GLM_RAM_GB` = RAM - 34 GB;
+NVIDIA only: the HIP build compiles the Hy4 path but it has not run on an AMD GPU; one GPU: no layer split). Other
+files: pack them by hand and write the config.
 
 ```bash
 python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf --out <dir>/pack-hy4

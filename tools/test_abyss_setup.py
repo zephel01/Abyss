@@ -1222,6 +1222,121 @@ class MemT(unittest.TestCase):
             A.main()
 
 
+class Hy4(unittest.TestCase):
+    """--model hy4 (Tencent's Hy4-flash, zephel01's 32G96G GGUF, BETA): the entry, the two shards by their prefix (the
+    imatrix file beside them skipped), a plain mirror of the repo linked with nothing downloaded, the config (64K, the
+    card's sampling, V4.1's RAM tier), NVIDIA only, one GPU."""
+    SHARDS = ("Hy4-flash-32G96G-00001-of-00002.gguf", "Hy4-flash-32G96G-00002-of-00002.gguf")
+
+    def test_the_entry(self):
+        m = A.MODELS["hy4"]
+        self.assertEqual((m["repo"], m["quant"], m["quants"], m["folder"]),
+                         ("zephel01/Hy4-flash-32G96G-GGUF", "32G96G", ("32G96G",), ""))
+        self.assertEqual((m["model_name"], m["prefix"], m["pack_args"]), ("hy4-flash", "hy4", []))
+        self.assertEqual(m["sampling"], {"temperature": 0.9, "top_p": 1.0})
+        self.assertTrue(m["nvidia_only"])
+        self.assertNotIn("context", m)   # (64K: the prompt path's needle runs at 63K answered all four)
+        for f in self.SHARDS:
+            self.assertTrue(f.startswith(m["prefix_file"]))
+
+    def test_the_shards_without_the_imatrix(self):
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            self.SHARDS[1], self.SHARDS[0], "Hy4-flash-own.imatrix.gguf", "README.md", "SHA256SUMS", ".gitattributes")]
+        m = A.MODELS["hy4"]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+            got = A.quant_files(m["quant"], m["repo"], m["folder"], m["prefix_file"])
+        self.assertEqual([g[0] for g in got], list(self.SHARDS))
+
+    @staticmethod
+    def no_fetch(url, dst, name):
+        """(S.download on a file already there only marks it - nothing fetched; one missing would be downloaded)"""
+        if not Path(dst).exists():
+            raise AssertionError(f"{name} would be downloaded")
+
+    def run_setup(self, d: Path, argv, ram=94.0):
+        """main() for --model hy4 on a 32 GB GPU with a plain mirror of the repo under <d>/data: no build, no network."""
+        data = d / "data"
+        flat = data / "models" / "zephel01" / "Hy4-flash-32G96G-GGUF"
+        flat.mkdir(parents=True)
+        files = []
+        for i, name in enumerate(self.SHARDS):
+            body = b"shard %d" % i
+            (flat / name).write_bytes(body)
+            files.append((name, len(body), hashlib.sha256(body).hexdigest()))
+        pack = flat / "32G96G" / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "native_experts.txt").write_text("x")
+        (pack / "tokenizer" / "chat_template.jinja").write_text("x")
+        gpu = {"index": 0, "name": "RTX 5090", "vram_gb": 32.0, "arch": "120", "count": 1}
+        tune = Namespace(gpu_tune=mock.Mock())
+        with mock.patch.object(sys, "argv", ["abyss_setup.py", "--model", "hy4", "--data-dir", str(data), *argv]), \
+                mock.patch.object(A, "ROOT", d), mock.patch.dict(sys.modules, {"abyss": tune}), \
+                mock.patch.object(A.S, "gpu_info", return_value=gpu), mock.patch.object(A.S, "ram_gb", return_value=ram), \
+                mock.patch.object(A, "use_prebuilt", return_value=False), mock.patch.object(A, "build_engine"), \
+                mock.patch.object(A.S, "pip_install"), mock.patch.object(A.S, "llama_cpp_reasons", return_value=[]), \
+                mock.patch.object(A, "quant_files", return_value=files), mock.patch.object(A.S, "check_shards"), \
+                mock.patch.object(A.S, "download", side_effect=self.no_fetch), \
+                mock.patch.object(A.S, "ask", side_effect=AssertionError("nothing to ask")), \
+                mock.patch.object(A.S, "run", side_effect=AssertionError("the pack is there")), \
+                mock.patch.object(A, "make_tools"), mock.patch.object(A.S, "step"), mock.patch.object(A.S, "say"), \
+                mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "warn") as warn:
+            self.assertEqual(A.main(), 0)
+        return flat, warn
+
+    def test_the_local_mirror_and_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            flat, warn = self.run_setup(Path(d), [])
+            for name in self.SHARDS:
+                link = flat / "32G96G" / name
+                self.assertTrue(link.is_symlink())
+                self.assertTrue(link.samefile(flat / name))
+                self.assertTrue((flat / "32G96G" / (name + ".sha256")).exists())
+            got = json.loads((Path(d) / "abyss-hy4-32g96g.json").read_text(encoding="utf-8"))
+            run = (Path(d) / "run-abyss-hy4-32g96g.sh").read_text(encoding="utf-8")
+        warn.assert_not_called()
+        self.assertEqual(got["args"], ["--glm-pack", str(flat / "32G96G" / "pack"), "--max-context", "65536",
+                                       "--prefill", "auto"])
+        self.assertEqual((got["model_name"], got["sampling"]), ("hy4-flash", {"temperature": 0.9, "top_p": 1.0}))
+        self.assertEqual(got["env"], {"STRATA_GLM_RAM_GB": "60"})   # (the card's tier on a 94 GB PC)
+        self.assertNotIn("gpu", got)
+        self.assertIn("Hy4-flash", run)
+        self.assertIn("--engine strata", run)
+
+    def test_a_small_pc_is_warned_and_a_big_one_has_no_tier(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, warn = self.run_setup(Path(d), [], ram=64.0)
+            got = json.loads((Path(d) / "abyss-hy4-32g96g.json").read_text(encoding="utf-8"))
+        self.assertIn("32 GB GPU + 94 GB RAM", warn.call_args.args[0])
+        self.assertEqual(got["env"], {"STRATA_GLM_RAM_GB": "30"})
+        with tempfile.TemporaryDirectory() as d:
+            self.run_setup(Path(d), [], ram=192.0)
+            self.assertNotIn("env", json.loads((Path(d) / "abyss-hy4-32g96g.json").read_text(encoding="utf-8")))
+
+    def test_nvidia_only(self):
+        argv = ["abyss_setup.py", "--model", "hy4", "--backend", "hip"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A, "hip_engine", side_effect=AssertionError("no ROCm step")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("Hy4-flash runs on NVIDIA GPUs only", fail.call_args.args[0])
+        self.assertNotIn("memory", fail.call_args.args[1])
+
+    def test_one_gpu(self):
+        gpu = {"index": 0, "name": "RTX 5090", "vram_gb": 32.0, "arch": "120", "count": 2}
+        argv = ["abyss_setup.py", "--model", "hy4", "--gpus", "0,1"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "gpu_info", return_value=gpu), \
+                mock.patch.object(A.S, "gpus", return_value=[gpu, {**gpu, "index": 1}]), \
+                mock.patch.object(A, "use_prebuilt", side_effect=AssertionError("stopped before the engine")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("no layer split for Hy4", fail.call_args.args[0])
+
+
 class VenvLayout(unittest.TestCase):
     """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
 

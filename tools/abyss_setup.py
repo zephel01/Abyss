@@ -34,6 +34,8 @@
     ./setup-deepseek.sh --model memt-nano    MemT-1.0-Nano (MemTensor, Qwen3.6-35B-A3B with a native memory; BETA, NVIDIA
                                              only): zephel01's Q4_K_M (22.1 GB) for an 8-32 GB GPU (the experts that do not fit
                                              go to RAM) + 32 GB RAM or more
+    ./setup-deepseek.sh --model hy4          Hy4-flash (Tencent, Engram n-gram table; BETA, NVIDIA only, text only):
+                                             zephel01's 32G96G (92.9 GB, Q3_K / IQ2_XXS experts) for a 32 GB GPU + 96 GB RAM
     ./setup-deepseek.sh --tools-only         only (re)create the Abyss-tools folder
     (no --quant: the PC-size file that suits this PC's VRAM + RAM is proposed - qwen38, glm, ornith; v4 keeps
      UD-Q2_K_XL and names zephel01's file for this size)
@@ -347,6 +349,23 @@ MODELS = {
                    "base": ("v4", "32G96G"), "nvidia_only": True, "context": 16384,
                    # MemTensor/MemT-1.0-Flash generation_config.json (2026-11-25): temperature 1.0, top_p 1.0
                    "sampling": {"temperature": 1.0, "top_p": 1.0}},
+    # Tencent's Hy4-flash (Tencent Hy License; BETA, v1.3.177+, our GGUF v1.3.199+): arch hy_v4_flash - gated MLA with
+    # sinks, 4 hyper-connection streams, a latent MoE and an Engram n-gram table (per_layer_token_embd, IQ4_NL here) read
+    # through the page cache from the SSD.  zephel01's 32G96G (2026-11-21): Q3_K experts on the 18 layers that matter
+    # most for Japanese, IQ2_XXS on the rest, 2 shards at the repo's top level (the imatrix file beside them is not
+    # needed to run: quant_files skips it).  The pack as the model card's command (no --compat-bf16).  NVIDIA only: the
+    # HIP build compiles the Hy4 path (an F32 prompt attention in place of the tensor-core one, the router on
+    # gb::router_f32) but it has never run on an AMD GPU; one GPU (the engine refuses a layer split for Hy4); text only
+    # (the vision encoder and the DFly2 drafter are not in the file; the engine has no Hy4 drafter yet).  RTX 5090
+    # (Gen4 x4), RAM tier 60 GB, iGPU off, mix459 + 512, median of 3: decode 52.2 tok/s (v1.3.199, the model card).
+    # The RAM tier as V4.1's (the Engram rows keep the page cache full: RAM - 34 GB, 60 on 94); sampling the card's
+    "hy4": {"repo": "zephel01/Hy4-flash-32G96G-GGUF", "quant": "32G96G", "quants": ("32G96G",), "folder": "",
+            "prefix_file": "Hy4-flash-32G96G-", "model_name": "hy4-flash", "prefix": "hy4", "title": "Hy4-flash",
+            "env": {}, "gb": 93, "pack_args": [], "sampling": {"temperature": 0.9, "top_p": 1.0},
+            "nvidia_only": True,
+            "nvidia_why": "Hy4-flash runs on NVIDIA GPUs only in this version (CUDA; the HIP build compiles its path, "
+                          "but it has not run on an AMD GPU)",
+            "one_gpu_why": "the engine has no layer split for Hy4"},
     "qwen35": {"repo": "zephel01/Qwen3.5-122B-A10B-IQ3_XXS-16G64G-GGUF", "quant": "IQ3_XXS-B2", "quants": ("IQ3_XXS-B2",),
                "folder": "", "prefix_file": "Qwen3.5-122B-A10B-IQ3_XXS-B2-", "model_name": "qwen3.5-122b-a10b",
                "prefix": "qwen35", "title": "Qwen3.5-122B-A10B", "env": {}, "gb": 51, "pack_args": [],
@@ -1361,10 +1380,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM), memt-flash: MemT-1.0-Flash (native memory, BETA, NVIDIA only: zephel01's overlay over the v4 32G96G L97 shards, which it sets up too, a 32 GB GPU + 96 GB RAM), memt-nano: MemT-1.0-Nano (native memory, BETA, NVIDIA only: zephel01's Q4_K_M, an 8-32 GB GPU); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM), memt-flash: MemT-1.0-Flash (native memory, BETA, NVIDIA only: zephel01's overlay over the v4 32G96G L97 shards, which it sets up too, a 32 GB GPU + 96 GB RAM), memt-nano: MemT-1.0-Nano (native memory, BETA, NVIDIA only: zephel01's Q4_K_M, an 8-32 GB GPU), hy4: Hy4-flash (BETA, NVIDIA only, text only: zephel01's 32G96G, a 32 GB GPU + 96 GB RAM); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G; memt-flash: 32G96G; memt-nano: Q4_K_M.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G; memt-flash: 32G96G; memt-nano: Q4_K_M; hy4: 32G96G.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1423,10 +1442,11 @@ def main() -> int:
     if backend is None:
         S.fail("no NVIDIA or supported AMD GPU found", "Abyss runs on NVIDIA GPUs (CUDA), or AMD ones with --backend hip")
     if model.get("nvidia_only") and backend != "cuda":
-        # (the memory's kernels build for HIP but have not run there: stopped before ROCm or the engine is touched)
-        S.fail(f"{model['title']}'s native memory runs on NVIDIA GPUs only in this version (CUDA; on AMD it is untested)",
+        # (MemT's memory / Hy4's kernels build for HIP but have not run there: stopped before ROCm or the engine is touched)
+        S.fail(model.get("nvidia_why") or
+               f"{model['title']}'s native memory runs on NVIDIA GPUs only in this version (CUDA; on AMD it is untested)",
                "an NVIDIA GPU (RTX 30 / 40 / 50); on AMD, DeepSeek V4 Flash 0731 (--model v4 --quant 32G96G) or "
-               "Ornith-1.5-35B-A3B (--model ornith35) run without the memory")
+               "Ornith-1.5-35B-A3B (--model ornith35) run" + ("" if a.model == "hy4" else " without the memory"))
     hip_extra = None
     if backend == "hip":
         gpus, hip_extra = hip_engine(a)
@@ -1444,7 +1464,8 @@ def main() -> int:
     for g in gpus if backend == "cuda" else []:
         S.ok(f"GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB, compute capability {g['arch']}")
     if model.get("nvidia_only") and len(gpus) > 1:
-        S.fail(f"{model['title']} runs on one GPU (a layer split is off for MemT)", "set it up without --gpus (--gpu picks the card)")
+        S.fail(f"{model['title']} runs on one GPU ({model.get('one_gpu_why', 'a layer split is off for MemT')})",
+               "set it up without --gpus (--gpu picks the card)")
     a._prebuilt = backend == "cuda" and use_prebuilt(a, gpus)
     if backend == "cuda" and len(gpus) == 1 and gpu.get("count", 1) > 1:
         S.say(f"  ({gpu['count']} NVIDIA GPUs here: --gpus all (or --gpus 0,1) splits the layers across them)")
@@ -1501,6 +1522,14 @@ def main() -> int:
             S.say("  an RTX 3090 (24 GB) 148 / 140 tok/s")
         if S.ram_gb() < 30:
             S.warn("MemT-1.0-Nano keeps the experts that do not fit the GPU in RAM: with under 32 GB of RAM it is not measured")
+    elif a.model == "hy4":
+        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB, made for a 32 GB GPU + 96 GB RAM: the experts "
+             "that do not fit there and the Engram table are read from the SSD - keep the model on a fast NVMe)")
+        S.say("  Hy4-flash 32G96G on an RTX 5090 (PCIe Gen4 x4) + a 60 GB RAM tier decoded 52.2 tok/s (the model card;")
+        S.say("  the missed experts on a Ryzen AI Max+ 395's LPDDR5X - a dual-channel DDR5 desktop computes them slower)")
+        if (gpus[0].get("vram_gb") or 0) < 30 or S.ram_gb() < 90:
+            S.warn("Hy4-flash 32G96G is measured on a 32 GB GPU + 94 GB RAM only: with less, more experts come from the "
+                   "SSD (slower)")
     elif model.get("vram_ctx"):
         gb = (model.get("quant_gb") or {}).get(quant, (model["gb"],))[0]
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file, ~{gb:.0f} GB, runs in VRAM: RAM holds the server and the "
@@ -1577,10 +1606,10 @@ def main() -> int:
         # Ornith-1.5-397B 16G64G: the model card's RAM tier (44 GB on a 64 GB PC: the rest for the OS and the page cache
         # the SSD experts go through)
         extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 20))
-    if a.model == "v41" and S.ram_gb() < 160:
-        # a RAM tier that leaves ~34 GB to the page cache and the rest of the PC: V4.1's Engram rows and SSD experts keep
-        # the page cache full, and without a cap systemd-oomd stops the server or the session that started it (the
-        # card's numbers: 60 GB on 94 GB)
+    if a.model in ("v41", "hy4") and S.ram_gb() < 160:
+        # a RAM tier that leaves ~34 GB to the page cache and the rest of the PC: V4.1's (and Hy4's) Engram rows and SSD
+        # experts keep the page cache full, and without a cap systemd-oomd stops the server or the session that started
+        # it (both cards' numbers: 60 GB on 94 GB)
         extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 34))
     if mtp is not None:
         # (the engine also finds MTP/ beside the GGUF by itself; the config names it)
@@ -1620,6 +1649,7 @@ def main() -> int:
                    " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model in ("mimo-9b", "mimo-9b-qsa")
              else " (SenseNova-Loop-9B: no draft block - n-gram drafts)" if a.model == "sensenova-loop-9b"
              else " (Ling-3.2-air: its MTP block is not used yet)" if a.model == "ling32air"
+             else " (Hy4-flash: no drafter yet - the DFly2 drafter is not in the file)" if a.model == "hy4"
              else " (MemT: drafting is off - the draft checks do not read the memory)" if model.get("nvidia_only")
              else ""))
     if a.model == "qwen38":

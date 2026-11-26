@@ -109,6 +109,13 @@ MemTensor の MemT（モデル自身のメモリつき。ベータ、NVIDIA、GP
 ./setup-deepseek.sh --model memt-flash --download-model   # V4 0731 32G96G の L97（96.8 GB、これも用意する）に重ねる 9.3 GB
 ```
 
+Tencent の Hy4-flash（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Hy4-flash](#hy4-flashベータ未リリース)）: GPU 32 GB + RAM 96 GB 向けの
+私たちの 32G96G の GGUF。サンプリングはモデルカードの値（temperature 0.9、top_p 1.0）、RAM 段は V4.1 と同じ（RAM − 34 GB）:
+
+```sh
+./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf（92.9 GB）
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -1306,7 +1313,11 @@ RTX 5090 で、HF のコードから書いた float64 の numpy の計算（`rec
 窓の層と疎な索引の層、潜在空間の MoE、SSD から読む Engram の n-gram 表）を動かします。試したのは
 [peasantsmith/Hy4-Flash-Maya](https://huggingface.co/peasantsmith/Hy4-Flash-Maya) の `Maya-XS`（エキスパート IQ2_XXS、Engram FP8）です。
 読み込みは、ほかの変換ツールのファイル（Engram 表が IQ4_NL / Q8_0 / F16 / BF16 / F32 でどの分割ファイルにあってもよい、
-射影が BF16 / F16）にも対応しますが、そのようなファイルではまだ試していません。setup にはまだ入っていないので、手でパックして設定を書きます。
+射影が BF16 / F16）にも対応しますが、そのようなファイルではまだ試していません。私たちの
+[zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF)（92.9 GB、GPU 32 GB + RAM 96 GB 向け）は
+`./setup-deepseek.sh --model hy4` で入ります（ファイルを Hugging Face の SHA-256 で確かめ、パックし、文脈 65,536、temperature 0.9 /
+top_p 1.0、`STRATA_GLM_RAM_GB` = RAM − 34 GB の `abyss-hy4-32g96g.json` を書きます。NVIDIA だけ: HIP のビルドでも Hy4 の経路は
+コンパイルされますが、AMD の GPU ではまだ動かしていません。GPU 1 枚: 層の分割なし）。ほかのファイルは、手でパックして設定を書きます。
 
 ```bash
 python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf --out <dir>/pack-hy4

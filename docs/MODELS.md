@@ -125,6 +125,9 @@ Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a pos
 | `Q4_K_M` (same repository) | 127.2 GB | not measured | not measured | |
 | `32G96G` (ours: [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF); Q3_K experts on the 18 layers that matter most for Japanese, IQ2_XXS on the rest, IQ4_NL Engram table; v1.3.199) | 92.9 GB | Japanese long explanations 44 / 60 answers with every fact right, other Japanese questions 49 / 60 (temp 0.9, 2 seeds + temp 0); KL 0.567 on a 457-token mixed text (the model card) | decode 52.2 tok/s (v1.3.199, RAM tier 60 GB, median of 3: 52.4 / 52.2 / 51.2; 79-83% of experts in VRAM) | 32 GB GPU + 96 GB RAM, long Japanese answers |
 
+Our `32G96G` sets up with one command: `./setup-deepseek.sh --model hy4` (beta, NVIDIA, one GPU, text only; the pack and
+the config, [MANUAL](MANUAL.md#hy4-flash-beta-unreleased)).
+
 ### Inkling 2 Mini (beta, v1.3.183)
 
 Thinking Machines' Inkling-2-Mini (Apache-2.0, 26B, depth-attention mixes and a 3-pass loop over layers 6-17), text

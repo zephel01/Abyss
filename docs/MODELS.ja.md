@@ -122,6 +122,9 @@ numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの 
 | `Q4_K_M`（同じリポジトリ） | 127.2 GB | 未計測 | 未計測 | |
 | `32G96G`（こちらのもの: [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF)。日本語に効く 18 層のエキスパートを Q3_K、ほかを IQ2_XXS、Engram の表は IQ4_NL。v1.3.199） | 92.9 GB | 日本語の長い説明で事実がすべて正しい答え 44 / 60、ほかの日本語の問い 49 / 60（temp 0.9 の 2 シード + temp 0）。457 トークンの混ざった文で KL 0.567（モデルカードの値） | 生成 52.2 tok/s（v1.3.199、RAM 段 60 GB、3 回の中央値: 52.4 / 52.2 / 51.2。エキスパートの 79〜83% が VRAM に当たる） | 32 GB の GPU + 96 GB の RAM、日本語の長い答え |
 
+こちらの `32G96G` は `./setup-deepseek.sh --model hy4` の 1 行で入ります（ベータ、NVIDIA、GPU 1 枚、テキストだけ。パックと設定も作る。
+[MANUAL](MANUAL.ja.md#hy4-flashベータ未リリース)）。
+
 ### Inkling 2 Mini（ベータ、v1.3.183）
 
 Thinking Machines の Inkling-2-Mini（Apache-2.0、26B。深さ方向の注意による混ぜ合わせと、層 6〜17 を 3 回まわすループ）。
