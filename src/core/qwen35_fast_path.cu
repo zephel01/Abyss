@@ -52,6 +52,10 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         ink_bind(il, missing);
         return;
     }
+    if (g.raon) {   // (raon: RDA / MLA / mHC - raon_fast_path.cu)
+        raon_bind(il, missing);
+        return;
+    }
     auto& Ly = F->L[(size_t) il];
     const std::string P = "blk." + std::to_string(g.phys(il)) + ".";   // (SenseNova-Loop: a second visit's weights)
     const auto f32 = [&](const char* n) -> const float* {
@@ -421,6 +425,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  (double) n_attn * cache_b / 1073741824.0, (long long) ctx,
                  q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.ling && !ling_alloc(err)) return false;
+    if (g.raon && !raon_alloc(err)) return false;
     if (g.memt && !memt_alloc(err)) return false;
     if (prism_on()) {   // (PrismML's Ternary Bonsai: the signs, the scratch, the F32 alpha / beta rows rotated once)
         if (!prism_alloc(err)) return false;
@@ -983,6 +988,10 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
         why = "laguna's window rings are not covered yet";
         return false;
     }
+    if (g_.raon) {   // (its 4 mHC streams are not in the snapshot, and a kept prefix holds its prompt's effort alpha)
+        why = "raon's slots are not covered yet";
+        return false;
+    }
     return true;
 }
 
@@ -997,7 +1006,7 @@ void Glm5Model::q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& 
     for (int il = l0_; il < lt_; ++il) {   // (the NextN block's layer too)
         const auto& Ly = F->L[(size_t) il];
         if (Ly.recr || Ly.kc == nullptr) continue;
-        if (g.ling) {   // (ling's MLA layer: one latent cache, rows of 576 FP16 - its vc is not read)
+        if (g.ling || g.raon) {   // (ling's, raon's MLA layer: one latent cache, rows of 576 FP16 - its vc is not read)
             out.push_back({(void*) Ly.kc, N * KV * 2});
             continue;
         }
@@ -2017,6 +2026,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     if (g.q4x) return fast_q4x_layers(p, err);
     if (g.loop) return fast_loop_layers(p, err);
     if (g.ink) return fast_ink_layers(p, err);
+    if (g.raon) return fast_raon_layers(p, err);
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];

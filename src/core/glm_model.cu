@@ -603,6 +603,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     if (g.get("inkling2_loop.block_count") || g.get("inkling2.block_count"))
         return from_gguf_inkling(g, out, err) && eog_from_gguf(g, out);
     if (g.get("bailingmoe3.block_count")) return from_gguf_ling(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("raon1.block_count")) return from_gguf_raon(g, out, err) && eog_from_gguf(g, out);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -1448,6 +1449,100 @@ bool Glm5Geometry::from_gguf_ling(const strata::GgufFile& g, Glm5Geometry& out, 
     return true;
 }
 
+// raon1 (KRAFTON Raon-1): the GGUF's raon1.* keys, Raon-1-mini's values as defaults; the qwen35moe path (arch 2) with
+// raon set, the qwen35 state sizes as ling's (the RDA state / conv rows, the MLA cache rows of 576)
+bool Glm5Geometry::from_gguf_raon(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "raon1.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    const int block_count = (int) num("block_count", 25);
+    out.arch = 2;
+    out.raon = true;
+    out.hc = (int) num("hyper_connection.count", 4);
+    out.raon_hc_eps = (float) num("hyper_connection.epsilon", 1e-5);
+    out.raon_hc_post = (float) num("hyper_connection.magnitude", 2.0);
+    out.n_embd = (int) num("embedding_length", 2560);
+    out.n_layers = block_count;
+    out.nextn = 0;
+    out.n_head = (int) num("attention.head_count", 40);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-5);
+    out.raon_lat_eps = (float) num("attention.latent_norm_rms_epsilon", 1e-6);
+    out.kv_lora = (int) num("attention.kv_lora_rank", 512);
+    out.q_lora = (int) num("attention.q_lora_rank", 576);
+    const int k_mla = (int) num("attention.key_length_mla", 192);
+    out.ling_v = (int) num("attention.value_length_mla", 128);
+    out.ling_rope = (int) num("rope.dimension_count", 64);
+    out.ling_qk_nope = k_mla - out.ling_rope;
+    out.n_rot = out.ling_rope;   // (NoPE: the 64 dims are never rotated)
+    out.kda_head_dim = (int) num("kda.head_dim", 128);
+    out.d_conv = (int) num("ssm.conv_kernel", 4);
+    out.kda_lb = (float) num("kda.gate_lower_bound", -5.0);
+    out.n_expert = (int) num("expert_count", 128);
+    out.n_exp_used = (int) num("expert_used_count", 6);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 1088);
+    out.n_ff_shexp = out.n_ff_exp;
+    out.n_shared = (int) num("expert_shared_count", 1) > 0 ? 1 : 0;
+    out.n_ff_dense = (int) num("feed_forward_length", 12032);
+    out.dense_lead = (int) num("leading_dense_block_count", 1);
+    out.gating = (int) num("expert_gating_func", 2) == 2 ? 0 : -1;   // (llama.cpp's 2 = sigmoid = Abyss's gating 0)
+    out.w_scale = (float) num("expert_weights_scale", 1.0);
+    out.norm_w = (int) num("expert_weights_norm", 1) != 0 ? 1 : 0;
+    out.swiglu_exp = out.swiglu_shexp = -1.0f;   // (SITU everywhere: glm_fast's negative limit)
+    const double sb = num("activation.situ_beta", 4.0), slb = num("activation.situ_linear_beta", 25.0);
+    out.n_head_kv.assign((size_t) block_count, 1);
+    if (const auto* v = g.get(p + "attention.head_count_kv"); v && v->type == strata::MetaType::ARRAY) {
+        if (v->items.size() < (size_t) block_count) {
+            err = "raon: attention.head_count_kv lists fewer entries than layers";
+            return false;
+        }
+        for (int il = 0; il < block_count; ++il) out.n_head_kv[(size_t) il] = (int) v->items[(size_t) il].num();
+    }
+    out.raon_steer.assign((size_t) block_count, 0);
+    if (const auto* v = g.get(p + "reasoning_effort.layers"); v && v->type == strata::MetaType::ARRAY)
+        for (const auto& it : v->items)
+            if (it.is_num() && it.num() >= 0 && it.num() < block_count) out.raon_steer[(size_t) it.num()] = 1;
+    out.raon_effort_names.clear();
+    out.raon_effort_alpha.clear();
+    if (const auto* v = g.get(p + "reasoning_effort.names"); v && v->type == strata::MetaType::ARRAY)
+        for (const auto& it : v->items) out.raon_effort_names.push_back(it.s);
+    if (const auto* v = g.get(p + "reasoning_effort.alpha"); v && v->type == strata::MetaType::ARRAY)
+        for (const auto& it : v->items) out.raon_effort_alpha.push_back(it.is_num() ? (float) it.num() : 0.0f);
+    if (const auto* v = g.get(p + "reasoning_effort.default"); v && v->type == strata::MetaType::STRING)
+        out.raon_effort_default = v->s;
+    out.raon_alpha = 0.05f;
+    for (size_t i = 0; i < out.raon_effort_names.size() && i < out.raon_effort_alpha.size(); ++i)
+        if (out.raon_effort_names[i] == out.raon_effort_default) out.raon_alpha = out.raon_effort_alpha[i];
+    out.ssm_state = out.kda_head_dim;
+    out.ssm_k_heads = out.ssm_v_heads = out.n_head;
+    out.ssm_inner = out.n_head * out.kda_head_dim;
+    out.attn_head_kv = 1;
+    out.head_dim = out.kv_lora + out.ling_rope;
+    if (const auto* v = g.get("tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
+        out.n_vocab = (int) v->count;
+    else
+        out.n_vocab = (int) num("vocab_size", 259840);
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_embd % 256 != 0 || out.n_expert <= 0 || out.n_expert > 512 ||
+        out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK || out.gating != 0 || out.hc != 4 ||
+        out.n_shared != 1 || out.dense_lead < 1) {
+        err = "raon: block_count / embedding_length / expert_* / expert_gating_func / hyper_connection.count are off";
+        return false;
+    }
+    if (out.kda_head_dim != 128 || out.d_conv != 4 || out.kv_lora != 512 || out.ling_rope != 64 || out.q_lora <= 0 ||
+        out.ling_qk_nope != 128 || out.ling_v != 128 || out.n_head > 64 || out.kda_lb >= 0.0f ||
+        std::fabs(sb - 4.0) > 1e-6 || std::fabs(slb - 25.0) > 1e-6) {
+        err = "raon: the kernels take kda.head_dim 128, conv 4, kv_lora 512, rope 64, qk_nope 128, v 128, <= 64 heads, "
+              "SITU betas 4 / 25";
+        return false;
+    }
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
+    return true;
+}
+
 // qwen4exp: the hparams llama.cpp's loader reads (src/models/qwen4exp.cpp load_arch_hparams), Qwen3.8-Flash-Next's
 // values as defaults; on the qwen35moe path (arch 2) with q4x set: hc streams, no NextN block, top-k <= glmf::kMaxK
 bool Glm5Geometry::from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
@@ -1831,6 +1926,7 @@ Glm5Model::~Glm5Model() {
     }
     fast_destroy();
     ling_free();      // (ling: the k_b / v_b rows and the attention scratch it allocated)
+    raon_free();      // (raon: the same, its scratch)
     memt_free();      // (memt: the memory states and scratch)
     prism_free();     // (prism: the sign vectors and scratch)
     q35d_destroy();   // (load_pack's record when fast_setup never ran)

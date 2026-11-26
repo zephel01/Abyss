@@ -257,6 +257,24 @@ struct Glm5Geometry {
     }
     static bool from_gguf_ling(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
+    // ---- raon (KRAFTON Raon-1, GGUF arch raon1; src/core/raon_fast_path.cu, kernels/raon_fast.hpp): arch stays 2 (the
+    // qwen35moe path's MoE, pool, tiers and CPU lane) with raon set.  The residual is 4 Raon-mHC streams (hc 4: a
+    // 17-row selector a site, the Helmert-chart residual mix, post gates x raon_hc_post); RDA layers (n_head_kv 0: KDA's
+    // short convs and gated delta rule, the decay through f_a (rank 128) / f_b, ssm_a = -exp(A_log), the write gate
+    // sigmoid(b + rda) folded into the values) and NoPE gated MLA layers (q through q_a / q_a_norm / q_b, a 512 latent +
+    // a 64-dim key shared by the heads and never rotated, absorbed k_b / v_b, a sigmoid gate per output channel,
+    // scale 1/sqrt(192)); the latents' norms at raon_lat_eps; a SiTU-GLU dense first layer, then a sigmoid router with
+    // exp_probs_b (top-k, normalised), a SiTU shared expert; the reasoning-effort vectors on raon_steer's layers' MoE
+    // output (x raon_alpha).  The qwen35 fields are set as ling's: the delta-net state / conv rows are the RDA ones,
+    // the KV rows the MLA cache rows (576 FP16, one KV head)
+    bool raon = false;
+    float raon_lat_eps = 1e-6f, raon_hc_eps = 1e-5f, raon_hc_post = 2.0f, raon_alpha = 0.05f;
+    std::vector<char> raon_steer;      // per layer: it adds the steering vector
+    std::vector<std::string> raon_effort_names;   // the GGUF's effort names and alphas ("none" is thinking off: 0.1)
+    std::vector<float> raon_effort_alpha;
+    std::string raon_effort_default = "high";
+    static bool from_gguf_raon(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
@@ -367,6 +385,11 @@ public:
     void expert_helper_resync(const std::function<bool()>& pending = {});
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);
+    /// raon: the reasoning-effort steering's alpha for this prompt (STRATA_RAON_EFFORT: a name of the GGUF's
+    /// raon1.reasoning_effort.names, a number, or auto - the model code's rule: a prompt with thinking off, the
+    /// tokens <think></think> next to each other, 0.1; else the default effort's).  No-op on other models
+    void raon_prompt(const std::vector<int64_t>& ids);
+    float raon_alpha() const { return raon_alpha_; }
     /// Conversation reuse (the fast path): save the sequence state at the current position - the recurrent KDA
     /// states and conv histories (the DSA caches are append-only, so the position alone restores them) - and
     /// restore it later to continue a prompt that extends the saved one.  false when unsupported.
@@ -867,6 +890,21 @@ public:
     float* ling_sc_ = nullptr;     // the MLA scores [heads][ctx] and the partial contexts
     float* ling_part_ = nullptr;
     float* ling_bias_ = nullptr;   // the group-masked router bias (n_expert)
+    // ---- raon (raon_fast_path.cu): the layer's RDA / MLA / mHC weights (from qwen35_bind), its scratch (from
+    // qwen35_alloc), the token path's layers (state_ = the 4 streams -> head_x / head_xq), the RDA and MLA mixers of a
+    // token (x / xq -> mixer), the buffers it owns
+    void raon_bind(int il, std::string& missing);
+    bool raon_alloc(std::string& err);
+    bool fast_raon_layers(int64_t p, std::string& err);
+    bool fast_raon_rda(int il, std::string& err);
+    bool fast_raon_mla(int il, int64_t p, std::string& err);
+    bool raon_mhc(int il, int site, std::string& err);   // (mhc_pre of the site + x's q8_1)
+    void raon_free();
+    std::vector<void*> raon_owned_;
+    float* raon_buf_ = nullptr;    // the scratch (raon_alloc carves it)
+    float* raon_sc_ = nullptr;     // the MLA scores [heads][ctx] and the partial contexts (ling_fast's mla_attend)
+    float* raon_part_ = nullptr;
+    float raon_alpha_ = 0.05f;
     // ---- inkling (inkling_fast_path.cu): the physical layer's weights (from qwen35_bind), the slots and scratch (from
     // qwen35_alloc, inside qwen35_state_), the token path's 48 layer applications and the head's mix (head_x / head_xq),
     // a new sequence's zeroed conv states, the snapshot's runs (conv states, window rings)

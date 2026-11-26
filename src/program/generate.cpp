@@ -2978,6 +2978,7 @@ static int glm_pack_generate(const Options& o) {
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
         stop_req.store(false);
+        model.raon_prompt(ids);   // (raon: this prompt's reasoning-effort alpha)
         model.force_next(-1);
         bool in_think = req_think_end >= 0;
         // this request's bias set: bias= from the start, bias_answer= once the reasoning has closed (at once when no
@@ -4442,6 +4443,7 @@ static int glm_pack_generate(const Options& o) {
         // one bucket for the rest of the vocabulary.
         if (const char* sc = getenv("STRATA_GLM_SCORE")) {
             const size_t c = (size_t) std::max(0L, std::atol(sc));
+            model.raon_prompt(o.tokens);   // (raon: the prompt's reasoning-effort alpha, as a generation's)
             const char* dump = getenv("STRATA_GLM_SCORE_DUMP");
             const char* ref = getenv("STRATA_GLM_SCORE_REF");
             const char* tkf = getenv("STRATA_GLM_SCORE_TOPK");

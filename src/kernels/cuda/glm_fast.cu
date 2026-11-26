@@ -3393,6 +3393,10 @@ __device__ __forceinline__ void route_body(const RouteArgs& a, unsigned int* syn
             q8_1_store_warp(llama_swiglu(a.sh_gate[i], a.sh_up[i], a.sh_limit), a.sh_hq + i / 32, lane);
             return;
         }
+        if (a.sh_limit < 0.0f) {   // (raon: a SITU shared expert)
+            q8_1_store_warp(situ_act(a.sh_gate[i], a.sh_up[i]), a.sh_hq + i / 32, lane);
+            return;
+        }
         const float g = fminf(a.sh_gate[i], a.sh_limit);
         const float u = fminf(fmaxf(a.sh_up[i], -a.sh_limit), a.sh_limit);
         q8_1_store_warp((g / (1.0f + expf(-g))) * u, a.sh_hq + i / 32, lane);
@@ -5982,6 +5986,10 @@ __global__ void sh_swiglu_kernel(const float* __restrict__ sh_gate, const float*
     if (i >= n_ff_sh) return;
     if (llama_clamp_on(sh_limit)) {
         q8_1_store_warp(llama_swiglu(sh_gate[i], sh_up[i], sh_limit), sh_hq + i / 32, threadIdx.x & 31);
+        return;
+    }
+    if (sh_limit < 0.0f) {   // (raon: a SITU shared expert)
+        q8_1_store_warp(situ_act(sh_gate[i], sh_up[i]), sh_hq + i / 32, threadIdx.x & 31);
         return;
     }
     const float g = fminf(sh_gate[i], sh_limit);

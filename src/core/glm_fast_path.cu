@@ -947,7 +947,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
+            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling || g.raon)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
             if (!g.ink) {   // (inkling: no shared expert)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
@@ -8006,7 +8006,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     if (!g.is_hy4()) abl_res(F->emb, 1, g.n_embd, F->cs);
     if (g.is_hy4()) {
         // (hy4_embed wrote state_)
-    } else if (g.qwen35() && !g.q4x)   // one residual stream (qwen4exp: hc copies, as the others)
+    } else if (g.qwen35() && !g.q4x && !g.raon)   // one residual stream (qwen4exp, raon: hc copies, as the others)
         cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
     else
         gf::embed_streams(F->emb, state_, g.n_embd, F->cs);

@@ -1288,6 +1288,10 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             return true;
         }
     }
+    if (g.raon) {   // (raon: no batched prompt path yet)
+        std::fprintf(stderr, "glm prefill: CUDA%d raon has no prompt path yet - token by token\n", dev_);
+        return true;
+    }
     // inkling: its attention, mixes and controllers are inkling_fast_path.cu's (ink_prompt_ok); the experts here
     if (g.ink) {
         std::string hw;

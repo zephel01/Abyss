@@ -20,6 +20,7 @@ import pathlib
 import sys
 
 import regex
+import unicodedata
 
 # ------------------------------------------------------------------ byte <-> unicode (GPT-2 byte-level BPE)
 def bytes_to_unicode() -> dict[int, str]:
@@ -121,6 +122,18 @@ BAILINGMOE_PATTERNS = (
 )
 
 
+# The `raon` pre-tokenizer (KRAFTON Raon-1), transcribed from the model's tokenizer.json (one Split, behavior Isolated,
+# then ByteLevel without its own regex): a run of CJK ideographs / kana with an optional leading space, other letter runs
+# (with their combining marks, spaces inside the run kept) , digits in groups of three counted from the right (the
+# first group takes the remainder), punctuation runs that take trailing newlines and slashes, then the usual whitespace
+# rules.  The text is NFC-normalised first (its normalizer; special tokens are not normalised)
+RAON_CJK = r"\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff"
+RAON_PATTERNS = (
+    r" ?[" + RAON_CJK + r"]+| ?(?:(?:(?![" + RAON_CJK + r"])\p{L})\p{M}*)+(?: (?:(?:(?![" + RAON_CJK + r"])\p{L})\p{M}*)+)*"
+    r"|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+
 def split_sequential(text: str, pats) -> list[str]:
     pieces = [text]
     for pat in pats:
@@ -148,9 +161,10 @@ class Tokenizer:
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
         if pre in ("bailingmoe", "llada-moe"):
             pre = self.pre = "bailingmoe2"
-        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2"):
+        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2", "raon"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
-                             "hy_v4, inkling2, bailingmoe2" % pre)
+                             "hy_v4, inkling2, bailingmoe2, raon" % pre)
+        self.nfc = pre == "raon"   # (its tokenizer.json's NFC normalizer, on the text between special tokens)
         # glm4/glm5 and inkling2 set ignore_merges: an exact vocab hit emits the whole pre-token piece (Inkling 2's
         # tokenizer.json sets it; its o200k vocabulary has entries the merges cannot build - chffff, Aleksandr, VBORw)
         self.ignore_merges = pre in ("glm4", "glm5", "inkling2")
@@ -174,7 +188,8 @@ class Tokenizer:
         self._re = regex.compile(GLM_PATTERN if pre in ("glm4", "glm5") else QWEN35_PATTERN)
         # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
         seq = (JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna"
-               else GPT4O_PATTERNS if pre == "inkling2" else BAILINGMOE_PATTERNS if pre == "bailingmoe2" else None)
+               else GPT4O_PATTERNS if pre == "inkling2" else BAILINGMOE_PATTERNS if pre == "bailingmoe2"
+               else RAON_PATTERNS if pre == "raon" else None)
         self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -271,6 +286,8 @@ class Tokenizer:
         if len(memo) > 300_000:
             memo.clear()
         out: list[int] = []
+        if self.nfc:
+            text = unicodedata.normalize("NFC", text)
         for piece in (split_sequential(text, self._seq) if self._seq else self._re.findall(text)):
             hit = memo.get(piece)
             if hit is not None:
@@ -437,12 +454,14 @@ def extract(gguf_path, out_dir) -> dict:
         # (named by `pre`, not by ignore_merges: inkling2 sets the flag but splits the GPT-4o way)
         "pre_pattern": (GLM_PATTERN if tk.pre in ("glm4", "glm5") else list(JOYAI_PATTERNS) if tk.pre in ("joyai-llm", "hy_v4")
                         else list(LAGUNA_PATTERNS) if tk.pre == "laguna" else list(GPT4O_PATTERNS) if tk.pre == "inkling2"
-                        else list(BAILINGMOE_PATTERNS) if tk.pre == "bailingmoe2" else QWEN35_PATTERN),
+                        else list(BAILINGMOE_PATTERNS) if tk.pre == "bailingmoe2"
+                        else list(RAON_PATTERNS) if tk.pre == "raon" else QWEN35_PATTERN),
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.pre in ("glm4", "glm5") else
                                "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (inkling2; its tokenizer.json sets "
                                "ignore_merges)" if tk.pre == "inkling2" else
                                "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_BAILINGMOE (bailingmoe2)" if tk.pre == "bailingmoe2" else
+                               "Raon-1's tokenizer.json Split regex, NFC first (raon)" if tk.pre == "raon" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

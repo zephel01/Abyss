@@ -537,6 +537,16 @@ struct Glm5Model::FastState {
         // (n_embd -> heads x (nope + rope)), attn_kv_a_mqa (n_embd -> kv_lora + rope), attn_gate (n_embd -> heads),
         // attn_kv_a_norm, the absorbed k_b ([head][kv_lora][nope]) / v_b ([head][v][kv_lora]) as F32 rows
         WSlot lg_f, lg_g, lg_beta, lg_wq, lg_kva, lg_gate;
+        // ---- raon (raon_fast_path.cu): RDA f_a (n_embd -> 128) / f_b (128 -> d_inner), the write delta ssm_rda (n_embd
+        // -> n_head), the output gate ssm_g (n_embd -> d_inner), +exp(A_log) per head (rn_apos); MLA q_a (n_embd ->
+        // q_lora), q_a_norm, q_b (q_lora -> heads x 192), the gate per channel (n_embd -> heads x 128) in lg_gate, kv_a /
+        // kv_a_norm / k_b / v_b in lg_kva / lg_kvn / lg_kb / lg_vb; the two mHC sites' selectors (BF16 [17][4 n_embd]),
+        // bases [17] and scales [4]; the effort steering vector (n_embd, nullptr where the layer has none)
+        WSlot rn_fa, rn_fb, rn_rda, rn_qa, rn_qb;
+        const float *rn_apos = nullptr, *rn_qan = nullptr, *rn_steer = nullptr;
+        const uint16_t* rn_hc_fn[2] = {nullptr, nullptr};
+        const float* rn_hc_base[2] = {nullptr, nullptr};
+        const float* rn_hc_scale[2] = {nullptr, nullptr};
         const float *lg_kvn = nullptr, *lg_kb = nullptr, *lg_vb = nullptr, *lg_a_neg = nullptr;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
