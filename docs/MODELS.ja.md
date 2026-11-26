@@ -123,7 +123,7 @@ numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの 
 | `32G96G`（こちらのもの: [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF)。日本語に効く 18 層のエキスパートを Q3_K、ほかを IQ2_XXS、Engram の表は IQ4_NL。v1.3.199） | 92.9 GB | 日本語の長い説明で事実がすべて正しい答え 44 / 60、ほかの日本語の問い 49 / 60（temp 0.9 の 2 シード + temp 0）。457 トークンの混ざった文で KL 0.567（モデルカードの値） | 生成 52.2 tok/s（v1.3.199、RAM 段 60 GB、3 回の中央値: 52.4 / 52.2 / 51.2。エキスパートの 79〜83% が VRAM に当たる） | 32 GB の GPU + 96 GB の RAM、日本語の長い答え |
 
 こちらの `32G96G` は `./setup-deepseek.sh --model hy4` の 1 行で入ります（ベータ、NVIDIA、GPU 1 枚、テキストだけ。パックと設定も作る。
-[MANUAL](MANUAL.ja.md#hy4-flashベータ未リリース)）。
+[MANUAL](MANUAL.ja.md#hy4-flashベータ)）。
 
 ### Inkling 2 Mini（ベータ、v1.3.183）
 
@@ -231,13 +231,13 @@ iGPU レーンなし、RAM の段は既定、学習したプールのファイ�
 | --- | ---: | --- | --- | --- |
 | 「B」（`tools/memt_flash.py --backbone`: MemT のエキスパート以外の骨格を L97 と同じテンソルの型で、メモリは Q8_0、エキスパートは L97 のもの） | 106.1 GB（書くのは 9.3 GB。残りは L97 の分割ファイルへのリンク） | メモリの書き 3.3〜4.5e-4、読み 0.5〜1.1%（層 4 / 22 / 42）。思い出し: 書いたターンから 4 点すべて、文書として書いた日本語のメモから 5 点すべて。メモリなし: 5 本とも NLL が「A」（L97 の骨格 + メモリ）より低い | 生成はメモリなし 77.5 tok/s（L97 は 78.9）、あり 68.2（-12%）。4K のプロンプト 983 / 867 tok/s。325 トークンのコミット 3.3〜3.5 秒 + 保存 0.7〜2.7 秒 | 32 GB の GPU + RAM 96 GB（書くにはエキスパートの置き場の尾が要る）。もっと小さい GPU は未計測 |
 
-### Raon-1 mini（ベータ、未リリース）
+### Raon-1 mini（ベータ、v1.3.211）
 
 KRAFTON の Raon-1 mini（GGUF のアーキテクチャ `raon1`）: 残差 4 本（Raon-mHC）、RDA 線形 attention 18 層と NoPE のゲート付き
 MLA 7 層、128 エキスパート（上位 6）と SiTU の FFN、推論量（reasoning effort）のステアリングベクトル。llama.cpp のアーキテクチャには
 なく、Abyss はモデル自身のコードから実装しました（読んだだけで、実行はしていない）。ファイルは KRAFTON の
 [Q4_K_M](https://huggingface.co/KRAFTON/Raon-1-mini-gguf)（`./setup-deepseek.sh --model raon`。effort の使い方は
-[MANUAL](MANUAL.ja.md#raon-1-miniベータ未リリース)）。品質: モデルのコードから書いた float64 の numpy の forward（同じ Q4_K_M の重みを
+[MANUAL](MANUAL.ja.md#raon-1-miniベータv13211)）。品質: モデルのコードから書いた float64 の numpy の forward（同じ Q4_K_M の重みを
 戻したもの、`recipes/raon1/ref.py`）に対する KL(参照 || エンジン)。英語の地の文（15 位置）と英語・日本語のチャット（各 30）。量子化
 そのもの（BF16 の重みの forward と Q4_K_M の重みの forward の差）は 0.0048 / 0.053 / 0.090。速度: RTX 5090（Gen4 x4）、RAM
 123 GB、iGPU レーンなし、各 1 回（3 回の中央値ではない）。
@@ -246,7 +246,7 @@ MLA 7 層、128 エキスパート（上位 6）と SiTU の FFN、推論量（r
 | --- | ---: | --- | --- | --- |
 | `Q4_K_M`（KRAFTON） | 19.7 GB | トークン経路 KL 0.0034 / 0.017 / 0.0037（地の文 / en / ja）、プロンプト経路 0.0009 / 0.0066 / 0.0041、全位置でトップのトークンが同じ。1,024 トークンでプロンプト経路とトークン経路の差 0.0015。greedy 12 トークンが参照と同じ。4K / 8K / 16K のチャットの先頭近くの針を見つけた。英語・日本語のチャットは思考オン・オフとも正しく答える | 生成は全部 VRAM で 173 tok/s（短いプロンプトのあとは 205）、16 / 12 / 8 GB に絞って 169 / 162 / 142（`STRATA_GLM_VRAM_GB`、残りは RAM）。プロンプト 4K 6,480 / 8K 6,330 / 16K 5,220 tok/s、16 / 12 / 8 GB での 4K は 3,610 / 3,130 / 2,500（4K のプロンプト + 512） | 8〜32 GB の NVIDIA GPU + RAM 32 GB 以上。未測定: RAM 32 GB の PC、ほかの GPU、AMD |
 
-### Ternary Bonsai 2.5 27B（ベータ、未リリース）
+### Ternary Bonsai 2.5 27B（ベータ、v1.3.205）
 
 prism-ml の Ternary-Bonsai-2.5-27B。Qwen3.8-27B の重みを 3 値にして、ブロックごとの Hadamard の基底で持つモデル（[MANUAL](MANUAL.ja.md#ternary-bonsai-25-27bベータ)）。
 品質: 英語・日本語・コードの 3,071 位置（`bench/qwen35dense/score.ids`）の SCORE、同じエンジンで Qwen3.8-27B Q8_0 に対する KL。

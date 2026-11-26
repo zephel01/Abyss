@@ -109,14 +109,14 @@ MemTensor の MemT（モデル自身のメモリつき。ベータ、NVIDIA、GP
 ./setup-deepseek.sh --model memt-flash --download-model   # V4 0731 32G96G の L97（96.8 GB、これも用意する）に重ねる 9.3 GB
 ```
 
-Tencent の Hy4-flash（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Hy4-flash](#hy4-flashベータ未リリース)）: GPU 32 GB + RAM 96 GB 向けの
+Tencent の Hy4-flash（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Hy4-flash](#hy4-flashベータ)）: GPU 32 GB + RAM 96 GB 向けの
 私たちの 32G96G の GGUF。サンプリングはモデルカードの値（temperature 0.9、top_p 1.0）、RAM 段は V4.1 と同じ（RAM − 34 GB）:
 
 ```sh
 ./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf（92.9 GB）
 ```
 
-KRAFTON の Raon-1 mini（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Raon-1 mini](#raon-1-miniベータ未リリース)）: 8〜32 GB の GPU 向けの
+KRAFTON の Raon-1 mini（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Raon-1 mini](#raon-1-miniベータv13211)）: 8〜32 GB の GPU 向けの
 KRAFTON 自身の Q4_K_M（GPU に載らないエキスパートは RAM へ）。サンプリングはモデルカードのチャット向けの値（temperature 1.0、
 top_p 0.95、top_k 20）:
 
@@ -1315,7 +1315,7 @@ RTX 5090 で、HF のコードから書いた float64 の numpy の計算（`rec
 ベータです。NVIDIA だけ。モデルに入るメモリは一度に 1 つ。MemT では DSpark と MTP の下書きは使わず、n-gram の繰り返しの下書きはメモリを使っていないときだけです
 （検証の窓がメモリを読まないため）。会話スロット、`--parallel`、層の分割も使いません。書くにはエキスパートの置き場の尾が要ります（32 GB の GPU で 13 GB あります。足りないと、理由を言って書くのを断ります）。
 
-## Hy4-flash（ベータ、未リリース）
+## Hy4-flash（ベータ）
 
 エンジンは Tencent の Hy4-flash（GGUF のアーキテクチャ `hy_v4_flash`。シンク付きのゲート MLA 注意、4 本の hyper-connection、
 窓の層と疎な索引の層、潜在空間の MoE、SSD から読む Engram の n-gram 表）を動かします。試したのは
@@ -1334,7 +1334,7 @@ python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gg
 設定は `"args": ["--glm-pack", "<dir>/pack-hy4", "--max-context", "16384"]`、`"tokenizer": "<dir>/pack-hy4/tokenizer"` とし、
 サーバーは `--engine strata` で起動します。思考は `reasoning_effort` に従います（`none` で切る。テンプレートにあれば `max`）。
 RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークンのプロンプト、512 トークン生成の 3 回の中央値:
-生成 60.0 tok/s。32 トークン以上のプロンプトは、まとめて読む経路（未リリース）を通ります。注意・Engram の行（チャンク分を
+生成 60.0 tok/s。32 トークン以上のプロンプトは、まとめて読む経路（v1.3.178）を通ります。注意・Engram の行（チャンク分を
 まとめて読む）・射影をチャンク単位で計算し、潜在空間のエキスパートは共通のエキスパートの仕組みで計算します。同じ機械・
 コードのプロンプト・その後 256 トークン生成で、プロンプト tok/s（1 トークンずつ → まとめて）: 459 トークン 62 → 487（3 回の中央値）、
 4,096 トークン 49 → 1,092、15,808 トークン 50 → 1,573。その後の生成は変わりません（61 / 49 / 48）。この経路があれば
@@ -1352,7 +1352,7 @@ RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークン�
 `"model"` には `python tools/vision/hy4v_ref.py vocab --gguf <1 本目の分割ファイル> --out <dir>/hy4-vocab.gguf` で作る語彙だけの GGUF を指定します。
 まだのもの: MTP ドラフター、AMD（HIP）。
 
-## Raon-1 mini（ベータ、未リリース）
+## Raon-1 mini（ベータ、v1.3.211）
 
 エンジンは KRAFTON の Raon-1 mini（GGUF のアーキテクチャ `raon1`: 残差 4 本、RDA 線形 attention、NoPE のゲート付き MLA、
 SiTU の FFN の 128 エキスパート）を、トークン経路とバッチのプロンプト経路で動かします。`./setup-deepseek.sh --model raon` で
@@ -1375,7 +1375,7 @@ SiTU の FFN の 128 エキスパート）を、トークン経路とバッチ�
 思考オフで終わっていれば 0.1。会話の再利用は、次のリクエストの alpha が同じときだけです。effort が変わると読み直します（プロンプトは
 毎秒数千トークンなので速い）。`STRATA_RAON_EFFORT`（名前、`none`、数値）は CLI と、指定のないリクエストの alpha を決めます。
 `STRATA_RAON_PROMPT_ATTN=0` はプロンプトの MLA attention を 1 行ずつ計算します（確認用）。速度と確認:
-[docs/MODELS](MODELS.ja.md#raon-1-miniベータ未リリース)。まだのもの: DFlash ドラフター、複数の会話のスロット、AMD（HIP）。
+[docs/MODELS](MODELS.ja.md#raon-1-miniベータv13211)。まだのもの: DFlash ドラフター、複数の会話のスロット、AMD（HIP）。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

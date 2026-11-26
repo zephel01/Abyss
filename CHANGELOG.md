@@ -7,6 +7,33 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.211 - 2026-11-26
+
+KRAFTON's Raon-1 mini runs (beta, NVIDIA, one GPU): `./setup-deepseek.sh --model raon` sets up KRAFTON's Q4_K_M
+GGUF. The other models' outputs are the same as v1.3.210.
+
+### Added
+
+- KRAFTON Raon-1 mini (GGUF arch `raon1`), beta: token-path decode and a batched prompt path (Raon-mHC 4-stream
+  residual, RDA linear attention, NoPE gated MLA with a 40-head tensor-core prompt attention, SiTU FFN). RTX 5090,
+  Q4_K_M, everything in VRAM: decode about 205 tok/s on short prompts, 173 tok/s after a 4K prompt; prompts about
+  6,400 tok/s at 4K and 5,200 tok/s at 16K (one run each). The same card held to 16 / 12 / 8 GB: decode 169 / 162 /
+  142 tok/s after a 4K prompt. Logits against a float64 forward on the GGUF's weights: KL 0.0034-0.017 (token path),
+  0.0009-0.0066 (prompt path), same greedy answers in English and Japanese; a code word near the start found at 4K,
+  8K and 16K.
+- Server: Raon's chat template with thinking on / off and tool calls; `reasoning_effort` (none / low / medium / high /
+  xhigh / max) is applied per request as the model's effort-steering strength, and a conversation is reused only
+  when that strength is the same. `STRATA_RAON_EFFORT` sets a fixed one.
+- `--model raon`: sets up `raon-1-mini-Q4_K_M.gguf` (19.7 GB) from KRAFTON/Raon-1-mini-gguf, checked against
+  Hugging Face's SHA-256, the pack, and `abyss-raon-q4_k_m.json` (65,536 context, the card's temperature 1.0 /
+  top_p 0.95 / top_k 20; the card's presence penalty is not applied - the engine has no penalties on this path).
+  NVIDIA only (the HIP build compiles the path, it has not run on AMD; the prompt attention is CUDA-only), one GPU.
+  Not yet: the DFlash drafter, several conversations at once.
+
+### Fixed
+
+- Docs: section titles that still said "unreleased" (Hy4-flash, Ternary Bonsai) now name their version.
+
 ## v1.3.210 - 2026-11-26
 
 Our Hy4-flash GGUF installs with one command: `./setup-deepseek.sh --model hy4` (beta, NVIDIA, one GPU). The engine is

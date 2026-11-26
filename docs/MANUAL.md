@@ -112,14 +112,14 @@ MemTensor's MemT models with their native memory (beta, NVIDIA, one GPU; [MemT-1
 ./setup-deepseek.sh --model memt-flash --download-model   # 9.3 GB over the V4 0731 32G96G L97 shards (96.8 GB, set up too)
 ```
 
-Tencent's Hy4-flash (beta, NVIDIA, one GPU, text only; [Hy4-flash](#hy4-flash-beta-unreleased)): our 32G96G GGUF for a
+Tencent's Hy4-flash (beta, NVIDIA, one GPU, text only; [Hy4-flash](#hy4-flash-beta)): our 32G96G GGUF for a
 32 GB GPU + 96 GB RAM, with the model card's sampling (temperature 0.9, top_p 1.0) and V4.1's RAM tier (RAM - 34 GB):
 
 ```sh
 ./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf (92.9 GB)
 ```
 
-KRAFTON's Raon-1 mini (beta, NVIDIA, one GPU, text only; [Raon-1 mini](#raon-1-mini-beta-unreleased)): KRAFTON's own
+KRAFTON's Raon-1 mini (beta, NVIDIA, one GPU, text only; [Raon-1 mini](#raon-1-mini-beta-v13211)): KRAFTON's own
 Q4_K_M for an 8-32 GB GPU (the experts that do not fit go to RAM), with the model card's chat sampling (temperature 1.0,
 top_p 0.95, top_k 20):
 
@@ -1386,7 +1386,7 @@ repeats' drafts only while no memory is on (the verify windows do not read the m
 and a layer split are off; a commit needs the pool's tail (a 32 GB GPU
 has 13 GB of it; a smaller tail refuses the commit with a message).
 
-## Hy4-flash (beta, unreleased)
+## Hy4-flash (beta)
 
 The engine runs Tencent's Hy4-flash (GGUF architecture `hy_v4_flash`: gated MLA attention with sinks, 4 hyper-connection
 streams, window and sparse-indexed layers, a latent MoE, and an Engram n-gram table read from the SSD). Tested on
@@ -1406,7 +1406,7 @@ python tools/iq_pack.py --gguf <dir>/Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gg
 The config: `"args": ["--glm-pack", "<dir>/pack-hy4", "--max-context", "16384"]`, `"tokenizer": "<dir>/pack-hy4/tokenizer"`,
 and start the server with `--engine strata`. Thinking follows `reasoning_effort` (`none` turns it off; `max` where the
 template has it). RTX 5090 (Gen4 x4) + RAM tier 60 GB, iGPU lane off, a 459-token prompt, 512 tokens, median of 3:
-decode 60.0 tok/s. Prompts of 32+ tokens go through the batched prompt path (unreleased): the attention, the Engram rows
+decode 60.0 tok/s. Prompts of 32+ tokens go through the batched prompt path (v1.3.178): the attention, the Engram rows
 (read for the whole chunk at once) and the projections a chunk at a time, the latent experts through the shared expert
 machinery. Same box, a code prompt, 256 tokens after it, prompt tok/s token path -> prompt path: 459 tokens 62 -> 487 (median of 3),
 4,096 tokens 49 -> 1,092, 15,808 tokens 50 -> 1,573; decode after it unchanged (61 / 49 / 48). With the prompt path
@@ -1425,7 +1425,7 @@ mmproj (`mmproj-Hy4-Flash-Maya-XS.gguf`) runs on strata-vision (`tools/vision/hy
 vision build) with a vocab-only GGUF from `python tools/vision/hy4v_ref.py vocab --gguf <shard 1> --out <dir>/hy4-vocab.gguf`
 as its `"model"`. Not yet: the MTP drafter, AMD (HIP).
 
-## Raon-1 mini (beta, unreleased)
+## Raon-1 mini (beta, v1.3.211)
 
 The engine runs KRAFTON's Raon-1 mini (GGUF architecture `raon1`: 4 residual streams, RDA linear attention, NoPE gated
 MLA, 128 experts with SiTU FFNs) token by token and with the batched prompt path. `./setup-deepseek.sh --model raon`
@@ -1449,7 +1449,7 @@ an integer 1-100 or Anthropic's thinking budget is the nearest of low / high / m
 the same alpha; with another effort it is read again (fast: a prompt runs at thousands of tokens a second).
 `STRATA_RAON_EFFORT` (a name, `none` or a number) sets the alpha for the CLI and for requests that name none;
 `STRATA_RAON_PROMPT_ATTN=0` reads the prompt's MLA attention a row at a time (a check). Speeds and checks:
-[docs/MODELS](MODELS.md#raon-1-mini-beta-unreleased). Not yet: the DFlash drafter, multi-conversation slots, AMD (HIP).
+[docs/MODELS](MODELS.md#raon-1-mini-beta-v13211). Not yet: the DFlash drafter, multi-conversation slots, AMD (HIP).
 
 ## EXL3 quants (GLM-5.3-Flash)
 
