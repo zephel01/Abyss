@@ -7,9 +7,9 @@
 //     output (ernie_hca_gate: sigmoid(qr . attn_gate), rounded to BF16);
 //   * six MLA + DSA layers (fast_ernie_mla): q through a 1024 LoRA (q_a, its norm, q_b: 64 heads of 192 nope + 64
 //     rope), one 512 latent + a 64-dim rope key a position (kv_a_mqa, its norm), kv_b absorbed into the query and the
-//     output, plain RoPE (base 8e6, adjacent pairs), sinks, VHA, the gate, attn_output.  The DSA indexer picks the top
-//     2048 of the positions older than the window only past er_dense_ctx() positions - the engine refuses longer
-//     contexts until it is implemented;
+//     output, plain RoPE (base 8e6, adjacent pairs), sinks, VHA, the gate, attn_output.  Past er_dense_ctx() positions
+//     (2048 + the window of 128) the DSA indexer (ernie_indexer) picks the top 2048 of the positions older than the
+//     window and the attention takes those plus the window; up to there every earlier position is in, so it is dense;
 //   * the mHC pre's RMS factor 1 / (sqrt(mean) + eps) (HcArgs::eps_out);
 //   * the FFN (fast_ernie_ffn): layer 0 a dense SiTU FFN (14336); the others the latent MoE - two routers
 //     (s = sigmoid(l0) + sigmoid(l1), selected by s + bias, weighted s / sum s times the expert's learned scale, which
@@ -17,7 +17,7 @@
 //     the expert tiers (MXFP4, SiTU), RMSNorm, fc2 (2048 -> 4096), plus the shared SiTU expert on x;
 //   * MultiMax on the logits (ernie_multimax).
 // Not here yet (refused where they would start): the prompt path, verify windows, DSpark, the CPU / iGPU lanes, layer
-// splits, the DSA indexer (contexts past er_dense_ctx()).
+// splits.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,7 @@ namespace strata::core {
 
 namespace gf = strata::kernels::glmf;
 namespace ek = strata::kernels::ernie;
+namespace ds = strata::kernels::dsv4;
 
 struct Ernie {
     struct Lay {
@@ -46,6 +48,10 @@ struct Ernie {
         const uint16_t* kvb = nullptr;   // attn_kv_b BF16 [heads (nope + v)][kv_lora]
         const float *q_a_norm = nullptr, *kv_a_norm = nullptr, *sinks = nullptr;
         float* cache = nullptr;          // [ctx][kv_lora + rope] F32 (owned)
+        // the DSA indexer (MLA layers): q from the q latent, the key and the head weights from x
+        WSlot iq_b, ik;
+        const float *iproj = nullptr, *ik_norm = nullptr, *ik_norm_b = nullptr;
+        uint16_t* ikc = nullptr;         // its keys [ctx][idx_key] FP16 (owned)
         // MoE layers
         const uint16_t* router1 = nullptr;
         WSlot lat_down, lat_up;
@@ -57,6 +63,10 @@ struct Ernie {
     void* xlq = nullptr;
     float *qr_raw = nullptr, *qc = nullptr, *kva = nullptr, *q = nullptr, *qlat = nullptr, *score = nullptr,
           *olat = nullptr, *o = nullptr;
+    float *iq = nullptr, *ikr = nullptr, *iw = nullptr, *iscore = nullptr;   // the indexer's scratch
+    int* sel = nullptr;                  // the attention's rows past er_dense_ctx(): [the indexer's top-k | the window]
+    int idx_mode = 1;    // (STRATA_ERNIE_IDX=0, debug: no indexer - every earlier position, dense, at any length)
+    std::string idump;   // (STRATA_ERNIE_IDX_DUMP=<dir>, debug: the MLA layers' x, mixer and selection a token)
     const float *mm_r = nullptr, *mm_t = nullptr;
     std::vector<void*> owned;
     bool dump = false;
@@ -88,6 +98,20 @@ void er_dump(const char* name, const float* d, size_t n, cudaStream_t s) {
         std::fclose(f);
     }
 }
+// STRATA_ERNIE_IDX_DUMP (debug): bytes of device memory (host memory when s is null) appended to <dir>/<name>.bin
+void er_dump_to(const std::string& dir, const std::string& name, const void* d, size_t bytes, cudaStream_t s) {
+    std::vector<char> h(bytes);
+    if (s != nullptr) {
+        cudaStreamSynchronize(s);
+        cudaMemcpy(h.data(), d, bytes, cudaMemcpyDeviceToHost);
+    } else {
+        std::memcpy(h.data(), d, bytes);
+    }
+    if (FILE* f = std::fopen((dir + "/" + name + ".bin").c_str(), "ab")) {
+        std::fwrite(h.data(), 1, bytes, f);
+        std::fclose(f);
+    }
+}
 }  // namespace
 
 bool Glm5Model::ernie_setup(std::string& err) {
@@ -97,9 +121,9 @@ bool Glm5Model::ernie_setup(std::string& err) {
         err = "ernie: a layer split is not implemented yet (one GPU)";
         return false;
     }
-    if (max_ctx_ > g.er_dense_ctx()) {
-        err = "ernie: the MLA layers' DSA indexer is not implemented yet - --max-context up to " +
-              std::to_string(g.er_dense_ctx()) + " (asked " + std::to_string((long long) max_ctx_) + ")";
+    if (g.idx_heads < 1 || g.idx_heads > 64 || g.idx_key != 128 || g.er_idx_top_k < 1 || g.er_idx_top_k > 2048 ||
+        g.n_swa < 1) {
+        err = "ernie: unsupported DSA indexer (<= 64 heads of 128, top-k <= 2048, a window are implemented)";
         return false;
     }
     Ernie* E = new Ernie();
@@ -107,6 +131,8 @@ bool Glm5Model::ernie_setup(std::string& err) {
     E->ctx = (int) std::max<int64_t>(max_ctx_, 1);
     E->dump = getenv("STRATA_ERNIE_DUMP") != nullptr;
     E->gate_bf16 = g.er_gate_bf16 ? 1 : 0;
+    if (const char* v = getenv("STRATA_ERNIE_IDX")) E->idx_mode = std::atoi(v) != 0 ? 1 : 0;
+    if (const char* v = getenv("STRATA_ERNIE_IDX_DUMP")) E->idump = v;
     if (const char* v = getenv("STRATA_ERNIE_GATE_BF16")) E->gate_bf16 = std::atoi(v) != 0 ? 1 : 0;
     E->L.resize((size_t) g.n_layers);
     std::string missing;
@@ -163,6 +189,13 @@ bool Glm5Model::ernie_setup(std::string& err) {
             El.sinks = f32("attn_sinks.weight");
             El.cache = (float*) dev_alloc(E, (size_t) E->ctx * LW * 4, err, "an MLA cache");
             if (El.cache == nullptr) return false;
+            El.iq_b = q("indexer.attn_q_b.weight");
+            El.ik = q("indexer.attn_k.weight");
+            El.iproj = f32("indexer.proj.weight");
+            El.ik_norm = f32("indexer.k_norm.weight");
+            El.ik_norm_b = f32("indexer.k_norm.bias");
+            El.ikc = (uint16_t*) dev_alloc(E, (size_t) E->ctx * g.idx_key * 2, err, "an indexer key cache");
+            if (El.ikc == nullptr) return false;
         }
         if (il >= g.dense_lead) {
             El.router1 = b16("ffn_gate_inp_1.weight");
@@ -212,16 +245,20 @@ bool Glm5Model::ernie_setup(std::string& err) {
         !(E->qc = fl(g.er_mla_qlora, "scratch")) || !(E->kva = fl(LW, "scratch")) ||
         !(E->q = fl(MH * (g.er_mla_nope + g.er_mla_rope), "scratch")) || !(E->qlat = fl(MH * g.er_mla_kvlora, "scratch")) ||
         !(E->score = fl(MH * (size_t) E->ctx, "scratch")) || !(E->olat = fl(MH * g.er_mla_kvlora, "scratch")) ||
-        !(E->o = fl(MH * g.er_mla_v, "scratch")))
+        !(E->o = fl(MH * g.er_mla_v, "scratch")) || !(E->iq = fl((size_t) g.idx_heads * g.idx_key, "scratch")) ||
+        !(E->ikr = fl(g.idx_key, "scratch")) || !(E->iw = fl(g.idx_heads, "scratch")) ||
+        !(E->iscore = fl((size_t) E->ctx, "scratch")))
         return false;
+    if (!(E->sel = (int*) dev_alloc(E, (size_t) (g.er_idx_top_k + g.n_swa) * 4, err, "scratch"))) return false;
     if (!(E->xlq = dev_alloc(E, X / 32 * 36, err, "scratch"))) return false;
     int n_mla = 0;
     for (int il = 0; il < g.n_layers; ++il) n_mla += g.is_er_mla(il) ? 1 : 0;
-    std::fprintf(stderr, "ernie: CUDA%d %d MLA layers (F32 caches %.2f GB for %d tokens), latent MoE %d -> %d, %d of %d "
-                         "experts, VHA rank %d, MultiMax %s; token path only (no prompt path, verify window, DSpark, "
-                         "lanes; DSA indexer: contexts up to %d)\n",
-                 dev_, n_mla, (double) n_mla * E->ctx * LW * 4 / 1073741824.0, E->ctx, g.n_embd, g.exp_dim(),
-                 g.n_exp_used, g.n_expert, g.er_vha_rank, g.er_multimax ? "on" : "off", g.er_dense_ctx());
+    std::fprintf(stderr, "ernie: CUDA%d %d MLA layers (F32 caches + FP16 indexer keys %.2f GB for %d tokens), latent MoE "
+                         "%d -> %d, %d of %d experts, VHA rank %d, MultiMax %s, DSA indexer %s (top %d + window %d past "
+                         "%d); token path only (no prompt path, verify window, DSpark, lanes)\n",
+                 dev_, n_mla, (double) n_mla * E->ctx * (LW * 4 + g.idx_key * 2) / 1073741824.0, E->ctx, g.n_embd,
+                 g.exp_dim(), g.n_exp_used, g.n_expert, g.er_vha_rank, g.er_multimax ? "on" : "off",
+                 E->idx_mode ? "on" : "OFF (STRATA_ERNIE_IDX=0: dense)", g.er_idx_top_k, g.n_swa, g.er_dense_ctx());
     return true;
 }
 
@@ -268,24 +305,45 @@ bool Glm5Model::fast_ernie_mla(int il, int64_t p64, std::string& err) {
     const auto& El = E->L[(size_t) il];
     const int p = (int) p64, H = g.n_head, NO = g.er_mla_nope, RO = g.er_mla_rope, V = g.er_mla_v, LK = g.er_mla_kvlora;
     const int QL = g.er_mla_qlora;
-    if (p + 1 > E->ctx || p + 1 > g.er_dense_ctx()) {
-        err = "ernie: position " + std::to_string(p) + " is past the MLA cache (" + std::to_string(E->ctx) +
-              " tokens; the DSA indexer is not implemented yet)";
+    if (p + 1 > E->ctx) {
+        err = "ernie: position " + std::to_string(p) + " is past the MLA cache (" + std::to_string(E->ctx) + " tokens)";
         return false;
     }
-    gf::MvJob j[2];
+    // the projections of x: q_a, kv_a, the indexer's key and head weights (scale idx_key^-1/2 idx_heads^-1/2)
+    gf::MvJob j[4];
     j[0] = {El.q_a.q, nullptr, F->x, E->qr_raw, nullptr, 1.0f, El.q_a.type, g.n_embd, QL};
     j[1] = {El.kv_a.q, nullptr, F->x, E->kva, nullptr, 1.0f, El.kv_a.type, g.n_embd, LK + RO};
-    if (!gf::mv(j, 2, s)) { err = "ernie: MLA q_a / kv_a"; return false; }
+    j[2] = {El.ik.q, nullptr, F->x, E->ikr, nullptr, 1.0f, El.ik.type, g.n_embd, g.idx_key};
+    j[3] = {El.iproj, nullptr, F->x, E->iw, nullptr, 1.0f / std::sqrt((float) g.idx_key * (float) g.idx_heads),
+            gf::kTypeF32, g.n_embd, g.idx_heads};
+    if (!gf::mv(j, 4, s)) { err = "ernie: MLA q_a / kv_a / indexer k"; return false; }
     ek::rms(E->qr_raw, El.q_a_norm, E->qc, QL, g.norm_eps, s);
     float* row = El.cache + (size_t) p * (LK + RO);
     ek::mla_kv(E->kva, El.kv_a_norm, row, LK, RO, p, g.er_mla_rope_base, g.norm_eps, s);
-    gf::MvJob jq = {El.q_b.q, nullptr, E->qc, E->q, nullptr, 1.0f, El.q_b.type, QL, H * (NO + RO)};
-    if (!gf::mv(&jq, 1, s)) { err = "ernie: MLA q_b"; return false; }
+    // the indexer's key of this position (every position: a later token may select it); LayerNorm eps 1e-6
+    ek::idx_key(E->ikr, El.ik_norm, El.ik_norm_b, El.ikc + (size_t) p * g.idx_key, g.idx_key, RO, p,
+                g.er_mla_rope_base, 1e-6f, s);
+    // the selection: past er_dense_ctx() the top-k of the positions older than the window (0 .. p - n_swa) + the window
+    const int n_old = p + 1 - g.n_swa;
+    const bool sparse = E->idx_mode && n_old > g.er_idx_top_k;
+    gf::MvJob jq[2];
+    int njq = 0;
+    jq[njq++] = {El.q_b.q, nullptr, E->qc, E->q, nullptr, 1.0f, El.q_b.type, QL, H * (NO + RO)};
+    if (sparse) jq[njq++] = {El.iq_b.q, nullptr, E->qc, E->iq, nullptr, 1.0f, El.iq_b.type, QL, g.idx_heads * g.idx_key};
+    if (!gf::mv(jq, njq, s)) { err = "ernie: MLA q_b"; return false; }
+    int n_att = p + 1;
+    const int* rows = nullptr;
+    if (sparse) {
+        ek::idx_q_rope(E->iq, g.idx_heads, g.idx_key, RO, p, g.er_mla_rope_base, s);
+        ds::indexer(E->iq, El.ikc, E->iw, g.idx_heads, g.idx_key, n_old, g.er_idx_top_k, E->iscore, E->sel, s);
+        ek::iota(E->sel + g.er_idx_top_k, n_old, g.n_swa, s);
+        n_att = g.er_idx_top_k + g.n_swa;
+        rows = E->sel;
+    }
     ek::mla_q_rope(E->q, H, NO, RO, p, g.er_mla_rope_base, s);
     ek::mla_absorb(E->q, El.kvb, E->qlat, H, NO, RO, V, LK, s);
-    ek::mla_attend(E->qlat, E->q, El.cache, p + 1, El.sinks, 1.0f / std::sqrt((float) (NO + RO)), E->score, E->olat, H,
-                   NO, RO, LK, s);
+    ek::mla_attend(E->qlat, E->q, El.cache, rows, n_att, El.sinks, 1.0f / std::sqrt((float) (NO + RO)), E->score,
+                   E->olat, H, NO, RO, LK, s);
     ek::mla_v(E->olat, El.kvb, E->o, H, NO, V, LK, s);
     ek::vha(E->o, El.vha, H, V, s);
     gf::MvJob jg = {El.gate.q, nullptr, E->qc, E->glog, nullptr, 1.0f, El.gate.type, QL, H * V};
@@ -294,6 +352,15 @@ bool Glm5Model::fast_ernie_mla(int il, int64_t p64, std::string& err) {
     gf::MvJob jo = {El.out.q, nullptr, E->o, F->mixer, nullptr, 1.0f, El.out.type, H * V, g.n_embd};
     if (!gf::mv(&jo, 1, s)) { err = "ernie: MLA output"; return false; }
     if (E->dump) er_dump(("mla_o-" + std::to_string(il)).c_str(), E->o, (size_t) H * V, s);
+    if (!E->idump.empty()) {   // x and the mixer every position; the selection (its position first) where sparse
+        const std::string L = std::to_string(il);
+        er_dump_to(E->idump, "ix-" + L, F->x, (size_t) g.n_embd * 4, s);
+        er_dump_to(E->idump, "imix-" + L, F->mixer, (size_t) g.n_embd * 4, s);
+        if (sparse) {
+            er_dump_to(E->idump, "isel-" + L, &p, 4, nullptr);
+            er_dump_to(E->idump, "isel-" + L, E->sel, (size_t) g.er_idx_top_k * 4, s);
+        }
+    }
     if (ek::launch_errors() > 0) { err = "ernie: MLA kernels"; return false; }
     return true;
 }

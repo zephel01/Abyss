@@ -10,7 +10,10 @@
 //   * MultiMax on the logits: x + t0 relu(r0 - x) + t1 relu(x - r1) + t2 relu(r2 - x)^2 + t3 relu(x - r3)^2;
 //   * the MLA layers' attention: q = [nope | rope] a head, one 512 latent + a 64-dim rope key a position (F32 cache),
 //     kv_b absorbed into the query (q_lat = W_k^T q_nope) and the output (v = W_v o_lat), plain RoPE on adjacent pairs,
-//     a sink a head in the softmax's denominator.
+//     a sink a head in the softmax's denominator;
+//   * the MLA layers' DSA indexer (the scores and the top-k are DeepSeek V4's ds::indexer): its key a position
+//     LayerNorm (weight + bias) then RoPE rotate-half on the first 64 dims (plain, the MLA base), kept FP16; its queries
+//     the same RoPE.  The Hadamard rotation both reference stacks apply to q and k is orthonormal: left out.
 #pragma once
 
 #include <cstdint>
@@ -36,11 +39,21 @@ void mla_kv(const float* kva, const float* norm, float* row, int L, int R, int p
 void mla_q_rope(float* q, int H, int nope, int R, int p, float base, cudaStream_t st);
 /// q_lat[h][c] = sum_{i < nope} q[h][i] kvb[(h (nope + V) + i) L + c]   (kvb BF16 [H (nope + V)][L])
 void mla_absorb(const float* q, const uint16_t* kvb, float* q_lat, int H, int nope, int R, int V, int L, cudaStream_t st);
-/// over the n cache rows: scores, the softmax with the head's sink, o_lat[h] = sum_j p_j row_j[0, L)
-void mla_attend(const float* q_lat, const float* q, const float* cache, int n, const float* sinks, float scale,
-                float* score, float* o_lat, int H, int nope, int R, int L, cudaStream_t st);
+/// over n cache rows (rows[0, n) when given - the DSA selection -, else rows 0 .. n-1): scores, the softmax with the
+/// head's sink, o_lat[h] = sum_j p_j row_j[0, L)
+void mla_attend(const float* q_lat, const float* q, const float* cache, const int* rows, int n, const float* sinks,
+                float scale, float* score, float* o_lat, int H, int nope, int R, int L, cudaStream_t st);
 /// o[h][d] = sum_c kvb[(h (nope + V) + nope + d) L + c] o_lat[h][c]
 void mla_v(const float* o_lat, const uint16_t* kvb, float* o, int H, int nope, int V, int L, cudaStream_t st);
+
+/// the DSA indexer's key of position p: LayerNorm(kraw [D]) * w + b, RoPE rotate-half (NEOX) on its first R dims (plain,
+/// base), FP16 -> row [D]  (D <= 512)
+void idx_key(const float* kraw, const float* w, const float* b, uint16_t* row, int D, int R, int p, float base, float eps,
+             cudaStream_t st);
+/// the indexer's queries iq [H][D] in place: RoPE rotate-half on each head's first R dims at p
+void idx_q_rope(float* iq, int H, int D, int R, int p, float base, cudaStream_t st);
+/// out[i] = start + i, i < n
+void iota(int* out, int start, int n, cudaStream_t st);
 
 int launch_errors();
 

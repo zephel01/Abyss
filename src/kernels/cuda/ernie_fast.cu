@@ -2,6 +2,8 @@
 // Correctness first: plain loops, F32 sums, the RoPE angles in double.
 #include "strata/kernels/ernie_fast.hpp"
 
+#include <cuda_fp16.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -167,8 +169,9 @@ __global__ void mla_absorb_kernel(const float* __restrict__ q, const uint16_t* _
 
 // block h (256 threads): a warp a cache row for the scores; then the softmax; then o_lat
 __global__ void mla_attend_kernel(const float* __restrict__ q_lat, const float* __restrict__ q,
-                                  const float* __restrict__ cache, int n, const float* __restrict__ sinks, float scale,
-                                  float* __restrict__ score, float* __restrict__ o_lat, int nope, int R, int L) {
+                                  const float* __restrict__ cache, const int* __restrict__ rows, int n,
+                                  const float* __restrict__ sinks, float scale, float* __restrict__ score,
+                                  float* __restrict__ o_lat, int nope, int R, int L) {
     extern __shared__ float sm[];   // [L + R] the query (latent | rope)
     __shared__ float sh[32];
     const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, nw = blockDim.x >> 5;
@@ -178,7 +181,7 @@ __global__ void mla_attend_kernel(const float* __restrict__ q_lat, const float* 
     __syncthreads();
     float* sc = score + (size_t) h * n;
     for (int j = w; j < n; j += nw) {
-        const float* row = cache + (size_t) j * W;
+        const float* row = cache + (size_t) (rows ? rows[j] : j) * W;
         float a = 0.0f;
         for (int i = lane; i < W; i += 32) a += sm[i] * row[i];
         a = warp_sum(a);
@@ -200,7 +203,7 @@ __global__ void mla_attend_kernel(const float* __restrict__ q_lat, const float* 
     __syncthreads();
     for (int c = tid; c < L; c += blockDim.x) {
         float a = 0.0f;
-        for (int j = 0; j < n; ++j) a += sc[j] * cache[(size_t) j * W + c];
+        for (int j = 0; j < n; ++j) a += sc[j] * cache[(size_t) (rows ? rows[j] : j) * W + c];
         o_lat[(size_t) h * L + c] = a * inv;
     }
 }
@@ -220,6 +223,48 @@ __global__ void mla_v_kernel(const float* __restrict__ o_lat, const uint16_t* __
         a = warp_sum(a);
         if (lane == 0) o[(size_t) h * V + d] = a;
     }
+}
+
+// the DSA indexer's key of position p: LayerNorm (weight + bias) of k_raw [D], RoPE rotate-half (NEOX) on its first R
+// dims (pairs i, i + R/2), FP16 -> row.  One block of D (128) threads.
+__global__ void idx_key_kernel(const float* __restrict__ kraw, const float* __restrict__ w, const float* __restrict__ b,
+                               uint16_t* __restrict__ row, int D, int R, int p, float base, float eps) {
+    __shared__ float sh[32];
+    __shared__ float v[512];
+    const int i = threadIdx.x;
+    const float x = i < D ? kraw[i] : 0.0f;
+    const float mu = block_sum(x, sh) / (float) D;
+    const float d = i < D ? x - mu : 0.0f;
+    const float var = block_sum(d * d, sh) / (float) D;
+    const float inv = rsqrtf(var + eps);
+    if (i < D) v[i] = d * inv * w[i] + b[i];
+    __syncthreads();
+    float y = i < D ? v[i] : 0.0f;
+    if (i < R) {
+        const int h = R / 2, k = i < h ? i : i - h;
+        float c, s;
+        rope_cs(p, k, R, base, c, s);
+        y = i < h ? v[i] * c - v[i + h] * s : v[i] * c + v[i - h] * s;
+    }
+    if (i < D) row[i] = __half_as_ushort(__float2half_rn(y));
+}
+
+// the indexer's queries: RoPE rotate-half on the first R dims of each of the H heads of D (block h)
+__global__ void idx_q_rope_kernel(float* __restrict__ iq, int D, int R, int p, float base) {
+    float* qh = iq + (size_t) blockIdx.x * D;
+    const int h = R / 2;
+    for (int k = threadIdx.x; k < h; k += blockDim.x) {
+        float c, s;
+        rope_cs(p, k, R, base, c, s);
+        const float x0 = qh[k], x1 = qh[k + h];
+        qh[k] = x0 * c - x1 * s;
+        qh[k + h] = x1 * c + x0 * s;
+    }
+}
+
+__global__ void iota_kernel(int* __restrict__ out, int start, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = start + i;
 }
 }  // namespace
 
@@ -266,15 +311,35 @@ void mla_absorb(const float* q, const uint16_t* kvb, float* q_lat, int H, int no
     mla_absorb_kernel<<<H, 512, (size_t) nope * sizeof(float), st>>>(q, kvb, q_lat, nope, R, V, L);
     check("mla_absorb");
 }
-void mla_attend(const float* q_lat, const float* q, const float* cache, int n, const float* sinks, float scale,
-                float* score, float* o_lat, int H, int nope, int R, int L, cudaStream_t st) {
-    mla_attend_kernel<<<H, 256, (size_t) (L + R) * sizeof(float), st>>>(q_lat, q, cache, n, sinks, scale, score, o_lat,
-                                                                         nope, R, L);
+void mla_attend(const float* q_lat, const float* q, const float* cache, const int* rows, int n, const float* sinks,
+                float scale, float* score, float* o_lat, int H, int nope, int R, int L, cudaStream_t st) {
+    mla_attend_kernel<<<H, 256, (size_t) (L + R) * sizeof(float), st>>>(q_lat, q, cache, rows, n, sinks, scale, score,
+                                                                         o_lat, nope, R, L);
     check("mla_attend");
 }
 void mla_v(const float* o_lat, const uint16_t* kvb, float* o, int H, int nope, int V, int L, cudaStream_t st) {
     mla_v_kernel<<<H, 256, (size_t) L * sizeof(float), st>>>(o_lat, kvb, o, nope, V, L);
     check("mla_v");
+}
+
+void idx_key(const float* kraw, const float* w, const float* b, uint16_t* row, int D, int R, int p, float base, float eps,
+             cudaStream_t st) {
+    if (D > 512 || D % 32 != 0 || R > D || R % 2 != 0) {
+        g_errors.fetch_add(1);
+        std::fprintf(stderr, "ernie kernels: idx_key takes D <= 512 (a multiple of 32), R <= D (%d, %d)\n", D, R);
+        return;
+    }
+    idx_key_kernel<<<1, D, 0, st>>>(kraw, w, b, row, D, R, p, base, eps);
+    check("idx_key");
+}
+void idx_q_rope(float* iq, int H, int D, int R, int p, float base, cudaStream_t st) {
+    idx_q_rope_kernel<<<H, 32, 0, st>>>(iq, D, R, p, base);
+    check("idx_q_rope");
+}
+void iota(int* out, int start, int n, cudaStream_t st) {
+    if (n <= 0) return;
+    iota_kernel<<<(n + 255) / 256, 256, 0, st>>>(out, start, n);
+    check("iota");
 }
 
 }  // namespace strata::kernels::ernie

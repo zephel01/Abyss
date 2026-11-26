@@ -249,8 +249,8 @@ struct Glm5Geometry {
     // src/core/ernie_fast_path.cu, worklog 2026-11-25_ernie55-port-survey.md): the V4 HCA layers with an output gate
     // (sigmoid of the q latent, rounded to BF16, on wo_a's output) and a value-head mix (VHA: o_h <- sum_g M[h][g] o_g,
     // M = I + V U^T of rank er_vha_rank) after the attention; er_mla layers an MLA attention instead (one 512 latent +
-    // a 64-dim rope key, plain RoPE of er_mla_rope_base, sinks, the same gate and VHA) whose DSA indexer only selects
-    // past er_dense_ctx() positions; the mHC pre's RMS factor 1 / (sqrt(mean) + eps); a dense SiTU FFN on the first
+    // a 64-dim rope key, plain RoPE of er_mla_rope_base, sinks, the same gate and VHA) whose DSA indexer (top
+    // er_idx_top_k of the positions older than the window, plus the window) only selects past er_dense_ctx() positions; the mHC pre's RMS factor 1 / (sqrt(mean) + eps); a dense SiTU FFN on the first
     // dense_lead layers; the MoE routed by sigma(l0) + sigma(l1) of two routers (gating 3: the score as given), its
     // weights times a learned per-expert scale, its experts in a latent of x_exp (fc1 -> experts -> RMSNorm -> fc2),
     // SiTU everywhere; MultiMax on the logits.  x_exp: the routed experts' width (the tiers size by exp_dim(); 0 = n_embd)
@@ -263,8 +263,8 @@ struct Glm5Geometry {
     int x_exp = 0;
     int exp_dim() const { return x_exp > 0 ? x_exp : n_embd; }
     bool is_er_mla(int il) const { return ernie && il >= 0 && il < (int) er_mla.size() && er_mla[(size_t) il] != 0; }
-    /// the context the ERNIE token path runs without the DSA indexer (top-k of the positions older than the window):
-    /// up to here every earlier position is selected, so the MLA attention is dense
+    /// the context up to which the DSA indexer (top-k of the positions older than the window) selects every earlier
+    /// position, so the MLA attention is dense there; past it the indexer runs
     int er_dense_ctx() const { return er_idx_top_k + n_swa; }
     int ling_qk_nope = 128, ling_rope = 64, ling_v = 128, ling_group = 8, ling_topk_group = 4;
     std::vector<float> lim_e, lim_s;   // per layer (the NextN block's too); 0 = no clamp
