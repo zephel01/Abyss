@@ -1930,7 +1930,7 @@ class RequestBodies(unittest.TestCase):
     def raw(self, headers: str, body: bytes = b"") -> tuple[int, dict]:
         """One POST written by hand (headers urllib would not send) -> (status, JSON answer)."""
         import socket
-        head = ("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" + headers +
+        head = ("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n" + headers +
                 "\r\n").encode()
         with socket.create_connection(("127.0.0.1", self.port), timeout=30) as s:
             s.sendall(head + body)
@@ -2077,7 +2077,7 @@ class StallLimit(unittest.TestCase):
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            s = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+            s = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
                          b"Content-Length: %d\r\n\r\n" % len(body), body)
             try:
                 time.sleep(0.5)                                         # the stream has started; nobody reads it
@@ -2094,7 +2094,7 @@ class StallLimit(unittest.TestCase):
         self.assertIn("the client stopped reading for 1 s", out.getvalue())
 
     def test_a_body_that_stops_arriving_is_a_408(self):
-        s = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        s = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
                      b"Content-Length: 100\r\n\r\n", b'{"model"')
         try:
             s.settimeout(30)
@@ -2340,6 +2340,89 @@ class HeldCallKeepAlive(unittest.TestCase):
     def test_streamed_text_sends_no_extra(self):
         _, _, pings = self.items("openai", "plain " + self.BODY, self.TICK)
         self.assertEqual(pings, 0)                                        # every token went out: nothing to add
+
+
+class HostGuard(unittest.TestCase):
+    """DNS rebinding (Strata #7130's idea): a request whose Host is a name that is not this PC's gets 403, whatever its
+    Origin says; localhost, IP addresses (LAN use on 0.0.0.0), this PC's own names and STRATA_ALLOWED_HOSTS pass."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def status(self, host, path="/health", body=None, origin=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=30)
+        h = {"Host": host, "Content-Type": "application/json"} if host is not None else {"Content-Type": "application/json"}
+        if origin:
+            h["Origin"] = origin
+        c.putrequest("POST" if body is not None else "GET", path, skip_host=True)
+        for k, v in h.items():
+            c.putheader(k, v)
+        data = json.dumps(body).encode() if body is not None else b""
+        if body is not None:
+            c.putheader("Content-Length", str(len(data)))
+        c.endheaders(data if body is not None else None)
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def test_rebinding_names_refused(self):
+        port = self.httpd.server_address[1]
+        self.assertEqual(self.status(f"evil.example:{port}"), 403)
+        # the rebinding page's own-page request: its Origin matches its Host, so only the Host check stops it
+        self.assertEqual(self.status(f"evil.example:{port}", "/settings", {"defaults": {}},
+                                     origin=f"http://evil.example:{port}"), 403)
+        self.assertEqual(self.status(f"evil.example:{port}", "/v1/chat/completions",
+                                     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}), 403)
+
+    def test_own_names_pass(self):
+        import socket
+        port = self.httpd.server_address[1]
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", f"192.168.1.20:{port}",
+                     f"[fe80::1%eth0]:{port}", f"app.localhost:{port}", f"{socket.gethostname()}:{port}",
+                     f"{socket.gethostname().split('.')[0].upper()}.local:{port}", "127.0.0.1", None):
+            self.assertEqual(self.status(host), 200, host)
+        # the web app's own request (Origin == Host), opened by the box's LAN address
+        self.assertEqual(self.status(f"192.168.1.20:{port}", "/v1/chat/completions",
+                                     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+                                     origin=f"http://192.168.1.20:{port}"), 200)
+
+    def test_allowed_hosts(self):
+        port = self.httpd.server_address[1]
+        with unittest.mock.patch.dict(os.environ, {"STRATA_ALLOWED_HOSTS": "abyss.example.com, .ts.net"}):
+            self.assertEqual(self.status(f"abyss.example.com:{port}"), 200)
+            self.assertEqual(self.status(f"box.tail1234.ts.net:{port}"), 200)
+            self.assertEqual(self.status(f"evil.example:{port}"), 403)
+        with unittest.mock.patch.dict(os.environ, {"STRATA_ALLOWED_HOSTS": "*"}):
+            self.assertEqual(self.status(f"evil.example:{port}"), 200)
+
+    def test_loading_gate_checks_too(self):
+        import http.client
+        g = SV.bind_early("127.0.0.1", 0)
+        try:
+            for host, want in (("evil.example", 403), ("localhost", 503)):
+                c = http.client.HTTPConnection("127.0.0.1", g.server_address[1], timeout=30)
+                c.putrequest("GET", "/health", skip_host=True)
+                c.putheader("Host", host)
+                c.endheaders()
+                r = c.getresponse()
+                r.read()
+                c.close()
+                self.assertEqual(r.status, want, host)
+        finally:
+            g.shutdown()
+            g.server_close()
 
 
 if __name__ == "__main__":

@@ -480,6 +480,11 @@ PCI 0000:c5:00.0)`. Setup still writes numbers.
   (or the PC's Tailscale address) the other devices are not loopback, so give the server an `api_key` to stop it
   from your phone or laptop; behind `tailscale serve` (or any reverse proxy on this PC) every client looks like
   loopback - set an `api_key` there too, or anyone on your tailnet can stop it.
+- **Host check (DNS rebinding).** A request whose `Host` is a DNS name that is not this PC's gets a `403`: a web
+  page on another site whose name was pointed at this PC must not reach the API. Passes: `localhost`, any IP address
+  (`127.0.0.1`, the PC's LAN or Tailscale address when serving on `0.0.0.0`), the PC's hostname (also with `.local`,
+  `.lan`, `.home`, `.home.arpa`, `.localdomain`) and the names in `STRATA_ALLOWED_HOSTS` - set that when you open
+  Abyss by another DNS name (MagicDNS, a reverse proxy's public name).
 - **What `/metrics` reports for monitors** (the web app's Monitor, Abyss Terminal): the model's name with its quant
   (`engine.display_name`, `engine.quant`, `engine.config`, `engine.backend`); every card in `hardware.gpus` with its
   `role` (`main`, `split`, `helper`, `igpu` - the iGPU lane's Radeon, in shared memory) and `source` (the backends
@@ -1731,6 +1736,7 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_VISION_START_S` / `STRATA_VISION_ENCODE_S` | 600 / 120 | (server) the image encoder's start and each picture's answer; past them it is ended, the request gets an error and the next picture starts it again (v1.3.78) |
 | `STRATA_HTTP_BACKLOG` | 256 | (server) the listen backlog: requests waiting to be accepted |
 | `STRATA_MAX_BODY_MIB` | 256 | (server) the largest request body; a larger one is answered 413 before it is read |
+| `STRATA_ALLOWED_HOSTS` | (empty) | (server) more names the `Host` header may carry besides `localhost`, IP addresses and this PC's own names (the DNS rebinding check): comma-separated, a leading dot allows a whole domain (`abyss.example.com,.ts.net`), `*` turns the check off |
 | `STRATA_HTTP_STALL_S` | 120 | (server) the longest one socket operation may wait, in seconds: a read of the request (a body that stops arriving is a 408) or one write of the answer. Per operation, not per request - long prompts and long streams are not cut. A client that stops reading a stream (a PC gone to sleep, a dropped VPN) no longer holds the engine: its answer is cancelled as on a disconnect and the next request runs. `0` = no limit |
 | `STRATA_FIT_FLOOR` | min(1024, context / 4) | (server) when `fit_max_tokens` clamps a max_tokens the context cannot hold (the Anthropic API by default), the fewest answer tokens it may leave; fewer is a 400 `prompt is too long: N tokens > M maximum` (Anthropic shape, `context_length_exceeded` on the OpenAI API), on which Claude Code compacts the conversation. A request without max_tokens still gets the rest of the context. `0` = clamp down to 1 token (before v1.3.172) |
 | `STRATA_RAW_SPECIALS` | 0 | (server) `1`: special-token text inside messages becomes the control token again (the old encode, every such text a token) |

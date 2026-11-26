@@ -3881,6 +3881,60 @@ def is_loopback(addr: str) -> bool:
     return ip.is_loopback or (ip.version == 6 and ip.ipv4_mapped is not None and ip.ipv4_mapped.is_loopback)
 
 
+_OWN_NAMES: set[str] | None = None
+
+
+def own_names() -> set[str]:
+    """This PC's own names, lowercase: localhost, its hostname and FQDN, and the hostname under the usual home-network
+    suffixes (.local for mDNS, .lan, .home, .home.arpa, .localdomain)."""
+    global _OWN_NAMES
+    if _OWN_NAMES is None:
+        import socket
+        names = {"localhost"}
+        for n in (socket.gethostname(), socket.getfqdn()):
+            n = (n or "").strip().rstrip(".").lower()
+            if n:
+                names.add(n)
+                short = n.split(".", 1)[0]
+                names.update({short} | {short + x for x in (".local", ".lan", ".home", ".home.arpa", ".localdomain")})
+        _OWN_NAMES = names
+    return _OWN_NAMES
+
+
+def host_allowed(host: str | None) -> bool:
+    """DNS rebinding (Strata #7130's idea): a page on a site the attacker names (evil.example, then pointed at
+    127.0.0.1 or this PC's LAN address) is the same origin as this server to the browser, so the own-page check
+    (Origin == Host) passes and its script could change settings, run MCP tools or use the model.  Its requests carry
+    the attacker's name in Host.  Allowed: no Host (not a browser), an IP address (a browser sends one only for a page
+    opened by that address: 127.0.0.1, the box's LAN IP when it serves on 0.0.0.0), localhost and *.localhost, this
+    PC's own names (own_names) and the names in STRATA_ALLOWED_HOSTS (comma-separated, for a DNS name or a reverse
+    proxy's public name; "*" turns the check off)."""
+    import ipaddress
+    if not host:
+        return True
+    h = host.strip().lower()
+    if h.startswith("["):                                   # [v6]:port
+        name = h[1:h.find("]")] if "]" in h else h[1:]
+    else:
+        name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    name = name.rstrip(".")
+    try:
+        ipaddress.ip_address(name.split("%", 1)[0])
+        return True
+    except ValueError:
+        pass
+    if name == "localhost" or name.endswith(".localhost") or name in own_names():
+        return True
+    extra = [x.strip().lower().rstrip(".") for x in os.environ.get("STRATA_ALLOWED_HOSTS", "").split(",") if x.strip()]
+    return "*" in extra or name in extra or any(x.startswith(".") and name.endswith(x) for x in extra)
+
+
+def host_refusal(host: str) -> dict:
+    return {"error": {"type": "permission_error",
+                      "message": f"Host {host!r} is not a name of this PC (DNS rebinding guard): open Abyss by "
+                                 "localhost, an IP address or this PC's name, or add the name to STRATA_ALLOWED_HOSTS"}}
+
+
 class EngineGate:
     """The engine's FIFO.  `with gate:` / acquire() / release() hold it alone (a lock, as before: reloads, image
     encodes, shutdown wait for every request to end).  `with gate.shared():` is a request's turn: up to slots() requests
@@ -4043,6 +4097,9 @@ def loading_handler(httpd) -> type:
             self.wfile.write(body)
 
         def do_GET(self):
+            if not host_allowed(self.headers.get("Host")):
+                self._json(403, host_refusal(self.headers.get("Host")))
+                return
             path = self.path.split("?")[0].rstrip("/")
             if path == "/health":
                 # 503 while loading (a client that reads 200 as "ready", e.g. a llama-swap health check, waits);
@@ -4056,6 +4113,9 @@ def loading_handler(httpd) -> type:
                                        "GET /health says how far"}}, retry=15)
 
         def do_POST(self):
+            if not host_allowed(self.headers.get("Host")):
+                self._json(403, host_refusal(self.headers.get("Host")))
+                return
             self._json(503, {"error": {"type": "overloaded_error", "message": "the model is still loading; "
                                        "GET /health says how far"}}, retry=15)
 
@@ -4153,6 +4213,12 @@ def make_handler(svc: Service):
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             return bool(given) and any(hmac.compare_digest(given.encode(), k.encode()) for k in key_list(svc.api_key))
 
+        def _host_ok(self) -> bool:
+            if host_allowed(self.headers.get("Host")):
+                return True
+            self._json(403, host_refusal(self.headers.get("Host")))
+            return False
+
         def _authorized(self) -> bool:
             if self._key_given():
                 return True
@@ -4160,6 +4226,8 @@ def make_handler(svc: Service):
             return False
 
         def do_GET(self):
+            if not self._host_ok():
+                return
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
@@ -4298,7 +4366,7 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
-            if not self._authorized():
+            if not self._host_ok() or not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
