@@ -119,6 +119,14 @@ Tencent's Hy4-flash (beta, NVIDIA, one GPU, text only; [Hy4-flash](#hy4-flash-be
 ./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf (92.9 GB)
 ```
 
+KRAFTON's Raon-1 mini (beta, NVIDIA, one GPU, text only; [Raon-1 mini](#raon-1-mini-beta-unreleased)): KRAFTON's own
+Q4_K_M for an 8-32 GB GPU (the experts that do not fit go to RAM), with the model card's chat sampling (temperature 1.0,
+top_p 0.95, top_k 20):
+
+```sh
+./setup-deepseek.sh --model raon --download-model        # raon-1-mini-Q4_K_M.gguf (19.7 GB)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -1416,6 +1424,32 @@ rows - the same rows). The Engram gate's three norms (value, key, the stream it 
 mmproj (`mmproj-Hy4-Flash-Maya-XS.gguf`) runs on strata-vision (`tools/vision/hy4v_patch.py`, applied by setup's
 vision build) with a vocab-only GGUF from `python tools/vision/hy4v_ref.py vocab --gguf <shard 1> --out <dir>/hy4-vocab.gguf`
 as its `"model"`. Not yet: the MTP drafter, AMD (HIP).
+
+## Raon-1 mini (beta, unreleased)
+
+The engine runs KRAFTON's Raon-1 mini (GGUF architecture `raon1`: 4 residual streams, RDA linear attention, NoPE gated
+MLA, 128 experts with SiTU FFNs) token by token and with the batched prompt path. `./setup-deepseek.sh --model raon`
+sets up [KRAFTON/Raon-1-mini-gguf](https://huggingface.co/KRAFTON/Raon-1-mini-gguf)'s `Q4_K_M` (checked against Hugging
+Face's SHA-256 - the same values as the repo's `SHA256SUMS` - the pack, and `abyss-raon-q4_k_m.json` with a 65,536
+context and temperature 1.0 / top_p 0.95 / top_k 20). NVIDIA only: the HIP build compiles the raon path but it has not
+run on an AMD GPU. One GPU: no layer split. The card's `presence_penalty` 1.5 is not in the config: the engine's
+`--glm-pack` path does not apply penalties. The repo's other quants run the same way packed by hand
+(`python tools/iq_pack.py --gguf <file> --out <dir>/pack`); the DFlash drafter is not used yet.
+
+**Reasoning effort.** Raon-1 thinks less or more through a steering vector added to five layers' MoE output, not through
+the prompt. The server takes `reasoning_effort` per request and sends it to the engine:
+
+| `reasoning_effort` | `none` (thinking off) | `low` | `medium` | `high` (default) | `xhigh` | `max` |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: |
+| alpha | 0.1 | 0.3 | 0.1 | 0.05 | 0.02 | 0 |
+
+`none` (also `minimal` and `false`) closes the think block as the template does (`<think></think>`); `maximum` is `max`;
+an integer 1-100 or Anthropic's thinking budget is the nearest of low / high / max. A request without one uses `high`
+(thinking on) or 0.1 when its prompt ends with thinking off. The conversation is reused only when the next request has
+the same alpha; with another effort it is read again (fast: a prompt runs at thousands of tokens a second).
+`STRATA_RAON_EFFORT` (a name, `none` or a number) sets the alpha for the CLI and for requests that name none;
+`STRATA_RAON_PROMPT_ATTN=0` reads the prompt's MLA attention a row at a time (a check). Speeds and checks:
+[docs/MODELS](MODELS.md#raon-1-mini-beta-unreleased). Not yet: the DFlash drafter, multi-conversation slots, AMD (HIP).
 
 ## EXL3 quants (GLM-5.3-Flash)
 

@@ -116,6 +116,14 @@ Tencent の Hy4-flash（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[H
 ./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf（92.9 GB）
 ```
 
+KRAFTON の Raon-1 mini（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Raon-1 mini](#raon-1-miniベータ未リリース)）: 8〜32 GB の GPU 向けの
+KRAFTON 自身の Q4_K_M（GPU に載らないエキスパートは RAM へ）。サンプリングはモデルカードのチャット向けの値（temperature 1.0、
+top_p 0.95、top_k 20）:
+
+```sh
+./setup-deepseek.sh --model raon --download-model        # raon-1-mini-Q4_K_M.gguf（19.7 GB）
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -1343,6 +1351,31 @@ RTX 5090（Gen4 x4）+ RAM 段 60 GB、iGPU レーンなし、459 トークン�
 （`mmproj-Hy4-Flash-Maya-XS.gguf`）は strata-vision で動きます（`tools/vision/hy4v_patch.py`、setup の vision ビルドが当てます）。
 `"model"` には `python tools/vision/hy4v_ref.py vocab --gguf <1 本目の分割ファイル> --out <dir>/hy4-vocab.gguf` で作る語彙だけの GGUF を指定します。
 まだのもの: MTP ドラフター、AMD（HIP）。
+
+## Raon-1 mini（ベータ、未リリース）
+
+エンジンは KRAFTON の Raon-1 mini（GGUF のアーキテクチャ `raon1`: 残差 4 本、RDA 線形 attention、NoPE のゲート付き MLA、
+SiTU の FFN の 128 エキスパート）を、トークン経路とバッチのプロンプト経路で動かします。`./setup-deepseek.sh --model raon` で
+[KRAFTON/Raon-1-mini-gguf](https://huggingface.co/KRAFTON/Raon-1-mini-gguf) の `Q4_K_M` が入ります（Hugging Face の SHA-256
+で確かめ（リポジトリの `SHA256SUMS` と同じ値）、パックし、文脈 65,536、temperature 1.0 / top_p 0.95 / top_k 20 の
+`abyss-raon-q4_k_m.json` を書きます）。NVIDIA だけ: HIP ビルドは raon の経路をコンパイルしますが、AMD の GPU ではまだ動かして
+いません。GPU 1 枚: 層の分割はありません。カードの `presence_penalty` 1.5 は設定に入れていません。エンジンの `--glm-pack` の
+経路はペナルティを使わないためです。リポジトリのほかの量子化も、手でパックすれば同じように動きます
+（`python tools/iq_pack.py --gguf <ファイル> --out <dir>/pack`）。DFlash ドラフターはまだ使いません。
+
+**推論量（reasoning effort）。** Raon-1 は、プロンプトではなく、5 つの層の MoE 出力に足すステアリングベクトルで考える量を
+変えます。サーバーはリクエストごとの `reasoning_effort` を受けて、エンジンに渡します:
+
+| `reasoning_effort` | `none`（思考オフ） | `low` | `medium` | `high`（既定） | `xhigh` | `max` |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: |
+| alpha | 0.1 | 0.3 | 0.1 | 0.05 | 0.02 | 0 |
+
+`none`（`minimal`、`false` も）はテンプレートどおり think ブロックを閉じます（`<think></think>`）。`maximum` は `max`。1〜100 の
+整数や Anthropic の thinking の budget は low / high / max のうち近いもの。指定のないリクエストは `high`（思考オン）、プロンプトが
+思考オフで終わっていれば 0.1。会話の再利用は、次のリクエストの alpha が同じときだけです。effort が変わると読み直します（プロンプトは
+毎秒数千トークンなので速い）。`STRATA_RAON_EFFORT`（名前、`none`、数値）は CLI と、指定のないリクエストの alpha を決めます。
+`STRATA_RAON_PROMPT_ATTN=0` はプロンプトの MLA attention を 1 行ずつ計算します（確認用）。速度と確認:
+[docs/MODELS](MODELS.ja.md#raon-1-miniベータ未リリース)。まだのもの: DFlash ドラフター、複数の会話のスロット、AMD（HIP）。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

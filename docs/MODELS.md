@@ -240,6 +240,22 @@ pool files, a 4K prompt + 512 tokens, a warm-up then the median of 3.
 | --- | ---: | --- | --- | --- |
 | "B" (`tools/memt_flash.py --backbone`: MemT's non-expert backbone in L97's tensor types, the memory Q8_0, L97's experts) | 106.1 GB (9.3 GB written; the rest links to L97's shards) | memory write 3.3-4.5e-4, read 0.5-1.1% (layers 4 / 22 / 42). Recall: 4 of 4 facts from a committed turn, 5 of 5 from a Japanese note written as a document. Memory off: NLL below "A" (L97's backbone + the memory) on all 5 texts | decode 77.5 tok/s without a memory (L97 78.9), 68.2 with one (-12%); the 4K prompt 983 / 867 tok/s. A 325-token commit 3.3-3.5 s + the save 0.7-2.7 s | 32 GB GPU + 96 GB RAM (a commit needs the expert pool's tail); smaller GPUs not measured |
 
+### Raon-1 mini (beta, unreleased)
+
+KRAFTON's Raon-1 mini (GGUF architecture `raon1`): 4 residual streams (Raon-mHC), 18 RDA linear-attention layers and
+7 NoPE gated MLA layers, 128 experts (top 6) with SiTU FFNs, and a reasoning-effort steering vector. It is not a
+llama.cpp architecture: Abyss implements it from the model's own code (read, not run). The file is KRAFTON's
+[Q4_K_M](https://huggingface.co/KRAFTON/Raon-1-mini-gguf) (`./setup-deepseek.sh --model raon`; how to use the effort:
+[MANUAL](MANUAL.md#raon-1-mini-beta-unreleased)). Quality: KL(reference || engine) against a float64 numpy forward
+written from the model code, on the same Q4_K_M weights dequantized (`recipes/raon1/ref.py`), over a raw English text
+(15 positions) and an English and a Japanese chat (30 each); the quantization itself, the same forward on the BF16
+weights against the Q4_K_M ones: 0.0048 / 0.053 / 0.090. Speeds: RTX 5090 (Gen4 x4), 123 GB RAM, iGPU lane off, one
+run each (not a median of 3).
+
+| file | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `Q4_K_M` (KRAFTON's) | 19.7 GB | token path KL 0.0034 / 0.017 / 0.0037 (raw / en / ja), prompt path 0.0009 / 0.0066 / 0.0041, the same top token at every position; the prompt path against the token path over 1,024 tokens 0.0015; greedy 12 tokens the same as the reference; a needle near the start of a 4K / 8K / 16K chat found; English and Japanese chats with thinking on and off answer right | decode 173 tok/s all in VRAM (205 after a short prompt), 169 / 162 / 142 held to 16 / 12 / 8 GB (`STRATA_GLM_VRAM_GB`, the rest in RAM); prompts 4K 6,480 / 8K 6,330 / 16K 5,220 tok/s, 4K at 16 / 12 / 8 GB 3,610 / 3,130 / 2,500 (a 4K prompt + 512) | an 8-32 GB NVIDIA GPU + 32 GB RAM or more; not measured: a 32 GB-RAM PC, other GPUs, AMD |
+
 ### Ternary Bonsai 2.5 27B (beta, unreleased)
 
 prism-ml's Ternary-Bonsai-2.5-27B: Qwen3.8-27B with ternary weights in a blockwise Hadamard basis ([MANUAL](MANUAL.md#ternary-bonsai-25-27b-beta)).

@@ -1337,6 +1337,106 @@ class Hy4(unittest.TestCase):
         self.assertIn("no layer split for Hy4", fail.call_args.args[0])
 
 
+class Raon(unittest.TestCase):
+    """--model raon (KRAFTON's Raon-1 mini, its own Q4_K_M, BETA): the entry, the one file by its prefix (the other quants
+    and the DFlash drafter beside it skipped), a plain mirror of the repo linked with nothing downloaded, the config
+    (64K, the card's chat sampling without the penalty the engine does not apply, no RAM tier), NVIDIA only, one GPU."""
+    FILE = "raon-1-mini-Q4_K_M.gguf"
+
+    def test_the_entry(self):
+        m = A.MODELS["raon"]
+        self.assertEqual((m["repo"], m["quant"], m["quants"], m["folder"]),
+                         ("KRAFTON/Raon-1-mini-gguf", "Q4_K_M", ("Q4_K_M",), ""))
+        self.assertEqual((m["model_name"], m["prefix"], m["pack_args"]), ("raon-1-mini", "raon", []))
+        self.assertEqual(m["sampling"], {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
+        self.assertTrue(m["nvidia_only"])
+        self.assertNotIn("context", m)   # (64K)
+
+    def test_the_file_only(self):
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "dflash-raon-1-mini-Q8_0.gguf", "raon-1-mini-IQ4_XS.gguf", self.FILE, "raon-1-mini-Q5_K_M.gguf",
+            "raon-1-mini-Q8_0.gguf", "README.md", "SHA256SUMS")]
+        m = A.MODELS["raon"]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+            got = A.quant_files(m["quant"], m["repo"], m["folder"], m["prefix_tmpl"].format(q=m["quant"]))
+        self.assertEqual([g[0] for g in got], [self.FILE])
+
+    def run_setup(self, d: Path, argv, ram=64.0, vram=16.0):
+        """main() for --model raon with a plain mirror of the repo under <d>/data: no build, no network."""
+        data = d / "data"
+        flat = data / "models" / "KRAFTON" / "Raon-1-mini-gguf"
+        flat.mkdir(parents=True)
+        body = b"raon"
+        (flat / self.FILE).write_bytes(body)
+        files = [(self.FILE, len(body), hashlib.sha256(body).hexdigest())]
+        pack = flat / "Q4_K_M" / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "native_experts.txt").write_text("x")
+        (pack / "tokenizer" / "chat_template.jinja").write_text("x")
+        gpu = {"index": 0, "name": "RTX 4080", "vram_gb": vram, "arch": "89", "count": 1}
+        tune = Namespace(gpu_tune=mock.Mock())
+        with mock.patch.object(sys, "argv", ["abyss_setup.py", "--model", "raon", "--data-dir", str(data), *argv]), \
+                mock.patch.object(A, "ROOT", d), mock.patch.dict(sys.modules, {"abyss": tune}), \
+                mock.patch.object(A.S, "gpu_info", return_value=gpu), mock.patch.object(A.S, "ram_gb", return_value=ram), \
+                mock.patch.object(A, "use_prebuilt", return_value=False), mock.patch.object(A, "build_engine"), \
+                mock.patch.object(A.S, "pip_install"), mock.patch.object(A.S, "llama_cpp_reasons", return_value=[]), \
+                mock.patch.object(A, "quant_files", return_value=files), mock.patch.object(A.S, "check_shards"), \
+                mock.patch.object(A.S, "download", side_effect=Hy4.no_fetch), \
+                mock.patch.object(A.S, "ask", side_effect=AssertionError("nothing to ask")), \
+                mock.patch.object(A.S, "run", side_effect=AssertionError("the pack is there")), \
+                mock.patch.object(A, "make_tools"), mock.patch.object(A.S, "step"), mock.patch.object(A.S, "say"), \
+                mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "warn") as warn:
+            self.assertEqual(A.main(), 0)
+        return flat, warn
+
+    def test_the_local_mirror_and_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            flat, warn = self.run_setup(Path(d), [])
+            link = flat / "Q4_K_M" / self.FILE
+            self.assertTrue(link.is_symlink())
+            self.assertTrue(link.samefile(flat / self.FILE))
+            got = json.loads((Path(d) / "abyss-raon-q4_k_m.json").read_text(encoding="utf-8"))
+            run = (Path(d) / "run-abyss-raon-q4_k_m.sh").read_text(encoding="utf-8")
+        warn.assert_not_called()
+        self.assertEqual(got["args"], ["--glm-pack", str(flat / "Q4_K_M" / "pack"), "--max-context", "65536",
+                                       "--prefill", "auto"])
+        self.assertEqual((got["model_name"], got["sampling"]),
+                         ("raon-1-mini", {"temperature": 1.0, "top_p": 0.95, "top_k": 20}))
+        self.assertNotIn("presence_penalty", got["sampling"])   # (the --glm-pack path does not apply penalties)
+        self.assertNotIn("env", got)
+        self.assertNotIn("gpu", got)
+        self.assertIn("Raon-1 mini", run)
+
+    def test_little_ram_is_warned(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, warn = self.run_setup(Path(d), [], ram=16.0)
+        self.assertIn("under 32 GB of RAM", warn.call_args.args[0])
+
+    def test_nvidia_only(self):
+        argv = ["abyss_setup.py", "--model", "raon", "--backend", "hip"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A, "hip_engine", side_effect=AssertionError("no ROCm step")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("Raon-1 mini runs on NVIDIA GPUs only", fail.call_args.args[0])
+        self.assertNotIn("memory", fail.call_args.args[1])
+
+    def test_one_gpu(self):
+        gpu = {"index": 0, "name": "RTX 5090", "vram_gb": 32.0, "arch": "120", "count": 2}
+        argv = ["abyss_setup.py", "--model", "raon", "--gpus", "0,1"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "gpu_info", return_value=gpu), \
+                mock.patch.object(A.S, "gpus", return_value=[gpu, {**gpu, "index": 1}]), \
+                mock.patch.object(A, "use_prebuilt", side_effect=AssertionError("stopped before the engine")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("no layer split for Raon-1", fail.call_args.args[0])
+
+
 class VenvLayout(unittest.TestCase):
     """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
 
