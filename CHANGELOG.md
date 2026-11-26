@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.209 - 2026-11-26
+
+Streams keep sending keep-alives while a tool call or json answer is written, the server refuses DNS names that are
+not this PC's (DNS rebinding), and Inkling 2's thinking budget also covers a thinking message opened again. The
+engine is the same as v1.3.208.
+
+### Fixed
+
+- Streams send keep-alives while an answer is written but held back - a DeepSeek DSML tool call, an `<invoke>` call
+  or a `response_format` json answer - at the same 10 s cadence as while the engine is quiet, in both the OpenAI and
+  the Anthropic form. A long call written behind a proxy that cuts silent streams is no longer cut. The content sent
+  is unchanged.
+- A request whose Host header is a DNS name that is not this PC's gets 403 (DNS rebinding: a page on another site
+  whose name was pointed at this PC could use the API, change settings or run MCP tools). IP addresses, `localhost`
+  and this PC's own names pass, so LAN use by the box's IP keeps working; add any other name you open Abyss by
+  (MagicDNS, a reverse proxy's public name) to the new `STRATA_ALLOWED_HOSTS` (comma-separated, `.domain` for a
+  domain, `*` = off).
+- Inkling 2: a thinking message the model opens again after the thinking budget closed the first one counts against
+  the same budget; one opened past it gets `STRATA_INK_REWRAP_BUDGET` more tokens (512, `0` = off), then it is closed
+  and the answer starts, instead of thinking on to `max_tokens` with an empty answer. Answers whose thinking stays
+  within the budget are unchanged.
+
 ## v1.3.208 - 2026-11-26
 
 Inkling 2 Mini lends the part of its long-context KV that the conversation has not reached yet to the expert pool
