@@ -73,6 +73,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -806,6 +807,16 @@ def write_config(name: str, pack: Path, ctx: int, port: int | None, rewrite: boo
     run.chmod(0o755)
     S.ok(f"{run.name} written")
     return cfg, run
+
+
+def v41_ram_tier(ram_gb: float, drafter_bytes: int = 0) -> int:
+    """STRATA_GLM_RAM_GB for V4.1 / Hy4 below 160 GB of RAM: min(RAM - 34, 0.65 x RAM), floor 16.  RAM - 34 alone is
+    right on a 94 GB box (60, validated) but on 123 GB it gave 89 and systemd-oomd killed three V4.1 132G loads (80
+    loaded); the 65% cap gives 94 -> 60, 123 -> 80, 128 -> 83.  A drafter whose weights sit in host RAM at load (its file
+    size, rounded up to whole GB) comes off the tier too."""
+    tier = min(round(ram_gb) - 34, round(0.65 * ram_gb))
+    tier -= math.ceil(drafter_bytes / 1e9) if drafter_bytes else 0
+    return max(16, tier)
 
 
 def dspark_step(a, data: Path, cfg: Path, fresh: bool, had: str | None, gpus, backend: str) -> None:
@@ -1633,10 +1644,14 @@ def main() -> int:
         # the SSD experts go through)
         extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 20))
     if a.model in ("v41", "hy4") and S.ram_gb() < 160:
-        # a RAM tier that leaves ~34 GB to the page cache and the rest of the PC: V4.1's (and Hy4's) Engram rows and SSD
-        # experts keep the page cache full, and without a cap systemd-oomd stops the server or the session that started
-        # it (both cards' numbers: 60 GB on 94 GB)
-        extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(max(16, round(S.ram_gb()) - 34))
+        # V4.1's (and Hy4's) Engram rows and SSD experts keep the page cache full, and without a cap systemd-oomd stops
+        # the server or the session that started it: see v41_ram_tier (60 GB on 94 GB, the cards' value; 80 on 123)
+        drafter = (extra.get("env") or {}).get("STRATA_DS4_DSPARK")
+        try:
+            dbytes = Path(drafter).stat().st_size if drafter else 0
+        except OSError:
+            dbytes = 0
+        extra.setdefault("env", {})["STRATA_GLM_RAM_GB"] = str(v41_ram_tier(S.ram_gb(), dbytes))
     if mtp is not None:
         # (the engine also finds MTP/ beside the GGUF by itself; the config names it)
         extra.setdefault("env", {})["STRATA_GLM_MTP_GGUF"] = str(mtp)

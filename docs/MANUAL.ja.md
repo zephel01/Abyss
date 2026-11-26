@@ -110,7 +110,7 @@ MemTensor の MemT（モデル自身のメモリつき。ベータ、NVIDIA、GP
 ```
 
 Tencent の Hy4-flash（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[Hy4-flash](#hy4-flashベータ)）: GPU 32 GB + RAM 96 GB 向けの
-私たちの 32G96G の GGUF。サンプリングはモデルカードの値（temperature 0.9、top_p 1.0）、RAM 段は V4.1 と同じ（RAM − 34 GB）:
+私たちの 32G96G の GGUF。サンプリングはモデルカードの値（temperature 0.9、top_p 1.0）、RAM 段は V4.1 と同じ（RAM − 34 GB と RAM の 65% の小さいほう。94 GB で 60、123 GB で 80）:
 
 ```sh
 ./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf（92.9 GB）
@@ -1324,7 +1324,7 @@ RTX 5090 で、HF のコードから書いた float64 の numpy の計算（`rec
 射影が BF16 / F16）にも対応しますが、そのようなファイルではまだ試していません。私たちの
 [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF)（92.9 GB、GPU 32 GB + RAM 96 GB 向け）は
 `./setup-deepseek.sh --model hy4` で入ります（ファイルを Hugging Face の SHA-256 で確かめ、パックし、文脈 65,536、temperature 0.9 /
-top_p 1.0、`STRATA_GLM_RAM_GB` = RAM − 34 GB の `abyss-hy4-32g96g.json` を書きます。NVIDIA だけ: HIP のビルドでも Hy4 の経路は
+top_p 1.0、`STRATA_GLM_RAM_GB` = RAM − 34 GB と RAM の 65% の小さいほう（94 GB で 60、123 GB で 80）の `abyss-hy4-32g96g.json` を書きます。NVIDIA だけ: HIP のビルドでも Hy4 の経路は
 コンパイルされますが、AMD の GPU ではまだ動かしていません。GPU 1 枚: 層の分割なし）。ほかのファイルは、手でパックして設定を書きます。
 
 ```bash

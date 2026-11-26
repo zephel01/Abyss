@@ -168,6 +168,16 @@ class PickQuant(unittest.TestCase):
             self.assertEqual(self.choose("qwen38", yes=False)[0], "12G32G")
 
 
+class V41RamTier(unittest.TestCase):
+    def test_values(self):
+        for ram, want in ((64, 30), (94, 60), (123, 80), (128, 83), (150, 98)):
+            self.assertEqual(A.v41_ram_tier(ram), want, ram)
+
+    def test_floor_and_drafter(self):
+        self.assertEqual(A.v41_ram_tier(40), 16)
+        self.assertEqual(A.v41_ram_tier(123, 6_940_214_304), 73)
+
+
 class DSparkStep(unittest.TestCase):
     """dspark_step against a config in a temporary folder, the drafter 'downloaded' from a local file."""
 

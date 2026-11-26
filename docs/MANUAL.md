@@ -113,7 +113,7 @@ MemTensor's MemT models with their native memory (beta, NVIDIA, one GPU; [MemT-1
 ```
 
 Tencent's Hy4-flash (beta, NVIDIA, one GPU, text only; [Hy4-flash](#hy4-flash-beta)): our 32G96G GGUF for a
-32 GB GPU + 96 GB RAM, with the model card's sampling (temperature 0.9, top_p 1.0) and V4.1's RAM tier (RAM - 34 GB):
+32 GB GPU + 96 GB RAM, with the model card's sampling (temperature 0.9, top_p 1.0) and V4.1's RAM tier (the smaller of RAM - 34 GB and 65% of RAM: 60 on 94 GB, 80 on 123 GB):
 
 ```sh
 ./setup-deepseek.sh --model hy4 --download-model         # Hy4-flash-32G96G-0000{1,2}-of-00002.gguf (92.9 GB)
@@ -1395,7 +1395,7 @@ the loader also takes other converters' files (an Engram table in IQ4_NL / Q8_0 
 BF16 / F16 projections), not tested on such a file yet. Our
 [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF) (92.9 GB, for a 32 GB GPU + 96 GB
 RAM) sets up with `./setup-deepseek.sh --model hy4` (the files checked against Hugging Face's SHA-256, the pack, and
-`abyss-hy4-32g96g.json` with a 65,536 context, temperature 0.9 / top_p 1.0 and `STRATA_GLM_RAM_GB` = RAM - 34 GB;
+`abyss-hy4-32g96g.json` with a 65,536 context, temperature 0.9 / top_p 1.0 and `STRATA_GLM_RAM_GB` = the smaller of RAM - 34 GB and 65% of RAM (60 on 94 GB, 80 on 123 GB);
 NVIDIA only: the HIP build compiles the Hy4 path but it has not run on an AMD GPU; one GPU: no layer split). Other
 files: pack them by hand and write the config.
 
