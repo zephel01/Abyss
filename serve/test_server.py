@@ -2265,5 +2265,82 @@ class SnapAtLastMessage(unittest.TestCase):
             httpd.server_close()
 
 
+class HeldCallKeepAlive(unittest.TestCase):
+    """Strata #7132's idea: while a DSML / <invoke> call or a response_format json answer is held back, the stream
+    still sends keep-alives (None items) at the KEEPALIVE_S cadence, in both API forms, and sends the same content."""
+
+    TOOLS = [{"name": "write_file", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}]
+    BODY = "y" * 400
+    DSML = ('Writing it.\n<\uff5cDSML\uff5ctool_calls>\n<\uff5cDSML\uff5cinvoke name="write_file">\n'
+            '<\uff5cDSML\uff5cparameter name="text" string="true">' + BODY + '</\uff5cDSML\uff5cparameter>\n'
+            '</\uff5cDSML\uff5cinvoke>\n</\uff5cDSML\uff5ctool_calls>')
+    XML = ('<|message_model|><|content_text|>Writing it.\n<invoke name="write_file">\n<parameter name="text">' + BODY + '</parameter>\n</invoke>')
+    DELAY, TICK = 0.003, 0.1                           # ~1.5 s of held tokens; keep-alives every 0.1 s
+
+    def items(self, api, script, tick, req=None):
+        """-> (the non-None items sent, the longest gap between any two items sent, in s, keep-alives)."""
+        tok = InklingThinkingOff.InkTok() if script.startswith("<|message_model|>") else ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX, delay_s=self.DELAY), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids = tok.encode("<|im_start|>assistant\n", parse_special=True)
+        req = {"stream": True, **(req or {})}
+        tools = None if req.get("response_format") else self.TOOLS
+        with unittest.mock.patch.object(SV, "KEEPALIVE_S", tick):
+            gen = SV.openai_chunks(svc, req, ids, False, tools, 3000, threading.Event()) if api == "openai" else \
+                SV.anthropic_events(svc, req, ids, False, tools, 3000, threading.Event())
+            out, pings, gap, t0 = [], 0, 0.0, time.monotonic()
+            for item in gen:
+                now = time.monotonic()
+                gap, t0 = max(gap, now - t0), now
+                if item is None:
+                    pings += 1
+                else:
+                    out.append(item)
+        return out, gap, pings
+
+    @staticmethod
+    def strip(items):
+        """The items without their per-request ids and times (two runs compare equal)."""
+        def clean(x):
+            if isinstance(x, dict):
+                return {k: clean(v) for k, v in x.items() if k not in ("id", "created", "signature")}
+            if isinstance(x, (list, tuple)):
+                return [clean(v) for v in x]
+            return x
+        return clean(items)
+
+    def check(self, api, script, req=None):
+        quiet, quiet_gap, _ = self.items(api, script, 1e9, req)          # (as before: no keep-alive in the block)
+        out, gap, pings = self.items(api, script, self.TICK, req)
+        self.assertGreater(quiet_gap, 1.0)                                # the held block is silent ...
+        self.assertLess(gap, self.TICK + 0.15)                            # ... and now it is not
+        self.assertGreater(pings, 3)
+        self.assertEqual(self.strip(out), self.strip(quiet))              # the same content either way
+        return out
+
+    def test_dsml_call_openai(self):
+        out = self.check("openai", self.DSML)
+        calls = [tc for c in out for tc in c["choices"][0]["delta"].get("tool_calls") or []]
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"text": self.BODY})
+
+    def test_dsml_call_anthropic(self):
+        out = self.check("anthropic", self.DSML)
+        self.assertIn("tool_use", [e.get("content_block", {}).get("type") for _, e in out])
+
+    def test_xml_call_openai(self):
+        out = self.check("openai", self.XML)               # (Inkling 2's XML form)
+        calls = [tc for c in out for tc in c["choices"][0]["delta"].get("tool_calls") or []]
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"text": self.BODY})
+
+    def test_json_answer(self):
+        out = self.check("openai", '{"text": "' + self.BODY + '"}', {"response_format": {"type": "json_object"}})
+        self.assertEqual("".join(c["choices"][0]["delta"].get("content") or "" for c in out),
+                         '{"text": "' + self.BODY + '"}')
+
+    def test_streamed_text_sends_no_extra(self):
+        _, _, pings = self.items("openai", "plain " + self.BODY, self.TICK)
+        self.assertEqual(pings, 0)                                        # every token went out: nothing to add
+
+
 if __name__ == "__main__":
     unittest.main()

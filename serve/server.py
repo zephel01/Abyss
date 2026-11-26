@@ -2997,6 +2997,7 @@ class Service:
                     return sp
 
                 runs = 0
+                quiet_at = time.monotonic()             # when this loop last yielded something (a keep-alive's clock)
                 run_ids, run_max, run_sampling = ids, max_new, engine_sampling(0, True)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
@@ -3009,8 +3010,14 @@ class Service:
                         for t in gen:
                             if t is None:               # heartbeat while the engine is quiet
                                 last_print = self._progress(last_print)
+                                quiet_at = time.monotonic()
                                 yield "ping", None
                                 continue
+                            if time.monotonic() - quiet_at >= KEEPALIVE_S:
+                                # tokens, but nothing went out for that long (a held DSML / <invoke> call): the same
+                                # heartbeat as a quiet engine's (QuietWatch)
+                                quiet_at = time.monotonic()
+                                yield "ping", None
                             n += 1
                             soft_tail = False
                             is_think_end = self.think_end_id is not None and t == self.think_end_id
@@ -3044,6 +3051,8 @@ class Service:
                                               "ends before it", flush=True)
                                     self._note(n, evs)
                                     last_print = self._progress(last_print)
+                                    if evs:
+                                        quiet_at = time.monotonic()
                                     for ev in evs:
                                         yield "event", ev
                                     if refused:
@@ -3107,6 +3116,8 @@ class Service:
                                       "before it", flush=True)
                             self._note(n, evs)
                             last_print = self._progress(last_print)
+                            if evs:
+                                quiet_at = time.monotonic()
                             for ev in evs:
                                 yield "event", ev
                             if stopped or refused:
@@ -3389,9 +3400,49 @@ def json_from_text(text: str) -> str:
     return text
 
 
+KEEPALIVE_S = 10.0       # the longest a stream stays silent while the answer is being written (the engine's own
+#                          heartbeat cadence: StrataEngine.generate yields None after 10 s without a line)
+
+
+class QuietWatch:
+    """Keep-alives while the answer is written but nothing goes out (Strata #7132's idea): a DeepSeek DSML call or an
+    <invoke> call is held until its block closes, a response_format json answer until the end, so a 4,000-token call
+    at 50 tok/s is 80 s of silence and a proxy that cuts silent streams (125 s on Strata's report) ends a healthy
+    request.  The engine's heartbeat only comes while the engine is quiet.  Service.run yields a ("ping", None) once tokens
+    came for KEEPALIVE_S with no event (a held call); `marks` wraps what the stream sends and notes when it last sent
+    something; `ticks` wraps the answer's events and puts a ("ping", None) before the next one once KEEPALIVE_S passed
+    with nothing sent (events the stream holds: the json answer).  What is sent is unchanged; keep-alives are SSE comments."""
+
+    def __init__(self):
+        self.out = time.monotonic()
+
+    def ticks(self, src):
+        try:
+            for item in src:
+                if item[0] != "ping" and time.monotonic() - self.out >= KEEPALIVE_S:
+                    yield "ping", None
+                yield item
+        finally:
+            src.close()
+
+    def marks(self, gen):
+        try:
+            for item in gen:
+                self.out = time.monotonic()
+                yield item
+        finally:
+            gen.close()
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  None items are keep-alives."""
+    quiet = QuietWatch()
+    src = run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel)
+    return quiet.marks(_openai_chunks(svc, req, ids, quiet.ticks(src)))
+
+
+def _openai_chunks(svc: Service, req: dict, ids, src):
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
     def chunk(delta, finish=None):
@@ -3405,7 +3456,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     rf = req.get("response_format")
     json_mode = isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
     held = []
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in src:
         if kind == "ping":
             yield None
         elif kind == "mcp":
@@ -3604,6 +3655,12 @@ def _openai_collect(chunks, content, reasoning, by_index, mcp) -> dict:
 
 # ------------------------------------------------------------------------------------------------ Anthropic
 def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+    """The Anthropic stream's (name, event) items; None items are keep-alives (QuietWatch: also while a call is held)."""
+    quiet = QuietWatch()
+    return quiet.marks(_anthropic_events(svc, ids, quiet.ticks(svc.run(ids, thinking, tools, max_new, req, cancel))))
+
+
+def _anthropic_events(svc: Service, ids, src):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
@@ -3623,7 +3680,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                                         "delta": {"type": "signature_delta", "signature": sig}})
 
     streamed = set()
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in src:
         if kind == "ping":
             yield None
             continue
