@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.210 - 2026-11-26
+
+Our Hy4-flash GGUF installs with one command: `./setup-deepseek.sh --model hy4` (beta, NVIDIA, one GPU). The engine is
+the same as v1.3.209.
+
+### Added
+
+- `--model hy4`: sets up zephel01/Hy4-flash-32G96G-GGUF (92.9 GB, for a 32 GB GPU + 96 GB RAM): the two shards checked
+  against Hugging Face's SHA-256, the pack (the same bytes as the one the model card was measured with), and
+  `abyss-hy4-32g96g.json` (65,536 context, the card's sampling temperature 0.9 / top_p 1.0, RAM tier = RAM - 34 GB,
+  60 GB on a 94 GB PC as on the card). It warns below 32 GB of VRAM or 90 GB of RAM. NVIDIA only (the HIP build
+  compiles the Hy4 path, but it has not run on AMD yet), one GPU, text only. RTX 5090 + 123 GB RAM with the written
+  config: decode 54.6-59.8 tok/s on a 512-token Japanese answer (a check run, not a bench; the card's 52.2 tok/s is
+  at a 60 GB RAM tier).
+
 ## v1.3.209 - 2026-11-26
 
 Streams keep sending keep-alives while a tool call or json answer is written, the server refuses DNS names that are
