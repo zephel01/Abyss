@@ -386,10 +386,12 @@ public:
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);
     /// raon: the reasoning-effort steering's alpha for this prompt (STRATA_RAON_EFFORT: a name of the GGUF's
-    /// raon1.reasoning_effort.names, a number, or auto - the model code's rule: a prompt with thinking off, the
-    /// tokens <think></think> next to each other, 0.1; else the default effort's).  No-op on other models
-    void raon_prompt(const std::vector<int64_t>& ids);
+    /// raon1.reasoning_effort.names, a number, or auto - the model code's rule: the prompt's last <think> closed at
+    /// once (thinking off) 0.1; else the default effort's).  effort: the request's own (the same forms; it comes
+    /// before the variable).  No-op on other models
+    void raon_prompt(const std::vector<int64_t>& ids, const std::string& effort = std::string());
     float raon_alpha() const { return raon_alpha_; }
+    bool raon_on() const { return g_.raon; }
     /// Conversation reuse (the fast path): save the sequence state at the current position - the recurrent KDA
     /// states and conv histories (the DSA caches are append-only, so the position alone restores them) - and
     /// restore it later to continue a prompt that extends the saved one.  false when unsupported.
@@ -905,6 +907,12 @@ public:
     float* raon_sc_ = nullptr;     // the MLA scores [heads][ctx] and the partial contexts (ling_fast's mla_attend)
     float* raon_part_ = nullptr;
     float raon_alpha_ = 0.05f;
+    // the prompt path (glm_prefill.cu's raon branches): the rows' mHC coefficients - the attention site's [T][24], the
+    // FFN site's [T][24], z [T][32] - grown to the chunk as it comes; a site's read (mhc_pre over R's rows -> x, x16)
+    float* raon_pc_ = nullptr;
+    int raon_pc_rows_ = 0;
+    bool raon_prompt_coef(int T, std::string& err);
+    void raon_prompt_read(int il, int site, int T, float* R, float* x, uint16_t* x16, cudaStream_t s);
     // ---- inkling (inkling_fast_path.cu): the physical layer's weights (from qwen35_bind), the slots and scratch (from
     // qwen35_alloc, inside qwen35_state_), the token path's 48 layer applications and the head's mix (head_x / head_xq),
     // a new sequence's zeroed conv states, the snapshot's runs (conv states, window rings)

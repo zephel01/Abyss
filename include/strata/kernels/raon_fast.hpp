@@ -24,21 +24,37 @@ namespace strata::kernels::raon {
 constexpr int kStreams = 4;
 constexpr int kSel = 17;     // the selector's rows: pre 4, post 4, the residual chart's 9
 constexpr int kCoef = 24;    // h_pre 4 | h_post 4 | H 16 (row-major)
+constexpr int kZRow = 32;    // a row's z scratch
 
 /// One mHC site's coefficients and branch input.  R: [4][n_embd]; fn: BF16 [17][4 n_embd]; base [17]; scale [4]
-/// (s0..s3 = alpha_pre, alpha_post, alpha_z, eta); norm_w [n_embd]; z: scratch (18 floats); coef: out (kCoef floats);
-/// x: out (n_embd floats, the normed input)
+/// (s0..s3 = alpha_pre, alpha_post, alpha_z, eta); norm_w [n_embd]; z: scratch (kZRow floats); coef: out (kCoef floats);
+/// x: out (n_embd floats, the normed input).  rows > 1 (the prompt path): rows of R (4 n_embd), z (kZRow), coef
+/// (kCoef) and x (n_embd) - each row the token path's arithmetic
 void mhc_pre(const float* R, const uint16_t* fn, const float* base, const float* scale, const float* norm_w,
              float hc_eps, float norm_eps, float post_factor, int n_embd, float* z, float* coef, float* x,
-             cudaStream_t s);
+             cudaStream_t s, int rows = 1);
 /// R[i][e] = sum_j H[i][j] R[j][e] + h_post[i] * out[e] (coef from mhc_pre)
-void mhc_post(float* R, const float* out, const float* coef, int n_embd, cudaStream_t s);
+void mhc_post(float* R, const float* out, const float* coef, int n_embd, cudaStream_t s, int rows = 1);
 /// v[h * hd + c] *= exp(logsigmoid(b[h] + w[h]) - logsigmoid(b[h]))
-void rda_ratio(float* v, const float* b, const float* w, int n_head, int head_dim, cudaStream_t s);
+void rda_ratio(float* v, const float* b, const float* w, int n_head, int head_dim, cudaStream_t s, int rows = 1);
 /// o[h][v] = (v_b[h][v] . ctx[h]) * sigmoid(gate[h * kV + v]); v_b F32 [n_head][128][512], ctx [n_head][512]
 void mla_out_gated(const float* ctx, const float* v_b, const float* gate, int n_head, float* o, cudaStream_t s);
 /// y[i] += alpha * c[i]
-void axpy(float* y, const float* c, float alpha, int n, cudaStream_t s);
+void axpy(float* y, const float* c, float alpha, int n, cudaStream_t s, int rows = 1);
+/// the prompt path: x[t] = rms(in[t]) * w over rows of n floats (any n), x16 its FP16
+void rms_rows_any(const float* in, const float* w, float eps, int rows, int n, float* x, void* x16, cudaStream_t s);
+/// the prompt path: the MLA cache rows (512 latent rms-normed | 64 pe as they are, FP16) of rows positions from kv rows
+/// of 576 floats, into cache (the first row's place)
+void mla_cache_rows(const float* kv, const float* kv_norm, float eps, int rows, uint16_t* cache, cudaStream_t s);
+/// o[i] *= sigmoid(gate[i])
+void gate_rows(float* o, const float* gate, int64_t n, cudaStream_t s);
+/// The prompt's causal MLA attention on tensor cores (ling_fast's mla_prompt_kernel generalised: n_head heads in
+/// passes of 32, no gate): ctx[t][h] = softmax_j(scale (q_abs[t][h] . lat_j + q_pe[t][h] . pe_j)) . lat_j over
+/// j <= p0 + t.  qabs [T][n_head][512] in, ctx [T][n_head][512] out (separate), q rows of ldq floats with each
+/// head's pe at h * 192 + 128.  False where it does not run (not sm_80+, the WMMA layout off)
+bool prompt_attn_ok();
+void mla_prompt_attn(const float* qabs, float* ctx, const float* q, int ldq, const uint16_t* cache, int64_t p0, int T,
+                     int n_head, float scale, cudaStream_t s);
 /// launches that failed (all raon kernels)
 int launch_errors();
 

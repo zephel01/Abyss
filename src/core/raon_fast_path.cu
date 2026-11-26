@@ -15,6 +15,7 @@
 // The state rides qwen35_alloc as ling's does: the RDA state / conv rows, an MLA layer's cache rows of 576 FP16.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/ling_fast.hpp"
 #include "strata/kernels/raon_fast.hpp"
@@ -201,17 +202,15 @@ bool Glm5Model::raon_alloc(std::string& err) {
         return false;
     }
     cudaMemset(raon_buf_, 0, c.total * 4);
-    // the identity rotary table: position 0's (cos 1, sin 0) - the pe dims pass through mla_prep unrotated, exactly
-    lk::rope_table(0, 10000.0, (float2*) (raon_buf_ + c.cs), fast_->cs);
-    cudaStreamSynchronize(fast_->cs);
+    // the identity rotary table (cos 1, sin 0): the pe dims pass through mla_prep unrotated, exactly
     {
         float2 h[lk::kRot / 2];
-        cudaMemcpy(h, raon_buf_ + c.cs, sizeof h, cudaMemcpyDeviceToHost);
-        for (const float2& v : h)
-            if (v.x != 1.0f || v.y != 0.0f) {
-                err = "raon: the identity rotary table is not (1, 0) (an M-RoPE table set?)";
-                return false;
-            }
+        for (float2& v : h) v = make_float2(1.0f, 0.0f);
+        if (cudaMemcpy(raon_buf_ + c.cs, h, sizeof h, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaGetLastError();
+            err = "raon: the identity rotary table did not upload";
+            return false;
+        }
     }
     int n_mla = 0, n_steer = 0;
     for (int il = l0_; il < l1_; ++il) {
@@ -226,7 +225,37 @@ bool Glm5Model::raon_alloc(std::string& err) {
     return true;
 }
 
+bool Glm5Model::raon_prompt_coef(int T, std::string& err) {
+    if (T <= raon_pc_rows_) return true;
+    if (raon_pc_ != nullptr) {
+        cudaStreamSynchronize(fast_->cs);
+        cudaFree(raon_pc_);
+        raon_pc_ = nullptr;
+        raon_pc_rows_ = 0;
+    }
+    if (cudaMalloc((void**) &raon_pc_, (size_t) T * (24 + 24 + rk::kZRow) * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        raon_pc_ = nullptr;
+        err = "raon: the prompt's mHC coefficients (" + std::to_string(T) + " rows) did not allocate";
+        return false;
+    }
+    raon_pc_rows_ = T;
+    return true;
+}
+
+void Glm5Model::raon_prompt_read(int il, int site, int T, float* R, float* x, uint16_t* x16, cudaStream_t s) {
+    const Glm5Geometry& g = g_;
+    const auto& Ly = fast_->L[(size_t) il];
+    rk::mhc_pre(R, Ly.rn_hc_fn[site], Ly.rn_hc_base[site], Ly.rn_hc_scale[site], site == 0 ? Ly.attn_norm : Ly.post_norm,
+                g.raon_hc_eps, g.norm_eps, g.raon_hc_post, g.n_embd, raon_pc_ + (size_t) 48 * T,
+                raon_pc_ + (size_t) (site == 0 ? 0 : 24) * T, x, s, T);
+    strata::kernels::glmb::f32_to_f16(x, x16, (int64_t) T * g.n_embd, s);
+}
+
 void Glm5Model::raon_free() {
+    if (raon_pc_ != nullptr) cudaFree(raon_pc_);
+    raon_pc_ = nullptr;
+    raon_pc_rows_ = 0;
     for (void* p : raon_owned_) cudaFree(p);
     raon_owned_.clear();
     if (raon_sc_ != nullptr) cudaFree(raon_sc_);
@@ -238,12 +267,12 @@ void Glm5Model::raon_free() {
 // STRATA_RAON_EFFORT: a name (low / medium / high / xhigh / max, as the GGUF lists them; none = thinking off's 0.1),
 // a number, or auto (unset): the model code's rule - thinking off (<think></think> adjacent in the prompt) 0.1, else the
 // default effort's alpha
-void Glm5Model::raon_prompt(const std::vector<int64_t>& ids) {
+void Glm5Model::raon_prompt(const std::vector<int64_t>& ids, const std::string& effort) {
     const Glm5Geometry& g = g_;
     if (!g.raon) return;
     constexpr float kNoThinking = 0.1f;
     const char* v = getenv("STRATA_RAON_EFFORT");
-    const std::string e = v != nullptr ? v : "";
+    const std::string e = !effort.empty() ? effort : v != nullptr ? v : "";
     if (!e.empty() && e != "auto") {
         if (e == "none") { raon_alpha_ = kNoThinking; return; }
         for (size_t i = 0; i < g.raon_effort_names.size() && i < g.raon_effort_alpha.size(); ++i)
@@ -252,16 +281,17 @@ void Glm5Model::raon_prompt(const std::vector<int64_t>& ids) {
         const double a = std::strtod(e.c_str(), &end);
         if (end != e.c_str() && *end == '\0') { raon_alpha_ = (float) a; return; }
         static bool warned = false;
-        if (!warned) std::fprintf(stderr, "raon: STRATA_RAON_EFFORT=%s is not an effort name or a number - auto\n", e.c_str());
+        if (!warned) std::fprintf(stderr, "raon: effort %s is not an effort name or a number - auto\n", e.c_str());
         warned = true;
     }
     // (the tokenizer's <think> / </think>: found by text in the vocabulary would need the tokenizer here - the GGUF's
     // ids, Raon-1's 259213 / 259214, are checked against the vocabulary size)
     constexpr int64_t kThink = 259213, kThinkEnd = 259214;
+    // (the LAST <think>: the generation prompt's - a past turn without reasoning is <think></think> too)
     bool off = false;
     if (g.n_vocab > kThinkEnd)
-        for (size_t i = 0; i + 1 < ids.size(); ++i)
-            if (ids[i] == kThink && ids[i + 1] == kThinkEnd) { off = true; break; }
+        for (size_t i = ids.size(); i-- > 0;)
+            if (ids[i] == kThink) { off = i + 1 < ids.size() && ids[i + 1] == kThinkEnd; break; }
     raon_alpha_ = off ? kNoThinking : g.raon_alpha;
 }
 

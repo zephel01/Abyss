@@ -1791,6 +1791,11 @@ __global__ void swiglu_f16_kernel(const float* __restrict__ gate, const float* _
         h[i] = __float2half(fminf(gs / (1.0f + expf(-gs)), l) * fminf(fmaxf(up[i], -l), l));
         return;
     }
+    if (limit < 0.0f) {   // (raon's SITU dense FFN / shared expert: glm_fast.cu's situ_act)
+        const float gs = gate[i], us = up[i];
+        h[i] = __float2half((4.0f * tanhf(gs * 0.25f)) * (1.0f / (1.0f + expf(-gs))) * (25.0f * tanhf(us * 0.04f)));
+        return;
+    }
     const float g = fminf(gate[i], limit);
     const float u = fminf(fmaxf(up[i], -limit), limit);
     h[i] = __float2half((g / (1.0f + expf(-g))) * u);

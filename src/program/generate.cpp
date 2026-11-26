@@ -2788,6 +2788,10 @@ static int glm_pack_generate(const Options& o) {
     // (the snapshot is dropped on a change; the slots hold default-state conversations only)
     const bool abl_def = model.abl_loaded();
     bool abl_req = abl_def, snap_abl = abl_def;
+    // raon: the request's reasoning effort (GEN key effort=<name|number>, the server's; empty: STRATA_RAON_EFFORT, else
+    // the prompt's own rule) and the steering alpha the saved state was computed with - another alpha never reuses it
+    std::string req_effort;
+    float snap_alpha = -1.0f;
     // images (GENI): this request's <|image|> positions and rows, and a hash of the rows the saved state read - the
     // same tokens with another picture must not reuse it
     std::vector<int64_t> cur_img_pos;
@@ -2978,7 +2982,7 @@ static int glm_pack_generate(const Options& o) {
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
         stop_req.store(false);
-        model.raon_prompt(ids);   // (raon: this prompt's reasoning-effort alpha)
+        model.raon_prompt(ids, req_effort);   // (raon: this prompt's reasoning-effort alpha)
         model.force_next(-1);
         bool in_think = req_think_end >= 0;
         // this request's bias set: bias= from the start, bias_answer= once the reasoning has closed (at once when no
@@ -3011,6 +3015,12 @@ static int glm_pack_generate(const Options& o) {
             model.abl_enable(abl_req);
             if (abl_req != snap_abl) snap_tokens.clear();
         }
+        if (model.raon_on() && model.raon_alpha() != snap_alpha) {   // (raon: a state steered with another alpha)
+            if (!snap_tokens.empty())
+                std::fprintf(stderr, "raon: the effort alpha changed (%g -> %g) - the conversation is read again\n",
+                             snap_alpha, model.raon_alpha());
+            snap_tokens.clear();
+        }
         size_t reuse = 0;
         if (model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
             std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
@@ -3032,6 +3042,7 @@ static int glm_pack_generate(const Options& o) {
         }
         if (reuse == 0) model.reset();
         snap_abl = abl_req;   // (the sequence in the model from here on)
+        snap_alpha = model.raon_alpha();
         std::vector<float> lg;
         const auto t0 = std::chrono::steady_clock::now();
         const auto st0 = model.fast_stats();   // (PP lines: the prompt's disk wait so far = disk_ms - st0's)
@@ -4880,6 +4891,7 @@ static int glm_pack_generate(const Options& o) {
             req_think_close.clear();
             req_spec = true;
             req_seeded = false;
+            req_effort.clear();
             req_bias = req_bias_ans = nullptr;
             std::string bias_err;
             req_ns = req_sess = 0;
@@ -4936,6 +4948,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }
                 else if (k == "spec") { req_spec = std::atoi(v.c_str()) != 0; }
+                else if (k == "effort") { req_effort = v; }   // (raon: the reasoning effort's steering alpha)
                 else if (k == "bias" || k == "bias_answer") {
                     const auto it = bias_sets.find(v);
                     if (it == bias_sets.end()) bias_err = "unknown bias set '" + v + "' (send BIAS first)";

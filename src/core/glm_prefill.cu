@@ -35,6 +35,7 @@
 #include "strata/kernels/qwen35_fast.hpp"
 #include "strata/kernels/laguna_fast.hpp"
 #include "strata/kernels/ling_fast.hpp"
+#include "strata/kernels/raon_fast.hpp"
 #include "strata/kernels/prompt_flash_attn.hpp"
 #include "strata/kernels/qsa27.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -189,6 +190,25 @@ LingMlaBufs carve_ling_mla(Carve& c, size_t T, const Glm5Geometry& g) {
 
 // qwen35moe's mixers over a sub-batch of T rows: the delta-net layers' projections, conv rows, gates, recurrence
 // output and gated norm (then the ssm_out product's FP16 input); the attention layers' projections, q, output
+struct RaonMlaBufs {
+    float *q, *kv, *qa, *gate, *o, *qabs, *ctx;
+    uint16_t *qa16, *o16;
+};
+RaonMlaBufs carve_raon_mla(Carve& c, size_t T, const Glm5Geometry& g) {
+    RaonMlaBufs b{};
+    const size_t H = (size_t) g.n_head, QL = (size_t) g.q_lora;
+    b.q = c.take<float>(T * H * 192);
+    b.kv = c.take<float>(T * 576);
+    b.qa = c.take<float>(T * QL);
+    b.qa16 = c.take<uint16_t>(T * QL);
+    b.gate = c.take<float>(T * H * 128);
+    b.o = c.take<float>(T * H * 128);
+    b.o16 = c.take<uint16_t>(T * H * 128);
+    b.qabs = c.take<float>(T * H * 512);
+    b.ctx = c.take<float>(T * H * 512);
+    return b;
+}
+
 struct Q35Bufs {
     float *qkv, *conv, *z, *alpha, *beta, *o, *y;
     uint16_t* y16;
@@ -1288,10 +1308,6 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             return true;
         }
     }
-    if (g.raon) {   // (raon: no batched prompt path yet)
-        std::fprintf(stderr, "glm prefill: CUDA%d raon has no prompt path yet - token by token\n", dev_);
-        return true;
-    }
     // inkling: its attention, mixes and controllers are inkling_fast_path.cu's (ink_prompt_ok); the experts here
     if (g.ink) {
         std::string hw;
@@ -1304,6 +1320,23 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         const auto& Ly = F->L[(size_t) il];
         if (g.is_hy4() || g.ink) {
             // (hy4_prompt_ok / ink_prompt_ok above)
+        } else if (g.raon) {   // (raon: the projections batched - prefill_half's raon mixer)
+            if (Ly.recr) {
+                deq_ok(Ly.q, "attn_q", il);
+                deq_ok(Ly.k, "attn_k", il);
+                deq_ok(Ly.v, "attn_v", il);
+                deq_ok(Ly.lg_g, "ssm_g", il);
+                deq_ok(Ly.lg_beta, "ssm_beta", il);
+                deq_ok(Ly.rn_rda, "ssm_rda", il);
+                deq_ok(Ly.rn_fa, "ssm_f_a", il);
+                deq_ok(Ly.rn_fb, "ssm_f_b", il);
+            } else {
+                deq_ok(Ly.rn_qa, "attn_q_a", il);
+                deq_ok(Ly.rn_qb, "attn_q_b", il);
+                deq_ok(Ly.lg_kva, "attn_kv_a_mqa", il);
+                deq_ok(Ly.lg_gate, "attn_gate", il);
+            }
+            deq_ok(Ly.out, "attn_output", il);
         } else if (g.ling) {   // (Ling: the projections batched, the MLA attention a row at a time - prefill_half)
             if (Ly.recr) {
                 deq_ok(Ly.q, "attn_q", il);
@@ -2026,6 +2059,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
     if (g.qwen35()) { Carve q; carve_q35(q, ts, g); carve_q4x(q, ts, g); uni = std::max(uni, q.off); }
     if (g.ling) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); Carve m; carve_ling_mla(m, ts, g); uni = std::max(uni, m.off); }
+    if (g.raon) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); Carve m; carve_raon_mla(m, ts, g); uni = std::max(uni, m.off); }
     if (has_dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, ts, g, max_pools) : (void) carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
@@ -4841,6 +4875,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             q35::mhc2_rows(S->R, S->R + E, 4 * E, E, T, y, op, S->comb + (size_t) 8 * T, k == 1,
                            k != 0 ? Ly.mhc_w[0] : nullptr, Ly.mhc_b[0], g.sinkhorn_iters, Ly.attn_norm, g.norm_eps, S->x,
                            S->x16, S->comb, s);
+        } else if (g.raon) {
+            // raon: the last FFN written into the 4 streams (its mHC post), then the attention's read (raon_fast_path.cu's
+            // order, a row at a time in one launch)
+            if (!raon_prompt_coef(T, err)) return false;
+            if (il > l0_) strata::kernels::raon::mhc_post(S->R, S->ffn, raon_pc_ + (size_t) 24 * T, E, s, T);
+            raon_prompt_read(il, 0, T, S->R, S->x, S->x16, s);
         } else if (g.qwen35()) {
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
@@ -4924,6 +4964,76 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (!skip_output) {
                     gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
                     hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
+                }
+            } else if (g.raon) {
+                // raon (raon_fast_path.cu's layers over the sub-batch's rows): the projections as GEMMs; an RDA layer's
+                // conv and recurrence batched (glm_batch's, the state carried across sub-batches; the write gate folded
+                // into v), an MLA layer's cache rows and its attention on tensor cores (raon_fast's, 40 heads in passes
+                // of 32; else a row at a time through the token path's kernels), the output products batched
+                namespace lk = strata::kernels::ling;
+                namespace rk = strata::kernels::raon;
+                const int H = g.n_head;
+                Carve c{S->uni};
+                if (Ly.recr) {
+                    KdaBufs B = carve_kda(c, (size_t) tn, g);
+                    hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
+                    hgemm_q(Ly.k, DI, E, x16, E, B.proj[1], DI, tn, 0.0f);
+                    hgemm_q(Ly.v, DI, E, x16, E, B.proj[2], DI, tn, 0.0f);
+                    hgemm_q(Ly.lg_g, DI, E, x16, E, B.g2, DI, tn, 0.0f);
+                    hgemm_q(Ly.lg_beta, H, E, x16, E, B.beta, H, tn, 0.0f);
+                    hgemm_q(Ly.rn_rda, H, E, x16, E, B.ga, H, tn, 0.0f);
+                    hgemm_q(Ly.rn_fa, 128, E, x16, E, B.fa, 128, tn, 0.0f);
+                    gb::f32_to_f16(B.fa, B.out16, (int64_t) tn * 128, s);   // (out16: free until the recurrence)
+                    hgemm_q(Ly.rn_fb, DI, 128, B.out16, 128, B.g1, DI, tn, 0.0f);
+                    S->mark("raon_rda_proj", s);
+                    const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
+                    float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
+                    gb::kda_conv(pr, Ly.conv, Ly.gdn_conv, cv, tn, DI, g.d_conv, s);
+                    gb::kda_conv_state(pr, Ly.gdn_conv, tn, DI, g.d_conv, s);
+                    rk::rda_ratio(B.conv[2], B.beta, B.ga, H, g.kda_head_dim, s, tn);
+                    gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
+                                Ly.gdn_state, B.g2, Ly.ssm_norm, g.norm_eps, H, tn, B.out16, s);
+                    S->mark("raon_rda_rec", s);
+                    if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                } else {
+                    RaonMlaBufs B = carve_raon_mla(c, (size_t) tn, g);
+                    const int QD = H * lk::kQHead, HV = H * lk::kV, QL = g.q_lora;
+                    hgemm_q(Ly.rn_qa, QL, E, x16, E, B.qa, QL, tn, 0.0f);
+                    hgemm_q(Ly.lg_kva, lk::kRow, E, x16, E, B.kv, lk::kRow, tn, 0.0f);
+                    hgemm_q(Ly.lg_gate, HV, E, x16, E, B.gate, HV, tn, 0.0f);
+                    rk::rms_rows_any(B.qa, Ly.rn_qan, g.raon_lat_eps, tn, QL, B.qa, B.qa16, s);
+                    hgemm_q(Ly.rn_qb, QD, QL, B.qa16, QL, B.q, QD, tn, 0.0f);
+                    S->mark("raon_mla_proj", s);
+                    const float scl = 1.0f / std::sqrt((float) lk::kQHead);
+                    rk::mla_cache_rows(B.kv, Ly.lg_kvn, g.raon_lat_eps, tn, Ly.kc + (size_t) (p0 + t0) * lk::kRow, s);
+                    static const bool pa_env = [] { const char* v = getenv("STRATA_RAON_PROMPT_ATTN"); return v == nullptr || std::atoi(v) != 0; }();
+                    if (pa_env && rk::prompt_attn_ok()) {
+                        // q_abs = k_b . q_nope per head (one batched product), the causal attention, o = v_b . ctx
+                        blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, lk::kLat, tn, lk::kNope, &one,
+                                                          Ly.lg_kb, lk::kNope, (long long) lk::kLat * lk::kNope, B.q, QD,
+                                                          lk::kQHead, &zero, B.qabs, H * lk::kLat, lk::kLat, H),
+                                "raon q_abs");
+                        rk::mla_prompt_attn(B.qabs, B.ctx, B.q, QD, Ly.kc, p0 + t0, tn, H, scl, s);
+                        blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, lk::kV, tn, lk::kLat, &one,
+                                                          Ly.lg_vb, lk::kLat, (long long) lk::kV * lk::kLat, B.ctx,
+                                                          H * lk::kLat, lk::kLat, &zero, B.o, HV, lk::kV, H),
+                                "raon mla out");
+                        rk::gate_rows(B.o, B.gate, (int64_t) tn * HV, s);
+                    } else
+                    for (int t = 0; t < tn; ++t) {
+                        if ((t & 255) == 255) progress_beat();
+                        const int64_t p = p0 + t0 + t;
+                        float* qt = B.q + (size_t) t * QD;
+                        lk::mla_absorb(qt, Ly.lg_kb, H, F->q35_q, s);
+                        lk::mla_attend(F->q35_q, qt, Ly.kc, p + 1, scl, H, raon_sc_, raon_part_, F->q35_ao, s);
+                        rk::mla_out_gated(F->q35_ao, Ly.lg_vb, B.gate + (size_t) t * HV, H, B.o + (size_t) t * HV, s);
+                    }
+                    S->mark("raon_mla_attend", s);
+                    if (lk::launch_errors() != 0 || rk::launch_errors() != 0) { err = "raon: a prompt kernel launch failed"; return false; }
+                    if (!skip_output) {
+                        gb::f32_to_f16(B.o, B.o16, (int64_t) tn * HV, s);
+                        hgemm_q(Ly.out, E, HV, B.o16, HV, mixer, E, tn, 0.0f);
+                    }
                 }
             } else if (g.ling) {
                 // Ling (ling_fast_path.cu's layers over the sub-batch's rows): the projections as GEMMs; a KDA layer's
@@ -5290,7 +5400,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_fn8, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm, S->pre, S->pre2);
         else if (g.q4x)
             q4_mix(il, 1, S->mixer, S->pre, S->post, false);
-        else if (g.loop && g.kind(il) != 0)   // (sensenova_loop: the attention's merge, the FFN's router)
+        else if (g.raon) {   // (raon: the attention's mHC post, the FFN's read)
+            strata::kernels::raon::mhc_post(S->R, S->mixer, raon_pc_, E, s, T);
+            raon_prompt_read(il, 1, T, S->R, S->x, S->x16, s);
+        } else if (g.loop && g.kind(il) != 0)   // (sensenova_loop: the attention's merge, the FFN's router)
             q35::mhc2_rows(S->R, S->R + E, 4 * E, E, T, S->mixer, 2, S->comb, false, Ly.mhc_w[1], Ly.mhc_b[1],
                            g.sinkhorn_iters, Ly.post_norm, g.norm_eps, S->x, S->x16, S->comb + (size_t) 8 * T, s);
         else if (g.qwen35()) {
@@ -5346,7 +5459,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         WSlot dffn[3] = {Ly.ffn_gate, Ly.ffn_up, Ly.ffn_down};
         const bool dram = !Ly.moe && q35d_prompt_ram(il);
         if (dram && !q35d_stage(il, s, dffn, err)) return false;
-        if (!Ly.moe && S->dq != nullptr && S->dq_gu != nullptr && !S->dq_off && int8_dense(dffn[0].type, g.n_ff_dense, E) &&
+        if (!Ly.moe && !g.raon && S->dq != nullptr && S->dq_gu != nullptr && !S->dq_off && int8_dense(dffn[0].type, g.n_ff_dense, E) &&
             int8_dense(dffn[1].type, g.n_ff_dense, E) && int8_dense(dffn[2].type, E, g.n_ff_dense)) {
             // the dense qwen35: gate and up (each its own type: one product a role, x quantized for each) into the
             // halves of the GU rows, the SwiGLU in place (h in each row's first n_ff floats), h as q8_1, down into
@@ -6082,12 +6195,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return v == nullptr || std::atoi(v) != 0;
         }();
         const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff) && !nvl && !Ly.mixed() && !g.ink &&
-                         !g.ling;   // (inkling: SITU apart; ling: the llama-form limits apart)
+                         !g.ling && !g.raon;   // (inkling, raon: SITU apart; ling: the llama-form limits apart)
         // the own GEMM, a product at a time: gate/up with the SwiGLU, down (each reads activations in its own form)
 #if defined(STRATA_MOE_OWN)
         // (inkling: its SITU in swiglu_rows - the split products, not the fused epilogue)
-        const bool own_gu = own_gate_up(Ly, g) && !g.ink && !g.ling, own_dn = own_down(Ly, g),
-                   own_split = own_gu_split(Ly, g) || (own_gate_up(Ly, g) && (g.ink || g.ling));
+        const bool own_gu = own_gate_up(Ly, g) && !g.ink && !g.ling && !g.raon, own_dn = own_down(Ly, g),
+                   own_split = own_gu_split(Ly, g) || (own_gate_up(Ly, g) && (g.ink || g.ling || g.raon));
         // STRATA_INK_FP4ACT=1 / 2 (opt-in, lossy; default 0 = the exact int8 path): inkling's NVFP4 experts with FP4
         // activations, one term / two (x ~ q1 + q2, the residual's term), on sm_120a's block-scaled FP4 tensor cores
         // (own::fp4_built: CUDA sm_120 only).  The row scales in Xs / Hs, the codes in Xq / Hq (their bytes fit).
@@ -7164,6 +7277,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (cpu_nrows > 0) gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, rows, M.pos, M.rw, T, K, E, S->ffn, s);
         }
         abl_out(il, 1, S->ffn, T, E, s);   // (the whole FFN: shared + routed + the CPU lane's rows)
+        if (g.raon && Ly.rn_steer != nullptr && raon_alpha_ != 0.0f)   // (raon: the reasoning-effort vector)
+            strata::kernels::raon::axpy(S->ffn, Ly.rn_steer, raon_alpha_, E, s, T);
         S->mark("combine", s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(ia), S->ffn, E);
@@ -7194,6 +7309,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
     }
     if (!tail_skip && g.q4x && l1_ < g.n_layers && kv_cut < 0) q4_mix(l1_ - 1, 0, S->ffn, S->post, nullptr, true);
+    // raon: the last FFN's mHC post - R's rows are the head's input (the prompt-path logits)
+    if (!tail_skip && g.raon && kv_cut < 0) strata::kernels::raon::mhc_post(S->R, S->ffn, raon_pc_ + (size_t) 24 * T, E, s, T);
     // the other qwen35 family on a split's earlier part (#55): the rows' residual takes the last FFN here - the next
     // part's first layer reads R as it is (one device adds it at the next layer's norm, the same float sum)
     if (g.qwen35() && !g.q4x && !g.ink && l1_ < g.n_layers && kv_cut < 0)
@@ -7414,7 +7531,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || (g_.memt && !g_.dsv4()) || g_.prism_block > 0) || split_next_ ||
+    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.raon || (g_.memt && !g_.dsv4()) || g_.prism_block > 0) || split_next_ ||
                            l0_ != 0 || l1_ != g_.n_layers)) {
         err = "prefill logits requires single-device DeepSeek V4.1, Inkling, Ling or MemT"; return false;
     }
@@ -7710,6 +7827,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
+                    else if (g.raon)   // (raon: the mean of the row's 4 streams, output_norm - the token path's head_prep)
+                        gf::head_prep(pf_->R + (size_t) t * 4 * E, w_.at("output_norm.weight"), g.norm_eps, E,
+                                      fast_->head_x, fast_->head_xq, fast_->cs);
                     else if (g.ling || (g.memt && !g.dsv4()) || g.prism_block > 0) {   // (ling, MemT's qwen35moe, the prism
                         // dense qwen35: R's row takes the last FFN, output_norm - the token path's head input)
                         gf::rms_q8(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, w_.at("output_norm.weight"),

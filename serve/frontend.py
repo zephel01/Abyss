@@ -122,6 +122,9 @@ class ChatTemplate:
         # Ling-3.x (Bailing V3): <role>HUMAN</role> turns; its processor writes a newline after each picture's
         # <|vision_end|> (BailingMM2Processor._expand_image_tokens), which the template itself does not
         self.ling = "<role>HUMAN</role>" in self.source and "<|role_end|>" in self.source
+        # KRAFTON Raon-1: a ChatML template that knows thinking on / off only (enable_thinking); the reasoning effort is
+        # the engine's - a steering vector's alpha per request (GEN effort=, raon_effort below), not prompt text
+        self.raon = "raon-1" in self.source and "<|im_start|>" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -158,6 +161,9 @@ class ChatTemplate:
                                           raw if raw in ok else level if level in ok else None)
             off = False   # (no think block to close: the effort level says it)
             messages = ink_tool_names(messages)
+        elif self.raon:   # (the effort goes to the engine: raon_effort; the template takes enable_thinking only)
+            kwargs.pop("effort_raw", None)
+            kwargs.pop("reasoning_effort", None)
         elif self.glm_effort:
             kwargs.pop("effort_raw", None)
             off = kwargs.pop("enable_thinking", True) is False
@@ -229,6 +235,24 @@ def effort_kwargs(value) -> dict:
     if key == "minimal":   # thinking off for every model but Inkling 2, whose template has its own "minimal" (0.1)
         return {"enable_thinking": False, "effort_raw": key}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level, "effort_raw": key}
+
+
+RAON_EFFORTS = ("low", "medium", "high", "xhigh", "max")   # raon1.reasoning_effort.names (alphas 0.3 .. 0)
+
+
+def raon_effort(kwargs: dict) -> str | None:
+    """Raon-1: the template kwargs' thinking level -> the engine's GEN effort= value (its steering alpha): thinking
+    off "none" (the model's 0.1), the client's own name when Raon has it (medium, xhigh), else the level (low / high /
+    max); None when nothing is asked (the engine's default, high).  The template still gets enable_thinking."""
+    if kwargs.get("enable_thinking") is False:
+        return "none"
+    raw = kwargs.get("effort_raw")
+    if isinstance(raw, str) and raw in RAON_EFFORTS:
+        return raw
+    if raw == "maximum":
+        return "max"
+    level = kwargs.get("reasoning_effort")
+    return level if level in RAON_EFFORTS else None
 
 
 def budget_effort(tokens) -> dict:

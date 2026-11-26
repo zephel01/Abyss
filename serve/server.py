@@ -55,7 +55,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, ContentGuard, Event,  # noqa: E402
                             INK_CALL, InklingCalls, ink_call_open,
                             OutputParser, reasoning_tail_calls, thinking_signature,
-                            anthropic_to_messages, effort_kwargs, effort_level, images_of, ja_system_prompt,
+                            anthropic_to_messages, effort_kwargs, effort_level, raon_effort, images_of, ja_system_prompt,
                             openai_to_messages,
                             v41_images_as_text)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -984,6 +984,11 @@ class StrataEngine:
         sa = sampling.get("_snap_at")
         if isinstance(sa, int) and not isinstance(sa, bool) and sa > 0:
             think += f" snap_at={sa}"
+        # Raon-1's reasoning effort (prepare): the engine's steering alpha for this request; the engine reads a
+        # conversation steered with another alpha again instead of reusing it
+        ef = sampling.get("_effort")
+        if isinstance(ef, str) and re.fullmatch(r"[a-z0-9.]{1,16}", ef):
+            think += f" effort={ef}"
         # the template's single-token tool-argument tags (GLM's <arg_value> </arg_value>), where the answer-loop guard
         # closes a looping argument; empty: this vocabulary has none (the engine's GLM ids are other tokens here)
         aid = sampling.get("_arg_ids")
@@ -2620,6 +2625,8 @@ class Service:
         # token earlier
         at = len(ids) - len(tail) - (1 if self.template.dsv4 else 0)
         given["_snap_at"] = at if tail and at > 1 and ids[-len(tail):] == tail else None
+        # Raon-1: the reasoning effort is the engine's steering alpha (GEN effort=), per request
+        given["_effort"] = raon_effort(kwargs) if getattr(self.template, "raon", False) else None
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def count_tokens(self, req: dict) -> dict:
@@ -3425,7 +3432,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill")}
         sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
-        sampling = {**sampling, "_snap_at": kw.get("_snap_at")}
+        sampling = {**sampling, "_snap_at": kw.get("_snap_at"), "_effort": kw.get("_effort")}
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4635,7 +4642,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
-            req = {**req, "_snap_at": kw.get("_snap_at"), "_memt": svc.memt_request(req, messages, kw)}
+            req = {**req, "_snap_at": kw.get("_snap_at"), "_effort": kw.get("_effort"),
+                   "_memt": svc.memt_request(req, messages, kw)}
             if kw.get("_no_calls"):
                 req = {**req, "_no_calls": True}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -4736,7 +4744,8 @@ def make_handler(svc: Service):
                 tools = kw["_parser_tools"]
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
-            req = {**req, "_snap_at": kw.get("_snap_at"), "_memt": svc.memt_request(req, messages, kw)}
+            req = {**req, "_snap_at": kw.get("_snap_at"), "_effort": kw.get("_effort"),
+                   "_memt": svc.memt_request(req, messages, kw)}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
