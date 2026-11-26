@@ -1237,7 +1237,7 @@ GPU 32 GB + RAM 96 GB 向けです（L97 と同じ）。メモリは Abyss 独�
 | --- | --- | ---: |
 | メモリのブロック（`memt-0000N-of-00002.safetensors`）と `config.json` | [MemTensor/MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash)、ファイルごと | 7.2 GB |
 | MemT のエキスパート以外の骨格（注意、共有エキスパート、ルーター、hyper-connection、埋め込み、ヘッド） | 同じリポジトリの 43 個のモデルの分割ファイルから、HTTP の範囲読み（44 回） | 14.7 GB |
-| 元の GGUF | [zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF) の `L97` フォルダ | 96.8 GB |
+| 元の GGUF | [zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF) の `L97` フォルダ | 96.8 GB |
 | trench-gguf の GPU 量子化（`gpuq/libgpuq_cuda.so`、v0.5.0 以降） | [zephel01/trench-gguf](https://github.com/zephel01/trench-gguf) | - |
 
 ```bash

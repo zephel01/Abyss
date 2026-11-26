@@ -1303,7 +1303,7 @@ non-expert backbone are needed - 21.9 GB of the 576 GB checkpoint:
 | --- | --- | ---: |
 | the memory blocks (`memt-0000N-of-00002.safetensors`) and `config.json` | [MemTensor/MemT-1.0-Flash](https://huggingface.co/MemTensor/MemT-1.0-Flash), whole files | 7.2 GB |
 | MemT's non-expert backbone (attention, shared experts, routers, hyper-connections, embeddings, head) | the same repo's 43 model shards, by HTTP range reads (44 reads) | 14.7 GB |
-| the base GGUF | [zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-32G96G-GGUF), folder `L97` | 96.8 GB |
+| the base GGUF | [zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4-Flash-0731-IQ2_M-32G96G-GGUF), folder `L97` | 96.8 GB |
 | trench-gguf's GPU quantizer (`gpuq/libgpuq_cuda.so`, v0.5.0 or later) | [zephel01/trench-gguf](https://github.com/zephel01/trench-gguf) | - |
 
 ```bash

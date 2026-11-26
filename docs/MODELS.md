@@ -123,6 +123,7 @@ Tencent's semantics gives the same top-1 on a short prompt (KL 0.0006-0.23 a pos
 | `Maya-S` / `Maya-M` / `Maya-L` (same repository) | 53.0 / 68.4 / 89.5 GB + the same table | not measured (same tensor types as Maya-XS) | not measured | more RAM |
 | `Q3_K_M` ([nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF); IQ4_NL Engram table inside the shards; v1.3.178) | 107.5 GB | nll 1.746 on the 459-token set, 3.910 on a Japanese 4K text (Maya-XS 4.167); Japanese facts 76 / 80 at temp 0.9 (2 seeds), 38 / 40 at temp 0 (Maya-XS 76 / 80, 40 / 40) | decode 40.5 tok/s (median of 3; 35% of its 63.8 GB of experts in VRAM, 264 experts a token on the CPU) | 32 GB GPU + 96 GB RAM |
 | `Q4_K_M` (same repository) | 127.2 GB | not measured | not measured | |
+| `32G96G` (ours: [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF); Q3_K experts on the 18 layers that matter most for Japanese, IQ2_XXS on the rest, IQ4_NL Engram table; v1.3.199) | 92.9 GB | Japanese long explanations 44 / 60 answers with every fact right, other Japanese questions 49 / 60 (temp 0.9, 2 seeds + temp 0); KL 0.567 on a 457-token mixed text (the model card) | decode 52.2 tok/s (v1.3.199, RAM tier 60 GB, median of 3: 52.4 / 52.2 / 51.2; 79-83% of experts in VRAM) | 32 GB GPU + 96 GB RAM, long Japanese answers |
 
 ### Inkling 2 Mini (beta, v1.3.183)
 
@@ -212,21 +213,23 @@ own 2-D rotary already places the patches, and the rule follows the HF code.
 
 MemTensor's MemT-1.0-Nano: Qwen3.6-35B-A3B (the qwen35moe path) with a memory block on each of its 10 full-attention
 layers; the memory is a 40 MiB state the model reads while it answers and writes at a turn's end. How to convert, pack
-and use the server's `memory` API: [MANUAL](MANUAL.md#memt-10-nano-native-memory-beta). No published GGUF; ours made with
-`tools/memt_convert.py` from the HF files. Quality: KL(reference || engine) against a float64 numpy forward written from
+and use the server's `memory` API: [MANUAL](MANUAL.md#memt-10-nano-native-memory-beta). Our `Q4_K_M` is published as
+[zephel01/MemT-1.0-Nano-Q4_K_M-GGUF](https://huggingface.co/zephel01/MemT-1.0-Nano-Q4_K_M-GGUF)
+(`./setup-deepseek.sh --model memt-nano`); made with `tools/memt_convert.py` from the HF files. Quality: KL(reference || engine) against a float64 numpy forward written from
 the HF code (`recipes/memt/ref_memt.py`). Speeds: RTX 5090, iGPU lane off, a 4K prompt + 512 tokens, median of 3.
 
 | file | size | quality | speed | use |
 | --- | ---: | --- | --- | --- |
 | `Q8_0` (`tools/memt_convert.py`, the memory blocks BF16 / F32) | 37.8 GB | backbone, memory off: a 49-token chat 0.0014 (token path) / 0.0078 (prompt path); a document's first 512 tokens 0.052 / 0.034. Memory read with the reference's state: 0.003 / 0.004, same top token 28 of 28 (without the memory 3.01, 37%). Memory written from 58 tokens: 0.8-2.8% relative error a layer, cosine >= 0.9994. Recall: 4 of 4 facts (CLI and server) | not measured | the closer file (checks); runs with the RAM tier like any MoE, speed not measured |
-| `Q4_K_M` (the per-tensor types of Ornith-1.5-35B-A3B's Q4_K_M, k-quants through trench-gguf's GPU quantizer) | 22.1 GB | backbone, memory off, the same 512 tokens: 0.194 (prompt path), same top token 88.3%. Recall through the server: 4 of 4 facts; a 62-token note written by `/documents`: 2 of 2 questions | decode 304.8 tok/s without a memory, 279.8 with one (-8.2%); the 4K prompt 8,802 -> 8,336 tok/s (-5.3%) (v1.3.205: with a memory on a token at a time; v1.3.204's 295.5 with one had drafts through windows that did not read the memory). Writing a 194-token turn 0.17 s. A memory 40 MiB (80 MiB on the GPU with the write copy) | measured on a 32 GB GPU; smaller GPUs not measured |
+| `Q4_K_M` (the per-tensor types of Ornith-1.5-35B-A3B's Q4_K_M, k-quants through trench-gguf's GPU quantizer) | 22.1 GB | backbone, memory off, the same 512 tokens: 0.194 (prompt path), same top token 88.3%. Recall through the server: 4 of 4 facts; a 62-token note written by `/documents`: 2 of 2 questions | decode 298.2 tok/s without a memory, 270.0 with one (-9%); the 4K prompt 8,847 -> 8,373 tok/s (v1.3.205, context 8192, a 58-token memory, as on the model card, which also lists 16 / 12 / 8 GB; with a memory a token at a time - v1.3.204's 295.5 with one had drafts through windows that did not read the memory). Writing a 194-token turn 0.17 s. A memory 40 MiB (80 MiB on the GPU with the write copy) | measured on a 32 GB GPU; smaller GPUs not measured |
 
 ### MemT-1.0-Flash (beta, v1.3.205)
 
 MemTensor's MemT-1.0-Flash: DeepSeek-V4-Flash-0731 post-trained with a memory block on each of its 20 CSA layers (the
 deepseek4 path); the memory is a 1.25 GiB state. How to build it over our V4 Flash 0731 `32G96G` L97, the downloads and the
-VRAM it takes: [MANUAL](MANUAL.md#memt-10-flash-native-memory-beta); the server's `memory` API is Nano's. No published
-GGUF. Quality: relative error against a float64 numpy forward written from the HF code with the same weights
+VRAM it takes: [MANUAL](MANUAL.md#memt-10-flash-native-memory-beta); the server's `memory` API is Nano's. The overlay is
+published as [zephel01/MemT-1.0-Flash-32G96G-GGUF](https://huggingface.co/zephel01/MemT-1.0-Flash-32G96G-GGUF)
+(`./setup-deepseek.sh --model memt-flash`, with the L97 shards). Quality: relative error against a float64 numpy forward written from the HF code with the same weights
 (`recipes/memt-flash/ref_block.py`). Speeds: RTX 5090 + 123 GB RAM, iGPU lane off, the default RAM tier and the learned
 pool files, a 4K prompt + 512 tokens, a warm-up then the median of 3.
 

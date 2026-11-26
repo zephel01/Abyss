@@ -120,6 +120,7 @@ numpy の参照と、短いプロンプトで top-1 が一致（位置ごとの 
 | `Maya-S` / `Maya-M` / `Maya-L`（同じリポジトリ） | 53.0 / 68.4 / 89.5 GB ＋ 同じ表 | 未計測（テンソルの型は Maya-XS と同じ） | 未計測 | RAM が多い PC |
 | `Q3_K_M`（[nace-ai/Hy4-flash-GGUF](https://huggingface.co/nace-ai/Hy4-flash-GGUF)。Engram の表は IQ4_NL で各ファイルの中。v1.3.178） | 107.5 GB | nll は 459 トークンの組で 1.746、日本語 4K の文で 3.910（Maya-XS 4.167）。日本語の事実問題は温度 0.9 で 80 中 76（seed 2 つ）、温度 0 で 40 中 38（Maya-XS は 76 / 80、40 / 40） | 生成 40.5 tok/s（3 回の中央値。エキスパート 63.8 GB のうち VRAM に 35%、1 トークンあたり 264 個を CPU で計算） | GPU 32 GB + RAM 96 GB |
 | `Q4_K_M`（同じリポジトリ） | 127.2 GB | 未計測 | 未計測 | |
+| `32G96G`（こちらのもの: [zephel01/Hy4-flash-32G96G-GGUF](https://huggingface.co/zephel01/Hy4-flash-32G96G-GGUF)。日本語に効く 18 層のエキスパートを Q3_K、ほかを IQ2_XXS、Engram の表は IQ4_NL。v1.3.199） | 92.9 GB | 日本語の長い説明で事実がすべて正しい答え 44 / 60、ほかの日本語の問い 49 / 60（temp 0.9 の 2 シード + temp 0）。457 トークンの混ざった文で KL 0.567（モデルカードの値） | 生成 52.2 tok/s（v1.3.199、RAM 段 60 GB、3 回の中央値: 52.4 / 52.2 / 51.2。エキスパートの 79〜83% が VRAM に当たる） | 32 GB の GPU + 96 GB の RAM、日本語の長い答え |
 
 ### Inkling 2 Mini（ベータ、v1.3.183）
 
@@ -206,20 +207,20 @@ forward で KL 0.006 で、エンジン自身の誤差と同じくらいの大�
 
 MemTensor の MemT-1.0-Nano。Qwen3.6-35B-A3B（qwen35moe の経路）の 10 層のフルアテンション層それぞれにメモリのブロックがあり、
 メモリは 40 MiB の状態です。モデルは答えるあいだこれを読み、ターンの終わりに書きます。変換・pack・サーバーの `memory` API の使い方は
-[MANUAL](MANUAL.ja.md#memt-10-nanoネイティブのメモリベータ)。公開の GGUF はなく、HF のファイルから `tools/memt_convert.py` で作ったもの。
+[MANUAL](MANUAL.ja.md#memt-10-nanoネイティブのメモリベータ)。こちらの `Q4_K_M` を [zephel01/MemT-1.0-Nano-Q4_K_M-GGUF](https://huggingface.co/zephel01/MemT-1.0-Nano-Q4_K_M-GGUF) で公開しています（`./setup-deepseek.sh --model memt-nano`）。HF のファイルから `tools/memt_convert.py` で作ったもの。
 品質: HF のコードから書いた float64 の numpy の forward（`recipes/memt/ref_memt.py`）に対する KL(基準 || エンジン)。速さ: RTX 5090、
 iGPU レーンなし、4K のプロンプト + 512 トークン、3 回の中央値。
 
 | ファイル | 大きさ | 品質 | 速さ | 向き |
 | --- | ---: | --- | --- | --- |
 | `Q8_0`（`tools/memt_convert.py`。メモリのブロックは BF16 / F32） | 37.8 GB | 骨格、メモリなし: 49 トークンのチャット 0.0014（トークン経路）/ 0.0078（プロンプト経路）、文書の先頭 512 トークン 0.052 / 0.034。基準の状態を読む: 0.003 / 0.004、上位 1 位は 28 位置すべて一致（メモリなしでは 3.01、37%）。58 トークンからの書き: 層ごとの相対誤差 0.8〜2.8%、cos 0.9994 以上。思い出し: 4 点すべて（CLI とサーバー） | 未計測 | 基準に近いほう（確認用）。ほかの MoE と同じく RAM の段を使って動くが、速さは未計測 |
-| `Q4_K_M`（テンソルごとの型は Ornith-1.5-35B-A3B の Q4_K_M と同じ。k-quant は trench-gguf の GPU 量子化） | 22.1 GB | 骨格、メモリなし、同じ 512 トークン: 0.194（プロンプト経路）、一致 88.3%。サーバーでの思い出し: 4 点すべて。`/documents` で書いた 62 トークンのメモ: 2 問とも正解 | 生成はメモリなし 304.8 tok/s、あり 279.8（−8.2%）。4K のプロンプト 8,802 → 8,336 tok/s（−5.3%）（v1.3.205: メモリありは 1 トークンずつ。v1.3.204 のあり 295.5 はメモリを読まない窓を通る下書きありの値）。194 トークンのターンを書くのに 0.17 秒。メモリ 1 つ 40 MiB（GPU では書き用と合わせて 80 MiB） | 32 GB の GPU で計測。小さい GPU は未計測 |
+| `Q4_K_M`（テンソルごとの型は Ornith-1.5-35B-A3B の Q4_K_M と同じ。k-quant は trench-gguf の GPU 量子化） | 22.1 GB | 骨格、メモリなし、同じ 512 トークン: 0.194（プロンプト経路）、一致 88.3%。サーバーでの思い出し: 4 点すべて。`/documents` で書いた 62 トークンのメモ: 2 問とも正解 | 生成はメモリなし 298.2 tok/s、あり 270.0（−9%）。4K のプロンプト 8,847 → 8,373 tok/s（v1.3.205、文脈 8192、58 トークンのメモリ。モデルカードと同じ値で、カードには 16 / 12 / 8 GB も載せています。メモリありは 1 トークンずつ。v1.3.204 のあり 295.5 はメモリを読まない窓を通る下書きありの値）。194 トークンのターンを書くのに 0.17 秒。メモリ 1 つ 40 MiB（GPU では書き用と合わせて 80 MiB） | 32 GB の GPU で計測。小さい GPU は未計測 |
 
 ### MemT-1.0-Flash（ベータ、v1.3.205）
 
 MemTensor の MemT-1.0-Flash。DeepSeek-V4-Flash-0731 を、20 層の CSA 層それぞれにメモリのブロックを付けて追加学習したもの（deepseek4 の経路）。
 メモリは 1.25 GiB の状態です。私たちの V4 Flash 0731 `32G96G` L97 の上に作る手順、ダウンロード、使う VRAM は
-[MANUAL](MANUAL.ja.md#memt-10-flashネイティブのメモリベータ)。サーバーの `memory` API は Nano と同じ。公開の GGUF はありません。
+[MANUAL](MANUAL.ja.md#memt-10-flashネイティブのメモリベータ)。サーバーの `memory` API は Nano と同じ。上に重ねる分を [zephel01/MemT-1.0-Flash-32G96G-GGUF](https://huggingface.co/zephel01/MemT-1.0-Flash-32G96G-GGUF) で公開しています（`./setup-deepseek.sh --model memt-flash`、L97 のシャードと一緒に使う）。
 品質: 同じ重みで HF のコードから書いた float64 の numpy の forward（`recipes/memt-flash/ref_block.py`）に対する相対誤差。速さ: RTX 5090 + RAM 123 GB、
 iGPU レーンなし、RAM の段は既定、学習したプールのファイルあり、4K のプロンプト + 512 トークン、1 回温めてから 3 回の中央値。
 
