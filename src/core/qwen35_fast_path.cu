@@ -301,8 +301,10 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
     const size_t HE = (size_t) g.hc * E, LR = (size_t) g.hc_lr;
     if (g.loop) bytes += al(E * 4) + 2 * al(64);   // (sensenova_loop: the second stream, the routers' gates)
-    if (g.q4x)   // the hyper-connections' activations
-        bytes += al(HE * 4) + al(HE / 32 * 36) + al(LR * 4) + al(LR / 32 * 36) + al(HE * 4) + 2 * al(64);
+    // the hyper-connections' activations: q4_sc and the two inject rows are 3 x 64 bytes (#66: 2 x 64 left q4_inj[1]
+    // at the arena's end - every token's inject block wrote its 4 floats past the allocation, compute-sanitizer)
+    if (g.q4x)
+        bytes += al(HE * 4) + al(HE / 32 * 36) + al(LR * 4) + al(LR / 32 * 36) + al(HE * 4) + 3 * al(64);
     const bool mtp = mtp_il_ >= 0;
     if (mtp)   // the drafter: the pending hidden, <= kVerifyMax rows of scratch, the chain's tokens and confidences
         bytes += al(E * 4) + al(TM * E * 4) * 3 + al(TM * (E / 32) * 36) + al(TM * (2 * E / 32) * 36) + al(TM * KV * 4) * 2 +
