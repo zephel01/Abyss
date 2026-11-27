@@ -139,7 +139,7 @@ RTX 3090（全部 VRAM）: decode 104 / 114 tok/s、同じプロンプト 1,700�
 
 Ling-3.2-air（inclusionAI、`bailingmoe3`。この版からベータ。[数字](MODELS.ja.md#ling-32-airベータv13201)）:
 bartowski が公開している Q4_K_M（3 分割、80.4 GB）をそのまま pack する。GPU 24〜32 GB + RAM 64〜96 GB 向け。
-画像も読める（NVIDIA。セットアップが聞く。[画像](SETTINGS.ja.md#ling-32-air-の画像)）。MTP の下書き役はまだ無い。会話スロットは Qwen3.8 と同じ（`STRATA_GLM_SLOTS`）。設定にはモデルのサンプリング（temperature 1.0、top-p 0.95、
+画像も読める（NVIDIA。セットアップが聞く。[画像](SETTINGS.ja.md#ling-32-air-の画像)）。MTP ブロックで下書きもできる（オプトイン、`STRATA_LING_MTP`、v1.3.204）。会話スロットは Qwen3.8 と同じ（`STRATA_GLM_SLOTS`）。設定にはモデルのサンプリング（temperature 1.0、top-p 0.95、
 top-k 20）が入る。RTX 5090 + RAM 123 GB: 4K のプロンプト 2,061 tok/s、decode 142.8 tok/s。16K では 3,092 / 120.7。
 
 サーバーでは、いちばん最初の起動直後の回答が遅めになる。チャット 8 回（英語 / 日本語 / コード、thinking あり、
