@@ -7,6 +7,29 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.218 - 2026-11-28
+
+Tencent's Hy-MT3-30B-A3B (a translation model, GGUF arch `hy_v3`) runs, as a beta. Other models' outputs do not change.
+
+### Added
+
+- Hy-MT3-30B-A3B (`--model hymt3`: Tencent's Q4_K_M 19.5 GB or Q8_0 32.8 GB; NVIDIA, one GPU, text only). GQA
+  attention with q/k norms before the RoPE, 128 experts top-8 with a sigmoid router and selection bias, an ungated BF16
+  shared expert, the first layer dense. The server uses the GGUF's template with thinking off (a request with no
+  reasoning level is no_think) and stops at `<eos:6124c78e>`; sampling temperature 0.7, top_p 1.0 (the card's).
+  - RTX 5090, Q4_K_M, a 4K prompt + 512 tokens, median of 3: decode 175.6 tok/s all in VRAM, 133.0 with
+    `STRATA_GLM_VRAM_GB=12`; the 4K prompt ~10,000 / ~3,590 tok/s.
+  - The first 16 greedy tokens of ja->en, en->ja and zh->ja translations match a float64 forward of the Hugging Face
+    math on the GGUF weights; Q4_K_M and Q8_0 give the same translations. KL of Q4_K_M against Q8_0 over 3,071 tokens:
+    en 0.041, ja 0.047, zh 0.037 (same top token 91.6-92.7%).
+
+### Fixed
+
+- The verify / window path gave a BF16 shared expert's down projection a q8_1 input (an illegal memory access after
+  ~20 tokens); it takes the token path's float-input GEMV now. Only BF16 shared experts take that path.
+- Conversation reuse: a model with nothing to snapshot (0 bytes) left the snapshot buffer null and never reused a
+  conversation; it allocates at least 64 bytes now. Models with a snapshot of 64 bytes or more allocate as before.
+
 ## v1.3.217 - 2026-11-27
 
 A Qwen3.8 out-of-bounds write is fixed, and HIP's expert warm-up error says what to try. Outputs do not change.
