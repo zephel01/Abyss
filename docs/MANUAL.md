@@ -140,6 +140,16 @@ tok/s; RTX 3090 (all in VRAM): decode 104 / 114 tok/s, the same prompt 1,700-1,9
 ./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G (11.6 GB)
 ```
 
+Inkling 2 Mini on an 8-16 GB GPU (from v1.3.214): `--quant UD-IQ3_XXS` sets up unsloth's 11.7 GB file. RTX 5090, a 4K
+prompt + 512 tokens, median of 3, all in VRAM: decode 206.5 tok/s; KL 0.0270 against Abyss's run of the ggml-org Q8_0
+(Japanese 0.0283; UD-Q4_K_XL 0.0058), Japanese facts 589 of 666 (UD-Q4_K_XL 593). ISTA-DASLab's GSQ-RCO IQ3_S
+(11.4 GB, [repo](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF)) packs too (`tools/iq_pack.py`) but is
+not offered: in the same runs decode 187.5 tok/s, KL 0.0404 (Japanese 0.0456), Japanese facts 558:
+
+```sh
+./setup-deepseek.sh --model inkling2mini --quant UD-IQ3_XXS --download-model   # Inkling-2-Mini-UD-IQ3_XXS (11.7 GB)
+```
+
 Ling-3.2-air (inclusionAI, `bailingmoe3`, beta from this version; [the numbers](MODELS.md#ling-32-air-beta-v13201)):
 bartowski's public Q4_K_M (3 shards, 80.4 GB), packed as it is, for a 24-32 GB GPU + 64-96 GB RAM. It reads images (NVIDIA; the setup asks, see
 [images](SETTINGS.md#images-on-ling-32-air)); its MTP block can draft (opt-in, `STRATA_LING_MTP`, v1.3.204); conversation slots as on Qwen3.8 (`STRATA_GLM_SLOTS`). The config takes the model's sampling (temperature 1.0, top-p 0.95, top-k

@@ -11,7 +11,8 @@
     ./setup-deepseek.sh --model ornith35     Ornith-1.5-35B-A3B, the official Q4_K_M for an 8-16 GB GPU + 32 GB RAM
     ./setup-deepseek.sh --model laguna       Laguna-S-2.1 (poolside, 118B-A8B), unsloth's UD-IQ4_XS for a 16-32 GB GPU + 64 GB RAM
     ./setup-deepseek.sh --model inkling2mini  Inkling 2 Mini (Thinking Machines, 128x1.8B looped MoE), unsloth's UD-Q4_K_XL
-                                             for a 12-32 GB GPU + 32 GB RAM (text only)
+                                             for a 12-32 GB GPU + 32 GB RAM (--quant UD-IQ3_XXS: the 11.7 GB file for an
+                                             8-16 GB GPU; text only)
     ./setup-deepseek.sh --model inkling2mini-abl  the same model abliterated, orcarouter's Mix-16G (--quant Mix-12G: the
                                              11.6 GB file) for a 12-24 GB GPU + 32 GB RAM (text only)
     ./setup-deepseek.sh --model ling32air   Ling-3.2-air (inclusionAI, 512 experts, KDA + MLA; BETA, images too), bartowski's
@@ -232,9 +233,11 @@ MODELS = {
     # Mainline_Support copy / ggml-org's; the engine reads both): unsloth's GGUFs, one file a quant at the repo's top
     # level.  17.6 GB at UD-Q4_K_XL (NVFP4 experts): all in VRAM on a 24-32 GB GPU, a 12-16 GB GPU + 32 GB RAM holds
     # the rest in the RAM tier.  Text only; no drafter in the file; the prompt runs token by token for now
-    "inkling2mini": {"repo": "unsloth/Inkling-2-Mini-GGUF", "quant": "UD-Q4_K_XL", "quants": ("UD-Q4_K_XL",),
+    "inkling2mini": {"repo": "unsloth/Inkling-2-Mini-GGUF", "quant": "UD-Q4_K_XL",
+                     "quants": ("UD-Q4_K_XL", "UD-IQ3_XXS"),
                      "folder": "", "prefix_tmpl": "Inkling-2-Mini-{q}.", "model_name": "inkling-2-mini",
-                     "prefix": "inkling2mini", "title": "Inkling 2 Mini", "env": {}, "gb": 18, "pack_args": [],
+                     "prefix": "inkling2mini", "title": "Inkling 2 Mini", "env": {}, "gb": 18,
+                     "gb_by_quant": {"UD-IQ3_XXS": 12}, "pack_args": [],
                      "sampling": {"temperature": 1.0, "top_k": 50}},
     # Inkling 2 Mini abliterated (orcarouter, 2026-11-24): the same inkling2_loop layout with mixed stock llama.cpp types
     # (Mix-16G: NVFP4 / IQ4_XS / Q5_K gate_up over IQ4_NL / Q5_1 down; Mix-12G: IQ2_XXS..IQ3_S gate_up over IQ4_NL down),
@@ -1412,10 +1415,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Set up DeepSeek V4 Flash / V4.1 Flash 1017 on Abyss")
     ap.add_argument("--model", choices=tuple(MODELS), default="v4", help="v4: DeepSeek V4 Flash 0731 (unsloth's GGUF, "
                     "the default); v41: DeepSeek V4.1 Flash 1017 (zephel01's LDLQ GGUF for a 32 GB GPU + 96 GB RAM, BETA); "
-                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, or IQ3_XS for a 24 GB GPU + 64 GB RAM; BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM), memt-flash: MemT-1.0-Flash (native memory, BETA, NVIDIA only: zephel01's overlay over the v4 32G96G L97 shards, which it sets up too, a 32 GB GPU + 96 GB RAM), memt-nano: MemT-1.0-Nano (native memory, BETA, NVIDIA only: zephel01's Q4_K_M, an 8-32 GB GPU), hy4: Hy4-flash (BETA, NVIDIA only, text only: zephel01's 32G96G, a 32 GB GPU + 96 GB RAM), raon: Raon-1 mini (BETA, NVIDIA only, text only: KRAFTON's Q4_K_M, an 8-32 GB GPU); "
+                    "ornith: Ornith-1.5-122B, ornith35: Ornith-1.5-35B-A3B (the official Q4_K_M, for an 8-16 GB GPU), laguna: Laguna-S-2.1 (unsloth's UD-IQ4_XS, a 16-32 GB GPU + 64 GB RAM), inkling2mini: Inkling 2 Mini (unsloth's UD-Q4_K_XL, a 12-32 GB GPU + 32 GB RAM, or UD-IQ3_XXS for an 8-16 GB GPU; text only), inkling2mini-abl: the same abliterated (orcarouter's Mix-16G, a 16-24 GB GPU), ling32air: Ling-3.2-air (bartowski's Q4_K_M, a 24-32 GB GPU + 64-96 GB RAM, or IQ3_XS for a 24 GB GPU + 64 GB RAM; BETA, images too), qwen38-27b: Qwen3.8-27B (unsloth's UD-Q4_K_XL, an 8 GB+ GPU, the FFN partly in RAM under 20 GB), bonsai27b: Ternary Bonsai 2.5 27B (prism-ml's PTQ1_0, an 8 GB+ GPU, text only, BETA), qwen35-9b-qsa: Qwen3.5-9B QSA (zephel01's Q4_K_M, an 11 GB+ GPU, text only), ornith-9b-qsa: Ornith-1.5-9B QSA (the same, text only), mimo-9b: MiMo-V2.6-Distill-Qwen-9B (bartowski's Q4_K_M, an 11 GB+ GPU, text only), mimo-9b-qsa: the same with a QSA indexer (zephel01's), sensenova-loop-9b: SenseNova-Loop-9B (guideboardlabs' Q4_K_M, a 10 GB+ GPU, text only), qwen35: Qwen3.5-122B-A10B (zephel01's IQ3_XXS for a 16 GB GPU + 64 GB RAM), memt-flash: MemT-1.0-Flash (native memory, BETA, NVIDIA only: zephel01's overlay over the v4 32G96G L97 shards, which it sets up too, a 32 GB GPU + 96 GB RAM), memt-nano: MemT-1.0-Nano (native memory, BETA, NVIDIA only: zephel01's Q4_K_M, an 8-32 GB GPU), hy4: Hy4-flash (BETA, NVIDIA only, text only: zephel01's 32G96G, a 32 GB GPU + 96 GB RAM), raon: Raon-1 mini (BETA, NVIDIA only, text only: KRAFTON's Q4_K_M, an 8-32 GB GPU); "
                     "qwen38: Qwen3.8-Flash-Next, glm: GLM-5.3-Flash (zephel01's GGUFs, --quant picks the PC size)")
     ap.add_argument("--quant", help="v4: a folder of " + REPO + " (default UD-Q2_K_XL, the tested one), or zephel01's 16G64G / 32G64G / 32G96G; v41: 132G "
-                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M (default) or IQ3_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G; memt-flash: 32G96G; memt-nano: Q4_K_M; hy4: 32G96G; raon: Q4_K_M.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
+                    "(default, speed) or 139G (quality); ornith: IQ3_XXS-B, 24G64G, 32G128G (Ornith-1.5-397B) or 16G64G (Ornith-1.5-397B on a 16 GB GPU); ornith35: Q4_K_M (default), Q5_K_M, Q6_K or Q8_0; laguna: UD-IQ4_XS; inkling2mini: UD-Q4_K_XL (default) or UD-IQ3_XXS; inkling2mini-abl: Mix-16G (default) or Mix-12G; ling32air: Q4_K_M (default) or IQ3_XS; qwen38-27b: any file of unsloth/Qwen3.8-27B-GGUF (UD-IQ1_S .. UD-Q8_K_XL, Q4_0, Q4_1, Q8_0, BF16; default UD-Q4_K_XL); bonsai27b: PTQ1_0 (default, with the MTP block) or Q2_0; qwen35-9b-qsa / ornith-9b-qsa / mimo-9b / mimo-9b-qsa: Q4_K_M (default) or Q8_0; sensenova-loop-9b: Q4_K_M (default), Q3_K_M, Q4_0 or Q8_0; qwen38: 12G32G, 16G64G or 24G64G; glm: 32G96G or 32G128G; memt-flash: 32G96G; memt-nano: Q4_K_M; hy4: 32G96G; raon: Q4_K_M.  Without it, the PC-size file that suits this PC's VRAM + RAM is "
                     "proposed (and taken with --yes; a file set up before is kept); v4 keeps UD-Q2_K_XL and names the one that suits")
     ap.add_argument("--name", help="the model's name in abyss-<name>.json / run-abyss-<name>.sh (default dsv4-<quant>, "
                                    "dsv41-<quant>)")
@@ -1528,7 +1531,8 @@ def main() -> int:
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: a 16 GB GPU + 64 GB RAM holds every expert; "
              "less reads from the SSD)")
     elif a.model in ("inkling2mini", "inkling2mini-abl"):
-        gb = {"Mix-12G": 12}.get(quant, model["gb"])   # (the abliterated Mix-12G: 11.6 GB, all in VRAM on a 16 GB GPU)
+        # (the abliterated Mix-12G: 11.6 GB and UD-IQ3_XXS: 11.7 GB, all in VRAM on a 16 GB GPU)
+        gb = {"Mix-12G": 12}.get(quant, (model.get("gb_by_quant") or {}).get(quant, model["gb"]))
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{gb} GB: all in VRAM on a {16 if gb < 17 else 24}-32 GB GPU; "
              "a 12-16 GB GPU + 32 GB RAM holds the rest in RAM)")
     elif a.model == "ling32air":

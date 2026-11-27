@@ -137,6 +137,16 @@ RTX 3090（全部 VRAM）: decode 104 / 114 tok/s、同じプロンプト 1,700�
 ./setup-deepseek.sh --model inkling2mini-abl --quant Mix-12G --download-model  # Mix-12G（11.6 GB）
 ```
 
+8〜16 GB の GPU で Inkling 2 Mini（v1.3.214 から）: `--quant UD-IQ3_XXS` で unsloth の 11.7 GB のファイルを設定する。RTX 5090、
+4K のプロンプトのあと 512 トークン、3 回の中央値、全部 VRAM: decode 206.5 tok/s。Abyss で動かした ggml-org の Q8_0 に対する
+KL 0.0270（日本語 0.0283。UD-Q4_K_XL は 0.0058）、日本語の事実 666 問中 589（UD-Q4_K_XL は 593）。ISTA-DASLab の GSQ-RCO
+IQ3_S（11.4 GB、[repo](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF)）も pack できる（`tools/iq_pack.py`）が、
+setup では出さない。同じ測り方で decode 187.5 tok/s、KL 0.0404（日本語 0.0456）、日本語の事実 558:
+
+```sh
+./setup-deepseek.sh --model inkling2mini --quant UD-IQ3_XXS --download-model   # Inkling-2-Mini-UD-IQ3_XXS（11.7 GB）
+```
+
 Ling-3.2-air（inclusionAI、`bailingmoe3`。この版からベータ。[数字](MODELS.ja.md#ling-32-airベータv13201)）:
 bartowski が公開している Q4_K_M（3 分割、80.4 GB）をそのまま pack する。GPU 24〜32 GB + RAM 64〜96 GB 向け。
 画像も読める（NVIDIA。セットアップが聞く。[画像](SETTINGS.ja.md#ling-32-air-の画像)）。MTP ブロックで下書きもできる（オプトイン、`STRATA_LING_MTP`、v1.3.204）。会話スロットは Qwen3.8 と同じ（`STRATA_GLM_SLOTS`）。設定にはモデルのサンプリング（temperature 1.0、top-p 0.95、

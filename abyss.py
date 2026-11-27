@@ -3299,8 +3299,10 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
     if quality and "kl" in quality and quality["verdict"] == "slightly off":
         # issue #15: a smaller GPU leaves more experts to the CPU lane, which rounds differently from the GPU (GLM on
         # 16 GB here: KL 0.000 -> 0.025) - expected, not a fault
-        lines.append("  slightly off is expected when the CPU lane computes many experts (a GPU of 16 GB or less): it "
-                     "rounds differently from the GPU the reference ran on")
+        # (#64: an R9700 with the iGPU lane on, 38% of a token on the lane - KL 0.0225)
+        lines.append("  slightly off is expected when many experts are computed off the GPU the reference ran on - the "
+                     "CPU lane (a GPU of 16 GB or less), the iGPU lane, or another GPU make (AMD): they round "
+                     "differently")
     if quality and "kl" in quality and quality["verdict"] == "OFF":
         lines.append("  a large KL means this PC computes something the known-good run did not - please report it")
     if quality and quality.get("beta"):
