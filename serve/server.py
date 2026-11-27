@@ -95,8 +95,9 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
-LING_END = "<|role_end|>"
-HYMT_END = "<eos:6124c78e>"   # (Tencent Hy-MT3: the template's eos_token, which ends an assistant turn)   # (Ling-3.x: the Bailing V3 template's turn end)
+LING_END = "<|role_end|>"   # (Ling-3.x: the Bailing V3 template's turn end)
+HYMT_END = "<eos:6124c78e>"   # (Tencent Hy-MT3: the template's eos_token, which ends an assistant turn)
+GIGA_END = "<|message_sep|>\n\n"   # (GigaChat4: chatml v5's message end, one special token)
 LING_IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"   # (Ling-3.x: a picture in the template, before expansion)
 # elastic KV's engine lines (glm_elastic.cu): the split at start, and each time the KV grows
 ELASTIC_START = re.compile(r"glm elastic: ((?:CUDA|HIP)\d+) KV on demand: \d+ caches, ([\d.]+) GB reserved for (\d+) tokens, "
@@ -2085,10 +2086,10 @@ class Service:
                             # (Ling-3.x, Bailing V3 template: a turn ends with <|role_end|>, also its EOS)
                             _special_ids(LING_END) +
                             # (Hy-MT3: a turn ends with its EOS, <eos:6124c78e>)
-                            _special_ids(HYMT_END))
+                            _special_ids(HYMT_END) + _special_ids(GIGA_END))
         # (as the engine gets them: the template's turn end first - the answer-loop guard ends a turn with it)
         turn_end = (_special_ids(IM_END) + _special_ids("</assistant>") + _special_ids(HY4_END) +
-                    _special_ids(LING_END) + _special_ids(HYMT_END))[:1]
+                    _special_ids(LING_END) + _special_ids(HYMT_END) + _special_ids(GIGA_END))[:1]
         self.stop_order = turn_end + sorted(self.stop_ids - set(turn_end))
         # the tool call's argument tags as one token each (GLM-5.3), else none: the engine's loop guard closes a looping
         # argument with the second (GEN key arg_ids=)

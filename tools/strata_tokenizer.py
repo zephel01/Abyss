@@ -134,6 +134,11 @@ RAON_PATTERNS = (
 )
 
 
+# The `gigachat4` pre-tokenizer (ai-sage GigaChat4): its tokenizer.json's Split regex is GPT-4o's expression character
+# for character (GPT4O_PATTERNS), then ByteLevel without its own regex; no normalizer, ignore_merges false
+GIGACHAT4_PATTERNS = GPT4O_PATTERNS
+
+
 def split_sequential(text: str, pats) -> list[str]:
     pieces = [text]
     for pat in pats:
@@ -163,9 +168,10 @@ class Tokenizer:
             pre = self.pre = "bailingmoe2"
         if pre == "hunyuan-dense":   # (Tencent Hy-MT3: llama-vocab.cpp gives it hy_v4's three expressions, no clean_spaces)
             pre = self.pre = "hy_v4"
-        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2", "raon"):
+        if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2", "raon",
+                       "gigachat4"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
-                             "hy_v4, inkling2, bailingmoe2, raon" % pre)
+                             "hy_v4, inkling2, bailingmoe2, raon, gigachat4" % pre)
         self.nfc = pre == "raon"   # (its tokenizer.json's NFC normalizer, on the text between special tokens)
         # glm4/glm5 and inkling2 set ignore_merges: an exact vocab hit emits the whole pre-token piece (Inkling 2's
         # tokenizer.json sets it; its o200k vocabulary has entries the merges cannot build - chffff, Aleksandr, VBORw)
@@ -191,7 +197,7 @@ class Tokenizer:
         # (hy_v4, Tencent Hy4-flash: the same three expressions - its tokenizer.json lists them in this order)
         seq = (JOYAI_PATTERNS if pre in ("joyai-llm", "hy_v4") else LAGUNA_PATTERNS if pre == "laguna"
                else GPT4O_PATTERNS if pre == "inkling2" else BAILINGMOE_PATTERNS if pre == "bailingmoe2"
-               else RAON_PATTERNS if pre == "raon" else None)
+               else RAON_PATTERNS if pre == "raon" else GIGACHAT4_PATTERNS if pre == "gigachat4" else None)
         self._seq = [regex.compile(x) for x in seq] if seq else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
@@ -457,13 +463,16 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": (GLM_PATTERN if tk.pre in ("glm4", "glm5") else list(JOYAI_PATTERNS) if tk.pre in ("joyai-llm", "hy_v4")
                         else list(LAGUNA_PATTERNS) if tk.pre == "laguna" else list(GPT4O_PATTERNS) if tk.pre == "inkling2"
                         else list(BAILINGMOE_PATTERNS) if tk.pre == "bailingmoe2"
-                        else list(RAON_PATTERNS) if tk.pre == "raon" else QWEN35_PATTERN),
+                        else list(RAON_PATTERNS) if tk.pre == "raon"
+                        else list(GIGACHAT4_PATTERNS) if tk.pre == "gigachat4" else QWEN35_PATTERN),
         "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.pre in ("glm4", "glm5") else
                                "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (inkling2; its tokenizer.json sets "
                                "ignore_merges)" if tk.pre == "inkling2" else
                                "llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_BAILINGMOE (bailingmoe2)" if tk.pre == "bailingmoe2" else
                                "Raon-1's tokenizer.json Split regex, NFC first (raon)" if tk.pre == "raon" else
+                               "GigaChat4's tokenizer.json Split regex (= GPT-4o's; ignore_merges false)"
+                               if tk.pre == "gigachat4" else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")

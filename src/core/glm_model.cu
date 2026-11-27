@@ -604,6 +604,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
         return from_gguf_inkling(g, out, err) && eog_from_gguf(g, out);
     if (g.get("bailingmoe3.block_count")) return from_gguf_ling(g, out, err) && eog_from_gguf(g, out);
     if (g.get("raon1.block_count")) return from_gguf_raon(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("gigachat4.block_count")) return from_gguf_giga(g, out, err) && eog_from_gguf(g, out);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -1562,6 +1563,108 @@ bool Glm5Geometry::from_gguf_raon(const strata::GgufFile& g, Glm5Geometry& out, 
     return true;
 }
 
+// gigachat4 (ai-sage GigaChat4-37B-A4B): the GGUF's gigachat4.* keys, GigaChat4-37B-A4B's values as defaults; the
+// qwen35moe path (arch 2) with giga set - the delta-net state / conv rows the GDN layers' (qwen35's own shapes), the KV
+// rows the MLA cache rows (576 FP16, one KV head).  The NextN block (nextn_predict_layers) counts in block_count
+bool Glm5Geometry::from_gguf_giga(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "gigachat4.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    const int block_count = (int) num("block_count", 33);
+    const int nextn = (int) num("nextn_predict_layers", 0);
+    out.arch = 2;
+    out.giga = true;
+    out.hc = 1;
+    out.n_embd = (int) num("embedding_length", 2560);
+    out.n_layers = block_count - nextn;
+    out.nextn = 0;   // (the NextN block: not served yet - the pack drops it)
+    out.n_head = (int) num("attention.head_count", 32);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+    out.giga_rank = (int) num("norm_gate_rank", 16);
+    out.kv_lora = (int) num("attention.kv_lora_rank", 512);
+    out.q_lora = (int) num("attention.q_lora_rank", 1536);
+    const int k_mla = (int) num("attention.key_length_mla", 192);
+    out.ling_v = (int) num("attention.value_length_mla", 128);
+    out.ling_rope = (int) num("rope.dimension_count", 64);
+    out.ling_qk_nope = k_mla - out.ling_rope;
+    out.n_rot = out.ling_rope;
+    out.rope_base = (float) num("rope.freq_base", 100000.0);
+    out.yarn_factor = (float) num("rope.scaling.factor", 1.0);
+    out.yarn_orig_ctx = (int) num("rope.scaling.original_context_length", 32768);
+    out.yarn_beta_fast = (float) num("rope.scaling.yarn_beta_fast", 32.0);
+    out.yarn_beta_slow = (float) num("rope.scaling.yarn_beta_slow", 1.0);
+    out.yarn_log_mul = (float) num("rope.scaling.yarn_log_multiplier", 0.1);
+    out.idx_heads = (int) num("attention.indexer.head_count", 64);
+    out.idx_key = (int) num("attention.indexer.key_length", 128);
+    out.idx_top_k = (int) num("attention.indexer.top_k", 2048);
+    out.ssm_state = (int) num("ssm.state_size", 128);
+    out.ssm_k_heads = (int) num("ssm.group_count", 16);
+    out.ssm_v_heads = (int) num("ssm.time_step_rank", 32);
+    out.ssm_inner = (int) num("ssm.inner_size", 4096);
+    out.d_conv = (int) num("ssm.conv_kernel", 4);
+    out.kda_head_dim = out.ssm_state;
+    out.n_expert = (int) num("expert_count", 192);
+    out.n_exp_used = (int) num("expert_used_count", 8);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 768);
+    out.n_ff_shexp = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
+    out.n_shared = (int) num("expert_shared_count", 1) > 0 && out.n_ff_shexp > 0 ? 1 : 0;
+    out.n_ff_dense = (int) num("feed_forward_length", 8192);
+    out.dense_lead = (int) num("leading_dense_block_count", 1);
+    out.gating = (int) num("expert_gating_func", 2) == 2 ? 0 : -1;   // (llama.cpp's 2 = sigmoid = Abyss's gating 0)
+    out.w_scale = (float) num("expert_weights_scale", 1.0);
+    out.norm_w = (int) num("expert_weights_norm", 1) != 0 ? 1 : 0;
+    const int n_group = (int) num("expert_group_count", 1), n_group_used = (int) num("expert_group_used_count", 1);
+    out.ink_softcap = (float) num("final_logit_softcapping", 0.0);
+    // (the SwiGLU limits: one value for every layer in the GigaChat4 files - swiglu_clamp_exp / _shexp)
+    out.swiglu_exp = (float) num("swiglu_clamp_exp", 10.0);
+    out.swiglu_shexp = (float) num("swiglu_clamp_shexp", 10.0);
+    bool lim_same = true;
+    for (const char* key : {"swiglu_clamp_exp", "swiglu_clamp_shexp"})
+        if (const auto* v = g.get(p + key); v && v->type == strata::MetaType::ARRAY)
+            for (size_t i = 0; i < v->items.size() && i < (size_t) out.n_layers; ++i)
+                if (!v->items[i].is_num() || std::fabs(v->items[i].num() - v->items[0].num()) > 1e-6) lim_same = false;
+    out.attn_head_kv = 1;
+    out.head_dim = out.kv_lora + out.ling_rope;
+    // the layer types: attention.recurrent_layers (true = a delta-net layer), the NextN block's entry too
+    out.n_head_kv.assign((size_t) out.n_layers, 1);
+    if (const auto* v = g.get(p + "attention.recurrent_layers"); v && v->type == strata::MetaType::ARRAY &&
+                                                              v->items.size() >= (size_t) out.n_layers) {
+        for (int il = 0; il < out.n_layers; ++il) out.n_head_kv[(size_t) il] = v->items[(size_t) il].u != 0 ? 0 : 1;
+    } else {
+        err = "giga: attention.recurrent_layers is missing";
+        return false;
+    }
+    if (const auto* v = g.get("tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
+        out.n_vocab = (int) v->count;
+    else
+        out.n_vocab = (int) num("vocab_size", 128256);
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_embd % 256 != 0 || out.n_expert <= 0 || out.n_expert > 512 ||
+        out.n_exp_used < 1 || out.n_exp_used > strata::kernels::glmf::kMaxK || out.gating != 0 || out.n_shared != 1 ||
+        out.dense_lead < 1 || n_group != 1 || n_group_used != 1 || !lim_same) {
+        err = "giga: block_count / embedding_length / expert_* / expert_gating_func / expert_group_count / the SwiGLU "
+              "limits are off";
+        return false;
+    }
+    if (out.n_ff_shexp != out.n_ff_exp) {
+        err = "giga: the shared expert's width differs from the experts' (not supported)";
+        return false;
+    }
+    if (out.ssm_state != 128 || out.d_conv != 4 || out.ssm_k_heads <= 0 || out.ssm_v_heads % out.ssm_k_heads != 0 ||
+        out.ssm_inner != out.ssm_v_heads * out.ssm_state || out.kv_lora != 512 || out.ling_rope != 64 ||
+        out.ling_qk_nope != 128 || out.ling_v != 128 || out.n_head > 64 || out.q_lora % 32 != 0 || out.giga_rank != 16) {
+        err = "giga: the kernels take ssm state 128, conv 4, kv_lora 512, rope 64, qk_nope 128, v 128, <= 64 heads, "
+              "q_lora a multiple of 32, norm gate rank 16";
+        return false;
+    }
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
+    return true;
+}
+
 // qwen4exp: the hparams llama.cpp's loader reads (src/models/qwen4exp.cpp load_arch_hparams), Qwen3.8-Flash-Next's
 // values as defaults; on the qwen35moe path (arch 2) with q4x set: hc streams, no NextN block, top-k <= glmf::kMaxK
 bool Glm5Geometry::from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
@@ -1946,6 +2049,7 @@ Glm5Model::~Glm5Model() {
     fast_destroy();
     ling_free();      // (ling: the k_b / v_b rows and the attention scratch it allocated)
     raon_free();      // (raon: the same, its scratch)
+    giga_free();      // (giga: its device copies and scratch)
     memt_free();      // (memt: the memory states and scratch)
     prism_free();     // (prism: the sign vectors and scratch)
     q35d_destroy();   // (load_pack's record when fast_setup never ran)

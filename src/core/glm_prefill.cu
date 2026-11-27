@@ -1308,6 +1308,11 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             return true;
         }
     }
+    // giga: no batched prompt path yet - the token path reads the prompt
+    if (g.giga) {
+        std::fprintf(stderr, "glm prefill: CUDA%d gigachat4 has no prompt path yet - token by token\n", dev_);
+        return true;
+    }
     // inkling: its attention, mixes and controllers are inkling_fast_path.cu's (ink_prompt_ok); the experts here
     if (g.ink) {
         std::string hw;
@@ -7845,7 +7850,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     if (ow.type == 0) job.w = ow.f32;
                     const bool hd = q35d_head_split() ? q35d_head(fast_->head_xq, 1, sc_ + sc_logits, fast_->cs, err, fast_->head_x)
                                                       : gf::mv(&job, 1, fast_->cs);
-                    if (hd && g.ink) strata::kernels::ink::softcap(sc_ + sc_logits, g.n_vocab, g.ink_softcap, fast_->cs);
+                    if (hd && (g.ink || g.giga)) strata::kernels::ink::softcap(sc_ + sc_logits, g.n_vocab, g.ink_softcap, fast_->cs);
                     if (!hd ||
                         !glmfast::cuda_ok(cudaMemcpyAsync(logits.data(), sc_ + sc_logits,
                             logits.size() * sizeof(float), cudaMemcpyDeviceToHost, fast_->cs),

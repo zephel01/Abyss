@@ -1478,6 +1478,75 @@ class Raon(unittest.TestCase):
         self.assertIn("no layer split for Raon-1", fail.call_args.args[0])
 
 
+class Giga4(unittest.TestCase):
+    """--model giga4 (ai-sage's GigaChat4-37B-A4B, its own Q4_K_M in the repo's GigaChat4-37B-A4B-Q4_K_M folder, BETA):
+    the entry, the one file of the folder, a plain mirror of the repo linked with nothing downloaded, the config, NVIDIA
+    only."""
+    FOLDER = "GigaChat4-37B-A4B-Q4_K_M"
+    FILE = FOLDER + "/GigaChat4-37B-A4B-Q4_K_M.gguf"
+
+    def test_the_entry(self):
+        m = A.MODELS["giga4"]
+        self.assertEqual((m["repo"], m["quant"], m["quants"], m["folder"]),
+                         ("ai-sage/GigaChat4-37B-A4B-GGUF", "Q4_K_M", ("Q4_K_M",), self.FOLDER))
+        self.assertEqual((m["model_name"], m["prefix"], m["pack_args"]), ("gigachat4-37b-a4b", "giga4", []))
+        self.assertTrue(m["nvidia_only"])
+
+    def test_the_file_only(self):
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (self.FILE, "README.md")]
+        m = A.MODELS["giga4"]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        with mock.patch.object(A.urllib.request, "urlopen", return_value=R()) as u:
+            got = A.quant_files(m["quant"], m["repo"], m["folder"], m["prefix_tmpl"].format(q=m["quant"]))
+        self.assertEqual([g[0] for g in got], [self.FILE])
+        self.assertIn("/tree/main/" + self.FOLDER, u.call_args.args[0].full_url)
+
+    def test_the_local_mirror_and_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            data = d / "data"
+            flat = data / "models" / "ai-sage" / "GigaChat4-37B-A4B-GGUF"
+            (flat / self.FOLDER).mkdir(parents=True)
+            body = b"giga"
+            (flat / self.FILE).write_bytes(body)
+            files = [(self.FILE, len(body), hashlib.sha256(body).hexdigest())]
+            pack = flat / "Q4_K_M" / "pack"
+            (pack / "tokenizer").mkdir(parents=True)
+            (pack / "native_experts.txt").write_text("x")
+            (pack / "tokenizer" / "chat_template.jinja").write_text("x")
+            gpu = {"index": 0, "name": "RTX 4080", "vram_gb": 16.0, "arch": "89", "count": 1}
+            tune = Namespace(gpu_tune=mock.Mock())
+            with mock.patch.object(sys, "argv", ["abyss_setup.py", "--model", "giga4", "--data-dir", str(data)]), \
+                    mock.patch.object(A, "ROOT", d), mock.patch.dict(sys.modules, {"abyss": tune}), \
+                    mock.patch.object(A.S, "gpu_info", return_value=gpu), mock.patch.object(A.S, "ram_gb", return_value=64.0), \
+                    mock.patch.object(A, "use_prebuilt", return_value=False), mock.patch.object(A, "build_engine"), \
+                    mock.patch.object(A.S, "pip_install"), mock.patch.object(A.S, "llama_cpp_reasons", return_value=[]), \
+                    mock.patch.object(A, "quant_files", return_value=files), mock.patch.object(A.S, "check_shards"), \
+                    mock.patch.object(A.S, "download", side_effect=Hy4.no_fetch), \
+                    mock.patch.object(A.S, "ask", side_effect=AssertionError("nothing to ask")), \
+                    mock.patch.object(A.S, "run", side_effect=AssertionError("the pack is there")), \
+                    mock.patch.object(A, "make_tools"), mock.patch.object(A.S, "step"), mock.patch.object(A.S, "say"), \
+                    mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "warn"):
+                self.assertEqual(A.main(), 0)
+            link = flat / "Q4_K_M" / "GigaChat4-37B-A4B-Q4_K_M.gguf"
+            self.assertTrue(link.is_symlink())
+            self.assertTrue(link.samefile(flat / self.FILE))
+            got = json.loads((d / "abyss-giga4-q4_k_m.json").read_text(encoding="utf-8"))
+        self.assertEqual(got["args"][:2], ["--glm-pack", str(pack)])
+        self.assertEqual((got["model_name"], got["sampling"]), ("gigachat4-37b-a4b", {"temperature": 1.0, "top_p": 0.95}))
+
+    def test_nvidia_only(self):
+        argv = ["abyss_setup.py", "--model", "giga4", "--backend", "hip"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A, "hip_engine", side_effect=AssertionError("no ROCm step")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("GigaChat4-37B-A4B runs on NVIDIA GPUs only", fail.call_args.args[0])
+
+
 class VenvLayout(unittest.TestCase):
     """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
 

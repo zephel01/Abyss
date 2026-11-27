@@ -948,7 +948,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling || g.raon))
+            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling || g.raon || g.giga))
                 Ly.router_bias = f32(g.hyv3 ? "exp_probs_b" : "exp_probs_b.bias");   // (hy_v3's GGUFs: no .bias)   // (hash layers, qwen35moe: none)
             if (!g.ink) {   // (inkling: no shared expert)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
@@ -8221,7 +8221,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
-    if (g.ink) strata::kernels::ink::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
+    if (g.ink || g.giga) strata::kernels::ink::softcap(tail->sc_ + tail->sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
     // STRATA_TEST_NAN_AT=<position> (a test): that position's logits all NaN - the token path must stop with one
     // message, not read past the embedding table
     static const long long nan_at = [] { const char* v = getenv("STRATA_TEST_NAN_AT"); return v ? std::atoll(v) : -1LL; }();
@@ -9382,7 +9382,7 @@ bool Glm5Model::part_token_head(int64_t p, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
-    if (g.ink) strata::kernels::ink::softcap(sc_ + sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
+    if (g.ink || g.giga) strata::kernels::ink::softcap(sc_ + sc_logits, g.n_vocab, g.ink_softcap, FT->cs);   // (inkling)
     if (FT->zero_copy) {
         gf::argmax(sc_ + sc_logits, g.n_vocab, FT->tok_hd, FT->cs);
     } else {

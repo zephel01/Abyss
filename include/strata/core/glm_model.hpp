@@ -276,6 +276,20 @@ struct Glm5Geometry {
     std::string raon_effort_default = "high";
     static bool from_gguf_raon(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
+    // ---- giga (ai-sage GigaChat4, GGUF arch gigachat4; src/core/giga_fast_path.cu, kernels/giga_fast.hpp): arch stays
+    // 2 (the qwen35moe path's MoE, pool, tiers and CPU lane) with giga set.  Plain residuals with pre AND post norms on
+    // both sublayers, every norm a GatedNorm (an RMSNorm whose output is scaled by a rank-giga_rank gate, x giga_gate_w);
+    // the qwen35 gated delta-net layers (ssm_*, h_k 16 / h_v 32 of 128) with the output gate a sigmoid x giga_gdn_gate;
+    // every 4th layer an MLA layer (q through q_a / q_a_norm / q_b, a 512 latent + a 64-dim interleaved rope key with
+    // YaRN, absorbed k_b / v_b, a sigmoid gate per output channel) with a DSA indexer (idx_heads x idx_key, the top
+    // idx_top_k cells past that many); a dense first layer, a sigmoid router with exp_probs_b, normalised, w_scale; an
+    // ungated shared expert; per-layer SwiGLU limits; a final logit softcap (ink_softcap).  The qwen35 fields: the
+    // delta-net state / conv rows are the GDN ones, the KV rows the MLA cache rows (576 FP16, one KV head)
+    bool giga = false;
+    int giga_rank = 16;
+    float giga_gate_w = 2.0f, giga_gdn_gate = 2.0f, yarn_log_mul = 0.1f;
+    static bool from_gguf_giga(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
@@ -914,6 +928,16 @@ public:
     int raon_pc_rows_ = 0;
     bool raon_prompt_coef(int T, std::string& err);
     void raon_prompt_read(int il, int site, int T, float* R, float* x, uint16_t* x16, cudaStream_t s);
+    // ---- giga (GigaChat4): giga_bind.cu binds a layer's weights (from qwen35_bind) and the head's GatedNorm;
+    // giga_fast_path.cu runs the token path (giga_alloc from qwen35_alloc, fast_giga_layers from fast_qwen35_layers)
+    void giga_bind(int il, std::string& missing);
+    bool giga_bind_head(std::string& missing);
+    bool giga_alloc(std::string& err);
+    bool fast_giga_layers(int64_t p, std::string& err);
+    void giga_free();
+    std::vector<void*> giga_owned_;     // (giga_bind's device copies: k_b / v_b as F32 rows)
+    float *giga_buf_ = nullptr, *giga_sc_ = nullptr, *giga_part_ = nullptr;   // (giga_fast_path.cu's scratch, in giga_owned_)
+    const float *giga_out_w_ = nullptr, *giga_out_down_ = nullptr, *giga_out_up_ = nullptr;   // output_norm's GatedNorm
     // ---- inkling (inkling_fast_path.cu): the physical layer's weights (from qwen35_bind), the slots and scratch (from
     // qwen35_alloc, inside qwen35_state_), the token path's 48 layer applications and the head's mix (head_x / head_xq),
     // a new sequence's zeroed conv states, the snapshot's runs (conv states, window rings)

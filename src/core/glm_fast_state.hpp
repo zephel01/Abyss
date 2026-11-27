@@ -548,6 +548,20 @@ struct Glm5Model::FastState {
         const float* rn_hc_base[2] = {nullptr, nullptr};
         const float* rn_hc_scale[2] = {nullptr, nullptr};
         const float *lg_kvn = nullptr, *lg_kb = nullptr, *lg_vb = nullptr, *lg_a_neg = nullptr;
+        // ---- giga (GigaChat4; giga_bind.cu): each GatedNorm is its RMSNorm weight w [n] plus the gate's two F32 rank-r
+        // matrices - up [r][n] (rows of n: the GGUF's *_gate_up, ne0 n, the n -> r projection) and down [n][r] (rows of
+        // r: *_gate_down, ne0 r, r -> n); out = y * 2 * sigmoid(down . silu(up . y)), y = rms(x) * w.
+        // [0] attn_norm, [1] post_attention_norm, [2] ffn_norm, [3] post_ffw_norm (n_embd); MLA q_a_norm (q_lora) and
+        // kv_a_norm (kv_lora).  GDN: qkv / zg / ssm_o / alpha_w / beta_w / conv1d / dt_bias / ssm_a / ssm_norm (qwen35's).
+        // MLA: rn_qa / rn_qb (q LoRA), lg_kva, lg_gate (n_embd -> heads x 128), lg_kb / lg_vb (F32 rows, raon's layout:
+        // k_b [head][512][128], v_b [head][128][512]), out.  DSA indexer: gi_iqb (q_lora -> idx_heads x idx_key), gi_ik
+        // (n_embd -> idx_key), gi_ikn (its k norm weight [idx_key]), gi_iproj (n_embd -> idx_heads)
+        struct GatedNorm {
+            const float *w = nullptr, *down = nullptr, *up = nullptr;
+        };
+        GatedNorm gn[4], gn_qa, gn_kva;
+        WSlot gi_iqb, gi_ik, gi_iproj;
+        const float* gi_ikn = nullptr;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;

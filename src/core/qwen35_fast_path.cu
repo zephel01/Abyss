@@ -56,6 +56,10 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         raon_bind(il, missing);
         return;
     }
+    if (g.giga) {   // (giga: GDN / MLA + DSA / GatedNorms - giga_bind.cu)
+        giga_bind(il, missing);
+        return;
+    }
     auto& Ly = F->L[(size_t) il];
     const std::string P = "blk." + std::to_string(g.phys(il)) + ".";   // (SenseNova-Loop: a second visit's weights)
     const auto f32 = [&](const char* n) -> const float* {
@@ -428,6 +432,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
                  q35_kv_ == 1 ? ", q4_0" : q35_kv_ == 2 ? ", int8" : q35_kv_ == 3 ? ", k8v4" : "");
     if (g.ling && !ling_alloc(err)) return false;
     if (g.raon && !raon_alloc(err)) return false;
+    if (g.giga && !giga_alloc(err)) return false;
     if (g.memt && !memt_alloc(err)) return false;
     if (prism_on()) {   // (PrismML's Ternary Bonsai: the signs, the scratch, the F32 alpha / beta rows rotated once)
         if (!prism_alloc(err)) return false;
@@ -998,6 +1003,10 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
         why = "raon's slots are not covered yet";
         return false;
     }
+    if (g_.giga) {   // (its indexer keys are not in the snapshot yet)
+        why = "gigachat4's slots are not covered yet";
+        return false;
+    }
     return true;
 }
 
@@ -1012,7 +1021,7 @@ void Glm5Model::q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& 
     for (int il = l0_; il < lt_; ++il) {   // (the NextN block's layer too)
         const auto& Ly = F->L[(size_t) il];
         if (Ly.recr || Ly.kc == nullptr) continue;
-        if (g.ling || g.raon) {   // (ling's, raon's MLA layer: one latent cache, rows of 576 FP16 - its vc is not read)
+        if (g.ling || g.raon || g.giga) {   // (ling's, raon's, giga's MLA layer: one latent cache, rows of 576 FP16 - its vc is not read)
             out.push_back({(void*) Ly.kc, N * KV * 2});
             continue;
         }
@@ -2033,6 +2042,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     if (g.loop) return fast_loop_layers(p, err);
     if (g.ink) return fast_ink_layers(p, err);
     if (g.raon) return fast_raon_layers(p, err);
+    if (g.giga) return fast_giga_layers(p, err);
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];

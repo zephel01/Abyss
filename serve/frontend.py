@@ -129,6 +129,9 @@ class ChatTemplate:
         # KRAFTON Raon-1: a ChatML template that knows thinking on / off only (enable_thinking); the reasoning effort is
         # the engine's - a steering vector's alpha per request (GEN effort=, raon_effort below), not prompt text
         self.raon = "raon-1" in self.source and "<|im_start|>" in self.source
+        # ai-sage GigaChat4 (chatml v5: <|role_sep|> / <|message_sep|>): thinking on / off is the template's own
+        # `reasoning` (True when absent); off ends the prompt with an empty, closed <think></think>
+        self.giga = "<|role_sep|>" in self.source and "<|message_sep|>" in self.source and "reasoning" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -166,6 +169,11 @@ class ChatTemplate:
                                           raw if raw in ok else level if level in ok else None)
             off = False   # (no think block to close: the effort level says it)
             messages = ink_tool_names(messages)
+        elif self.giga:   # (GigaChat4: no effort levels - thinking on or off)
+            kwargs.pop("effort_raw", None)
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs["reasoning"] = not (kwargs.pop("enable_thinking", True) is False or level == "none")
+            kwargs.setdefault("bos_token", self.bos_token)   # (the template opens with {{ bos_token }}, as HF renders it)
         elif self.raon:   # (the effort goes to the engine: raon_effort; the template takes enable_thinking only)
             kwargs.pop("effort_raw", None)
             kwargs.pop("reasoning_effort", None)
@@ -559,7 +567,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
-        if k == "enable_thinking" and not v:
+        if k in ("enable_thinking", "reasoning") and not v:   # (GigaChat4's card: "reasoning": false)
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
@@ -713,7 +721,9 @@ DSML_CALLS, DSML_CALLS_END = "<\uff5cDSML\uff5ctool_calls>", "</\uff5cDSML\uff5c
 # DeepSeek V4.1 writes a space after the DSML token and `calls` for the block (<｜DSML｜ calls>, <｜DSML｜ invoke ...>,
 # <｜DSML｜ parameter ...>), whatever spelling the pack's template shows; both are read.
 DSML41_CALLS, DSML41_CALLS_END = "<\uff5cDSML\uff5c calls>", "</\uff5cDSML\uff5c calls>"
-DSML_ENDS = {DSML_CALLS: DSML_CALLS_END, DSML41_CALLS: DSML41_CALLS_END}
+# ai-sage GigaChat4 writes the same form with its own token, ｜GCML｜ (<｜GCML｜tool_calls>, <｜GCML｜invoke ...>)
+GCML_CALLS, GCML_CALLS_END = "<\uff5cGCML\uff5ctool_calls>", "</\uff5cGCML\uff5ctool_calls>"
+DSML_ENDS = {DSML_CALLS: DSML_CALLS_END, DSML41_CALLS: DSML41_CALLS_END, GCML_CALLS: GCML_CALLS_END}
 
 
 def _dsml41_text(text: str, after_token: bool = False) -> str:
@@ -779,11 +789,12 @@ def parse_dsml_calls(body: str, schemas: dict | None = None) -> list[ToolCall]:
     boolean parameter written `True` / `False` (or with string="true") come out as a bool."""
     import re
     calls = []
-    for m in re.finditer(r'<\uff5cDSML\uff5c\s*invoke\s+name="([^"]*)"\s*>(.*?)</\uff5cDSML\uff5c\s*invoke>', body, re.S):
+    for m in re.finditer(r'<\uff5c(?:DSML|GCML)\uff5c\s*invoke\s+name="([^"]*)"\s*>(.*?)</\uff5c(?:DSML|GCML)\uff5c\s*invoke>',
+                         body, re.S):
         args = {}
         props = (((schemas or {}).get(m.group(1)) or {}).get("parameters") or {}).get("properties") or {}
-        for pm in re.finditer(r'<\uff5cDSML\uff5c\s*parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>(.*?)'
-                              r'</\uff5cDSML\uff5c\s*parameter>', m.group(2), re.S):
+        for pm in re.finditer(r'<\uff5c(?:DSML|GCML)\uff5c\s*parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>(.*?)'
+                              r'</\uff5c(?:DSML|GCML)\uff5c\s*parameter>', m.group(2), re.S):
             value, types = pm.group(3), _declared_types(props.get(pm.group(1)))
             b = _as_bool(value, types)
             if b is not None:
@@ -1939,7 +1950,7 @@ class OutputParser:
                 if not hits:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    tags = (CALL_START, DSML_CALLS, DSML41_CALLS) + ((XML_CALLS, XML_INVOKE + " ") if xml else ())
+                    tags = (CALL_START, DSML_CALLS, DSML41_CALLS, GCML_CALLS) + ((XML_CALLS, XML_INVOKE + " ") if xml else ())
                     j = len(self.buf) - self._hold(self.buf, tags)
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
@@ -2149,7 +2160,8 @@ def reasoning_tail_calls(reasoning: str, tools: list[dict] | None, ends: tuple[s
         if e is None:
             break
         t = t[:-len(e)].rstrip()
-    for opening, close in ((DSML_CALLS, DSML_CALLS_END), (DSML41_CALLS, DSML41_CALLS_END), (CALL_START, CALL_END)):
+    for opening, close in ((DSML_CALLS, DSML_CALLS_END), (DSML41_CALLS, DSML41_CALLS_END), (GCML_CALLS, GCML_CALLS_END),
+                           (CALL_START, CALL_END)):
         if t.endswith(close):
             i = t.rfind(opening)
             if i < 0:

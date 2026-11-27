@@ -199,8 +199,19 @@ RAON_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_outpu
                   "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                   "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                   "token_embd.weight", "output.weight")
+# gigachat4 (ai-sage GigaChat4): every non-expert quantized tensor served as stored (the delta-net / MLA projections,
+# the absorbed MLA k_b / v_b as their 3-D bytes, the DSA indexer's projections, the dense first FFN, the shared
+# expert); the F32 GatedNorm weights and their rank-16 gates, convs, ssm_a / dt, routers and exp_probs_b into dense.bin.
+# The NextN block (blk.{trunk}) is dropped
+GIGA_NATIVE_OK = ("attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight",
+                  "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_k_b.weight", "attn_v_b.weight",
+                  "attn_output.weight", "indexer.attn_k.weight", "indexer.attn_q_b.weight", "indexer.proj.weight",
+                  "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                  "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                  "token_embd.weight", "output.weight")
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
-                 "sensenova_loop", "hy_v4_flash", "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3")   # unsloth spells glm5-next without the hyphen
+                 "sensenova_loop", "hy_v4_flash", "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3",
+                 "gigachat4")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -215,7 +226,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
     if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna", "hy_v4_flash", "inkling2_loop", "inkling2",
-                "bailingmoe3", "raon1", "hy_v3"):
+                "bailingmoe3", "raon1", "hy_v3", "gigachat4"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -356,7 +367,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 # [4096, 8192]: the same bytes - rows of ne0 - so it packs as the 2-D view (ne0, ne1 * ne2))
                 t.shape = [int(t.shape[0]), int(t.shape[1]) * int(t.shape[2])]
                 dims = 2
-            if dims > 2 and not (arch in ("glm5-next", "glm5next", "hy_v4_flash", "bailingmoe3", "raon1") and dims == 3):
+            if dims > 2 and not (arch in ("glm5-next", "glm5next", "hy_v4_flash", "bailingmoe3", "raon1",
+                                         "gigachat4") and dims == 3):
                 print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
             ne0, ne1 = index_shape(t.shape)
@@ -431,6 +443,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             elif arch == "raon1" and not name.endswith(RAON_NATIVE_OK):
                 print("%s is %s: not on the raon1 native set (RAON_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
+            elif arch == "gigachat4" and not name.endswith(GIGA_NATIVE_OK):
+                print("%s is %s: not on the gigachat4 native set (GIGA_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
             elif arch == "hy_v4_flash" and not name.endswith(HY4_NATIVE_OK):
@@ -799,6 +815,10 @@ def main() -> int:
         prefix = "raon1."
         print("raon1: packing for the Glm5Model runner's qwen35moe path, raon layers (every dense tensor served as "
               "stored)")
+    if arch == "gigachat4":
+        prefix = "gigachat4."
+        print("gigachat4: packing for the Glm5Model runner's qwen35moe path, giga layers (every dense tensor served as "
+              "stored; the NextN block dropped)")
     if arch == "hy_v4_flash":
         prefix = "hy_v4_flash."
         print("hy_v4_flash: packing for the Glm5Model runner's hy4 path (every dense tensor served as stored; the "
@@ -809,7 +829,7 @@ def main() -> int:
     block_count = None
     trunk = None
     if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna", "hy_v4_flash",
-                "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3"):
+                "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3", "gigachat4"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -904,7 +924,7 @@ def main() -> int:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
     if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna", "hy_v4_flash", "inkling2_loop",
-                "inkling2", "bailingmoe3", "raon1"):
+                "inkling2", "bailingmoe3", "raon1", "gigachat4"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     elif arch == "hy_v3":   # (no leading_dense_block_count: the layers before the first router are dense)
         lead = 0
