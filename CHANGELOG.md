@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.217 - 2026-11-27
+
+A Qwen3.8 out-of-bounds write is fixed, and HIP's expert warm-up error says what to try. Outputs do not change.
+
+### Fixed
+
+- Qwen3.8-Flash-Next (the q4x token path): the state arena counted 2 of the 3 small rows it holds (q4_sc and the two
+  inject rows), so every token's inject block wrote 4 floats past the end of the allocation (compute-sanitizer, found
+  while looking into #66). The arena now counts all three (64 bytes more). The tokens are byte-identical before and
+  after (RTX 5090, 128K + MTP, 64K + MTP, 128K without MTP); the sanitizer reports 0 errors.
+
+### Changed
+
+- HIP: a GPU error while warming the expert tiers (#66: RX 9060 XT 16 GB, 128K + MTP, error 719) now says it is a GPU
+  fault or VRAM running short, suggests leaving more VRAM free (`STRATA_GLM_RESERVE_MB=5120`, a smaller
+  `STRATA_GLM_POOL_GB` or `--max-context`) and where to look (`sudo dmesg | grep -i -E "amdgpu|fault"`). It used to
+  give CUDA's "GPU lost? ... Xid" advice. CUDA's message is unchanged.
+
 ## v1.3.216 - 2026-11-27
 
 The license notice names Project Maya too. Code and outputs are the same as v1.3.215.

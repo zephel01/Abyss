@@ -4902,11 +4902,22 @@ bool Glm5Model::fast_warm(std::string& err) {
         });
     // a CUDA error here is almost always the GPU itself gone (2026-11-10: an RTX 5090 on OCuLink fell off the bus at the
     // end of the warm-up - Xid 79 - and the old message, "the warmed expert tables did not upload", read like a bug)
+    // (HIP, #66: an RX 9060 XT 16 GB at 128K + MTP stopped here with error 719 - there it is a GPU fault (a kernel or
+    // copy that touched memory it could not reach, or VRAM that ran short), not a card off the bus, and the advice is
+    // the VRAM's)
     auto warm_lost = [&](cudaError_t e, const char* what) {
+#if defined(STRATA_USE_HIP)
+        err = "glm fast: HIP" + std::to_string(dev_) + " failed in " + what + " while warming the expert tiers (" +
+              cudaGetErrorString(e) + ", HIP error " + std::to_string((int) e) +
+              ") - a GPU fault: a copy or an earlier kernel touched VRAM it could not reach, or the card ran short of "
+              "VRAM. Leave more of it free (STRATA_GLM_RESERVE_MB=5120, a smaller STRATA_GLM_POOL_GB or --max-context) "
+              "and look for an amdgpu page fault in the kernel log (`sudo dmesg | grep -i -E \"amdgpu|fault\"`)";
+#else
         err = "glm fast: CUDA" + std::to_string(dev_) + " failed in " + what + " while warming the expert tiers (" +
               cudaGetErrorString(e) + ", CUDA error " + std::to_string((int) e) +
               ") - GPU lost? (fell off the bus / reset: look for an Xid in the kernel log, `sudo dmesg | grep -i xid`; "
               "nvidia-smi shows \"Unknown Error\" then; reboot, and reseat an external link)";
+#endif
         return false;
     };
     // stream them: 8 experts per batch, 3 slices each in parallel; VRAM ones through the pinned staging
