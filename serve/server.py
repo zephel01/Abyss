@@ -593,8 +593,12 @@ def clear_run_marker(marker: Path | None) -> None:
 
 # exit codes of an engine that aborted (SIGABRT on Linux / macOS; abort() on Windows) or crashed (SIGSEGV / SIGBUS;
 # an access violation or a stack overflow on Windows) - not ones RAM explains
-_ABORT_RCS = {-6, 3}
+_ABORT_RCS = {-6, 3, 0xC0000409, -1073740791}  # 0xC0000409: a Windows fail-fast (abort / terminate)
 _CRASH_RCS = {-11, -7, 0xC0000005, 0xC00000FD, -1073741819, -1073741571}
+# an instruction the CPU does not have (SIGILL; Windows 0xC000001D): the prebuilt engine needs an AVX2 CPU
+_ILLEGAL_RCS = {-4, 0xC000001D, -1073741795}
+# an arithmetic fault (SIGFPE; Windows 0xC0000094 integer divide by zero)
+_FPE_RCS = {-8, 0xC0000094, -1073741676}
 _ABORT_MARKS = ("Assertion", "assertion", "terminate called", "what():", "Aborted", "abort()")
 
 
@@ -608,6 +612,14 @@ def engine_death_note(rc, tail: str) -> str:
                     "line: " + line + " - please report it at github.com/zephel01/Abyss/issues.")
     mark = next((ln for ln in reversed(lines) if any(m in ln for m in _ABORT_MARKS)), "")
     code = "" if rc is None else f" (exit code {rc})"
+    if rc in _ILLEGAL_RCS:
+        return ("The engine stopped on an instruction this CPU does not have" + code + ", not for lack of RAM. The "
+                "prebuilt engine needs an x86-64 CPU with AVX2; on an older CPU build the engine on this PC (run the "
+                "setup without --prebuilt, with the CUDA toolkit and a C++ compiler installed). If the CPU has AVX2, "
+                "please report it at github.com/zephel01/Abyss/issues with the log.")
+    if rc in _FPE_RCS:
+        return ("The engine stopped on an arithmetic fault" + code + " (such as a division by zero), not for lack "
+                "of RAM. Please report it at github.com/zephel01/Abyss/issues with the log.")
     if rc in _ABORT_RCS or (mark and rc != -9 and rc not in _CRASH_RCS):
         return ("The engine aborted on an internal error" + code + ", not for lack of RAM." +
                 (" Its log line: " + mark if mark else " The end of its log says what it stopped on.") +

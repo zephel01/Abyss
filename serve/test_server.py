@@ -2139,6 +2139,20 @@ class DeathNote(unittest.TestCase):
         for rc in (-11, 0xC0000005):
             self.assertIn("crashed", engine_death_note(rc, "glm fast: decode\n"))
 
+    def test_illegal_instruction_and_fpe(self):
+        from serve.server import engine_death_note
+        for rc in (-4, 0xC000001D, -1073741795):
+            note = engine_death_note(rc, "glm fast: loading\n")
+            self.assertIn("instruction this CPU does not have", note)
+            self.assertIn("AVX2", note)
+            self.assertNotIn("running out of RAM", note)
+        for rc in (-8, 0xC0000094, -1073741676):
+            note = engine_death_note(rc, "glm fast: decode\n")
+            self.assertIn("arithmetic fault", note)
+            self.assertNotIn("running out of RAM", note)
+        self.assertIn("aborted", engine_death_note(0xC0000409, "glm fast: decode\n"))
+        self.assertIn("aborted", engine_death_note(-1073740791, ""))
+
     def test_killed_is_ram_and_watchdog_wins(self):
         from serve.server import engine_death_note
         self.assertIn("running out of RAM", engine_death_note(-9, "glm fast: decode\n"))
