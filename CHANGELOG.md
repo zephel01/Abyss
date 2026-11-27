@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.219 - 2026-11-28
+
+On an AMD GPU, a GPU fault in the expert warm-up at start makes the server start the engine again with more VRAM left
+free, instead of failing the start (#66). Outputs do not change.
+
+### Fixed
+
+- HIP (discrete cards): when the expert warm-up at start hits a GPU fault (#66: RX 9060 XT 16 GB, 128K + MTP, error
+  719 with `STRATA_GLM_RESERVE_MB=3072`; the reporter's runs started with 5120 or with `STRATA_GLM_POOL_GB=3.5`), the
+  server starts the engine again with 2 GB more VRAM left free (3072 -> 5120 -> 7168, at most 2 times). The log says
+  `glm fast: HIP0 the warm-up hit a GPU fault with N GB free - retrying with STRATA_GLM_RESERVE_MB=...`, and later
+  restarts keep the larger reserve. No retry with `STRATA_GLM_POOL_GB` set, on a unified-memory APU, for other errors,
+  or when the engine runs without the server; a retry start's reserve wins over `--vram-reserve-mib`. CUDA is
+  unchanged. Checked with a fault-injection run on an RTX 5090 (one fault: a second start with 5120 and an answer; three
+  faults: two retries, then the normal error); a real AMD fault was not run here.
+
 ## v1.3.218 - 2026-11-28
 
 Tencent's Hy-MT3-30B-A3B (a translation model, GGUF arch `hy_v3`) runs, as a beta. Other models' outputs do not change.
