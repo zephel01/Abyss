@@ -2087,6 +2087,8 @@ class Service:
                             _special_ids(LING_END) +
                             # (Hy-MT3: a turn ends with its EOS, <eos:6124c78e>)
                             _special_ids(HYMT_END) + _special_ids(GIGA_END))
+        if getattr(template, "giga", False):   # (GigaChat4 ends its answer with the EOS, </s>, as the model card's runs do)
+            self.stop_ids |= set(_special_ids("</s>"))
         # (as the engine gets them: the template's turn end first - the answer-loop guard ends a turn with it)
         turn_end = (_special_ids(IM_END) + _special_ids("</assistant>") + _special_ids(HY4_END) +
                     _special_ids(LING_END) + _special_ids(HYMT_END) + _special_ids(GIGA_END))[:1]

@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, OutputParser, effort_kwargs, openai_to_messages  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service  # noqa: E402
 
 # a stand-in with the parts of GigaChat4's template the server keys on (chatml v5's separators, `reasoning`)
 SRC = ("{{- bos_token }}{%- if reasoning is not defined or reasoning is none %}{%- set reasoning = True %}{%- endif %}"
@@ -73,6 +74,16 @@ class GigaTemplate(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual((calls[0].name, calls[0].arguments), ("get_weather", {"city": "Tokyo", "days": 2}))
         self.assertFalse([e for e in ev if e.kind == "content" and e.text.strip()])
+
+    def test_stops(self):
+        # the model ends its answer with the EOS </s> (and a turn in the template with <|message_sep|>\n\n): both stop
+        class Tok(ByteTokenizer):
+            SPECIALS = ByteTokenizer.SPECIALS + ["</s>", "<|message_sep|>\n\n"]
+        tok = Tok()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, self.t)
+        sp = tok.special_tokens
+        self.assertIn(sp["</s>"], svc.stop_ids)
+        self.assertIn(sp["<|message_sep|>\n\n"], svc.stop_ids)
 
 
 if __name__ == "__main__":
