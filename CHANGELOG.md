@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.216 - 2026-11-27
+
+The license notice names Project Maya too. Code and outputs are the same as v1.3.215.
+
+### Fixed
+
+- LICENSE (also `LICENSE-Abyss.txt` in the prebuilt engine): it kept only Strata's copyright line and missed Project
+  Maya's, which Abyss is forked from (#65). It now has Abyss's, Project Maya's and Strata's lines, as MIT asks.
+
 ## v1.3.215 - 2026-11-27
 
 Inkling 2 Mini's tool calls stream while they are written, and setup writes Ling-3.2-air's MTP file. The engine is the
