@@ -336,19 +336,23 @@ class InkDSparkStep(unittest.TestCase):
             w.add_tensor(n, [4], "F32", np.zeros(4, np.float32))
         return w.write()
 
-    def test_the_old_file_wins_and_the_newer_layout_is_named(self):
-        # (unsloth, 2026-11-23: dspark-Inkling-2-Mini-Q8_0.gguf became the newer dflash layout, the old one _Old)
+    def test_the_newer_layout_is_read_and_the_old_file_wins(self):
+        # (unsloth, 2026-11-23: dspark-Inkling-2-Mini-Q8_0.gguf became the newer dflash layout, the old one _Old;
+        # the engine reads both since v1.3.213 and prefers _Old where both are)
         new = self.drafter(self.dst, ["markov_w1.weight", "markov_w2.weight", "markov_w2.bias", "mask_embd.weight"])
         self.assertTrue(A.ink_dspark_new_layout(new))
-        with mock.patch.object(A.S, "warn") as warn:
+        self.assertEqual(A.ink_dspark_found(self.mdir), new)
+        with mock.patch.object(A.S, "warn") as warn, mock.patch.object(A.S, "ok") as ok:
             self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
-        self.assertIn(A.INK_DSPARK_OLD, warn.call_args[0][0])
+        warn.assert_not_called()
+        self.assertIn("the newer layout", ok.call_args[0][0])
         old = self.drafter(self.dst.with_name(A.INK_DSPARK_OLD), ["markov_w1.weight", "dspark_fuse.weight"])
         self.assertFalse(A.ink_dspark_new_layout(old))
         self.assertEqual(A.ink_dspark_found(self.mdir), old)
-        with mock.patch.object(A.S, "warn") as warn:
+        with mock.patch.object(A.S, "warn") as warn, mock.patch.object(A.S, "ok") as ok:
             self.assertNotIn("STRATA_INK_DSPARK", self.run_step())
         warn.assert_not_called()
+        self.assertIn("the older layout", ok.call_args[0][0])
 
 
 class DFlash27Step(unittest.TestCase):

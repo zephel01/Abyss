@@ -878,8 +878,10 @@ def dspark_step(a, data: Path, cfg: Path, fresh: bool, had: str | None, gpus, ba
 # beside the pack (inkd_find: the hf layout next to the model's folder, or the folder itself) and keeps it when the
 # expert pool comes out the same with it; the config's env names it only by hand (STRATA_INK_DSPARK=<file>: loaded
 # whatever the VRAM) or turns it off (=0, --no-dspark).  Since 2026-11-23 unsloth's file under INK_DSPARK_NAME is a
-# newer dflash layout (markov_w2, no dspark_fuse) the engine does not read yet; the layout it reads is kept there as
-# INK_DSPARK_OLD (the repo's top folder), which the engine prefers when both are in one place
+# newer dflash layout (markov_w2, no dspark_fuse; ISTA-DASLab's GSQ-RCO repo ships it under that name too), the older
+# one is kept there as INK_DSPARK_OLD (the repo's top folder).  The engine reads both (v1.3.213); INK_DSPARK_OLD wins
+# when both are in one place (on par measured: RTX 5090, 512 tokens, code / edit within -5..+5% either way, the older
+# one's draft 0.05 ms shorter)
 INK_DSPARK_NAME = "dspark-Inkling-2-Mini-Q8_0.gguf"
 INK_DSPARK_OLD = "dspark-Inkling-2-Mini-Q8_0_Old.gguf"
 
@@ -892,7 +894,8 @@ def ink_dspark_found(mdir: Path) -> Path | None:
 
 
 def ink_dspark_new_layout(p: Path) -> bool:
-    """True for unsloth's newer dflash drafter (2026-11-23: markov_w2, no dspark_fuse), which the engine skips."""
+    """True for the newer dflash drafter layout (unsloth's since 2026-11-23, ISTA-DASLab's: markov_w2, no dspark_fuse),
+    which the engine reads since v1.3.213 (the same checkpoint exported another way)."""
     try:
         import gguf_io
         names = {t.name for t in gguf_io.Reader(p, data=False).tensors}
@@ -943,15 +946,12 @@ def ink_dspark_step(a, mdir: Path, cfg: Path, gpus, backend: str) -> None:
              "when the experts fit beside it")
         return
     if found is None:
-        S.ok(f"DSpark drafter: off - put unsloth's {INK_DSPARK_OLD} (the repo's top folder) in "
+        S.ok(f"DSpark drafter: off - put unsloth's {INK_DSPARK_OLD} (the repo's top folder) or {INK_DSPARK_NAME} in "
              f"{mdir.parent / 'dspark'} and the engine loads it")
         return
-    if ink_dspark_new_layout(found):
-        S.warn(f"DSpark drafter: {found} is the newer drafter layout (unsloth's file under this name since "
-               f"2026-11-23), which Abyss does not read yet - the engine runs without a drafter; put unsloth's "
-               f"{INK_DSPARK_OLD} beside it and the engine loads that one")
-        return
-    S.ok(f"DSpark drafter: on ({found}; the engine keeps it when the experts fit beside it, --no-dspark turns it off)")
+    layout = "the newer layout" if ink_dspark_new_layout(found) else "the older layout"
+    S.ok(f"DSpark drafter: on ({found}, {layout}; the engine keeps it when the experts fit beside it, --no-dspark "
+         "turns it off)")
 
 
 def dflash_step(a, data: Path, cfg: Path, gpus) -> None:
