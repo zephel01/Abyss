@@ -618,6 +618,24 @@ def engine_death_note(rc, tail: str) -> str:
             "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
             "smaller model (Q2_0 / IQ2_XS).")
 
+# #66: an expert warm-up that hit a HIP GPU fault (an RX 9060 XT 16 GB at 128K + MTP: error 719 with a 3 GB reserve;
+# 5 GB started) ends the engine with "RETRY STRATA_GLM_RESERVE_MB=<n> STRATA_GLM_WARM_RETRY=<k>" - the context is
+# unusable after the fault, so the retry is a new process; each one leaves 2 GB more free, at most WARM_RETRY_MAX
+WARM_RETRY_ENV = "STRATA_GLM_WARM_RETRY"
+WARM_RETRY_MAX = 2
+
+
+def warm_retry_env(line: str, env) -> dict | None:
+    """The env a RETRY line asks the engine to be started again with, or None when it asks for anything else, past
+    WARM_RETRY_MAX retries, or when the user sized the pool (STRATA_GLM_POOL_GB: the engine checks it too)."""
+    kv = dict(f.partition("=")[::2] for f in line.split()[1:])
+    if set(kv) != {"STRATA_GLM_RESERVE_MB", WARM_RETRY_ENV} or not all(v.isdigit() for v in kv.values()):
+        return None
+    if not 1 <= int(kv[WARM_RETRY_ENV]) <= WARM_RETRY_MAX or (env or {}).get("STRATA_GLM_POOL_GB"):
+        return None
+    return kv
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -648,8 +666,12 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
+        # STRATA_GLM_WARM_RETRY: this server starts the engine again when its expert warm-up hits a HIP GPU fault
+        # (#66, the RETRY line below); the engine only offers that when it is set
+        penv = env if env is not None and WARM_RETRY_ENV in env else {**(os.environ if env is None else env),
+                                                                         WARM_RETRY_ENV: "0"}
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=penv)
         if self.run_marker is not None:
             write_run_marker(self.run_marker, self.proc.pid, self.model_path)
         self.max_context = 0
@@ -674,6 +696,7 @@ class StrataEngine:
         # READY the engine is ended and the start fails with a line that says so, instead of a server that never opens
         start_s = env_seconds("STRATA_ENGINE_START_S", 1800)
         deadline = time.monotonic() + start_s if start_s > 0 else None
+        retry = None                     # a RETRY line: the env to start the engine again with (#66)
         while True:
             try:
                 line = self.lines.get(timeout=None if deadline is None else max(0.1, deadline - time.monotonic()))
@@ -687,6 +710,8 @@ class StrataEngine:
                 break
             if line.startswith("NOTE "):
                 print("[abyss] " + line[5:].strip(), flush=True)
+            if line.startswith("RETRY "):
+                retry = warm_retry_env(line, penv)
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -701,6 +726,23 @@ class StrataEngine:
         loading.set()
         if self.parallel > 1:
             self._start_demux()
+        if self.max_context <= 0 and retry is not None:
+            # the engine's warm-up hit a GPU fault and it ended (its context is unusable): once it is gone and the
+            # GPU has freed its memory, the same start with more VRAM left free (STRATA_GLM_RESERVE_MB + 2 GB)
+            clear_run_marker(self.run_marker)
+            try:
+                self.proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=20)
+            wait_gpu_release(self.proc.pid)
+            print(f"[abyss] the engine's expert warm-up hit a GPU fault - starting it again with "
+                  f"STRATA_GLM_RESERVE_MB={retry['STRATA_GLM_RESERVE_MB']} (retry {retry[WARM_RETRY_ENV]} of "
+                  f"{WARM_RETRY_MAX})", flush=True)
+            if log:
+                self.log.close()
+            self.__init__(exe, args, cwd, log, {**(os.environ if env is None else env), **retry})
+            return
         if self.max_context <= 0:
             clear_run_marker(self.run_marker)
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))

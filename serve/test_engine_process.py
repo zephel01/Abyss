@@ -34,6 +34,13 @@ log = open(os.environ["FAKE_LOG"], "a")
 if mode == "no-ready":
     time.sleep(30)
     sys.exit(0)
+if mode == "warm-fault":   # (#66) the warm-up's GPU fault while STRATA_GLM_WARM_RETRY < FAKE_FAULTS: RETRY, exit 1
+    tries = int(os.environ["STRATA_GLM_WARM_RETRY"])
+    reserve = int(os.environ.get("STRATA_GLM_RESERVE_MB", "1536"))
+    log.write(f"start:{reserve}:{tries}\n"); log.flush()
+    if tries < int(os.environ.get("FAKE_FAULTS", "1")):
+        print(f"RETRY STRATA_GLM_RESERVE_MB={reserve + 2048} STRATA_GLM_WARM_RETRY={tries + 1}", flush=True)
+        sys.exit(1)
 print("INFO engine=fake kv=1", flush=True)
 print("READY 4096 stop", flush=True)
 box = queue.Queue()
@@ -210,6 +217,31 @@ class FakeEngineTests(unittest.TestCase):
                 self.engine("no-ready")
         self.assertIn("STRATA_ENGINE_START_S", str(cm.exception))
         self.assertLess(time.monotonic() - t0, 10)
+
+    def test_a_warm_up_gpu_fault_starts_the_engine_again_with_more_vram_free(self):   # #66
+        e = self.engine("warm-fault", STRATA_GLM_RESERVE_MB=3072, FAKE_FAULTS=1)
+        self.assertEqual(e.max_context, 4096)
+        self.assertEqual(self.lines(), ["start:3072:0", "start:5120:1"])
+        self.assertEqual((e.spawn[4]["STRATA_GLM_RESERVE_MB"], e.spawn[4]["STRATA_GLM_WARM_RETRY"]), ("5120", "1"))
+        e.restart()                                     # a later start keeps the larger reserve and the count
+        self.assertEqual(self.lines()[-1], "start:5120:1")
+
+    def test_at_most_two_warm_up_retries(self):
+        with self.assertRaises(RuntimeError):
+            self.engine("warm-fault", STRATA_GLM_RESERVE_MB=3072, FAKE_FAULTS=5)
+        self.assertEqual(self.lines(), ["start:3072:0", "start:5120:1", "start:7168:2"])
+
+    def test_no_warm_up_retry_when_the_user_sized_the_pool(self):
+        with self.assertRaises(RuntimeError):
+            self.engine("warm-fault", STRATA_GLM_POOL_GB="3.5", FAKE_FAULTS=1)
+        self.assertEqual(self.lines(), ["start:1536:0"])
+
+    def test_a_retry_line_asking_for_anything_else_is_ignored(self):
+        self.assertIsNone(S.warm_retry_env("RETRY LD_PRELOAD=/x STRATA_GLM_WARM_RETRY=1", {}))
+        self.assertIsNone(S.warm_retry_env("RETRY STRATA_GLM_RESERVE_MB=5120 STRATA_GLM_WARM_RETRY=3", {}))
+        self.assertIsNone(S.warm_retry_env("RETRY STRATA_GLM_RESERVE_MB=-1 STRATA_GLM_WARM_RETRY=1", {}))
+        self.assertEqual(S.warm_retry_env("RETRY STRATA_GLM_RESERVE_MB=5120 STRATA_GLM_WARM_RETRY=1", None),
+                         {"STRATA_GLM_RESERVE_MB": "5120", S.WARM_RETRY_ENV: "1"})
 
     def test_the_service_reloads_the_context_through_quit(self):
         e = self.engine()

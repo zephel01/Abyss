@@ -4906,7 +4906,51 @@ bool Glm5Model::fast_warm(std::string& err) {
     // (HIP, #66: an RX 9060 XT 16 GB at 128K + MTP stopped here with error 719 - there it is a GPU fault (a kernel or
     // copy that touched memory it could not reach, or VRAM that ran short), not a card off the bus, and the advice is
     // the VRAM's)
+    // (#66: the reporter's card started at STRATA_GLM_RESERVE_MB=5120 or STRATA_GLM_POOL_GB=3.5 - the driver ran short
+    // of free VRAM beside a pool sized for a 3 GB reserve.)  On HIP a GPU fault here leaves the context unusable (error
+    // 719 is sticky), so the retry is the launcher's: under serve/server.py (it sets STRATA_GLM_WARM_RETRY) the engine
+    // prints "RETRY STRATA_GLM_RESERVE_MB=<+2048> STRATA_GLM_WARM_RETRY=<n+1>" and ends, and the server starts it
+    // again with those - at most 2 times, never with STRATA_GLM_POOL_GB set (the user sized the pool) or on a unified-
+    // memory APU.  CUDA keeps its error (there it means a GPU off the bus).  STRATA_GLM_WARM_FAULT_TEST=N fakes the
+    // fault at the first batch while STRATA_GLM_WARM_RETRY < N, on either build (the retry's test on a CUDA card).
+    const int warm_tries = [] {
+        const char* v = getenv("STRATA_GLM_WARM_RETRY");
+        return v != nullptr && v[0] != '\0' ? std::max(0, std::atoi(v)) : -1;   // -1: no launcher that retries
+    }();
+    const bool warm_fault_test = [&] {
+        const char* v = getenv("STRATA_GLM_WARM_FAULT_TEST");
+        return v != nullptr && std::max(0, warm_tries) < std::atoi(v);
+    }();
+    size_t warm_free = 0, warm_total = 0;
+    if (cudaMemGetInfo(&warm_free, &warm_total) != cudaSuccess) warm_free = warm_total = 0;
+    const int warm_reserve_mb = (int) (glmfast::vram_reserve_bytes(F->unified_memory ? 1024
+                                       : glmfast::default_reserve_mb(warm_total, g_.q4x)) >> 20);
+    auto warm_retry = [&](cudaError_t e, const char* what) {
+#if defined(STRATA_USE_HIP)
+        const bool fault = e == hipErrorLaunchFailure || e == hipErrorIllegalAddress || e == hipErrorOutOfMemory;
+        const char* api = "HIP";
+#else
+        const bool fault = false;
+        const char* api = "CUDA";
+#endif
+        if (warm_tries < 0 || warm_tries >= 2 || getenv("STRATA_GLM_POOL_GB") != nullptr || F->unified_memory ||
+            !(fault || warm_fault_test))
+            return false;
+        size_t fr = 0, tt = 0;
+        const double free_gb = (double) (cudaMemGetInfo(&fr, &tt) == cudaSuccess ? fr : warm_free) / 1073741824.0;
+        const int next_mb = warm_reserve_mb + 2048;
+        std::fprintf(stderr, "glm fast: %s%d the warm-up hit a GPU fault with %.1f GB free - retrying with "
+                             "STRATA_GLM_RESERVE_MB=%d (%s in %s, error %d%s; retry %d of 2)\n",
+                     api, dev_, free_gb, next_mb, cudaGetErrorString(e), what, (int) e,
+                     warm_fault_test ? ", STRATA_GLM_WARM_FAULT_TEST" : "", warm_tries + 1);
+        std::printf("RETRY STRATA_GLM_RESERVE_MB=%d STRATA_GLM_WARM_RETRY=%d\n", next_mb, warm_tries + 1);
+        std::fflush(stdout);
+        err = "glm fast: " + std::string(api) + std::to_string(dev_) + " the warm-up hit a GPU fault; the server " +
+              "starts the engine again with STRATA_GLM_RESERVE_MB=" + std::to_string(next_mb);
+        return true;
+    };
     auto warm_lost = [&](cudaError_t e, const char* what) {
+        if (warm_retry(e, what)) return false;
 #if defined(STRATA_USE_HIP)
         err = "glm fast: HIP" + std::to_string(dev_) + " failed in " + what + " while warming the expert tiers (" +
               cudaGetErrorString(e) + ", HIP error " + std::to_string((int) e) +
@@ -4955,6 +4999,13 @@ bool Glm5Model::fast_warm(std::string& err) {
             done_bytes += F->L[(size_t) J.il].blob;
         }
         if (const cudaError_t e = cudaStreamSynchronize(F->copy); e != cudaSuccess) return warm_lost(e, "the copies to VRAM");
+        if (warm_fault_test && b == 0) {   // (the test's fake fault, after the first batch's copies)
+#if defined(STRATA_USE_HIP)
+            return warm_lost(hipErrorLaunchFailure, "the copies to VRAM");
+#else
+            return warm_lost(cudaErrorLaunchFailure, "the copies to VRAM");
+#endif
+        }
         const int pct = (int) (100.0 * (double) done_bytes / (double) std::max<size_t>(1, total_bytes));
         if (pct / 10 != last_pct / 10) {
             last_pct = pct;

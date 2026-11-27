@@ -177,6 +177,8 @@ STRATA_GLM_TOPK_PAR  # src/kernels/cuda/glm_fast.cu
 STRATA_GLM_TRACE  # src/core/glm_model.cu
 STRATA_GLM_UNIFORM_SLOTS  # src/core/glm_fast_path.cu
 STRATA_GLM_VISION_LEND_MB  # src/core/glm_fast_path.cu
+STRATA_GLM_WARM_FAULT_TEST  # src/core/glm_fast_path.cu (tests only: fakes the warm-up's GPU fault, #66)
+STRATA_GLM_WARM_RETRY  # src/core/glm_fast_path.cu (set by serve/server.py: the warm-up retry count, #66)
 STRATA_GLM_WINDOW_GROUP  # src/core/dsv4_verify.cu (columns a group of the pipelined GLM window; investigation)
 STRATA_GLM_WINDOW_JUNK  # src/core/dsv4_verify.cu (tests only: random drafts, all rejected)
 STRATA_GROUP_COPY  # src/prefill/prefill.cpp

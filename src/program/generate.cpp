@@ -5340,7 +5340,15 @@ int main(int argc, char** argv) {
     // --vram-reserve-mib feeds the GLM runner's pool too (issue #39: on a Qwen3.8 pack the flag was parsed and
     // ignored - that pool read STRATA_GLM_RESERVE_MB only).  The flag wins over the variable: it is the config's own
     // arg, while setup writes the variable as a per-machine default (HIP, Windows APUs)
-    if (o.vram_reserve_given) {
+    // (#66: a start the server repeats after a warm-up GPU fault, STRATA_GLM_WARM_RETRY >= 1, keeps the larger
+    // reserve it asked for - the flag's value is what faulted)
+    const char* warm_retry = std::getenv("STRATA_GLM_WARM_RETRY");
+    const char* retry_mb = std::getenv("STRATA_GLM_RESERVE_MB");
+    if (o.vram_reserve_given && warm_retry != nullptr && std::atoi(warm_retry) > 0 && retry_mb != nullptr &&
+        std::atoi(retry_mb) > o.vram_reserve_mib) {
+        std::fprintf(stderr, "NOTE: the warm-up retry's STRATA_GLM_RESERVE_MB=%s overrides --vram-reserve-mib %d\n",
+                     retry_mb, o.vram_reserve_mib);
+    } else if (o.vram_reserve_given) {
         const std::string mb = std::to_string(o.vram_reserve_mib);
         const char* env_mb = std::getenv("STRATA_GLM_RESERVE_MB");
         if (env_mb != nullptr && mb != env_mb)
