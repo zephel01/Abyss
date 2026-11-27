@@ -813,6 +813,30 @@ def write_config(name: str, pack: Path, ctx: int, port: int | None, rewrite: boo
     return cfg, run
 
 
+def ling_nextn_step(first: Path, pack: Path) -> None:
+    """Ling-3.2-air: the GGUF's NextN block (blk.42) into <pack>/nextn.gguf, the file STRATA_LING_MTP=1 drafts with
+    (bartowski's Q4_0 experts repacked to Q5_0 with the same values, no ggml; ~2.1 GB).  Drafting stays off by default
+    (measured on one box only); a failure here leaves the model as it is, without the file."""
+    out = pack / "nextn.gguf"
+    if out.exists():
+        S.ok(f"MTP block: {out} (already made; STRATA_LING_MTP=1 drafts with it)")
+        return
+    tmp = pack / "nextn.gguf.part"
+    r = S.run([sys.executable, ROOT / "tools" / "nextn_pack.py", "--gguf", first, "--out", tmp, "--experts", "q5_0"],
+              check=False, quiet=True)
+    if r.returncode == 0 and tmp.exists():
+        os.replace(tmp, out)
+        S.ok(f"MTP block: {out} ({out.stat().st_size / 1e9:.2f} GB; off by default - STRATA_LING_MTP=1 in the config's "
+             "env turns it on, docs/MANUAL.md)")
+        return
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    S.warn(f"MTP block: not written (nextn_pack.py exit {r.returncode}); the model runs without it - "
+           f"tools/nextn_pack.py --gguf {first} --out {out} --experts q5_0 makes it by hand")
+
+
 def v41_ram_tier(ram_gb: float, drafter_bytes: int = 0) -> int:
     """STRATA_GLM_RAM_GB for V4.1 / Hy4 below 160 GB of RAM: min(RAM - 34, 0.65 x RAM), floor 16.  RAM - 34 alone is
     right on a 94 GB box (60, validated) but on 123 GB it gave 89 and systemd-oomd killed three V4.1 132G loads (80
@@ -1627,6 +1651,8 @@ def main() -> int:
         first = mdir / Path(files[0][0]).name
         S.run([sys.executable, ROOT / "tools" / "iq_pack.py", "--gguf", first, "--out", pack, *pack_args], quiet=True)
         S.ok(f"pack: {pack}")
+    if a.model == "ling32air":
+        ling_nextn_step(mdir / Path(files[0][0]).name, pack)
 
     S.step(6, "the run config")
     cfg_path = ROOT / f"abyss-{name}.json"
@@ -1695,7 +1721,7 @@ def main() -> int:
              else (" (MiMo-V2.6-Distill-Qwen-9B drafts with Qwen3.5-9B's NextN block, MTP/)" if mtp else
                    " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model in ("mimo-9b", "mimo-9b-qsa")
              else " (SenseNova-Loop-9B: no draft block - n-gram drafts)" if a.model == "sensenova-loop-9b"
-             else " (Ling-3.2-air: its MTP block drafts opt-in, STRATA_LING_MTP - docs/MANUAL.md)" if a.model == "ling32air"
+             else " (Ling-3.2-air: its MTP block drafts opt-in, STRATA_LING_MTP=1 with the pack's nextn.gguf - docs/MANUAL.md)" if a.model == "ling32air"
              else " (Hy4-flash: no drafter yet - the DFly2 drafter is not in the file)" if a.model == "hy4"
              else " (Raon-1 mini: the repo's DFlash drafter is not used yet)" if a.model == "raon"
              else " (MemT: drafting is off - the draft checks do not read the memory)" if model.get("nvidia_only")

@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.215 - 2026-11-27
+
+Inkling 2 Mini's tool calls stream while they are written, and setup writes Ling-3.2-air's MTP file. The engine is the
+same as v1.3.214; outputs do not change.
+
+### Added
+
+- Server: Inkling 2 Mini's tool calls stream as the model writes them, as Qwen's do - the call's name first, then its
+  arguments in pieces (OpenAI `tool_calls` deltas), instead of one block at the end. A client sees a long `write` call
+  start at once. RTX 5090, UD-Q4_K_XL, three `write` calls (Python module, Japanese HTML page, README; 891-2,816
+  characters of arguments): 313-1,223 argument pieces each, the first after 0.95-6.0 s, the joined arguments valid JSON
+  and the same as the non-streamed call at temperature 0. A call cut by `max_tokens` after its arguments started is
+  closed and sent with finish `length`; one cut before them is dropped.
+- Setup: `--model ling32air` writes `<pack>/nextn.gguf` (2.11 GB, the GGUF's NextN block; ~10 s), the file
+  `STRATA_LING_MTP=1` drafts with. Drafting stays off by default. Run the setup again to add it to an existing pack.
+  RTX 5090 + 123 GB RAM, IQ3_XS, greedy 512 tokens after a 4K prompt: deterministic md5 the same with and without it
+  on code / prose / Japanese / edit; decode, one run each, off / on: code 134.7 / 131.5, prose 132.1 / 139.1,
+  Japanese 146.8 / 155.6, edit 123.6 / 142.4 tok/s.
+
 ## v1.3.214 - 2026-11-27
 
 Windows keeps the learned files up to date, bartowski's Ling-3.2-air IQ3_XS runs on the GPU path and setup offers it,
