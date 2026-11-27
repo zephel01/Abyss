@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.220 - 2026-11-28
+
+ai-sage's GigaChat4-37B-A4B (GGUF arch `gigachat4`) runs, as a beta. Other models' outputs do not change.
+
+### Added
+
+- **GigaChat4-37B-A4B (ai-sage, beta):** 24 gated delta-net layers and 8 MLA layers with a DSA indexer (past 2,048
+  positions a query attends to the indexer's best 2,048), GatedNorm everywhere, 192 experts top 8 plus a shared one.
+  `./setup-deepseek.sh --model giga4` sets up ai-sage's Q4_K_M (23.3 GB) with temperature 1.0 / top_p 0.95; NVIDIA,
+  one GPU, text only. **License: ai-sage's noncommercial license for individuals.** Thinking follows the template's
+  `reasoning` variable; tool calls come back as OpenAI / Anthropic tool calls; answers end at `</s>`.
+  - RTX 5090, a 4K prompt + 512 tokens, median of 3: decode 115.9 tok/s all in VRAM, 96.5 / 85.3 held to 12 / 8 GB;
+    the 4K prompt 7,380 tok/s (12 / 8 GB: 2,854 / 2,305); a 16K prompt 8,342 tok/s, then decode 96.6.
+  - KL against a float64 forward written from the model's code on the same Q4_K_M weights: prompt path 0.0007 /
+    0.0079 / 0.0222 / 0.0008 (raw / en / ru / ja), 2,303 positions of text 0.0050; token path 0.0013-0.0139, the
+    2,303 positions 0.0067. The token path's larger gap is its q8_1 activation rounding (it can flip near-tie expert
+    choices); a higher-precision path is planned.
+  - Not yet: the built-in MTP drafter, multi-conversation slots, AMD.
+
 ## v1.3.219 - 2026-11-28
 
 On an AMD GPU, a GPU fault in the expert warm-up at start makes the server start the engine again with more VRAM left
