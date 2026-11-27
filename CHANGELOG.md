@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.213 - 2026-11-27
+
+Inkling 2 Mini's newer DSpark drafter file loads: unsloth's current `dspark-Inkling-2-Mini-Q8_0.gguf` and the one in
+ISTA-DASLab's GSQ-RCO repo. The other models' outputs are the same as v1.3.212.
+
+### Added
+
+- Inkling 2 Mini: the engine reads the newer dflash drafter layout (`markov_w2`, `ctx_mix`, no `dspark_fuse`) as well as
+  the old one, told apart by its tensors. It is the same official checkpoint exported another way (the fuse weights
+  stored softmaxed, the Markov head folded into the output rows with a bias), so the drafts are the same kind and the
+  kept tokens are still the target's own: greedy answers the same tokens with and without the drafter (md5, 4
+  prompts on UD-Q4_K_XL and on GSQ-RCO IQ3_S). RTX 5090, 512 tokens, median of 3, old / new drafter: UD-Q4_K_XL code
+  221.9 / 232.0 tok/s, edit 257.4 / 244.5; GSQ-RCO IQ3_S code 231.8 / 223.9, edit 259.7 / 263.4 (drafting off about
+  195). On par, so where both files sit in one place the `_Old` one is still taken. 0.57 GB in VRAM either way.
+- Setup no longer warns about the newer file; it names the layout it found.
+
 ## v1.3.212 - 2026-11-28
 
 The setup's V4.1 / Hy4 RAM tier no longer gets the engine stopped on a 123-128 GB box. The engine is the same as
