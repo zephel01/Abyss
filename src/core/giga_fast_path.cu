@@ -187,6 +187,15 @@ bool Glm5Model::giga_alloc(std::string& err) {
     return true;
 }
 
+// (the prompt path's - giga_prefill.cu - view of the carve: an MLA layer's indexer keys, the rope frequencies)
+uint16_t* Glm5Model::giga_keys(int mla) const {
+    const GigaCarve c = giga_carve(g_, std::max<int64_t>(max_ctx_, 1));
+    return (uint16_t*) (giga_buf_ + c.keys + (size_t) mla * c.key_layer);
+}
+const double* Glm5Model::giga_freq() const {
+    return (const double*) (giga_buf_ + giga_carve(g_, std::max<int64_t>(max_ctx_, 1)).freq);
+}
+
 namespace {
 // GN over n floats: h += add, y = GN(h)
 template <class GN>

@@ -938,6 +938,20 @@ public:
     std::vector<void*> giga_owned_;     // (giga_bind's device copies: k_b / v_b as F32 rows)
     float *giga_buf_ = nullptr, *giga_sc_ = nullptr, *giga_part_ = nullptr;   // (giga_fast_path.cu's scratch, in giga_owned_)
     const float *giga_out_w_ = nullptr, *giga_out_down_ = nullptr, *giga_out_up_ = nullptr;   // output_norm's GatedNorm
+    // the prompt path (giga_prefill.cu; prefill_half's giga branches): giga_prompt_ok - every projection has an FP16
+    // decode and the tensor-core kernels run here; a site's norms over the chunk's rows (0: the last FFN's post norm in
+    // place, R += it, x = GN_attn(R); 1: the mixer's post norm in place, R += it, x = GN_ffn(R); 2: the last FFN's post
+    // norm alone - the head rows' add), x16 x's FP16; a sub-batch's mixer (the delta-net's state / conv rows, an MLA
+    // layer's cache rows and indexer keys left as the token path leaves them); the head's input of one row
+    bool giga_prompt_ok(std::string& why);
+    void giga_prompt_norm(int il, int site, int T, float* R, int ldr, float* add, float* x, uint16_t* x16, cudaStream_t s);
+    bool giga_prompt_mixer(int il, int64_t p0, int tn, const uint16_t* x16, float* mixer, bool skip_output,
+                           const Hy4PromptIo& io, std::string& err);
+    void giga_prompt_head(float* R_row, const float* ffn_row, cudaStream_t s);
+    uint16_t* giga_keys(int mla) const;     // (an MLA layer's indexer keys: rows of 128 FP16; giga_fast_path.cu's carve)
+    const double* giga_freq() const;        // (the rope pairs' 32 frequencies on the device)
+    float* giga_psc_ = nullptr;             // (the prompt's indexer scores: rows x positions, in giga_owned_)
+    size_t giga_psc_floats_ = 0;
     // ---- inkling (inkling_fast_path.cu): the physical layer's weights (from qwen35_bind), the slots and scratch (from
     // qwen35_alloc, inside qwen35_state_), the token path's 48 layer applications and the head's mix (head_x / head_xq),
     // a new sequence's zeroed conv states, the snapshot's runs (conv states, window rings)
@@ -1535,5 +1549,7 @@ private:
 /// (src/core/glm_prefill.cu) - the layer split search's startability gate.
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
                               bool has_moe, bool mtp, int64_t max_ctx, size_t gstride);
+/// gigachat4: the scratch its mixers take for a sub-batch of T rows (src/core/giga_prefill.cu; the chunk's union).
+size_t giga_prompt_bytes(const Glm5Geometry& g, size_t T);
 
 }  // namespace strata::core

@@ -132,6 +132,8 @@ void Glm5Model::giga_free() {
     for (void* p : giga_owned_) cudaFree(p);
     giga_owned_.clear();
     giga_buf_ = giga_sc_ = giga_part_ = nullptr;
+    giga_psc_ = nullptr;
+    giga_psc_floats_ = 0;
 }
 
 }  // namespace strata::core

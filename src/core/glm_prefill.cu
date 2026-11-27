@@ -586,6 +586,7 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
             Carve k; carve_kda(k, (size_t) t2, g); need = std::max(need, k.off);
             Carve m; carve_ling_mla(m, (size_t) t2, g); need = std::max(need, m.off);
         }
+        if (g.giga) need = std::max(need, giga_prompt_bytes(g, (size_t) t2));
         if (dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, (size_t) t2, g, max_pools) : (void) carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
         if (dense) { Carve d; carve_dense(d, (size_t) t2, g); need = std::max(need, d.off); }
         if (need > room) break;
@@ -1308,10 +1309,13 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             return true;
         }
     }
-    // giga: no batched prompt path yet - the token path reads the prompt
+    // giga: its norms and mixers are giga_prefill.cu's (giga_prompt_ok); the dense FFN and the experts here
     if (g.giga) {
-        std::fprintf(stderr, "glm prefill: CUDA%d gigachat4 has no prompt path yet - token by token\n", dev_);
-        return true;
+        std::string hw;
+        if (!giga_prompt_ok(hw)) {
+            std::fprintf(stderr, "glm prefill: CUDA%d gigachat4 has no prompt path (%s) - token by token\n", dev_, hw.c_str());
+            return true;
+        }
     }
     // inkling: its attention, mixes and controllers are inkling_fast_path.cu's (ink_prompt_ok); the experts here
     if (g.ink) {
@@ -1323,8 +1327,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     }
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (g.is_hy4() || g.ink) {
-            // (hy4_prompt_ok / ink_prompt_ok above)
+        if (g.is_hy4() || g.ink || g.giga) {
+            // (hy4_prompt_ok / ink_prompt_ok / giga_prompt_ok above)
         } else if (g.raon) {   // (raon: the projections batched - prefill_half's raon mixer)
             if (Ly.recr) {
                 deq_ok(Ly.q, "attn_q", il);
@@ -1422,7 +1426,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
-        if (!g.dsv4() && !(g.qwen35() && Ly.recr) && !g.is_hy4() && !g.ink) deq_ok(Ly.out, "attn_output", il);
+        if (!g.dsv4() && !(g.qwen35() && Ly.recr) && !g.is_hy4() && !g.ink && !g.giga) deq_ok(Ly.out, "attn_output", il);
         if (Ly.moe) {
             has_moe = true;
             if (g.n_shared > 0) {   // (inkling: no shared expert)
@@ -2065,6 +2069,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (g.qwen35()) { Carve q; carve_q35(q, ts, g); carve_q4x(q, ts, g); uni = std::max(uni, q.off); }
     if (g.ling) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); Carve m; carve_ling_mla(m, ts, g); uni = std::max(uni, m.off); }
     if (g.raon) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); Carve m; carve_raon_mla(m, ts, g); uni = std::max(uni, m.off); }
+    if (g.giga) uni = std::max(uni, giga_prompt_bytes(g, ts));
     if (has_dsa) { Carve d; g.dsv4() ? (void) carve_ds4(d, ts, g, max_pools) : (void) carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
@@ -4886,6 +4891,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (!raon_prompt_coef(T, err)) return false;
             if (il > l0_) strata::kernels::raon::mhc_post(S->R, S->ffn, raon_pc_ + (size_t) 24 * T, E, s, T);
             raon_prompt_read(il, 0, T, S->R, S->x, S->x16, s);
+        } else if (g.giga) {
+            // giga: the last FFN through its post norm into R's first stream, x = GN_attn(R) (giga_prefill.cu)
+            giga_prompt_norm(il, 0, T, S->R, 4 * E, il == l0_ ? nullptr : S->ffn, S->x, S->x16, s);
         } else if (g.qwen35()) {
             // a plain residual (R's first stream): it takes the last FFN, x = rms(R) * attn_norm and its FP16
             q35::add_rms_rows(S->R, 4 * E, il == l0_ ? nullptr : S->ffn, Ly.attn_norm, g.norm_eps, T, E, S->x, S->x16, s);
@@ -4970,6 +4978,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gb::f32_to_f16(B.ao, B.ao16, (int64_t) tn * HDq, s);
                     hgemm_q(Ly.out, E, HDq, B.ao16, HDq, mixer, E, tn, 0.0f);
                 }
+            } else if (g.giga) {
+                // giga (giga_prefill.cu): the delta-net / MLA layer over the sub-batch's rows, the indexer's choice
+                // for the rows past idx_top_k positions
+                if ((t0 & 4095) == 0 && t0 > 0) progress_beat();
+                if (!giga_prompt_mixer(il, p0 + t0, tn, x16, mixer, skip_output, hy4_io(S, (size_t) S->T * E), err))
+                    return false;
             } else if (g.raon) {
                 // raon (raon_fast_path.cu's layers over the sub-batch's rows): the projections as GEMMs; an RDA layer's
                 // conv and recurrence batched (glm_batch's, the state carried across sub-batches; the write gate folded
@@ -5408,7 +5422,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         else if (g.raon) {   // (raon: the attention's mHC post, the FFN's read)
             strata::kernels::raon::mhc_post(S->R, S->mixer, raon_pc_, E, s, T);
             raon_prompt_read(il, 1, T, S->R, S->x, S->x16, s);
-        } else if (g.loop && g.kind(il) != 0)   // (sensenova_loop: the attention's merge, the FFN's router)
+        } else if (g.giga)   // (giga: the mixer through its post norm into R, x = GN_ffn(R))
+            giga_prompt_norm(il, 1, T, S->R, 4 * E, S->mixer, S->x, S->x16, s);
+        else if (g.loop && g.kind(il) != 0)   // (sensenova_loop: the attention's merge, the FFN's router)
             q35::mhc2_rows(S->R, S->R + E, 4 * E, E, T, S->mixer, 2, S->comb, false, Ly.mhc_w[1], Ly.mhc_b[1],
                            g.sinkhorn_iters, Ly.post_norm, g.norm_eps, S->x, S->x16, S->comb + (size_t) 8 * T, s);
         else if (g.qwen35()) {
@@ -7316,6 +7332,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (!tail_skip && g.q4x && l1_ < g.n_layers && kv_cut < 0) q4_mix(l1_ - 1, 0, S->ffn, S->post, nullptr, true);
     // raon: the last FFN's mHC post - R's rows are the head's input (the prompt-path logits)
     if (!tail_skip && g.raon && kv_cut < 0) strata::kernels::raon::mhc_post(S->R, S->ffn, raon_pc_ + (size_t) 24 * T, E, s, T);
+    // giga: the last FFN's post norm (in place) - the head's rows add it to R (giga_prompt_head)
+    if (!tail_skip && g.giga && kv_cut < 0) giga_prompt_norm(l1_ - 1, 2, T, S->R, 4 * E, S->ffn, S->x, S->x16, s);
     // the other qwen35 family on a split's earlier part (#55): the rows' residual takes the last FFN here - the next
     // part's first layer reads R as it is (one device adds it at the next layer's norm, the same float sum)
     if (g.qwen35() && !g.q4x && !g.ink && l1_ < g.n_layers && kv_cut < 0)
@@ -7536,7 +7554,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.raon || (g_.memt && !g_.dsv4()) || g_.prism_block > 0) || split_next_ ||
+    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.raon || g_.giga || (g_.memt && !g_.dsv4()) || g_.prism_block > 0) || split_next_ ||
                            l0_ != 0 || l1_ != g_.n_layers)) {
         err = "prefill logits requires single-device DeepSeek V4.1, Inkling, Ling or MemT"; return false;
     }
@@ -7832,6 +7850,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
+                    else if (g.giga)   // (giga: R's row takes the post-normed last FFN, GN_output - the token path's head)
+                        giga_prompt_head(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, fast_->cs);
                     else if (g.raon)   // (raon: the mean of the row's 4 streams, output_norm - the token path's head_prep)
                         gf::head_prep(pf_->R + (size_t) t * 4 * E, w_.at("output_norm.weight"), g.norm_eps, E,
                                       fast_->head_x, fast_->head_xq, fast_->cs);

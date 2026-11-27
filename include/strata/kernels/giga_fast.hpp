@@ -64,6 +64,31 @@ void idx_score(const float* iq, const float* w, const uint16_t* keys, int64_t n,
 void idx_topk(const float* score, int64_t n, int k, int* sel, cudaStream_t s);
 /// out[i] = cache[sel[i]], rows of kRow FP16, i < k
 void gather_rows(const uint16_t* cache, const int* sel, int k, uint16_t* out, cudaStream_t s);
+
+// ---- the prompt path (src/core/giga_prefill.cu): the same arithmetic over rows (row t = position p0 + t)
+/// gated_norm over rows with strides: h rows ldh apart, add rows lda apart, y rows ldy apart (n floats of each)
+void gated_norm_ld(float* h, int ldh, const float* add, int lda, const float* w, const float* p_in, const float* p_out,
+                   float gate_w, float eps, int n, int rank, int form, float* y, int ldy, cudaStream_t s, int rows);
+/// rope_table + mla_prep a row (interleaved pairs): q rows of ldq floats ([n_head][kQHead] in each) roped in place; the
+/// cache rows (cache: the first row's place) = lat rows [kLat] | the roped kv rows' [kLat, kRow) (kv rows of kRow)
+void mla_prep_rows(float* q, int ldq, int n_head, const float* lat, const float* kv, const double* freq, int64_t p0,
+                   int rows, uint16_t* cache, cudaStream_t s);
+/// idx_prep's key a row: keys (the first row's place) from kraw rows of kIdxKey
+void idx_keys_rows(const float* kraw, const float* k_norm, float eps, const double* freq, int64_t p0, int rows,
+                   uint16_t* keys, cudaStream_t s);
+/// idx_prep's query rope a row: iq rows of n_heads x kIdxKey, row t at position p0 + t
+void idx_q_rope_rows(float* iq, int n_heads, const double* freq, int64_t p0, int rows, cudaStream_t s);
+/// idx_score a row on tensor cores (the query heads as FP16, F32 sums): score[t * ld + s] over s <= p0 + t; 64 heads
+void idx_score_rows(const float* iq, const float* w, const uint16_t* keys, int64_t p0, int rows, float* score, int64_t ld,
+                    cudaStream_t s);
+/// idx_topk a row: row t picks k of its p0 + t + 1 scores (> k) into sel + t * k
+void idx_topk_rows(const float* score, int64_t ld, int64_t p0, int rows, int k, int* sel, cudaStream_t s);
+/// The prompt's MLA attention on tensor cores (raon_fast's mla_prompt_attn; scale on q): row t at position p0 + t reads
+/// cache rows [0, p0 + t], or - past k positions, sel given - the k rows of sel + (t - sel_row0) * k.  qabs
+/// [T][n_head][kLat] in, ctx the same shape out (apart), q rows of ldq floats.  prompt_attn_ok false: not here
+bool prompt_attn_ok();
+void mla_prompt_attn(const float* qabs, float* ctx, const float* q, int ldq, const uint16_t* cache, int64_t p0, int T,
+                     int n_head, float scale, const int* sel, int k, int sel_row0, cudaStream_t s);
 /// launches that failed (all giga kernels)
 int launch_errors();
 
