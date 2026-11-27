@@ -1351,6 +1351,33 @@ class Hy4(unittest.TestCase):
         self.assertIn("no layer split for Hy4", fail.call_args.args[0])
 
 
+
+class HyMT3(unittest.TestCase):
+    """--model hymt3 (Tencent's Hy-MT3-30B-A3B, its own Q4_K_M / Q8_0, BETA): the entry, and the one file of the quant
+    by its prefix (the other quant beside it skipped)."""
+
+    def test_the_entry(self):
+        m = A.MODELS["hymt3"]
+        self.assertEqual((m["repo"], m["quant"], m["quants"], m["folder"]),
+                         ("tencent/Hy-MT3-30B-A3B-GGUF", "Q4_K_M", ("Q4_K_M", "Q8_0"), ""))
+        self.assertEqual((m["model_name"], m["prefix"], m["pack_args"]), ("hy-mt3-30b-a3b", "hymt3", []))
+        self.assertEqual(m["sampling"], {"temperature": 0.7, "top_p": 1.0})
+        self.assertTrue(m["nvidia_only"])
+
+    def test_the_file_only(self):
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in (
+            "Hy-MT3-30B-A3B-Q4_K_M.gguf", "Hy-MT3-30B-A3B-Q8_0.gguf", "LICENSE.txt", "README.md")]
+        m = A.MODELS["hymt3"]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        for q in m["quants"]:
+            with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+                got = A.quant_files(q, m["repo"], m["folder"], m["prefix_tmpl"].format(q=q))
+            self.assertEqual([g[0] for g in got], ["Hy-MT3-30B-A3B-%s.gguf" % q])
+
+
 class Raon(unittest.TestCase):
     """--model raon (KRAFTON's Raon-1 mini, its own Q4_K_M, BETA): the entry, the one file by its prefix (the other quants
     and the DFlash drafter beside it skipped), a plain mirror of the repo linked with nothing downloaded, the config

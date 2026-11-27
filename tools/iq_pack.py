@@ -200,7 +200,7 @@ RAON_NATIVE_OK = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_outpu
                   "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                   "token_embd.weight", "output.weight")
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
-                 "sensenova_loop", "hy_v4_flash", "inkling2_loop", "inkling2", "bailingmoe3", "raon1")   # unsloth spells glm5-next without the hyphen
+                 "sensenova_loop", "hy_v4_flash", "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -215,7 +215,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
     if arch in ("qwen35moe", "qwen35", "qwen4exp-fast", "laguna", "hy_v4_flash", "inkling2_loop", "inkling2",
-                "bailingmoe3", "raon1"):
+                "bailingmoe3", "raon1", "hy_v3"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -417,7 +417,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 print("%s is %s: not on the qwen35 native set (QWEN35_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
-            elif arch == "laguna" and not name.endswith(LAGUNA_NATIVE_OK):
+            elif arch in ("laguna", "hy_v3") and not name.endswith(LAGUNA_NATIVE_OK):
                 print("%s is %s: not on the laguna native set (LAGUNA_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
@@ -791,6 +791,10 @@ def main() -> int:
         prefix = "bailingmoe3."
         print("bailingmoe3: packing for the Glm5Model runner's qwen35moe path, ling layers (every dense tensor served as "
               "stored; the NextN block dropped)")
+    if arch == "hy_v3":
+        prefix = "hy_v3."
+        print("hy_v3: packing for the Glm5Model runner's qwen35moe path, laguna layers without the output gate (every "
+              "dense tensor served as stored)")
     if arch == "raon1":
         prefix = "raon1."
         print("raon1: packing for the Glm5Model runner's qwen35moe path, raon layers (every dense tensor served as "
@@ -805,7 +809,7 @@ def main() -> int:
     block_count = None
     trunk = None
     if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna", "hy_v4_flash",
-                "inkling2_loop", "inkling2", "bailingmoe3", "raon1"):
+                "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -902,6 +906,10 @@ def main() -> int:
     if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna", "hy_v4_flash", "inkling2_loop",
                 "inkling2", "bailingmoe3", "raon1"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
+    elif arch == "hy_v3":   # (no leading_dense_block_count: the layers before the first router are dense)
+        lead = 0
+        while lead < n_layers and "blk.%d.ffn_gate_inp.weight" % lead not in T:
+            lead += 1
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)
     moe_layers = [l for l in range(n_layers) if l >= lead]

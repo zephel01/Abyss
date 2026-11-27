@@ -34,6 +34,12 @@ class TinyVocab(unittest.TestCase):
         for pre in ("qwen35", "joyai-llm", "laguna", "hy_v4"):
             self.assertFalse(tiny(pre).ignore_merges, pre)
 
+    def test_hunyuan_dense_is_hy_v4(self):
+        # Tencent Hy-MT3's pre `hunyuan-dense`: llama-vocab.cpp gives it hy_v4's (joyai's) three expressions
+        tk = tiny("hunyuan-dense")
+        self.assertEqual(tk.pre, "hy_v4")
+        self.assertEqual(split_sequential("1234 日本語abc", tk._seq), split_sequential("1234 日本語abc", tiny("hy_v4")._seq))
+
     def test_unbuildable_entry_is_one_token(self):
         tk = tiny("inkling2")
         self.assertEqual(tk.encode("Xyz"), [tk.ids["Xyz"]])           # no merge builds it

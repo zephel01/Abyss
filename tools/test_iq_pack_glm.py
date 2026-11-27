@@ -147,7 +147,8 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("inkling2", iq_pack.ARCHITECTURES)         # Abyss: Inkling 2 Mini (unsloth's looped layout)
         self.assertIn("bailingmoe3", iq_pack.ARCHITECTURES)      # Abyss: Ling-3.2-air (KDA + MLA)
         self.assertIn("raon1", iq_pack.ARCHITECTURES)            # Abyss: KRAFTON Raon-1 (RDA + MLA + mHC)
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 14)
+        self.assertIn("hy_v3", iq_pack.ARCHITECTURES)            # Abyss: Tencent Hy-MT3 (laguna layers, no gate)
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 15)
 
     def test_hy4_as_stored(self):
         # hy_v4_flash: every non-expert tensor served as stored (the 3-D absorbed k_b / v_b too), nothing to BF16

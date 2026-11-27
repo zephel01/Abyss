@@ -1362,7 +1362,7 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                 deq_ok(Ly.aq, "attn_q", il);
                 deq_ok(Ly.ak, "attn_k", il);
                 deq_ok(Ly.av, "attn_v", il);
-                if (g.laguna) deq_ok(Ly.lag_g, "attn_gate", il);
+                if (g.laguna && !g.hyv3) deq_ok(Ly.lag_g, "attn_gate", il);
             }
         } else if (g.v41) {
             // deepseek41: the attention's projections batched (prefill_v41_mixer) when every one dequantizes, else
@@ -4939,7 +4939,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.aq, HDq, E, x16, E, B.qf, HDq, tn, 0.0f);
                 hgemm_q(Ly.ak, KV, E, x16, E, B.k, KV, tn, 0.0f);
                 hgemm_q(Ly.av, KV, E, x16, E, B.v, KV, tn, 0.0f);
-                hgemm_q(Ly.lag_g, H, E, x16, E, gl, H, tn, 0.0f);
+                if (!g.hyv3) hgemm_q(Ly.lag_g, H, E, x16, E, gl, H, tn, 0.0f);
                 S->mark("lag_proj", s);
                 const bool swa = Ly.lag_swa;
                 for (int a = 0; a < tn; a += Glm5Geometry::kLagSlice) {
@@ -4958,7 +4958,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                  swa ? g.n_swa : 0, 1.0f / std::sqrt((float) D), nullptr, 1, B.ao + (size_t) a * HDq, s,
                                  q35_kv_);
                 }
-                lk::gate_rows(B.ao, gl, tn, H, s);
+                if (!g.hyv3) lk::gate_rows(B.ao, gl, tn, H, s);
                 S->mark("lag_attn", s);
                 if (t0 + tn == T) dump_row("attn_gated-" + std::to_string(il), B.ao, HDq, tn - 1);
                 if (!skip_output) {

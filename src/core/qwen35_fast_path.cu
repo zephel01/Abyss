@@ -115,7 +115,7 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         Ly.aq = q("attn_q.weight", E, (int64_t) H * D);
         Ly.ak = q("attn_k.weight", E, (int64_t) g.attn_head_kv * D);
         Ly.av = q("attn_v.weight", E, (int64_t) g.attn_head_kv * D);
-        Ly.lag_g = q("attn_gate.weight", E, H);
+        if (!g.hyv3) Ly.lag_g = q("attn_gate.weight", E, H);   // (hy_v3: no output gate)
         Ly.out = q("attn_output.weight", (int64_t) H * D, E);
         Ly.q_norm = f32("attn_q_norm.weight");
         Ly.k_norm = f32("attn_k_norm.weight");
@@ -903,7 +903,9 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     const size_t total = q35_snap_bytes();   // (the runs below, in this order)
     if (q35_snap_h_ == nullptr) {
         if (restore) return false;
-        if (cudaHostAlloc(&q35_snap_h_, total, cudaHostAllocDefault) != cudaSuccess) {
+        // (hy_v3: no recurrent layer, no window ring - nothing to keep but the position; a buffer all the same, or
+        // a 0-byte allocation leaves the pointer null and no conversation is ever reused or set aside)
+        if (cudaHostAlloc(&q35_snap_h_, std::max(total, (size_t) 64), cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
             q35_snap_h_ = nullptr;
             return false;
@@ -986,8 +988,10 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
         why = "inkling's slots are not covered yet";
         return false;
     }
-    if (g_.laguna) {
-        why = "laguna's window rings are not covered yet";
+    // (hy_v3: laguna's layers with no window - every cache spans the context, FP16 rows of KV heads x 128 as the plain
+    // qwen35 attention's; --kv int8 stays off the slots: its laguna rows are not the qwen35 int8 rows)
+    if (g_.laguna && !(g_.hyv3 && q35_kv_ == 0)) {
+        why = g_.hyv3 ? "hy_v3's slots take the FP16 KV cache only" : "laguna's window rings are not covered yet";
         return false;
     }
     if (g_.raon) {   // (its 4 mHC streams are not in the snapshot, and a kept prefix holds its prompt's effort alpha)
@@ -1126,7 +1130,7 @@ bool Glm5Model::q35_slot_load(const uint8_t* src, uint64_t bytes, int64_t n, std
     cudaSetDevice(dev_);
     if (!kv_ensure(n, err)) return false;   // (elastic KV: the rows the slot brings back)
     cudaDeviceSynchronize();
-    if (q35_snap_h_ == nullptr && cudaHostAlloc(&q35_snap_h_, snap_b, cudaHostAllocDefault) != cudaSuccess) {
+    if (q35_snap_h_ == nullptr && cudaHostAlloc(&q35_snap_h_, std::max(snap_b, (size_t) 64), cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();
         q35_snap_h_ = nullptr;
         err = "the snapshot did not allocate";
@@ -1898,14 +1902,14 @@ bool Glm5Model::fast_laguna_attn(int il, int64_t p64, std::string& err) {
     j[1] = {Ly.ak.q, F->xq, F->x, F->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
     j[2] = {Ly.av.q, F->xq, F->x, F->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
     j[3] = {Ly.lag_g.q, F->xq, F->x, F->lag_gl, nullptr, 1.0f, Ly.lag_g.type, E, H};
-    if (!gf::mv(j, 4, s)) { err = "laguna: the attention projections"; return false; }
+    if (!gf::mv(j, g.hyv3 ? 3 : 4, s)) { err = "laguna: the attention projections"; return false; }
     if (F->prof_on) F->mark("lag_attn_mv");
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     if (dumps) {
         q35_dump(s, "Qcur", il, F->q35_qf, HD);
         q35_dump(s, "Kcur", il, F->q35_k, KV);
         q35_dump(s, "Vcur", il, F->q35_v, KV);
-        q35_dump(s, "attn_gate_proj", il, F->lag_gl, H);
+        if (!g.hyv3) q35_dump(s, "attn_gate_proj", il, F->lag_gl, H);
     }
     const bool swa = Ly.lag_swa;
     const int nr = swa ? g.n_rot_swa : g.n_rot;
@@ -1921,7 +1925,7 @@ bool Glm5Model::fast_laguna_attn(int il, int64_t p64, std::string& err) {
         q35_dump(s, "Qcur_rope", il, F->q35_q, HD);
         q35_dump(s, "attn_out", il, F->q35_ao, HD);
     }
-    lk::gate_rows(F->q35_ao, F->lag_gl, 1, H, s);
+    if (!g.hyv3) lk::gate_rows(F->q35_ao, F->lag_gl, 1, H, s);
     if (F->prof_on) F->mark("lag_attend");
     if (dumps) q35_dump(s, "attn_gated", il, F->q35_ao, HD);
     gf::quantize_q8_1(F->q35_ao, F->q35_aoq, HD, s);

@@ -148,6 +148,7 @@ struct Glm5Geometry {
     // window n_swa) n_rot_swa dims of rope_base_swa plain; pre-norms attn_norm / ffn_norm; dense_lead dense FFN layers;
     // a sigmoid router with exp_probs_b (gating 0, normalised, w_scale); an ungated shared expert; no NextN
     bool laguna = false;
+    bool hyv3 = false;   // hy_v3 (Tencent Hy-MT3): laguna's layers with no output gate (from_gguf_laguna)
     std::vector<int> lag_heads;
     std::vector<char> lag_swa;
     float rope_base_swa = 10000.0f;

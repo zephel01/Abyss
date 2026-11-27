@@ -161,6 +161,8 @@ class Tokenizer:
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
         if pre in ("bailingmoe", "llada-moe"):
             pre = self.pre = "bailingmoe2"
+        if pre == "hunyuan-dense":   # (Tencent Hy-MT3: llama-vocab.cpp gives it hy_v4's three expressions, no clean_spaces)
+            pre = self.pre = "hy_v4"
         if pre not in ("qwen35", "glm4", "glm5", "joyai-llm", "laguna", "hy_v4", "inkling2", "bailingmoe2", "raon"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, joyai-llm, laguna, "
                              "hy_v4, inkling2, bailingmoe2, raon" % pre)

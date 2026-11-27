@@ -127,6 +127,14 @@ top_p 0.95, top_k 20):
 ./setup-deepseek.sh --model raon --download-model        # raon-1-mini-Q4_K_M.gguf (19.7 GB)
 ```
 
+Tencent's Hy-MT3-30B-A3B (beta, NVIDIA, one GPU, text only, a translation model; [Hy-MT3](#hy-mt3-30b-a3b-beta)):
+Tencent's own Q4_K_M (or `--quant Q8_0`, 32.8 GB) for an 8-32 GB GPU (the experts that do not fit go to RAM), with the
+model card's sampling (temperature 0.7, top_p 1.0):
+
+```sh
+./setup-deepseek.sh --model hymt3 --download-model       # Hy-MT3-30B-A3B-Q4_K_M.gguf (19.5 GB)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -1463,6 +1471,33 @@ the same alpha; with another effort it is read again (fast: a prompt runs at tho
 `STRATA_RAON_EFFORT` (a name, `none` or a number) sets the alpha for the CLI and for requests that name none;
 `STRATA_RAON_PROMPT_ATTN=0` reads the prompt's MLA attention a row at a time (a check). Speeds and checks:
 [docs/MODELS](MODELS.md#raon-1-mini-beta-v13211). Not yet: the DFlash drafter, multi-conversation slots, AMD (HIP).
+
+## Hy-MT3-30B-A3B (beta)
+
+The engine runs Tencent's Hy-MT3-30B-A3B, a translation model (GGUF architecture `hy_v3`: 48 layers of GQA attention
+with q/k RMSNorm before NEOX RoPE, a dense first layer, then 128 experts top-8 with a sigmoid router and one ungated
+shared expert; BF16 shared expert, dense FFN, embeddings and output head) token by token and with the batched prompt
+path. `./setup-deepseek.sh --model hymt3` sets up
+[tencent/Hy-MT3-30B-A3B-GGUF](https://huggingface.co/tencent/Hy-MT3-30B-A3B-GGUF)'s `Q4_K_M` (`--quant Q8_0` for the
+other file; checked against Hugging Face's SHA-256), the pack, and `abyss-hymt3-q4_k_m.json` with a 65,536 context and
+temperature 0.7 / top_p 1.0. NVIDIA only: the HIP build compiles the path but it has not run on an AMD GPU. One GPU:
+no layer split. No drafter (the GGUFs have no MTP block); the n-gram drafts stay on.
+
+**Prompts.** Use the model card's prompts, e.g. `Translate the following text into Japanese. Note that you should only
+output the translated result without any additional explanation:\n\n<text>` (into Chinese:
+`将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：\n\n<text>`). The template's default is `no_think`
+(`<think></think>`, the answer at once); a request without `reasoning_effort` keeps it, and the server reads the whole
+answer as content. `reasoning_effort` `low` / `high` pass to the template (it thinks first); `none` is `no_think`.
+The turn ends at `<eos:6124c78e>`.
+
+**Checks** (RTX 5090, 123 GB RAM): every op of layers 0-2 recomputed in float64 from the engine's own inputs matches to
+1e-7, except the GEMVs that round their input to q8_1 (q / o 3-5e-3, the experts 6-9e-3); Q8_0 and Q4_K_M write the same
+first 16 greedy tokens as a float64 forward of the Hugging Face code (ja->en, en->ja, zh->ja); Q4_K_M against Q8_0 over
+3,071 tokens of en / ja / zh text KL 0.041 / 0.047 / 0.037, the same top token 91.6 / 92.7 / 91.8%. Speed (Q4_K_M,
+4K prompt + 512 tokens, median of 3): decode 176 tok/s and a 4K prompt ~10,000 tok/s all in VRAM; held to 12 GB
+(`STRATA_GLM_VRAM_GB=12`) 133 tok/s and ~3,600 tok/s. Conversation slots are on with the default FP16 KV cache (a next
+turn reads only its new tokens, also after another conversation in between); a quantized KV (`--kv`) turns them off.
+Not yet: AMD (HIP).
 
 ## EXL3 quants (GLM-5.3-Flash)
 

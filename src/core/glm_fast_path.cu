@@ -948,7 +948,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.router = b16("ffn_gate_inp.weight");
             }
-            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling || g.raon)) Ly.router_bias = f32("exp_probs_b.bias");   // (hash layers, qwen35moe: none)
+            if (!(g.dsv4() && il < g.hash_layers) && (!g.qwen35() || g.laguna || g.ink || g.ling || g.raon))
+                Ly.router_bias = f32(g.hyv3 ? "exp_probs_b" : "exp_probs_b.bias");   // (hy_v3's GGUFs: no .bias)   // (hash layers, qwen35moe: none)
             if (!g.ink) {   // (inkling: no shared expert)
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
@@ -7495,7 +7496,11 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         const char* v = getenv("STRATA_GLM_SH_LATE");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    const bool late = sh_late && FFs > 0;
+    // a BF16 / F32 shared down (hy_v3's GGUFs keep the shared expert in BF16) reads h as floats, which the fused
+    // gate/up launch does not carry: gate/up late, the SwiGLU in floats and down as its own GEMV (sh_f)
+    const bool sh_f = FFs > 0 && Ly.sh_down.q != nullptr &&
+                      (Ly.sh_down.type == gf::kTypeBF16 || Ly.sh_down.type == gf::kTypeF32);
+    const bool late = (sh_late || sh_f) && FFs > 0;
     int nj = late || FFs == 0 ? 1 : 3;   // (no shared expert: the router alone)
     j[0] = {Ly.router, nullptr, F->x, F->rlog, nullptr, 1.0f, Ly.router_type, g.n_embd, g.n_expert};
     if (nj == 3) {
@@ -7591,7 +7596,14 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         sj[0] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
         sj[1] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
         if (!gf::mv(sj, 2, s)) { err = "glm fast: shared expert"; return false; }
-        gf::sh_swiglu(F->sh_g, F->sh_u, g.lim_shexp(il), FFs, F->sh_hq, s);
+        if (sh_f) {
+            gf::swiglu_f32(F->sh_g, F->sh_u, g.lim_shexp(il), FFs, F->sh_g, s);
+            const gf::MvJob sd = {Ly.sh_down.q, F->sh_hq, F->sh_g, F->sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs,
+                                  g.n_embd};
+            if (!gf::mv(&sd, 1, s)) { err = "glm fast: shared expert down"; return false; }
+        } else {
+            gf::sh_swiglu(F->sh_g, F->sh_u, g.lim_shexp(il), FFs, F->sh_hq, s);
+        }
         if (F->prof_on) F->mark("shexp_mv");
     }
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
@@ -7647,8 +7659,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         if (F->prof_on) F->mark("moe_down");
     } else {
     // (the shared expert's down rides the gate/up launch: sh_out)
-    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.lim_exp(il), F->xq, F->hq, Ly.sh_down.q,
-                    Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s, Ly.up_type);
+    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.lim_exp(il), F->xq, F->hq,
+                    sh_f ? nullptr : Ly.sh_down.q, Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s, Ly.up_type);   // (sh_f: done)
     if (Ly.sh_down.q != nullptr) abl_apply(il, 1, F->sh_out, 1, g.n_embd, s);
     if (F->prof_on) F->mark("moe_gate_up");
     if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // the shared expert behind its sigmoid gate

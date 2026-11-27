@@ -598,7 +598,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count") || g.get("sensenova_loop.block_count"))
         return from_gguf_qwen35(g, out, err) && eog_from_gguf(g, out);
     if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err) && eog_from_gguf(g, out);
-    if (g.get("laguna.block_count")) return from_gguf_laguna(g, out, err) && eog_from_gguf(g, out);
+    if (g.get("laguna.block_count") || g.get("hy_v3.block_count")) return from_gguf_laguna(g, out, err) && eog_from_gguf(g, out);
     if (g.get("hy_v4_flash.block_count")) return from_gguf_hy4(g, out, err) && eog_from_gguf(g, out);
     if (g.get("inkling2_loop.block_count") || g.get("inkling2.block_count"))
         return from_gguf_inkling(g, out, err) && eog_from_gguf(g, out);
@@ -1014,8 +1014,13 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
 // lag_heads the q heads per layer (attention.head_count may be an array), the window layers by
 // attention.sliding_window_pattern (an array, or a period: a layer is full when il % period == 0), gating 0 (sigmoid
 // with exp_probs_b), the dense lead layers' FFN feed_forward_length wide
+// hy_v3 (Tencent Hy-MT3-30B-A3B, llama.cpp src/models/hy-v3.cpp, checked against the HF config): read here too, with
+// hyv3 set - laguna's layers without the per-head output gate, every layer full attention (no window) of
+// attention.head_count heads, RoPE over the whole head (no rope.dimension_count in the GGUF), the dense lead layers told
+// by their missing router (no leading_dense_block_count), the sigmoid router's bias stored as blk.N.exp_probs_b
 bool Glm5Geometry::from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
-    const std::string p = "laguna.";
+    const bool hyv3 = g.get("hy_v3.block_count") != nullptr;
+    const std::string p = hyv3 ? "hy_v3." : "laguna.";
     const auto num = [&](const std::string& key, double def) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -1033,7 +1038,7 @@ bool Glm5Geometry::from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out
     out.head_dim = (int) num("attention.key_length", 128);
     const int v_len = (int) num("attention.value_length", 128);
     out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
-    out.n_rot = (int) num("rope.dimension_count", 64);
+    out.n_rot = (int) num("rope.dimension_count", hyv3 ? out.head_dim : 64);
     out.n_rot_swa = (int) num("rope.dimension_count_swa", out.head_dim);
     out.rope_base = (float) num("rope.freq_base", 500000.0);
     out.rope_base_swa = (float) num("rope.freq_base_swa", out.rope_base);
@@ -1052,6 +1057,20 @@ bool Glm5Geometry::from_gguf_laguna(const strata::GgufFile& g, Glm5Geometry& out
     out.n_shared = out.n_ff_shexp > 0 ? 1 : 0;
     out.n_ff_dense = (int) num("feed_forward_length", 12288);
     out.dense_lead = (int) num("leading_dense_block_count", 1);
+    if (hyv3) {   // (first_k_dense_replace: the layers before the first router)
+        out.hyv3 = true;
+        out.dense_lead = 0;
+        while (out.dense_lead < out.n_layers && g.find("blk." + std::to_string(out.dense_lead) + ".ffn_gate_inp.weight") == nullptr)
+            ++out.dense_lead;
+        if (num("nextn_predict_layers", 0) != 0) {
+            err = "hy_v3: a NextN block in the GGUF (not served yet: Hy-MT3's GGUFs carry none)";
+            return false;
+        }
+        if (out.n_swa != 0 || g.get(p + "rope.scaling.type") != nullptr) {
+            err = "hy_v3: a sliding window or RoPE scaling in the GGUF (Hy-MT3 has neither; not supported)";
+            return false;
+        }
+    }
     out.gating = (int) num("expert_gating_func", 2) == 2 ? 0 : -1;   // (llama.cpp's 2 = sigmoid)
     out.w_scale = (float) num("expert_weights_scale", 1.0);
     out.norm_w = (int) num("expert_weights_norm", 1) != 0 ? 1 : 0;
@@ -4384,7 +4403,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             // deepseek4: a projection the GEMVs serve (the compressors', the indexer's q_b) that the GGUF stored as F16
             // comes as a BF16 row (iq_pack.py --compat-bf16) and runs on the BF16 GEMV
             // hy4: a projection a GGUF keeps in BF16 (the llama.cpp-fork conversions) runs on the BF16 GEMV too
-            if (g_.dsv4() || g_.is_hy4())
+            // hy_v3: the BF16 shared expert, dense lead FFN and (Q8_0 file) attn_k / attn_v too
+            if (g_.dsv4() || g_.is_hy4() || g_.hyv3)
                 ws_map_[r.name] = strata::core::WSlot{nullptr, strata::kernels::glmf::kTypeBF16, (const void*) ((uint8_t*) w_arena_ + at),
                                                       (int64_t) t->shape[0], (int64_t) (t->shape.size() > 1 ? t->shape[1] : 1)};
             at += (r.bytes + 255u) & ~(uint64_t) 255u;

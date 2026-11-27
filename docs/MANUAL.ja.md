@@ -124,6 +124,14 @@ top_p 0.95、top_k 20）:
 ./setup-deepseek.sh --model raon --download-model        # raon-1-mini-Q4_K_M.gguf（19.7 GB）
 ```
 
+Tencent の Hy-MT3-30B-A3B（ベータ、NVIDIA、GPU 1 枚、テキストだけ、翻訳モデル。[Hy-MT3](#hy-mt3-30b-a3bベータ)）: 8〜32 GB の
+GPU 向けの Tencent 自身の Q4_K_M（`--quant Q8_0` で 32.8 GB の版。GPU に載らないエキスパートは RAM へ）。サンプリングは
+モデルカードの値（temperature 0.7、top_p 1.0）:
+
+```sh
+./setup-deepseek.sh --model hymt3 --download-model       # Hy-MT3-30B-A3B-Q4_K_M.gguf（19.5 GB）
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -1389,6 +1397,33 @@ SiTU の FFN の 128 エキスパート）を、トークン経路とバッチ�
 毎秒数千トークンなので速い）。`STRATA_RAON_EFFORT`（名前、`none`、数値）は CLI と、指定のないリクエストの alpha を決めます。
 `STRATA_RAON_PROMPT_ATTN=0` はプロンプトの MLA attention を 1 行ずつ計算します（確認用）。速度と確認:
 [docs/MODELS](MODELS.ja.md#raon-1-miniベータv13211)。まだのもの: DFlash ドラフター、複数の会話のスロット、AMD（HIP）。
+
+## Hy-MT3-30B-A3B（ベータ）
+
+エンジンは Tencent の翻訳モデル Hy-MT3-30B-A3B（GGUF のアーキテクチャ `hy_v3`: 48 層の GQA attention で、q/k の RMSNorm を
+NEOX の RoPE の前にかける。先頭の 1 層は dense、そのあとは 128 エキスパートから top-8、ルーターは sigmoid、ゲートのない共有
+エキスパートが 1 つ。共有エキスパート、dense の FFN、埋め込み、出力ヘッドは BF16）を、トークン経路とバッチのプロンプト経路で
+動かします。`./setup-deepseek.sh --model hymt3` で
+[tencent/Hy-MT3-30B-A3B-GGUF](https://huggingface.co/tencent/Hy-MT3-30B-A3B-GGUF) の `Q4_K_M`（もう 1 つのファイルは
+`--quant Q8_0`。Hugging Face の SHA-256 で確認）、パック、`abyss-hymt3-q4_k_m.json`（文脈 65,536、temperature 0.7 /
+top_p 1.0）が入ります。NVIDIA だけ: HIP ビルドはこの経路をコンパイルしますが、AMD の GPU ではまだ動かしていません。
+GPU 1 枚: 層の分割はしません。ドラフターはありません（GGUF に MTP のブロックがない）。n-gram の下書きは使います。
+
+**プロンプト。** モデルカードのプロンプトを使います。例: `Translate the following text into Japanese. Note that you
+should only output the translated result without any additional explanation:\n\n<文>`（中国語へは
+`将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：\n\n<文>`）。テンプレートの既定は `no_think`
+（`<think></think>` ですぐ答える）で、`reasoning_effort` のないリクエストはそのままです。サーバーは答え全体を content として
+読みます。`reasoning_effort` の `low` / `high` はテンプレートに渡ります（先に考える）。`none` は `no_think` です。
+ターンは `<eos:6124c78e>` で終わります。
+
+**確認**（RTX 5090、RAM 123 GB）: 層 0〜2 の演算をエンジン自身の入力から float64 で計算し直すと 1e-7 まで一致します
+（入力を q8_1 に丸める GEMV だけ大きく、q / o が 3〜5e-3、エキスパートが 6〜9e-3）。Q8_0 と Q4_K_M の greedy の翻訳の最初の 16 トークンは、
+Hugging Face のコードの float64 の forward と同じです（ja→en、en→ja、zh→ja）。Q4_K_M の Q8_0 に対する KL は、英語 / 日本語 /
+中国語の 3,071 トークンで 0.041 / 0.047 / 0.037、top-1 の一致は 91.6 / 92.7 / 91.8%。速度（Q4_K_M、4K のプロンプト + 512
+トークン、3 回の中央値）: 全部 VRAM で生成 176 tok/s、4K のプロンプト約 10,000 tok/s。12 GB に絞ると
+（`STRATA_GLM_VRAM_GB=12`）133 tok/s と約 3,600 tok/s。会話のスロットは既定の FP16 の KV キャッシュで有効です（次のターンは
+新しいトークンだけを読みます。間に別の会話が入っても同じ）。KV を量子化する（`--kv`）とスロットは使いません。
+まだのもの: AMD（HIP）。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

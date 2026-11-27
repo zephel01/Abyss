@@ -116,6 +116,9 @@ class ChatTemplate:
         # <｜reasoning_mode｜>reasoning_effort:<level>, the think tags are <think:opensource> / </think:opensource>
         self.hy4 = "reasoning_mode" in self.source and "'no_think'" in self.source
         self.hy4_max = self.hy4 and "'max'" in self.source
+        # Tencent Hy-MT3 (the same family's template, plain <think> tags - HYTK '' - and no 'max'): a translation model
+        # whose template defaults to no_think; a request without a level keeps that default (Hy4's is high)
+        self.hymt = self.hy4 and "set HYTK = ''" in self.source and not self.hy4_max
         # Inkling 2: reasoning_effort none / minimal / low / medium / high / xhigh / max (0 .. 0.99, 0.9 when absent)
         # goes into a system message "Thinking effort level: <n>"; thinking off is "none" (the model may still think
         # briefly - the server reads its messages either way)
@@ -149,7 +152,8 @@ class ChatTemplate:
             kwargs.pop("effort_raw", None)
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
-            kwargs["reasoning_effort"] = ("no_think" if off or level in ("none", "no_think") else
+            kwargs["reasoning_effort"] = ("no_think" if off or level in ("none", "no_think") or (self.hymt and level is None)
+                                          else "low" if self.hymt and level == "low" else
                                           "max" if level == "max" and self.hy4_max else "high")
             off = False   # (the template closes its own think block for no_think)
         elif self.ink:

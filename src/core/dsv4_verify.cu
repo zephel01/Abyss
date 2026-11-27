@@ -861,7 +861,12 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     j[2] = {Ly.sh_up.q, (uint8_t*) V->xq + tb * q8e, nullptr, V->sh_u + (size_t) tb * FFs, nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     // the shared expert's gate/up after the routes, as the token path does (fast_moe, STRATA_GLM_SH_LATE)
-    const bool late = verify_sh_late() && FFs > 0;
+    // a BF16 / F32 shared expert (hy_v3's GGUFs): its GEMVs read floats - a column at a time below (fast_moe's sh_f),
+    // its down not in the experts' launches
+    const bool sh_f = FFs > 0 && Ly.sh_down.q != nullptr &&
+                      (Ly.sh_down.type == gf::kTypeBF16 || Ly.sh_down.type == gf::kTypeF32);
+    const bool late = (verify_sh_late() || sh_f) && FFs > 0;
+    const void* sh_dn = sh_f ? nullptr : Ly.sh_down.q;   // (the down the experts' launches compute)
     if (!router_done && !verify_moe_router(il, tb, T, s, err)) return false;
     const bool lane = F->cpu_plan != 0ull && F->cpu_fmt[(size_t) il].n_ff > 0;
     static const int promote_min = [] {
@@ -926,7 +931,20 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                                     // tail skip as the token path's)
         ++F->expected;
     }
-    if (late) {
+    if (late && sh_f) {
+        for (int t = tb; t < tb + T; ++t) {
+            float* sg = V->sh_g + (size_t) t * FFs;
+            gf::MvJob sj[2] = {{Ly.sh_gate.q, (uint8_t*) V->xq + t * q8e, V->x + (size_t) t * E, sg, nullptr, 1.0f,
+                                Ly.sh_gate.type, E, FFs},
+                               {Ly.sh_up.q, (uint8_t*) V->xq + t * q8e, V->x + (size_t) t * E, V->sh_u + (size_t) t * FFs,
+                                nullptr, 1.0f, Ly.sh_up.type, E, FFs}};
+            if (!gf::mv(sj, 2, s)) { err = "verify: shared expert"; return false; }
+            gf::swiglu_f32(sg, V->sh_u + (size_t) t * FFs, lim_s, FFs, sg, s);
+            const gf::MvJob sd = {Ly.sh_down.q, (uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8, sg,
+                                  V->sh_out + (size_t) t * E, nullptr, 1.0f, Ly.sh_down.type, FFs, E};
+            if (!gf::mv(&sd, 1, s)) { err = "verify: shared expert down"; return false; }
+        }
+    } else if (late) {
         if (!(g.arch == 0 || g.ink || g.ling ? glm_mvn(j + 1, 2, T, s) : g.q4x ? q4x_mvn(j + 1, 2, T, s) : g.dsv4() ? ds_mvn(j + 1, 2, T, s) : gf::mvn(j + 1, 2, T, s))) { err = "deepseek4 verify: shared expert"; return false; }
         gf::sh_swiglu(V->sh_g + (size_t) tb * FFs, V->sh_u + (size_t) tb * FFs, lim_s, T * FFs,
                       (uint8_t*) V->sh_hq + (size_t) tb * (FFs / 32) * kQ8, s);
@@ -1003,7 +1021,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         if (done_ev != nullptr && t == tb + T - 1) cudaEventRecord(done_ev, s);
         if (cols) continue;   // (the batched launches below; the check runs these after them)
         gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, lim_e, (const uint8_t*) V->xq + (size_t) t * q8e,
-                        hq, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
+                        hq, sh_dn, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * (FFs / 32) * kQ8,
                         FFs, sh_out, s, Ly.up_type);
         if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, 1, E, s);
         if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)   // (as fast_moe)
@@ -1017,7 +1035,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         float* sh_out = V->sh_out + (size_t) tb * E;
         void* hq = (uint8_t*) V->hq + (size_t) tb * V->hq_n;
         gf::moe_gate_up_cols(Ly.gu_type, V->cols_d + tb, T, k, E, g.n_ff_exp, lim_e,
-                             (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, Ly.sh_down.q, Ly.sh_down.type,
+                             (const uint8_t*) V->xq + (size_t) tb * q8e, q8e, hq, V->hq_n, sh_dn, Ly.sh_down.type,
                              (const uint8_t*) V->sh_hq + (size_t) tb * shq, shq, FFs, sh_out, E, s, Ly.nv_scale,
                              Ly.up_type);
         if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_out, T, E, s);
@@ -1033,7 +1051,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
                 float* sh_o = V->sh_out + (size_t) t * E;
                 void* hq1 = (uint8_t*) V->hq + (size_t) t * V->hq_n;
                 gf::moe_gate_up(Ly.gu_type, md, k, E, g.n_ff_exp, lim_e, (const uint8_t*) V->xq + (size_t) t * q8e,
-                                hq1, Ly.sh_down.q, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s,
+                                hq1, sh_dn, Ly.sh_down.type, (const uint8_t*) V->sh_hq + (size_t) t * shq, FFs, sh_o, s,
                                 Ly.up_type);
                 if (Ly.sh_down.q != nullptr) abl_apply(il, 1, sh_o, 1, E, s);
                 if (g.qwen35() && Ly.sh_down.q != nullptr && Ly.sh_gate_w != nullptr)
@@ -1800,7 +1818,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             j[1] = {Ly.ak.q, V->xq, V->x, V->q35_k, nullptr, 1.0f, Ly.ak.type, (int) E, KV};
             j[2] = {Ly.av.q, V->xq, V->x, V->q35_v, nullptr, 1.0f, Ly.av.type, (int) E, KV};
             j[3] = {Ly.lag_g.q, V->xq, V->x, gl, nullptr, 1.0f, Ly.lag_g.type, (int) E, H};
-            if (!gf::mvn(j, 4, T, s)) { err = "laguna verify: the attention projections"; return false; }
+            if (!gf::mvn(j, g.hyv3 ? 3 : 4, T, s)) { err = "laguna verify: the attention projections"; return false; }
             const bool swa = Ly.lag_swa;
             lk::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, H, g.attn_head_kv,
                                swa ? g.n_rot_swa : g.n_rot, swa ? F->lag_freq_swa : F->lag_freq,
@@ -1808,7 +1826,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
                                nullptr, q35_kv_);
             lk::attn(V->q35_q, Ly.kc, Ly.vc, Ly.lag_ring, H, g.attn_head_kv, p0, T, swa ? g.n_swa : 0,
                      1.0f / std::sqrt((float) lk::kHeadDim), V->lag_part, lk::kMaxSplits, V->q35_ao, s, q35_kv_);
-            lk::gate_rows(V->q35_ao, gl, T, H, s);
+            if (!g.hyv3) lk::gate_rows(V->q35_ao, gl, T, H, s);
             gf::quantize_q8_1(V->q35_ao, V->q35_aoq, T * HDl, s);
             gf::MvJob o = {Ly.out.q, V->q35_aoq, V->q35_ao, V->mixer, nullptr, 1.0f, Ly.out.type, HDl, (int) E};
             if (!gf::mvn(&o, 1, T, s)) { err = "laguna verify: attn_output"; return false; }
