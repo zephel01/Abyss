@@ -256,6 +256,22 @@ run each (not a median of 3).
 | --- | ---: | --- | --- | --- |
 | `Q4_K_M` (KRAFTON's) | 19.7 GB | token path KL 0.0034 / 0.017 / 0.0037 (raw / en / ja), prompt path 0.0009 / 0.0066 / 0.0041, the same top token at every position; the prompt path against the token path over 1,024 tokens 0.0015; greedy 12 tokens the same as the reference; a needle near the start of a 4K / 8K / 16K chat found; English and Japanese chats with thinking on and off answer right | decode 173 tok/s all in VRAM (205 after a short prompt), 169 / 162 / 142 held to 16 / 12 / 8 GB (`STRATA_GLM_VRAM_GB`, the rest in RAM); prompts 4K 6,480 / 8K 6,330 / 16K 5,220 tok/s, 4K at 16 / 12 / 8 GB 3,610 / 3,130 / 2,500 (a 4K prompt + 512) | an 8-32 GB NVIDIA GPU + 32 GB RAM or more; not measured: a 32 GB-RAM PC, other GPUs, AMD |
 
+### GigaChat4-37B-A4B (beta)
+
+ai-sage's GigaChat4-37B-A4B (GGUF architecture `gigachat4`): 24 gated delta-net layers and 8 MLA layers with a DSA
+indexer (past 2,048 positions a query attends to its 2,048 best), every norm a rank-16 GatedNorm, 192 experts (top 8)
+plus an ungated shared one, a logit softcap. Abyss implements it from the model's own code (read, not run). The file is
+ai-sage's [Q4_K_M](https://huggingface.co/ai-sage/GigaChat4-37B-A4B-GGUF) (`./setup-deepseek.sh --model giga4`;
+[MANUAL](MANUAL.md#gigachat4-37b-a4b-beta)); **license: noncommercial use by individuals**. Quality: KL(reference ||
+engine) against a float64 numpy forward written from the model code, on the same Q4_K_M weights dequantized
+(`recipes/giga4/ref.py`), over a raw English prompt (17 positions), English / Russian / Japanese chats (34-36 each) and
+2,303 positions of plain text (`docs/MANUAL.md`'s start), which crosses the indexer's 2,048. Speeds: RTX 5090 (Gen4 x4),
+123 GB RAM, iGPU lane off.
+
+| file | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `Q4_K_M` (ai-sage's) | 23.3 GB | token path KL 0.0013 / 0.0081 / 0.0139 / 0.0019 (raw / en / ru / ja), the same top token at 97-100% of positions (the rest: near-tie expert choices); 2,303 positions KL 0.0067, 0.0087 past 2,048; prompt path 0.0007 / 0.0079 / 0.0222 / 0.0008, 2,303 positions 0.0050 (0.0045 past 2,048); the indexer's 2,048 cells the same as the reference's for 2,029-2,047 of 2,048 (8 layers x 7 positions); greedy 12 tokens the same as the reference; English, Russian and Japanese chats with thinking on and off answer right, a tool call parsed | decode 115.9 tok/s all in VRAM (151 after a 12-token prompt), 96.5 / 85.3 held to 12 / 8 GB (`STRATA_GLM_VRAM_GB`, the rest in RAM); prompts 4K 7,380 tok/s, 16K 8,342 (decode 96.6 after it), 4K at 12 / 8 GB 2,854 / 2,305 (a 4K prompt + 512, median of 3) | an 8-32 GB NVIDIA GPU + 32 GB RAM or more; not measured: other GPUs, AMD |
+
 ### Ternary Bonsai 2.5 27B (beta, v1.3.205)
 
 prism-ml's Ternary-Bonsai-2.5-27B: Qwen3.8-27B with ternary weights in a blockwise Hadamard basis ([MANUAL](MANUAL.md#ternary-bonsai-25-27b-beta)).

@@ -135,6 +135,14 @@ model card's sampling (temperature 0.7, top_p 1.0):
 ./setup-deepseek.sh --model hymt3 --download-model       # Hy-MT3-30B-A3B-Q4_K_M.gguf (19.5 GB)
 ```
 
+ai-sage's GigaChat4-37B-A4B (beta, NVIDIA, one GPU, text only; [GigaChat4-37B-A4B](#gigachat4-37b-a4b-beta)): ai-sage's
+own Q4_K_M for an 8-32 GB GPU (the experts that do not fit go to RAM), with the sampling of the model card's evals
+(temperature 1.0, top_p 0.95). **License: noncommercial use by individuals only** (the repo's LICENSE.txt):
+
+```sh
+./setup-deepseek.sh --model giga4 --download-model       # GigaChat4-37B-A4B-Q4_K_M.gguf (23.3 GB)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -1498,6 +1506,24 @@ first 16 greedy tokens as a float64 forward of the Hugging Face code (ja->en, en
 (`STRATA_GLM_VRAM_GB=12`) 133 tok/s and ~3,600 tok/s. Conversation slots are on with the default FP16 KV cache (a next
 turn reads only its new tokens, also after another conversation in between); a quantized KV (`--kv`) turns them off.
 Not yet: AMD (HIP).
+
+## GigaChat4-37B-A4B (beta)
+
+The engine runs ai-sage's GigaChat4-37B-A4B (GGUF architecture `gigachat4`: 24 gated delta-net layers and 8 MLA layers
+with a DSA indexer - past 2,048 positions each query attends to the indexer's best 2,048 - every norm a GatedNorm,
+192 experts top 8 plus a shared one). `./setup-deepseek.sh --model giga4` sets up
+[ai-sage/GigaChat4-37B-A4B-GGUF](https://huggingface.co/ai-sage/GigaChat4-37B-A4B-GGUF)'s `Q4_K_M` (the file in the
+repo's `GigaChat4-37B-A4B-Q4_K_M` folder, checked against Hugging Face's SHA-256), the pack, and
+`abyss-giga4-q4_k_m.json` (temperature 1.0 / top_p 0.95). **License:** ai-sage's noncommercial license for individuals
+(`LICENSE.txt` in the repo): personal, noncommercial use only - read it before you use the model. NVIDIA only: the HIP
+build compiles the path but it has not run on an AMD GPU. One GPU: no layer split.
+
+**Thinking on / off.** The template's own `reasoning` variable: on unless a request turns it off with
+`reasoning_effort: "none"`, `chat_template_kwargs: {"enable_thinking": false}` or the model card's
+`chat_template_kwargs: {"reasoning": false}`; off ends the prompt with an empty `<think></think>`. Tool calls (the
+model's `<｜GCML｜tool_calls>` blocks) come back as OpenAI / Anthropic tool calls. Speeds and checks:
+[docs/MODELS](MODELS.md#gigachat4-37b-a4b-beta). Not yet: the built-in MTP drafter, multi-conversation slots, AMD (HIP;
+its build would read prompts token by token).
 
 ## EXL3 quants (GLM-5.3-Flash)
 

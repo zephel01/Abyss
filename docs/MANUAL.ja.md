@@ -132,6 +132,14 @@ GPU 向けの Tencent 自身の Q4_K_M（`--quant Q8_0` で 32.8 GB の版。GPU
 ./setup-deepseek.sh --model hymt3 --download-model       # Hy-MT3-30B-A3B-Q4_K_M.gguf（19.5 GB）
 ```
 
+ai-sage の GigaChat4-37B-A4B（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[GigaChat4-37B-A4B](#gigachat4-37b-a4bベータ)）: 8〜32 GB の
+GPU 向けの ai-sage 自身の Q4_K_M（GPU に入らないエキスパートは RAM へ）。サンプリングはモデルカードの評価のもの（temperature 1.0、
+top_p 0.95）。**ライセンス: 個人の非商用の利用だけ**（リポジトリの LICENSE.txt）:
+
+```sh
+./setup-deepseek.sh --model giga4 --download-model       # GigaChat4-37B-A4B-Q4_K_M.gguf（23.3 GB）
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -1424,6 +1432,23 @@ Hugging Face のコードの float64 の forward と同じです（ja→en、en�
 （`STRATA_GLM_VRAM_GB=12`）133 tok/s と約 3,600 tok/s。会話のスロットは既定の FP16 の KV キャッシュで有効です（次のターンは
 新しいトークンだけを読みます。間に別の会話が入っても同じ）。KV を量子化する（`--kv`）とスロットは使いません。
 まだのもの: AMD（HIP）。
+
+## GigaChat4-37B-A4B（ベータ）
+
+エンジンは ai-sage の GigaChat4-37B-A4B（GGUF のアーキテクチャ `gigachat4`: ゲート付きデルタネット 24 層と、DSA インデクサ付きの
+MLA 8 層。2,048 位置を超えると、各クエリはインデクサが選んだ上位 2,048 位置を見ます。すべての norm が GatedNorm、192 エキスパートの
+上位 8 と共有 1）を動かします。`./setup-deepseek.sh --model giga4` で
+[ai-sage/GigaChat4-37B-A4B-GGUF](https://huggingface.co/ai-sage/GigaChat4-37B-A4B-GGUF) の `Q4_K_M`（リポジトリの
+`GigaChat4-37B-A4B-Q4_K_M` フォルダのファイル。Hugging Face の SHA-256 で確かめます）が入り、パックし、`abyss-giga4-q4_k_m.json`
+（temperature 1.0 / top_p 0.95）を書きます。**ライセンス:** ai-sage の個人向け非商用ライセンス（リポジトリの `LICENSE.txt`）。
+個人の非商用の利用だけです。使う前に読んでください。NVIDIA だけ: HIP ビルドは経路をコンパイルしますが、AMD の GPU ではまだ動かして
+いません。GPU 1 枚: 層の分割はありません。
+
+**思考のオン／オフ。** テンプレート自身の `reasoning` 変数です。既定はオンで、`reasoning_effort: "none"`、
+`chat_template_kwargs: {"enable_thinking": false}`、またはモデルカードの `chat_template_kwargs: {"reasoning": false}` でオフ。
+オフのときはプロンプトが空の `<think></think>` で終わります。ツール呼び出し（モデルの `<｜GCML｜tool_calls>` ブロック）は
+OpenAI / Anthropic のツール呼び出しとして返ります。速度と確認: [docs/MODELS](MODELS.ja.md#gigachat4-37b-a4bベータ)。まだのもの:
+内蔵の MTP ドラフター、複数の会話のスロット、AMD（HIP。そのビルドではプロンプトを 1 トークンずつ読みます）。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

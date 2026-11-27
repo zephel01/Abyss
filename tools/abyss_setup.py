@@ -1630,6 +1630,15 @@ def main() -> int:
         S.say("  (4K prompt + 512, one run each, 123 GB RAM; a 32 GB-RAM PC and other GPUs are not measured)")
         if S.ram_gb() < 30:
             S.warn("Raon-1 mini keeps the experts that do not fit the GPU in RAM: with under 32 GB of RAM it is not measured")
+    elif a.model == "giga4":
+        S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: the experts that do not fit the GPU go to RAM)")
+        S.say("  GigaChat4-37B-A4B on an RTX 5090 decoded 116 tok/s all in VRAM, 97 / 85 held to 12 / 8 GB;")
+        S.say("  the 4K prompt 7,380 / 2,850 / 2,310 tok/s")
+        S.say("  (4K prompt + 512, median of 3, 123 GB RAM; a 32 GB-RAM PC and other GPUs are not measured)")
+        S.say("  License: noncommercial use by individuals only (LICENSE.txt in the repo)")
+        if S.ram_gb() < 30:
+            S.warn("GigaChat4-37B-A4B keeps the experts that do not fit the GPU in RAM: with under 32 GB of RAM it is not "
+                   "measured")
     elif a.model == "hy4":
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB, made for a 32 GB GPU + 96 GB RAM: the experts "
              "that do not fit there and the Engram table are read from the SSD - keep the model on a fast NVMe)")
