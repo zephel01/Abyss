@@ -1691,7 +1691,7 @@ def main() -> int:
              else (" (MiMo-V2.6-Distill-Qwen-9B drafts with Qwen3.5-9B's NextN block, MTP/)" if mtp else
                    " (MiMo-V2.6-Distill-Qwen-9B: no draft block - n-gram drafts)") if a.model in ("mimo-9b", "mimo-9b-qsa")
              else " (SenseNova-Loop-9B: no draft block - n-gram drafts)" if a.model == "sensenova-loop-9b"
-             else " (Ling-3.2-air: its MTP block is not used yet)" if a.model == "ling32air"
+             else " (Ling-3.2-air: its MTP block drafts opt-in, STRATA_LING_MTP - docs/MANUAL.md)" if a.model == "ling32air"
              else " (Hy4-flash: no drafter yet - the DFly2 drafter is not in the file)" if a.model == "hy4"
              else " (Raon-1 mini: the repo's DFlash drafter is not used yet)" if a.model == "raon"
              else " (MemT: drafting is off - the draft checks do not read the memory)" if model.get("nvidia_only")
