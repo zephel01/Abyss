@@ -18,6 +18,13 @@
 //     start, f_rnn = mix(3) at pos - 1.  The pick is the argmax (ties to the lower id, NaN as -inf) over each row's
 //     candidates: the top 16 of each of 64 vocabulary chunks of W_lm (y_s + b) (1024 a row), scored exactly;
 //     its confidence the softmax over the candidates' softcapped scores.
+// The newer layout (unsloth's since 2026-11-23, ISTA-DASLab's GSQ-RCO repo: dflash.has_markov_context, markov_w2, no
+// dspark_fuse) is the same checkpoint exported another way (Abyss-tools worklog/2026-11-27_inkling-dspark-v2.md):
+// blk.i.ctx_mix / markov_ctx_mix the fuse rows already softmaxed, blk.i.ctx_norm / markov_ctx_norm the dflare norms,
+// markov_w2 = W_lm hidden_out folded at conversion (the vocabulary's 200058 rows) with markov_w2.bias = W_lm hidden_out.b,
+// token_embd_norm the target's, mask_embd the mask row once a block row, sliding_window 1025 = the 1024 window + 1.
+// Read by tensor presence (v2): F is markov_w2 (no fold at load), the head's logits W_lm y_s + markov_w2.bias (-inf past
+// the vocabulary), markov_w1 / joint_proj / mask_embd any type the host dequantizes (Q8_0, BF16, F32) to FP16 / F32.
 // The context follows the sequence as DFlash 2's does (dflash2.cu): the token path, the verify window (the kept
 // columns, at spec_rewind) and the prompt path leave their taps (ink_tap accumulates the four mixes), inkd_commit
 // turns them into ring rows.
@@ -82,9 +89,16 @@ struct IkState {
     Alpha al{};
     float *out_norm = nullptr, *mk_norm = nullptr, *mask = nullptr, *ho_b = nullptr, *jb = nullptr;
     uint16_t *w1 = nullptr, *wsta = nullptr, *wdt = nullptr;   // BF16 bits: markov_w1 [V][256]; joint_proj's halves
-    __half* F = nullptr;                                             // the fold [V][256]
+    __half* F = nullptr;                                             // the fold [Vh][256]
     double* inv = nullptr;                                           // the RoPE frequencies [64]
-    int ff = 9216, n_max = kND, V = 0, ctx_g = 32768;
+    // the newer layout (v2): markov_w1 FP16 [Vh][256], joint_proj's halves F32 (wdt_f [512][768], wsta_f [768][4608]),
+    // markov_w2.bias [Vh]; mask_ld the mask rows' stride (0: one row for all)
+    bool v2 = false;
+    __half* w1h = nullptr;
+    float *wdt_f = nullptr, *wsta_f = nullptr, *w2b = nullptr;
+    const float* tok_norm = nullptr;                                 // (null: the target's token_embd_norm)
+    int mask_ld = 0;
+    int ff = 9216, n_max = kND, V = 0, Vh = 0, ctx_g = 32768;        // Vh: the vocabulary rows the head scores
     float eps = 1e-6f, softcap = 30.0f;
     // the taps' accumulators: acc_g [rows_g][E] (layer 1's), acc_l [kTail][3][E] (layers 0, 2, the Markov head's)
     float *acc_g = nullptr, *acc_l = nullptr;
@@ -147,6 +161,10 @@ __device__ float block_sum(float v, float* sh) {
 }
 
 __device__ __forceinline__ float bf16f(uint16_t b) { return __uint_as_float((uint32_t) b << 16); }
+// the Markov chain's weights: BF16 bits (the older layout), FP16 or F32 (the newer one's, dequantized at load)
+__device__ __forceinline__ float ldw(uint16_t b) { return bf16f(b); }
+__device__ __forceinline__ float ldw(__half h) { return __half2float(h); }
+__device__ __forceinline__ float ldw(float f) { return f; }
 
 // a q8_1 block (glm_fast's layout: the scale and the sum as FP16, 32 int8) from 32 values held one per lane
 struct Q81 {
@@ -411,6 +429,15 @@ __global__ void k_bias_q8(const float* __restrict__ x, const float* __restrict__
     }
 }
 
+// the newer layout's head: logits[r][c] += b[c] for c < Vh, -inf past it (the target's padded rows); n = rows * V
+__global__ void k_logit_bias(float* __restrict__ logits, int V, int Vh, const float* __restrict__ b, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int c = (int) (i % V);
+        logits[i] = c < Vh ? logits[i] + b[c] : -INFINITY;
+    }
+}
+
 // rows [r][V] -> each chunk's top kTopK (value, index): the chunk's floats in shared memory, kTopK block argmaxes
 // (ties to the lower index, NaN as -inf)
 __global__ void __launch_bounds__(256) k_topk_part(const float* __restrict__ logits, int V, int chunk,
@@ -456,8 +483,9 @@ __global__ void __launch_bounds__(256) k_topk_part(const float* __restrict__ log
 // the state's update, latent, each candidate's score cv + F[id] . latent, the argmax (ties to the lower id, NaN -inf)
 // and its confidence (the softmax over the candidates' softcapped scores); prev = the pick.  out: the drafts, conf
 constexpr int kMkT = 1024;
+template <typename TD, typename TW>
 __global__ void __launch_bounds__(kMkT) k_markov(const float* __restrict__ zs, const float* __restrict__ jb,
-                                                 const uint16_t* __restrict__ wdt, const uint16_t* __restrict__ w1,
+                                                 const TD* __restrict__ wdt, const TW* __restrict__ w1,
                                                  const __half* __restrict__ F, const float* __restrict__ cv,
                                                  const int* __restrict__ ci, int nc, int nd, const int* __restrict__ y,
                                                  float softcap, int V, int* __restrict__ out, float* __restrict__ conf) {
@@ -473,7 +501,7 @@ __global__ void __launch_bounds__(kMkT) k_markov(const float* __restrict__ zs, c
         const int prev = prev_s;
         if (t < kRank) {
             xin[t] = st[t];
-            xin[kRank + t] = prev >= 0 && prev < V ? bf16f(w1[(size_t) prev * kRank + t]) : 0.0f;
+            xin[kRank + t] = prev >= 0 && prev < V ? ldw(w1[(size_t) prev * kRank + t]) : 0.0f;
         }
         __syncthreads();
         if (t < kZ) {   // (4 sums in flight: the rows' loads overlap)
@@ -481,7 +509,7 @@ __global__ void __launch_bounds__(kMkT) k_markov(const float* __restrict__ zs, c
 #pragma unroll 4
             for (int k = 0; k < 2 * kRank; k += 4) {
 #pragma unroll
-                for (int u = 0; u < 4; ++u) a4[u] += bf16f(wdt[(size_t) (k + u) * kZ + t]) * xin[k + u];
+                for (int u = 0; u < 4; ++u) a4[u] += ldw(wdt[(size_t) (k + u) * kZ + t]) * xin[k + u];
             }
             z[t] = zs[(size_t) s * kZ + t] + jb[t] + ((a4[0] + a4[1]) + (a4[2] + a4[3]));
         }
@@ -576,8 +604,11 @@ int64_t env_i(const char* n, int64_t def) {
 // finds unsloth's drafter there too)
 std::string Glm5Model::inkd_find() const {
     namespace fs = std::filesystem;
-    // unsloth's file under kName is the newer dflash layout since 2026-11-23 (inkd_load says so and runs without
-    // it); the layout read here is kept there as kOld, which wins when both sit in one place
+    // unsloth's file under kName is the newer dflash layout since 2026-11-23 (ISTA-DASLab's GSQ-RCO repo ships the
+    // same layout under that name); the older layout is kept there as kOld.  inkd_load reads both; kOld wins when both
+    // sit in one place - measured on par (RTX 5090, 512 tokens, median of 3 a prompt: Q4_K_XL code 221.9 / 232.0,
+    // edit 257.4 / 244.5; GSQ-RCO IQ3_S code 231.8 / 223.9, edit 259.7 / 263.4 tok/s old / new), the older's draft
+    // 0.05 ms shorter (1.13 / 1.18 ms), and the setups that have it keep what they ran
     static const char* kOld = "dspark-Inkling-2-Mini-Q8_0_Old.gguf";
     static const char* kName = "dspark-Inkling-2-Mini-Q8_0.gguf";
     if (pack_dir_.empty()) return "";
@@ -658,10 +689,16 @@ bool Glm5Model::inkd_load(std::string& err) {
     };
     const strata::MetaValue* arch = G.get("general.architecture");
     if (arch == nullptr || arch->s != "dflash") return refuse("not a dflash GGUF");
-    if (G.find("dspark_fuse.weight") == nullptr && G.find("markov_w2.weight") != nullptr)   // (unsloth's since 11-23)
-        return refuse(std::string(path) + " is the newer dflash drafter layout (markov_w2, no dspark_fuse), which Abyss "
-                      "does not read yet - use unsloth's dspark-Inkling-2-Mini-Q8_0_Old.gguf (beside the pack, or "
-                      "STRATA_INK_DSPARK=<file>), or run without a drafter (STRATA_INK_DSPARK=0)");
+    // the layout by its tensors: the newer one (markov_w2, per-layer ctx_mix, no dspark_fuse) needs the Markov head's
+    // context input (has_markov_context: f_rnn, joint_proj's 5120 columns)
+    D->v2 = G.find("dspark_fuse.weight") == nullptr && G.find("markov_w2.weight") != nullptr &&
+            G.find("blk.0.ctx_mix.weight") != nullptr;
+    if (D->v2) {
+        const strata::MetaValue* mc = G.get("dflash.has_markov_context");
+        if (mc == nullptr || !(mc->is_num() ? mc->num() != 0.0 : mc->s == "true"))
+            return refuse(std::string(path) + ": the newer dflash layout without dflash.has_markov_context (the Markov "
+                          "head's context input), which this drafter path does not read");
+    }
     const strata::MetaValue* tl = G.get("dflash.target_layers");
     static const int kTaps[4] = {5, 23, 41, 48};
     bool taps_ok = tl != nullptr && tl->items.size() == 4;
@@ -672,11 +709,19 @@ bool Glm5Model::inkd_load(std::string& err) {
     D->eps = (float) num("dflash.attention.layer_norm_rms_epsilon", 1e-6);
     D->softcap = (float) num("dflash.final_logit_softcapping", 30.0);
     const double rope_base = num("dflash.rope.freq_base", 1e6);
+    // the rank: the older layout's key, the newer one's markov_w1 rows; the window: the newer layout writes it as
+    // llama.cpp's n_swa (the 1024 positions before the block + 1)
+    int rank = (int) num("dflash.dspark.markov_rank", 0);
+    if (D->v2) {
+        const strata::TensorInfo* tw = G.find("markov_w1.weight");
+        rank = tw != nullptr && tw->shape.size() == 2 ? (int) tw->shape[0] : 0;
+    }
+    const int swa = (int) num("dflash.attention.sliding_window", 0) - (D->v2 ? 1 : 0);
     if (!taps_ok || (int) num("dflash.block_count", 0) != kL || (int) num("dflash.embedding_length", 0) != E ||
         D->ff <= 0 || D->ff % 256 != 0 || (int) num("dflash.attention.head_count", 0) != kNH ||
         (int) num("dflash.attention.head_count_kv", 0) != kNKV || (int) num("dflash.attention.key_length", 0) != kHD ||
         (int) num("dflash.attention.value_length", 0) != kHD || (int) num("dflash.block_size", 0) != kNB ||
-        (int) num("dflash.dspark.markov_rank", 0) != kRank || (int) num("dflash.attention.sliding_window", 0) != kLocalWin ||
+        rank != kRank || swa != kLocalWin ||
         (int) num("dflash.rope.dimension_count", kHD) != kHD || E % 256 != 0 || E > 256 * kRmsPer || V <= 0)
         return refuse("the drafter's layout (3 layers over taps 5/23/41/48, the target's width, 24 / 8 heads of 128, "
                       "block 8, Markov rank 256, a 1024-row window)");
@@ -744,7 +789,7 @@ bool Glm5Model::inkd_load(std::string& err) {
         Ly.q_norm = f32(P + "attn_q_norm.weight", {(uint64_t) kHD});
         Ly.k_norm = f32(P + "attn_k_norm.weight", {(uint64_t) kHD});
         Ly.kc_norm = f32(P + "attn_k_ctx_norm.weight", {(uint64_t) kHD});
-        Ly.dflare = f32(P + "dflare_norm.weight", {uE});
+        Ly.dflare = f32(P + (D->v2 ? "ctx_norm.weight" : "dflare_norm.weight"), {uE});
         // (sliding_window_pattern [T, F, T]: layers 0 and 2 the window, layer 1 every position)
         const bool local = l != 1;
         Ly.ring = local ? kLocalRing : D->ctx_g;
@@ -753,12 +798,26 @@ bool Glm5Model::inkd_load(std::string& err) {
         Ly.rv = (__half*) dev((size_t) Ly.ring * kKVD * sizeof(__half));
     }
     D->out_norm = f32("output_norm.weight", {uE});
-    D->mk_norm = f32("dspark_norm.weight", {uE});
-    D->mask = f32("mask_embd.weight", {uE});
-    D->ho_b = f32("dspark_hidden_out.bias", {uE});
     D->jb = f32("joint_proj.bias", {(uint64_t) kZ});
+    D->Vh = V;
+    if (!D->v2) {
+        D->mk_norm = f32("dspark_norm.weight", {uE});
+        D->mask = f32("mask_embd.weight", {uE});
+        D->ho_b = f32("dspark_hidden_out.bias", {uE});
+    } else {
+        D->mk_norm = f32("markov_ctx_norm.weight", {uE});
+        if (G.find("token_embd_norm.weight") != nullptr) D->tok_norm = f32("token_embd_norm.weight", {uE});
+    }
     if (!ok) return refuse(why.empty() ? "the weights did not upload (VRAM?)" : why);
-    {   // the fuse's rows (softmax over the 4 taps)
+    if (D->v2) {   // the mixes as they are (the conversion softmaxed the fuse's rows): layers 0..2, then the Markov head's
+        for (int r = 0; r < 4; ++r) {
+            const strata::TensorInfo* t =
+                find(r < 3 ? "blk." + std::to_string(r) + ".ctx_mix.weight" : std::string("markov_ctx_mix.weight"), kF32, {4});
+            if (t == nullptr) return refuse(why);
+            const float* mw = (const float*) G.tensor_data(*t);
+            for (int j = 0; j < 4; ++j) D->al.a[r][j] = mw[j];
+        }
+    } else {   // the fuse's rows (softmax over the 4 taps)
         const strata::TensorInfo* t = find("dspark_fuse.weight", kF32, {4, 4});
         if (t == nullptr) return refuse(why);
         const float* fw = (const float*) G.tensor_data(*t);
@@ -769,9 +828,81 @@ bool Glm5Model::inkd_load(std::string& err) {
             for (int j = 0; j < 4; ++j) D->al.a[r][j] = std::exp(fw[r * 4 + j] - m) / s;
         }
     }
+    // the newer layout's rows on the host as floats, whatever their type (Q8_0, BF16, F32): rows r0 .. r0 + n - 1 of
+    // a 2-D tensor (cols values a row)
+    const auto host_rows = [&](const strata::TensorInfo& t, int64_t r0, int64_t n, int64_t cols, float* out) -> bool {
+        const uint8_t* src = G.tensor_data(t) + (size_t) r0 * strata::qt::row_size((int) t.type, cols);
+        if ((int) t.type == kF32) {
+            std::memcpy(out, src, (size_t) n * cols * sizeof(float));
+            return true;
+        }
+        const strata::qt::Traits* tt = strata::qt::traits((int) t.type);
+        if (tt == nullptr || tt->to_float == nullptr || tt->blck_size <= 0 || cols % tt->blck_size != 0) return false;
+        tt->to_float(src, out, n * cols);
+        return true;
+    };
+    // a [rows][256] tensor as FP16 rows on the device (markov_w1, markov_w2), 4096 rows a pass
+    const auto rows_f16 = [&](const strata::TensorInfo& t, int64_t rows, __half* dst) -> bool {
+        constexpr int64_t kStep = 4096;
+        std::vector<float> f((size_t) kStep * kRank);
+        std::vector<uint16_t> h((size_t) kStep * kRank);
+        for (int64_t r0 = 0; r0 < rows; r0 += kStep) {
+            const int64_t n = std::min(kStep, rows - r0);
+            if (!host_rows(t, r0, n, kRank, f.data())) return false;
+            strata::qt::fp32_to_fp16_row(f.data(), h.data(), n * kRank);
+            if (cudaMemcpy(dst + (size_t) r0 * kRank, h.data(), (size_t) n * kRank * 2, cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+        }
+        return true;
+    };
+    if (D->v2) {
+        // markov_w1 / markov_w2 [Vh][256] (the vocabulary's rows, at most the target's V) as FP16: w1 the chain's prev
+        // rows, w2 the head's F (W_lm hidden_out, folded at conversion); markov_w2.bias [Vh]
+        const strata::TensorInfo* tw1 = G.find("markov_w1.weight");
+        const strata::TensorInfo* tw2 = G.find("markov_w2.weight");
+        if (tw1 == nullptr || tw2 == nullptr || tw1->shape.size() != 2 || tw2->shape.size() != 2 ||
+            tw1->shape[0] != (uint64_t) kRank || tw2->shape[0] != (uint64_t) kRank || tw1->shape[1] != tw2->shape[1] ||
+            tw2->shape[1] > (uint64_t) V || tw2->shape[1] < (uint64_t) V / 2)
+            return refuse("markov_w1 / markov_w2 (256 x the vocabulary, at most the target's)");
+        D->Vh = (int) tw2->shape[1];
+        D->w2b = f32("markov_w2.bias", {(uint64_t) D->Vh});
+        D->w1h = (__half*) dev((size_t) D->Vh * kRank * sizeof(__half));
+        D->F = (__half*) dev((size_t) D->Vh * kRank * sizeof(__half));
+        if (!ok) return refuse(why.empty() ? "the Markov head's weights did not upload (VRAM?)" : why);
+        if (!rows_f16(*tw1, D->Vh, D->w1h) || !rows_f16(*tw2, D->Vh, D->F))
+            return refuse("markov_w1 / markov_w2: a type the host does not dequantize, or the upload");
+        // joint_proj [768][5120] split as the older layout's, in F32: the state / prev columns transposed
+        // ([512][768]), the hidden / f_rnn columns ([768][4608], mvn)
+        const strata::TensorInfo* tj = G.find("joint_proj.weight");
+        if (tj == nullptr || tj->shape.size() != 2 || tj->shape[0] != (uint64_t) 2 * kRank + 2 * uE ||
+            tj->shape[1] != (uint64_t) kZ)
+            return refuse("joint_proj.weight (5120 x 768)");
+        const size_t jin = (size_t) 2 * kRank + 2 * E, jsi = (size_t) 2 * E;
+        std::vector<float> jw((size_t) kZ * jin), dt((size_t) 2 * kRank * kZ), sta((size_t) kZ * jsi);
+        if (!host_rows(*tj, 0, kZ, (int64_t) jin, jw.data())) return refuse("joint_proj.weight: a type the host does not dequantize");
+        for (size_t o = 0; o < (size_t) kZ; ++o) {
+            for (size_t k = 0; k < (size_t) 2 * kRank; ++k) dt[k * kZ + o] = jw[o * jin + k];
+            std::memcpy(&sta[o * jsi], &jw[o * jin + 2 * kRank], jsi * sizeof(float));
+        }
+        // mask_embd [7][E] (a row a block row); a single row serves them all
+        const strata::TensorInfo* tm = G.find("mask_embd.weight");
+        const int nm = tm != nullptr && tm->shape.size() == 2 ? (int) tm->shape[1] : 1;
+        if (tm == nullptr || tm->shape[0] != uE || (tm->shape.size() == 2 && nm != kND) || tm->shape.size() > 2)
+            return refuse("mask_embd.weight (E x 7)");
+        std::vector<float> mk((size_t) nm * E);
+        if (!host_rows(*tm, 0, nm, E, mk.data())) return refuse("mask_embd.weight: a type the host does not dequantize");
+        D->wdt_f = (float*) dev(dt.size() * sizeof(float));
+        D->wsta_f = (float*) dev(sta.size() * sizeof(float));
+        D->mask = (float*) dev(mk.size() * sizeof(float));
+        D->mask_ld = nm > 1 ? E : 0;
+        if (ok)
+            ok = cudaMemcpy(D->wdt_f, dt.data(), dt.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(D->wsta_f, sta.data(), sta.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(D->mask, mk.data(), mk.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (!gf::mvn_supported(kF32)) return refuse("mvn has no F32 rows");
+    } else {
     // markov_w1 [V(pad)][256] BF16 as it is (the first V rows); joint_proj [768][5120] BF16 split: the state / prev
     // columns transposed ([512][768], the chain's reads coalesced), the hidden / f_rnn columns ([768][4608], mvn)
-    {
         const strata::TensorInfo* tw = G.find("markov_w1.weight");
         if (tw == nullptr || (int) tw->type != kBF16 || tw->shape.size() != 2 || tw->shape[0] != (uint64_t) kRank ||
             tw->shape[1] < (uint64_t) V)
@@ -799,9 +930,9 @@ bool Glm5Model::inkd_load(std::string& err) {
     const auto ow_it = ws_map_.find("output.weight");
     if (ow_it == ws_map_.end()) return refuse("the target's output.weight");
     const WSlot ow = ow_it->second;
-    if (ow.type != kF32 && !strata::kernels::dequant_bf16_supported(ow.type))
+    if (!D->v2 && ow.type != kF32 && !strata::kernels::dequant_bf16_supported(ow.type))
         return refuse("the target's output.weight type " + std::to_string(ow.type) + " (no FP16 dequant)");
-    {
+    if (!D->v2) {   // (the newer layout ships the fold: markov_w2)
         const strata::TensorInfo* th = find("dspark_hidden_out.weight", kBF16, {(uint64_t) kRank, uE});
         if (th == nullptr) return refuse(why);
         const uint16_t* hw = (const uint16_t*) G.tensor_data(*th);
@@ -908,9 +1039,10 @@ bool Glm5Model::inkd_load(std::string& err) {
         D->prof = true;
         for (cudaEvent_t& e : D->ev) D->prof = D->prof && cudaEventCreate(&e) == cudaSuccess;
     }
-    std::fprintf(stderr, "ink dspark: %s - %d layers over taps 5/23/41/48, up to %d drafts a step; the global layer's "
-                         "context %d positions; %.2f GB on CUDA%d\n",
-                 path, kL, D->n_max, D->ctx_g, (double) D->bytes / 1073741824.0, dev_);
+    std::fprintf(stderr, "ink dspark: %s (%s layout) - %d layers over taps 5/23/41/48, up to %d drafts a step; the global "
+                         "layer's context %d positions; %.2f GB on CUDA%d\n",
+                 path, D->v2 ? "newer, markov_w2" : "older, dspark_fuse", kL, D->n_max, D->ctx_g,
+                 (double) D->bytes / 1073741824.0, dev_);
     return true;
 }
 
@@ -1198,9 +1330,11 @@ bool Glm5Model::inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string&
         tt->to_float(pack_emb_src_ + (size_t) y * strata::qt::row_size((strata::qt::Type) pack_emb_type_, E), D->emb_h, E);
         cudaMemcpyAsync(D->a, D->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
     }
-    k_rms<<<1, 256, 0, s>>>(D->a, E, w_.at("token_embd_norm.weight"), g.norm_eps, E, D->x, E, nullptr);
+    k_rms<<<1, 256, 0, s>>>(D->a, E, D->tok_norm != nullptr ? D->tok_norm : w_.at("token_embd_norm.weight"), g.norm_eps, E,
+                            D->x, E, nullptr);
     for (int i = 1; i < kNB; ++i)
-        cudaMemcpyAsync(D->x + (size_t) i * E, D->mask, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(D->x + (size_t) i * E, D->mask + (size_t) (i - 1) * D->mask_ld, (size_t) E * sizeof(float),
+                        cudaMemcpyDeviceToDevice, s);
     const float scale = 1.0f / std::sqrt((float) kHD);
     const int nE = kNB * E;
     for (int l = 0; l < kL; ++l) {
@@ -1239,22 +1373,32 @@ bool Glm5Model::inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string&
     }
     // ---- the head: rows 1 .. ND (row 0 is the anchor's)
     mark();
-    k_rms<<<ND, 256, 0, s>>>(D->x + E, E, D->out_norm, D->eps, E, D->hn, E, nullptr);
-    k_bias_q8<<<(ND * E + 255) / 256, 256, 0, s>>>(D->hn, D->ho_b, E, ND * E, D->xn, (Q81*) D->hq);
+    // (the newer layout: W_lm y_s and markov_w2.bias; the older: W_lm (y_s + hidden_out.b))
+    k_rms<<<ND, 256, 0, s>>>(D->x + E, E, D->out_norm, D->eps, E, D->hn, E, D->v2 ? (Q81*) D->hq : nullptr);
+    if (!D->v2) k_bias_q8<<<(ND * E + 255) / 256, 256, 0, s>>>(D->hn, D->ho_b, E, ND * E, D->xn, (Q81*) D->hq);
     // the static part of joint_proj: [y_s | f_rnn]
     cudaMemcpy2DAsync(D->xz, (size_t) 2 * E * sizeof(float), D->hn, (size_t) E * sizeof(float), (size_t) E * sizeof(float),
                       (size_t) ND, cudaMemcpyDeviceToDevice, s);
     for (int i = 0; i < ND; ++i)
         cudaMemcpyAsync(D->xz + (size_t) i * 2 * E + E, D->frnn, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    gf::MvJob jz = {D->wsta, nullptr, D->xz, D->zs, nullptr, 1.0f, kBF16, 2 * E, kZ};
+    gf::MvJob jz = D->v2 ? gf::MvJob{D->wsta_f, nullptr, D->xz, D->zs, nullptr, 1.0f, kF32, 2 * E, kZ}
+                         : gf::MvJob{D->wsta, nullptr, D->xz, D->zs, nullptr, 1.0f, kBF16, 2 * E, kZ};
     if (!gf::mvn(&jz, 1, ND, s)) { err = "ink dspark: joint_proj"; return false; }
     const WSlot& ow = ws_map_.at("output.weight");
-    if (!mv_rows(ow, E, V, D->xn, D->hq, D->logits, ND, s)) { err = "ink dspark: output head"; return false; }
+    if (!mv_rows(ow, E, V, D->v2 ? D->hn : D->xn, D->hq, D->logits, ND, s)) { err = "ink dspark: output head"; return false; }
+    if (D->v2) {
+        const int64_t nl = (int64_t) ND * V;
+        k_logit_bias<<<(unsigned) ((nl + 255) / 256), 256, 0, s>>>(D->logits, V, D->Vh, D->w2b, nl);
+    }
     const int chunk = (V + kTkCh - 1) / kTkCh;
     k_topk_part<<<dim3(kTkCh, ND), 256, (size_t) chunk * sizeof(float), s>>>(D->logits, V, chunk, D->tk_v, D->tk_i);
     mark();
-    k_markov<<<1, kMkT, 0, s>>>(D->zs, D->jb, D->wdt, D->w1, D->F, D->tk_v, D->tk_i, kNC, ND, D->y_d, D->softcap, V,
-                                D->res_d, D->res_conf_d);
+    if (D->v2)
+        k_markov<<<1, kMkT, 0, s>>>(D->zs, D->jb, D->wdt_f, D->w1h, D->F, D->tk_v, D->tk_i, kNC, ND, D->y_d, D->softcap,
+                                    D->Vh, D->res_d, D->res_conf_d);
+    else
+        k_markov<<<1, kMkT, 0, s>>>(D->zs, D->jb, D->wdt, D->w1, D->F, D->tk_v, D->tk_i, kNC, ND, D->y_d, D->softcap, V,
+                                    D->res_d, D->res_conf_d);
     mark();
     cudaMemcpyAsync(D->res_h, D->res_d, (size_t) ND * sizeof(int), cudaMemcpyDeviceToHost, s);
     cudaMemcpyAsync(D->res_conf_h, D->res_conf_d, (size_t) ND * sizeof(float), cudaMemcpyDeviceToHost, s);
