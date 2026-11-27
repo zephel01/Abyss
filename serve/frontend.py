@@ -17,6 +17,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import base64
+import codecs
 import json
 import math
 import os
@@ -1056,11 +1057,300 @@ def ink_call_open(name: str) -> str:
     return "<|message_model|>" + name + INK_CALL
 
 
+class InkArgStream:
+    """The streaming view of an Inkling 2 call body ({"name": NAME, "args": {...}}), read as it is written.  The body
+    is followed with a small incremental JSON reader: once "name" (a string) and then "args" / "arguments" /
+    "parameters" (an object) are read, on_start(name) is asked whether to announce the call; inside the arguments each
+    complete piece goes out re-encoded as json.dumps(args, ensure_ascii=False) would write it (string values
+    character by character, other scalars whole once complete, `, ` and `: ` between), so the pieces joined are the
+    same text as the call a held body gives.  A body of any other shape is never announced ("hold": the whole body
+    decides at its end, as before).  A body that goes wrong after the announcement, or ends early, is closed as far
+    as it came (close())."""
+
+    ARGS_KEYS = ("args", "arguments", "parameters")
+    LIT = frozenset("0123456789+-.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")   # a scalar's characters
+    WS = " \t\r\n"
+
+    def __init__(self, on_start):
+        self.on_start = on_start
+        self.buf, self.phase = "", "top"   # top -> k1 -> c1 -> v1 -> s1 -> k2 -> c2 -> v2 -> args -> after | hold
+        self.name = ""
+        self.stack = []                    # open containers in the arguments: [kind "o"/"a", state, key text]
+        self.mode = None                   # None | "str" (a string value) | "lit" (a scalar being read)
+        self.lit = ""
+        self.out = []                      # every piece sent: the arguments' text so far
+
+    @property
+    def started(self) -> bool:
+        return self.phase in ("args", "after", "broken")
+
+    def text(self) -> str:
+        return "".join(self.out)
+
+    def feed(self, s: str) -> list[str]:
+        """More of the body: the argument pieces to send (none before the call is announced, or after it closed)."""
+        if self.phase in ("hold", "after", "broken"):
+            return []
+        self.buf += s
+        pieces = []
+        try:
+            i = self._run(pieces)
+        except ValueError:               # (the pieces up to it are whole JSON and are sent; close() ends the rest)
+            self.phase = "broken" if self.started else "hold"
+            i = len(self.buf)
+        self.buf = self.buf[i:]
+        self.out += pieces
+        return pieces
+
+    # -- the reader ----------------------------------------------------------------------------------------------
+    def _ws(self, i: int) -> int:
+        b = self.buf
+        while i < len(b) and b[i] in self.WS:
+            i += 1
+        return i
+
+    def _string_end(self, i: int) -> int:
+        """buf[i] is a string's opening quote: the index past its closing quote, or -1 when it has not come."""
+        b, j = self.buf, i + 1
+        while True:
+            q, e = b.find('"', j), b.find("\\", j)
+            if q < 0:
+                return -1
+            if 0 <= e < q:
+                j = e + 2
+                if j > len(b):
+                    return -1
+                continue
+            return q + 1
+
+    def _whole_string(self, i: int):
+        """(the string at buf[i] decoded, the index past it), or None while incomplete."""
+        end = self._string_end(i)
+        if end < 0:
+            return None
+        v = json.loads(self.buf[i:end])
+        return v, end
+
+    def _run(self, pieces: list) -> int:
+        b, i = self.buf, 0
+        while True:
+            if self.phase == "args":
+                return self._args(i, pieces)
+            if self.phase == "after":
+                return len(b)
+            i = self._ws(i)
+            if i >= len(b):
+                return i
+            c, ph = b[i], self.phase
+            if ph == "top":
+                if c != "{":
+                    raise ValueError
+                self.phase, i = "k1", i + 1
+            elif ph in ("k1", "k2"):
+                if c != '"':
+                    raise ValueError
+                got = self._whole_string(i)
+                if got is None:
+                    return i
+                key, i = got
+                if (ph == "k1" and key != "name") or (ph == "k2" and key not in self.ARGS_KEYS):
+                    raise ValueError
+                self.phase = "c1" if ph == "k1" else "c2"
+            elif ph in ("c1", "c2"):
+                if c != ":":
+                    raise ValueError
+                self.phase, i = ("v1" if ph == "c1" else "v2"), i + 1
+            elif ph == "v1":
+                if c != '"':
+                    raise ValueError
+                got = self._whole_string(i)
+                if got is None:
+                    return i
+                self.name, i = got
+                self.phase = "s1"
+            elif ph == "s1":
+                if c != ",":
+                    raise ValueError
+                self.phase, i = "k2", i + 1
+            elif ph == "v2":
+                if c != "{" or not self.on_start(self.name):
+                    raise ValueError
+                self.phase, i = "args", i + 1
+                self.stack = [["o", "k0"]]
+                pieces.append("{")
+
+    def _value_done(self) -> None:
+        if self.stack:
+            self.stack[-1][1] = "e"
+
+    def _args(self, i: int, pieces: list) -> int:
+        """Inside the arguments object: consume what can be, returning the index to keep from."""
+        b = self.buf
+        while True:
+            if self.mode == "str":
+                i = self._str(i, pieces)
+                if self.mode == "str":
+                    return i
+                continue
+            if self.mode == "lit":
+                j = i
+                while j < len(b) and b[j] in self.LIT:
+                    j += 1
+                self.lit += b[i:j]
+                if j >= len(b):
+                    return j
+                pieces.append(json.dumps(json.loads(self.lit), ensure_ascii=False))
+                self.mode, self.lit, i = None, "", j
+                self._value_done()
+                continue
+            if not self.stack:
+                self.phase = "after"
+                return len(b)
+            i = self._ws(i)
+            if i >= len(b):
+                return i
+            c = b[i]
+            top = self.stack[-1]
+            kind, st = top[0], top[1]
+            if kind == "o" and st in ("k0", "k"):
+                if c == "}" and st == "k0":
+                    self.stack.pop()
+                    pieces.append("}")
+                    self._value_done()
+                    i += 1
+                    continue
+                if c != '"':
+                    raise ValueError
+                got = self._whole_string(i)
+                if got is None:
+                    return i
+                key, i = got
+                top[1] = "colon"
+                top[2:] = [(", " if st == "k" else "") + json.dumps(key, ensure_ascii=False) + ": "]
+                continue
+            if kind == "o" and st == "colon":
+                if c != ":":
+                    raise ValueError
+                pieces.append(top[2])
+                top[1], i = "v", i + 1
+                continue
+            if kind == "o" and st == "e" or kind == "a" and st == "e":
+                if c == ",":
+                    top[1] = "k" if kind == "o" else "v"
+                    i += 1
+                    continue
+                if c == ("}" if kind == "o" else "]"):
+                    self.stack.pop()
+                    pieces.append(c)
+                    self._value_done()
+                    i += 1
+                    continue
+                raise ValueError
+            # a value: after an object's colon, or an array's start / comma
+            if kind == "a" and st == "v0" and c == "]":
+                self.stack.pop()
+                pieces.append("]")
+                self._value_done()
+                i += 1
+                continue
+            if c not in "{[\"" and c not in self.LIT:
+                raise ValueError
+            if kind == "a" and st == "v":
+                pieces.append(", ")
+            top[1] = "in"                       # (a value is being read: done -> "e", _value_done)
+            if c == "{":
+                self.stack.append(["o", "k0"])
+                pieces.append("{")
+                i += 1
+            elif c == "[":
+                self.stack.append(["a", "v0"])
+                pieces.append("[")
+                i += 1
+            elif c == '"':
+                self.mode = "str"
+                pieces.append('"')
+                i += 1
+            else:
+                self.mode, self.lit = "lit", ""
+
+    def _str(self, i: int, pieces: list) -> int:
+        """Inside a string value: its decoded characters so far, re-encoded; the index to keep from."""
+        b, n = self.buf, len(self.buf)
+        while i < n:
+            j = i
+            while j < n and b[j] not in '"\\' and b[j] >= " ":
+                j += 1
+            if j > i:
+                pieces.append(b[i:j])           # (plain characters: json.dumps writes them as they are)
+                i = j
+                continue
+            c = b[i]
+            if c == '"':
+                pieces.append('"')
+                self.mode = None
+                self._value_done()
+                return i + 1
+            if c != "\\":
+                raise ValueError                # (a raw control character: not JSON)
+            if i + 1 >= n:
+                return i
+            if b[i + 1] != "u":
+                esc = b[i:i + 2]
+                end = i + 2
+            else:
+                if i + 6 > n:
+                    return i
+                end = i + 6
+                cp = int(b[i + 2:i + 6], 16) if all(x in "0123456789abcdefABCDEF" for x in b[i + 2:i + 6]) else -1
+                if cp < 0:
+                    raise ValueError
+                if 0xD800 <= cp < 0xDC00:       # a high surrogate: its low half may follow as a second escape
+                    if i + 12 > n and b[i + 6:].startswith("\\u"[:n - i - 6]):
+                        return i
+                    if b[i + 6:i + 8] == "\\u":
+                        lo = b[i + 8:i + 12]
+                        if all(x in "0123456789abcdefABCDEF" for x in lo) and 0xDC00 <= int(lo, 16) < 0xE000:
+                            end = i + 12
+                esc = b[i:end]
+            pieces.append(json.dumps(json.loads('"' + esc + '"'), ensure_ascii=False)[1:-1])
+            i = end
+        return i
+
+    def close(self) -> str:
+        """The body ended early (or went wrong) after the announcement: the text that closes what is open, so the
+        pieces sent parse as JSON; the reader is done."""
+        if not self.started or self.phase == "after":
+            self.phase = "after" if self.started else "hold"
+            return ""
+        tail = ""
+        if self.mode == "str":
+            tail += '"'
+            self._value_done()
+        elif self.mode == "lit":
+            try:
+                tail += json.dumps(json.loads(self.lit), ensure_ascii=False)
+            except ValueError:
+                tail += "null"
+            self._value_done()
+        self.mode = None
+        for kind, st, *_ in reversed(self.stack):
+            if kind == "o" and st == "v":
+                tail += "null"                  # (a key sent with its colon, its value never came)
+            tail += "}" if kind == "o" else "]"
+        self.stack, self.phase = [], "after"
+        self.out.append(tail)
+        return tail
+
+
 class InklingCalls:
     """Inkling 2's call messages out of the token stream (the markers are special tokens, so this works on ids, ahead
     of the text parser): a <|message_model|> holds its header (the tool's name) until the message's kind is known; a
     text / thinking message goes on as before, an invoke message's JSON is read to its <|end_message|> and becomes one
-    tool_call event (the existing call shape) - or text when it is not a call to a declared tool or not valid JSON."""
+    tool_call event (the existing call shape) - or text when it is not a call to a declared tool or not valid JSON.
+    While the JSON is written it is also read as it comes (InkArgStream): a body in the template's shape is announced
+    ("tool_start") once its name and the start of its arguments are read, and its arguments go out piece by piece
+    ("tool_args"), as the text parser's stream_tools calls do - a 4K-token file write is no longer silent until its
+    end.  Joined, the pieces are the text of the arguments the whole body gives."""
 
     HDR_MAX = 64                     # header tokens at most (a tool's name): more is not a header - text
 
@@ -1072,11 +1362,44 @@ class InklingCalls:
         self.invoke_text, self.error = invoke_text, error
         self.parser = parser
         self.state, self.hdr, self.body, self.name, self.marker = "idle", [], [], "", INK_CALL
+        self.stream, self.scall, self.dec = None, None, None
 
     def start_call(self, name: str, marker: str = INK_CALL) -> None:
         """The prompt ended inside a call's header (a required call, ink_call_open): its JSON comes next."""
         self.state, self.body, self.name, self.marker = "json", [], name, marker
         self.parser.state, self.parser.lead = "content", True   # (a call message: any reasoning is over)
+        self.scall = None
+        # the streaming view: JSON calls only, and not under tool_choice "none" (that call is refused at its end)
+        self.stream = InkArgStream(self._announce) if marker == INK_CALL and not self.parser.no_calls else None
+        self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace") \
+            if self.stream is not None and hasattr(self.tok, "token_bytes") else None
+        self.sent = 0                    # (a tokenizer without token_bytes: the decoded body's characters fed so far)
+
+    def _announce(self, name: str) -> bool:
+        """InkArgStream read the name and the start of the arguments: announce the call if it is one to run."""
+        nm = name or self.name
+        if not nm or not self.parser._declared(nm):
+            return False                 # (not a call this request can take: the whole body decides at its end)
+        self.scall = ToolCall(name=nm, arguments={})
+        return True
+
+    def _stream_text(self, t: int) -> str:
+        if self.dec is not None:
+            return self.dec.decode(self.tok.token_bytes(t))
+        text = self.tok.decode(self.body)
+        if text.endswith("\ufffd"):
+            return ""                    # (a character still split across tokens)
+        delta, self.sent = text[self.sent:], len(text)
+        return delta
+
+    def _stream_push(self, t: int) -> list[Event]:
+        """One more body id through the streaming view: the call's announcement and argument pieces, if any."""
+        if self.stream is None or self.stream.phase in ("hold", "after", "broken"):
+            return []
+        before = self.scall
+        pieces = self.stream.feed(self._stream_text(t))
+        out = [Event("tool_start", call=self.scall)] if self.scall is not None and before is None else []
+        return out + [Event("tool_args", p, call=self.scall) for p in pieces if p]
 
     def push(self, t: int) -> list[Event] | None:
         """One generated id.  None: not this reader's - the caller handles it as before; a list: taken (the events
@@ -1105,11 +1428,25 @@ class InklingCalls:
         if t == self.em:
             return self._close()
         self.body.append(t)
-        return []
+        return self._stream_push(t)
 
-    def _close(self) -> list[Event]:
+    def _close(self, cut: bool = False) -> list[Event]:
+        """The call message ended (cut: the output ended inside it, no <|end_message|>)."""
         text, name, marker = self.tok.decode(self.body), self.name, self.marker
         self.state, self.body, self.name, self.marker = "idle", [], "", INK_CALL
+        stream, scall = self.stream, self.scall
+        self.stream, self.scall, self.dec = None, None, None
+        if scall is not None:
+            # announced while it was written: the call is what was streamed (closed as far as it came, when the
+            # output ended early or the body went wrong after the start) - the pieces sent are never taken back
+            tail = stream.close()
+            out = [Event("tool_args", tail, call=scall)] if tail else []
+            try:
+                scall.arguments = json.loads(stream.text())
+            except ValueError:           # (cannot happen: the pieces are json.dumps's)
+                scall.arguments = {}
+            self.parser.state, self.parser.lead = "content", True
+            return out + [Event("tool_call", call=scall)]
         call = None
         try:
             obj = json.loads(text) if marker == INK_CALL else None
@@ -1128,6 +1465,8 @@ class InklingCalls:
                 call = ToolCall(name=nm, arguments=args)
         # a call message whose body is the XML form (<invoke name=..><parameter name=..>), not JSON
         calls = [call] if call is not None else parse_xml_calls(text, self.parser.schemas)
+        if not calls and cut and marker == INK_CALL:
+            return []                        # (a JSON call the output ended inside: never the marker as text)
         if not calls:                        # (not a call this request can take: the text, as the parser would)
             return [Event("content", name + marker + text)]
         if self.parser.no_calls:
@@ -1136,8 +1475,10 @@ class InklingCalls:
         return [Event("tool_call", call=c) for c in calls]
 
     def finish(self) -> list[Event]:
-        """The output ended inside a call message (no <|end_message|>): read what came."""
-        return self._close() if self.state == "json" else []
+        """The output ended inside a call message (no <|end_message|>): read what came.  A call already announced
+        ends as it was streamed (closed where it stopped; the turn's finish says why, e.g. "length"); one that was
+        not is a call if what came is one, else dropped - its marker never reaches the answer's text."""
+        return self._close(cut=True) if self.state == "json" else []
 
 
 class OutputParser:
