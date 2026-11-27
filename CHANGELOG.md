@@ -7,6 +7,36 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.214 - 2026-11-27
+
+Windows keeps the learned files up to date, bartowski's Ling-3.2-air IQ3_XS runs on the GPU path and setup offers it,
+and setup offers Inkling 2 Mini's UD-IQ3_XXS. The other models' outputs are the same as v1.3.213.
+
+### Fixed
+
+- Windows: `pool_pin.txt`, `expert_usage.txt` and MemT's memory file were written once and never updated (`std::rename`
+  fails there when the file exists; #61's log said "could not be kept in (read-only?)"). They are now replaced in place
+  (`std::filesystem::rename`), as on Linux.
+- Ling-3.2-air IQ3_XS (bartowski): some layers pair an IQ3_S gate with a Q4_K up, which the GLM fast path's gate/up
+  pair table did not have (#62). It has both orders now.
+
+### Added
+
+- Setup: `--model ling32air --quant IQ3_XS` (58.6 GB, a 24 GB GPU + 64 GB RAM). RTX 5090 + 123 GB RAM, `--bench` (RAM
+  tier 80 GB, iGPU off): decode 116.6 tok/s (Q4_K_M 101.2), KL 0.056 against the Q4_K_M, same top token 95.5%. Both
+  Ling files have a `--bench` quality reference now.
+- Setup: `--model inkling2mini --quant UD-IQ3_XXS` (11.7 GB, an 8-16 GB GPU). RTX 5090, a 4K prompt + 512 tokens,
+  median of 3, all in VRAM: decode 206.5 tok/s, KL 0.0270 against Abyss's run of the ggml-org Q8_0 (UD-Q4_K_XL
+  0.0058), Japanese facts 589 of 666 (UD-Q4_K_XL 593). ISTA-DASLab's GSQ-RCO IQ3_S packs too but is not offered: 187.5
+  tok/s, KL 0.0404, Japanese facts 558 in the same runs.
+
+### Changed
+
+- `--bench`: a "slightly off" quality now says the iGPU lane and AMD GPUs round differently from the reference too,
+  not only the CPU lane (#64: an R9700 with the iGPU lane, KL 0.0225; GLM Q120d on an RTX 5090 here gives KL 0.0213
+  with the iGPU lane on and OK with it off).
+- Docs and setup: Ling-3.2-air's MTP drafter is opt-in (`STRATA_LING_MTP`, since v1.3.204); they said there was none.
+
 ## v1.3.213 - 2026-11-27
 
 Inkling 2 Mini's newer DSpark drafter file loads: unsloth's current `dspark-Inkling-2-Mini-Q8_0.gguf` and the one in

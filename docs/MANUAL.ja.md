@@ -159,10 +159,13 @@ top-k 20）が入る。RTX 5090 + RAM 123 GB: 4K のプロンプト 2,061 tok/s�
 動かないので、速くなるのは回答を重ねたときではなく次の起動から（`STRATA_GLM_BG_SPLIT=1` でも数字は同じ）。
 配布する経路の履歴（`STRATA_GLM_PRIOR`、Qwen3.8 にあるもの）があれば初回から速くなるが、Ling 用はまだ無い。
 
-確かめたのは Q4_K_M だけ。`--quant` には bartowski の他のファイル（IQ1_S〜Q8_0、bf16）を名前で渡せるが、未確認:
+確かめたのは Q4_K_M と IQ3_XS（v1.3.214。IQ3_S の gate と Q4_K の up を組んだ層も GPU の経路で動く、#62）。RTX 5090 +
+RAM 123 GB、`./abyss.sh --bench`（RAM tier 80 GB、iGPU なし）: decode 101.2 / 116.6 tok/s。IQ3_XS の Q4_K_M に対する KL は
+0.056（一番上の候補が同じ 95.5%）。`--quant` には bartowski の他のファイル（IQ1_S〜Q8_0、bf16）を名前で渡せるが、未確認:
 
 ```sh
 ./setup-deepseek.sh --model ling32air --download-model                 # Ling-3.2-air-Q4_K_M（80.4 GB）
+./setup-deepseek.sh --model ling32air --quant IQ3_XS --download-model  # Ling-3.2-air-IQ3_XS（58.6 GB、GPU 24 GB + RAM 64 GB。v1.3.214）
 ./setup-deepseek.sh --model ling32air --quant IQ4_XS --download-model  # repo の他のファイル（未確認）
 ```
 

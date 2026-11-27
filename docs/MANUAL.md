@@ -159,11 +159,14 @@ decoded at 88-116 tok/s (median 99), TTFT 0.16-0.38 s. The engine learns this ma
 pack's `expert_usage.txt`) and fills VRAM from it at the next start: 124-141 tok/s (median 135), TTFT 0.13-0.32 s after
 those ~4K tokens. On this model the VRAM pool does not move during a session, so the gain comes with the next start, not
 after more answers (`STRATA_GLM_BG_SPLIT=1` gave the same numbers). A shipped routing profile (`STRATA_GLM_PRIOR`, as
-Qwen3.8's) would make the first start warm too; there is none for Ling yet. Only Q4_K_M has been checked; `--quant`
-takes bartowski's other files (IQ1_S to Q8_0, bf16) by name, untested:
+Qwen3.8's) would make the first start warm too; there is none for Ling yet. Q4_K_M and IQ3_XS (v1.3.214: its IQ3_S gate + Q4_K up layers run on
+the GPU path, #62) have been checked - RTX 5090 + 123 GB RAM, `./abyss.sh --bench` (RAM tier 80 GB, iGPU off): decode
+101.2 / 116.6 tok/s, IQ3_XS KL 0.056 against the Q4_K_M (same top token 95.5%); `--quant` takes bartowski's other
+files (IQ1_S to Q8_0, bf16) by name, untested:
 
 ```sh
 ./setup-deepseek.sh --model ling32air --download-model                 # Ling-3.2-air-Q4_K_M (80.4 GB)
+./setup-deepseek.sh --model ling32air --quant IQ3_XS --download-model  # Ling-3.2-air-IQ3_XS (58.6 GB, a 24 GB GPU + 64 GB RAM; v1.3.214)
 ./setup-deepseek.sh --model ling32air --quant IQ4_XS --download-model  # another file of the repo (untested)
 ```
 
