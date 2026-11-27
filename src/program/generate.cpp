@@ -2534,7 +2534,8 @@ static bool memt_file_write(const std::string& path, const std::vector<float>& s
     bool ok = std::fwrite(&n, 8, 1, f) == 1 && std::fwrite(h.data(), 1, h.size(), f) == h.size() &&
               std::fwrite(st.data(), 4, st.size(), f) == st.size();
     ok = (std::fclose(f) == 0) && ok;
-    if (ok && std::rename(tmp.c_str(), path.c_str()) != 0) ok = false;
+    std::error_code ec;   // (replaces an existing file on Windows too, unlike std::rename)
+    if (ok && (std::filesystem::rename(tmp, path, ec), ec)) ok = false;
     if (!ok) { std::remove(tmp.c_str()); err = "cannot write " + path; }
     return ok;
 }

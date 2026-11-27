@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <sstream>
@@ -4665,7 +4666,10 @@ bool Glm5Model::save_usage() {
         f << out;
         if (!f) return false;
     }
-    return std::rename(tmp.c_str(), up.c_str()) == 0;
+    std::error_code ec;   // (std::rename fails on Windows when the file exists: the usage was never updated there)
+    std::filesystem::rename(tmp, up, ec);
+    if (ec) std::remove(tmp.c_str());
+    return !ec;
 }
 
 // ---------------------------------------------------------------- load-time warm-up

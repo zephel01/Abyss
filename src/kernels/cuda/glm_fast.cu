@@ -6314,9 +6314,9 @@ void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off
 namespace {
 // the gate/up type pairs of a mixed layer that have a kernel (moe_gate_up_kernel<G, U>): the 2-bit i-quants among
 // themselves (unsloth's UD-IQ1_S Qwen3.8: IQ2_S / IQ2_XXS both ways), the 3-bit and the 1-bit pairs; Q4_K / Q6_K
-// (bartowski's Ling-3.2-air Q4_K_M: Q4_K gate + Q6_K up in layers 2-10)
+// (bartowski's Ling-3.2-air Q4_K_M: Q4_K gate + Q6_K up in layers 2-10); IQ3_S / Q4_K (its IQ3_XS, #62)
 #define GLMF_GU_PAIRS(X) X(16, 17) X(17, 16) X(16, 22) X(22, 16) X(17, 22) X(22, 17) X(18, 21) X(21, 18) X(19, 29) X(29, 19) \
-    X(12, 14) X(14, 12)
+    X(12, 14) X(14, 12) X(21, 12) X(12, 21)
 
 bool gate_up_mixed(int gu_type, int up_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq,
                    void* hq, const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out,

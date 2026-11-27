@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -108,8 +109,10 @@ inline bool save_mib(const std::string& file, const std::string& k, size_t mib, 
                     "pool; STRATA_GLM_POOL_PIN=reset learns one again, deleting the file learns all again\n");
     for (const std::string& l : keep) std::fprintf(o, "%s\n", l.c_str());
     std::fprintf(o, "%s\t%zu\t%s\n", k.c_str(), mib, note.c_str());
+    // (std::filesystem::rename replaces an existing file on Windows too; std::rename fails there when it exists)
+    std::error_code ec;
     const bool ok = std::fclose(o) == 0;
-    if (!ok || std::rename(tmp.c_str(), file.c_str()) != 0) {
+    if (!ok || (std::filesystem::rename(tmp, file, ec), ec)) {
         std::remove(tmp.c_str());
         return false;
     }
