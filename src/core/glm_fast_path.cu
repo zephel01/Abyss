@@ -1968,10 +1968,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (!pin_key.empty() && pin.why != poolpin::kSaved && pin.why != poolpin::kShort) {
             char note[96];
             std::snprintf(note, sizeof note, "%d-%d slots/layer", nmin, nmax);
-            const bool ok = poolpin::save_mib(poolpin::file_for(pack_dir_), pin_key, pin.budget >> 20, note);
-            std::fprintf(stderr, "glm fast: CUDA%d expert pool budget %.2f GB %s %s\n", dev_,
-                         (double) pin.budget / 1073741824.0, ok ? "kept in" : "could not be kept in (read-only?)",
-                         poolpin::file_for(pack_dir_).c_str());
+            std::string why;
+            const bool ok = poolpin::save_mib(poolpin::file_for(pack_dir_), pin_key, pin.budget >> 20, note, &why);
+            std::fprintf(stderr, "glm fast: CUDA%d expert pool budget %.2f GB %s %s%s%s%s\n", dev_,
+                         (double) pin.budget / 1073741824.0, ok ? "kept in" : "could not be kept in",
+                         poolpin::file_for(pack_dir_).c_str(), ok ? "" : " (", ok ? "" : why.c_str(), ok ? "" : ")");
         }
         // qwen35moe / laguna with FP16 attention caches: the pool is short of the experts and --kv int8 would free at
         // least 1 GB and 10% of it - say so once (the default stays FP16)
@@ -4766,10 +4767,7 @@ bool Glm5Model::save_usage() {
         f << out;
         if (!f) return false;
     }
-    std::error_code ec;   // (std::rename fails on Windows when the file exists: the usage was never updated there)
-    std::filesystem::rename(tmp, up, ec);
-    if (ec) std::remove(tmp.c_str());
-    return !ec;
+    return poolpin::replace_file(tmp, up);   // (Windows: retried while a reader holds the file, #62)
 }
 
 // ---------------------------------------------------------------- load-time warm-up

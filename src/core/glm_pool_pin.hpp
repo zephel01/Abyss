@@ -21,6 +21,7 @@
 
 #include "strata/program/gpu_ident.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef STRATA_VERSION
@@ -91,7 +93,36 @@ inline size_t load_mib(const std::string& file, const std::string& k) {
 
 // keep `k`'s budget (MiB) and a note; the other keys' lines stay.  Written to a temporary file and renamed over, so
 // two engines on one pack never read half a file.  False when the folder cannot be written (a read-only pack)
-inline bool save_mib(const std::string& file, const std::string& k, size_t mib, const std::string& note) {
+// put `tmp` in place of `dst` (std::filesystem::rename replaces an existing file on Windows too; std::rename fails there
+// when it exists).  Windows: a reader that holds `dst` open for a moment (an antivirus scan, the search indexer)
+// refuses the replace, so it is tried a few times, then a read-only `dst` is made writable and removed first (#62:
+// v1.3.219 on Windows still said "could not be kept in (read-only?)").  `why` gets the system's reason on a failure.
+inline bool replace_file(const std::string& tmp, const std::string& dst, std::string* why = nullptr) {
+    std::error_code ec;
+    std::filesystem::rename(tmp, dst, ec);
+#ifdef _WIN32
+    for (int i = 1; ec && i <= 4; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50 * i));
+        ec.clear();
+        std::filesystem::rename(tmp, dst, ec);
+    }
+    if (ec) {
+        std::error_code e2;
+        std::filesystem::permissions(dst, std::filesystem::perms::owner_write, std::filesystem::perm_options::add, e2);
+        std::filesystem::remove(dst, e2);
+        e2.clear();
+        std::filesystem::rename(tmp, dst, e2);
+        if (!e2) ec.clear();
+    }
+#endif
+    if (!ec) return true;
+    if (why != nullptr) *why = ec.message();
+    std::remove(tmp.c_str());
+    return false;
+}
+
+inline bool save_mib(const std::string& file, const std::string& k, size_t mib, const std::string& note,
+                     std::string* why = nullptr) {
     std::vector<std::string> keep;
     {
         std::ifstream f(file);
@@ -109,14 +140,12 @@ inline bool save_mib(const std::string& file, const std::string& k, size_t mib, 
                     "pool; STRATA_GLM_POOL_PIN=reset learns one again, deleting the file learns all again\n");
     for (const std::string& l : keep) std::fprintf(o, "%s\n", l.c_str());
     std::fprintf(o, "%s\t%zu\t%s\n", k.c_str(), mib, note.c_str());
-    // (std::filesystem::rename replaces an existing file on Windows too; std::rename fails there when it exists)
-    std::error_code ec;
-    const bool ok = std::fclose(o) == 0;
-    if (!ok || (std::filesystem::rename(tmp, file, ec), ec)) {
+    if (std::fclose(o) != 0) {
+        if (why != nullptr) *why = "write failed";
         std::remove(tmp.c_str());
         return false;
     }
-    return true;
+    return replace_file(tmp, file, why);
 }
 
 enum Why { kSaved = 0, kFirst, kReset, kShort, kGrew };
