@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.222 - 2026-11-28
+
+Inkling 2 Mini keeps conversations apart (slots): a thread coming back after another one answers without reading
+itself again (30K tokens: 3.6 s -> 0.49 s to the first token), with the answer it would give alone. Other models'
+outputs do not change.
+
+### Added
+
+- Inkling 2 Mini: conversation slots (`STRATA_GLM_SLOTS`, 8 by default as on Qwen3.8 / Ornith / Ling). Inkling used to
+  refuse them. A conversation set aside now keeps its snapshot (the short-convolution states and the window layers'
+  rings), the full layers' K / V rows, and the DSpark drafter's context (its rings, so a thread that comes back drafts
+  as it would have alone). That is ~0.5 GB + ~37 KB a token in host RAM (0.79-0.90 GB at 7-10K tokens, 1.64 GB at
+  30K, 2.01 GB at 41K) and no VRAM: the expert pool is the same with and without slots. Off with `--parallel` above 1
+  (each lane keeps its own conversation). RTX 5090, UD-Q4_K_XL, `--max-context 65536`, drafter on, four threads (EN /
+  JA / code 7-10K tokens, EN 30K) taking turns through the server, 256 tokens a turn: a thread coming back starts
+  answering after 0.36-0.72 s instead of 0.89-1.16 s (7-10K) and 0.49 s instead of 3.56-3.58 s (30K); the whole turn
+  takes 1.2-1.8 s instead of 2.0-2.4 s and 1.6-1.7 s instead of 4.7-4.9 s; a 41K thread 0.54-0.72 s instead of
+  4.95-4.98 s. Held to 12 GB: 1.69-2.05 s instead of 3.37-3.73 s, and 1.87-1.93 s instead of 7.73-7.75 s. Every answer
+  has the md5 of the thread alone (all in VRAM; at 12 GB with `STRATA_DETERMINISTIC=1`). Reading a thread again from
+  the start, as before, gives other bits than continuing it. Setting a big thread aside delays the next request by
+  0.1-0.6 s (the copy to RAM runs before it).
+
 ## v1.3.221 - 2026-11-28
 
 Inkling 2 Mini decodes faster on 8-16 GB cards (8 GB: 88.2 -> 101.3 tok/s) with the same tokens, an engine that dies
