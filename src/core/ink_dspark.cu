@@ -28,6 +28,10 @@
 // The context follows the sequence as DFlash 2's does (dflash2.cu): the token path, the verify window (the kept
 // columns, at spec_rewind) and the prompt path leave their taps (ink_tap accumulates the four mixes), inkd_commit
 // turns them into ring rows.
+// The same file name can also be Inkling's DFlash 2 drafter (tools/ink_dflash2_convert.py: a dflash GGUF with the
+// selector's tensors, ink_dflash2.cu): the taps then go to the accumulators side by side (acc_l [tail][4][E], the last
+// 2048 rows of a prompt chunk - the drafter's window) and inkd_commit / inkd_draft hand them to ikf_rows / ikf_draft;
+// the hooks, the deferred rows, the window's settle and the gate stay the ones here.
 #include "glm_fast_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_model.hpp"
@@ -94,6 +98,8 @@ struct IkState {
     // the newer layout (v2): markov_w1 FP16 [Vh][256], joint_proj's halves F32 (wdt_f [512][768], wsta_f [768][4608]),
     // markov_w2.bias [Vh]; mask_ld the mask rows' stride (0: one row for all)
     bool v2 = false;
+    bool df2 = false;                // (Inkling's DFlash 2: the taps side by side, ink_dflash2.cu drafts)
+    int tail = kTail;                // (acc_l's rows: a prompt chunk's last rows kept)
     __half* w1h = nullptr;
     float *wdt_f = nullptr, *wsta_f = nullptr, *w2b = nullptr;
     const float* tok_norm = nullptr;                                 // (null: the target's token_embd_norm)
@@ -244,6 +250,29 @@ __global__ void __launch_bounds__(256) k_tap(const float* __restrict__ x, int64_
             d[2 * (size_t) E] = (j == 0 ? 0.0f : d[2 * (size_t) E]) + al.a[3][j] * v;
         }
     }
+}
+
+// DFlash 2's taps (ink_dflash2.cu): row r of n (normed with nw when not null) as tap j of acc4's row r - (n - nl)
+// ([rows][4][E], the four taps side by side); ro as k_tap's
+__global__ void __launch_bounds__(256) k_tap4(const float* __restrict__ x, int64_t ld, int n, const float* __restrict__ nw,
+                                              float eps, int E, int j, int nl, float* __restrict__ acc4,
+                                              const int64_t* __restrict__ pa, const int64_t* __restrict__ pb) {
+    STRATA_PDL_ENTRY();
+    __shared__ float sh[32];
+    const int r = blockIdx.x;
+    const int ro = pa != nullptr ? (int) (*pa - (pb != nullptr ? *pb : 0)) : 0;
+    const int rl = r - (n - nl) + ro;
+    if (rl < 0) return;   // (uniform a block: before the sum's barriers)
+    const float* xr = x + (size_t) r * ld;
+    float sc = 1.0f;
+    if (nw != nullptr) {
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < E; i += 256) ss += xr[i] * xr[i];
+        ss = block_sum(ss, sh);
+        sc = rsqrtf(ss / (float) E + eps);
+    }
+    float* d = acc4 + ((size_t) rl * 4 + j) * E;
+    for (int i = threadIdx.x; i < E; i += 256) d[i] = nw != nullptr ? xr[i] * sc * nw[i] : xr[i];
 }
 
 __global__ void k_set_i64(int64_t* d, int64_t v) {
@@ -689,6 +718,37 @@ bool Glm5Model::inkd_load(std::string& err) {
     };
     const strata::MetaValue* arch = G.get("general.architecture");
     if (arch == nullptr || arch->s != "dflash") return refuse("not a dflash GGUF");
+    if (G.find("selector_hidden.weight") != nullptr) {   // Inkling's DFlash 2 (ink_dflash2.cu)
+        const strata::MetaValue* tl = G.get("dflash.target_layers");
+        static const int kTaps[4] = {5, 23, 41, 48};
+        bool taps_ok = tl != nullptr && tl->items.size() == 4;
+        for (int i = 0; taps_ok && i < 4; ++i) taps_ok = (int) tl->items[(size_t) i].num() == kTaps[i];
+        if (!taps_ok) return refuse(std::string(path) + ": a DFlash 2 drafter over other taps than 5/23/41/48");
+        D->df2 = true;
+        std::string why;
+        if (!ikf_load(G, path, why)) return refuse(why);
+        const int E = g.n_embd;
+        D->n_max = (int) std::max<int64_t>(1, std::min<int64_t>(kND, env_i("STRATA_INK_DSPARK_N", kND)));
+        D->tail = 2048;   // (the drafter's window: a prompt chunk's last 2048 rows)
+        D->rows_g = 64;   // (no acc_g: the deferred rows' cap, inkd_tok_begin's min(64, rows_g))
+        for (auto& Ly : D->L) Ly.ring = Ly.win = D->tail;   // (the context's bookkeeping: L[0].lo, the rings ikf's)
+        bool ok = true;
+        const auto dev = [&](size_t bytes) -> void* {
+            void* p = nullptr;
+            if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; cudaGetLastError(); return nullptr; }
+            D->allocs.push_back(p);
+            D->bytes += bytes;
+            return p;
+        };
+        D->acc_l = (float*) dev((size_t) D->tail * 4 * E * sizeof(float));
+        D->roff_d = (int64_t*) dev(64);
+        if (!ok) return refuse("the taps' buffer did not allocate (VRAM?)");
+        if (const char* v = getenv("STRATA_INK_DSPARK_DEFER"); v == nullptr || std::atoi(v) != 0) D->defer = true;
+        D->bytes += ikf_bytes();
+        std::fprintf(stderr, "ink dspark: %s is Inkling's DFlash 2 drafter - up to %d drafts a step; %.2f GB on CUDA%d\n",
+                     path, D->n_max, (double) D->bytes / 1073741824.0, dev_);
+        return true;
+    }
     // the layout by its tensors: the newer one (markov_w2, per-layer ctx_mix, no dspark_fuse) needs the Markov head's
     // context input (has_markov_context: f_rnn, joint_proj's 5120 columns)
     D->v2 = G.find("dspark_fuse.weight") == nullptr && G.find("markov_w2.weight") != nullptr &&
@@ -1051,6 +1111,7 @@ void Glm5Model::inkd_destroy() {
     inkd_auto_ = false;
     if (D == nullptr) return;
     inkd_ = nullptr;
+    ikf_destroy();
     for (void* p : D->allocs) cudaFree(p);
     if (D->dump) std::fclose(D->dump);
     for (cudaEvent_t e : D->ev)
@@ -1165,6 +1226,7 @@ bool Glm5Model::inkd_slot_load(const uint8_t* src, int64_t n) {
 
 void Glm5Model::inkd_report() const {
     const auto* D = (const IkState*) inkd_;
+    if (D != nullptr && D->df2) ikf_report();
     if (D == nullptr || D->drafts == 0) return;
     std::fprintf(stderr, "ink dspark: %llu drafts, %.2f ms each (host to results); %llu context commits (%llu of deferred rows), "
                          "%llu prompt rows (%llu past the global layer's buffer)\n",
@@ -1189,6 +1251,8 @@ void Glm5Model::inkd_reset() {
     D->win_p0 = -1;
     // a restored snapshot (pos_ inside the context): the rows before it are still this sequence's
     if (pos_ > 0 && pos_ <= D->ctx_end) {
+        if (D->df2)   // (the positions after pos_ wrote over the ring rows 2048 before them)
+            for (auto& Ly : D->L) Ly.lo = std::max<int64_t>(Ly.lo, D->ctx_end - Ly.ring);
         D->ctx_end = pos_;
         for (auto& Ly : D->L) Ly.lo = std::min<int64_t>(std::max<int64_t>(Ly.lo, pos_ - Ly.ring), pos_);
         if (D->frnn_pos != pos_ - 1) D->frnn_pos = -1;
@@ -1197,6 +1261,7 @@ void Glm5Model::inkd_reset() {
         for (auto& Ly : D->L) Ly.lo = pos_;
         D->frnn_pos = -1;
     }
+    if (D->df2) D->frnn_pos = D->ctx_end - 1;   // (DFlash 2 has no f_rnn: the rings reach ctx_end)
 }
 
 // ------------------------------------------------------------------------------------------------ the context
@@ -1214,7 +1279,7 @@ void Glm5Model::ink_tap(int visit, const float* x, int64_t ld, int n, const floa
     }
     if (j == 0) {   // (the rows' first tap: how many of them the accumulators hold)
         int ng = n;
-        if (prompt && n > D->rows_g) {   // (a long chunk: acc_g grown - halving while the VRAM refuses)
+        if (prompt && n > D->rows_g && !D->df2) {   // (a long chunk: acc_g grown - halving while the VRAM refuses)
             int want = std::min(n, D->ctx_g);
             float* p = nullptr;
             while (want > D->rows_g && cudaMalloc(&p, (size_t) want * E * sizeof(float)) != cudaSuccess) {
@@ -1236,11 +1301,16 @@ void Glm5Model::ink_tap(int visit, const float* x, int64_t ld, int n, const floa
         }
         D->tap_n = n;
         D->tap_ng = std::min(ng, D->rows_g);
-        D->tap_nl = std::min(n, kTail);
+        D->tap_nl = std::min(n, D->tail);
         D->tap_prompt = prompt;
     }
     if (n != D->tap_n) return;   // (a tap of other rows than the first one's: a mismatch - not taken)
     const bool pd = pend && D->defer && n == 1;
+    if (D->df2) {
+        strata::kernels::pdl_launch(k_tap4, dim3((unsigned) n), dim3(256), 0, s, x, ld, n, norm_w, g_.norm_eps, E, j,
+                                    D->tap_nl, D->acc_l, pd ? D->tap_pa : nullptr, pd ? D->tap_pb : nullptr);
+        return;
+    }
     strata::kernels::pdl_launch(k_tap, dim3((unsigned) n), dim3(256), 0, s, x, ld, n, norm_w, g_.norm_eps, E, j, D->tap_ng,
                                 D->tap_nl, D->acc_g, D->acc_l, D->al, pd ? D->tap_pa : nullptr, pd ? D->tap_pb : nullptr);
 }
@@ -1255,7 +1325,7 @@ void Glm5Model::inkd_tok_taps(int n) {   // (a replayed token / window graph: it
     if (D == nullptr) return;
     D->tap_n = n;
     D->tap_ng = std::min(n, D->rows_g);
-    D->tap_nl = std::min(n, kTail);
+    D->tap_nl = std::min(n, D->tail);
     D->tap_prompt = false;
 }
 
@@ -1270,6 +1340,24 @@ bool Glm5Model::inkd_commit(int64_t p0, int n, bool prompt, cudaStream_t s) {
     }
     const int E = g_.n_embd;
     const int ng = D->tap_ng, nl = D->tap_nl;
+    if (D->df2) {   // (DFlash 2: acc_l's rows = positions p0 + n - nl .., the four taps side by side)
+        if (prompt) {
+            D->prompt_rows += (uint64_t) n;
+            D->prompt_cut += (uint64_t) (n - nl);
+        }
+        const bool gap = p0 != D->ctx_end;
+        if (!ikf_rows(D->acc_l, p0 + n - nl, nl, s)) return false;
+        const int64_t first = p0 + n - nl, end = p0 + n;
+        IkLayer& Ly = D->L[0];
+        if (gap || first != p0 || Ly.lo > p0) Ly.lo = first;
+        Ly.lo = std::max<int64_t>(Ly.lo, end - D->tail);
+        for (int l = 1; l < kL; ++l) D->L[l].lo = Ly.lo;
+        D->ctx_end = end;
+        D->frnn_pos = end - 1;   // (no f_rnn: the draft's check that the context reaches the position)
+        D->tap_n = 0;
+        ++D->commits;
+        return true;
+    }
     if (prompt) {
         D->prompt_rows += (uint64_t) n;
         D->prompt_cut += (uint64_t) (n - ng);
@@ -1367,7 +1455,7 @@ bool Glm5Model::inkd_flush() {
     D->pend_n = 0;
     D->tap_n = n;
     D->tap_ng = std::min(n, D->rows_g);
-    D->tap_nl = std::min(n, kTail);
+    D->tap_nl = std::min(n, D->tail);
     D->tap_prompt = false;
     ++D->flushes;
     return inkd_commit(D->pend_p0, n, false, fast_->cs);
@@ -1412,6 +1500,22 @@ bool Glm5Model::inkd_draft(int32_t y, int32_t* drafts, float* conf, std::string&
     if (!inkd_flush()) { err = "ink dspark: the deferred rows' commit"; return false; }
     const int64_t pos = pos_;
     if (D->ctx_end != pos || D->frnn_pos != pos - 1) return true;   // (no context for this position: no drafts)
+    if (D->df2) {
+        int32_t dr[kND];
+        float cf[kND];
+        for (int k = 0; k < kND; ++k) {
+            dr[k] = -1;
+            cf[k] = 0.0f;
+        }
+        if (!ikf_draft(y, pos, D->L[0].lo, dr, cf, err)) return false;
+        for (int k = 0; k < D->n_max && dr[k] >= 0; ++k) {
+            drafts[k] = dr[k];
+            conf[k] = cf[k];
+        }
+        ++D->drafts;
+        D->ms_draft += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
     const int E = g.n_embd, V = D->V, FF = D->ff, ND = D->n_max;
     int ph = 0;
     const auto mark = [&] { if (D->prof) cudaEventRecord(D->ev[ph++], s); };

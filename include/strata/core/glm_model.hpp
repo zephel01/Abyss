@@ -1153,6 +1153,17 @@ public:
     uint64_t inkd_slot_bytes(int64_t n) const;
     bool inkd_slot_save(uint8_t* dst, int64_t n);
     bool inkd_slot_load(const uint8_t* src, int64_t n);
+    // ---- Inkling 2 Mini's DFlash 2 drafter (src/core/ink_dflash2.cu; incoai/Inkling-2-Mini-DFlash2 converted by
+    // tools/ink_dflash2_convert.py): inkd_load loads it when STRATA_INK_DSPARK's dflash GGUF has the selector's
+    // tensors; the DSpark drafter's taps and hooks feed it (inkd_commit: the four taps a row side by side, ikf_rows),
+    // inkd_draft asks it (ikf_draft)
+    void* ikf_ = nullptr;
+    bool ikf_load(const strata::GgufFile& G, const char* path, std::string& why);
+    void ikf_destroy();
+    size_t ikf_bytes() const;
+    void ikf_report() const;
+    bool ikf_rows(const float* feat, int64_t p_first, int n, cudaStream_t s);
+    bool ikf_draft(int32_t y, int64_t pos, int64_t lo, int32_t* drafts, float* conf, std::string& err);
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);
     bool verify_moe_router(int il, int tb, int n, cudaStream_t s, std::string& err);   // (its first launch)
