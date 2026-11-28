@@ -763,6 +763,11 @@ public:
     bool ernie_hca_gate(int il, std::string& err);
     bool fast_ernie_ffn(int il, std::string& err);
     void ernie_multimax(float* logits, cudaStream_t s);
+    // the batched prompt path's ERNIE half (glm_prefill.cu runs the latent MoE through its expert machinery): the
+    // attention a token at a time through the token path; ernie_prompt_ok: the FFN weights the prompt GEMMs decode;
+    // ernie_lat: layer il's fc1 (latent_down), fc2 (latent_up), the latent's norm and the second router
+    bool ernie_prompt_ok(std::string& why) const;
+    bool ernie_lat(int il, WSlot& down, WSlot& up, const float*& norm, const uint16_t*& router1) const;
     // ---- deepseek41 (src/core/dsv41_fast_path.cu): the token path, prompt chunks (their attention a token at a time),
     // snapshots and verify windows (dsv4_verify.cu, the batched kind); no layer splits
     void* dsv41_state_ = nullptr;                          // the window rings, the 4 KV slots and the scratch

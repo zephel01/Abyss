@@ -148,7 +148,8 @@ __global__ void __launch_bounds__(256) hc_finish_kernel(const HcFinishArgs a) {
     if (tid < 24) smix[tid] = a.mix[(size_t) t * 24 + tid];
     if (tid == 24) smix[24] = a.ss[t];
     __syncthreads();
-    const float inv = rsqrtf(smix[24] / (float) hc_dim + a.norm_eps);
+    const float mean = smix[24] / (float) hc_dim;
+    const float inv = a.eps_out ? 1.0f / (sqrtf(mean) + a.norm_eps) : rsqrtf(mean + a.norm_eps);
     if (warp == 0) {
         if (lane < hc) {
             const float pre_v = dsigmoid(smix[lane] * inv * a.w_scale[0] + a.w_base[lane]) + a.hc_eps;
@@ -1658,7 +1659,8 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
         const float x = logits[(size_t) t * E + e];
         // gating 1 (deepseek4): sqrt(softplus) - ggml's softplus (x > 20: x), then sqrt; 2 (qwen35moe): the logit,
         // the chosen k take their softmax below
-        const float p = gating == 2 ? x : gating == 1 ? sqrtf(x > 20.0f ? x : logf(1.0f + expf(x))) : 1.0f / (1.0f + expf(-x));
+        // (3, ERNIE-5.5: sigma(l0) + sigma(l1), summed before the route - the score itself)
+        const float p = gating == 2 || gating == 3 ? x : gating == 1 ? sqrtf(x > 20.0f ? x : logf(1.0f + expf(x))) : 1.0f / (1.0f + expf(-x));
         s_p[e] = p;
         s_sel[e] = bias ? p + bias[e] : p;
         if (!isfinite(logits[(size_t) t * E + e]) || !isfinite(s_sel[e])) atomicExch(&bad, 1);

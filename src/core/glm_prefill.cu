@@ -19,6 +19,7 @@
 #include "glm_fast_state.hpp"
 #include "glm_pool_pin.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
+#include "strata/kernels/ernie_fast.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 
 #include "strata/core/knobs.hpp"
@@ -525,7 +526,7 @@ static bool own_type_l(int type, const Glm5Geometry& g) {
 
 struct MoeBufs {
     float *logits, *rw, *OUTP, *OUTPc;
-    float* GUX;   // 2 n_ff > n_embd (hy4's latent experts): a part's gate/up rows, apart from OUTP
+    float* GUX;   // 2 n_ff > n_embd (hy4's latent experts): a part's gate/up rows, apart from OUTP; ERNIE: > its latent width
     float *sh_g, *sh_u;
     uint16_t* sh16;
     int *ids, *rank, *counts, *base, *row_tok, *pos, *bounds;
@@ -553,7 +554,7 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     // each set's gate/up rows live in its own OUTP rows until the down product, the swiglu over their gate halves
     b.OUTP = c.take<float>(W * g.n_embd);
     b.OUTPc = c.take<float>(W * g.n_embd);
-    b.GUX = 2 * (size_t) g.n_ff_exp > (size_t) g.n_embd ? c.take<float>(W * 2 * (size_t) g.n_ff_exp) : nullptr;
+    b.GUX = 2 * (size_t) g.n_ff_exp > (size_t) g.exp_dim() ? c.take<float>(W * 2 * (size_t) g.n_ff_exp) : nullptr;
     const size_t ts = std::min(T, sub);   // the shared expert's sub-batch
     b.sh_g = c.take<float>(ts * FF);
     b.sh_u = c.take<float>(ts * FF);
@@ -1260,9 +1261,14 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     }
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    if (g.ernie) {   // (ERNIE-5.5: the batched kernels have no MLA / gate / VHA / latent MoE yet)
-        std::fprintf(stderr, "glm prefill: CUDA%d ernie has no prompt path yet - token by token\n", dev_);
-        return true;
+    // ernie (ERNIE-5.5): the attention a token at a time through the token path (prefill_half), the FFN batched here
+    // (ernie_prompt_ok: fc1 / fc2 decode to FP16); the latent MoE through the expert machinery at the latent's width
+    if (g.ernie) {
+        std::string ew;
+        if (!ernie_prompt_ok(ew)) {
+            std::fprintf(stderr, "glm prefill: CUDA%d ernie has no prompt path (%s) - token by token\n", dev_, ew.c_str());
+            return true;
+        }
     }
     // NVFP4 experts: the MMQ sets apply their second-level scales (the down one folded into the route weights, the
     // gate/up one on the product's rows before the SwiGLU); the light kernels, the CPU and the iGPU rows do not take
@@ -1333,6 +1339,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         const auto& Ly = F->L[(size_t) il];
         if (g.is_hy4() || g.ink || g.giga) {
             // (hy4_prompt_ok / ink_prompt_ok / giga_prompt_ok above)
+        } else if (g.ernie) {
+            // (the attention: the token path's, a token at a time - no batched projections)
         } else if (g.raon) {   // (raon: the projections batched - prefill_half's raon mixer)
             if (Ly.recr) {
                 deq_ok(Ly.q, "attn_q", il);
@@ -3926,6 +3934,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         h.comb = S->comb;
         h.x = S->x;
         h.x16 = S->x16;
+        h.eps_out = g.ernie && g.er_hc_eps_out ? 1 : 0;
         gb::hc_finish(h, s);
     };
 
@@ -4917,7 +4926,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const float* xs = S->x + (size_t) t0 * E;
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
             float* mixer = S->mixer + (size_t) t0 * E;
-            if (g.v41 && S->has_dsa) {
+            if (g.ernie) {
+                // ERNIE-5.5: a token at a time through the token path's attention (the HCA layers' rings and compressed
+                // rows, the MLA layers' latent cache and indexer keys advance in order, as decode left them)
+                for (int t = 0; t < tn; ++t) {
+                    if ((t & 255) == 255) progress_beat();
+                    cudaMemcpyAsync(F->x, xs + (size_t) t * E, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+                    gf::quantize_q8_1(F->x, F->xq, E, s);
+                    if (!fast_dsv4_attn(il, p0 + t0 + t, err)) return false;
+                    cudaMemcpyAsync(mixer + (size_t) t * E, F->mixer, (size_t) E * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, s);
+                }
+            } else if (g.v41 && S->has_dsa) {
                 if (!prefill_v41_mixer(il, p0 + t0, tn, t0, x16, xs, mixer, skip_output, (void*) S->uni, err))
                     return false;
             } else if (g.v41) {
@@ -5620,6 +5640,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
 
         // ---- MoE: the shared expert (sub-batches, straight into ffn), the routes, the expert groups
+        // (ERNIE-5.5's latent MoE: the experts run at the latent's width from here - x holds the latent rows (fc1, after
+        // the routers read the residual-width x), ffn the routed sum; its shared expert goes to mixer at the residual's
+        // width and fc2 adds the normed sum to it at the end)
+        const int E_res = E;
+        const int E = g.ernie ? g.exp_dim() : E_res;
         Carve c{S->uni};
         MoeBufs M = carve_moe(c, (size_t) T, (size_t) S->sh_sub(), g);
         const int FF = g.n_ff_exp * g.n_shared, NE = g.n_expert, nff = g.n_ff_exp;
@@ -5633,6 +5658,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto shared_expert = [&] {
             if (g.n_shared == 0) {   // (inkling: no shared expert - the routed sum starts from zero)
                 cudaMemsetAsync(S->ffn, 0, (size_t) T * E * sizeof(float), s);
+                return;
+            }
+            if (g.ernie) {   // (SiTU: the negative limit; on the residual-width x16, into mixer)
+                for (int t0 = 0, shs = S->sh_sub(); t0 < T; t0 += shs) {
+                    const int tn = std::min(shs, T - t0);
+                    const uint16_t* x16 = S->x16 + (size_t) t0 * E_res;
+                    hgemm_q(Ly.sh_gate, FF, E_res, x16, E_res, M.sh_g, FF, tn, 0.0f);
+                    hgemm_q(Ly.sh_up, FF, E_res, x16, E_res, M.sh_u, FF, tn, 0.0f);
+                    gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.lim_shexp(il), s);
+                    hgemm_q(Ly.sh_down, E_res, FF, M.sh16, FF, S->mixer + (size_t) t0 * E_res, E_res, tn, 0.0f);
+                }
+                cudaMemsetAsync(S->ffn, 0, (size_t) T * E * sizeof(float), s);   // (the routed sum's start)
+                S->mark("shexp", s);
                 return;
             }
             if (g.is_hy4()) {
@@ -5658,6 +5696,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (!hy4_sh_ok) return false;
         if (g.is_hy4()) {   // (its router reads x at the residual's width)
             if (!hy4_prompt_router(il, T, M.logits, hy4_io(S, (size_t) S->T * E), err)) return false;
+        } else if (g.ernie) {
+            // the two BF16 routers on the residual-width x (s = sigmoid(l0) + sigmoid(l1): gating 3), then fc1 -> the
+            // latent rows into x (the routers' input is read by then; the shared expert reads x16)
+            WSlot ld, lu;
+            const float* lnorm = nullptr;
+            const uint16_t* r1 = nullptr;
+            if (!ernie_lat(il, ld, lu, lnorm, r1)) {
+                err = "ernie prompt: layer " + std::to_string(il) + " has no latent weights";
+                return false;
+            }
+            float* l1 = S->mixer;   // (free until the shared expert writes it, after the route)
+            sgemm_bf16(Ly.router, NE, E_res, S->x, E_res, M.logits, NE, T, 1.0f);
+            sgemm_bf16(r1, NE, E_res, S->x, E_res, l1, NE, T, 1.0f);
+            strata::kernels::ernie::router2(M.logits, l1, M.logits, T * NE, s);
+            hgemm_q(ld, E, E_res, S->x16, E_res, S->x, E, T, 0.0f);
         } else if (Ly.router_type == gf::kTypeF32) {   // (deepseek41, qwen35moe: an F32 router)
 #if defined(STRATA_USE_HIP)
             // the engine's own tile kernel: rocBLAS's F32 GEMM took 15.7 ms a layer here (575 rows, 256 experts, 3072),
@@ -7301,12 +7354,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             flush();
             if (cpu_nrows > 0) gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, rows, M.pos, M.rw, T, K, E, S->ffn, s);
         }
-        abl_out(il, 1, S->ffn, T, E, s);   // (the whole FFN: shared + routed + the CPU lane's rows)
+        if (g.ernie) {
+            // the routed sum's RMSNorm (the latent norm) -> x / x16 at the latent's width, fc2 added onto the shared
+            // expert in mixer, which becomes the FFN's output
+            WSlot ld, lu;
+            const float* lnorm = nullptr;
+            const uint16_t* r1 = nullptr;
+            ernie_lat(il, ld, lu, lnorm, r1);
+            q35::add_rms_rows(S->ffn, E, nullptr, lnorm, g.norm_eps, T, E, S->x, S->x16, s);
+            hgemm_q(lu, E_res, E, S->x16, E, S->mixer, E_res, T, 1.0f);
+            cudaMemcpyAsync(S->ffn, S->mixer, (size_t) T * E_res * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            S->mark("ernie_fc2", s);
+        }
+        abl_out(il, 1, S->ffn, T, E_res, s);   // (the whole FFN: shared + routed + the CPU lane's rows)
         if (g.raon && Ly.rn_steer != nullptr && raon_alpha_ != 0.0f)   // (raon: the reasoning-effort vector)
             strata::kernels::raon::axpy(S->ffn, Ly.rn_steer, raon_alpha_, E, s, T);
         S->mark("combine", s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
-        dump_row("ffn_out-" + std::to_string(ia), S->ffn, E);
+        dump_row("ffn_out-" + std::to_string(ia), S->ffn, E_res);
         if (g.is_hy4()) {   // routed_up, the shared expert, post_ffw_norm and the streams' add
             if (!hy4_prompt_ffn_out(il, T, hy4_io(S, (size_t) S->T * E), err)) return false;
             S->mark("hy4_out", s);
@@ -7558,7 +7623,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink || g_.ling || g_.raon || g_.giga || (g_.memt && !g_.dsv4()) || g_.prism_block > 0) || split_next_ ||
+    if (prefill_logits && (!(g_.v41 || g_.ernie || g_.ink || g_.ling || g_.raon || g_.giga || (g_.memt && !g_.dsv4()) || g_.prism_block > 0) || split_next_ ||
                            l0_ != 0 || l1_ != g_.n_layers)) {
         err = "prefill logits requires single-device DeepSeek V4.1, Inkling, Ling or MemT"; return false;
     }
@@ -7856,6 +7921,11 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                                    fast_->cs);
                     else if (g.giga)   // (giga: R's row takes the post-normed last FFN, GN_output - the token path's head)
                         giga_prompt_head(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, fast_->cs);
+                    else if (g.ernie)   // (ernie: R's row through the deepseek4 head's hc collapse, dsv4_head's)
+                        strata::kernels::dsv4::head_prep(pf_->R + (size_t) t * 4 * E, w16_.at("output_hc_fn.weight"),
+                                                         w_.at("output_hc_scale.weight"), w_.at("output_hc_base.weight"),
+                                                         g.hc_eps, w_.at("output_norm.weight"), g.norm_eps, E,
+                                                         fast_->head_x, fast_->head_xq, fast_->cs);
                     else if (g.raon)   // (raon: the mean of the row's 4 streams, output_norm - the token path's head_prep)
                         gf::head_prep(pf_->R + (size_t) t * 4 * E, w_.at("output_norm.weight"), g.norm_eps, E,
                                       fast_->head_x, fast_->head_xq, fast_->cs);
@@ -7875,6 +7945,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     const bool hd = q35d_head_split() ? q35d_head(fast_->head_xq, 1, sc_ + sc_logits, fast_->cs, err, fast_->head_x)
                                                       : gf::mv(&job, 1, fast_->cs);
                     if (hd && (g.ink || g.giga)) strata::kernels::ink::softcap(sc_ + sc_logits, g.n_vocab, g.ink_softcap, fast_->cs);
+                    if (hd && g.ernie) ernie_multimax(sc_ + sc_logits, fast_->cs);
                     if (!hd ||
                         !glmfast::cuda_ok(cudaMemcpyAsync(logits.data(), sc_ + sc_logits,
                             logits.size() * sizeof(float), cudaMemcpyDeviceToHost, fast_->cs),

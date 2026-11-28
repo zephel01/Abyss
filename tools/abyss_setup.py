@@ -433,10 +433,11 @@ MODELS = {
     # the logits.  Xylolabs' IQ2_XXS (IQ2_XXS gate / up, IQ2_XS down; 5 parts at the repo's top level, 82.84 GB; the
     # SHA-256 from Hugging Face's file list); the pack is --compat-bf16 (iq_pack.py splits the router and joins k_b /
     # v_b, tools/test_iq_pack_ernie5.py).  NVIDIA only (the HIP build compiles the ernie path, never run on an AMD GPU);
-    # one GPU (no layer split for ernie); text only; the prompt is read a token at a time (no batched prompt path yet);
+    # one GPU (no layer split for ernie); text only; the batched prompt path (its attention a row at a time).
     # no drafter (the files have no DSpark head).  2026-11-28, RTX 5090 (Gen4 x4), 123 GB RAM, iGPU off, RAM tier 36 GB,
-    # 4K prompt + 512, median of 3: decode 21.7 tok/s, the prompt ~20.7 tok/s; held to 24 GB 14.3 / ~13.8.  The 16K
-    # context: the runs were 8K (the needle at 4.6K).  Sampling the GGUF's general.sampling (temperature 1.0, top_p 0.95)
+    # 4K prompt + 512, median of 3: decode 21.7 tok/s, the prompt (a token at a time) ~20.7; 24 GB 14.3 / ~13.8;
+    # the batched prompt path 90 tok/s at 4,020 and 15,847 tokens (11.1 ms/tok, 24 GB not measured).  The 16K
+    # context: the runs were 8K (the needle at 4.6K; the 15,847-token prompt at 20K).  Sampling the GGUF's general.sampling (temperature 1.0, top_p 0.95)
     "ernie55": {"repo": "Xylolabs/ERNIE-5.5-Flash-Preview-GGUF", "quant": "IQ2_XXS", "quants": ("IQ2_XXS",),
                 "folder": "", "prefix_tmpl": "ERNIE-5.5-Flash-Preview-{q}-", "model_name": "ernie-5.5-flash-preview",
                 "prefix": "ernie55", "title": "ERNIE-5.5-Flash-Preview", "env": {}, "gb": 83,
@@ -1672,7 +1673,7 @@ def main() -> int:
         S.ok(f"RAM {S.ram_gb():.0f} GB (the {quant} file is ~{model['gb']} GB: the experts that do not fit the GPU go to RAM, "
              "the rest are read from the SSD - keep the model on a fast NVMe)")
         S.say("  ERNIE-5.5-Flash-Preview IQ2_XXS on an RTX 5090 (PCIe Gen4 x4) + a 36 GB RAM tier: decode 21.7 tok/s,")
-        S.say("  14.3 held to 24 GB; the prompt is read a token at a time in this version (~20 tok/s: a 4K prompt ~3.3 min)")
+        S.say("  14.3 held to 24 GB; prompts ~90 tok/s (a 4K prompt ~45 s, a 16K one ~3 min)")
         if (gpus[0].get("vram_gb") or 0) < 23:
             S.warn("ERNIE-5.5-Flash-Preview is measured on 24 and 32 GB of VRAM only: with less, more experts come from "
                    "RAM and the SSD (slower; not measured)")

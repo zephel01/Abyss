@@ -145,7 +145,7 @@ own Q4_K_M for an 8-32 GB GPU (the experts that do not fit go to RAM), with the 
 
 Baidu's ERNIE-5.5-Flash-Preview (beta, NVIDIA, one GPU, text only; [ERNIE-5.5-Flash-Preview](#ernie-55-flash-preview-beta)):
 Xylolabs' IQ2_XXS (5 parts) for a 24-32 GB GPU + 64 GB RAM or more, with the GGUF's sampling (temperature 1.0, top_p
-0.95). The prompt is read a token at a time in this version (~20 tok/s: a 4K prompt takes ~3.3 minutes):
+0.95). Prompts run at ~90 tok/s (a 4K prompt ~45 seconds):
 
 ```sh
 ./setup-deepseek.sh --model ernie55 --download-model     # ERNIE-5.5-Flash-Preview-IQ2_XXS-0000{1..5}-of-00005.gguf (82.84 GB)
@@ -1544,9 +1544,12 @@ MultiMax on the logits). `./setup-deepseek.sh --model ernie55` sets up
 1.0 / top_p 0.95, the GGUF's; a 16K context - the checks ran at 8K). **License:** Apache-2.0. NVIDIA only: the HIP build
 compiles the path but it has not run on an AMD GPU. One GPU: no layer split.
 
-**The prompt is read a token at a time** in this version: ~20 tok/s, so a 4K prompt takes ~3.3 minutes before the
-first answer token. Decode is 21.7 tok/s (RTX 5090 on PCIe Gen4 x4, a 36 GB RAM tier, iGPU off, a 4K prompt + 512,
-median of 3; 14.3 tok/s held to 24 GB with `STRATA_GLM_VRAM_GB=24`, the prompt ~13.8). The experts that do not fit the
+**Prompts** go through the batched prompt path at ~90 tok/s (a 4,020- and a 15,847-token prompt alike), so a 4K prompt
+takes ~45 seconds before the first answer token (~3.3 minutes a token at a time, `--prefill 0`). Its attention still
+runs a row at a time; the FFN and the experts run in batches. Its logits differ from the token path's by KL 0.006-0.03
+(the prompt path's rounding). Decode is 21.7 tok/s (RTX 5090 on PCIe Gen4 x4, a 36 GB RAM tier, iGPU off, a 4K prompt + 512,
+median of 3; 14.3 tok/s held to 24 GB with `STRATA_GLM_VRAM_GB=24`, the prompt a token at a time ~13.8;
+the batched prompt at 24 GB is not measured). The experts that do not fit the
 GPU go to the RAM tier, the rest are read from the SSD: setup sets `STRATA_GLM_RAM_GB` by the PC's RAM (48 GB -> 30,
 64 -> 46, 96 GB and up -> 60).
 
@@ -1567,7 +1570,7 @@ found.
 
 **Thinking.** `reasoning_effort` low / medium / high (high when absent; the server's max is high), `"none"` or
 `chat_template_kwargs: {"enable_thinking": false}` closes the think block. The reasoning comes back as reasoning (up to
-`</ernie:think>`), a turn ends at `<|ernie:im_end|>`. Not yet: the batched prompt path, a drafter (DSpark: Xylolabs'
+`</ernie:think>`), a turn ends at `<|ernie:im_end|>`. Not yet: batched attention in the prompt path, a drafter (DSpark: Xylolabs'
 files have no DSpark head), tool calls as OpenAI / Anthropic calls (the model's `<ernie:tool_call>` blocks come back as
 text), conversation slots, AMD (HIP).
 

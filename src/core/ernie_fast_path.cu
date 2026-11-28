@@ -16,12 +16,14 @@
 //     rides the experts' down scale MoeDev::nv_scale), fc1 (4096 -> 2048), the 10 routed experts in the latent through
 //     the expert tiers (MXFP4, SiTU), RMSNorm, fc2 (2048 -> 4096), plus the shared SiTU expert on x;
 //   * MultiMax on the logits (ernie_multimax).
-// Not here yet (refused where they would start): the prompt path, verify windows, DSpark, the CPU / iGPU lanes, layer
-// splits.
+// The batched prompt path (glm_prefill.cu, STRATA_ERNIE_PREFILL=0: off): the attention a token at a time through this
+// token path, the FFN batched (routers, fc1, the latent experts through the prompt's expert machinery, fc2, the shared
+// expert).  Not here yet (refused where they would start): verify windows, DSpark, the CPU / iGPU lanes, layer splits.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/ernie_fast.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
@@ -301,7 +303,7 @@ bool Glm5Model::ernie_setup(std::string& err) {
     for (int il = 0; il < g.n_layers; ++il) n_mla += g.is_er_mla(il) ? 1 : 0;
     std::fprintf(stderr, "ernie: CUDA%d %d MLA layers (F32 caches + FP16 indexer keys %.2f GB for %d tokens), latent MoE "
                          "%d -> %d, %d of %d experts, VHA rank %d (0: folded), MultiMax %s, DSA indexer %s (top %d + window %d past "
-                         "%d); token path only (no prompt path, verify window, DSpark, lanes)\n",
+                         "%d); no verify window, DSpark or lanes\n",
                  dev_, n_mla, (double) n_mla * E->ctx * (LW * 4 + g.idx_key * 2) / 1073741824.0, E->ctx, g.n_embd,
                  g.exp_dim(), g.n_exp_used, g.n_expert, g.er_vha_rank, g.er_multimax ? (g.er_mm_meta ? "on (metadata)" : "on") : "off",
                  E->idx_mode ? "on" : "OFF (STRATA_ERNIE_IDX=0: dense)", g.er_idx_top_k, g.n_swa, g.er_dense_ctx());
@@ -498,6 +500,46 @@ bool Glm5Model::fast_ernie_ffn(int il, std::string& err) {
     }
     if (!F->kda_graph_on) F->bg_drain(s, F->bg_pace, F->bg_attn_mask);
     if (ek::launch_errors() > 0) { err = "ernie: ffn kernels"; return false; }
+    return true;
+}
+
+bool Glm5Model::ernie_prompt_ok(std::string& why) const {
+    const char* v = getenv("STRATA_ERNIE_PREFILL");
+    if (v != nullptr && std::atoi(v) == 0) {
+        why = "STRATA_ERNIE_PREFILL=0";
+        return false;
+    }
+    const Ernie* E = fast_ != nullptr ? fast_->ernie : nullptr;
+    if (E == nullptr) {
+        why = "ernie: no token path state";
+        return false;
+    }
+    std::string bad;
+    const auto ok = [](const WSlot& w) {
+        return w.q != nullptr && (w.type == gf::kTypeBF16 || w.type == gf::kTypeF32 ||
+                                  strata::kernels::dequant_bf16_supported(w.type));
+    };
+    for (int il = g_.dense_lead; il < g_.n_layers; ++il) {
+        const auto& El = E->L[(size_t) il];
+        if (!ok(El.lat_down)) bad += "blk." + std::to_string(il) + ".ffn_latent_down ";
+        if (!ok(El.lat_up)) bad += "blk." + std::to_string(il) + ".ffn_latent_up ";
+        if (El.router1 == nullptr || El.lat_norm == nullptr) bad += "blk." + std::to_string(il) + " router / latent norm ";
+    }
+    if (!bad.empty()) {
+        why = "ernie: weights without an FP16 decode: " + bad.substr(0, 300);
+        return false;
+    }
+    return true;
+}
+
+bool Glm5Model::ernie_lat(int il, WSlot& down, WSlot& up, const float*& norm, const uint16_t*& router1) const {
+    const Ernie* E = fast_ != nullptr ? fast_->ernie : nullptr;
+    if (E == nullptr || il < 0 || il >= (int) E->L.size()) return false;
+    const auto& El = E->L[(size_t) il];
+    down = El.lat_down;
+    up = El.lat_up;
+    norm = El.lat_norm;
+    router1 = El.router1;
     return true;
 }
 

@@ -295,3 +295,4 @@ STRATA_ERNIE_DUMP  # src/core/ernie_fast_path.cu (debug: a directory; ERNIE-5.5'
 STRATA_ERNIE_GATE_BF16  # src/core/ernie_fast_path.cu (debug: 0 leaves ERNIE-5.5's output-gate sigmoid unrounded, as the float64 reference's dumps)
 STRATA_ERNIE_IDX  # src/core/ernie_fast_path.cu (debug: 0 turns ERNIE-5.5's DSA indexer off - dense MLA attention at any length)
 STRATA_ERNIE_IDX_DUMP  # src/core/ernie_fast_path.cu (debug: a directory; ERNIE-5.5's MLA layers' x, mixer output and selection as .bin for recipes/ernie55/idx/ref_dsa.py)
+STRATA_ERNIE_PREFILL  # src/core/ernie_fast_path.cu (0: ERNIE-5.5 reads prompts token by token - the batched prompt path off, the A/B baseline)

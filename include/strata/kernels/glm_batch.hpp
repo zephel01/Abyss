@@ -42,6 +42,7 @@ struct HcFinishArgs {
     float* comb = nullptr;   // T x 16
     float* x = nullptr;      // T x n_embd
     void* x16 = nullptr;     // T x n_embd FP16
+    int eps_out = 0;         // ERNIE-5.5: the mix's RMS factor 1 / (sqrt(mean) + eps) (glm_fast.cu hc_inv)
 };
 void hc_finish(const HcFinishArgs& a, cudaStream_t s);
 

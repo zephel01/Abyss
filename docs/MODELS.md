@@ -286,7 +286,7 @@ text (across the indexer's 2,176) and the answer part of an English and a Japane
 
 | file | size | quality | speed | use |
 | --- | ---: | --- | --- | --- |
-| `IQ2_XXS` (Xylolabs'; IQ2_XXS gate / up, IQ2_XS down, the rest Q8_0 / BF16 / F32) | 82.84 GB | KL mean (median) 0.210 (0.056) / 0.165 (0.064; 0.130 past 2,176) / 0.395 (0.023) / 1.01 (0.0004) (raw / text / en answer / ja answer), the same top token at 87.5 / 86.6 / 81.8 / 83.5%; nll on the text 1.756 (MX 1.662). Xylolabs' own (llama.cpp against the original): chat 0.252 / 84.0%. Greedy English and Japanese answers right; a needle in a 4.6K chat found | decode 21.7 tok/s (24 GB: 14.3); the prompt is read a token at a time: ~20.7 tok/s (24 GB: ~13.8), a 4K prompt ~3.3 minutes; the 4.6K needle chat decoded at 14.4 | a 24-32 GB NVIDIA GPU + 64 GB RAM or more; not measured: smaller GPUs, a 64 GB-RAM PC, AMD |
+| `IQ2_XXS` (Xylolabs'; IQ2_XXS gate / up, IQ2_XS down, the rest Q8_0 / BF16 / F32) | 82.84 GB | KL mean (median) 0.210 (0.056) / 0.165 (0.064; 0.130 past 2,176) / 0.395 (0.023) / 1.01 (0.0004) (raw / text / en answer / ja answer), the same top token at 87.5 / 86.6 / 81.8 / 83.5%; nll on the text 1.756 (MX 1.662). Xylolabs' own (llama.cpp against the original): chat 0.252 / 84.0%. Greedy English and Japanese answers right; a needle in a 4.6K chat found | decode 21.7 tok/s (24 GB: 14.3); prompts ~90 tok/s (4K and 16K; a 4K prompt ~45 seconds; a token at a time ~20.7, 24 GB ~13.8); the 4.6K needle chat decoded at 14.4 | a 24-32 GB NVIDIA GPU + 64 GB RAM or more; not measured: smaller GPUs, a 64 GB-RAM PC, AMD |
 
 ### Ternary Bonsai 2.5 27B (beta, v1.3.205)
 

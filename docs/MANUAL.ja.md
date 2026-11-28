@@ -142,7 +142,7 @@ top_p 0.95）。**ライセンス: 個人の非商用の利用だけ**（リポ�
 
 Baidu の ERNIE-5.5-Flash-Preview（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[ERNIE-5.5-Flash-Preview](#ernie-55-flash-previewベータ)）:
 24〜32 GB の GPU と 64 GB 以上の RAM 向けの Xylolabs の IQ2_XXS（5 分割）。サンプリングは GGUF のもの（temperature 1.0、
-top_p 0.95）。この版ではプロンプトを 1 トークンずつ読みます（約 20 tok/s。4K のプロンプトに約 3.3 分）:
+top_p 0.95）。プロンプトは約 90 tok/s（4K のプロンプトに約 45 秒）:
 
 ```sh
 ./setup-deepseek.sh --model ernie55 --download-model     # ERNIE-5.5-Flash-Preview-IQ2_XXS-0000{1..5}-of-00005.gguf（82.84 GB）
@@ -1469,9 +1469,11 @@ MultiMax）。`./setup-deepseek.sh --model ernie55` で
 GGUF の値です。コンテキストは 16K。確認は 8K で行いました）を書きます。**ライセンス:** Apache-2.0。NVIDIA だけ: HIP ビルドは
 経路をコンパイルしますが、AMD の GPU ではまだ動かしていません。GPU 1 枚: 層の分割はありません。
 
-**この版ではプロンプトを 1 トークンずつ読みます。** 約 20 tok/s なので、4K のプロンプトだと最初の答えのトークンまで約 3.3 分
-かかります。デコードは 21.7 tok/s です（RTX 5090、PCIe Gen4 x4、RAM 層 36 GB、iGPU なし、4K のプロンプト + 512、3 回の
-中央値。`STRATA_GLM_VRAM_GB=24` で 24 GB に絞ると 14.3 tok/s、プロンプトは約 13.8）。GPU に入らないエキスパートは RAM 層に、
+**プロンプト**はまとめて読む経路を通り、約 90 tok/s です（4,020 トークンでも 15,847 トークンでも同じ）。4K のプロンプトなら
+最初の答えのトークンまで約 45 秒です（1 トークンずつ読む `--prefill 0` では約 3.3 分）。アテンションはまだ 1 行ずつで、FFN と
+エキスパートをまとめて計算します。ロジットはトークン経路と KL 0.006〜0.03 だけ違います（プロンプト経路の丸め）。デコードは 21.7 tok/s です（RTX 5090、PCIe Gen4 x4、RAM 層 36 GB、iGPU なし、4K のプロンプト + 512、3 回の
+中央値。`STRATA_GLM_VRAM_GB=24` で 24 GB に絞ると 14.3 tok/s、1 トークンずつ読むプロンプトは約 13.8。24 GB でのまとめて読む
+プロンプトは未測定）。GPU に入らないエキスパートは RAM 層に、
 残りは SSD から読みます。セットアップは PC の RAM に合わせて `STRATA_GLM_RAM_GB` を決めます（48 GB なら 30、64 なら 46、
 96 GB 以上なら 60）。
 
@@ -1491,7 +1493,7 @@ greedy の答えは正しく、4.6K のチャットの中の needle も見つけ
 
 **思考。** `reasoning_effort` は low / medium / high（指定がなければ high。サーバーの max は high になります）。`"none"` か
 `chat_template_kwargs: {"enable_thinking": false}` で思考のブロックを閉じます。思考は思考として返り（`</ernie:think>` まで）、
-ターンは `<|ernie:im_end|>` で終わります。まだのもの: まとめて読むプロンプトの経路、ドラフター（DSpark: Xylolabs のファイルには
+ターンは `<|ernie:im_end|>` で終わります。まだのもの: プロンプト経路でのアテンションのまとめ読み、ドラフター（DSpark: Xylolabs のファイルには
 DSpark のヘッドがありません）、OpenAI / Anthropic のツール呼び出しとしての返却（モデルの `<ernie:tool_call>` ブロックは
 テキストのまま返ります）、会話のスロット、AMD（HIP）。
 
