@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.224 - 2026-11-28
+
+ERNIE-5.5-Flash-Preview reads prompts ~4.4x faster: a 4K prompt takes ~45 s instead of ~3.3 minutes. Other models'
+outputs do not change.
+
+### Faster
+
+- ERNIE-5.5-Flash-Preview (beta) reads prompts on the batched prompt path: ~90 tok/s at 4K and 16K (a 4K prompt ~45 s,
+  was ~3.3 min a token at a time; RTX 5090 Gen4 x4, RAM tier 36 GB, iGPU off). The attention still runs a row at a
+  time; the FFN and the experts are batched. Logits against the token path: KL 0.0059 on raw English, 0.0084 on 2.3K
+  tokens, 0.020 / 0.032 on English / Japanese chat (the same top token at 95-98% of positions); the 4K needle is found.
+  Decode after a 4K prompt 22.1 tok/s (median of 3), 17.3 after 16K. `--prefill 0` (or `STRATA_ERNIE_PREFILL=0`)
+  keeps the token path. Other models' outputs are unchanged (7-config and Inkling md5).
+
 ## v1.3.223 - 2026-11-28
 
 Baidu's ERNIE-5.5-Flash-Preview as a beta on one NVIDIA GPU + RAM (Xylolabs' IQ2_XXS, decode 21.7 tok/s on an RTX
