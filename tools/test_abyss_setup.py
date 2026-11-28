@@ -1547,6 +1547,81 @@ class Giga4(unittest.TestCase):
         self.assertIn("GigaChat4-37B-A4B runs on NVIDIA GPUs only", fail.call_args.args[0])
 
 
+class Ernie55(unittest.TestCase):
+    """--model ernie55 (Xylolabs' ERNIE-5.5-Flash-Preview IQ2_XXS, 5 parts at the repo's top level, BETA): the entry, the
+    quant's parts only (not IQ1_M's or the MXFP4 ones), a plain mirror linked, the config (the RAM tier by the box's
+    RAM, the 16K context, the GGUF's sampling), NVIDIA only."""
+    PARTS = [f"ERNIE-5.5-Flash-Preview-IQ2_XXS-0000{i}-of-00005.gguf" for i in range(1, 6)]
+
+    def test_the_entry(self):
+        m = A.MODELS["ernie55"]
+        self.assertEqual((m["repo"], m["quant"], m["quants"], m["folder"]),
+                         ("Xylolabs/ERNIE-5.5-Flash-Preview-GGUF", "IQ2_XXS", ("IQ2_XXS",), ""))
+        self.assertEqual((m["prefix"], m["pack_args"], m["context"]), ("ernie55", ["--compat-bf16"], 16384))
+        self.assertTrue(m["nvidia_only"])
+
+    def test_the_ram_tier(self):
+        self.assertEqual([A.ernie_ram_tier(r) for r in (32, 48, 64, 94, 96, 123, 128, 256)],
+                         [20, 30, 46, 60, 60, 60, 60, 60])
+
+    def test_the_parts_only(self):
+        names = self.PARTS + ["ERNIE-5.5-Flash-Preview-IQ1_M-00001-of-00005.gguf",
+                              "ERNIE-5.5-Flash-Preview-MXFP4-BF16-00001-of-00005.gguf", "README.md"]
+        items = [{"type": "file", "path": p, "size": 1, "lfs": {"oid": "x"}} for p in names]
+        m = A.MODELS["ernie55"]
+
+        class R:
+            def read(self):
+                return json.dumps(items).encode()
+        with mock.patch.object(A.urllib.request, "urlopen", return_value=R()):
+            got = A.quant_files(m["quant"], m["repo"], m["folder"], m["prefix_tmpl"].format(q=m["quant"]))
+        self.assertEqual([g[0] for g in got], self.PARTS)
+
+    def test_the_local_mirror_and_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            data = d / "data"
+            flat = data / "models" / "Xylolabs" / "ERNIE-5.5-Flash-Preview-GGUF"
+            flat.mkdir(parents=True)
+            files = []
+            for p in self.PARTS:
+                body = p.encode()
+                (flat / p).write_bytes(body)
+                files.append((p, len(body), hashlib.sha256(body).hexdigest()))
+            pack = flat / "IQ2_XXS" / "pack"
+            (pack / "tokenizer").mkdir(parents=True)
+            (pack / "native_experts.txt").write_text("x")
+            (pack / "tokenizer" / "chat_template.jinja").write_text("x")
+            gpu = {"index": 0, "name": "RTX 5090", "vram_gb": 32.0, "arch": "120", "count": 1}
+            tune = Namespace(gpu_tune=mock.Mock())
+            with mock.patch.object(sys, "argv", ["abyss_setup.py", "--model", "ernie55", "--data-dir", str(data)]), \
+                    mock.patch.object(A, "ROOT", d), mock.patch.dict(sys.modules, {"abyss": tune}), \
+                    mock.patch.object(A.S, "gpu_info", return_value=gpu), mock.patch.object(A.S, "ram_gb", return_value=64.0), \
+                    mock.patch.object(A, "use_prebuilt", return_value=False), mock.patch.object(A, "build_engine"), \
+                    mock.patch.object(A.S, "pip_install"), mock.patch.object(A.S, "llama_cpp_reasons", return_value=[]), \
+                    mock.patch.object(A, "quant_files", return_value=files), mock.patch.object(A.S, "check_shards"), \
+                    mock.patch.object(A.S, "download", side_effect=Hy4.no_fetch), \
+                    mock.patch.object(A.S, "ask", side_effect=AssertionError("nothing to ask")), \
+                    mock.patch.object(A.S, "run", side_effect=AssertionError("the pack is there")), \
+                    mock.patch.object(A, "make_tools"), mock.patch.object(A.S, "step"), mock.patch.object(A.S, "say"), \
+                    mock.patch.object(A.S, "ok"), mock.patch.object(A.S, "warn"):
+                self.assertEqual(A.main(), 0)
+            for p in self.PARTS:
+                self.assertTrue((flat / "IQ2_XXS" / p).samefile(flat / p))
+            got = json.loads((d / "abyss-ernie55-iq2_xxs.json").read_text(encoding="utf-8"))
+        self.assertEqual(got["args"], ["--glm-pack", str(pack), "--max-context", "16384", "--prefill", "auto"])
+        self.assertEqual((got["model_name"], got["sampling"]), ("ernie-5.5-flash-preview", {"temperature": 1.0, "top_p": 0.95}))
+        self.assertEqual(got["env"]["STRATA_GLM_RAM_GB"], "46")
+
+    def test_nvidia_only(self):
+        argv = ["abyss_setup.py", "--model", "ernie55", "--backend", "hip"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(A.S, "say"), mock.patch.object(A.S, "step"), \
+                mock.patch.object(A, "hip_engine", side_effect=AssertionError("no ROCm step")), \
+                mock.patch.object(A.S, "fail", side_effect=SystemExit) as fail, self.assertRaises(SystemExit):
+            A.main()
+        self.assertIn("ERNIE-5.5-Flash-Preview runs on NVIDIA GPUs only", fail.call_args.args[0])
+
+
 class VenvLayout(unittest.TestCase):
     """The .venv's programs where Windows puts them (issue #39): Scripts/<name>.exe, bin/<name> elsewhere."""
 

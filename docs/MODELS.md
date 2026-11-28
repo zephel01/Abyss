@@ -272,6 +272,22 @@ engine) against a float64 numpy forward written from the model code, on the same
 | --- | ---: | --- | --- | --- |
 | `Q4_K_M` (ai-sage's) | 23.3 GB | token path KL 0.0013 / 0.0081 / 0.0139 / 0.0019 (raw / en / ru / ja), the same top token at 97-100% of positions (the rest: near-tie expert choices); 2,303 positions KL 0.0067, 0.0087 past 2,048; prompt path 0.0007 / 0.0079 / 0.0222 / 0.0008, 2,303 positions 0.0050 (0.0045 past 2,048); the indexer's 2,048 cells the same as the reference's for 2,029-2,047 of 2,048 (8 layers x 7 positions); greedy 12 tokens the same as the reference; English, Russian and Japanese chats with thinking on and off answer right, a tool call parsed | decode 115.9 tok/s all in VRAM (151 after a 12-token prompt), 96.5 / 85.3 held to 12 / 8 GB (`STRATA_GLM_VRAM_GB`, the rest in RAM); prompts 4K 7,380 tok/s, 16K 8,342 (decode 96.6 after it), 4K at 12 / 8 GB 2,854 / 2,305 (a 4K prompt + 512, median of 3) | an 8-32 GB NVIDIA GPU + 32 GB RAM or more; not measured: other GPUs, AMD |
 
+### ERNIE-5.5-Flash-Preview (beta)
+
+Baidu's ERNIE-5.5-Flash-Preview from Xylolabs' GGUFs (GGUF architecture `ernie5_5`, llama.cpp pull request #31925's
+layout): HCA layers with VHA and a sigmoid gate, 6 MLA layers with a DSA indexer (past 2,176 positions), a latent MoE of
+512 experts (top 10, two routers), SiTU, MultiMax on the logits. The file is Xylolabs'
+[IQ2_XXS](https://huggingface.co/Xylolabs/ERNIE-5.5-Flash-Preview-GGUF) (`./setup-deepseek.sh --model ernie55`;
+[MANUAL](MANUAL.md#ernie-55-flash-preview-beta)); license Apache-2.0. Each tensor was compared by value with our own
+MXFP4 + BF16 conversion of the original weights (`recipes/ernie55/xylo/cmp_tensors.py`). Quality: KL(MX || IQ2), the
+engine on that MX pack against the engine on this file, over a raw English text (311 positions), 2,338 tokens of plain
+text (across the indexer's 2,176) and the answer part of an English and a Japanese chat (121 each). Speeds: RTX 5090
+(Gen4 x4), 123 GB RAM, RAM tier 36 GB, iGPU lane off, a 4K prompt + 512, median of 3 (2026-11-28).
+
+| file | size | quality | speed | use |
+| --- | ---: | --- | --- | --- |
+| `IQ2_XXS` (Xylolabs'; IQ2_XXS gate / up, IQ2_XS down, the rest Q8_0 / BF16 / F32) | 82.84 GB | KL mean (median) 0.210 (0.056) / 0.165 (0.064; 0.130 past 2,176) / 0.395 (0.023) / 1.01 (0.0004) (raw / text / en answer / ja answer), the same top token at 87.5 / 86.6 / 81.8 / 83.5%; nll on the text 1.756 (MX 1.662). Xylolabs' own (llama.cpp against the original): chat 0.252 / 84.0%. Greedy English and Japanese answers right; a needle in a 4.6K chat found | decode 21.7 tok/s (24 GB: 14.3); the prompt is read a token at a time: ~20.7 tok/s (24 GB: ~13.8), a 4K prompt ~3.3 minutes; the 4.6K needle chat decoded at 14.4 | a 24-32 GB NVIDIA GPU + 64 GB RAM or more; not measured: smaller GPUs, a 64 GB-RAM PC, AMD |
+
 ### Ternary Bonsai 2.5 27B (beta, v1.3.205)
 
 prism-ml's Ternary-Bonsai-2.5-27B: Qwen3.8-27B with ternary weights in a blockwise Hadamard basis ([MANUAL](MANUAL.md#ternary-bonsai-25-27b-beta)).

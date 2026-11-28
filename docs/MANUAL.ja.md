@@ -140,6 +140,14 @@ top_p 0.95）。**ライセンス: 個人の非商用の利用だけ**（リポ�
 ./setup-deepseek.sh --model giga4 --download-model       # GigaChat4-37B-A4B-Q4_K_M.gguf（23.3 GB）
 ```
 
+Baidu の ERNIE-5.5-Flash-Preview（ベータ、NVIDIA、GPU 1 枚、テキストだけ。[ERNIE-5.5-Flash-Preview](#ernie-55-flash-previewベータ)）:
+24〜32 GB の GPU と 64 GB 以上の RAM 向けの Xylolabs の IQ2_XXS（5 分割）。サンプリングは GGUF のもの（temperature 1.0、
+top_p 0.95）。この版ではプロンプトを 1 トークンずつ読みます（約 20 tok/s。4K のプロンプトに約 3.3 分）:
+
+```sh
+./setup-deepseek.sh --model ernie55 --download-model     # ERNIE-5.5-Flash-Preview-IQ2_XXS-0000{1..5}-of-00005.gguf（82.84 GB）
+```
+
 Inkling 2 Mini abliterated（orcarouter が abliterated 版を型の混在で量子化した GGUF。この版から）: `Mix-16G`（15.7 GB、既定）
 か `Mix-12G`（11.6 GB）。どちらも 16〜24 GB の GPU で全部 VRAM に載る。Inkling 2 Mini と同じ `inkling2_loop` の形で、
 llama.cpp の標準の型を層ごとに混ぜている（16G は gate-up が NVFP4 / IQ4_XS / Q5_K、down が IQ4_NL / Q5_1。12G は gate-up が
@@ -1449,6 +1457,43 @@ MLA 8 層。2,048 位置を超えると、各クエリはインデクサが選�
 オフのときはプロンプトが空の `<think></think>` で終わります。ツール呼び出し（モデルの `<｜GCML｜tool_calls>` ブロック）は
 OpenAI / Anthropic のツール呼び出しとして返ります。速度と確認: [docs/MODELS](MODELS.ja.md#gigachat4-37b-a4bベータ)。まだのもの:
 内蔵の MTP ドラフター、複数の会話のスロット、AMD（HIP。そのビルドではプロンプトを 1 トークンずつ読みます）。
+
+## ERNIE-5.5-Flash-Preview（ベータ）
+
+エンジンは Baidu の ERNIE-5.5-Flash-Preview を Xylolabs の GGUF で動かします（GGUF のアーキテクチャ `ernie5_5`。llama.cpp の
+プルリクエスト #31925 の形です。VHA とシグモイドのゲート付きの HCA 層、DSA インデクサ付きの MLA 6 層（2,176 位置を超えると、
+各クエリはインデクサが選んだ位置を見ます）、2 つのルーターで上位 10 を選ぶ 512 エキスパートの latent MoE、SiTU、ロジットの
+MultiMax）。`./setup-deepseek.sh --model ernie55` で
+[Xylolabs/ERNIE-5.5-Flash-Preview-GGUF](https://huggingface.co/Xylolabs/ERNIE-5.5-Flash-Preview-GGUF) の `IQ2_XXS`（5 分割、
+82.84 GB。Hugging Face の SHA-256 で確かめます）が入り、パックし、`abyss-ernie55-iq2_xxs.json`（temperature 1.0 / top_p 0.95。
+GGUF の値です。コンテキストは 16K。確認は 8K で行いました）を書きます。**ライセンス:** Apache-2.0。NVIDIA だけ: HIP ビルドは
+経路をコンパイルしますが、AMD の GPU ではまだ動かしていません。GPU 1 枚: 層の分割はありません。
+
+**この版ではプロンプトを 1 トークンずつ読みます。** 約 20 tok/s なので、4K のプロンプトだと最初の答えのトークンまで約 3.3 分
+かかります。デコードは 21.7 tok/s です（RTX 5090、PCIe Gen4 x4、RAM 層 36 GB、iGPU なし、4K のプロンプト + 512、3 回の
+中央値。`STRATA_GLM_VRAM_GB=24` で 24 GB に絞ると 14.3 tok/s、プロンプトは約 13.8）。GPU に入らないエキスパートは RAM 層に、
+残りは SSD から読みます。セットアップは PC の RAM に合わせて `STRATA_GLM_RAM_GB` を決めます（48 GB なら 30、64 なら 46、
+96 GB 以上なら 60）。
+
+**品質**（この IQ2_XXS で動かしたエンジンと、元の重みから作った我々の MXFP4 + BF16 のパックで動かしたエンジンとの比較。
+位置ごとの KL(MX || IQ2)、かっこ内は中央値）:
+
+| テキスト | 位置 | KL 平均（中央値） | 1 位のトークンの一致 |
+| --- | ---: | --- | ---: |
+| 英語の地の文 | 311 | 0.210（0.056） | 87.5% |
+| 地の文 2,338 トークン（2,176 以降は 0.130） | 2,336 | 0.165（0.064） | 86.6% |
+| 英語のチャット、答えの部分 | 121 | 0.395（0.023） | 81.8% |
+| 日本語のチャット、答えの部分 | 121 | 1.01（0.0004） | 83.5% |
+
+大きな値は、MultiMax で両方の分布がとても尖り、違うトークンを選ぶ少数の位置から来ます。日本語は平均が英語より高いものの、
+中央値は高くありません。Xylolabs 自身の値（llama.cpp と元のモデルの比較）はチャットで 0.252 / 84.0% です。英語と日本語の
+greedy の答えは正しく、4.6K のチャットの中の needle も見つけます。
+
+**思考。** `reasoning_effort` は low / medium / high（指定がなければ high。サーバーの max は high になります）。`"none"` か
+`chat_template_kwargs: {"enable_thinking": false}` で思考のブロックを閉じます。思考は思考として返り（`</ernie:think>` まで）、
+ターンは `<|ernie:im_end|>` で終わります。まだのもの: まとめて読むプロンプトの経路、ドラフター（DSpark: Xylolabs のファイルには
+DSpark のヘッドがありません）、OpenAI / Anthropic のツール呼び出しとしての返却（モデルの `<ernie:tool_call>` ブロックは
+テキストのまま返ります）、会話のスロット、AMD（HIP）。
 
 ## EXL3 量子化（GLM-5.3-Flash）
 

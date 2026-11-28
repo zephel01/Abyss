@@ -108,6 +108,7 @@ ELASTIC_LENT = re.compile(r"glm elastic: (?:CUDA|HIP)\d+ (?:the expert pool take
 ELASTIC_STEP = re.compile(r"glm elastic: ((?:CUDA|HIP)\d+) KV \d+ -> (\d+) tokens \(([\d.]+) of ([\d.]+) GB mapped; the "
                           r"weights hold ([\d.]+) GB")
 HY4_END = "<\uff5chy_end:opensource\uff5c>"   # Hy4-flash's turn end (its EOS)
+ERNIE_END = "<|ernie:im_end|>"   # ERNIE 5.5's turn end (its EOS)
 HY4_IMAGE_START = "<\uff5chy_image\u2581start:opensource\uff5c>"
 HY4_IMAGE_PAD = "<\uff5chy_image\u2581pad:opensource\uff5c>"
 # the thinking budget's bridge (STRATA_GLM_THINK_BRIDGE): said inside the reasoning just before a forced </think>
@@ -2098,12 +2099,15 @@ class Service:
                             # (Ling-3.x, Bailing V3 template: a turn ends with <|role_end|>, also its EOS)
                             _special_ids(LING_END) +
                             # (Hy-MT3: a turn ends with its EOS, <eos:6124c78e>)
-                            _special_ids(HYMT_END) + _special_ids(GIGA_END))
+                            _special_ids(HYMT_END) + _special_ids(GIGA_END) +
+                            # (ERNIE 5.5: a turn ends with <|ernie:im_end|>, also its EOS)
+                            _special_ids(ERNIE_END))
         if getattr(template, "giga", False):   # (GigaChat4 ends its answer with the EOS, </s>, as the model card's runs do)
             self.stop_ids |= set(_special_ids("</s>"))
         # (as the engine gets them: the template's turn end first - the answer-loop guard ends a turn with it)
         turn_end = (_special_ids(IM_END) + _special_ids("</assistant>") + _special_ids(HY4_END) +
-                    _special_ids(LING_END) + _special_ids(HYMT_END) + _special_ids(GIGA_END))[:1]
+                    _special_ids(LING_END) + _special_ids(HYMT_END) + _special_ids(GIGA_END) +
+                    _special_ids(ERNIE_END))[:1]
         self.stop_order = turn_end + sorted(self.stop_ids - set(turn_end))
         # the tool call's argument tags as one token each (GLM-5.3), else none: the engine's loop guard closes a looping
         # argument with the second (GEN key arg_ids=)
@@ -2115,7 +2119,8 @@ class Service:
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
-        end = _special_ids("</think>") or _special_ids("</think:opensource>")   # (Hy4-flash's spelling)
+        end = (_special_ids("</think>") or _special_ids("</think:opensource>") or   # (Hy4-flash's spelling)
+               _special_ids("</ernie:think>"))                                     # (ERNIE 5.5's)
         self.think_end_id = end[0] if end else None
         # Inkling 2: no think tags - a turn is messages, <|message_model|><|content_thinking|> reasoning <|end_message|>
         # <|message_model|><|content_text|> answer <|end_message|> <|content_model_end_sampling|> (its EOS).  The
@@ -2137,7 +2142,7 @@ class Service:
             self.stop_order = [self.ink_ids[4]] + sorted(self.stop_ids - {self.ink_ids[4]})
         # <think> as one token: a template that leaves the opening to the model (MiMo-V2.6-Distill-Qwen-9B's ends the
         # prompt at "<|im_start|>assistant\n") gets it as the answer's first token - not reasoning text (run())
-        start = _special_ids("<think>") or _special_ids("<think:opensource>")
+        start = _special_ids("<think>") or _special_ids("<think:opensource>") or _special_ids("<ernie:think>")
         self.think_start_id = start[0] if start else None
         # Qwen's call form (<tool_call><function=NAME>...): its templates' response_template ends the reasoning at a
         # <tool_call> as well as at </think> (2026-11-07), so a call started inside the thinking is still a call

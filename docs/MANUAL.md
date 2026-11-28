@@ -143,6 +143,14 @@ own Q4_K_M for an 8-32 GB GPU (the experts that do not fit go to RAM), with the 
 ./setup-deepseek.sh --model giga4 --download-model       # GigaChat4-37B-A4B-Q4_K_M.gguf (23.3 GB)
 ```
 
+Baidu's ERNIE-5.5-Flash-Preview (beta, NVIDIA, one GPU, text only; [ERNIE-5.5-Flash-Preview](#ernie-55-flash-preview-beta)):
+Xylolabs' IQ2_XXS (5 parts) for a 24-32 GB GPU + 64 GB RAM or more, with the GGUF's sampling (temperature 1.0, top_p
+0.95). The prompt is read a token at a time in this version (~20 tok/s: a 4K prompt takes ~3.3 minutes):
+
+```sh
+./setup-deepseek.sh --model ernie55 --download-model     # ERNIE-5.5-Flash-Preview-IQ2_XXS-0000{1..5}-of-00005.gguf (82.84 GB)
+```
+
 Inkling 2 Mini abliterated (orcarouter's mixed-type GGUFs of the abliterated model, from this version): `Mix-16G`
 (15.7 GB, the default) or `Mix-12G` (11.6 GB), all in VRAM on a 16-24 GB GPU. They are the same `inkling2_loop` layout
 as Inkling 2 Mini with stock llama.cpp types mixed per layer (NVFP4 / IQ4_XS / Q5_K gate-up over IQ4_NL / Q5_1 down
@@ -1524,6 +1532,44 @@ build compiles the path but it has not run on an AMD GPU. One GPU: no layer spli
 model's `<｜GCML｜tool_calls>` blocks) come back as OpenAI / Anthropic tool calls. Speeds and checks:
 [docs/MODELS](MODELS.md#gigachat4-37b-a4b-beta). Not yet: the built-in MTP drafter, multi-conversation slots, AMD (HIP;
 its build would read prompts token by token).
+
+## ERNIE-5.5-Flash-Preview (beta)
+
+The engine runs Baidu's ERNIE-5.5-Flash-Preview from Xylolabs' GGUFs (GGUF architecture `ernie5_5`, the layout of
+llama.cpp pull request #31925: HCA layers with VHA and a sigmoid gate, 6 MLA layers with a DSA indexer - past 2,176
+positions a query attends to the indexer's best - a latent MoE of 512 experts, top 10 behind two routers, SiTU, and
+MultiMax on the logits). `./setup-deepseek.sh --model ernie55` sets up
+[Xylolabs/ERNIE-5.5-Flash-Preview-GGUF](https://huggingface.co/Xylolabs/ERNIE-5.5-Flash-Preview-GGUF)'s `IQ2_XXS`
+(5 parts, 82.84 GB, checked against Hugging Face's SHA-256), the pack, and `abyss-ernie55-iq2_xxs.json` (temperature
+1.0 / top_p 0.95, the GGUF's; a 16K context - the checks ran at 8K). **License:** Apache-2.0. NVIDIA only: the HIP build
+compiles the path but it has not run on an AMD GPU. One GPU: no layer split.
+
+**The prompt is read a token at a time** in this version: ~20 tok/s, so a 4K prompt takes ~3.3 minutes before the
+first answer token. Decode is 21.7 tok/s (RTX 5090 on PCIe Gen4 x4, a 36 GB RAM tier, iGPU off, a 4K prompt + 512,
+median of 3; 14.3 tok/s held to 24 GB with `STRATA_GLM_VRAM_GB=24`, the prompt ~13.8). The experts that do not fit the
+GPU go to the RAM tier, the rest are read from the SSD: setup sets `STRATA_GLM_RAM_GB` by the PC's RAM (48 GB -> 30,
+64 -> 46, 96 GB and up -> 60).
+
+**Quality** (the engine on this IQ2_XXS against the engine on our own MXFP4 + BF16 pack of the original weights;
+KL(MX || IQ2) a position, median in brackets):
+
+| text | positions | KL mean (median) | same top token |
+| --- | ---: | --- | ---: |
+| raw English | 311 | 0.210 (0.056) | 87.5% |
+| plain text, 2,338 tokens (past 2,176: 0.130) | 2,336 | 0.165 (0.064) | 86.6% |
+| English chat, the answer | 121 | 0.395 (0.023) | 81.8% |
+| Japanese chat, the answer | 121 | 1.01 (0.0004) | 83.5% |
+
+The large values sit at a few positions where MultiMax makes both distributions very peaked and they pick different
+tokens; the Japanese mean is higher than the English one, its median is not. Xylolabs' own numbers (llama.cpp against
+the original model): chat 0.252 / 84.0%. Greedy English and Japanese answers are right, and a needle in a 4.6K chat is
+found.
+
+**Thinking.** `reasoning_effort` low / medium / high (high when absent; the server's max is high), `"none"` or
+`chat_template_kwargs: {"enable_thinking": false}` closes the think block. The reasoning comes back as reasoning (up to
+`</ernie:think>`), a turn ends at `<|ernie:im_end|>`. Not yet: the batched prompt path, a drafter (DSpark: Xylolabs'
+files have no DSpark head), tool calls as OpenAI / Anthropic calls (the model's `<ernie:tool_call>` blocks come back as
+text), conversation slots, AMD (HIP).
 
 ## EXL3 quants (GLM-5.3-Flash)
 

@@ -132,6 +132,9 @@ class ChatTemplate:
         # ai-sage GigaChat4 (chatml v5: <|role_sep|> / <|message_sep|>): thinking on / off is the template's own
         # `reasoning` (True when absent); off ends the prompt with an empty, closed <think></think>
         self.giga = "<|role_sep|>" in self.source and "<|message_sep|>" in self.source and "reasoning" in self.source
+        # Baidu ERNIE 5.5 (tools/ernie55_chat_template.jinja): reasoning_effort low / medium / high (high when absent) in
+        # its <ernie:global_setting>, enable_thinking false closes the think block (<ernie:think></ernie:think>)
+        self.ernie = "<|ernie:im_start|>" in self.source and "<ernie:think>" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -174,6 +177,12 @@ class ChatTemplate:
             level = kwargs.pop("reasoning_effort", None)
             kwargs["reasoning"] = not (kwargs.pop("enable_thinking", True) is False or level == "none")
             kwargs.setdefault("bos_token", self.bos_token)   # (the template opens with {{ bos_token }}, as HF renders it)
+        elif self.ernie:   # (ERNIE 5.5: low / medium / high; the server's max is its high)
+            raw = kwargs.pop("effort_raw", None)
+            level = kwargs.pop("reasoning_effort", None)
+            if level == "none":
+                kwargs["enable_thinking"] = False
+            kwargs["reasoning_effort"] = raw if raw in ("low", "medium", "high") else "low" if level == "low" else "high"
         elif self.raon:   # (the effort goes to the engine: raon_effort; the template takes enable_thinking only)
             kwargs.pop("effort_raw", None)
             kwargs.pop("reasoning_effort", None)
@@ -705,6 +714,7 @@ class Event:
 
 THINK_END = "</think>"
 THINK_END_HY4 = "</think:opensource>"   # Hy4-flash's end-of-reasoning token
+THINK_END_ERNIE = "</ernie:think>"       # ERNIE 5.5's
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 FUNC_START = "<function="                       # Qwen's form: <function=NAME><parameter=P>V</parameter>...</function>
@@ -1909,7 +1919,7 @@ class OutputParser:
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 # the special token's text ends this delta (Hy4-flash spells it </think:opensource>)
-                tag = THINK_END_HY4 if THINK_END_HY4 in self.buf else THINK_END
+                tag = next((t for t in (THINK_END_HY4, THINK_END_ERNIE) if t in self.buf), THINK_END)
                 i = self.buf.rfind(tag)
                 if i < 0:
                     i = len(self.buf)
