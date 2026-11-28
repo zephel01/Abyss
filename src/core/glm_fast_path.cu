@@ -1643,13 +1643,52 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
+        // the prompt's tail slots a layer: k_extra everywhere, except Inkling's weighted split below
+        std::vector<int> kx((size_t) NL, k_extra);
+        // Inkling 2 Mini (inkling2_loop): layers [ink_lo, ink_hi) run ink_passes times a token on the same weights, so
+        // one VRAM copy there serves ink_passes lookups a token (36 of the 48).  With the pool short of the experts, a
+        // slot's value is its expert's routing share x the layer's passes, per byte (the Q8_0 layers' slots are twice
+        // the NVFP4 ones), and each layer lends the prompt its own part of the tail (the same bytes as k_extra
+        // everywhere, every layer keeping the prompt's keep): the uniform tail took ~59 of 72 slots a layer at 12 GB
+        // and left the split no room.  Maya v1.1.83's idea ("the cost is the visits that wait, not the bytes"); the
+        // share is the pack's expert_counts.txt, else this machine's expert_usage.txt (no profile: uniform as before).
+        // STRATA_INK_SLOT_PASSES=0 keeps the earlier split
+        const bool ink_w = g.ink && g.ink_passes > 1 && per < g.n_expert && !vis_lend_ok_ &&
+                           (k_extra == 0 || pf_ != nullptr) && [] {
+                               const char* v = getenv("STRATA_INK_SLOT_PASSES");
+                               return v == nullptr || std::atoi(v) != 0;
+                           }();
         // When the APU can hold every expert, keep exactly that many slots in each
         // layer rather than spending the capped budget on uneven partitions/spares.
         if (getenv("STRATA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert)) {
             std::vector<std::vector<double>> share((size_t) NL);
             std::ifstream cf(expert_counts_path(pack_dir_));
             std::string line;
-            while (std::getline(cf, line)) {
+            // (inkling, no expert_counts.txt: the usage profile's "layer e:count ..." lines, as counts by expert)
+            std::ifstream uf;
+            bool from_usage = false;
+            if (ink_w && !cf.good()) {
+                const std::string up = usage_path();
+                if (!up.empty()) uf.open(up);
+                from_usage = uf.good();
+            }
+            while (std::getline(from_usage ? uf : cf, line)) {
+                if (from_usage) {
+                    if (line.empty() || line[0] == '#') continue;
+                    std::istringstream us(line);
+                    int ul = -1;
+                    us >> ul;
+                    std::vector<double> c((size_t) g.n_expert, 0.0);
+                    std::string tok;
+                    while (us >> tok) {
+                        const size_t p = tok.find(':');
+                        if (p == std::string::npos) continue;
+                        const int e = std::atoi(tok.c_str());
+                        if (e >= 0 && e < g.n_expert) c[(size_t) e] = std::atof(tok.c_str() + p + 1);
+                    }
+                    line = std::to_string(ul);
+                    for (double x : c) line += " " + std::to_string(x);
+                }
                 std::istringstream ss(line);
                 int il = -1;
                 ss >> il;
@@ -1691,7 +1730,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                 // it (a 24 GB card running the whole model has ~30 slots a layer: the +16 floor alone overran it)
                 // (a pool below the floor - issue #23 - gives every layer what it has: per)
                 const int need = g.n_exp_used + gf::kSpares + k_extra;
-                const int fl = std::min({cap, per, std::max(need, std::min(per, need + 16))});
+                // (inkling's weighted split: a route and the spares, the prompt's keep with a tail - each layer's
+                // tail is set after the split, so the floor need not hold it)
+                const int fl = ink_w ? std::min(per, k_extra > 0 ? std::max(g.n_exp_used + gf::kSpares, prefill_keep())
+                                                                 : g.n_exp_used + gf::kSpares)
+                                     : std::min({cap, per, std::max(need, std::min(per, need + 16))});
                 size_t used = 0;
                 for (int il = l0_; il < lt_; ++il)
                     if (F->L[(size_t) il].moe) {
@@ -1702,7 +1745,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 const auto gain = [&](int il) {
                     const auto& sh = share[(size_t) il];
                     const int j = nsl[(size_t) il] - gf::kSpares;
-                    return (j >= 0 && j < (int) sh.size()) ? sh[(size_t) j] : 0.0;
+                    const double v = (j >= 0 && j < (int) sh.size()) ? sh[(size_t) j] : 0.0;
+                    if (!ink_w) return v;
+                    const double passes = il >= g.ink_lo && il < g.ink_hi ? (double) g.ink_passes : 1.0;
+                    return v * passes / (double) slot_stride(il);   // (lookups served a byte)
                 };
                 for (;;) {
                     int best = -1;
@@ -1720,6 +1766,59 @@ bool Glm5Model::fast_setup(std::string& err) {
                     ++nsl[(size_t) best];
                     used += slot_stride(best);
                 }
+                // inkling: the tail's bytes (k_extra x every layer's stride, as before) from each layer in proportion
+                // to its slots above the prompt's keep; short of them (rounding), the uniform split as before
+                if (ink_w && k_extra > 0) {
+                    const int kp = prefill_keep();
+                    const size_t X = (size_t) k_extra * stride_sum;
+                    size_t sur = 0;
+                    for (int il = l0_; il < lt_; ++il)
+                        if (F->L[(size_t) il].moe) sur += (size_t) std::max(0, nsl[(size_t) il] - kp) * slot_stride(il);
+                    bool ok = sur >= X;
+                    if (ok) {
+                        const double f = (double) X / (double) sur;
+                        size_t got = 0;
+                        for (int il = l0_; il < lt_; ++il)
+                            if (F->L[(size_t) il].moe) {
+                                const int room = std::max(0, nsl[(size_t) il] - kp);
+                                kx[(size_t) il] = std::min(room, (int) std::ceil(f * (double) room));
+                                got += (size_t) kx[(size_t) il] * slot_stride(il);
+                            }
+                        for (int il = l0_; il < lt_ && got < X; ++il)   // (a float's rounding: one more where there is room)
+                            if (F->L[(size_t) il].moe && kx[(size_t) il] < nsl[(size_t) il] - kp) {
+                                ++kx[(size_t) il];
+                                got += slot_stride(il);
+                            }
+                        ok = got >= X;
+                    }
+                    if (!ok) {
+                        std::fprintf(stderr, "inkling: CUDA%d the weighted split cannot lend the prompt's tail - the "
+                                             "uniform split\n", dev_);
+                        for (int il = l0_; il < lt_; ++il)
+                            if (F->L[(size_t) il].moe) {
+                                nsl[(size_t) il] = per;
+                                kx[(size_t) il] = k_extra;
+                            }
+                    }
+                }
+                if (ink_w) {
+                    int lmin = INT32_MAX, lmax = 0, omin = INT32_MAX, omax = 0;
+                    for (int il = l0_; il < lt_; ++il) {
+                        if (!F->L[(size_t) il].moe) continue;
+                        const int n = nsl[(size_t) il];
+                        if (il >= g.ink_lo && il < g.ink_hi) {
+                            lmin = std::min(lmin, n);
+                            lmax = std::max(lmax, n);
+                        } else {
+                            omin = std::min(omin, n);
+                            omax = std::max(omax, n);
+                        }
+                    }
+                    std::fprintf(stderr, "inkling: CUDA%d expert slots by lookups a token (%s): layers %d-%d (x%d) %d-%d "
+                                         "a layer, the others %d-%d (STRATA_INK_SLOT_PASSES=0: as before)\n",
+                                 dev_, from_usage ? "this machine's expert_usage.txt" : "expert_counts.txt", g.ink_lo,
+                                 g.ink_hi - 1, g.ink_passes, lmin, lmax, omin, omax);
+                }
             }
         }
         size_t tot = 0, xtot = 0;
@@ -1727,7 +1826,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) {
                 tot += (size_t) nsl[(size_t) il] * slot_stride(il);
-                xtot += (size_t) k_extra * slot_stride(il);
+                xtot += (size_t) kx[(size_t) il] * slot_stride(il);
                 nmin = std::min(nmin, nsl[(size_t) il]);
                 nmax = std::max(nmax, nsl[(size_t) il]);
             }
@@ -1753,7 +1852,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::vector<size_t> strides((size_t) NL, 0);
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe) {
-                    core[(size_t) il] = nsl[(size_t) il] - k_extra;
+                    core[(size_t) il] = nsl[(size_t) il] - kx[(size_t) il];
                     strides[(size_t) il] = slot_stride(il);
                 }
             std::string eerr;
@@ -1767,10 +1866,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 tot = xtot;
                 for (int il = l0_; il < lt_; ++il)
                     if (F->L[(size_t) il].moe) {
-                        const int e = core[(size_t) il] - (nsl[(size_t) il] - k_extra);
+                        const int e = core[(size_t) il] - (nsl[(size_t) il] - kx[(size_t) il]);
                         emin = std::min(emin, e);
                         emax = std::max(emax, e);
-                        nsl[(size_t) il] = core[(size_t) il] + k_extra;
+                        nsl[(size_t) il] = core[(size_t) il] + kx[(size_t) il];
                         tot += (size_t) core[(size_t) il] * slot_stride(il);
                         nmin = std::min(nmin, nsl[(size_t) il]);
                         nmax = std::max(nmax, nsl[(size_t) il]);
@@ -1792,12 +1891,12 @@ bool Glm5Model::fast_setup(std::string& err) {
             size_t layer_max = 0;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe)
-                    layer_max = std::max(layer_max, (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il));
+                    layer_max = std::max(layer_max, (size_t) (nsl[(size_t) il] - kx[(size_t) il]) * slot_stride(il));
             for (size_t cap = main_bytes / 2; segs.empty() && cap >= layer_max && layer_max > 0; cap /= 2) {
                 std::vector<size_t> sizes(1, 0);
                 for (int il = l0_; il < lt_; ++il) {
                     if (!F->L[(size_t) il].moe) continue;
-                    const size_t lb = (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il);
+                    const size_t lb = (size_t) (nsl[(size_t) il] - kx[(size_t) il]) * slot_stride(il);
                     if (sizes.back() > 0 && sizes.back() + lb > cap) sizes.push_back(0);
                     sizes.back() += lb;
                     seg_of[(size_t) il] = (int) sizes.size() - 1;
@@ -1837,7 +1936,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (seg_of[(size_t) il] != cur_seg) b = segs[(size_t) (cur_seg = seg_of[(size_t) il])];
             P.stride = slot_stride(il);
             P.n = nl;
-            P.n_main = nl - k_extra;
+            P.n_main = nl - kx[(size_t) il];
             P.base = epool ? ebase[(size_t) il] : b;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
@@ -1851,7 +1950,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (!F->L[(size_t) il].moe) continue;
             auto& P = F->lp[(size_t) il];
             P.xbase = b;
-            b += (size_t) k_extra * P.stride;
+            b += (size_t) kx[(size_t) il] * P.stride;
         }
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
         if (vis_lend_ok_)
