@@ -989,8 +989,10 @@ bool Glm5Model::q35_slot_supported(std::string& why) const {
         why = "the model is split across GPUs";
         return false;
     }
-    if (g_.ink) {
-        why = "inkling's slots are not covered yet";
+    // (inkling: the snapshot holds the conv states and the window layers' rings, the runs the full layers' rows and
+    // the DSpark drafter's context; --parallel's lanes each hold a conversation of their own instead)
+    if (g_.ink && ink_par_ > 1) {
+        why = "inkling --parallel: each lane holds a conversation of its own";
         return false;
     }
     // (hy_v3: laguna's layers with no window - every cache spans the context, FP16 rows of KV heads x 128 as the plain
@@ -1018,6 +1020,10 @@ void Glm5Model::q35_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& 
     const size_t rk = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, false) : KV * 2;
     const size_t rv = q35_kv_ != 0 ? (size_t) g.attn_head_kv * q35::kv_row_bytes(q35_kv_, true) : KV * 2;
     const size_t N = (size_t) n;
+    if (g.ink) {   // (inkling: its own caches - every layer application's, the 48 slots)
+        ink_slot_runs(n, out);
+        return;
+    }
     for (int il = l0_; il < lt_; ++il) {   // (the NextN block's layer too)
         const auto& Ly = F->L[(size_t) il];
         if (Ly.recr || Ly.kc == nullptr) continue;
@@ -1049,7 +1055,7 @@ uint64_t Glm5Model::q35_slot_bytes(int64_t n) const {
     if (n <= 0 || n > max_ctx_ || !q35_slot_supported(why)) return 0;
     std::vector<std::pair<void*, size_t>> runs;
     q35_slot_runs(n, runs);
-    uint64_t b = kQ35SlotHdr + q35_snap_bytes();
+    uint64_t b = kQ35SlotHdr + q35_snap_bytes() + (g_.ink ? inkd_slot_bytes(n) : 0);
     for (const auto& r : runs) b += r.second;
     return b;
 }
@@ -1057,7 +1063,8 @@ uint64_t Glm5Model::q35_slot_bytes(int64_t n) const {
 namespace {
 // what a slot's runs must match: their count and sizes at 1 and at 4097 positions, the snapshot's size, the cache format
 uint64_t q35_layout_hash(const Glm5Model& m, size_t snap_b, int kv,
-                         const std::function<void(int64_t, std::vector<std::pair<void*, size_t>>&)>& runs) {
+                         const std::function<void(int64_t, std::vector<std::pair<void*, size_t>>&)>& runs,
+                         uint64_t extra1 = 0, uint64_t extra4097 = 0) {
     uint64_t h = 1469598103934665603ull;
     const auto mix = [&](uint64_t v) {
         for (int i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
@@ -1070,6 +1077,10 @@ uint64_t q35_layout_hash(const Glm5Model& m, size_t snap_b, int kv,
         runs(n, r);
         mix(r.size());
         for (const auto& x : r) mix(x.second);
+    }
+    if (extra1 != 0 || extra4097 != 0) {   // (inkling's drafter context at 1 and 4097 positions)
+        mix(extra1);
+        mix(extra4097);
     }
     return h;
 }
@@ -1093,7 +1104,7 @@ bool Glm5Model::q35_slot_save(uint8_t* dst, uint64_t bytes, std::string& err) {
     q35_slot_runs(n, runs);
     const uint64_t hash = q35_layout_hash(*this, snap_b, q35_kv_, [&](int64_t k, std::vector<std::pair<void*, size_t>>& o) {
         q35_slot_runs(k, o);
-    });
+    }, g_.ink ? inkd_slot_bytes(1) : 0, g_.ink ? inkd_slot_bytes(4097) : 0);
     const int64_t hdr[6] = {(int64_t) kQ35SlotMagic, n, (int64_t) hash, (int64_t) snap_b, q35_snap_pend_, q35_snap_done_};
     std::memcpy(dst, hdr, kQ35SlotHdr);
     std::memcpy(dst + kQ35SlotHdr, q35_snap_h_, snap_b);
@@ -1105,6 +1116,10 @@ bool Glm5Model::q35_slot_save(uint8_t* dst, uint64_t bytes, std::string& err) {
             return false;
         }
         at += r.second;
+    }
+    if (g_.ink && !inkd_slot_save(at, n)) {   // (the DSpark drafter's context, after the runs)
+        err = "the drafter's context did not copy back";
+        return false;
     }
     if (cudaStreamSynchronize(F->cs) != cudaSuccess) {
         cudaGetLastError();
@@ -1129,7 +1144,7 @@ bool Glm5Model::q35_slot_load(const uint8_t* src, uint64_t bytes, int64_t n, std
     const size_t snap_b = q35_snap_bytes();
     const uint64_t hash = q35_layout_hash(*this, snap_b, q35_kv_, [&](int64_t k, std::vector<std::pair<void*, size_t>>& o) {
         q35_slot_runs(k, o);
-    });
+    }, g_.ink ? inkd_slot_bytes(1) : 0, g_.ink ? inkd_slot_bytes(4097) : 0);
     if ((uint64_t) hdr[0] != kQ35SlotMagic || hdr[1] != n || n <= 0 || n > max_ctx_ || (uint64_t) hdr[2] != hash ||
         (uint64_t) hdr[3] != snap_b || bytes != q35_slot_bytes(n)) {
         err = "not a slot of this model";
@@ -1159,6 +1174,14 @@ bool Glm5Model::q35_slot_load(const uint8_t* src, uint64_t bytes, int64_t n, std
             return false;
         }
         at += r.second;
+    }
+    if (g_.ink) {
+        ink_win_p0_ = -1;   // (a verify window of the conversation set aside: not this one's to settle)
+        if (!inkd_slot_load(at, n)) {
+            snap_pos_ = -1;
+            err = "the drafter's context did not read back";
+            return false;
+        }
     }
     if (cudaStreamSynchronize(F->cs) != cudaSuccess) {
         cudaGetLastError();

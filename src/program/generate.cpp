@@ -2853,8 +2853,8 @@ static int glm_pack_generate(const Options& o) {
     // conversation in the model first sets that conversation aside, then takes back the slot it does continue -
     // chats, and an agent's main thread and its subagents, that interleave no longer re-read each other's prompts.
     //   GLM-5.3 (Glm5Model::slot_save / slot_load: its snapshot and DSA caches): files.
-    //   qwen35 (Qwen3.8 / Ornith / Qwen3.8-27B; Glm5Model::q35_slot_*: the snapshot and every attention cache's rows
-    //   up to it): host RAM first (pinned; STRATA_GLM_SLOT_RAM_GB, default a quarter of the memory free at the first
+    //   qwen35 (Qwen3.8 / Ornith / Qwen3.8-27B / Ling / Inkling 2 - its drafter's context too, not with --parallel;
+    //   Glm5Model::q35_slot_*: the snapshot and every attention cache's rows up to it): host RAM first (pinned; STRATA_GLM_SLOT_RAM_GB, default a quarter of the memory free at the first
     //   slot, at most 8 GB, and never below 8 GB of the machine's memory free), then files.
     //   DeepSeek V4 / V4.1 and Hy4: none (the live snapshot only) - not tried, so no "not implemented" line a request.
     // STRATA_GLM_SLOTS=<n> slots (default 4, qwen35 8; 0 off: one conversation in the model, as before), for

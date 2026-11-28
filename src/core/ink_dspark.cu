@@ -1065,6 +1065,104 @@ int Glm5Model::inkd_max() const {
     return D != nullptr ? D->n_max : 0;
 }
 
+// ------------------------------------------------------------------------------------------------ conversation slots
+// A slot holds what inkd_reset keeps when the conversation's snapshot (at n) is restored: per layer the ring rows of
+// positions n - min(n, ring) .. n - 1 (by their ring rows: the rows a position past n overwrote are kept as they
+// are, as the conversation's own restore keeps them), where each layer's context starts, f_rnn and its position.
+// The layout: 8 int64 (whether the context reaches n, lo[3], frnn_pos), f_rnn (E floats), then layer by layer the
+// K rows and the V rows in position order.
+namespace {
+constexpr size_t kInkdSlotHdr = 8 * sizeof(int64_t);
+}  // namespace
+
+uint64_t Glm5Model::inkd_slot_bytes(int64_t n) const {
+    const auto* D = (const IkState*) inkd_;
+    if (D == nullptr || n <= 0) return 0;
+    uint64_t b = kInkdSlotHdr + (uint64_t) g_.n_embd * sizeof(float);
+    for (const auto& Ly : D->L) b += 2 * (uint64_t) std::min<int64_t>(n, Ly.ring) * kKVD * sizeof(__half);
+    return b;
+}
+
+namespace {
+// rows p0 .. p0 + rows - 1 of a ring (row p at p % ring) to / from a host run in position order
+bool ring_rows_copy(__half* ring, int ring_n, int64_t p0, int64_t rows, uint8_t* host, bool to_host, cudaStream_t s) {
+    const size_t rb = (size_t) kKVD * sizeof(__half);
+    int64_t done = 0;
+    while (done < rows) {
+        const int64_t i0 = (p0 + done) % ring_n;
+        const int64_t m = std::min<int64_t>(rows - done, ring_n - i0);
+        __half* d = ring + (size_t) i0 * kKVD;
+        uint8_t* h = host + (size_t) done * rb;
+        if (cudaMemcpyAsync(to_host ? (void*) h : (void*) d, to_host ? (const void*) d : (const void*) h, (size_t) m * rb,
+                            to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, s) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        done += m;
+    }
+    return true;
+}
+}  // namespace
+
+bool Glm5Model::inkd_slot_save(uint8_t* dst, int64_t n) {
+    auto* D = (IkState*) inkd_;
+    if (D == nullptr || n <= 0) return true;
+    if (!inkd_flush()) return false;   // (the deferred rows first, as inkd_reset commits them)
+    cudaStream_t s = fast_->cs;
+    int64_t hdr[8] = {};
+    const bool has = n <= D->ctx_end;   // (else the restore starts the context over at n)
+    hdr[0] = has ? 1 : 0;
+    for (int l = 0; l < kL; ++l)
+        hdr[1 + l] = has ? std::min<int64_t>(std::max<int64_t>(D->L[l].lo, n - D->L[l].ring), n) : n;
+    hdr[4] = has && D->frnn_pos == n - 1 ? n - 1 : -1;
+    std::memcpy(dst, hdr, kInkdSlotHdr);
+    uint8_t* at = dst + kInkdSlotHdr;
+    const size_t fb = (size_t) g_.n_embd * sizeof(float);
+    if (cudaMemcpyAsync(at, D->frnn, fb, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    at += fb;
+    for (auto& Ly : D->L) {
+        const int64_t rows = std::min<int64_t>(n, Ly.ring);
+        for (__half* r : {Ly.rk, Ly.rv}) {
+            if (!ring_rows_copy(r, Ly.ring, n - rows, rows, at, true, s)) return false;
+            at += (size_t) rows * kKVD * sizeof(__half);
+        }
+    }
+    return true;
+}
+
+bool Glm5Model::inkd_slot_load(const uint8_t* src, int64_t n) {
+    auto* D = (IkState*) inkd_;
+    if (D == nullptr || n <= 0) return true;
+    cudaStream_t s = fast_->cs;
+    D->pend_n = 0;   // (the conversation set aside: its deferred rows and window are its own)
+    D->win_p0 = -1;
+    D->tap_n = 0;
+    int64_t hdr[8];
+    std::memcpy(hdr, src, kInkdSlotHdr);
+    const uint8_t* at = src + kInkdSlotHdr;
+    const size_t fb = (size_t) g_.n_embd * sizeof(float);
+    if (cudaMemcpyAsync(D->frnn, at, fb, cudaMemcpyHostToDevice, s) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    at += fb;
+    for (auto& Ly : D->L) {
+        const int64_t rows = std::min<int64_t>(n, Ly.ring);
+        for (__half* r : {Ly.rk, Ly.rv}) {
+            if (!ring_rows_copy(r, Ly.ring, n - rows, rows, const_cast<uint8_t*>(at), false, s)) return false;
+            at += (size_t) rows * kKVD * sizeof(__half);
+        }
+    }
+    // the state inkd_reset leaves at n (snapshot_restore calls it again: the same numbers)
+    D->ctx_end = n;
+    for (int l = 0; l < kL; ++l) D->L[l].lo = hdr[1 + l];
+    D->frnn_pos = hdr[4];
+    return true;
+}
+
 void Glm5Model::inkd_report() const {
     const auto* D = (const IkState*) inkd_;
     if (D == nullptr || D->drafts == 0) return;

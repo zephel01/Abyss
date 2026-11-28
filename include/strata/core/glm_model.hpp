@@ -428,7 +428,7 @@ public:
     /// rows 0 .. n-1 - the NextN block's and the qwen4exp draft layer's caches, qwen4exp's QSA block keys - in one
     /// host buffer of q35_slot_bytes(n).  q35_slot_load puts them back as the live state and the snapshot: the
     /// model is then exactly as it was when that snapshot was taken.  q35_slot_supported: false (and why) on a
-    /// layout the slots do not cover (a model split across GPUs, laguna).
+    /// layout the slots do not cover (a model split across GPUs, laguna, inkling's --parallel lanes).
     bool q35_slot_supported(std::string& why) const;
     uint64_t q35_slot_bytes(int64_t n) const;
     bool q35_slot_save(uint8_t* dst, uint64_t bytes, std::string& err);
@@ -961,6 +961,9 @@ public:
     void ink_reset();
     void ink_snap_runs(std::vector<std::pair<void*, size_t>>& out, std::vector<size_t>* used = nullptr,
                        int64_t pos = -1) const;
+    // a conversation slot's caches (q35_slot_runs): the full layers' K / V rows 0 .. n-1 of every layer application
+    // (the window layers' rings and the conv states ride the snapshot)
+    void ink_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& out) const;
     void ink_free();
     // inkling's verify window (STRATA_INK_DRAFT=1, opt-in): the token path's 48 layer applications over T columns at
     // once - every column the bits a token alone gets (glm_mvn, rms_q8_rows, the attention's splits a row as the
@@ -1099,6 +1102,12 @@ public:
     std::string inkd_find() const;
     size_t inkd_bytes() const;   // (its device allocations)
     int inkd_max() const;   // (drafts a step at most: 7, STRATA_INK_DSPARK_N)
+    // a conversation slot's drafter context (q35_slot_save / _load): the rows of positions n - min(n, ring) .. n - 1
+    // of each layer's rings, f_rnn and where the context starts - the state a snapshot restored at n leaves
+    // (inkd_reset), so the conversation drafts on as it would have alone.  0 bytes without the drafter
+    uint64_t inkd_slot_bytes(int64_t n) const;
+    bool inkd_slot_save(uint8_t* dst, int64_t n);
+    bool inkd_slot_load(const uint8_t* src, int64_t n);
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);
     bool verify_moe_router(int il, int tb, int n, cudaStream_t s, std::string& err);   // (its first launch)

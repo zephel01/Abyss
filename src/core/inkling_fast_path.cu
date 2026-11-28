@@ -672,6 +672,20 @@ void Glm5Model::ink_snap_runs(std::vector<std::pair<void*, size_t>>& out, std::v
     }
 }
 
+void Glm5Model::ink_slot_runs(int64_t n, std::vector<std::pair<void*, size_t>>& out) const {
+    const FastState* F = fast_;
+    if (F == nullptr || F->ink == nullptr || n <= 0) return;
+    // (a full layer's row p is position p - its rows are written once and only read after, so rows 0 .. n-1 are all a
+    // position below n left there; on the elastic KV they are mapped: written by this conversation, or kv_ensure'd)
+    const size_t row = (size_t) g_.attn_head_kv * g_.head_dim * 2, N = (size_t) n;
+    for (size_t sl = 0; sl < F->ink->S.size(); ++sl) {
+        if (F->ink->L[(size_t) g_.ink_phys((int) sl)].swa) continue;
+        const auto& S = F->ink->S[sl];
+        out.emplace_back(S.kc, N * row);
+        out.emplace_back(S.vc, N * row);
+    }
+}
+
 // ---------------------------------------------------------------- the token path
 namespace {
 struct Blocks {
