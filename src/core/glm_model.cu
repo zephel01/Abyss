@@ -594,6 +594,7 @@ static bool eog_from_gguf(const strata::GgufFile& g, Glm5Geometry& out) {
 
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
     if (g.get("deepseek4.block_count")) return from_gguf_dsv4(g, out, err);
+    if (g.get("ernie5_5.block_count")) return from_gguf_dsv4(g, out, err, "ernie5_5.");   // (Xylolabs' ERNIE-5.5 GGUFs)
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
     if (g.get("qwen35moe.block_count") || g.get("qwen35.block_count") || g.get("sensenova_loop.block_count"))
         return from_gguf_qwen35(g, out, err) && eog_from_gguf(g, out);
@@ -1743,8 +1744,10 @@ bool Glm5Geometry::from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& o
 // deepseek4: the hparams llama.cpp's loader reads (src/models/deepseek4.cpp load_arch_hparams), with the released
 // DeepSeek-V4-Flash values as defaults.  The glm5-next fields the shared kernels read are set to what they mean here:
 // every layer is an attention + MoE layer (no KDA, no dense lead), the MoE shapes are the model's.
-bool Glm5Geometry::from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
-    const std::string p = "deepseek4.";
+bool Glm5Geometry::from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err,
+                                  const std::string& prefix) {
+    const std::string p = prefix;
+    const bool x5 = p == "ernie5_5.";   // (ernie5_5: key_length is the MLA layers' 576, the HCA head key_length_swa)
     const auto num = [&](const std::string& key, double def) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -1761,7 +1764,7 @@ bool Glm5Geometry::from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, 
     if (out.nextn > 0 && g.find("blk." + std::to_string(block_count - 1) + ".hc_attn_fn.weight") != nullptr) out.nextn = 0;
     out.n_layers = block_count - out.nextn;
     out.n_head = (int) num("attention.head_count", 64);
-    out.head_dim = (int) num("attention.key_length", 512);
+    out.head_dim = (int) num(x5 ? "attention.key_length_swa" : "attention.key_length", 512);
     out.n_rot = (int) num("rope.dimension_count", 64);
     out.q_lora = (int) num("attention.q_lora_rank", 1024);
     out.kv_lora = out.head_dim;   // the one K=V row
@@ -1796,8 +1799,12 @@ bool Glm5Geometry::from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, 
     const int gfn = (int) num("expert_gating_func", 4);
     // ERNIE-5.5 (deepseek4.ernie.*, tools/ernie55_convert.py): sigmoid routers (2), summed over two - an engine without
     // the ernie path refuses the file here
-    const bool ernie = g.get(p + "ernie.version") != nullptr;
-    if (ernie && (gfn != 2 || (int) num("ernie.version", 0) != 1)) {
+    const bool ernie = x5 || g.get(p + "ernie.version") != nullptr;
+    if (x5 && gfn != 2) {
+        err = "ernie5_5: expert_gating_func " + std::to_string(gfn) + " (2, sigmoid, is implemented)";
+        return false;
+    }
+    if (ernie && !x5 && (gfn != 2 || (int) num("ernie.version", 0) != 1)) {
         err = "ernie: deepseek4.ernie.version " + std::to_string((int) num("ernie.version", 0)) + " / expert_gating_func " +
               std::to_string(gfn) + " (version 1 with gating 2 is implemented)";
         return false;
@@ -1872,8 +1879,12 @@ bool Glm5Geometry::from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, 
 
 // ERNIE-5.5-Flash-Preview's additions to the deepseek4 geometry (deepseek4.ernie.*, tools/ernie55_convert.py): the MLA
 // layers, the latent MoE, the dense lead layer, SiTU.  Anything this engine does not run is refused here.
+// ernie5_5 (Xylolabs' GGUFs, llama.cpp PR #31925's keys): the same values under ernie5_5.*, the MLA layers being the
+// compress-ratio-0 ones, the VHA folded, MultiMax in ernie5_5.logit_multimax (r0..r3, t0..t3) - worklog
+// 2026-11-28_ernie55-xylolabs.md checks each against our MX GGUF's tensors
 bool Glm5Geometry::from_gguf_ernie(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
-    const std::string p = "deepseek4.", e = p + "ernie.";
+    const bool x5 = g.get("ernie5_5.block_count") != nullptr;
+    const std::string p = x5 ? "ernie5_5." : "deepseek4.", e = p + "ernie.";
     const auto num = [&](const std::string& key, double def) -> double {
         const auto* v = g.get(key);
         if (!v) return def;
@@ -1885,8 +1896,11 @@ bool Glm5Geometry::from_gguf_ernie(const strata::GgufFile& g, Glm5Geometry& out,
         return v == nullptr ? def : v->is_num() ? v->num() != 0.0 : def;
     };
     out.ernie = true;
+    out.er_x5 = x5;
     out.er_mla.assign((size_t) out.n_layers, 0);
-    if (const auto* v = g.get(e + "mla_layers"); v && v->type == strata::MetaType::ARRAY) {
+    if (x5) {
+        for (int il = 0; il < out.n_layers; ++il) out.er_mla[(size_t) il] = out.comp_ratio[(size_t) il] == 0 ? 1 : 0;
+    } else if (const auto* v = g.get(e + "mla_layers"); v && v->type == strata::MetaType::ARRAY) {
         for (const auto& it : v->items) {
             const int il = (int) it.num();
             if (il < 0 || il >= out.n_layers || out.comp_ratio[(size_t) il] != 0) {
@@ -1902,29 +1916,44 @@ bool Glm5Geometry::from_gguf_ernie(const strata::GgufFile& g, Glm5Geometry& out,
             err = "ernie: layer " + std::to_string(il) + " is neither an MLA layer nor HCA (ratio 128): not implemented";
             return false;
         }
-    const int heads = (int) num(e + "mla.head_count", 64);
-    out.er_mla_qlora = (int) num(e + "mla.q_lora_rank", 1024);
-    out.er_mla_kvlora = (int) num(e + "mla.kv_lora_rank", 512);
-    out.er_mla_nope = (int) num(e + "mla.qk_nope_head_dim", 192);
-    out.er_mla_rope = (int) num(e + "mla.qk_rope_head_dim", 64);
-    out.er_mla_v = (int) num(e + "mla.v_head_dim", 256);
-    out.er_mla_rope_base = (float) num(e + "mla.rope_freq_base", 8.0e6);
-    out.er_vha_rank = (int) num(e + "vha_rank", 16);
+    const int heads = (int) num(x5 ? p + "attention.head_count" : e + "mla.head_count", 64);
+    out.er_mla_qlora = (int) num(x5 ? p + "attention.q_lora_rank" : e + "mla.q_lora_rank", 1024);
+    out.er_mla_kvlora = (int) num(x5 ? p + "attention.kv_lora_rank" : e + "mla.kv_lora_rank", 512);
+    out.er_mla_rope = (int) num(x5 ? p + "rope.dimension_count" : e + "mla.qk_rope_head_dim", 64);
+    // (ernie5_5: key_length_mla is nope + rope, 256)
+    out.er_mla_nope = x5 ? (int) num(p + "attention.key_length_mla", 256) - out.er_mla_rope
+                         : (int) num(e + "mla.qk_nope_head_dim", 192);
+    out.er_mla_v = (int) num(x5 ? p + "attention.value_length_mla" : e + "mla.v_head_dim", 256);
+    // (ernie5_5: rope.freq_base is the plain RoPE's 8e6 - the HCA layers take compress_rope_freq_base, as ours)
+    out.er_mla_rope_base = (float) num(x5 ? p + "rope.freq_base" : e + "mla.rope_freq_base", 8.0e6);
+    out.er_vha_rank = x5 ? 0 : (int) num(e + "vha_rank", 16);   // (0: the folded M = I + V U^T stored as attn_vha)
     out.er_idx_top_k = (int) num(p + "attention.indexer.top_k", 2048);
-    out.x_exp = (int) num(e + "latent_size", 2048);
-    out.er_hc_eps_out = flag(e + "hc_rms_eps_outside_sqrt", true);
-    out.er_multimax = flag(e + "multimax", true);
-    out.er_gate_bf16 = flag(e + "attn_gate_sigmoid_bf16", true);
-    const float sb = (float) num(e + "situ_beta", 4.0), slb = (float) num(e + "situ_linear_beta", 25.0);
-    const int routers = (int) num(e + "router_count", 2);
-    const bool lnorm = flag(e + "latent_norm", true);
+    out.x_exp = (int) num(x5 ? p + "expert_latent_length" : e + "latent_size", 2048);
+    out.er_hc_eps_out = x5 ? true : flag(e + "hc_rms_eps_outside_sqrt", true);
+    out.er_multimax = x5 ? false : flag(e + "multimax", true);
+    if (x5) {
+        if (const auto* v = g.get(p + "logit_multimax"); v && v->type == strata::MetaType::ARRAY) {
+            if (v->items.size() != 8) {
+                err = "ernie5_5: logit_multimax has " + std::to_string(v->items.size()) + " values (8: r0..r3, t0..t3)";
+                return false;
+            }
+            for (int i = 0; i < 8; ++i) out.er_mm[i] = (float) v->items[(size_t) i].num();
+            out.er_multimax = out.er_mm_meta = true;
+        }
+    }
+    // (ernie5_5 has no key: both reference stacks round the gate's sigmoid to BF16 - survey section 1.3)
+    out.er_gate_bf16 = x5 ? true : flag(e + "attn_gate_sigmoid_bf16", true);
+    const float sb = (float) num(x5 ? p + "activation.situ_beta" : e + "situ_beta", 4.0);
+    const float slb = (float) num(x5 ? p + "activation.situ_linear_beta" : e + "situ_linear_beta", 25.0);
+    const int routers = x5 ? 2 : (int) num(e + "router_count", 2);   // (ernie5_5: one [2 x 512] tensor, split by the pack)
+    const bool lnorm = x5 ? true : flag(e + "latent_norm", true);
     out.dense_lead = (int) num(p + "leading_dense_block_count", 0);
     out.n_ff_dense = (int) num(p + "feed_forward_length", 14336);
     out.hash_layers = 0;
     // SiTU (4 tanh(g / 4) sigmoid(g) * 25 tanh(u / 25)): the expert kernels' negative limit (glm_fast.cu situ_act)
     out.swiglu_exp = out.swiglu_shexp = -1.0f;
     if (heads != out.n_head || out.er_mla_kvlora != 512 || out.er_mla_rope != 64 || out.er_mla_nope + out.er_mla_rope > 512 ||
-        out.er_mla_v > 512 || out.er_mla_qlora % 32 != 0 || out.er_vha_rank < 1 || sb != 4.0f || slb != 25.0f ||
+        out.er_mla_v > 512 || out.er_mla_qlora % 32 != 0 || (x5 ? out.er_vha_rank != 0 : out.er_vha_rank < 1) || sb != 4.0f || slb != 25.0f ||
         routers != 2 || !lnorm || out.x_exp % 256 != 0 || out.x_exp > out.n_embd || out.n_ff_exp % 256 != 0 ||
         out.dense_lead < 0 || out.dense_lead >= out.n_layers || out.n_ff_dense % 32 != 0 || out.nextn != 0) {
         err = "ernie: unsupported geometry (MLA 64 heads of 192 + 64 / v <= 512 on a 512 latent, SiTU 4 / 25, two routers, "
@@ -4327,7 +4356,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     //    quantized rows) is resolved through the GGUF shards and dequantized by ggml's traits.
     struct Row {
         std::string name, kind;
-        uint64_t offset = 0, bytes = 0;
+        uint64_t offset = 0, bytes = 0, ne0 = 0, ne1 = 0;
     };
     std::vector<Row> rows;
     {
@@ -4338,11 +4367,34 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             std::istringstream ss(line);
             Row r;
             std::string f;
-            ss >> r.name >> f >> r.kind >> r.offset >> r.bytes;   // name served kind offset bytes ...
+            std::string arena, bytes2;
+            ss >> r.name >> f >> r.kind >> r.offset >> r.bytes >> arena >> bytes2 >> r.ne0 >> r.ne1;   // name served kind offset bytes ...
             row_kind_[r.name] = r.kind;
             rows.push_back(r);
         }
     }
+    // a float row the pack WROTE (not a GGUF tensor as stored): ernie5_5's router halves and its F32 kv_b joined from
+    // k_b / v_b (tools/iq_pack.py ernie5_rewrite).  Its TensorInfo comes from the index row (ne0, ne1, the kind's type)
+    // when no shard has the name, or the shard's tensor has another element count; every other pack's rows are GGUF
+    // tensors of the same count (they failed here before otherwise), so they keep the shard's TensorInfo
+    std::unordered_map<std::string, strata::TensorInfo> synth;
+    for (const auto& r : rows) {
+        if (r.kind != "2" && r.kind != "4" && r.kind != "5") continue;
+        const uint64_t n = r.ne0 * std::max<uint64_t>(r.ne1, 1);
+        const int es = r.kind == "2" ? 4 : 2;
+        if (n == 0 || n * es != r.bytes) continue;
+        const strata::TensorInfo* t = find_tensor(r.name);
+        if (t != nullptr && t->elements() == n) continue;
+        strata::TensorInfo ti;
+        ti.name = r.name;
+        ti.shape = r.ne1 > 0 ? std::vector<uint64_t>{r.ne0, r.ne1} : std::vector<uint64_t>{r.ne0};
+        ti.type = r.kind == "2" ? 0u : r.kind == "4" ? 30u : 1u;
+        synth[r.name] = ti;
+    }
+    const auto find_row_tensor = [&](const std::string& name) -> const strata::TensorInfo* {
+        const auto it = synth.find(name);
+        return it != synth.end() ? &it->second : find_tensor(name);
+    };
     // dequant-at-load ONLY for the small tensors; everything the device MMVQ serves stays
     // quantized in VRAM (glm5-next's dense side is ~30B params - 129.8 GiB in F32, never fits)
     // token_embd stays QUANTIZED too (Q4_K, 0.36 GB instead of 2.54 GB F32): step() dequantizes
@@ -4423,7 +4475,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + " exl3"] += xm->second.vram();
             continue;
         }
-        const strata::TensorInfo* t = find_tensor(r.name);
+        const strata::TensorInfo* t = find_row_tensor(r.name);
         if (!t) {
             err = "pack: tensor " + r.name + " is in index.txt but in no shard";
             return false;
@@ -4506,7 +4558,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             continue;
         }
-        const strata::TensorInfo* t = find_tensor(r.name);
+        const strata::TensorInfo* t = find_row_tensor(r.name);
         if (const int role = q35d_role(r.name); role >= 0) {
             const int si = find_shard_of(r.name);
             const strata::TensorInfo* ti = si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr;

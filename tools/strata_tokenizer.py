@@ -286,7 +286,12 @@ class Tokenizer:
         # (not ERNIE 5.5's, a deepseek4-arch file with its own types: its vocabulary above 128000 is ordinary text)
         if types and md.get("general.architecture") in ("deepseek4", "deepseek41") and md.get("tokenizer.ggml.pre") != "ernie55":
             types = deepseek_special_types(tokens, types)
-        return cls(tokens, list(md["tokenizer.ggml.merges"]), types, md.get("tokenizer.ggml.pre", "qwen35"), special)
+        pre = md.get("tokenizer.ggml.pre", "qwen35")
+        if md.get("general.architecture") == "ernie5_5" and pre == "ernie5":
+            # (Xylolabs' ERNIE-5.5 GGUFs, llama.cpp PR #31925's name: the same vocabulary and merges as ours, checked
+            # token by token - worklog 2026-11-28_ernie55-xylolabs.md)
+            pre = "ernie55"
+        return cls(tokens, list(md["tokenizer.ggml.merges"]), types, pre, special)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:

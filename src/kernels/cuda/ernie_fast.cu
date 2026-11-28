@@ -30,6 +30,9 @@ __device__ __forceinline__ float bf16_round(float x) {   // round to nearest eve
 }
 
 __device__ __forceinline__ float bf(uint16_t v) { return __uint_as_float((unsigned int) v << 16); }
+// a weight element: BF16 or F32 (ernie5_5's kv_b, dequantized from Q8_0 by the pack)
+__device__ __forceinline__ float wv(const uint16_t* w, size_t i) { return bf(w[i]); }
+__device__ __forceinline__ float wv(const float* w, size_t i) { return w[i]; }
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -153,16 +156,17 @@ __global__ void mla_q_rope_kernel(float* __restrict__ q, int nope, int R, int p,
 }
 
 // block h, a thread a latent column c (blockDim = L)
-__global__ void mla_absorb_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kvb, float* __restrict__ q_lat,
+template <typename W>
+__global__ void mla_absorb_kernel(const float* __restrict__ q, const W* __restrict__ kvb, float* __restrict__ q_lat,
                                   int nope, int R, int V, int L) {
     extern __shared__ float sq[];
     const int h = blockIdx.x;
     for (int i = threadIdx.x; i < nope; i += blockDim.x) sq[i] = q[(size_t) h * (nope + R) + i];
     __syncthreads();
-    const uint16_t* W = kvb + (size_t) h * (nope + V) * L;
+    const W* Wk = kvb + (size_t) h * (nope + V) * L;
     for (int c = threadIdx.x; c < L; c += blockDim.x) {
         float a = 0.0f;
-        for (int i = 0; i < nope; ++i) a += sq[i] * bf(W[(size_t) i * L + c]);
+        for (int i = 0; i < nope; ++i) a += sq[i] * wv(Wk, (size_t) i * L + c);
         q_lat[(size_t) h * L + c] = a;
     }
 }
@@ -209,17 +213,18 @@ __global__ void mla_attend_kernel(const float* __restrict__ q_lat, const float* 
 }
 
 // block h (256 threads): a warp an output dim d
-__global__ void mla_v_kernel(const float* __restrict__ o_lat, const uint16_t* __restrict__ kvb, float* __restrict__ o,
+template <typename W>
+__global__ void mla_v_kernel(const float* __restrict__ o_lat, const W* __restrict__ kvb, float* __restrict__ o,
                              int nope, int V, int L) {
     extern __shared__ float so[];
     const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
     for (int i = threadIdx.x; i < L; i += blockDim.x) so[i] = o_lat[(size_t) h * L + i];
     __syncthreads();
-    const uint16_t* Wv = kvb + ((size_t) h * (nope + V) + nope) * L;
+    const W* Wv = kvb + ((size_t) h * (nope + V) + nope) * L;
     for (int d = w; d < V; d += nw) {
-        const uint16_t* row = Wv + (size_t) d * L;
+        const W* row = Wv + (size_t) d * L;
         float a = 0.0f;
-        for (int c = lane; c < L; c += 32) a += bf(row[c]) * so[c];
+        for (int c = lane; c < L; c += 32) a += wv(row, (size_t) c) * so[c];
         a = warp_sum(a);
         if (lane == 0) o[(size_t) h * V + d] = a;
     }
@@ -307,8 +312,13 @@ void mla_q_rope(float* q, int H, int nope, int R, int p, float base, cudaStream_
     mla_q_rope_kernel<<<H, 32, 0, st>>>(q, nope, R, p, base);
     check("mla_q_rope");
 }
-void mla_absorb(const float* q, const uint16_t* kvb, float* q_lat, int H, int nope, int R, int V, int L, cudaStream_t st) {
-    mla_absorb_kernel<<<H, 512, (size_t) nope * sizeof(float), st>>>(q, kvb, q_lat, nope, R, V, L);
+void mla_absorb(const float* q, const void* kvb, int kvb_f32, float* q_lat, int H, int nope, int R, int V, int L,
+                cudaStream_t st) {
+    if (kvb_f32)
+        mla_absorb_kernel<float><<<H, 512, (size_t) nope * sizeof(float), st>>>(q, (const float*) kvb, q_lat, nope, R, V, L);
+    else
+        mla_absorb_kernel<uint16_t><<<H, 512, (size_t) nope * sizeof(float), st>>>(q, (const uint16_t*) kvb, q_lat, nope,
+                                                                                   R, V, L);
     check("mla_absorb");
 }
 void mla_attend(const float* q_lat, const float* q, const float* cache, const int* rows, int n, const float* sinks,
@@ -317,8 +327,11 @@ void mla_attend(const float* q_lat, const float* q, const float* cache, const in
                                                                          o_lat, nope, R, L);
     check("mla_attend");
 }
-void mla_v(const float* o_lat, const uint16_t* kvb, float* o, int H, int nope, int V, int L, cudaStream_t st) {
-    mla_v_kernel<<<H, 256, (size_t) L * sizeof(float), st>>>(o_lat, kvb, o, nope, V, L);
+void mla_v(const float* o_lat, const void* kvb, int kvb_f32, float* o, int H, int nope, int V, int L, cudaStream_t st) {
+    if (kvb_f32)
+        mla_v_kernel<float><<<H, 256, (size_t) L * sizeof(float), st>>>(o_lat, (const float*) kvb, o, nope, V, L);
+    else
+        mla_v_kernel<uint16_t><<<H, 256, (size_t) L * sizeof(float), st>>>(o_lat, (const uint16_t*) kvb, o, nope, V, L);
     check("mla_v");
 }
 

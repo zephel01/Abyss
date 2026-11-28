@@ -291,3 +291,7 @@ STRATA_INK_PREFILL  # src/core/inkling_fast_path.cu (Inkling's batched prompt pa
 STRATA_INK_NV_OWN  # src/core/glm_prefill.cu (Inkling prompt: NVFP4 experts on the own int8 GEMM, default 1; 0: MMQ or the FP16 path)
 STRATA_INK_NV_DQ  # src/core/glm_prefill.cu (Inkling prompt: NVFP4 experts the own GEMM does not take through FP16 dequant + cuBLAS, default 1; 0: MMQ)
 STRATA_MEMT_DUMP  # src/core/memt_path.cu (debug: a directory; MemT-1.0-Flash writes its memory layers' inputs and outputs there as .bin files for recipes/memt-flash/ref_block.py)
+STRATA_ERNIE_DUMP  # src/core/ernie_fast_path.cu (debug: a directory; ERNIE-5.5's router scores, latent activations and MLA outputs appended there as .f32 for recipes/ernie55/phaseb)
+STRATA_ERNIE_GATE_BF16  # src/core/ernie_fast_path.cu (debug: 0 leaves ERNIE-5.5's output-gate sigmoid unrounded, as the float64 reference's dumps)
+STRATA_ERNIE_IDX  # src/core/ernie_fast_path.cu (debug: 0 turns ERNIE-5.5's DSA indexer off - dense MLA attention at any length)
+STRATA_ERNIE_IDX_DUMP  # src/core/ernie_fast_path.cu (debug: a directory; ERNIE-5.5's MLA layers' x, mixer output and selection as .bin for recipes/ernie55/idx/ref_dsa.py)

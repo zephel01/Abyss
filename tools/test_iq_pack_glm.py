@@ -149,7 +149,8 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("raon1", iq_pack.ARCHITECTURES)            # Abyss: KRAFTON Raon-1 (RDA + MLA + mHC)
         self.assertIn("hy_v3", iq_pack.ARCHITECTURES)            # Abyss: Tencent Hy-MT3 (laguna layers, no gate)
         self.assertIn("gigachat4", iq_pack.ARCHITECTURES)        # Abyss: ai-sage GigaChat4 (GDN + MLA + DSA)
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 16)
+        self.assertIn("ernie5_5", iq_pack.ARCHITECTURES)         # Abyss: ERNIE-5.5 (Xylolabs' GGUFs)
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 17)
 
     def test_hy4_as_stored(self):
         # hy_v4_flash: every non-expert tensor served as stored (the 3-D absorbed k_b / v_b too), nothing to BF16

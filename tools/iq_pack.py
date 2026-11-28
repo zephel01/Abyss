@@ -209,12 +209,30 @@ GIGA_NATIVE_OK = ("attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "ss
                   "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                   "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                   "token_embd.weight", "output.weight")
+# ernie5_5 (Xylolabs' ERNIE-5.5-Flash-Preview GGUFs, llama.cpp PR #31925's layout) for the deepseek4 path's ernie
+# layers: the Q8_0 projections served as stored (ours are BF16 - the engine takes either), the mHC fn rounded to BF16 as
+# deepseek4's, and three tensors rewritten into our layout (each checked against our MX GGUF by
+# recipes/ernie55/xylo/cmp_tensors.py, worklog 2026-11-28_ernie55-xylolabs.md):
+#   * ffn_gate_inp [4096, 1024] F32 = the two routers' rows one after the other (values exactly BF16) -> ffn_gate_inp
+#     (rows 0..511) and ffn_gate_inp_1 (rows 512..1023), BF16;
+#   * attn_k_b [192, 512, 64] (a head's nope rows transposed) and attn_v_b [512, 256, 64] Q8_0 -> one attn_kv_b
+#     [512, 64 x (192 + 256)] F32, a head's 192 k rows then its 256 v rows (a Q8_0 value is exact in F32);
+#   * everything else keeps its name: attn_vha (the folded M = I + V U^T), ffn_routed_{down,up,norm}, exp_scale are
+#     read under these names by the engine
+ERNIE5_NATIVE_OK = ("attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight", "attn_output_a.weight", "attn_output_b.weight",
+                    "attn_compressor_kv.weight", "attn_compressor_gate.weight", "attn_gate.weight",
+                    "attn_kv_a_mqa.weight", "attn_output.weight", "ffn_routed_down.weight", "ffn_routed_up.weight",
+                    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                    "token_embd.weight", "output.weight")
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna",
                  "sensenova_loop", "hy_v4_flash", "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3",
-                 "gigachat4")   # unsloth spells glm5-next without the hyphen
+                 "gigachat4", "ernie5_5")   # unsloth spells glm5-next without the hyphen
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
+    if arch == "ernie5_5":   # (the mHC fn, read as BF16 by the shared hc kernels; ours are rounded the same way)
+        return name in DEEPSEEK4_BF16_GLOBAL or (name.startswith("blk.") and name.endswith(DEEPSEEK4_BF16))
     if arch == "deepseek4":
         return name in DEEPSEEK4_BF16_GLOBAL or (name.startswith("blk.") and name.endswith(DEEPSEEK4_BF16)) or (
             type_name == "F16" and name.startswith("blk.") and name.endswith(DEEPSEEK4_F16_TO_BF16))
@@ -351,8 +369,23 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     served = 0
     converted = []
     with open(out / "dense.bin", "wb") as fo:
+        def put(nm, raw, kind, ne0, ne1):
+            nonlocal at
+            rows.append([nm, "0", kind, str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
+                         "0", "0", "1"] + ["0"] * 7)
+            fo.write(raw)
+            pad = (-len(raw)) % ALIGN
+            fo.write(b"\0" * pad)
+            at += len(raw) + pad
+
         for name, (g, t, mm, _) in model.where.items():
             if is_expert(t.name) or t.name in NOT_IN_PACK or t.name.endswith(NOT_IN_PACK_SUFFIX):
+                continue
+            if arch == "ernie5_5" and name.startswith("blk.") and name.endswith(
+                    ("ffn_gate_inp.weight", "attn_k_b.weight", "attn_v_b.weight")):
+                rc = ernie5_rewrite(name, t, model, put, converted)
+                if rc:
+                    return rc
                 continue
             if block_count is not None and name.startswith("blk."):
                 il = name.split(".")[1]
@@ -445,6 +478,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 print("%s is %s: not on the raon1 native set (RAON_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
                 return 1
+            elif arch == "ernie5_5" and not name.endswith(ERNIE5_NATIVE_OK):
+                print("%s is %s: not on the ernie5_5 native set (ERNIE5_NATIVE_OK); refusing to pack it silently"
+                      % (t.name, t.type_name))
+                return 1
             elif arch == "gigachat4" and not name.endswith(GIGA_NATIVE_OK):
                 print("%s is %s: not on the gigachat4 native set (GIGA_NATIVE_OK); refusing to pack it silently"
                       % (t.name, t.type_name))
@@ -470,6 +507,51 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
         }, indent=2) + "\n", encoding="utf-8")
         print("compat-bf16: %d tensors, %.2f GiB; expert and PLE table bytes unchanged"
               % (len(converted), sum(t["bytes"] for t in converted) / 2**30))
+    return 0
+
+
+def ernie5_rewrite(name, t, model: Model, put, converted) -> int:
+    """ernie5_5: the router split into its two matrices (BF16), k_b + v_b joined into our F32 attn_kv_b (see
+    ERNIE5_NATIVE_OK above).  v_b is written with k_b; its own row is skipped."""
+    import gguf_io
+    P = name[: name.rindex(".", 0, name.rindex(".")) + 1]   # "blk.N."
+    if name.endswith("ffn_gate_inp.weight"):
+        ne0, ne1 = int(t.shape[0]), int(t.shape[1])
+        if t.type_name != "F32" or ne1 % 2:
+            print("%s: %s %s (F32 [n_embd, 2 x n_expert] expected)" % (name, t.type_name, t.shape))
+            return 1
+        u = np.frombuffer(model.bytes(name).tobytes(), dtype=np.uint32).reshape(ne1, ne0)
+        if np.count_nonzero(u & 0xFFFF):
+            print("router %s holds values that are not BF16; the engine's routers are BF16" % name)
+            return 1
+        b = (u >> 16).astype(np.uint16)
+        h = ne1 // 2
+        put(name, b[:h].tobytes(), "4", ne0, h)
+        put(P + "ffn_gate_inp_1.weight", b[h:].tobytes(), "4", ne0, h)
+        converted.append({"name": name, "source_type": "F32", "bytes": int(b.nbytes),
+                          "to": "BF16 ffn_gate_inp + ffn_gate_inp_1 (exact)"})
+        return 0
+    if name.endswith("attn_v_b.weight"):
+        return 0
+    vn = P + "attn_v_b.weight"
+    if vn not in model.where:
+        print("%s without %s" % (name, vn))
+        return 1
+    tv = model.where[vn][1]
+    nope, lat, heads = (int(x) for x in t.shape)       # k_b: ne0 nope, ne1 latent, ne2 heads
+    lat2, vdim, heads2 = (int(x) for x in tv.shape)    # v_b: ne0 latent, ne1 v, ne2 heads
+    if lat != lat2 or heads != heads2:
+        print("%s %s / %s %s: the latent or head counts disagree" % (name, t.shape, vn, tv.shape))
+        return 1
+    k = gguf_io.dequantize(model.bytes(name), t.type_name).astype(np.float32).reshape(heads, lat, nope)
+    v = gguf_io.dequantize(model.bytes(vn), tv.type_name).astype(np.float32).reshape(heads, vdim, lat)
+    kv = np.concatenate([k.transpose(0, 2, 1), v], axis=1)   # [heads][nope + v][latent]
+    if not np.isfinite(kv).all():
+        print("%s: non-finite values" % name)
+        return 1
+    put(P + "attn_kv_b.weight", np.ascontiguousarray(kv).tobytes(), "2", lat, heads * (nope + vdim))
+    converted.append({"name": P + "attn_kv_b.weight", "source_type": "%s k_b + %s v_b" % (t.type_name, tv.type_name),
+                      "bytes": int(kv.nbytes), "to": "F32 (exact)"})
     return 0
 
 
@@ -819,6 +901,10 @@ def main() -> int:
         prefix = "gigachat4."
         print("gigachat4: packing for the Glm5Model runner's qwen35moe path, giga layers (every dense tensor served as "
               "stored; the NextN block dropped)")
+    if arch == "ernie5_5":
+        prefix = "ernie5_5."
+        print("ernie5_5: packing for the Glm5Model runner's deepseek4 path, ernie layers (quantized dense served "
+              "natively; the router split, k_b / v_b joined into an F32 kv_b)")
     if arch == "hy_v4_flash":
         prefix = "hy_v4_flash."
         print("hy_v4_flash: packing for the Glm5Model runner's hy4 path (every dense tensor served as stored; the "
@@ -829,7 +915,7 @@ def main() -> int:
     block_count = None
     trunk = None
     if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "qwen35", "laguna", "hy_v4_flash",
-                "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3", "gigachat4"):
+                "inkling2_loop", "inkling2", "bailingmoe3", "raon1", "hy_v3", "gigachat4", "ernie5_5"):
         bc = g.metadata.get(prefix + "block_count", g.metadata.get(prefix + "num_hidden_layers"))
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -897,6 +983,11 @@ def main() -> int:
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
+    if arch == "ernie5_5" and not (out / "tokenizer" / "chat_template.jinja").exists():
+        # (Xylolabs' GGUFs carry no template - theirs is a separate file whose BOS the runtime adds): ours, which writes
+        # <|ERNIE_MASK|> itself (the pack's tokenizer adds no BOS)
+        shutil.copyfile(HERE / "ernie55_chat_template.jinja", out / "tokenizer" / "chat_template.jinja")
+        print("ernie5_5: chat template tools/ernie55_chat_template.jinja")
 
     # ---- the experts (a dense qwen35 has none: native_experts.txt keeps the header the engine reads the shards from)
     if arch == "qwen35":
@@ -924,7 +1015,7 @@ def main() -> int:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
     if arch in ("glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe", "laguna", "hy_v4_flash", "inkling2_loop",
-                "inkling2", "bailingmoe3", "raon1", "gigachat4"):
+                "inkling2", "bailingmoe3", "raon1", "gigachat4", "ernie5_5"):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     elif arch == "hy_v3":   # (no leading_dense_block_count: the layers before the first router are dense)
         lead = 0
@@ -934,8 +1025,9 @@ def main() -> int:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)
     moe_layers = [l for l in range(n_layers) if l >= lead]
     first_moe = moe_layers[0]
-    n_expert = int(T["blk.%d.ffn_gate_inp.weight" % first_moe].shape[1])  # router rows = experts kept
-    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in moe_layers):
+    rdiv = 2 if arch == "ernie5_5" else 1   # (ernie5_5: the two routers in one tensor)
+    n_expert = int(T["blk.%d.ffn_gate_inp.weight" % first_moe].shape[1]) // rdiv  # router rows = experts kept
+    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) // rdiv != n_expert for l in moe_layers):
         print("the routers disagree on the expert count; a per-layer pruned model cannot be packed")
         return 1
     layout, offset = [], 0

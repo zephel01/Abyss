@@ -102,7 +102,9 @@ struct Glm5Geometry {
     int cand_layer = 20, cand_blocks = 2048, cand_bs = 8;
     bool dsv4() const { return arch == 1; }
     int ratio(int il) const { return il < (int) comp_ratio.size() ? comp_ratio[(size_t) il] : 0; }
-    static bool from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+    // (prefix "ernie5_5.": Xylolabs' ERNIE-5.5 GGUFs, llama.cpp PR #31925's ernie5_5 keys, read onto the same path)
+    static bool from_gguf_dsv4(const strata::GgufFile& g, Glm5Geometry& out, std::string& err,
+                               const std::string& prefix = "deepseek4.");
     static bool from_gguf_dsv41(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
     static bool from_gguf_ernie(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);   // (from _dsv4)
     // ---- qwen35moe (Qwen3.5-MoE: Ornith-1.5-122B; src/core/qwen35_fast_path.cu): arch 2 - plain residuals (no
@@ -260,6 +262,12 @@ struct Glm5Geometry {
     float er_mla_rope_base = 8.0e6f;
     int er_vha_rank = 16, er_idx_top_k = 2048;
     bool er_hc_eps_out = true, er_multimax = true, er_gate_bf16 = true;
+    // er_x5: the file is arch ernie5_5 (Xylolabs, llama.cpp PR #31925's names): VHA stored folded (attn_vha = M),
+    // MultiMax in the metadata (er_mm: r0..r3, t0..t3), the router's two matrices as one [2 n_expert] tensor (the
+    // pack splits it), the MLA kv_b as k_b / v_b (the pack joins them into an F32 attn_kv_b), the latent MoE as
+    // ffn_routed_{down,norm,up} and the expert scale as exp_scale
+    bool er_x5 = false, er_mm_meta = false;
+    float er_mm[8] = {};
     int x_exp = 0;
     int exp_dim() const { return x_exp > 0 ? x_exp : n_embd; }
     bool is_er_mla(int il) const { return ernie && il >= 0 && il < (int) er_mla.size() && er_mla[(size_t) il] != 0; }

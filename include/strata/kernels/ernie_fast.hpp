@@ -37,14 +37,15 @@ void multimax(float* x, int n, const float* r, const float* t, cudaStream_t st);
 void mla_kv(const float* kva, const float* norm, float* row, int L, int R, int p, float base, float eps, cudaStream_t st);
 /// RoPE in place on q's dims [nope, nope + R) of every head (H heads of nope + R)
 void mla_q_rope(float* q, int H, int nope, int R, int p, float base, cudaStream_t st);
-/// q_lat[h][c] = sum_{i < nope} q[h][i] kvb[(h (nope + V) + i) L + c]   (kvb BF16 [H (nope + V)][L])
-void mla_absorb(const float* q, const uint16_t* kvb, float* q_lat, int H, int nope, int R, int V, int L, cudaStream_t st);
+/// q_lat[h][c] = sum_{i < nope} q[h][i] kvb[(h (nope + V) + i) L + c]   (kvb [H (nope + V)][L]: BF16, F32 when kvb_f32)
+void mla_absorb(const float* q, const void* kvb, int kvb_f32, float* q_lat, int H, int nope, int R, int V, int L,
+                cudaStream_t st);
 /// over n cache rows (rows[0, n) when given - the DSA selection -, else rows 0 .. n-1): scores, the softmax with the
 /// head's sink, o_lat[h] = sum_j p_j row_j[0, L)
 void mla_attend(const float* q_lat, const float* q, const float* cache, const int* rows, int n, const float* sinks,
                 float scale, float* score, float* o_lat, int H, int nope, int R, int L, cudaStream_t st);
 /// o[h][d] = sum_c kvb[(h (nope + V) + nope + d) L + c] o_lat[h][c]
-void mla_v(const float* o_lat, const uint16_t* kvb, float* o, int H, int nope, int V, int L, cudaStream_t st);
+void mla_v(const float* o_lat, const void* kvb, int kvb_f32, float* o, int H, int nope, int V, int L, cudaStream_t st);
 
 /// the DSA indexer's key of position p: LayerNorm(kraw [D]) * w + b, RoPE rotate-half (NEOX) on its first R dims (plain,
 /// base), FP16 -> row [D]  (D <= 512)
