@@ -7,6 +7,36 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.221 - 2026-11-28
+
+Inkling 2 Mini decodes faster on 8-16 GB cards (8 GB: 88.2 -> 101.3 tok/s) with the same tokens, an engine that dies
+on an illegal instruction or an arithmetic fault is no longer called a RAM shortage, and Windows keeps its learned files
+up to date when another program holds them for a moment (#62). Other models' outputs do not change.
+
+### Changed
+
+- **Inkling 2 Mini, VRAM held below the model (8-16 GB cards):** a layer's expert slots now follow the lookups they
+  serve - layers 6-17 run three times a token on the same weights, so a slot there serves three - weighted by routing
+  share per byte (the pack's `expert_counts.txt`, else this machine's `expert_usage.txt`), and each layer lends the
+  prompt path its own part of the pool's tail (the same bytes as before; the uniform tail had left no room to move a
+  slot). Idea from Maya (863e9b56); the code is Abyss's. RTX 5090, a 4K prompt + 512 tokens, drafter off, median of 3:
+  UD-Q4_K_XL held to 8 GB decode 88.2 -> 101.3 tok/s (prompt 1,071 -> 1,148), held to 12 GB 130.5 -> 133.7 (prompt
+  1,517 -> 1,901); UD-IQ3_XXS held to 8 GB 135.8 -> 139.8. All in VRAM, nothing changes; with
+  `STRATA_DETERMINISTIC=1` and the same usage file the tokens are v1.3.220's. The first start of a new pack (no usage
+  yet) keeps the uniform split. `STRATA_INK_SLOT_PASSES=0` restores the old split. Other models' slots and outputs do
+  not change.
+
+### Fixed
+
+- The server's note when the engine ends: an illegal instruction (SIGILL, Windows 0xC000001D) now says the CPU lacks an
+  instruction the build uses (the prebuilt engine needs AVX2; build on that PC instead), an arithmetic fault (SIGFPE,
+  Windows 0xC0000094) says so, and a Windows fail-fast (0xC0000409) counts as an abort - none of them points at RAM any
+  more. Idea from Strata (c282ce6c4).
+- Windows: `pool_pin.txt` and `expert_usage.txt` could still fail to be replaced (#62, v1.3.219: "could not be kept in
+  (read-only?)") when another program held the file for a moment (an antivirus scan, the search indexer). The replace
+  is retried 4 times (50-200 ms), then the old file is made writable and removed first; a failure now prints the
+  system's reason. Linux is unchanged.
+
 ## v1.3.220 - 2026-11-28
 
 ai-sage's GigaChat4-37B-A4B (GGUF arch `gigachat4`) runs, as a beta. Other models' outputs do not change.
