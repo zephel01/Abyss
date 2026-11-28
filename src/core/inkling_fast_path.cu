@@ -117,7 +117,7 @@ struct Ink {
         uint64_t requests = 0;   // (the routes it posts: FastState::expected)
         bool bad = false;        // its capture / instantiate failed: that key's tokens are launches (the same kernels)
     };
-    std::map<std::tuple<int, int, unsigned long long, int, float, int>, TokGraph> graphs;   // (+ the lane: its caches)
+    std::map<std::tuple<int, int, unsigned long long, int, float, int, int>, TokGraph> graphs;   // (+ the lane: its caches; the decode attention's kernel)
     uint64_t graph_caps = 0, graph_runs = 0, graph_eager = 0;
     // the verify window in one CUDA graph too (STRATA_INK_WIN_GRAPH): a graph per (width, the last column's full /
     // window layers' attention splits, the CPU-lane plan, the tail skip, the routes' by-value settings); the first
@@ -128,7 +128,7 @@ struct Ink {
         bool bad = false;
         int seen = 0;   // (windows of this key launched before its capture)
     };
-    std::map<std::tuple<int, int, int, unsigned long long, int, float, uint64_t, int>, WinGraph> wgraphs;   // (+ batch)
+    std::map<std::tuple<int, int, int, unsigned long long, int, float, uint64_t, int, int>, WinGraph> wgraphs;   // (+ batch, the decode attention's kernel)
     uint64_t wgraph_caps = 0, wgraph_runs = 0, wgraph_eager = 0, wgraph_bad = 0;
     uint64_t graph_inkd = 0;   // (the DSpark taps' accumulators' generation the graphs were captured with)
     void* base = nullptr;
@@ -1081,7 +1081,8 @@ bool Glm5Model::fast_ink_layers(int64_t p, std::string& err) {
         if (F->copy2 != nullptr) F->bg_drain(s, SIZE_MAX, 3, F->copy2);
         ik::set_pos(K.pos_d, p, s);
         const auto key = std::make_tuple(ik::attn_splits(p, 0, ik::kMaxSplits), ik::attn_splits(p, g.n_swa, ik::kMaxSplits),
-                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), K.lane);
+                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), K.lane,
+                                         ik::attn_dec_mode(p, p, 0, (int) (g.n_head / g.attn_head_kv), 1));
         if (inkd_acc_gen() != K.graph_inkd) {   // (the drafter's tap buffers moved: the graphs write the old ones)
             K.graphs.clear();
             K.wgraphs.clear();
@@ -1819,7 +1820,8 @@ bool Glm5Model::ink_window(const std::vector<int32_t>& toks, int64_t p0, const I
                              (F->tail_skip_disk ? 1u : 0u);
         const int64_t p1 = p_last;
         const auto key = std::make_tuple(T, ik::attn_rows_grid(p1, 0, ik::kMaxSplits), ik::attn_rows_grid(p1, g.n_swa, ik::kMaxSplits),
-                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), sig, bt ? 1 : 0);
+                                         F->cpu_plan, fast_skip_from(0), fast_skip_w(0), sig, bt ? 1 : 0,
+                                         ik::attn_dec_mode(bt ? 0 : p1 - T + 1, p1, 0, (int) (g.n_head / g.attn_head_kv), T));
         // (a key's first windows as launches: a capture costs ~13 ms - RTX 5090, ~1,450 nodes - and a replay saves
         // ~0.6, so a width seen a few times only is not captured)
         // STRATA_INK_WIN_CAP_AFTER=<n> (default 6): the windows of a key launched before its capture

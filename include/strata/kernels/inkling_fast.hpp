@@ -196,6 +196,11 @@ void attn_tok(const float* q, const float* r, const float* sink, const float* re
               float scale, float* part, int max_splits, const float* gate, float* out, void* outq, cudaStream_t s);
 /// The split count attn gives a row at position p (a graph's key)
 int attn_splits(int64_t p, int window, int max_splits);
+/// Which kernel the token path's attention (T = 1, or a verify window / batch of T rows at positions p_first .. p_last;
+/// a batch: p_first 0) runs for a global layer (window 0) with G q heads a KV head: 0 attn_part_kernel only (a short
+/// context, AMD, STRATA_INK_DECODE_ATTN=0), 1 the tensor-core decode kernel only (every row past
+/// STRATA_INK_DECODE_ATTN_FROM keys), 2 both, each its own rows (a graph's key)
+int attn_dec_mode(int64_t p_first, int64_t p_last, int window, int G, int T);
 /// The split grid attn(rows) launches for a window whose last row is at p_last: the last row's count rounded up to a
 /// power of two, 8 at the least (each row still its own count - a captured window's graph key)
 int attn_rows_grid(int64_t p_last, int window, int max_splits);
