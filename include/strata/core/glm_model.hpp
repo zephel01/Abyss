@@ -1164,6 +1164,10 @@ public:
     void ikf_report() const;
     bool ikf_rows(const float* feat, int64_t p_first, int n, cudaStream_t s);
     bool ikf_draft(int32_t y, int64_t pos, int64_t lo, int32_t* drafts, float* conf, std::string& err);
+    // a conversation slot's DFlash 2 context (inkd_slot_save / _load): the five layers' K and V ring rows of positions
+    // p0 .. p0 + rows - 1 (rows <= 2048) in position order, to or from host
+    static uint64_t ikf_slot_bytes(int64_t rows);
+    bool ikf_slot_copy(int64_t p0, int64_t rows, uint8_t* host, bool to_host, cudaStream_t s);
     bool verify_moe(int il, int tb, int n, const std::vector<int32_t>& toks, cudaStream_t s, cudaEvent_t wait_ev,
                     cudaEvent_t done_ev, std::string& err, bool router_done = false, bool graphed = false);
     bool verify_moe_router(int il, int tb, int n, cudaStream_t s, std::string& err);   // (its first launch)

@@ -1139,6 +1139,7 @@ constexpr size_t kInkdSlotHdr = 8 * sizeof(int64_t);
 uint64_t Glm5Model::inkd_slot_bytes(int64_t n) const {
     const auto* D = (const IkState*) inkd_;
     if (D == nullptr || n <= 0) return 0;
+    if (D->df2) return kInkdSlotHdr + ikf_slot_bytes(n);   // (DFlash 2: its own rings, no f_rnn)
     uint64_t b = kInkdSlotHdr + (uint64_t) g_.n_embd * sizeof(float);
     for (const auto& Ly : D->L) b += 2 * (uint64_t) std::min<int64_t>(n, Ly.ring) * kKVD * sizeof(__half);
     return b;
@@ -1176,6 +1177,13 @@ bool Glm5Model::inkd_slot_save(uint8_t* dst, int64_t n) {
     for (int l = 0; l < kL; ++l)
         hdr[1 + l] = has ? std::min<int64_t>(std::max<int64_t>(D->L[l].lo, n - D->L[l].ring), n) : n;
     hdr[4] = has && D->frnn_pos == n - 1 ? n - 1 : -1;
+    if (D->df2) {   // (DFlash 2's rings: the rows positions past n wrote over are gone, as inkd_reset says)
+        const int64_t lo = has ? std::min<int64_t>(std::max<int64_t>({D->L[0].lo, n - D->tail, D->ctx_end - D->tail}), n) : n;
+        for (int l = 0; l < kL; ++l) hdr[1 + l] = lo;
+        std::memcpy(dst, hdr, kInkdSlotHdr);
+        const int64_t rows = std::min<int64_t>(n, D->tail);
+        return ikf_slot_copy(n - rows, rows, dst + kInkdSlotHdr, true, s);
+    }
     std::memcpy(dst, hdr, kInkdSlotHdr);
     uint8_t* at = dst + kInkdSlotHdr;
     const size_t fb = (size_t) g_.n_embd * sizeof(float);
@@ -1204,6 +1212,14 @@ bool Glm5Model::inkd_slot_load(const uint8_t* src, int64_t n) {
     int64_t hdr[8];
     std::memcpy(hdr, src, kInkdSlotHdr);
     const uint8_t* at = src + kInkdSlotHdr;
+    if (D->df2) {
+        const int64_t rows = std::min<int64_t>(n, D->tail);
+        if (!ikf_slot_copy(n - rows, rows, const_cast<uint8_t*>(at), false, s)) return false;
+        D->ctx_end = n;
+        for (int l = 0; l < kL; ++l) D->L[l].lo = hdr[1 + l];
+        D->frnn_pos = n - 1;   // (no f_rnn: inkd_reset's)
+        return true;
+    }
     const size_t fb = (size_t) g_.n_embd * sizeof(float);
     if (cudaMemcpyAsync(D->frnn, at, fb, cudaMemcpyHostToDevice, s) != cudaSuccess) {
         cudaGetLastError();

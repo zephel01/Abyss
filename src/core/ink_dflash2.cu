@@ -988,6 +988,36 @@ bool Glm5Model::ikf_rows(const float* feat, int64_t p_first, int n, cudaStream_t
     return cudaGetLastError() == cudaSuccess;
 }
 
+// ------------------------------------------------------------------------------------------------ conversation slots
+uint64_t Glm5Model::ikf_slot_bytes(int64_t rows) {
+    return (uint64_t) kL * 2 * (uint64_t) std::min<int64_t>(rows, kRing) * kKVD * sizeof(__half);
+}
+
+bool Glm5Model::ikf_slot_copy(int64_t p0, int64_t rows, uint8_t* host, bool to_host, cudaStream_t s) {
+    auto* D = (IkfState*) ikf_;
+    if (D == nullptr || rows <= 0) return true;
+    rows = std::min<int64_t>(rows, kRing);
+    const size_t rb = (size_t) kKVD * sizeof(__half);
+    for (auto& Ly : D->L)
+        for (__half* r : {Ly.rk, Ly.rv}) {
+            int64_t done = 0;
+            while (done < rows) {   // (row p at p % kRing)
+                const int64_t i0 = (p0 + done) % kRing;
+                const int64_t m = std::min<int64_t>(rows - done, kRing - i0);
+                __half* d = r + (size_t) i0 * kKVD;
+                if (cudaMemcpyAsync(to_host ? (void*) host : (void*) d, to_host ? (const void*) d : (const void*) host,
+                                    (size_t) m * rb, to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, s) !=
+                    cudaSuccess) {
+                    cudaGetLastError();
+                    return false;
+                }
+                host += (size_t) m * rb;
+                done += m;
+            }
+        }
+    return true;
+}
+
 // ------------------------------------------------------------------------------------------------ the draft
 // the drafts for the pending token y at position pos over the context lo .. pos - 1 (the rings hold it)
 bool Glm5Model::ikf_draft(int32_t y, int64_t pos, int64_t lo, int32_t* drafts, float* conf, std::string& err) {
