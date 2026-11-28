@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.223 - 2026-11-28
+
+Baidu's ERNIE-5.5-Flash-Preview as a beta on one NVIDIA GPU + RAM (Xylolabs' IQ2_XXS, decode 21.7 tok/s on an RTX
+5090). The prompt is still read a token at a time (a 4K prompt takes ~3.3 minutes); the batched prompt path comes next.
+Other models' outputs do not change.
+
+### Added
+
+- Baidu's ERNIE-5.5-Flash-Preview (beta, NVIDIA, one GPU, text only, Apache-2.0): the engine reads Xylolabs'
+  `ernie5_5` GGUFs (llama.cpp PR #31925's layout), and `./setup-deepseek.sh --model ernie55` sets up their IQ2_XXS (5
+  parts, 82.84 GB, SHA-256 checked) with the GGUF's sampling (temperature 1.0, top_p 0.95), a 16K context and a RAM
+  tier by the PC's RAM (48 GB -> 30, 64 -> 46, 96+ -> 60; computed, measured on 123 GB only). RTX 5090 (Gen4 x4),
+  123 GB RAM, iGPU off, a 4K prompt + 512, median of 3: decode 21.7 tok/s (36 GB tier; 22.5 at the 60 GB tier, one
+  run), 14.3 held to 24 GB. **The prompt is read a token at a time in this version: ~20 tok/s, a 4K prompt takes ~3.3
+  minutes.** Quality against our MXFP4 + BF16 conversion of the original weights: KL 0.210 (median 0.056) on raw
+  English, 0.165 on 2.3K tokens of text, 0.395 (0.023) on an English answer and 1.01 (0.0004) on a Japanese one, the
+  same top token at 82-88% of positions. Xylolabs' own chat KL against the original is 0.252. Greedy English and
+  Japanese answers are right, and a needle in a 4.6K chat is found. The server reads its thinking (`reasoning_effort`
+  low / medium / high, `none` off) and stops at `<|ernie:im_end|>`. Not yet: the batched prompt path, a drafter (no
+  DSpark head in the files), tool calls as API calls, conversation slots, AMD. Other models' outputs do not change
+  (7-config and Inkling md5).
+
 ## v1.3.222 - 2026-11-28
 
 Inkling 2 Mini keeps conversations apart (slots): a thread coming back after another one answers without reading
