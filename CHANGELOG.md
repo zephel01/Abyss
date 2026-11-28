@@ -7,6 +7,30 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.225 - 2026-11-28
+
+Inkling 2 Mini decodes faster at long context (165K: 95.5 -> 106.3 tok/s, +11%), and can use incoai's DFlash 2 drafter
+as an opt-in. Other models' outputs do not change.
+
+### Faster
+
+- Inkling 2 Mini decodes faster at long context: the global layers' token-path attention runs a tensor-core split-K
+  kernel from 64K keys. A block takes one KV head's key split for all the rows of a verify window, so each K / V tile
+  is read once. RTX 5090, UD-Q4_K_XL, no drafter, median of 3: 64K 147.3 -> 150.9 tok/s, 128K 105.5 -> 113.8, 165K
+  95.5 -> 106.3; with the DSpark drafter 165K 107.8 -> 120.8. 4K and 32K are unchanged (194, 170 tok/s). Only the
+  order of the sums changes: at 64K the bits are the same, and at 128K / 165K the KL against the old kernel is 0.049
+  / 0.033, inside the old kernel's own deterministic vs non-deterministic distance (0.035-0.076). The 128K needle is
+  found 4/4 by both kernels, and drafter on / off outputs match. `STRATA_INK_DECODE_ATTN=0` keeps the old kernel;
+  `STRATA_INK_DECODE_ATTN_FROM` sets the threshold (65536). AMD keeps the old kernel. Idea from Strata (6ad0c0000).
+
+### Added
+
+- Inkling 2 Mini can use incoai's DFlash 2 drafter, opt-in: convert it with `tools/ink_dflash2_convert.py` (Q8_0 GGUF,
+  526 MB) and name it in `STRATA_INK_DSPARK`. RTX 5090, 4K prompt + 512, median of 3, none / DSpark / DFlash 2: prose
+  194.2 / 212.5 / 209.2 tok/s, Japanese 194.6 / 209.9 / 222.1, code 194.2 / 250.3 / 224.2. It wins on Japanese only,
+  so DSpark stays the default; setup does not download DFlash 2. Greedy and seeded sampled outputs match no drafter.
+  Conversation slots (v1.3.222) keep its context, so a resumed conversation drafts as it would alone (12/12 same md5).
+
 ## v1.3.224 - 2026-11-28
 
 ERNIE-5.5-Flash-Preview reads prompts ~4.4x faster: a 4K prompt takes ~45 s instead of ~3.3 minutes. Other models'
